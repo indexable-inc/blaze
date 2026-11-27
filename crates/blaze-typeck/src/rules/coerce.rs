@@ -195,8 +195,10 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
     /// object, between objects; an auto trait dropped, never added); then deref, borrow, unsize.
     /// Another pointer of one ADT whose target holds a `dyn` or slice argument (`Box<T>` to
     /// `Box<dyn Tr>`): `Source: CoerceUnsized<Target>` (core's and alloc's impls). Each goal is
-    /// asked in a probe, then registered; never on a variable source pointee (one to a `dyn`
-    /// target is first resolved by selecting the pending obligations: a projection's variable).
+    /// asked in a probe, then registered. When the target reaches a `dyn` object and the source
+    /// at that position is still an unresolved type variable, alias, or opaque type, unsizing is
+    /// registered directly rather than falling through to unification (which would prematurely
+    /// equate `?E = dyn Tr`).
     fn coerce_unsized(&mut self, a: Ty, b: Ty, cause: Cause) -> Result<Option<Unsizing>, Stop> {
         let (ma, mut pointee_a, mb, mut pointee_b, raw) = match (self.view(a), self.view(b)) {
             (TyView::Ref(ma, x), TyView::Ref(mb, y)) => (ma, x, mb, y, false),
@@ -235,9 +237,9 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
                 }
                 Some(Unsizing::Adjust)
             }
+            (_, TyView::Dynamic(_)) => self.unsize_to_dyn(pointee_a, pointee_b, cause)?,
             (TyView::Infer(crate::ty::Var { kind: crate::ty::VarKind::Ty, .. }), _)
             | (_, TyView::Infer(crate::ty::Var { kind: crate::ty::VarKind::Ty, .. })) => return Ok(None),
-            (_, TyView::Dynamic(_)) => self.unsize_to_dyn(pointee_a, pointee_b, cause)?,
             // A struct whose tail field unsizes (the Reference, "Type coercions", "Unsized
             // Coercions": "`Foo<.., T, ..>` to `Foo<.., U, ..>`, when `Foo` is a struct, `T`
             // implements `Unsize<U>`, the last field of `Foo` has a type involving `T` ..";
@@ -247,7 +249,8 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             // Asked only when the target's arguments reach a slice or `dyn`
             // (rules/coerce_nested.rs): `&S<?0>` to `&S<u8>` would register an ambiguous goal.
             (TyView::Adt(ka, _), TyView::Adt(kb, lb)) if ka == kb && self.target_reaches_unsized(lb) => {
-                self.unsize_pointee(pointee_a, pointee_b, true, cause)?
+                let skip_eq_probe = self.has_unresolved_to_dyn(pointee_a, pointee_b);
+                self.unsize_pointee(pointee_a, pointee_b, !skip_eq_probe, cause)?
             }
             _ => return Ok(None),
         };
@@ -263,12 +266,18 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
 
     /// The pointee `a` unsizes to the object `b` (`a: Unsize<b>`), as [`Self::unsize_pointee`].
     fn unsize_to_dyn(&mut self, a: Ty, b: Ty, cause: Cause) -> Result<Option<Unsizing>, Stop> {
-        // An opaque type is never the object type (a caller knows only its bounds: the
-        // Reference, "Abstract return types"), and must not be asked: unification with an alias
-        // is lazy (the pair is deferred and "succeeds"), which made `&mut impl Tr` to `&mut dyn
-        // Tr` a plain reborrow whose deferred `impl Tr == dyn Tr` then failed.
-        let opaque_source = matches!(self.view(a), TyView::Opaque(..));
-        self.unsize_pointee(a, b, !opaque_source, cause)
+        // An opaque type, an unnormalized alias, or an unresolved type variable must not
+        // short-circuit via `probe(unify)`: a type variable unifies with `dyn ..`
+        // unconditionally, and unification with an alias or opaque is lazy (deferred and
+        // "succeeds"), which would fall through to `coerce_borrowed` and prematurely equate
+        // `?E = dyn Tr` (or `impl Tr == dyn Tr` / `Alias == dyn Tr`) instead of unsizing.
+        let skip_eq_probe = matches!(
+            self.view(a),
+            TyView::Opaque(..)
+                | TyView::Alias { .. }
+                | TyView::Infer(crate::ty::Var { kind: crate::ty::VarKind::Ty, .. })
+        );
+        self.unsize_pointee(a, b, !skip_eq_probe, cause)
     }
 
     /// Equal pointees take the reborrow arms. Otherwise the solver decides the unsizing.
@@ -282,7 +291,8 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
     /// `coerce_unsized` for one ADT's two instances (`Box<T>` to `Box<dyn Tr>`, and nested:
     /// `Pin<Box<T>>` to `Pin<Box<dyn Tr>>`, a user `Wrap<Rc<T>>`): only when the target's
     /// arguments `lb` reach a `dyn` or a slice through ADT arguments and pointers
-    /// (rules/coerce_nested.rs) and the two do not unify as they are; then the one general
+    /// (rules/coerce_nested.rs) and the two do not unify as they are (unless an unresolved
+    /// variable, alias, or opaque in `a` faces a `dyn` in `b`); then the one general
     /// question `a: CoerceUnsized<b>`, asked, registered, and one `Unsize` adjustment. The
     /// nested pointer's own `CoerceUnsized` is the impl's where-clause, the solver's goal.
     fn coerce_unsized_adt(&mut self, mut a: Ty, b: Ty, lb: TyList, cause: Cause) -> Result<Option<Unsizing>, Stop> {
@@ -292,7 +302,7 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         if !self.ty.ty_flags(a).is_empty() {
             a = self.try_structurally_resolve(a)?;
         }
-        if self.probe(|m| m.unify_some(a, b))?.is_some() {
+        if !self.has_unresolved_to_dyn(a, b) && self.probe(|m| m.unify_some(a, b))?.is_some() {
             return Ok(None);
         }
         let unsizing = self.unsize_goal(LangItem::CoerceUnsized, a, b, cause)?;
@@ -300,6 +310,42 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             self.adj_scratch.push((AdjustKind::Unsize, b));
         }
         Ok(unsizing)
+    }
+
+    /// Whether `a` has an unresolved type variable, unnormalized alias, or opaque type at any
+    /// position where `b` has a trait object `dyn ..`, walking through matching ADTs, references,
+    /// and raw pointers (bounded by `MAX_PAIRS`, rule 18).
+    fn has_unresolved_to_dyn(&mut self, a: Ty, b: Ty) -> bool {
+        const MAX_PAIRS: u32 = 256;
+        let mut work = blaze_own::Vec::new_in(self.alloc);
+        work.push((a, b));
+        let mut seen = 0u32;
+        while let Some((x, y)) = work.pop() {
+            seen += 1;
+            if seen > MAX_PAIRS {
+                return false;
+            }
+            let (x, y) = (self.ty.shallow_resolve(x), self.ty.shallow_resolve(y));
+            match (self.view(x), self.view(y)) {
+                (
+                    TyView::Infer(crate::ty::Var { kind: crate::ty::VarKind::Ty, .. })
+                    | TyView::Opaque(..)
+                    | TyView::Alias { .. },
+                    TyView::Dynamic(_),
+                ) => return true,
+                (TyView::Adt(kx, lx), TyView::Adt(ky, ly)) if kx == ky => {
+                    let n = self.ty.list_len(lx).min(self.ty.list_len(ly));
+                    for i in (0..n).rev() {
+                        work.push((self.ty.list_get(lx, i), self.ty.list_get(ly, i)));
+                    }
+                }
+                (TyView::Ref(_, px) | TyView::Ptr(_, px), TyView::Ref(_, py) | TyView::Ptr(_, py)) => {
+                    work.push((px, py));
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// A failed object equality diagnoses the coercion at its source without installing an

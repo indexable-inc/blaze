@@ -1380,6 +1380,9 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     /// Unsizes reference/raw-pointer value `a` of ground type `from_ty` to `to_ty`:
     /// `&[T; N] -> &[T]`, `&T -> &dyn Tr`, `&dyn Sub -> &dyn Super`, and struct-tail unsizing.
     fn unsize(&mut self, a: V, from_ty: PTy, to_ty: PTy) -> Result<V, BuildError> {
+        if from_ty == to_ty {
+            return Ok(a);
+        }
         let pointee_of = |cx: &Self, ty: PTy| match cx.node(ty)? {
             PNode::Ref(_, t) | PNode::Ptr(_, t) => Ok(t),
             _ => Err(cx.unsupported("an unsizing of a value that is not a reference or raw pointer")),
