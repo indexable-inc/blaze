@@ -314,7 +314,9 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
 
     /// Whether `a` has an unresolved type variable, unnormalized alias, or opaque type at any
     /// position where `b` has a trait object `dyn ..`, walking through matching ADTs, references,
-    /// and raw pointers (bounded by `MAX_PAIRS`, rule 18).
+    /// and raw pointers (bounded by `MAX_PAIRS`, rule 18). Past the bound, returns `true`
+    /// conservatively (as `target_reaches_unsized` does) so the site asks the solver rather than
+    /// prematurely equating `?E = dyn Tr` via `probe(unify)`.
     fn has_unresolved_to_dyn(&mut self, a: Ty, b: Ty) -> bool {
         const MAX_PAIRS: u32 = 256;
         let mut work = blaze_own::Vec::new_in(self.alloc);
@@ -323,7 +325,7 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         while let Some((x, y)) = work.pop() {
             seen += 1;
             if seen > MAX_PAIRS {
-                return false;
+                return true;
             }
             let (x, y) = (self.ty.shallow_resolve(x), self.ty.shallow_resolve(y));
             match (self.view(x), self.view(y)) {

@@ -104,6 +104,20 @@ fn world() -> Fx {
     let p_cu_u = fx.bound(coerce, &[p0, p1]);
     fx.imp("impl CoerceUnsized<Pin<U>> for Pin<P>", 2, pin_p, Some((coerce, &[pin_u])), &[], std::vec![p_cu_u]);
 
+    // Wide<M, P> with a binary-tree marker `M` exceeding `has_unresolved_to_dyn`'s 256-pair walk cap
+    // before reaching the trailing `P = Box<?E> -> Box<dyn Display>` argument.
+    let pair_k = fx.strukt("Pair", 2, &[]);
+    let mut deep_marker = u32_;
+    for _ in 0..8 {
+        deep_marker = fx.adt(pair_k, &[deep_marker, deep_marker]);
+    }
+    let wide_k = fx.strukt("Wide", 2, &[]);
+    let (wide_mp, wide_mu) = (fx.adt(wide_k, &[p0, p1]), fx.adt(wide_k, &[p0, p2]));
+    let p1_cu_p2 = fx.bound(coerce, &[p1, p2]);
+    fx.imp("impl CoerceUnsized<Wide<M, U>> for Wide<M, P>", 3, wide_mp, Some((coerce, &[wide_mu])), &[], std::vec![p1_cu_p2]);
+    let wide_tree_box_p0 = fx.adt(wide_k, &[deep_marker, box_t]);
+    fx.func("wide_box", 1, &[p0], wide_tree_box_p0, Vec::new());
+
     let pin_box_t = fx.adt(pin_k, &[box_t]);
     fx.func("box_new", 1, &[p0], box_t, Vec::new());
     fx.func("box_pin", 1, &[p0], pin_box_t, Vec::new());
@@ -166,7 +180,9 @@ fn world() -> Fx {
     let r_dyn_my_trait = fx.r(Mutbl::Not, dyn_my_trait);
     let box_dyn_display = fx.adt(box_k, &[dyn_display]);
     let pin_box_dyn_display = fx.adt(pin_k, &[box_dyn_display]);
+    let wide_box_dyn_display = fx.adt(wide_k, &[deep_marker, box_dyn_display]);
     let box_dyn_my_trait = fx.adt(box_k, &[dyn_my_trait]);
+    let wide_box_dyn_my_trait = fx.adt(wide_k, &[deep_marker, box_dyn_my_trait]);
 
     fx.func("takes_dyn_display", 0, &[r_dyn_display], unit, Vec::new());
     fx.func("takes_mut_dyn_display", 0, &[m_dyn_display], unit, Vec::new());
@@ -175,7 +191,9 @@ fn world() -> Fx {
     fx.func("takes_dyn_my_trait", 0, &[r_dyn_my_trait], unit, Vec::new());
     fx.func("takes_box_dyn_display", 0, &[box_dyn_display], unit, Vec::new());
     fx.func("takes_pin_box_dyn_display", 0, &[pin_box_dyn_display], unit, Vec::new());
+    fx.func("takes_wide_box_dyn_display", 0, &[wide_box_dyn_display], unit, Vec::new());
     fx.func("takes_box_dyn_my_trait", 0, &[box_dyn_my_trait], unit, Vec::new());
+    fx.func("takes_wide_box_dyn_my_trait", 0, &[wide_box_dyn_my_trait], unit, Vec::new());
 
     let res_u32_unit = fx.adt(res_k, &[u32_, unit]);
     for name in [
@@ -187,8 +205,10 @@ fn world() -> Fx {
         "parse_mut_ptr_to_const_ptr_display",
         "parse_box_display",
         "parse_pin_box_display",
+        "parse_wide_box_display",
         "parse_ref_bad_trait",
         "parse_box_bad_trait",
+        "parse_wide_box_bad_trait",
     ] {
         fx.func(name, 0, &[r_str], res_u32_unit, Vec::new());
     }
@@ -389,5 +409,36 @@ fn control_missing_trait_impl_fails_with_e0277() {
         c.diags.iter().any(|d| d.code == DiagCode::Unsatisfied),
         "CONTROL: Box<ParseIntError> -> Box<dyn MyTrait> must fail with E0277, got {:?}",
         c.diags
+    );
+}
+
+/// Boundary test for `has_unresolved_to_dyn`'s `MAX_PAIRS` (256) walk cap:
+/// `Wide<DeepMarker, Box<?E>> -> Wide<DeepMarker, Box<dyn Display>>` has 511 matching pairs in
+/// its leading `DeepMarker` argument before reaching `(?E, dyn Display)`. Exhausting the walk cap
+/// must return `true` conservatively so `coerce_unsized_adt` still defers `CoerceUnsized` instead
+/// of falling through to `probe(unify)` and prematurely equating `?E = dyn Display`.
+#[test]
+fn walk_cap_exhaustion_is_conservative_for_unresolved_to_dyn() {
+    let fx = world();
+
+    let (c, arg) = check_parse_map_err(&fx, "parse_wide_box_display", "takes_wide_box_dyn_display", |b, e| {
+        let e_use = b.local(e);
+        let wb = b.path(&["wide_box"]);
+        b.call(wb, &[e_use])
+    });
+    assert!(c.diags.is_empty(), "Wide<Tree, Box<?E>> -> Wide<Tree, Box<dyn Display>>: {:?}", c.diags);
+    let got = adjusts(&fx, &c, arg);
+    assert!(got.starts_with("unsize -> Wide<"), "expected unsize adjustment, got `{got}`");
+
+    // Control: missing trait impl still fails with E0277 past the walk cap.
+    let (c_bad, _) = check_parse_map_err(&fx, "parse_wide_box_bad_trait", "takes_wide_box_dyn_my_trait", |b, e| {
+        let e_use = b.local(e);
+        let wb = b.path(&["wide_box"]);
+        b.call(wb, &[e_use])
+    });
+    assert!(
+        c_bad.diags.iter().any(|d| d.code == DiagCode::Unsatisfied),
+        "CONTROL: Wide<Tree, Box<ParseIntError>> -> Wide<Tree, Box<dyn MyTrait>> must fail with E0277, got {:?}",
+        c_bad.diags
     );
 }
