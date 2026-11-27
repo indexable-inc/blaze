@@ -26,7 +26,7 @@ blaze-cas	85	1	4	392
 blaze-cbor	0	0	1	0
 blaze-cc	0	0	4	3
 blaze-check	72	1	0	107
-blaze-cli	727	1	0	495
+blaze-cli	720	1	0	488
 blaze-columns	29	0	1	23
 blaze-comptime/rungs/derive-hello	0	1	0	0
 blaze-cond	1	0	0	11
