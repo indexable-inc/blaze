@@ -904,6 +904,11 @@ macro_rules! define {
             pub fn view(&self) -> View<'_> {
                 View { head: self.head, $( $name: &self.$name, )* }
             }
+
+            /// The allocator holding this function's columns.
+            pub fn allocator(&self) -> &A {
+                self.ops.allocator()
+            }
         }
 
         impl View<'_> {

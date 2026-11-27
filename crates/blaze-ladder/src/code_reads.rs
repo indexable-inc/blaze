@@ -247,13 +247,21 @@ struct Asked {
     kind: ReadKind,
     item: ItemKey,
     extra: u64,
-    args: Vec<PTy, Global>,
+    args_start: u32,
+    args_len: u32,
     answer: ContentId,
+}
+
+/// Flat reusable backing buffers for [`ReadLog`]: cleared without freeing capacity between
+/// functions so steady-state logging makes zero `Global` heap allocations.
+struct LogBuf {
+    asked: Vec<Asked, Global>,
+    args: Vec<PTy, Global>,
 }
 
 /// The questions one build asked ([`Recorded`]), in the order asked.
 pub struct ReadLog {
-    asked: RefCell<Vec<Asked, Global>>,
+    buf: RefCell<LogBuf>,
     /// The first question whose answer could not be digested: the build's read list is then
     /// refused ([`ReadLog::seal`]), never made short.
     stopped: Cell<Option<ReadsError>>,
@@ -262,18 +270,24 @@ pub struct ReadLog {
 
 impl ReadLog {
     pub fn new(plant: ReadPlant) -> ReadLog {
-        ReadLog { asked: RefCell::new(Vec::new_in(Global)), stopped: Cell::new(None), plant }
+        ReadLog {
+            buf: RefCell::new(LogBuf { asked: Vec::new_in(Global), args: Vec::new_in(Global) }),
+            stopped: Cell::new(None),
+            plant,
+        }
     }
 
     /// Forgets every question: the log is the next build's.
     pub fn clear(&self) {
-        self.asked.borrow_mut().clear();
+        let mut buf = self.buf.borrow_mut();
+        buf.asked.clear();
+        buf.args.clear();
         self.stopped.set(None);
     }
 
     /// The count of questions logged.
     pub fn len(&self) -> usize {
-        self.asked.borrow().len()
+        self.buf.borrow().asked.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -296,14 +310,17 @@ impl ReadLog {
             Err(Stop::Malformed) => return self.stop(ReadsError::Malformed { kind, item }),
             Err(Stop::Unmade(unmade)) => return self.stop(ReadsError::Unmade { kind, item, unmade }),
         };
-        let mut asked = self.asked.borrow_mut();
-        if asked.len() >= READS_CAP {
-            drop(asked);
+        let mut buf = self.buf.borrow_mut();
+        if buf.asked.len() >= READS_CAP {
+            drop(buf);
             return self.stop(ReadsError::TooMany);
         }
-        let mut kept = Vec::with_capacity_in(args.len(), Global);
-        kept.extend_from_slice(args);
-        asked.push(Asked { kind, item, extra, args: kept, answer });
+        let (Ok(args_start), Ok(args_len)) = (u32::try_from(buf.args.len()), u32::try_from(args.len())) else {
+            drop(buf);
+            return self.stop(ReadsError::TooMany);
+        };
+        buf.args.extend_from_slice(args);
+        buf.asked.push(Asked { kind, item, extra, args_start, args_len, answer });
     }
 
     /// The instance call `called` runs, as the front end's `resolve` answered it (`None`: it
@@ -355,8 +372,11 @@ impl ReadLog {
         if let Some(error) = other.stopped.get() {
             self.stop(error);
         }
-        for a in other.asked.borrow().iter() {
-            self.ask(a.kind, a.item, a.extra, &a.args, Ok(a.answer));
+        let other_buf = other.buf.borrow();
+        for a in other_buf.asked.iter() {
+            let start = a.args_start as usize;
+            let end = start + a.args_len as usize;
+            self.ask(a.kind, a.item, a.extra, &other_buf.args[start..end], Ok(a.answer));
         }
     }
 
@@ -365,8 +385,8 @@ impl ReadLog {
         if let Some(error) = self.stopped.get() {
             return Err(error);
         }
-        let asked = self.asked.borrow();
-        match asked.as_slice() {
+        let buf = self.buf.borrow();
+        match buf.asked.as_slice() {
             [one] => Ok(one.answer),
             _ => Err(ReadsError::TwoAnswers { kind, item }),
         }
@@ -375,48 +395,59 @@ impl ReadLog {
     /// The build's read list: each question named for good (its arguments interned in
     /// `ground` and named by `encode_instance`), sorted by its bytes, each once. A question
     /// asked twice with two answers is refused, as is a log that stopped.
-    pub fn seal(&self, ground: &mut PortableTys<'_>, scratch: Alloc<'_>) -> Result<ReadList, ReadsError> {
+    pub fn seal<'a>(&self, ground: &mut PortableTys<'_>, scratch: Alloc<'a>) -> Result<ReadList<'a>, ReadsError> {
         if let Some(error) = self.stopped.get() {
             return Err(error);
         }
-        let asked = self.asked.borrow();
-        let mut rows: Vec<(Vec<u8, Global>, ContentId, ReadKind, ItemKey), Global> = Vec::with_capacity_in(asked.len(), Global);
-        for a in asked.iter() {
-            let list = ground.intern_list(&a.args).map_err(|_| ReadsError::Full { kind: a.kind, item: a.item })?;
-            let mut name: AVec<'_, u8> = blaze_own::Vec::new_in(scratch);
+        let buf = self.buf.borrow();
+        let mut bytes: AVec<'a, u8> = blaze_own::Vec::new_in(scratch);
+        let mut rows: AVec<'a, (u32, u32, ContentId, ReadKind, ItemKey)> = blaze_own::Vec::with_capacity_in(buf.asked.len(), scratch);
+        let mut name: AVec<'a, u8> = blaze_own::Vec::new_in(scratch);
+        for a in buf.asked.iter() {
+            let start = a.args_start as usize;
+            let end = start + a.args_len as usize;
+            let list = ground.intern_list(&buf.args[start..end]).map_err(|_| ReadsError::Full { kind: a.kind, item: a.item })?;
+            name.clear();
             encode_instance(a.item, list, ground.view(), scratch, &mut name).map_err(|why| ReadsError::Symbol { kind: a.kind, item: a.item, why })?;
-            let mut question = Vec::with_capacity_in(9 + name.len(), Global);
-            question.push(a.kind as u8);
-            question.extend_from_slice(&a.extra.to_le_bytes());
-            question.extend_from_slice(&name);
-            rows.push((question, a.answer, a.kind, a.item));
+            let q_start = u32::try_from(bytes.len()).map_err(|_| ReadsError::TooMany)?;
+            bytes.push(a.kind as u8);
+            bytes.extend_from_slice(&a.extra.to_le_bytes());
+            bytes.extend_from_slice(&name);
+            let q_len = u32::try_from(bytes.len() - q_start as usize).map_err(|_| ReadsError::TooMany)?;
+            rows.push((q_start, q_len, a.answer, a.kind, a.item));
         }
-        rows.sort_unstable_by(|x, y| x.0.cmp(&y.0));
-        let mut out: Vec<(Vec<u8, Global>, ContentId), Global> = Vec::with_capacity_in(rows.len(), Global);
-        for (question, answer, kind, item) in rows {
+        rows.sort_unstable_by(|x, y| {
+            let bx = &bytes[x.0 as usize..x.0 as usize + x.1 as usize];
+            let by = &bytes[y.0 as usize..y.0 as usize + y.1 as usize];
+            bx.cmp(by)
+        });
+        let mut out: AVec<'a, (u32, u32, ContentId)> = blaze_own::Vec::with_capacity_in(rows.len(), scratch);
+        for &(q_start, q_len, answer, kind, item) in rows.iter() {
+            let q = &bytes[q_start as usize..q_start as usize + q_len as usize];
             match out.last() {
-                Some((last, was)) if *last == question => {
-                    if *was != answer {
+                Some(&(ls, ll, was)) if &bytes[ls as usize..ls as usize + ll as usize] == q => {
+                    if was != answer {
                         return Err(ReadsError::TwoAnswers { kind, item });
                     }
                 }
-                _ => out.push((question, answer)),
+                _ => out.push((q_start, q_len, answer)),
             }
         }
-        Ok(ReadList { rows: out })
+        Ok(ReadList { bytes, rows: out })
     }
 }
 
 /// A sealed read list: rows of (question, answer digest), sorted by question, each once.
-pub struct ReadList {
-    rows: Vec<(Vec<u8, Global>, ContentId), Global>,
+pub struct ReadList<'a> {
+    bytes: AVec<'a, u8>,
+    rows: AVec<'a, (u32, u32, ContentId)>,
 }
 
-impl ReadList {
+impl<'a> ReadList<'a> {
     /// No row: an entry made from no text (the thread-local getter and ender, a builtins
     /// shim) reads nothing beyond its key.
-    pub fn empty() -> ReadList {
-        ReadList { rows: Vec::new_in(Global) }
+    pub fn empty(alloc: Alloc<'a>) -> ReadList<'a> {
+        ReadList { bytes: blaze_own::Vec::new_in(alloc), rows: blaze_own::Vec::new_in(alloc) }
     }
 
     pub fn len(&self) -> usize {
@@ -429,7 +460,7 @@ impl ReadList {
 
     /// Each row, in order.
     pub fn rows(&self) -> impl Iterator<Item = (&[u8], ContentId)> {
-        self.rows.iter().map(|(question, answer)| (&question[..], *answer))
+        self.rows.iter().map(|&(start, len, answer)| (&self.bytes[start as usize..start as usize + len as usize], answer))
     }
 }
 

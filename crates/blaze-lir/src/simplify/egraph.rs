@@ -5645,7 +5645,7 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
         return Ok((view.to_func_in(alloc), 0));
     }
     apply_val_fixups(&mut func, &val_map, &fixups)?;
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok((func, rewrites))
 }
 
@@ -5968,7 +5968,7 @@ pub fn hoist_loop_invariants<A: Allocator + Copy>(
     }
 
     apply_val_fixups(&mut func, &val_map, &fixups)?;
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok((func, total_hoisted))
 }
 

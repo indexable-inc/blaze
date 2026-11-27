@@ -1479,7 +1479,7 @@ pub fn superopt_a64<A: Allocator + Copy>(
     if !any_rewritten {
         return Ok(SuperoptOutput { func: view.to_func_in(alloc), stats });
     }
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     let cleaned = dead(func.view(), alloc)?;
     Ok(SuperoptOutput { func: cleaned, stats })
 }

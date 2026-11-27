@@ -2154,7 +2154,7 @@ fn apply_lut_plan<A: Allocator + Copy>(
     }
 
     apply_val_fixups(&mut func, &val_map, &fixups);
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(func)
 }
 
@@ -2678,7 +2678,7 @@ fn apply_dotprod_plan<A: Allocator + Copy>(
     }
 
     apply_val_fixups(&mut func, &val_map, &fixups);
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(func)
 }
 
@@ -3137,7 +3137,7 @@ pub fn lower_sorting_networks<A: Allocator + Copy>(
     }
 
     apply_val_fixups(&mut func, &val_map, &fixups);
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     let cleaned = dead(func.view(), alloc)?;
 
     Ok(SimdIdiomOutput {
@@ -4441,7 +4441,7 @@ fn apply_crc32_plan<A: Allocator + Copy>(
         set_at(&mut val_map, to_idx(plan.crc_next), promoted_crc);
     }
     apply_val_fixups(&mut func, &val_map, &fixups);
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(func)
 }
 

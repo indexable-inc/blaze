@@ -224,7 +224,7 @@ pub fn propagate_planted<A: Allocator + Copy>(view: View<'_>, plant: Plant, allo
     }
 
     if !any_stands && !any_folded && !any_devirt && !any_jump {
-        verify(view).map_err(SimplifyError::Verify)?;
+        crate::verify::verify_in(view, alloc).map_err(SimplifyError::Verify)?;
         return Ok(view.to_func_in(alloc));
     }
 

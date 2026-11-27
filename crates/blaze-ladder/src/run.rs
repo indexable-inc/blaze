@@ -442,7 +442,7 @@ struct Bodies<'a> {
     panic: blaze_build::Panic,
     /// The build's allocator, handed down from its caller: the scratch of [`FrontAdts`]'s
     /// answers (an opaque type's hidden type, a promoted fn's key).
-    alloc: Alloc<'static>,
+    alloc: Alloc<'a>,
 }
 
 /// One built coroutine instance, its three functions kept until each one's slot is reached

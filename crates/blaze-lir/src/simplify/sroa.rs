@@ -70,7 +70,7 @@ pub fn scalar_replace_planted<A: Allocator + Copy>(
 ) -> Result<Func<A>, SimplifyError> {
     if view.slots.is_empty() {
         if cfg!(debug_assertions) {
-            verify(view).map_err(SimplifyError::Verify)?;
+            crate::verify::verify_in(view, alloc).map_err(SimplifyError::Verify)?;
         }
         return Ok(view.to_func_in(alloc));
     }
@@ -83,7 +83,7 @@ pub fn scalar_replace_planted<A: Allocator + Copy>(
     let mut found = find(&work_view, &cfg, &alloc)?;
     if found.kept.iter().all(|&k| k) {
         if cfg!(debug_assertions) {
-            verify(work_view).map_err(SimplifyError::Verify)?;
+            crate::verify::verify_in(work_view, alloc).map_err(SimplifyError::Verify)?;
         }
         return Ok(match promoted {
             Some(func) => func,
@@ -93,7 +93,7 @@ pub fn scalar_replace_planted<A: Allocator + Copy>(
     let phis = place(&work_view, &cfg, &mut found, &alloc);
     if found.kept.iter().all(|&k| k) {
         if cfg!(debug_assertions) {
-            verify(work_view).map_err(SimplifyError::Verify)?;
+            crate::verify::verify_in(work_view, alloc).map_err(SimplifyError::Verify)?;
         }
         return Ok(match promoted {
             Some(func) => func,
@@ -1356,7 +1356,7 @@ fn promote_slot_addr_phis_round<A: Allocator + Copy>(
     if u32::try_from(func.ops.len()).is_err() || u32::try_from(func.extra.len()).is_err() {
         return Err(SimplifyError::Refused { inst: 0, what: "an output past LIR's columns" });
     }
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(Some(func))
 }
 
@@ -2776,7 +2776,7 @@ fn emit<A: Allocator + Copy>(
     }
     // As the builder does: the output is checked in debug builds.
     if cfg!(debug_assertions) {
-        verify(func.view()).map_err(SimplifyError::Verify)?;
+        crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     }
     Ok(func)
 }

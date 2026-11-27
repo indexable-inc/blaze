@@ -21,7 +21,8 @@
 //! head, and so the dominance rule above, unchanged, is what refuses in its output any value
 //! that would cross a poll outside the state.
 
-use alloc::{vec, vec::Vec};
+use alloc::alloc::Allocator;
+use blaze_own::Vec;
 use core::fmt;
 
 use crate::{
@@ -135,9 +136,10 @@ pub struct VerifiedFunc<A: core::alloc::Allocator> {
 }
 
 impl<A: core::alloc::Allocator> VerifiedFunc<A> {
-    /// `func` verified all the way ([`verify`]), or the rule it breaks.
+    /// `func` verified all the way ([`verify_in`], using `func`'s own allocator), or the rule it
+    /// breaks.
     pub fn new(func: crate::Func<A>) -> core::result::Result<VerifiedFunc<A>, VerifyError> {
-        verify(func.view())?;
+        verify_in(func.view(), func.allocator())?;
         Ok(VerifiedFunc { func })
     }
 
@@ -162,12 +164,18 @@ impl<A: core::alloc::Allocator> VerifiedFunc<A> {
     }
 }
 
+/// Checks `view` all the way: [`structure`], then what it means, using `alloc` for scratch.
+/// The answer is the proof ([`Verified`]) every emitter takes.
+pub fn verify_in<A: Allocator>(view: View<'_>, alloc: A) -> core::result::Result<Verified<'_>, VerifyError> {
+    structure(view)?;
+    semantics(&view, &alloc)?;
+    Ok(Verified { view })
+}
+
 /// Checks `view` all the way: [`structure`], then what it means. The answer is the proof
 /// ([`Verified`]) every emitter takes.
 pub fn verify(view: View<'_>) -> core::result::Result<Verified<'_>, VerifyError> {
-    structure(view)?;
-    semantics(&view)?;
-    Ok(Verified { view })
+    verify_in(view, alloc::alloc::Global)
 }
 
 /// Checks what every reader of `view` relies on: lengths, tags, ranges and indices.
@@ -700,9 +708,9 @@ pub fn sole_switch_default(view: &View<'_>, block: Block) -> Option<Value> {
 }
 
 /// The block of each instruction, by layout.
-fn block_of(view: &View<'_>) -> Vec<u32> {
-    // alloc: the verifier's scratch, one word per instruction, for one function
-    let mut of = vec![0u32; view.len()];
+fn block_of<'a, A: Allocator>(view: &View<'_>, alloc: &'a A) -> Vec<u32, &'a A> {
+    let mut of = Vec::with_capacity_in(view.len(), alloc);
+    of.resize(view.len(), 0u32);
     for b in 0..view.blocks() {
         for at in view.block(Block(b as u32)) {
             of[at] = b as u32;
@@ -712,41 +720,77 @@ fn block_of(view: &View<'_>) -> Vec<u32> {
 }
 
 /// What [`semantics`] works from: each block's successors and predecessors, and dominators.
-struct Cfg {
+struct Cfg<'a, A: Allocator> {
     /// Per block, its immediate dominator; [`NONE`] for an unreachable block, itself for the
     /// entry.
-    idom: Vec<u32>,
+    idom: Vec<u32, &'a A>,
     /// Per block, how many edges lead to it.
-    preds: Vec<u32>,
+    preds: Vec<u32, &'a A>,
 }
 
-impl Cfg {
-    fn of(view: &View<'_>) -> Cfg {
+impl<'a, A: Allocator> Cfg<'a, A> {
+    fn of(view: &View<'_>, alloc: &'a A) -> Cfg<'a, A> {
         let blocks = view.blocks();
-        // alloc: the verifier's scratch, a few words per block, for one function
-        let mut succs: Vec<Vec<u32>> = vec![Vec::new(); blocks];
-        // alloc: as above
-        let mut preds_of: Vec<Vec<u32>> = vec![Vec::new(); blocks];
-        // alloc: as above
-        let mut preds = vec![0u32; blocks];
+        let mut succ_counts = Vec::with_capacity_in(blocks, alloc);
+        succ_counts.resize(blocks, 0u32);
+        let mut preds = Vec::with_capacity_in(blocks, alloc);
+        preds.resize(blocks, 0u32);
+        let mut total_edges = 0usize;
         for b in 0..blocks {
             edges(view, view.terminator(Block(b as u32)), |edge| {
-                succs[b].push(edge.to.0);
-                preds_of[edge.to.index()].push(b as u32);
+                succ_counts[b] += 1;
                 preds[edge.to.index()] += 1;
+                total_edges += 1;
             });
         }
+        // Flat CSR arrays: zero per-block heap allocations.
+        let mut succ_off = Vec::with_capacity_in(blocks + 1, alloc);
+        let mut pred_off = Vec::with_capacity_in(blocks + 1, alloc);
+        let mut s_acc = 0u32;
+        let mut p_acc = 0u32;
+        for b in 0..blocks {
+            succ_off.push(s_acc);
+            pred_off.push(p_acc);
+            s_acc += succ_counts[b];
+            p_acc += preds[b];
+        }
+        succ_off.push(s_acc);
+        pred_off.push(p_acc);
+
+        let mut succ_cur = Vec::with_capacity_in(blocks, alloc);
+        succ_cur.extend_from_slice(&succ_off[..blocks]);
+        let mut pred_cur = Vec::with_capacity_in(blocks, alloc);
+        pred_cur.extend_from_slice(&pred_off[..blocks]);
+
+        let mut succ_edges = Vec::with_capacity_in(total_edges, alloc);
+        succ_edges.resize(total_edges, 0u32);
+        let mut pred_edges = Vec::with_capacity_in(total_edges, alloc);
+        pred_edges.resize(total_edges, 0u32);
+        for b in 0..blocks {
+            edges(view, view.terminator(Block(b as u32)), |edge| {
+                let si = succ_cur[b] as usize;
+                succ_cur[b] += 1;
+                succ_edges[si] = edge.to.0;
+
+                let to = edge.to.index();
+                let pi = pred_cur[to] as usize;
+                pred_cur[to] += 1;
+                pred_edges[pi] = b as u32;
+            });
+        }
+
         // Reverse postorder from the entry, by an explicit stack.
-        // alloc: as above
-        let mut post = Vec::with_capacity(blocks);
-        // alloc: as above
-        let mut seen = vec![false; blocks];
-        // alloc: as above
-        let mut stack = vec![(0u32, 0usize)];
+        let mut post = Vec::with_capacity_in(blocks, alloc);
+        let mut seen = Vec::with_capacity_in(blocks, alloc);
+        seen.resize(blocks, false);
+        let mut stack = Vec::with_capacity_in(blocks.max(1), alloc);
+        stack.push((0u32, 0usize));
         seen[0] = true;
         while let Some(top) = stack.last_mut() {
             let (b, next) = *top;
-            if let Some(&s) = succs[b as usize].get(next) {
+            let start = succ_off[b as usize] as usize;
+            let end = succ_off[b as usize + 1] as usize;
+            if let Some(&s) = succ_edges[start..end].get(next) {
                 top.1 += 1;
                 if !seen[s as usize] {
                     seen[s as usize] = true;
@@ -757,22 +801,25 @@ impl Cfg {
                 stack.pop();
             }
         }
-        // alloc: as above
-        let mut order = vec![NONE; blocks];
+        let mut order = Vec::with_capacity_in(blocks, alloc);
+        order.resize(blocks, NONE);
         for (i, &b) in post.iter().rev().enumerate() {
             order[b as usize] = i as u32;
         }
         // Cooper, Harvey and Kennedy's iteration, bounded: it settles in at most as many
         // rounds as the graph is deep, so twice the blocks is a bound it never reaches.
-        // alloc: as above
-        let mut idom = vec![NONE; blocks];
+        let mut idom = Vec::with_capacity_in(blocks, alloc);
+        idom.resize(blocks, NONE);
         idom[0] = 0;
-        let rpo: Vec<u32> = post.iter().rev().copied().collect(); // alloc: as above
+        let mut rpo = Vec::with_capacity_in(post.len(), alloc);
+        rpo.extend(post.iter().rev().copied());
         for _ in 0..2 * blocks + 2 {
             let mut changed = false;
             for &b in rpo.iter().skip(1) {
                 let mut new = NONE;
-                for &p in &preds_of[b as usize] {
+                let p_start = pred_off[b as usize] as usize;
+                let p_end = pred_off[b as usize + 1] as usize;
+                for &p in &pred_edges[p_start..p_end] {
                     if idom[p as usize] == NONE {
                         continue;
                     }
@@ -830,7 +877,7 @@ fn intersect(idom: &[u32], order: &[u32], mut a: u32, mut b: u32) -> u32 {
 }
 
 /// Checks what `view`, whose [`structure`] holds, means.
-fn semantics(view: &View<'_>) -> Result {
+fn semantics<A: Allocator>(view: &View<'_>, alloc: &A) -> Result {
     let ptr_int = Ty::int(view.head.ptr_bits).unwrap_or(Ty::I64);
     let own = view.sig(SigId(view.head.sig));
     // Blocks: parameters at the head, one terminator at the end; landing blocks' one
@@ -864,8 +911,8 @@ fn semantics(view: &View<'_>) -> Result {
             }
         }
     }
-    let cfg = Cfg::of(view);
-    let of = block_of(view);
+    let cfg = Cfg::of(view, alloc);
+    let of = block_of(view, alloc);
     // Edges.
     for b in 0..view.blocks() {
         let at = view.terminator(Block(b as u32));
@@ -926,7 +973,7 @@ fn semantics(view: &View<'_>) -> Result {
             Res::Some if ty.is_none() => return Err(inst(view, at, "no result type on an operation that makes one")),
             Res::None | Res::Some | Res::Any => {}
         }
-        types(view, at, op, ty, ptr_int, &own).map_err(|rule| inst(view, at, rule))?;
+        types(view, at, op, ty, ptr_int, &own, alloc).map_err(|rule| inst(view, at, rule))?;
         // Every value used is defined where it dominates the use.
         if !cfg.reachable(of[at]) {
             continue;
@@ -962,7 +1009,7 @@ fn semantics(view: &View<'_>) -> Result {
 
 /// Why the use of `value` at instruction `at` is not dominated by its definition, if it is
 /// not.
-fn dominance(view: &View<'_>, cfg: &Cfg, of: &[u32], value: usize, at: usize) -> Option<&'static str> {
+fn dominance<A: Allocator>(view: &View<'_>, cfg: &Cfg<'_, A>, of: &[u32], value: usize, at: usize) -> Option<&'static str> {
     if view.ty(Value(value as u32)).is_none() {
         return Some("a use of an instruction that makes no value");
     }
@@ -1003,13 +1050,14 @@ fn is_float_ty(ty: Ty) -> bool {
 }
 
 /// Checks the types of instruction `at`'s operands and result.
-fn types(
+fn types<A: Allocator>(
     view: &View<'_>,
     at: usize,
     op: Op,
     ty: Ty,
     ptr_int: Ty,
     own: &crate::func::Sig<'_>,
+    alloc: &A,
 ) -> core::result::Result<(), &'static str> {
     let mut o = view.operands(at);
     let t = |v: Value| view.ty(v);
@@ -1312,7 +1360,7 @@ fn types(
             need(s.is_scalar() && s.is_int(), "a switch on a value that is not a scalar integer")?;
             o.target();
             let bits = s.bits(ptr_bits);
-            let mut seen: Vec<u128> = Vec::new(); // alloc: the verifier's scratch, one switch's cases
+            let mut seen: Vec<u128, &A> = Vec::new_in(alloc);
             for (words, _) in o.cases(scrutinee) {
                 let value = words.iter().rev().fold(0u128, |all, &w| (all << 32) | w as u128);
                 need(bits >= 128 || value >> bits == 0, "a case value with bits past its scrutinee's width")?;

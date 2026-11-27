@@ -27,10 +27,11 @@ use blaze_code::record::{CodeRecord, CodeView, NO_TARGET, PositionPart, Site, Si
 use blaze_export::{Data, DataPlace, DataWord, Entry, ExportError, Exported, Function, Panic, Platform, Profile, ProgramIn, Tier, TlsRuntime};
 use blaze_ladder::body_ids::{self, RowKind, Scratch, Stepped, Walk};
 use blaze_ladder::code_records::{CodeKey, entry_of, statics};
-use blaze_ladder::run::make_one::{ByKind, MOST_WALKED, Maker};
+use blaze_ladder::front2::program::lazy::{SharedLazyFront, SharedLazyFrontHandle, SharedLazyFrontStats};
+use blaze_ladder::run::make_one::{MOST_WALKED, Maker, RecordsProgram, Typing, TypingCounts};
 use blaze_ladder::run::special::{EntryForm, Roots, Special, make_special, run_roots};
 use blaze_ladder::run::RunError;
-use blaze_own::{AString, AVec, Alloc, Box, Bump, Erased, SharedAlloc, String, Vec};
+use blaze_own::{AString, AVec, Alloc, Box, Bump, Erased, SharedAlloc, String, Vec, VecDeque};
 use blaze_typeck::ItemKey;
 use bstd::Cx;
 use bstd::entry::Status;
@@ -53,25 +54,41 @@ use crate::{CliError, program, run_names, run_package};
 const EXPORT_FRAME_RESERVE: usize = 4 << 30;
 
 /// Maximum concurrent codegen workers during `blaze build` whole-program reachability closure.
-/// 12 workers saturate Apple Silicon P-cores while keeping per-worker `Names`/`Maker` RSS bounded.
-const MAX_EXPORT_WORKERS: usize = 12;
+/// Workers share one sharded [`SharedLazyFront`] (frozen heads, evaluated constants/statics,
+/// crate member indexes, and checked dep/toolchain `Typed` records) while keeping only a small
+/// bounded per-worker epoch frame (~16–64 MiB/worker), so concurrency scales linearly to all
+/// host cores (18 on Mac, 128 on server; bounded per Rule 18).
+const MAX_EXPORT_WORKERS: usize = 256;
 
 /// Cold misses handled serially before spinning up parallel codegen workers so warm no-op builds
 /// and single-function edits pay zero worker/frame startup overhead.
 const EXPORT_PAR_MIN_MISSES: usize = 4;
 
-/// Per-worker frame reset/trim budgets during parallel export codegen. After the first make sets
-/// the baseline (crate `Names` + `Maker` init), each worker gets at least `HEADROOM` bytes before
-/// resetting so large workspaces (200+ crates) never thrash `Maker::construct`.
-const EXPORT_WORKER_FRAME_HEADROOM: usize = 3 << 30;
-const EXPORT_WORKER_FRAME_HARD_RESET_AT: usize = 6 << 30;
-const EXPORT_WORKER_FRAME_KEEP: usize = 16 << 20;
+/// Per-worker frame and heap-epoch reset budgets during parallel export codegen. Because
+/// [`SharedLazyFront`] retains all frozen heads, constants, member indexes, and dep/toolchain
+/// typed bodies across worker epoch resets, each worker's local `Frame` + `Maker` resets cleanly
+/// at a small budget (~16–64 MiB/worker instead of 3.5 GiB/worker) without thrashing.
+const EXPORT_WORKER_FRAME_HEADROOM: usize = 64 << 20;
+const EXPORT_WORKER_FRAME_HARD_RESET_AT: usize = 128 << 20;
+const EXPORT_WORKER_FRAME_KEEP: usize = 8 << 20;
+/// Soft/hard caps on distinct live lowered `tabled` bodies and `Store::tys` nodes retained in one
+/// worker epoch (sibling monomorphizations of the same `tabled` fn count as 1 live body and stay
+/// warm across the soft cap).
+const EXPORT_WORKER_MAX_LIVE_BODIES: usize = 128;
+const EXPORT_WORKER_HARD_LIVE_BODIES: usize = 256;
+const EXPORT_WORKER_MAX_STORE_TYS: usize = 131_072;
+const EXPORT_WORKER_HARD_STORE_TYS: usize = 262_144;
 const EXPORT_WORKER_SCRATCH: usize = 1 << 20;
-const EXPORT_PER_WORKER_IN_FLIGHT: usize = 6;
-const EXPORT_MAX_QUEUED_PER_WORKER: usize = 4096;
+/// Per-worker in-flight inbox depth and work-stealing low-water mark: keeping 2–4 jobs in each
+/// worker's private inbox eliminates coordinator round-trip waits while keeping the bulk of queued
+/// jobs inside the coordinator's stealable `worker_queues` (so at most `EXPORT_PER_WORKER_IN_FLIGHT
+/// - 1` = 3 jobs can ever sit behind a giant function like `visit_seq`).
+const EXPORT_PER_WORKER_IN_FLIGHT: usize = 4;
+const EXPORT_STEAL_LOW_WATER: usize = 2;
+const EXPORT_MAX_QUEUED_PER_WORKER: usize = 8192;
 const EXPORT_HAND_WAIT: core::time::Duration = core::time::Duration::from_secs(30);
 const EXPORT_PROCS_WAIT: core::time::Duration = core::time::Duration::from_secs(60);
-const EXPORT_RECV_SLICE: core::time::Duration = core::time::Duration::from_millis(10);
+const EXPORT_RECV_SLICE: core::time::Duration = core::time::Duration::from_millis(2);
 const EXPORT_END_WAIT: core::time::Duration = core::time::Duration::from_secs(300);
 
 /// Program root shape domain for `blaze build` (`start_list::ListName::of` -> `RootName::program`),
@@ -159,15 +176,21 @@ fn persist_worker_typed_batch<'a, D: blaze_core::Driver>(
     Ok(())
 }
 
-/// Surfaces any main-thread typed-record persistence error, flushes `codes`, merges persisted
-/// dependency/toolchain typed-body keys into `walked` / `toolchain_made`, and roots them before
-/// the command's closing store commit.
-#[expect(clippy::too_many_arguments, reason = "closing export root persistence joins code store and dep/toolchain typed keys")]
-fn finish_export_roots<D: blaze_core::Driver>(
+/// Surfaces any main-thread typed-record persistence error, restores any concurrently swept
+/// entries in `codes`, roots all reached `CodeRecord`s and persisted dep/toolchain `Typed` keys
+/// (`keep_program` / `keep_toolchain`), and commits `lent` immediately if any puts or roots are
+/// uncommitted.
+///
+/// Called **immediately after the reachability walk finishes** (before LTO, `wasm64`, and
+/// `blaze_export::export()`) and again before `blaze_export::export()` if LTO/TLS emitted extra
+/// entries, so a linker/LTO/output failure never discards compiled `CodeRecord`s or `Typed`
+/// batches, and unlent store arena chunks are freed before linking.
+#[expect(clippy::too_many_arguments, reason = "export root checkpoint joins code store and dep/toolchain typed keys")]
+fn checkpoint_export_roots<D: blaze_core::Driver>(
     lent: &blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
     today: &crate::start_list::Today,
     toolchain: blaze_toolchain::ToolchainId,
-    mut codes: HomeCodeStore<'_, D>,
+    codes: &mut HomeCodeStore<'_, D>,
     typed: &crate::engine_body_record::StoreTyped<'_>,
     dep_typed_program: &[blaze_cas::Key],
     dep_typed_toolchain: &[blaze_cas::Key],
@@ -191,7 +214,6 @@ fn finish_export_roots<D: blaze_core::Driver>(
     })?;
     let mut walked = codes.reached();
     let mut toolchain_made = codes.toolchain_made();
-    drop(codes);
     walked.extend_from_slice(typed.kept_program());
     walked.extend_from_slice(dep_typed_program);
     toolchain_made.extend_from_slice(typed.kept_toolchain());
@@ -209,6 +231,14 @@ fn finish_export_roots<D: blaze_core::Driver>(
             heap,
         )
     })?;
+    if lent.needs_commit() {
+        lent.commit().map_err(|why| {
+            box_err(
+                ExportCliError::KeepRoots { class: "store commit", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -707,6 +737,7 @@ struct ExportSummary<'f> {
     lto_inlined: usize,
     lto_hot: usize,
     phase_times: ExportPhaseTimes,
+    shared_front_stats: SharedLazyFrontStats,
     top_stats: Option<CompileTopStats>,
 }
 
@@ -1232,6 +1263,357 @@ enum ExportEpochEnd {
     Reset(Option<ExportJob>),
 }
 
+/// `Typing` adapter used by both parallel export workers and the coordinator `Maker`:
+/// 1. Attaches the command-scoped [`SharedLazyFront`] to the worker's [`RecordsProgram`] on the
+///    first body check (zero changes to `make_one.rs`, zero thread-locals / ambient state).
+/// 2. Shares freshly typechecked dependency/toolchain `Checked` records via
+///    [`SharedLazyFront::get_typed_bytes`] / [`SharedLazyFront::put_typed_bytes`] so no dep or
+///    toolchain body is typechecked more than once across 128 workers or worker epoch resets,
+///    and deduplicates `WorkerTypedBatch` CAS puts sent to the coordinator.
+struct SharedExportTyping<K> {
+    pub kept: K,
+    shared: SharedLazyFrontHandle,
+    alloc: Alloc<'static>,
+    counts: TypingCounts,
+}
+
+impl<K> SharedExportTyping<K> {
+    fn new(kept: K, shared: &SharedLazyFrontHandle, alloc: Alloc<'static>) -> Self {
+        Self { kept, shared: std::sync::Arc::clone(shared), alloc, counts: TypingCounts::default() }
+    }
+}
+
+struct OneTyped {
+    key: ItemKey,
+    got: Option<Result<blaze_typeck::Checked<'static>, blaze_ladder::front2::program::lazy::typed::TypedGap>>,
+}
+
+impl blaze_ladder::front2::program::lazy::typed::TypedRecords for OneTyped {
+    fn typed(
+        &mut self,
+        key: ItemKey,
+    ) -> Result<blaze_typeck::Checked<'static>, blaze_ladder::front2::program::lazy::typed::TypedGap> {
+        use blaze_ladder::front2::program::lazy::typed::TypedGap;
+        if key != self.key {
+            return Err(TypedGap::NoBody { key });
+        }
+        self.got.take().unwrap_or(Err(TypedGap::NoRecord { key }))
+    }
+}
+
+impl<'n, K: blaze_ladder::front2::program::lazy::typed::KeptBodies> Typing<RecordsProgram<'n>>
+    for SharedExportTyping<K>
+{
+    fn check_one(
+        &mut self,
+        program: &mut RecordsProgram<'n>,
+        key: ItemKey,
+    ) -> Result<Option<(usize, blaze_typeck::Checked<'static>)>, RunError> {
+        use blaze_ladder::front2::program::lazy::typed::{BodySource, RunChecked, is_local};
+        use blaze_ladder::seam::FrontEnd as _;
+        program.attach_shared(&self.shared);
+        if !is_local(key)
+            && let Some(bytes) = self.shared.get_typed_bytes(key)
+            && let Ok(checked) = blaze_typeck::checked_record::decode(bytes.as_slice(), self.alloc)
+        {
+            let made = program.check_one_typed(key, &mut OneTyped { key, got: Some(Ok(checked)) })?;
+            if made.is_some() {
+                self.counts.read += 1;
+            }
+            return Ok(made);
+        }
+        match self.kept.source(key) {
+            Ok(BodySource::Run(kind)) => {
+                let made = program.check_one(key)?;
+                if let Some((_, ref checked)) = made {
+                    self.counts.checked[kind.index()] += 1;
+                    let mut should_persist = true;
+                    if !is_local(key)
+                        && matches!(kind, RunChecked::Dependency | RunChecked::Toolchain)
+                        && let Ok(encoded) = blaze_typeck::checked_record::encode(checked, self.alloc)
+                    {
+                        should_persist = self.shared.put_typed_bytes(key, encoded.as_slice());
+                    }
+                    if should_persist {
+                        self.kept.keep_checked(key, kind, checked);
+                    }
+                }
+                Ok(made)
+            }
+            Ok(BodySource::Read(checked)) => {
+                let made = program.check_one_typed(key, &mut OneTyped { key, got: Some(Ok(checked)) })?;
+                if made.is_some() {
+                    self.counts.read += 1;
+                }
+                Ok(made)
+            }
+            Err(gap) => program.check_one_typed(key, &mut OneTyped { key, got: Some(Err(gap)) }),
+        }
+    }
+
+    fn counts(&self) -> Option<TypingCounts> {
+        Some(self.counts)
+    }
+}
+
+/// Defers `maker.prepare_local(...)` during `Walk::begin` so the coordinator thread never lowers
+/// enclosing bodies on cold misses that are immediately dispatched to workers, while still
+/// preparing locals whenever `Walk::begin` hits a cached entry whose read list needs verification.
+struct LazyVerifyMaker<'m, 'n, 's, 'e> {
+    maker: &'m mut Maker<'n, crate::run_ids::Runnable, SharedExportTyping<crate::engine_body_record::StoreTyped<'n>>>,
+    shared: &'s SharedLazyFrontHandle,
+    enclosers: &'e crate::test_drive::suite_cache::LocalEnclosers,
+    prepared: bool,
+}
+
+impl<'m, 'n, 's, 'e> LazyVerifyMaker<'m, 'n, 's, 'e> {
+    fn ensure_prepared(&mut self) {
+        if !self.prepared {
+            self.prepared = true;
+            if let Some(prog) = self.maker.program() {
+                prog.attach_shared(self.shared);
+            }
+            self.maker.prepare_local(self.enclosers.locals(), self.enclosers.enclosers());
+            if let Some(prog) = self.maker.program() {
+                prog.attach_shared(self.shared);
+            }
+        }
+    }
+}
+
+impl blaze_ladder::body_ids::Make for LazyVerifyMaker<'_, '_, '_, '_> {
+    type Error = RunError;
+    type Grant = crate::run_ids::Runnable;
+
+    fn make(&mut self, grant: &Self::Grant, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
+        self.ensure_prepared();
+        self.maker.make(grant, tabled, name, entry)
+    }
+
+    fn make_static(&mut self, grant: &Self::Grant, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
+        self.ensure_prepared();
+        self.maker.make_static(grant, item, entry)
+    }
+
+    fn make_thread_local(&mut self, grant: &Self::Grant, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
+        self.ensure_prepared();
+        self.maker.make_thread_local(grant, item, entry)
+    }
+
+    fn verify(&mut self, tabled: ItemKey, name: &[u8], entry: &[u8]) -> Result<Option<blaze_ladder::code_records::reads::Verdict>, Self::Error> {
+        self.ensure_prepared();
+        self.maker.verify(tabled, name, entry)
+    }
+
+    fn verify_keyed(&mut self, key: CodeKey, under: CodeKey, tabled: ItemKey, name: &[u8], entry: &[u8]) -> Result<Option<blaze_ladder::code_records::reads::Verdict>, Self::Error> {
+        self.ensure_prepared();
+        self.maker.verify_keyed(key, under, tabled, name, entry)
+    }
+}
+
+/// Sans-IO affinity-first work-stealing scheduler for parallel export codegen (Rule 14).
+///
+/// - **Affinity fast path (LIFO per home deque)**: sibling monomorphizations of the same `tabled`
+///   fn route to `home_of(tabled)` and pop LIFO from the back of its deque so the lowered body and
+///   `MakerState` stay hot in that worker's epoch.
+/// - **Zero-starvation work stealing (FIFO front-steal from deepest victim)**: whenever any worker
+///   falls below `steal_low_water` while `queued > 0`, it steals from the **front** (oldest
+///   unrelated `tabled` cluster) of the deepest non-empty queue, breaking ties deterministically by
+///   lowest worker index (Rule 25). This prevents one giant function (`visit_seq`,
+///   `emit_sota_a64_with_abi`) or one heavily monomorphized generic fn from stranding idle peers.
+struct ExportScheduler<'a, J> {
+    active_workers: usize,
+    per_worker_cap: usize,
+    steal_low_water: usize,
+    worker_in_flight: AVec<'a, usize>,
+    worker_queues: AVec<'a, VecDeque<(ItemKey, J), Alloc<'a>>>,
+    in_flight: usize,
+    queued: usize,
+    steals: u64,
+    #[cfg(test)]
+    allow_steal: bool,
+}
+
+impl<'a, J> ExportScheduler<'a, J> {
+    fn new_in(active_workers: usize, per_worker_cap: usize, steal_low_water: usize, alloc: Alloc<'a>) -> Self {
+        let mut worker_in_flight = Vec::with_capacity_in(active_workers, alloc);
+        worker_in_flight.resize(active_workers, 0);
+        let mut worker_queues = Vec::with_capacity_in(active_workers, alloc);
+        for _ in 0..active_workers {
+            worker_queues.push(VecDeque::new_in(alloc));
+        }
+        Self {
+            active_workers,
+            per_worker_cap: per_worker_cap.max(1),
+            steal_low_water: steal_low_water.clamp(1, per_worker_cap.max(1)),
+            worker_in_flight,
+            worker_queues,
+            in_flight: 0,
+            queued: 0,
+            steals: 0,
+            #[cfg(test)]
+            allow_steal: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn disable_stealing_for_test(&mut self) {
+        self.allow_steal = false;
+    }
+
+    #[inline]
+    fn stealing_enabled(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.allow_steal
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
+
+    #[inline]
+    fn home_of(&self, tabled: ItemKey) -> usize {
+        let mixed = ((tabled.0 as u64) ^ ((tabled.0 >> 64) as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32;
+        (mixed as usize) % self.active_workers
+    }
+
+    #[inline]
+    fn in_flight(&self) -> usize {
+        self.in_flight
+    }
+
+    #[inline]
+    fn queued(&self) -> usize {
+        self.queued
+    }
+
+    #[inline]
+    fn max_in_flight(&self) -> usize {
+        self.active_workers.saturating_mul(self.per_worker_cap).max(1)
+    }
+
+    /// Enqueues `job` for `tabled`, returning an immediate `(worker, job)` dispatch when either
+    /// `home` has capacity or an idle/underloaded peer can immediately steal work.
+    fn enqueue(&mut self, tabled: ItemKey, job: J) -> Option<(usize, J)> {
+        let home = self.home_of(tabled);
+        if self.worker_in_flight[home] == 0 {
+            self.worker_in_flight[home] = 1;
+            self.in_flight += 1;
+            return Some((home, job));
+        }
+        // Never queue a second job behind a busy worker (which may be compiling a giant function)
+        // while any peer is completely idle.
+        if self.stealing_enabled()
+            && let Some(idle) = self.least_loaded_below(1)
+        {
+            self.worker_in_flight[idle] = 1;
+            self.in_flight += 1;
+            self.steals = self.steals.saturating_add(1);
+            return Some((idle, job));
+        }
+        let target_cap = if self.stealing_enabled() && self.least_loaded_below(self.steal_low_water).is_some() {
+            self.steal_low_water
+        } else {
+            self.per_worker_cap
+        };
+        if self.worker_in_flight[home] < target_cap {
+            self.worker_in_flight[home] += 1;
+            self.in_flight += 1;
+            return Some((home, job));
+        }
+        self.worker_queues[home].push_back((tabled, job));
+        self.queued += 1;
+        if self.stealing_enabled() {
+            if let Some(thief) = self.least_loaded_below(self.steal_low_water) {
+                if let Some(stolen) = self.next_dispatch_for(thief) {
+                    return Some((thief, stolen));
+                }
+            }
+        }
+        None
+    }
+
+    /// Records completion of one job on `worker`.
+    fn on_complete(&mut self, worker: usize) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if let Some(slot) = self.worker_in_flight.get_mut(worker) {
+            *slot = slot.saturating_sub(1);
+        }
+    }
+
+    /// Pops the next job to dispatch to `worker`: own deque LIFO first, then FIFO front-steal from
+    /// the deepest non-empty peer queue when `worker_in_flight[worker] < steal_low_water`.
+    fn next_dispatch_for(&mut self, worker: usize) -> Option<J> {
+        if worker >= self.active_workers || self.worker_in_flight[worker] >= self.per_worker_cap {
+            return None;
+        }
+        if let Some((_, job)) = self.worker_queues[worker].pop_back() {
+            self.queued -= 1;
+            self.worker_in_flight[worker] += 1;
+            self.in_flight += 1;
+            return Some(job);
+        }
+        if self.stealing_enabled() && self.worker_in_flight[worker] < self.steal_low_water && self.queued > 0 {
+            let victim = self.deepest_queue()?;
+            let (_, job) = self.worker_queues[victim].pop_front()?;
+            self.queued -= 1;
+            self.worker_in_flight[worker] += 1;
+            self.in_flight += 1;
+            self.steals = self.steals.saturating_add(1);
+            return Some(job);
+        }
+        None
+    }
+
+    /// Selects the next `(worker, job)` pair to refill any starved worker (`< steal_low_water`)
+    /// or any worker with a non-empty own queue below `per_worker_cap`.
+    fn next_refill(&mut self) -> Option<(usize, J)> {
+        if self.queued == 0 {
+            return None;
+        }
+        if self.stealing_enabled()
+            && let Some(starved) = self.least_loaded_below(self.steal_low_water)
+            && let Some(job) = self.next_dispatch_for(starved)
+        {
+            return Some((starved, job));
+        }
+        for w in 0..self.active_workers {
+            if !self.worker_queues[w].is_empty() && self.worker_in_flight[w] < self.per_worker_cap {
+                if let Some(job) = self.next_dispatch_for(w) {
+                    return Some((w, job));
+                }
+            }
+        }
+        None
+    }
+
+    fn least_loaded_below(&self, limit: usize) -> Option<usize> {
+        let mut best: Option<(usize, usize)> = None;
+        for (w, &load) in self.worker_in_flight.iter().enumerate() {
+            if load < limit && best.is_none_or(|(_, best_load)| load < best_load) {
+                best = Some((w, load));
+                if load == 0 {
+                    break;
+                }
+            }
+        }
+        best.map(|(w, _)| w)
+    }
+
+    fn deepest_queue(&self) -> Option<usize> {
+        let mut best: Option<(usize, usize)> = None;
+        for (w, q) in self.worker_queues.iter().enumerate() {
+            let len = q.len();
+            if len > 0 && best.is_none_or(|(_, best_len)| len > best_len) {
+                best = Some((w, len));
+            }
+        }
+        best.map(|(w, _)| w)
+    }
+}
+
 #[expect(clippy::too_many_arguments, reason = "one worker frame epoch receives shared read-only program inputs and channels")]
 fn run_export_worker_epoch<'f>(
     worker: usize,
@@ -1240,6 +1622,7 @@ fn run_export_worker_epoch<'f>(
     root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
     crates: run_names::RunCrates<'f>,
     sync_typed: crate::engine_body_record::SyncTypedFrom<'f>,
+    shared_front: &SharedLazyFrontHandle,
     builder: &blaze_ladder::code_records::Builder,
     maker_entry: Option<ItemKey>,
     maker_start: blaze_ladder::run::special::MakerStart,
@@ -1275,11 +1658,11 @@ fn run_export_worker_epoch<'f>(
         }
     };
     let reader = sync_typed.reader_persisting(cx, crates.snapshot(), heap.alloc(), shared);
-    let mut maker: Maker<'_, crate::run_ids::Runnable, _> = Maker::of_start(
+    let mut maker: Maker<'_, crate::run_ids::Runnable, SharedExportTyping<_>> = Maker::of_start(
         names,
         maker_entry,
         maker_start,
-        ByKind::new(reader),
+        SharedExportTyping::new(reader, shared_front, heap.alloc()),
         builder,
         Some(crate::run_parent::command_make_watch()),
         heap.alloc(),
@@ -1295,15 +1678,25 @@ fn run_export_worker_epoch<'f>(
                 Err(_) => return ExportEpochEnd::Done,
             },
         };
+        let last_tabled = job.order.tabled;
         scratch.clear();
         let was_warm = makes > 0;
         let made = {
             let _span = cx.span("blaze build: code worker makes one entry");
             crate::work::unwinding(|| {
+                if let Some(prog) = maker.program() {
+                    prog.attach_shared(shared_front);
+                }
                 maker.prepare_local(job.enclosers.locals(), job.enclosers.enclosers());
+                if let Some(prog) = maker.program() {
+                    prog.attach_shared(shared_front);
+                }
                 job.order.make(&mut maker, &job.proof, job.name.as_slice(), &mut scratch)
             })
         };
+        if let Some(prog) = maker.program() {
+            prog.attach_shared(shared_front);
+        }
         let result = match made {
             Ok(Ok(())) => {
                 makes = makes.saturating_add(1);
@@ -1343,8 +1736,28 @@ fn run_export_worker_epoch<'f>(
         if done.send(&sending, ExportDone { worker, row: job.row, result, typed }).is_err() {
             return ExportEpochEnd::Done;
         }
-        if worker_frame.used() >= *reset_at {
+        let (live_bodies, store_tys) = maker.program().map_or((0, 0), |p| p.worker_epoch_load());
+        let frame_used = worker_frame.used();
+        let hard_reset = frame_used >= EXPORT_WORKER_FRAME_HARD_RESET_AT
+            || live_bodies >= EXPORT_WORKER_HARD_LIVE_BODIES
+            || store_tys >= EXPORT_WORKER_HARD_STORE_TYS;
+        if hard_reset {
             return ExportEpochEnd::Reset(None);
+        }
+        let soft_reset = frame_used >= *reset_at
+            || live_bodies >= EXPORT_WORKER_MAX_LIVE_BODIES
+            || store_tys >= EXPORT_WORKER_MAX_STORE_TYS;
+        if soft_reset {
+            // Preserve warm bursts of sibling monomorphizations of the same `tabled` fn across the
+            // soft threshold; reset cleanly as soon as the inbox switches to another `tabled` fn
+            // (or is empty).
+            match jobs.try_recv() {
+                Ok(next_job) if next_job.order.tabled == last_tabled => {
+                    *carry = Some(next_job);
+                }
+                Ok(next_job) => return ExportEpochEnd::Reset(Some(next_job)),
+                Err(_) => return ExportEpochEnd::Reset(None),
+            }
         }
     }
 }
@@ -1357,6 +1770,7 @@ fn run_export_code_worker(
     root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
     crates: run_names::RunCrates<'_>,
     sync_typed: crate::engine_body_record::SyncTypedFrom<'_>,
+    shared_front: &SharedLazyFrontHandle,
     builder: &blaze_ladder::code_records::Builder,
     maker_entry: Option<ItemKey>,
     maker_start: blaze_ladder::run::special::MakerStart,
@@ -1384,6 +1798,7 @@ fn run_export_code_worker(
             root,
             crates,
             sync_typed,
+            shared_front,
             builder,
             maker_entry,
             maker_start,
@@ -1406,12 +1821,13 @@ fn run_export_code_worker(
 /// Finishes walking the remaining rows of `walk` (`*next_row..`) using `worker_count` parallel
 /// codegen workers on `cx.scope()`, driving `Walk::begin` / `Order::make` / `Walk::finish`.
 #[expect(clippy::too_many_arguments, reason = "parallel reachability walk borrows every phase state directly")]
-fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
+fn walk_remaining_parallel<'a, 'f, 'p, 'n, D: blaze_core::Driver>(
     cx: &Cx,
     clock: &bstd::clock::Clock,
     root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
     crates: run_names::RunCrates<'_>,
     sync_typed: crate::engine_body_record::SyncTypedFrom<'_>,
+    shared_front: &SharedLazyFrontHandle,
     procs: &dyn crate::job_texts::ProcsByNeed<'p>,
     list: &blaze_world::crate_list::CrateList<'_>,
     ids: &crate::run_ids::RunIds<'_>,
@@ -1426,7 +1842,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
     codes: &mut HomeCodeStore<'_, D>,
     dep_typed_program: &mut AVec<'a, blaze_cas::Key>,
     dep_typed_toolchain: &mut AVec<'a, blaze_cas::Key>,
-    maker: &mut Maker<'_, crate::run_ids::Runnable, ByKind<crate::engine_body_record::StoreTyped<'_>>>,
+    maker: &mut Maker<'n, crate::run_ids::Runnable, SharedExportTyping<crate::engine_body_record::StoreTyped<'n>>>,
     scratch: &mut Scratch<'a>,
     outcomes: &mut AVec<'a, RowOutcome<'a>>,
     compiled: &mut usize,
@@ -1445,7 +1861,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
     let shared = heap.shared();
     let start_row = *next_row;
     let inbox_cap = NonZeroUsize::new(EXPORT_PER_WORKER_IN_FLIGHT * 2).expect("non-zero inbox cap");
-    let done_cap = NonZeroUsize::new((worker_count * EXPORT_PER_WORKER_IN_FLIGHT).max(8)).expect("non-zero done cap");
+    let done_cap = NonZeroUsize::new((worker_count * EXPORT_PER_WORKER_IN_FLIGHT).max(16)).expect("non-zero done cap");
     let worker_nz = NonZeroUsize::new(worker_count).expect("non-zero worker count");
     let mut inboxes: Vec<bstd::sync::chan::OwnedChan<ExportJob, SharedAlloc<'static>>, SharedAlloc<'static>> =
         Vec::with_capacity_in(worker_count, shared);
@@ -1473,6 +1889,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                 root,
                 crates,
                 sync_typed,
+                shared_front,
                 builder,
                 maker_entry,
                 maker_start,
@@ -1491,21 +1908,15 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
     }
 
     let active_workers = tasks.len();
-    let max_in_flight = (active_workers * EXPORT_PER_WORKER_IN_FLIGHT).max(1);
     let max_queued = (active_workers * EXPORT_MAX_QUEUED_PER_WORKER).max(1);
     let mut par_outcomes: AVec<'a, Option<RowOutcome<'a>>> = Vec::new_in(alloc);
     let mut pending_rows: AVec<'a, Option<blaze_ladder::body_ids::Pending>> = Vec::new_in(alloc);
-    let mut worker_in_flight: AVec<'a, usize> = Vec::with_capacity_in(active_workers, alloc);
-    worker_in_flight.resize(active_workers, 0);
-    // Strict per-worker backlog stacks keyed by `tabled` home affinity: never spill a `tabled`
-    // body to a different worker, which would re-lower and re-typecheck giant functions
-    // (`constructor_simplify`, `BodiesStage::groups`, `checking`, etc.) up to 12x across workers.
-    let mut worker_queues: AVec<'a, AVec<'a, ExportJob>> = Vec::with_capacity_in(active_workers, alloc);
-    for _ in 0..active_workers {
-        worker_queues.push(Vec::new_in(alloc));
-    }
-    let mut in_flight = 0usize;
-    let mut queued = 0usize;
+    let mut scheduler: ExportScheduler<'a, ExportJob> = ExportScheduler::new_in(
+        active_workers.max(1),
+        EXPORT_PER_WORKER_IN_FLIGHT,
+        EXPORT_STEAL_LOW_WATER,
+        alloc,
+    );
 
     let serve_procs = |procs_asked: &bstd::sync::chan::OwnedChan<usize, SharedAlloc<'static>>,
                        procs_answers: &[bstd::sync::chan::OwnedChan<ExportProcsAnswer, SharedAlloc<'static>>]| {
@@ -1576,115 +1987,146 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
             return Ok(());
         }
 
-        let flush_worker_queue = |worker: usize,
-                                  worker_queues: &mut [AVec<'a, ExportJob>],
-                                  worker_in_flight: &mut [usize],
-                                  in_flight: &mut usize,
-                                  queued: &mut usize,
-                                  inboxes: &[bstd::sync::chan::OwnedChan<ExportJob, SharedAlloc<'static>>]|
+        let send_job = |worker: usize,
+                        job: ExportJob,
+                        inboxes: &[bstd::sync::chan::OwnedChan<ExportJob, SharedAlloc<'static>>]|
          -> Result<(), CliError> {
-            while worker_in_flight[worker] < EXPORT_PER_WORKER_IN_FLIGHT {
-                // Pop LIFO within the same home worker so sibling closures of the same `tabled`
-                // body execute back-to-back while hot in `MakerState`.
-                let Some(job) = worker_queues[worker].pop() else { break };
-                *queued -= 1;
-                let row = job.row;
-                let by = cx.until(bstd::Deadline::after(clock.now().since_start(), EXPORT_HAND_WAIT));
-                let sending = by.span("blaze build: dispatch queued export job");
-                if inboxes[worker].send(&sending, job).is_err() {
-                    return Err(box_err(
-                        ExportCliError::Walk {
-                            symbol: [0; 32],
-                            shown: owned_fmt(format_args!("export worker {worker} inbox closed while dispatching queued row {row}"), frame, heap.alloc()),
-                        },
-                        heap,
-                    ));
-                }
-                worker_in_flight[worker] += 1;
-                *in_flight += 1;
+            let row = job.row;
+            let by = cx.until(bstd::Deadline::after(clock.now().since_start(), EXPORT_HAND_WAIT));
+            let sending = by.span("blaze build: dispatch export job");
+            if inboxes[worker].send(&sending, job).is_err() {
+                return Err(box_err(
+                    ExportCliError::Walk {
+                        symbol: [0; 32],
+                        shown: owned_fmt(format_args!("export worker {worker} inbox closed while dispatching row {row}"), frame, heap.alloc()),
+                    },
+                    heap,
+                ));
             }
             Ok(())
         };
 
-        while *next_row < walk.len() || in_flight > 0 || queued > 0 {
-            serve_procs(&procs_asked, procs_answers.as_slice());
+        let refill_workers = |scheduler: &mut ExportScheduler<'a, ExportJob>,
+                              inboxes: &[bstd::sync::chan::OwnedChan<ExportJob, SharedAlloc<'static>>]|
+         -> Result<(), CliError> {
+            while let Some((worker, job)) = scheduler.next_refill() {
+                send_job(worker, job, inboxes)?;
+            }
+            Ok(())
+        };
 
-            // Drain any completed worker jobs immediately so `walk.finish` records them in
-            // `HomeCodeStore` and expands newly reached callees.
-            while let Ok(done) = done_ch.try_recv() {
-                in_flight -= 1;
-                if let Some(slot) = worker_in_flight.get_mut(done.worker) {
-                    *slot = slot.saturating_sub(1);
+        let finish_one_done = |done: ExportDone,
+                               scheduler: &mut ExportScheduler<'a, ExportJob>,
+                               inboxes: &[bstd::sync::chan::OwnedChan<ExportJob, SharedAlloc<'static>>],
+                               walk: &mut Walk<'a>,
+                               codes: &mut HomeCodeStore<'_, D>,
+                               dep_typed_program: &mut AVec<'a, blaze_cas::Key>,
+                               dep_typed_toolchain: &mut AVec<'a, blaze_cas::Key>,
+                               scratch: &mut Scratch<'a>,
+                               pending_rows: &mut AVec<'a, Option<blaze_ladder::body_ids::Pending>>,
+                               par_outcomes: &mut AVec<'a, Option<RowOutcome<'a>>>,
+                               compiled: &mut usize,
+                               cached: &mut usize,
+                               unkeyed: &mut usize,
+                               stubs: &mut usize|
+         -> Result<(), CliError> {
+            scheduler.on_complete(done.worker);
+            // Refill the completing worker immediately (own LIFO queue, or FIFO steal if starved)
+            // before spending coordinator time on `walk.finish`, keeping worker pipelines full.
+            while let Some(job) = scheduler.next_dispatch_for(done.worker) {
+                send_job(done.worker, job, inboxes)?;
+            }
+            persist_worker_typed_batch(lent, done.typed, dep_typed_program, dep_typed_toolchain, frame, heap)?;
+            let row = done.row;
+            let rel = row - start_row;
+            let pend = pending_rows[rel].take().ok_or_else(|| {
+                box_err(
+                    ExportCliError::Walk { symbol: walk.symbol(row).0, shown: owned_fmt(format_args!("duplicate or unknown worker completion for row {row}"), frame, heap.alloc()) },
+                    heap,
+                )
+            })?;
+            let symbol = walk.symbol(row);
+            let kind = walk.kind(row);
+            match done.result {
+                Ok(entry_bytes) => {
+                    let one = walk
+                        .finish::<RunError>(pend, entry_bytes.as_slice(), codes, &body_ids::EntryForm, MOST_WALKED, scratch)
+                        .map_err(|why| {
+                            box_err(
+                                ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                                heap,
+                            )
+                        })?;
+                    let outcome = match one.stepped {
+                        Stepped::Found(key) => {
+                            *cached += 1;
+                            RowOutcome::Keyed(key)
+                        }
+                        Stepped::Made(key) => {
+                            *compiled += 1;
+                            RowOutcome::Keyed(key)
+                        }
+                        Stepped::Unkeyed(_) => {
+                            *unkeyed += 1;
+                            let mut copied: AVec<'_, u8> = Vec::with_capacity_in(entry_bytes.len(), alloc);
+                            copied.extend_from_slice(entry_bytes.as_slice());
+                            RowOutcome::Unkeyed(copied)
+                        }
+                    };
+                    par_outcomes[rel] = Some(outcome);
                 }
-                flush_worker_queue(
-                    done.worker,
-                    &mut worker_queues,
-                    &mut worker_in_flight,
-                    &mut in_flight,
-                    &mut queued,
-                    &inboxes,
-                )?;
-                persist_worker_typed_batch(lent, done.typed, dep_typed_program, dep_typed_toolchain, frame, heap)?;
-                let row = done.row;
-                let rel = row - start_row;
-                let pend = pending_rows[rel].take().ok_or_else(|| {
-                    box_err(
-                        ExportCliError::Walk { symbol: walk.symbol(row).0, shown: owned_fmt(format_args!("duplicate or unknown worker completion for row {row}"), frame, heap.alloc()) },
+                Err(ExportWorkerErr::ScopeOne(why_str)) if row >= root_count && kind == RowKind::Instance => {
+                    let _ = walk.abandon::<RunError>(pend);
+                    let msg = bstd::mem::format_in!(frame, "blaze build: called unbuilt function: {}", why_str.as_str());
+                    let stub_bytes = make_unbuilt_stub_record(symbol, msg.as_str(), frame, alloc, heap).map_err(|e| box_err(e, heap))?;
+                    *stubs += 1;
+                    par_outcomes[rel] = Some(RowOutcome::UnbuiltStub(stub_bytes));
+                }
+                Err(ExportWorkerErr::ScopeOne(why_str) | ExportWorkerErr::Fatal(why_str)) => {
+                    let _ = walk.abandon::<RunError>(pend);
+                    return Err(box_err(
+                        ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{}", why_str.as_str()), frame, heap.alloc()) },
                         heap,
-                    )
-                })?;
-                let symbol = walk.symbol(row);
-                let kind = walk.kind(row);
-                match done.result {
-                    Ok(entry_bytes) => {
-                        let one = walk
-                            .finish::<RunError>(pend, entry_bytes.as_slice(), codes, &body_ids::EntryForm, MOST_WALKED, scratch)
-                            .map_err(|why| {
-                                box_err(
-                                    ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
-                                    heap,
-                                )
-                            })?;
-                        let outcome = match one.stepped {
-                            Stepped::Found(key) => {
-                                *cached += 1;
-                                RowOutcome::Keyed(key)
-                            }
-                            Stepped::Made(key) => {
-                                *compiled += 1;
-                                RowOutcome::Keyed(key)
-                            }
-                            Stepped::Unkeyed(_) => {
-                                *unkeyed += 1;
-                                let mut copied: AVec<'_, u8> = Vec::with_capacity_in(entry_bytes.len(), alloc);
-                                copied.extend_from_slice(entry_bytes.as_slice());
-                                RowOutcome::Unkeyed(copied)
-                            }
-                        };
-                        par_outcomes[rel] = Some(outcome);
-                    }
-                    Err(ExportWorkerErr::ScopeOne(why_str)) if row >= root_count && kind == RowKind::Instance => {
-                        let _ = walk.abandon::<RunError>(pend);
-                        let msg = bstd::mem::format_in!(frame, "blaze build: called unbuilt function: {}", why_str.as_str());
-                        let stub_bytes = make_unbuilt_stub_record(symbol, msg.as_str(), frame, alloc, heap).map_err(|e| box_err(e, heap))?;
-                        *stubs += 1;
-                        par_outcomes[rel] = Some(RowOutcome::UnbuiltStub(stub_bytes));
-                    }
-                    Err(ExportWorkerErr::ScopeOne(why_str) | ExportWorkerErr::Fatal(why_str)) => {
-                        let _ = walk.abandon::<RunError>(pend);
-                        return Err(box_err(
-                            ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{}", why_str.as_str()), frame, heap.alloc()) },
-                            heap,
-                        ));
-                    }
+                    ));
                 }
             }
+            Ok(())
+        };
 
-            // Dispatch waiting rows until all workers are saturated (`in_flight == max_in_flight`),
-            // the frontier is drained, or the safety backlog cap (`max_queued`) is reached.
-            // Never spill a `tabled` body across workers, and never let one slow worker's backlog
-            // starve idle peers while `in_flight < max_in_flight`.
-            while *next_row < walk.len() && in_flight < max_in_flight && queued < max_queued {
+        let max_in_flight = scheduler.max_in_flight();
+        let drain_burst = active_workers.max(8);
+
+        while *next_row < walk.len() || scheduler.in_flight() > 0 || scheduler.queued() > 0 {
+            serve_procs(&procs_asked, procs_answers.as_slice());
+
+            // Drain completions in bounded bursts interleaved with immediate worker refills and
+            // newly discovered frontier dispatches so idle workers never wait behind a long drain.
+            let mut drained = 0usize;
+            while drained < drain_burst {
+                let Ok(done) = done_ch.try_recv() else { break };
+                drained += 1;
+                finish_one_done(
+                    done,
+                    &mut scheduler,
+                    &inboxes,
+                    walk,
+                    codes,
+                    dep_typed_program,
+                    dep_typed_toolchain,
+                    scratch,
+                    &mut pending_rows,
+                    &mut par_outcomes,
+                    compiled,
+                    cached,
+                    unkeyed,
+                    stubs,
+                )?;
+            }
+            refill_workers(&mut scheduler, &inboxes)?;
+
+            // Dispatch waiting frontier rows until all workers are saturated (`in_flight ==
+            // max_in_flight`), the frontier is drained, or the safety backlog cap is reached.
+            while *next_row < walk.len() && scheduler.in_flight() < max_in_flight && scheduler.queued() < max_queued {
                 let row = *next_row;
                 *next_row += 1;
                 let need_len = walk.len() - start_row;
@@ -1703,8 +2145,8 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                     box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled: *compiled, cached: *cached, why }, heap)
                 })?;
                 let enclosers = crate::test_drive::suite_cache::local_enclosers_of(walk, row, tabled);
-                maker.prepare_local(enclosers.locals(), enclosers.enclosers());
-                match walk.begin(row, ids, codes, builder, &builder.producer, maker, &body_ids::EntryForm, MOST_WALKED, scratch) {
+                let mut verify_maker = LazyVerifyMaker { maker, shared: shared_front, enclosers: &enclosers, prepared: false };
+                match walk.begin(row, ids, codes, builder, &builder.producer, &mut verify_maker, &body_ids::EntryForm, MOST_WALKED, scratch) {
                     Ok(blaze_ladder::body_ids::Begun::Stepped(one)) => match one.stepped {
                         Stepped::Found(key) => {
                             *cached += 1;
@@ -1736,25 +2178,10 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                         let mut name = Vec::with_capacity_in(name_slice.len(), shared);
                         name.extend_from_slice(name_slice);
                         let job = ExportJob { row, order: pend.order(), proof, name, enclosers };
-                        let mixed = (tabled.0 as u64) ^ ((tabled.0 >> 64) as u64);
-                        let home = (mixed as usize) % active_workers;
-                        if worker_in_flight[home] < EXPORT_PER_WORKER_IN_FLIGHT {
-                            let by = cx.until(bstd::Deadline::after(clock.now().since_start(), EXPORT_HAND_WAIT));
-                            let sending = by.span("blaze build: dispatch export job");
-                            if inboxes[home].send(&sending, job).is_err() {
-                                let _ = walk.abandon::<RunError>(pend);
-                                return Err(box_err(
-                                    ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("export worker job channel closed or timed out"), frame, heap.alloc()) },
-                                    heap,
-                                ));
-                            }
-                            worker_in_flight[home] += 1;
-                            in_flight += 1;
-                        } else {
-                            worker_queues[home].push(job);
-                            queued += 1;
-                        }
                         pending_rows[rel] = Some(pend);
+                        if let Some((target_worker, dispatch_job)) = scheduler.enqueue(tabled, job) {
+                            send_job(target_worker, dispatch_job, &inboxes)?;
+                        }
                     }
                     Err(why) if row >= root_count && kind == RowKind::Instance && why.scope() == blaze_ladder::scope::Scope::One => {
                         let msg = bstd::mem::format_in!(frame, "blaze build: called unbuilt function: {why}");
@@ -1770,10 +2197,13 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                     }
                 }
             }
+            refill_workers(&mut scheduler, &inboxes)?;
 
             // If workers are busy and we cannot dispatch more right now, wait briefly on `done_ch`
             // (bounded slice so `procs_asked` is always serviced without deadlock).
-            if in_flight > 0 && (*next_row >= walk.len() || in_flight >= max_in_flight || queued >= max_queued) {
+            if scheduler.in_flight() > 0
+                && (*next_row >= walk.len() || scheduler.in_flight() >= max_in_flight || scheduler.queued() >= max_queued)
+            {
                 if cx.check().is_err() {
                     return Err(box_err(
                         ExportCliError::Walk { symbol: [0; 32], shown: owned_fmt(format_args!("export cancelled while waiting for code workers"), frame, heap.alloc()) },
@@ -1783,77 +2213,29 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                 let slice_cx = cx.until(bstd::Deadline::after(clock.now().since_start(), EXPORT_RECV_SLICE));
                 match done_ch.recv(&slice_cx) {
                     Ok(done) => {
-                        in_flight -= 1;
-                        if let Some(slot) = worker_in_flight.get_mut(done.worker) {
-                            *slot = slot.saturating_sub(1);
-                        }
-                        flush_worker_queue(
-                            done.worker,
-                            &mut worker_queues,
-                            &mut worker_in_flight,
-                            &mut in_flight,
-                            &mut queued,
+                        finish_one_done(
+                            done,
+                            &mut scheduler,
                             &inboxes,
+                            walk,
+                            codes,
+                            dep_typed_program,
+                            dep_typed_toolchain,
+                            scratch,
+                            &mut pending_rows,
+                            &mut par_outcomes,
+                            compiled,
+                            cached,
+                            unkeyed,
+                            stubs,
                         )?;
-                        persist_worker_typed_batch(lent, done.typed, dep_typed_program, dep_typed_toolchain, frame, heap)?;
-                        let row = done.row;
-                        let rel = row - start_row;
-                        let pend = pending_rows[rel].take().ok_or_else(|| {
-                            box_err(
-                                ExportCliError::Walk { symbol: walk.symbol(row).0, shown: owned_fmt(format_args!("duplicate or unknown worker completion for row {row}"), frame, heap.alloc()) },
-                                heap,
-                            )
-                        })?;
-                        let symbol = walk.symbol(row);
-                        let kind = walk.kind(row);
-                        match done.result {
-                            Ok(entry_bytes) => {
-                                let one = walk
-                                    .finish::<RunError>(pend, entry_bytes.as_slice(), codes, &body_ids::EntryForm, MOST_WALKED, scratch)
-                                    .map_err(|why| {
-                                        box_err(
-                                            ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
-                                            heap,
-                                        )
-                                    })?;
-                                let outcome = match one.stepped {
-                                    Stepped::Found(key) => {
-                                        *cached += 1;
-                                        RowOutcome::Keyed(key)
-                                    }
-                                    Stepped::Made(key) => {
-                                        *compiled += 1;
-                                        RowOutcome::Keyed(key)
-                                    }
-                                    Stepped::Unkeyed(_) => {
-                                        *unkeyed += 1;
-                                        let mut copied: AVec<'_, u8> = Vec::with_capacity_in(entry_bytes.len(), alloc);
-                                        copied.extend_from_slice(entry_bytes.as_slice());
-                                        RowOutcome::Unkeyed(copied)
-                                    }
-                                };
-                                par_outcomes[rel] = Some(outcome);
-                            }
-                            Err(ExportWorkerErr::ScopeOne(why_str)) if row >= root_count && kind == RowKind::Instance => {
-                                let _ = walk.abandon::<RunError>(pend);
-                                let msg = bstd::mem::format_in!(frame, "blaze build: called unbuilt function: {}", why_str.as_str());
-                                let stub_bytes = make_unbuilt_stub_record(symbol, msg.as_str(), frame, alloc, heap).map_err(|e| box_err(e, heap))?;
-                                *stubs += 1;
-                                par_outcomes[rel] = Some(RowOutcome::UnbuiltStub(stub_bytes));
-                            }
-                            Err(ExportWorkerErr::ScopeOne(why_str) | ExportWorkerErr::Fatal(why_str)) => {
-                                let _ = walk.abandon::<RunError>(pend);
-                                return Err(box_err(
-                                    ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{}", why_str.as_str()), frame, heap.alloc()) },
-                                    heap,
-                                ));
-                            }
-                        }
+                        refill_workers(&mut scheduler, &inboxes)?;
                     }
                     Err(bstd::sync::RecvError::Stopped { .. } | bstd::sync::RecvError::Empty { .. }) => {
                         // Slice expired: loop back to service `procs_asked` and check cancellation.
                     }
                     Err(bstd::sync::RecvError::Closed { .. }) => {
+                        let in_flight = scheduler.in_flight();
                         return Err(box_err(
                             ExportCliError::Walk { symbol: [0; 32], shown: owned_fmt(format_args!("export code worker done channel closed with {in_flight} jobs in flight"), frame, heap.alloc()) },
                             heap,
@@ -2029,11 +2411,13 @@ fn export_program<'f>(
         Some(shim) => Some(shim.main.tabled),
         None => (!roots.is_empty()).then(|| roots.root(0).tabled),
     };
+    let shared_front: SharedLazyFrontHandle =
+        std::sync::Arc::new_in(SharedLazyFront::new_in(heap.shared()), heap.shared());
     let mut maker = Maker::of_roots(
         names,
         maker_entry,
         &roots,
-        ByKind::new(typed.over(ids)),
+        SharedExportTyping::new(typed.over(ids), &shared_front, heap.alloc()),
         &builder,
         Some(crate::run_parent::command_make_watch()),
         heap.alloc(),
@@ -2076,6 +2460,7 @@ fn export_program<'f>(
                     root,
                     crates,
                     sync_typed,
+                    &shared_front,
                     &maker_procs,
                     list,
                     &ids,
@@ -2115,6 +2500,9 @@ fn export_program<'f>(
             })?;
             let enclosers = crate::test_drive::suite_cache::local_enclosers_of(&walk, row, tabled);
             maker.prepare_local(enclosers.locals(), enclosers.enclosers());
+            if let Some(prog) = maker.program() {
+                prog.attach_shared(&shared_front);
+            }
             match walk.one(row, &ids, &mut codes, &builder, &builder.producer, &mut maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
                 Ok(one) => match one.stepped {
                     Stepped::Found(key) => {
@@ -2159,6 +2547,21 @@ fn export_program<'f>(
     }
     let walk_ns = phases.since(walk_began);
 
+    // Commit and root all compiled `CodeRecord`s and persisted dep/toolchain `Typed` batches
+    // BEFORE `wasm64`, LTO, or `blaze_export::export()` runs, so a downstream LTO/linker/output
+    // failure never discards compiled work, and unlent store arena chunks are freed before linking.
+    checkpoint_export_roots(
+        lent,
+        &today,
+        builder.toolchain,
+        &mut codes,
+        &maker.typing().kept,
+        dep_typed_program.as_slice(),
+        dep_typed_toolchain.as_slice(),
+        frame,
+        heap,
+    )?;
+
     if target == BuildTarget::Wasm64 {
         let link_began = phases.now();
         let mut wasm_bytes: AVec<'_, u8> = Vec::new_in(alloc);
@@ -2191,17 +2594,20 @@ fn export_program<'f>(
         if let Some(why) = seen.refused() {
             return Err(CliError::RunNames(run_names::RunNamesError::Trees { why }));
         }
-        finish_export_roots(
-            lent,
-            &today,
-            builder.toolchain,
-            codes,
-            &maker.typing().kept,
-            dep_typed_program.as_slice(),
-            dep_typed_toolchain.as_slice(),
-            frame,
-            heap,
-        )?;
+        if lent.needs_commit() {
+            checkpoint_export_roots(
+                lent,
+                &today,
+                builder.toolchain,
+                &mut codes,
+                &maker.typing().kept,
+                dep_typed_program.as_slice(),
+                dep_typed_toolchain.as_slice(),
+                frame,
+                heap,
+            )?;
+        }
+        drop(codes);
         write_output_file(cx, fs, output_path, wasm_bytes.as_slice(), false, heap)?;
         let link_ns = phases.since(link_began);
         let exported = Exported {
@@ -2230,6 +2636,7 @@ fn export_program<'f>(
             lto_inlined: 0,
             lto_hot: 0,
             phase_times: ExportPhaseTimes { front_ns, walk_ns, lto_ns: 0, link_ns },
+            shared_front_stats: shared_front.stats(),
             top_stats,
         });
     }
@@ -2403,6 +2810,22 @@ fn export_program<'f>(
     } else {
         None
     };
+
+    // Commit and root any extra LTO-discovered or TLS special records BEFORE `ProgramIn` borrows
+    // `&codes` and BEFORE `blaze_export::export()` runs, so a linker error never discards them.
+    if lent.needs_commit() || tls_keys.is_some() {
+        checkpoint_export_roots(
+            lent,
+            &today,
+            builder.toolchain,
+            &mut codes,
+            &maker.typing().kept,
+            dep_typed_program.as_slice(),
+            dep_typed_toolchain.as_slice(),
+            frame,
+            heap,
+        )?;
+    }
 
     // Assemble `ProgramIn` functions and data (zero-copy for cached positionless records).
     let mut functions: AVec<'_, Function<'_>> = Vec::with_capacity_in(outcomes.len() + 2, alloc);
@@ -2595,23 +3018,26 @@ fn export_program<'f>(
     let mut exe_bytes: AVec<'_, u8> = Vec::new_in(heap.alloc());
     let exported = blaze_export::export(&program_in, platform, &mut exe_bytes, heap.alloc()).map_err(|error| box_err(ExportCliError::Export(error), heap))?;
 
-    // Release immutable borrows of `codes` before restoring any concurrently swept entries and
-    // persisting closing program + toolchain roots (Rule 3: refuse instead of silently dropping).
+    // Release immutable borrows of `codes` and ensure any remaining store mutations are committed
+    // and rooted (Rule 3: refuse instead of silently dropping).
     drop(functions);
     drop(symbol_names);
     drop(data);
     drop(seen_data);
-    finish_export_roots(
-        lent,
-        &today,
-        builder.toolchain,
-        codes,
-        &maker.typing().kept,
-        dep_typed_program.as_slice(),
-        dep_typed_toolchain.as_slice(),
-        frame,
-        heap,
-    )?;
+    if lent.needs_commit() {
+        checkpoint_export_roots(
+            lent,
+            &today,
+            builder.toolchain,
+            &mut codes,
+            &maker.typing().kept,
+            dep_typed_program.as_slice(),
+            dep_typed_toolchain.as_slice(),
+            frame,
+            heap,
+        )?;
+    }
+    drop(codes);
 
     write_executable(cx, fs, output_path, exe_bytes.as_slice(), heap)?;
     let link_ns = phases.since(link_began);
@@ -2628,6 +3054,7 @@ fn export_program<'f>(
         lto_inlined,
         lto_hot,
         phase_times: ExportPhaseTimes { front_ns, walk_ns, lto_ns, link_ns },
+        shared_front_stats: shared_front.stats(),
         top_stats,
     })
 }
@@ -2982,6 +3409,29 @@ fn print_summary(
         let mut phase_line = String::new_in(erased.handle());
         format_build_phases_line(&mut phase_line, summary.phase_times, wall_ns, peak_rss_bytes);
         err.line(cx, format_args!("{}", phase_line.as_str()))?;
+        let sf = summary.shared_front_stats;
+        if sf.head_hits + sf.head_misses + sf.pure_const_hits + sf.pure_const_misses + sf.typed_hits + sf.typed_misses > 0 {
+            err.line(
+                cx,
+                format_args!(
+                    "build shared-front: heads={}/{} (puts={}) const_bits={}/{} pure_consts={}/{} pure_statics={}/{} members={}/{} typed={}/{} (puts={})",
+                    sf.head_hits,
+                    sf.head_hits + sf.head_misses,
+                    sf.head_puts,
+                    sf.const_bit_hits,
+                    sf.const_bit_hits + sf.const_bit_misses,
+                    sf.pure_const_hits,
+                    sf.pure_const_hits + sf.pure_const_misses,
+                    sf.pure_static_hits,
+                    sf.pure_static_hits + sf.pure_static_misses,
+                    sf.member_index_hits,
+                    sf.member_index_hits + sf.member_index_misses,
+                    sf.typed_hits,
+                    sf.typed_hits + sf.typed_misses,
+                    sf.typed_puts,
+                ),
+            )?;
+        }
         if let Some(top) = summary.top_stats.as_ref() {
             let mut tables = String::new_in(erased.handle());
             format_top_fn_tables(&mut tables, top);
@@ -3891,5 +4341,297 @@ mod tests {
         assert!(rendered.contains("312"), "{rendered}");
         assert!(rendered.contains("142.5"), "{rendered}");
         assert!(rendered.contains("my_crate::big_parser::parse_expr"), "{rendered}");
+    }
+
+    #[test]
+    fn export_scheduler_dst_eliminates_starvation_under_skewed_giant_workloads_and_control_catches_it() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+
+        // 1. Randomized blaze-sim DST across worker counts, skewed `tabled` keys, and arbitrary
+        //    completion orders: verifies exact-once execution and zero starvation whenever work is
+        //    queued.
+        blaze_sim::check(blaze_sim::Config::cases(80), |tape| {
+            let workers = usize::try_from(tape.int_in(2..=12u64, "workers")).expect("workers");
+            let total_jobs = usize::try_from(tape.int_in(1..=96u64, "jobs")).expect("jobs");
+            let hot_keys = usize::try_from(tape.int_in(1..=4u64, "hot_keys")).expect("hot_keys");
+            let cap = 6usize;
+            let low_water = 2usize;
+
+            let mut sched: ExportScheduler<'_, usize> = ExportScheduler::new_in(workers, cap, low_water, alloc);
+            let mut running: Vec<Vec<usize, Alloc<'static>>, Alloc<'static>> = Vec::with_capacity_in(workers, alloc);
+            for _ in 0..workers {
+                running.push(Vec::new_in(alloc));
+            }
+            let mut completed: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(total_jobs, alloc);
+            completed.resize(total_jobs, 0);
+
+            let mut next_job = 0usize;
+            while next_job < total_jobs || sched.in_flight() > 0 || sched.queued() > 0 {
+                // Enqueue a random burst of jobs (strongly skewed toward `hot_keys`).
+                let burst = usize::try_from(tape.int_in(1..=8u64, "burst")).expect("burst");
+                for _ in 0..burst {
+                    if next_job >= total_jobs || sched.in_flight() >= sched.max_in_flight() {
+                        break;
+                    }
+                    let skew = tape.coin("skewed");
+                    let tabled = if skew {
+                        let k = tape.int_in(0..=u64::try_from(hot_keys - 1).expect("hk"), "hot_k");
+                        ItemKey(u128::from(k) + 1)
+                    } else {
+                        ItemKey(u128::from(u64::try_from(next_job).expect("nj")) + 10_000)
+                    };
+                    let job_id = next_job;
+                    next_job += 1;
+                    if let Some((w, id)) = sched.enqueue(tabled, job_id) {
+                        running[w].push(id);
+                    }
+                }
+                while let Some((w, id)) = sched.next_refill() {
+                    running[w].push(id);
+                }
+
+                // Core zero-starvation invariant: whenever queued work exists, NO worker may sit
+                // below `low_water`.
+                if sched.queued() > 0 {
+                    for w in 0..workers {
+                        assert!(
+                            running[w].len() >= low_water,
+                            "starved worker {w} has {} < {low_water} while {} jobs queued",
+                            running[w].len(),
+                            sched.queued()
+                        );
+                    }
+                }
+
+                // Complete one job from a randomly chosen non-empty worker.
+                let mut busy: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(workers, alloc);
+                for w in 0..workers {
+                    if !running[w].is_empty() {
+                        busy.push(w);
+                    }
+                }
+                if busy.is_empty() {
+                    break;
+                }
+                let pick = usize::try_from(tape.int_in(0..=u64::try_from(busy.len() - 1).expect("b"), "done_w")).expect("pick");
+                let w = busy[pick];
+                let finished = running[w].remove_shift(0);
+                completed[finished] += 1;
+                sched.on_complete(w);
+                while let Some(id) = sched.next_dispatch_for(w) {
+                    running[w].push(id);
+                }
+                while let Some((rw, id)) = sched.next_refill() {
+                    running[rw].push(id);
+                }
+            }
+
+            assert_eq!(sched.in_flight(), 0);
+            assert_eq!(sched.queued(), 0);
+            for (job_id, &hits) in completed.iter().enumerate() {
+                assert_eq!(hits, 1, "job {job_id} must complete exactly once, got {hits}");
+            }
+        });
+
+        // 2. Deterministic giant-function scenario + Rule 23 planted-bug control:
+        //    8 workers, 64 jobs all hashing to the same `home` worker where job 0 is a giant
+        //    function taking 40 ticks and jobs 1..64 take 1 tick each.
+        let run_giant_scenario = |steal: bool| -> (usize, usize) {
+            let workers = 8usize;
+            let total = 64usize;
+            let mut sched: ExportScheduler<'_, (usize, usize)> = ExportScheduler::new_in(workers, 4, 2, alloc);
+            if !steal {
+                sched.disable_stealing_for_test();
+            }
+            let giant_key = ItemKey(0xDEAD_BEEF_CAFE_BABEu128);
+            let mut in_prog: Vec<VecDeque<(usize, usize), Alloc<'static>>, Alloc<'static>> = Vec::with_capacity_in(workers, alloc);
+            for _ in 0..workers {
+                in_prog.push(VecDeque::new_in(alloc));
+            }
+            for id in 0..total {
+                let dur = if id == 0 { 40usize } else { 1usize };
+                if let Some((w, job)) = sched.enqueue(giant_key, (id, dur)) {
+                    in_prog[w].push_back(job);
+                }
+            }
+            while let Some((w, job)) = sched.next_refill() {
+                in_prog[w].push_back(job);
+            }
+            let mut ticks = 0usize;
+            let mut idle_worker_ticks_while_queued = 0usize;
+            let mut done = 0usize;
+            while done < total {
+                ticks += 1;
+                if sched.queued() > 0 {
+                    for w in 0..workers {
+                        if in_prog[w].is_empty() {
+                            idle_worker_ticks_while_queued += 1;
+                        }
+                    }
+                }
+                for w in 0..workers {
+                    if let Some(front) = in_prog[w].front_mut() {
+                        front.1 -= 1;
+                        if front.1 == 0 {
+                            let _ = in_prog[w].pop_front();
+                            done += 1;
+                            sched.on_complete(w);
+                            while let Some(job) = sched.next_dispatch_for(w) {
+                                in_prog[w].push_back(job);
+                            }
+                        }
+                    }
+                }
+                while let Some((w, job)) = sched.next_refill() {
+                    in_prog[w].push_back(job);
+                }
+                assert!(ticks < 500, "bounded simulation progress");
+            }
+            (ticks, idle_worker_ticks_while_queued)
+        };
+
+        let (steal_ticks, steal_idle) = run_giant_scenario(true);
+        assert_eq!(steal_idle, 0, "work-stealing scheduler must have 0 idle worker ticks while jobs are queued");
+        // At most `per_worker_cap - 1` (= 3) pre-buffered small jobs can sit in the home worker's
+        // inbox behind the 40-tick giant job; all remaining 60 small jobs are stolen by the 7
+        // peers and finish in parallel well before tick 40 (independent of total job count).
+        assert_eq!(steal_ticks, 43, "expected exact makespan 40 + (per_worker_cap - 1) = 43 ticks under 40-tick giant job, got {steal_ticks}");
+
+        let (ctrl_ticks, ctrl_idle) = run_giant_scenario(false);
+        assert!(ctrl_idle > 200, "Rule 23 control: disabling stealing must expose severe idle worker starvation ({ctrl_idle})");
+        assert!(ctrl_ticks > 100, "Rule 23 control: disabling stealing serializes all 64 jobs behind the giant job ({ctrl_ticks})");
+    }
+
+    #[test]
+    fn pre_export_checkpoint_survives_linker_failure_and_gc_and_control_loses_it() {
+        use core::time::Duration;
+        use blaze_cas::Key as CasKey;
+        use blaze_cas::plain::{GRACE_NS, LEASE_NS, Liveness, Settings as StoreSettings};
+        use blaze_core::FileName;
+        use blaze_core::sim::{Faults, Sim};
+        use blaze_ids::ContentId;
+        use blaze_keyed::kind::{Namespace, ReservedTag};
+        use blaze_ladder::code_records::{CodeClass, CodeStore};
+        use crate::store::plain_place::{Facts, config, open};
+
+        let run_with_linker_failure = |checkpoint_before_export: bool| -> (usize, usize, usize) {
+            let heap = blaze_own::testing::heap();
+            let alloc = heap.alloc();
+            let open_proc = |sim: Sim, nonce: u64| {
+                let mut cfg = config(FileName::new("store").expect("dir"), &StoreSettings::default(), Facts { boot: Some(1), nonce }, alloc);
+                cfg.liveness = Liveness::Reached;
+                open(sim, cfg, alloc).expect("open store")
+            };
+            let code_key = |tag: &'static str, n: u32| CodeKey(ContentId::of(tag, &n.to_le_bytes()));
+            let payload = |n: u32| -> std::vec::Vec<u8> {
+                (0..1024).map(|i| ((n as usize).wrapping_mul(97).wrapping_add(i) & 0xff) as u8).collect()
+            };
+            let content_key = |bytes: &[u8]| CodeKey(ContentId::of("pre-export checkpoint content", bytes));
+
+            let picked = run_package::Program {
+                package: "blaze-cli",
+                bin: "blaze",
+                manifest: "crates/blaze-cli/Cargo.toml",
+                root: "crates/blaze-cli/src/main.rs",
+                edition: "2024",
+            };
+            let ws_id = Some(ContentId::of("pre-export ws", b"blaze"));
+            let crate_key = blaze_id::CrateItemKey(ContentId::of("pre-export crate", b"blaze-cli"));
+            let ids_table = CasKey(ContentId::of("pre-export run_ids", b"table"));
+            let today = crate::start_list::Today {
+                certificate: crate::start_list::Certificate::for_tests([0x77; 32]),
+                name: crate::start_list::ListName::of(&build_program_shape(&picked, ws_id, crate_key)),
+                tables: [ids_table, ids_table],
+            };
+
+            let sim = Sim::new(91, Faults::default());
+            let lent = open_proc(sim, 1);
+            lent.put(&ids_table, Namespace::LOCAL, ReservedTag::Drive.tag(), b"run-ids-table").expect("put ids table");
+
+            let mut codes = HomeCodeStore::new(&lent);
+            for i in 0..6u32 {
+                let bytes = payload(i);
+                let ck = content_key(&bytes);
+                codes.put(CodeClass::Program, ck, &bytes).expect("put prog");
+                codes.point(CodeClass::Program, code_key("pre-export prog", i), ck).expect("point prog");
+            }
+            for i in 100..104u32 {
+                let bytes = payload(i);
+                let ck = content_key(&bytes);
+                codes.put(CodeClass::Toolchain, ck, &bytes).expect("put tool");
+                codes.point(CodeClass::Toolchain, code_key("pre-export tool", i), ck).expect("point tool");
+            }
+            let mut dep_typed_keys: std::vec::Vec<CasKey> = std::vec::Vec::new();
+            for i in 200..204u32 {
+                let key = blaze_drive::Key(ContentId::of("pre-export dep typed", &i.to_le_bytes()));
+                let bytes = payload(i);
+                let wrote = crate::engine_body_record::put_dep_typed_if_absent(&lent, key, &bytes).expect("put dep typed");
+                assert!(wrote);
+                dep_typed_keys.push(CasKey(key.0));
+            }
+
+            if checkpoint_before_export {
+                // Phase 3: checkpoint roots & commit BEFORE `blaze_export::export()` runs.
+                codes.ensure_persisted().expect("ensure persisted");
+                let mut walked = codes.reached();
+                walked.extend_from_slice(&dep_typed_keys);
+                let tool_made = codes.toolchain_made();
+                let kept = keep_export_roots(&lent, &today, blaze_toolchain::PINNED, &walked, &tool_made);
+                kept.program.expect("program root");
+                kept.toolchain.expect("toolchain root");
+                if lent.needs_commit() {
+                    lent.commit().expect("pre-export commit");
+                }
+            }
+            // Simulate `blaze_export::export()` failing with a linker error: `export_program`
+            // returns `Err(...)`, so `engine_check`'s closing `after_answer_printed_with` NEVER
+            // runs — `codes` and `lent` are simply dropped on error unwind!
+            drop(codes);
+            let mut sim = lent.into_store().into_driver();
+
+            // Advance past lease + grace and run two GC compaction rounds.
+            sim.advance(Duration::from_nanos(LEASE_NS.max(GRACE_NS)) + Duration::from_secs(60));
+            let gc1 = open_proc(sim, 2);
+            let _ = gc1.compact_foreground(32).expect("gc1");
+            let mut sim = gc1.into_store().into_driver();
+            sim.advance(Duration::from_nanos(GRACE_NS) + Duration::from_secs(60));
+            let gc2 = open_proc(sim, 3);
+            let _ = gc2.compact_foreground(32).expect("gc2");
+            let sim = gc2.into_store().into_driver();
+
+            // Reopen in the next `blaze build` and probe all compiled CodeRecords and Typed entries.
+            let verify = open_proc(sim, 4);
+            let codes = HomeCodeStore::new(&verify);
+            let mut prog_hits = 0usize;
+            for i in 0..6u32 {
+                if entry_of(&codes, code_key("pre-export prog", i)).expect("read prog") == Some(payload(i).as_slice()) {
+                    prog_hits += 1;
+                }
+            }
+            let mut tool_hits = 0usize;
+            for i in 100..104u32 {
+                if entry_of(&codes, code_key("pre-export tool", i)).expect("read tool") == Some(payload(i).as_slice()) {
+                    tool_hits += 1;
+                }
+            }
+            let mut typed_hits = 0usize;
+            for (idx, cas_key) in dep_typed_keys.iter().enumerate() {
+                if verify.get(cas_key).expect("read typed").is_some_and(|l| l.bytes == payload(200 + idx as u32).as_slice()) {
+                    typed_hits += 1;
+                }
+            }
+            (prog_hits, tool_hits, typed_hits)
+        };
+
+        let (prog, tool, typed) = run_with_linker_failure(true);
+        assert_eq!(prog, 6, "pre-export checkpoint must preserve all 6 program CodeRecords across linker failure + GC");
+        assert_eq!(tool, 4, "pre-export checkpoint must preserve all 4 toolchain CodeRecords across linker failure + GC");
+        assert_eq!(typed, 4, "pre-export checkpoint must preserve all 4 persisted dep Typed records across linker failure + GC");
+
+        let (ctrl_prog, ctrl_tool, ctrl_typed) = run_with_linker_failure(false);
+        assert_eq!(ctrl_prog, 0, "Rule 23 control: skipping pre-export checkpoint discards uncommitted program CodeRecords on linker failure");
+        assert_eq!(ctrl_tool, 0, "Rule 23 control: skipping pre-export checkpoint discards uncommitted toolchain CodeRecords on linker failure");
+        assert_eq!(ctrl_typed, 0, "Rule 23 control: skipping pre-export checkpoint discards uncommitted dep Typed records on linker failure");
     }
 }

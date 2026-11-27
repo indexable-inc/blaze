@@ -1331,7 +1331,7 @@ pub fn fuse_adjacent_loops<A: Allocator + Copy>(
             }
         }
 
-        verify(func.view()).map_err(SimplifyError::Verify)?;
+        crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
         cur = dead(func.view(), alloc)?;
         fused_count += 1;
     }
@@ -2342,7 +2342,7 @@ pub fn interchange_and_tile_loops<A: Allocator + Copy>(
     }
 
     let _ = (plan.outer_hdr, plan.inner_hdr, plan.inner_body, plan.outer_latch, plan.inner_iv_next);
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     let cleaned = dead(func.view(), alloc)?;
     Ok(LoopNestOutput {
         func: cleaned,

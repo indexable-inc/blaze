@@ -1038,7 +1038,7 @@ pub fn insert_software_prefetch<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(PrefetchOutput { func, stats })
 }
 

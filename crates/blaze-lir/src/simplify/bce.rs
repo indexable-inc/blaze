@@ -2848,7 +2848,7 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     let dce = dead(func.view(), alloc)?;
     let coalesced = coalesce_cfg(dce.view(), alloc)?;
     Ok(BceOutput {

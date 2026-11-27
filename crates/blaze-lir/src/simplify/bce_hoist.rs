@@ -3042,7 +3042,7 @@ fn version_loop_without_bounds_checks<A: Allocator + Copy>(
     apply_fixups(&mut func, fixups_fast.as_slice(), &val_map_fast);
     apply_fixups(&mut func, fixups_slow.as_slice(), &val_map_slow);
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     let cleaned = dead(func.view(), alloc)?;
     coalesce_cfg(cleaned.view(), alloc)
 }
@@ -3072,7 +3072,7 @@ pub fn hoist_loop_bounds_checks<A: Allocator + Copy>(
         stats.checks_hoisted = stats.checks_hoisted.saturating_add(hoisted_now);
     }
 
-    verify(cur.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(cur.view(), cur.allocator()).map_err(SimplifyError::Verify)?;
     Ok(BceHoistOutput { func: cur, stats })
 }
 

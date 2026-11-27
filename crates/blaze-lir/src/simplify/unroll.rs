@@ -1487,7 +1487,7 @@ pub fn unroll_scalar_loops<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(UnrollOutput {
         func,
         stats: UnrollStats { loops_unrolled: 1 },
@@ -2146,7 +2146,7 @@ fn rotate_one_loop<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(Some(func))
 }
 

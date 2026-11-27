@@ -1,8 +1,7 @@
 //! `memcpy`, `memmove` and `memset` (lib.rs, "Bulk memory"): inline for a constant length up
 //! to the bound, else a call of the system routine; and the copies of `byval` arguments.
 
-use alloc::vec::Vec;
-use alloc::{alloc::Allocator, alloc::Global};
+use alloc::alloc::Allocator;
 
 use blaze_lir::{Op, Value};
 
@@ -133,7 +132,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
             Some(n) if n <= self.inline_most => {
                 self.ld(X9, a);
                 self.ld(X10, b);
-                let mut to_end: Vec<u32, Global> = Vec::new_in(Global);
+                let mut to_end: blaze_own::AVec<'_, u32> = blaze_own::AVec::new_in(self.scratch);
                 for (off, size) in pieces(n) {
                     // (`mem` takes `FAR`, `x16`, for an offset past its immediates, never `x0`, `x1`.)
                     self.mem(true, size, X0, X9, off as i32);

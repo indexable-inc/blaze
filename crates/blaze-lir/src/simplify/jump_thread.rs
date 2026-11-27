@@ -2578,7 +2578,7 @@ fn rewrite_two_valued_switches<A: Allocator + Copy>(
         });
     }
     if cfg!(debug_assertions) {
-        verify(func.view()).map_err(SimplifyError::Verify)?;
+        crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     }
     Ok(func)
 }
@@ -3506,7 +3506,7 @@ fn apply_round<A: Allocator + Copy>(
         return Err(SimplifyError::Refused { inst: 0, what: "an output past LIR's columns in jump_thread" });
     }
     if cfg!(debug_assertions) {
-        verify(func.view()).map_err(SimplifyError::Verify)?;
+        crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     }
     Ok(func)
 }
@@ -3710,7 +3710,7 @@ pub fn thread_jumps<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Fun
         any_coalesced = true;
     }
 
-    verify(cur.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(cur.view(), cur.allocator()).map_err(SimplifyError::Verify)?;
     Ok(cur)
 }
 

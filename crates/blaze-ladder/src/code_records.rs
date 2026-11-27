@@ -521,7 +521,7 @@ pub fn make_entry<'a, 'd>(
     isa: Isa,
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, u8>, CodeRecordError> {
-    make_entry_reading(func, names, routines, declared, &ReadList::empty(), isa, alloc)
+    make_entry_reading(func, names, routines, declared, &ReadList::empty(alloc), isa, alloc)
 }
 
 /// [`make_entry`] with the build's read list `reads` ([`reads::ReadLog::seal`]).
@@ -530,7 +530,7 @@ pub fn make_entry_reading<'a, 'd>(
     names: &InstanceNames<'_>,
     routines: crate::front2::builtins_shim::Routines<'d>,
     declared: &mut AVec<'_, Declared<'d>>,
-    reads: &ReadList,
+    reads: &ReadList<'_>,
     isa: Isa,
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, u8>, CodeRecordError> {
@@ -550,7 +550,7 @@ pub fn make_entry_with_vtables<'a, 'd>(
     vtables: &mut AVec<'_, VtableDatum<'_>>,
     routines: crate::front2::builtins_shim::Routines<'d>,
     declared: &mut AVec<'_, Declared<'d>>,
-    reads: &ReadList,
+    reads: &ReadList<'_>,
     traps: &[TrapSource],
     isa: Isa,
     alloc: Alloc<'a>,

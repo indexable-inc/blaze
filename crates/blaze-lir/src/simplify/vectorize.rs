@@ -3225,7 +3225,7 @@ fn emit_prefix_scan_loop<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(VectorizeOutput {
         func,
         stats: VectorizeStats { loops_vectorized: 1 },
@@ -4304,7 +4304,7 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(VectorizeOutput {
         func,
         stats: VectorizeStats { loops_vectorized: 1 },
@@ -5387,7 +5387,7 @@ pub fn vectorize_iv_div_loops<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(VectorizeOutput {
         func,
         stats: VectorizeStats { loops_vectorized: 1 },
