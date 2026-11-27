@@ -100,6 +100,23 @@ impl<'a, S: Strategy> Fulfill<'a, S> {
         self.alloc
     }
 
+    /// Resets the queue and wake tables while retaining buffer capacities for reuse across
+    /// `select` calls inside one body's bump frame.
+    pub fn clear(&mut self) {
+        self.goal.clear();
+        self.state.clear();
+        self.stamp.clear();
+        self.ready.clear();
+        self.batch.clear();
+        self.queued.clear();
+        self.wait_head.clear();
+        self.wait_ob.clear();
+        self.wait_next.clear();
+        self.cursor = 0;
+        self.work.clear();
+        self.vars.clear();
+    }
+
     /// Adds an obligation; it is evaluated on the next `select`.
     pub fn register(&mut self, g: Goal) -> Result<u32, SolveError> {
         let id = crate::error::row(self.goal.len())?;
@@ -216,6 +233,29 @@ impl<'a, S: Strategy> Fulfill<'a, S> {
         mode: TypingMode,
         reads: &mut Vec<Read, Alloc<'a>>,
     ) -> Result<(), Stop> {
+        self.select_from_opt(solver, tys, src, mode, Some(reads))
+    }
+
+    /// Like [`Fulfill::select_from`], without exporting solver reads into a caller `Vec<Read>`
+    /// (used by typeck where `src` records reads directly and the exported read log is discarded).
+    pub fn select_from_quiet<T: Tys, Src: crate::facts::Source<T>>(
+        &mut self,
+        solver: &mut Solver<'a>,
+        tys: &mut T,
+        src: &mut Src,
+        mode: TypingMode,
+    ) -> Result<(), Stop> {
+        self.select_from_opt(solver, tys, src, mode, None)
+    }
+
+    fn select_from_opt<T: Tys, Src: crate::facts::Source<T>>(
+        &mut self,
+        solver: &mut Solver<'a>,
+        tys: &mut T,
+        src: &mut Src,
+        mode: TypingMode,
+        mut reads: Option<&mut Vec<Read, Alloc<'a>>>,
+    ) -> Result<(), Stop> {
         for _ in 0..MAX_PASSES {
             if S::WAKE {
                 self.wake(&*tys);
@@ -239,7 +279,10 @@ impl<'a, S: Strategy> Fulfill<'a, S> {
                 let g = self.goal[ob as usize];
                 self.evaluations += 1;
                 self.stamp[ob as usize] += 1;
-                let a = solver.evaluate_from(tys, src, mode, g, reads)?;
+                let a = match reads.as_deref_mut() {
+                    Some(r) => solver.evaluate_from(tys, src, mode, g, r)?,
+                    None => solver.evaluate_from_quiet(tys, src, mode, g)?,
+                };
                 self.state[ob as usize] = match a {
                     Answer::Yes => State::Holds,
                     Answer::No => State::Fails,

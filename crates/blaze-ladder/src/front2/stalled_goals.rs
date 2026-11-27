@@ -328,17 +328,44 @@ pub fn decide_stalled_goals<'n, 'a, S: NamesSource<'n>>(
     for _ in 0..MOST_ROUNDS {
         r.store.hidden.set_leaking(&leaks);
         let mut failed_fields = AVec::new_in(alloc);
-        let (got, fills, gaps) = {
-            let tys = match body.tys.view(&r.store.tys) {
-                Ok(t) => t,
-                Err(error) => return check(error),
-            };
-            let view = body.typeck.view(tys);
-            let world = world_at(r, &scope);
-            let got = done.decide_stalled_with_storage(&view, out, &interiors.exact, &world, alloc, |d, block, field| {
-                failed_fields.push((d, block, field));
-            });
-            (got, world.fills.into_inner(), world.gaps.into_inner())
+        let taken = match r.store.round_scratch.take() {
+            Some(frame) => Ok(frame),
+            None => blaze_mem::Frame::with_reserve(1 << 30, blaze_mem::Tag::Infer),
+        };
+        let round_res = match taken {
+            Ok(mut rf) => {
+                let res = rf.scope(|frame| {
+                    let erased = blaze_own::Erased::new(frame);
+                    let tys = match body.tys.view(&r.store.tys) {
+                        Ok(t) => t,
+                        Err(error) => return Err(error),
+                    };
+                    let view = body.typeck.view(tys);
+                    let world = world_at(r, &scope);
+                    let got = done.decide_stalled_with_storage_in(&view, out, &interiors.exact, &world, erased.handle(), alloc, |d, block, field| {
+                        failed_fields.push((d, block, field));
+                    });
+                    Ok((got, world.fills.into_inner(), world.gaps.into_inner()))
+                });
+                r.store.round_scratch = Some(rf);
+                res
+            }
+            Err(_) => {
+                let tys = match body.tys.view(&r.store.tys) {
+                    Ok(t) => t,
+                    Err(error) => return check(error),
+                };
+                let view = body.typeck.view(tys);
+                let world = world_at(r, &scope);
+                let got = done.decide_stalled_with_storage_in(&view, out, &interiors.exact, &world, alloc, alloc, |d, block, field| {
+                    failed_fields.push((d, block, field));
+                });
+                Ok((got, world.fills.into_inner(), world.gaps.into_inner()))
+            }
+        };
+        let (got, fills, gaps) = match round_res {
+            Ok(triple) => triple,
+            Err(error) => return check(error),
         };
         // A failed candidate makes the decision no answer, as it makes a check's.
         if !gaps.is_empty() {

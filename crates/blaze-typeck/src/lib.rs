@@ -81,7 +81,7 @@ mod toy;
 
 use blaze_own::Alloc;
 
-pub use infer::{InferCtx, InferSnapshot};
+pub use infer::{InferCtx, InferCtxIn, InferSnapshot};
 pub use replay::{Replay, replay};
 pub use instance::{ResolveError, Resolved, holds, normalize_projection, resolve_instance, select_impl};
 pub use drop_impl::adt_drop_impl;

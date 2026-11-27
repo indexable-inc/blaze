@@ -162,6 +162,16 @@ pub struct Scratch<'a> {
     /// On only while `Solver::why_no` runs, so a rule notes what only its chain reads (a
     /// negative impl naming the goal's type: trait_goals.rs `step_impl`). Not a shortcut.
     pub(crate) why_no: bool,
+    /// Reusable per-step buffers so structural and trait-goal steps do not allocate fresh
+    /// temporary `Vec`s into the body's bump frame on every solver step.
+    pub(crate) auto_tys: Vec<Ty, Alloc<'a>>,
+    pub(crate) auto_reach: Vec<crate::why_no::Reach, Alloc<'a>>,
+    pub(crate) auto_params: Vec<u32, Alloc<'a>>,
+    pub(crate) auto_opaque: Vec<u32, Alloc<'a>>,
+    pub(crate) wf_preds: Vec<crate::term::Pred, Alloc<'a>>,
+    pub(crate) wf_kids: Vec<Ty, Alloc<'a>>,
+    pub(crate) impl_keep: Vec<u32, Alloc<'a>>,
+    pub(crate) prematch_work: Vec<(Ty, Ty), Alloc<'a>>,
 }
 
 impl<'a> Scratch<'a> {
@@ -178,6 +188,14 @@ impl<'a> Scratch<'a> {
             auto: crate::auto_summary::Summaries::new_in(alloc),
             off: crate::eval::Off { summaries: false, prematch: false, memo: false },
             why_no: false,
+            auto_tys: Vec::new_in(alloc),
+            auto_reach: Vec::new_in(alloc),
+            auto_params: Vec::new_in(alloc),
+            auto_opaque: Vec::new_in(alloc),
+            wf_preds: Vec::new_in(alloc),
+            wf_kids: Vec::new_in(alloc),
+            impl_keep: Vec::new_in(alloc),
+            prematch_work: Vec::new_in(alloc),
         }
     }
 
