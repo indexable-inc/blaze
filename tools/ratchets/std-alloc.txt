@@ -27,7 +27,7 @@ blaze-cas	85	1	4	392
 blaze-cbor	0	0	1	0
 blaze-cc	0	0	4	3
 blaze-check	72	1	0	107
-blaze-cli	714	1	0	484
+blaze-cli	723	1	0	491
 blaze-columns	29	0	1	23
 blaze-comptime/rungs/derive-hello	0	1	0	0
 blaze-cond	1	0	0	11
@@ -63,10 +63,10 @@ blaze-inproc-rt	0	1	0	0
 blaze-json	0	0	2	0
 blaze-keyed	0	0	13	291
 blaze-kit	12	0	13	30
-blaze-ladder	308	1	2	1491
+blaze-ladder	308	1	2	1493
 blaze-launch	0	0	15	58
 blaze-launch-rt	91	1	1	159
-blaze-launcher	57	1	0	13
+blaze-launcher	59	1	0	18
 blaze-lex	14	0	0	16
 blaze-lint	17	0	0	31
 blaze-lint-defs	0	0	3	16
