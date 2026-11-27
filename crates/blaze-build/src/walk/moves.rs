@@ -473,10 +473,10 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     }
 
     /// Binding `p` (of type `g`, needing drop) binds its part by value: the part moves out of
-    /// the scrutinee, its bit cleared. Outside a match that owns its scrutinee (an `if let`,
-    /// a `let`-`else`) refused by name. `alt`: `p` is an or-alternative's, bound on that
-    /// alternative's own pass, so its effect is a store on that path (a bit cleared), never a
-    /// fact of the walk (a whole local's move, `moved`, is path-blind: refused there).
+    /// the scrutinee, its bit cleared. Outside a match that owns its scrutinee, refused by name.
+    /// `alt`: `p` is an or-alternative's, bound on that alternative's own pass, so its effect is
+    /// a store on that path (a field bit cleared, or the whole local's runtime drop flag cleared
+    /// via `set_flag`), never a path-blind walk state mutation (`self.init` / `self.definitely_uninit`).
     pub(super) fn move_out(&mut self, p: PatId, g: PTy, alt: bool) -> Result<(), BuildError> {
         let Some(cx) = self.moves.cx else { return Err(BuildError::UnsupportedPat { pat: p, what: MOVE_OUT }) };
         // A guarded arm's move is held until its guard passed (`Pending`).
@@ -520,7 +520,17 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 // The whole local moves (its flag, set by `scan_flags`).
                 self.moves.steps.truncate(start as usize);
                 if alt {
-                    return Err(BuildError::UnsupportedPat { pat: p, what: "a by-value binding of a whole local scrutinee inside an or-pattern" });
+                    if cx.guarded {
+                        return Err(BuildError::UnsupportedPat {
+                            pat: p,
+                            what: "a by-value binding of a part that needs drop in an or-pattern of a guarded arm",
+                        });
+                    }
+                    if !self.has_drop_flag(x) {
+                        return Err(malformed("a whole local moved inside an or-pattern without a drop flag (`scan_flags`)"));
+                    }
+                    self.set_flag(x, false);
+                    return Ok(());
                 }
                 return self.arm_effect(Pending::Moved { expr: cx.root.expr, x }, cx.guarded);
             }
@@ -1504,6 +1514,30 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         Ok(())
     }
 
+    /// Whether pattern `p` binds the whole matched value by value — directly (`x` / `x @ sub`)
+    /// or at the top level of any alternative of a (possibly nested) or-pattern
+    /// (`x @ A(_) | x @ B(_)`).
+    pub(in crate::walk) fn binds_whole_by_value(&self, p: PatId) -> Result<bool, BuildError> {
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
+        todo.push(p);
+        while let Some(q) = todo.pop() {
+            match self.pat(q)? {
+                Pat::Bind { ann, sub, .. } => {
+                    if ann.by_ref.is_none() {
+                        return Ok(true);
+                    }
+                    todo.extend(sub);
+                }
+                Pat::Or { alts } => {
+                    let subs = self.body.pat_lists.get(alts.range()).ok_or(malformed("an or-pattern past `pat_lists`"))?;
+                    todo.extend_from_slice(subs);
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
     /// Whether some binding strictly inside pattern `p` binds by value (`scan_flags`: a
     /// `match` on a local with such an arm may move a part out, so the local gets field
     /// flags).
@@ -1516,12 +1550,16 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 if !root && ann.by_ref.is_none() {
                     return Ok(true);
                 }
-                todo.extend(sub.map(|s| (s, false)));
+                todo.extend(sub.map(|s| (s, root)));
                 continue;
             }
             match pat {
                 Pat::Ref { inner, .. } => todo.push((inner, false)),
-                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } | Pat::Or { alts: elems } => {
+                Pat::Or { alts } => {
+                    let subs = self.body.pat_lists.get(alts.range()).ok_or(malformed("an or-pattern past `pat_lists`"))?;
+                    todo.extend(subs.iter().map(|&s| (s, root)));
+                }
+                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } => {
                     let subs = self.body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
                     todo.extend(subs.iter().map(|&s| (s, false)));
                 }
@@ -1547,10 +1585,10 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             return Ok(());
         }
         let Some(x) = self.local_of(scrutinee)? else { return Ok(()) };
-        let whole = matches!(self.body.pats.get(pat.ix()), Some(Pat::Bind { ann, .. }) if ann.by_ref.is_none());
-        if whole {
+        if self.binds_whole_by_value(pat)? {
             *self.needs_flag.get_mut(x.ix()).ok_or(malformed("a local past `pats`"))? = true;
-        } else if self.moves_deep(pat)? {
+        }
+        if self.moves_deep(pat)? {
             *self.partial.get_mut(x.ix()).ok_or(malformed("a local past `pats`"))? = true;
         }
         Ok(())
