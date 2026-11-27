@@ -1234,7 +1234,7 @@ pub(crate) fn check_misel_subset(
                     && view.ty(a) == res_ty
                     && view.ty(b) == res_ty
                     && matches!(res_ty.lanes(), 2 | 4 | 8 | 16)
-                    && mask.len() == res_ty.lanes() as usize
+                    && usize::try_from(res_ty.lanes()).is_ok_and(|n| mask.len() == n)
                     && mask.iter().all(|&m| m < 2 * res_ty.lanes());
                 if !ok {
                     return Err(refuse(Some(inst), "shuffle on unsupported vector type"));
@@ -2367,50 +2367,90 @@ impl<'a, 'v> Selector<'a, 'v> {
 
     /// Evaluates a compile-time constant uniform integer vector splat (including constant-folded
     /// `And`/`Or`/`Xor`/`Add`/`Sub`/`Neg` chains like `Simd::rotate_right`'s `Splat(12) & Splat(31)`).
-    fn const_vec_splat_u64(&self, val: Value, elem_bits: u64, depth: u8) -> Option<u64> {
-        if depth > 4 {
-            return None;
+    fn const_vec_splat_u64(&self, root: Value, elem_bits: u64, start_depth: u8) -> Option<u64> {
+        enum Step {
+            Eval(Value, u8),
+            Neg,
+            Bin(Op),
         }
         let mask = if elem_bits >= 64 { u64::MAX } else { (1u64 << elem_bits) - 1 };
-        let idx = val.index();
-        match self.view.op(idx) {
-            Op::Splat => {
-                let scalar = self.view.operands(idx).value();
-                self.const_u64.get(scalar.index()).copied().flatten().map(|k| k & mask)
-            }
-            Op::Bitcast => {
-                let inner = self.view.operands(idx).value();
-                let ity = self.view.ty(inner);
-                if matches!(ity.form(), blaze_lir::ty::Form::Vector)
-                    && u64::from(ity.elem().bits(64)) == elem_bits
-                {
-                    self.const_vec_splat_u64(inner, elem_bits, depth + 1)
-                } else {
-                    None
+        let mut work = [const { None::<Step> }; 32];
+        let mut wlen = 0usize;
+        let mut vals = [0u64; 32];
+        let mut vlen = 0usize;
+        if let Some(slot) = work.get_mut(wlen) {
+            *slot = Some(Step::Eval(root, start_depth));
+            wlen += 1;
+        }
+        while wlen > 0 {
+            wlen -= 1;
+            let step = work.get_mut(wlen)?.take()?;
+            match step {
+                Step::Eval(val, depth) => {
+                    if depth > 4 {
+                        return None;
+                    }
+                    let idx = val.index();
+                    match self.view.op(idx) {
+                        Op::Splat => {
+                            let scalar = self.view.operands(idx).value();
+                            let k = self.const_u64.get(scalar.index()).copied().flatten()?;
+                            *vals.get_mut(vlen)? = k & mask;
+                            vlen += 1;
+                        }
+                        Op::Bitcast => {
+                            let inner = self.view.operands(idx).value();
+                            let ity = self.view.ty(inner);
+                            if matches!(ity.form(), blaze_lir::ty::Form::Vector)
+                                && u64::from(ity.elem().bits(64)) == elem_bits
+                            {
+                                *work.get_mut(wlen)? = Some(Step::Eval(inner, depth + 1));
+                                wlen += 1;
+                            } else {
+                                return None;
+                            }
+                        }
+                        Op::Neg => {
+                            let a = self.view.operands(idx).value();
+                            *work.get_mut(wlen)? = Some(Step::Neg);
+                            wlen += 1;
+                            *work.get_mut(wlen)? = Some(Step::Eval(a, depth + 1));
+                            wlen += 1;
+                        }
+                        op @ (Op::And | Op::Or | Op::Xor | Op::Add | Op::Sub) => {
+                            let mut o = self.view.operands(idx);
+                            let a = o.value();
+                            let b = o.value();
+                            *work.get_mut(wlen)? = Some(Step::Bin(op));
+                            wlen += 1;
+                            *work.get_mut(wlen)? = Some(Step::Eval(b, depth + 1));
+                            wlen += 1;
+                            *work.get_mut(wlen)? = Some(Step::Eval(a, depth + 1));
+                            wlen += 1;
+                        }
+                        _ => return None,
+                    }
+                }
+                Step::Neg => {
+                    let x = *vals.get(vlen.checked_sub(1)?)?;
+                    *vals.get_mut(vlen - 1)? = 0u64.wrapping_sub(x) & mask;
+                }
+                Step::Bin(op) => {
+                    let bv = *vals.get(vlen.checked_sub(1)?)?;
+                    vlen -= 1;
+                    let av = *vals.get(vlen.checked_sub(1)?)?;
+                    let res = match op {
+                        Op::And => av & bv,
+                        Op::Or => av | bv,
+                        Op::Xor => av ^ bv,
+                        Op::Add => av.wrapping_add(bv),
+                        _ => av.wrapping_sub(bv),
+                    };
+                    *vals.get_mut(vlen - 1)? = res & mask;
                 }
             }
-            Op::Neg => {
-                let a = self.view.operands(idx).value();
-                self.const_vec_splat_u64(a, elem_bits, depth + 1)
-                    .map(|x| 0u64.wrapping_sub(x) & mask)
-            }
-            Op::And | Op::Or | Op::Xor | Op::Add | Op::Sub => {
-                let mut o = self.view.operands(idx);
-                let a = o.value();
-                let b = o.value();
-                let av = self.const_vec_splat_u64(a, elem_bits, depth + 1)?;
-                let bv = self.const_vec_splat_u64(b, elem_bits, depth + 1)?;
-                let res = match self.view.op(idx) {
-                    Op::And => av & bv,
-                    Op::Or => av | bv,
-                    Op::Xor => av ^ bv,
-                    Op::Add => av.wrapping_add(bv),
-                    _ => av.wrapping_sub(bv),
-                };
-                Some(res & mask)
-            }
-            _ => None,
         }
+        (vlen == 1).then(|| vals[0])
     }
 
     /// Allocates (or reuses a forward-preallocated) destination `VReg` for LIR instruction `inst`.
@@ -5905,27 +5945,29 @@ impl<'a, 'v> Selector<'a, 'v> {
                 let a = o.value();
                 let b = o.value();
                 let mask = o.mask();
-                let lanes = res_ty.lanes() as usize;
+                let lanes = usize::try_from(res_ty.lanes()).unwrap_or(1);
                 let stride = 16 / lanes;
                 let mut byte_idx = [0u8; 16];
                 for (li, &src_lane) in mask.iter().enumerate() {
-                    let src_base = (src_lane as usize) * stride;
+                    let src_base = usize::try_from(src_lane).unwrap_or(0) * stride;
                     for k in 0..stride {
-                        byte_idx[li * stride + k] = (src_base + k) as u8;
+                        if let (Ok(v), Some(slot)) = (u8::try_from(src_base + k), byte_idx.get_mut(li * stride + k)) {
+                            *slot = v;
+                        }
                     }
                 }
                 let ar = self.get_val(a, false);
                 let br = self.get_val(b, false);
 
                 // Fast paths: exact identity of `a` or `b` -> 0 instructions.
-                let is_id_a = byte_idx.iter().enumerate().all(|(k, &v)| v == k as u8);
-                let is_id_b = byte_idx.iter().enumerate().all(|(k, &v)| v == (16 + k) as u8);
+                let is_id_a = byte_idx.iter().zip(0u8..16).all(|(&v, k)| v == k);
+                let is_id_b = byte_idx.iter().zip(16u8..32).all(|(&v, k)| v == k);
                 if is_id_a {
                     self.bind_alias_vreg(inst, ar, res_ty);
                 } else if is_id_b {
                     self.bind_alias_vreg(inst, br, res_ty);
                 } else if byte_idx[0] < 16
-                    && byte_idx.iter().enumerate().all(|(k, &v)| v == byte_idx[0] + k as u8)
+                    && byte_idx.iter().zip(0u8..16).all(|(&v, k)| v == byte_idx[0] + k)
                 {
                     // Contiguous shift across `a || b` -> single `ext vd.16b, va.16b, vb.16b, #imm4`.
                     let dst = self.alloc_res_vreg(inst, res_ty);
@@ -5942,8 +5984,8 @@ impl<'a, 'v> Selector<'a, 'v> {
                 } else if byte_idx[0] >= 16
                     && byte_idx
                         .iter()
-                        .enumerate()
-                        .all(|(k, &v)| v == (((byte_idx[0] as usize) + k) % 32) as u8)
+                        .zip(0u8..16)
+                        .all(|(&v, k)| v == (byte_idx[0] + k) % 32)
                 {
                     // Contiguous shift across `b || a` -> single `ext vd.16b, vb.16b, va.16b, #imm4`.
                     let dst = self.alloc_res_vreg(inst, res_ty);
@@ -5965,11 +6007,7 @@ impl<'a, 'v> Selector<'a, 'v> {
                         let (src_reg, idx_bytes) = if all_a {
                             (ar, byte_idx)
                         } else {
-                            let mut b_idx = [0u8; 16];
-                            for k in 0..16 {
-                                b_idx[k] = byte_idx[k] - 16;
-                            }
-                            (br, b_idx)
+                            (br, byte_idx.map(|v| v.saturating_sub(16)))
                         };
                         // 1-instruction NEON in-register reverses (zero index register, 1 cycle):
                         // - `rev32.8h`  (u32 ror16, BLAKE3): [2,3,0,1, 6,7,4,5, 10,11,8,9, 14,15,12,13]
@@ -6029,11 +6067,11 @@ impl<'a, 'v> Selector<'a, 'v> {
                         // allocator constraints!
                         let mut a_idx = [0xffu8; 16];
                         let mut b_idx = [0xffu8; 16];
-                        for k in 0..16 {
-                            if byte_idx[k] < 16 {
-                                a_idx[k] = byte_idx[k];
+                        for ((&v, a_slot), b_slot) in byte_idx.iter().zip(a_idx.iter_mut()).zip(b_idx.iter_mut()) {
+                            if v < 16 {
+                                *a_slot = v;
                             } else {
-                                b_idx[k] = byte_idx[k] - 16;
+                                *b_slot = v - 16;
                             }
                         }
                         let va_idx = self.materialize_vec16_bytes(a_idx);

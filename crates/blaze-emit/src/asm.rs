@@ -363,7 +363,7 @@ impl<'out, 'syms, 's, A: Allocator> Assembler<'out, 'syms, 's, A> {
                 self.code.extend_from_slice(&word.to_le_bytes());
             }
             table::Instruction::SymCall { sym, link } => {
-                let Some(&target) = self.syms.get(sym as usize) else {
+                let Some(&target) = usize::try_from(sym).ok().and_then(|i| self.syms.get(i)) else {
                     return Err(AsmError { line, why: "a `sym` operand index out of range", token: AsmToken::of(text) });
                 };
                 let at = u32::try_from(self.code.len())

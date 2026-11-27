@@ -212,7 +212,7 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
             if let Some((vt, chunks)) = super::simd::native_vec128_chunks(&l) {
                 let out = super::simd::temp_vec(s, &l);
                 for c in 0..chunks {
-                    let off = (c * 16) as i32;
+                    let off = super::simd::chunk_off(c);
                     let a = super::simd::load_vec128_at(s, &l, vt, x, off);
                     let b = super::simd::load_vec128_at(s, &l, vt, y, off);
                     let r = s.b.binary(lop, Flags::IN_RANGE, a, b);
@@ -357,12 +357,15 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
                 // cast to `Simd<u32, 32>`): lower lane-by-lane with scalar conversions.
                 let from_lane = lir(l.elem).0;
                 let to_lane = lir(m.elem).0;
-                let slot = s.b.slot(m.size as u32, m.align, SlotKind::Temp);
+                let size = u32::try_from(m.size).map_err(|_| shape("vector too large"))?;
+                let slot = s.b.slot(size, m.align, SlotKind::Temp);
                 let dst = s.b.slot_addr(slot);
                 for i in 0..l.count {
-                    let a = s.b.load(from_lane, Flags::NONE, x, (i * l.stride) as i32, MemAttrs::aligned(l.elem.align()));
+                    let src_off = i32::try_from(i * l.stride).map_err(|_| shape("vector offset overflow"))?;
+                    let dst_off = i32::try_from(i * m.stride).map_err(|_| shape("vector offset overflow"))?;
+                    let a = s.b.load(from_lane, Flags::NONE, x, src_off, MemAttrs::aligned(l.elem.align()));
                     let r = convert_val(s, to_lane, a)?;
-                    s.b.store(Flags::NONE, r, dst, (i * m.stride) as i32, MemAttrs::aligned(m.elem.align()));
+                    s.b.store(Flags::NONE, r, dst, dst_off, MemAttrs::aligned(m.elem.align()));
                 }
                 Out::At(dst)
             }
@@ -387,18 +390,22 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
                 (super::simd::native_vec128_chunks(&l), super::simd::native_vec128_chunks(&r))
                 && (in_chunks > 1 || out_chunks > 1)
                 && vt == rt
+                && let (Ok(chunk_lanes_usize), Ok(out_chunks_usize), Ok(in_c)) =
+                    (usize::try_from(rt.lanes()), usize::try_from(out_chunks), u32::try_from(in_chunks))
             {
                 let chunk_lanes = rt.lanes();
-                let chunk_lanes_usize = chunk_lanes as usize;
                 let mut plan: [(u32, u32, [u32; 16]); 4] = [(0, 0, [0; 16]); 4];
-                let mut can_chunk = out_chunks <= 4 && chunk_lanes_usize <= 16;
+                let mut can_chunk = out_chunks_usize <= 4 && chunk_lanes_usize <= 16;
                 if can_chunk {
-                    for oc in 0..out_chunks as usize {
+                    for oc in 0..out_chunks_usize {
                         let mut c0: Option<u32> = None;
                         let mut c1: Option<u32> = None;
                         let mut sub = [0u32; 16];
                         for k in 0..chunk_lanes_usize {
-                            let src_lane = mask[oc * chunk_lanes_usize + k];
+                            let Some(&src_lane) = mask.get(oc * chunk_lanes_usize + k) else {
+                                can_chunk = false;
+                                break;
+                            };
                             let sc = src_lane / chunk_lanes;
                             let sl = src_lane % chunk_lanes;
                             let mapped = if c0 == Some(sc) {
@@ -415,42 +422,50 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
                                 can_chunk = false;
                                 break;
                             };
-                            sub[k] = mapped;
+                            if let Some(slot) = sub.get_mut(k) {
+                                *slot = mapped;
+                            }
                         }
                         if !can_chunk {
                             break;
                         }
                         let a_chunk = c0.unwrap_or(0);
                         let b_chunk = c1.unwrap_or(a_chunk);
-                        plan[oc] = (a_chunk, b_chunk, sub);
+                        if let Some(slot) = plan.get_mut(oc) {
+                            *slot = (a_chunk, b_chunk, sub);
+                        }
                     }
                 }
                 if can_chunk {
                     let out = super::simd::temp_vec(s, &r);
-                    let in_c = in_chunks as u32;
                     let mut loaded: [Option<Value>; 8] = [None; 8];
                     let load_src_chunk = |s: &mut B<'_, '_, '_, '_, LA, S, A>,
                                           loaded: &mut [Option<Value>; 8],
                                           sc: u32|
                      -> Value {
-                        if let Some(v) = loaded[sc as usize] {
+                        let sc_ix = usize::try_from(sc).ok();
+                        if let Some(Some(v)) = sc_ix.and_then(|i| loaded.get(i).copied()) {
                             return v;
                         }
                         let (base, off) = if sc < in_c {
-                            (x, (sc * 16) as i32)
+                            (x, super::simd::chunk_off(u64::from(sc)))
                         } else {
-                            (y, ((sc - in_c) * 16) as i32)
+                            (y, super::simd::chunk_off(u64::from(sc - in_c)))
                         };
                         let v = super::simd::load_vec128_at(s, &l, vt, base, off);
-                        loaded[sc as usize] = Some(v);
+                        if let Some(slot) = sc_ix.and_then(|i| loaded.get_mut(i)) {
+                            *slot = Some(v);
+                        }
                         v
                     };
-                    for oc in 0..out_chunks as usize {
-                        let (a_chunk, b_chunk, sub) = plan[oc];
+                    for (oc, &(a_chunk, b_chunk, sub)) in plan.iter().take(out_chunks_usize).enumerate() {
                         let va = load_src_chunk(s, &mut loaded, a_chunk);
                         let vb = load_src_chunk(s, &mut loaded, b_chunk);
-                        let v = s.b.shuffle(rt, va, vb, &sub[..chunk_lanes_usize]);
-                        super::simd::store_vec128_at(s, &r, v, out, (oc * 16) as i32);
+                        if let Some(sub_slice) = sub.get(..chunk_lanes_usize) {
+                            let v = s.b.shuffle(rt, va, vb, sub_slice);
+                            let off = u64::try_from(oc).map_or(0, super::simd::chunk_off);
+                            super::simd::store_vec128_at(s, &r, v, out, off);
+                        }
                     }
                     return Ok(Out::At(out));
                 }
@@ -526,7 +541,8 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
                     (s.b.load(lane, Flags::NONE, x, 0, MemAttrs::aligned(l.elem.align())), 1u64)
                 };
                 for i in first_lane..l.count {
-                    let v = s.b.load(lane, Flags::NONE, x, (i * l.stride) as i32, MemAttrs::aligned(l.elem.align()));
+                    let off = i32::try_from(i * l.stride).map_err(|_| shape("vector offset overflow"))?;
+                    let v = s.b.load(lane, Flags::NONE, x, off, MemAttrs::aligned(l.elem.align()));
                     acc = s.b.binary(binop, flags, acc, v);
                 }
                 Out::Scalar(acc)

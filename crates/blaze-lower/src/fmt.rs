@@ -261,9 +261,11 @@ impl Machine<'_, '_, '_, '_> {
                         for count in [parsed.width, parsed.precision].into_iter().flatten() {
                             match count {
                                 crate::typeck::Count::Name(word) => {
-                                    let start = word.as_ptr() as usize - spec_text.as_ptr() as usize;
+                                    let start = word.as_ptr().addr() - spec_text.as_ptr().addr();
                                     let (ws, we) = (spec_v.start + start, spec_v.start + start + word.len());
-                                    self.fmt_named(&written, &mut captured, &text[ws..we], Range::new(at(ws), at(we)));
+                                    if let Some(name) = text.get(ws..we) {
+                                        self.fmt_named(&written, &mut captured, name, Range::new(at(ws), at(we)));
+                                    }
                                 }
                                 crate::typeck::Count::Star => next += 1,
                                 crate::typeck::Count::Index(_) => {}
@@ -271,17 +273,19 @@ impl Machine<'_, '_, '_, '_> {
                         }
                     } else {
                         for (d, _) in spec_text.match_indices('$') {
-                            let before = &spec_text[..d];
+                            let Some(before) = spec_text.get(..d) else { continue };
                             let start = before
                                 .char_indices()
                                 .rev()
                                 .take_while(|(_, c)| c.is_alphanumeric() || *c == '_')
                                 .last()
                                 .map_or(d, |(s, _)| s);
-                            let word = &before[start..];
+                            let Some(word) = before.get(start..) else { continue };
                             if word.chars().next().is_some_and(|c| !c.is_ascii_digit()) {
                                 let (ws, we) = (spec_v.start + start, spec_v.start + d);
-                                self.fmt_named(&written, &mut captured, &text[ws..we], Range::new(at(ws), at(we)));
+                                if let Some(name) = text.get(ws..we) {
+                                    self.fmt_named(&written, &mut captured, name, Range::new(at(ws), at(we)));
+                                }
                             }
                         }
                         if spec_text.contains(".*") {

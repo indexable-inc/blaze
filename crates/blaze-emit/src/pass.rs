@@ -182,15 +182,17 @@ pub(crate) fn run<A: Allocator>(
     if view.head.ptr_bits != 64 {
         return Err(EmitError::Signature { why: "a target whose pointers are not 64 bits" });
     }
-    let sig = view.sigs.get(view.head.sig as usize).map(|_| view.sig(SigId(view.head.sig)));
-    let Some(sig) = sig else { return Err(EmitError::Signature { why: "no signature row" }) };
+    let Some(&sig_rec) = usize::try_from(view.head.sig).ok().and_then(|i| view.sigs.get(i)) else {
+        return Err(EmitError::Signature { why: "no signature row" });
+    };
+    let sig = view.sig(SigId(view.head.sig));
     let is_naked = (view.head.attrs & blaze_lir::func::FnAttrs::NAKED) != 0;
-    let is_variadic = view.sigs[view.head.sig as usize].bits & SigRec::VARIADIC != 0;
+    let is_variadic = sig_rec.bits & SigRec::VARIADIC != 0;
     if !is_naked {
         if is_variadic && isa.os != crate::Os::MacOs {
             return Err(EmitError::Signature { why: variadic::VARIADIC_DEFINITION });
         }
-        check_sig(view, isa, view.sigs[view.head.sig as usize], sig.params, sig.rets)
+        check_sig(view, isa, sig_rec, sig.params, sig.rets)
             .map_err(|why| EmitError::Signature { why })?;
     }
 

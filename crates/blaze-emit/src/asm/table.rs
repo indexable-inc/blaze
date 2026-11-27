@@ -557,10 +557,14 @@ fn arithmetic_reg(ops: &Ops<'_>, encode: fn(Reg, Reg, Reg) -> u32) -> Fit {
 
 fn mov_imm(ops: &Ops<'_>) -> Fit {
     let [Arg::Gpr { reg: rd, wide, sp: false }, Arg::Imm(v)] = *ops.args() else { return Fit::No };
-    if (0..=0xffff).contains(&v) {
-        Fit::Word(enc::sf(wide, enc::movz(rd, v as u32, 0)))
-    } else if (-0x10000..=-1).contains(&v) {
-        Fit::Word(enc::sf(wide, enc::movn(rd, ((!v) as u32) & 0xffff, 0)))
+    if (0..=0xffff).contains(&v)
+        && let Ok(imm) = u32::try_from(v)
+    {
+        Fit::Word(enc::sf(wide, enc::movz(rd, imm, 0)))
+    } else if (-0x10000..=-1).contains(&v)
+        && let Ok(inv) = u32::try_from(!v)
+    {
+        Fit::Word(enc::sf(wide, enc::movn(rd, inv & 0xffff, 0)))
     } else {
         Fit::Bad { why: "a `mov` immediate outside -65536..=65535", at: 1 }
     }
@@ -572,7 +576,7 @@ fn pair_imm7(off: i128, scale: i128) -> Option<i32> {
         return None;
     }
     let scaled = off / scale;
-    (-64..=63).contains(&scaled).then_some(scaled as i32)
+    if (-64..=63).contains(&scaled) { i32::try_from(scaled).ok() } else { None }
 }
 
 fn pair_mem(ops: &Ops<'_>, load: bool) -> Fit {
@@ -592,10 +596,9 @@ fn pair_mem(ops: &Ops<'_>, load: bool) -> Fit {
             let (base, off, at) = match mode {
                 Mode::Off(b, o, at) | Mode::Pre(b, o, at) | Mode::Post(b, o, at) => (b, o, at),
             };
-            if pair_imm7(off, 8).is_none() {
+            let Some(off) = pair_imm7(off, 8).and_then(|_| i32::try_from(off).ok()) else {
                 return Fit::Bad { why: "an `x` pair offset outside -512..=504 or not 8-aligned", at };
-            }
-            let off = off as i32;
+            };
             Fit::Word(match (load, mode) {
                 (false, Mode::Off(..)) => enc::stp_off(r1, r2, base, off),
                 (true, Mode::Off(..)) => enc::ldp_off(r1, r2, base, off),
@@ -607,10 +610,9 @@ fn pair_mem(ops: &Ops<'_>, load: bool) -> Fit {
         }
         (Arg::Gpr { reg: r1, wide: false, sp: false }, Arg::Gpr { reg: r2, wide: false, sp: false }) => {
             let Mode::Off(base, off, at) = mode else { return Fit::No };
-            if pair_imm7(off, 4).is_none() {
+            let Some(off) = pair_imm7(off, 4).and_then(|_| i32::try_from(off).ok()) else {
                 return Fit::Bad { why: "a `w` pair offset outside -256..=252 or not 4-aligned", at };
-            }
-            let off = off as i32;
+            };
             Fit::Word(if load { enc::ldp_w_off(r1, r2, base, off) } else { enc::stp_w_off(r1, r2, base, off) })
         }
         (Arg::Fp { reg: r1, width: FpWidth::Q }, Arg::Fp { reg: r2, width: FpWidth::Q }) => {
@@ -633,10 +635,9 @@ fn pair_mem(ops: &Ops<'_>, load: bool) -> Fit {
             let (base, off, at) = match mode {
                 Mode::Off(b, o, at) | Mode::Pre(b, o, at) | Mode::Post(b, o, at) => (b, o, at),
             };
-            if pair_imm7(off, 8).is_none() {
+            let Some(off) = pair_imm7(off, 8).and_then(|_| i32::try_from(off).ok()) else {
                 return Fit::Bad { why: "a `d` pair offset outside -512..=504 or not 8-aligned", at };
-            }
-            let off = off as i32;
+            };
             Fit::Word(match (load, mode) {
                 (false, Mode::Off(..)) => enc::stp_d_off(r1, r2, base, off),
                 (true, Mode::Off(..)) => enc::ldp_d_off(r1, r2, base, off),
@@ -648,10 +649,9 @@ fn pair_mem(ops: &Ops<'_>, load: bool) -> Fit {
         }
         (Arg::Fp { reg: r1, width: FpWidth::S }, Arg::Fp { reg: r2, width: FpWidth::S }) => {
             let Mode::Off(base, off, at) = mode else { return Fit::No };
-            if pair_imm7(off, 4).is_none() {
+            let Some(off) = pair_imm7(off, 4).and_then(|_| i32::try_from(off).ok()) else {
                 return Fit::Bad { why: "an `s` pair offset outside -256..=252 or not 4-aligned", at };
-            }
-            let off = off as i32;
+            };
             Fit::Word(if load { enc::ldp_s_off(r1, r2, base, off) } else { enc::stp_s_off(r1, r2, base, off) })
         }
         _ => Fit::No,
@@ -662,25 +662,31 @@ fn single_mem(ops: &Ops<'_>, load: bool) -> Fit {
     match *ops.args() {
         [Arg::Gpr { reg, wide, sp: false }, Arg::Addr { base, off, pre: false }] => {
             let (size, scale) = if wide { (Size::X, 8i128) } else { (Size::W, 4i128) };
-            if off >= 0 && off % scale == 0 && (off / scale) < 4096 {
-                let imm12 = (off / scale) as u32;
+            if off >= 0 && off % scale == 0 && (off / scale) < 4096
+                && let Ok(imm12) = u32::try_from(off / scale)
+            {
                 Fit::Word(if load { enc::ldr(size, reg, base, imm12) } else { enc::str(size, reg, base, imm12) })
-            } else if (-256..=255).contains(&off) {
-                Fit::Word(if load { enc::ldur(size, reg, base, off as i32) } else { enc::stur(size, reg, base, off as i32) })
+            } else if (-256..=255).contains(&off)
+                && let Ok(off) = i32::try_from(off)
+            {
+                Fit::Word(if load { enc::ldur(size, reg, base, off) } else { enc::stur(size, reg, base, off) })
             } else {
                 Fit::Bad { why: "a `ldr`/`str` offset out of unsigned scaled / unscaled range", at: 1 }
             }
         }
         [Arg::Gpr { reg, wide: true, sp: false }, Arg::Addr { base, off: 0, pre: false }, Arg::Imm(off)] => {
-            if (-256..=255).contains(&off) {
-                Fit::Word(if load { enc::ldr_post(reg, base, off as i32) } else { enc::str_post(reg, base, off as i32) })
+            if (-256..=255).contains(&off)
+                && let Ok(off) = i32::try_from(off)
+            {
+                Fit::Word(if load { enc::ldr_post(reg, base, off) } else { enc::str_post(reg, base, off) })
             } else {
                 Fit::Bad { why: "a post-index `ldr`/`str` offset outside -256..=255", at: 2 }
             }
         }
         [Arg::Fp { reg, width: FpWidth::Q }, Arg::Addr { base, off, pre: false }] => {
-            if off >= 0 && off % 16 == 0 && (off / 16) < 4096 {
-                let imm12 = (off / 16) as u32;
+            if off >= 0 && off % 16 == 0 && (off / 16) < 4096
+                && let Ok(imm12) = u32::try_from(off / 16)
+            {
                 Fit::Word(if load { enc::ldr_q(reg, base, imm12) } else { enc::str_q(reg, base, imm12) })
             } else {
                 Fit::Bad { why: "a `ldr`/`str q` offset out of unsigned 16-aligned range", at: 1 }
@@ -688,8 +694,9 @@ fn single_mem(ops: &Ops<'_>, load: bool) -> Fit {
         }
         [Arg::Fp { reg, width: w @ (FpWidth::D | FpWidth::S) }, Arg::Addr { base, off, pre: false }] => {
             let (size, scale) = if w == FpWidth::D { (Size::X, 8i128) } else { (Size::W, 4i128) };
-            if off >= 0 && off % scale == 0 && (off / scale) < 4096 {
-                let imm12 = (off / scale) as u32;
+            if off >= 0 && off % scale == 0 && (off / scale) < 4096
+                && let Ok(imm12) = u32::try_from(off / scale)
+            {
                 let word = if load { enc::ldr(size, reg, base, imm12) } else { enc::str(size, reg, base, imm12) };
                 Fit::Word(enc::fp_access(word))
             } else {

@@ -26,7 +26,7 @@ blaze-body-flow	6	1	0	7	0	0	0	0	0	0
 blaze-body-lower	13	0	0	24	0	0	0	0	0	0
 blaze-borrow	5	0	0	7	0	0	0	0	0	0
 blaze-bstd-convert	13	0	0	9	8	0	0	0	0	0
-blaze-build	142	2	2	409	0	0	6	3	0	0
+blaze-build	141	2	2	409	0	0	6	3	0	0
 blaze-build-script	145	0	0	118	3	0	0	0	0	0
 blaze-bytes	9	0	0	20	0	0	1	0	0	0
 blaze-c	2	0	0	0	0	0	0	0	0	0
@@ -41,7 +41,7 @@ blaze-cbor	3	0	0	0	0	0	1	0	0	0
 blaze-cc	6	0	0	1	0	0	0	0	0	0
 blaze-cert	7	0	0	2	0	0	0	0	0	2
 blaze-check	7	0	0	31	0	0	48	0	0	0
-blaze-cli	1333	31	3	770	299	96	3	12	0	3
+blaze-cli	1330	31	3	769	299	96	3	12	0	3
 blaze-cli-spec	1	0	0	0	0	0	0	0	0	0
 blaze-code	1	0	0	1	0	0	0	0	0	0
 blaze-columns	27	0	0	35	0	0	0	0	0	0
@@ -158,7 +158,7 @@ blaze-toml	3	0	0	0	0	0	1	0	0	0
 blaze-toolchain	21	0	0	15	0	0	0	0	0	0
 blaze-trace	3	0	1	9	0	0	3	0	0	0
 blaze-ty	2	0	0	39	0	0	0	0	0	0
-blaze-typeck	542	0	0	1107	0	0	0	0	0	0
+blaze-typeck	497	0	0	1062	0	0	0	0	0	0
 blaze-unicode	3	0	0	9	0	0	0	0	0	0
 blaze-unit-graph	15	0	0	4	0	0	0	0	0	0
 blaze-units	2	0	0	0	0	0	0	0	0	0

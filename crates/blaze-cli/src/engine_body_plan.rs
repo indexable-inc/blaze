@@ -516,7 +516,9 @@ fn reached_under_tracking_test_cuts(
         let Err(slot) = test_cut.binary_search(&name) else { continue };
         test_cut.insert_shift(slot, name);
         let Ok(at) = outlined.binary_search_by(|one| one.name.cmp(&name)) else { continue };
-        if let Ok(record) = &outlined[at].made {
+        if let Some(one) = outlined.get(at)
+            && let Ok(record) = &one.made
+        {
             for part in record.parts.iter() {
                 if matches!(part.locate, Locate::File { edition } if !crate::data_include::is_data(edition)) {
                     cut_next.push(part.name);

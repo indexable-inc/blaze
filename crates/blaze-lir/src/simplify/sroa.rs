@@ -2315,15 +2315,12 @@ impl<A: Allocator + Copy> Out<A> {
         at
     }
 
-    /// A zero-byte scalar or native 128-bit vector of `ty` (from `memset(_, 0, _)`), made once per block.
-    fn zero<B: Allocator>(&mut self, cache: &mut Vec<(u16, u32), B>, ty: Ty, loc: u32) -> u32 {
+    /// A zero-byte scalar of `ty`, made once per block.
+    fn zero_scalar<B: Allocator>(&mut self, cache: &mut Vec<(u16, u32), B>, ty: Ty, loc: u32) -> u32 {
         if let Some(&(_, at)) = cache.iter().find(|it| it.0 == ty.0) {
             return at;
         }
-        let at = if is_native_vec128(ty) {
-            let lane_zero = self.zero(cache, ty.lane(), loc);
-            self.raw(Op::Splat, 0, ty.0, lane_zero, 0, loc)
-        } else if ty.is_scalar() && ty.is_int() {
+        let at = if ty.is_scalar() && ty.is_int() {
             self.raw(Op::Iconst, 0, ty.0, 0, 0, loc)
         } else if ty == Ty::PTR {
             self.raw(Op::Null, 0, ty.0, 0, 0, loc)
@@ -2343,6 +2340,20 @@ impl<A: Allocator + Copy> Out<A> {
         };
         cache.push((ty.0, at));
         at
+    }
+
+    /// A zero-byte scalar or native 128-bit vector of `ty` (from `memset(_, 0, _)`), made once per block.
+    fn zero<B: Allocator>(&mut self, cache: &mut Vec<(u16, u32), B>, ty: Ty, loc: u32) -> u32 {
+        if let Some(&(_, at)) = cache.iter().find(|it| it.0 == ty.0) {
+            return at;
+        }
+        if is_native_vec128(ty) {
+            let lane_zero = self.zero_scalar(cache, ty.lane(), loc);
+            let at = self.raw(Op::Splat, 0, ty.0, lane_zero, 0, loc);
+            cache.push((ty.0, at));
+            return at;
+        }
+        self.zero_scalar(cache, ty, loc)
     }
 
     /// A value word of input instruction `inst`, appended to `extra` and fixed up later.
