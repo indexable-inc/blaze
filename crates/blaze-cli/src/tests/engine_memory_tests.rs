@@ -103,14 +103,21 @@ fn engine_memory_prints_a_line_for_every_stage() {
     assert!(number_after(kept, "the names world's frame") > 0, "the names world's frame is in use: {kept}");
 }
 
-/// COLD CHECK PINS NO SHARED ARENAS: after `Names` flushes at the stage boundary and `Heads`
-/// flushes at its stage boundary, no uncommitted `InArena` bytes remain pinned (`held == 0`)
-/// because non-lending probes (`tag_of`, `with_bytes`, `get_committed`) and short-lived
-/// snapshots never set `Lent::shared_lent`.
+/// COLD CHECK PINS NO SHARED ARENAS: `Names` and `Heads` stage boundaries delegate to
+/// `PlainPlace::flush_puts_if_large` (`STAGE_FLUSH_BYTES` = 16 MiB), coalescing tiny stages into
+/// one `after_answer` commit while keeping uncommitted `InArena` bytes strictly below the 16 MiB
+/// threshold and pinning zero shared arenas past commit (`kept_arenas == 0`) because non-lending
+/// probes (`tag_of`, `with_bytes`, `get_committed`) and short-lived snapshots never set
+/// `Lent::shared_lent`.
 #[test]
 fn engine_memory_cold_check_frees_shared_arenas_at_stage_boundaries() {
     let (checked, text) = chain(37);
     let heads = checked.records.lines[Stage::Heads.index()];
     let store_held = heads.held.saturating_sub(heads.results_held);
-    assert_eq!(store_held, 0, "no shared arena bytes pinned after Names & Heads flushes: {heads} (results_held={})\n{text}", heads.results_held);
+    assert_eq!(heads.kept_arenas, 0, "no shared arenas pinned past commit after Names & Heads: {heads}\n{text}");
+    assert!(
+        store_held < crate::store::plain_place::STAGE_FLUSH_BYTES,
+        "uncommitted InArena bytes stay below STAGE_FLUSH_BYTES (16 MiB): {heads} (results_held={})\n{text}",
+        heads.results_held,
+    );
 }

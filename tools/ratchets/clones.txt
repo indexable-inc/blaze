@@ -80,7 +80,7 @@ blaze-script	50
 blaze-semver	12
 blaze-sh	22
 blaze-sha256	1
-blaze-shell	308
+blaze-shell	309
 blaze-sim	24
 blaze-solve	24
 blaze-sort	3

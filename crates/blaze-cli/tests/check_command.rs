@@ -396,10 +396,13 @@ fn inspect_command_emits_annotated_hints_and_json() {
     let ws = base.join("ws");
     write(&ws.join("sample.rs"), INSPECT_SAMPLE);
 
-    // 1. Default annotated output on the full file.
+    // 1. Default LLM view output on the full file (header, outline, annotated source).
     let ann = blaze(&ws, &home, &["inspect", "sample.rs"], "inspect_ann");
     assert_eq!(ann.status, Some(0), "inspect annotated failed:\n{}", ann.all());
-    assert!(ann.out.contains("// pub fn load(mode: u32) -> Result<u32, "), "missing load sig:\n{}", ann.out);
+    assert!(ann.out.contains("# sample.rs (lines 1-127 of 127"), "missing header:\n{}", ann.out);
+    assert!(ann.out.contains("> semantic-hints: complete"), "missing semantic status:\n{}", ann.out);
+    assert!(ann.out.contains("## Outline") && ann.out.contains("`pub fn load(mode: u32) -> Result<u32, _>`"), "missing load in outline:\n{}", ann.out);
+    assert!(ann.out.contains("## Source"), "missing source section:\n{}", ann.out);
     assert!(ann.out.contains("/* = "), "missing inferred return hint:\n{}", ann.out);
     assert!(ann.out.contains("/* ? ErrA */"), "missing ? ErrA hint:\n{}", ann.out);
     assert!(ann.out.contains("/*: u32*/"), "missing binding hint:\n{}", ann.out);
@@ -410,12 +413,12 @@ fn inspect_command_emits_annotated_hints_and_json() {
     // 2. Filtered JSON output (`sample.rs::load --json`).
     let json = blaze(&ws, &home, &["inspect", "sample.rs::load", "--json"], "inspect_json");
     assert_eq!(json.status, Some(0), "inspect --json failed:\n{}", json.all());
-    assert!(json.out.contains("\"items\": ["), "missing items array:\n{}", json.out);
-    assert!(json.out.contains("\"name\": \"load\""), "missing load item:\n{}", json.out);
+    assert!(json.out.contains("\"outline\": ["), "missing outline array:\n{}", json.out);
+    assert!(json.out.contains("\"hints\": ["), "missing hints array:\n{}", json.out);
+    assert!(json.out.contains("\"name\": \"load\""), "missing load outline item:\n{}", json.out);
     assert!(!json.out.contains("\"name\": \"demo\""), "filter should exclude demo:\n{}", json.out);
-    assert!(json.out.contains("\"inferred_output\": \"Result<u32, "), "missing inferred_output:\n{}", json.out);
-    assert!(json.out.contains("\"inferred_error_set\": \""), "missing inferred_error_set:\n{}", json.out);
     assert!(json.out.contains("\"kind\": \"inferred_return\""), "missing inferred_return hint:\n{}", json.out);
+    assert!(json.out.contains("\"label\": \"= "), "missing inferred return label:\n{}", json.out);
     assert!(json.out.contains("\"kind\": \"try_propagate\""), "missing try_propagate hint:\n{}", json.out);
     assert!(json.out.contains("\"kind\": \"binding\""), "missing binding hint:\n{}", json.out);
 

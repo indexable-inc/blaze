@@ -320,6 +320,12 @@ pub trait NamesSource<'n>: Copy {
     /// row" for every item, and every call value would be refused.
     fn attr_value(self, key: ItemKey, attr: &'static str) -> Option<Option<RowValue<'n>>>;
 
+    /// Question 10e: whether item `key` (in `module`) sits inside a `#![blaze::sans_io]` crate,
+    /// module file, or inline `mod { #![blaze::sans_io] ... }` block. Over records this reads
+    /// [`ItemIdentity::sans_io`] (or [`ModuleRow::sans_io`] for body-local items) through
+    /// `NameCell::Item`, never `NameCell::Whole { section: Items }`.
+    fn in_sans_io_scope(self, key: ItemKey, module: ItemKey) -> bool;
+
     /// Question 11, the kind: what an item's outline entry is, without its detail's data.
     fn kind_of_item(self, key: ItemKey) -> Option<ItemKind>;
 
@@ -703,6 +709,16 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
         // the very rows its items record's value table is written from.
         let krate: &'n blaze_scope::resolve::CrateNames<'n> = self.crates().get(Names::crate_of(self, key)?).copied()?;
         Some(blaze_scope::attr_values::row(&krate.values, key, attr).map(|row| row.answer()))
+    }
+
+    fn in_sans_io_scope(self, key: ItemKey, module: ItemKey) -> bool {
+        let Some(krate_idx) = Names::crate_of(self, key).or_else(|| Names::crate_of(self, module)) else {
+            return false;
+        };
+        let Some(krate) = self.crates().get(krate_idx).copied() else {
+            return false;
+        };
+        blaze_scope::items_record::item_in_sans_io_scope(krate, key, module)
     }
 
     fn kind_of_item(self, key: ItemKey) -> Option<ItemKind> {
@@ -2133,6 +2149,18 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         // No record: the loader filed `NoRecord` the one time it was asked.
         let record = self.items_of(krate)?;
         Some(self.read(krate, record.attr_value(key, attr))?.map(|answer| answer.map_err(RowRefusal::Recorded)))
+    }
+
+    fn in_sans_io_scope(self, key: ItemKey, module: ItemKey) -> bool {
+        if let Some(krate) = self.items.crate_of(key)
+            && let Some(record) = self.items_of(krate)
+            && let Some(Some(row)) = self.read(krate, record.identity(key))
+        {
+            return row.sans_io;
+        }
+        let Some(krate) = self.items.crate_of(module) else { return false };
+        let Some(record) = self.items_of(krate) else { return false };
+        self.read(krate, record.module(module)).flatten().is_some_and(|m| m.sans_io)
     }
 
     fn kind_of_item(self, key: ItemKey) -> Option<ItemKind> {

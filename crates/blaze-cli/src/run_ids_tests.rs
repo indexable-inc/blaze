@@ -494,7 +494,7 @@ fn a_table_is_put_at_its_certificate_and_absent_is_none() {
         }
         fn kept(&self) -> crate::store::StoreKept {
             let bytes = self.0.iter().map(|(_, bytes)| bytes.len() as u64).sum();
-            crate::store::StoreKept { copies: self.0.len() as u64, copy_bytes: bytes, held_bytes: bytes }
+            crate::store::StoreKept { copies: self.0.len() as u64, copy_bytes: bytes, held_bytes: bytes, kept_arenas: 0 }
         }
     }
     let io = Io::simulated(SimWorld::new(3, Limits::USUAL));

@@ -91,7 +91,11 @@ const MAGIC: [u8; 4] = *b"BZIT";
 /// 16: per-file CSR item index (`by_file`: `(files + 1)` u32 offsets + `u32` item indices) stored
 /// as column 12 of `T_ITEMS` for O(items_in_file) per-file item iteration (`file_item_indices`);
 /// a version-15 record is refused the same way.
-const VERSION: u32 = 16;
+/// 17: item (`SANS_IO`) and module (`MOD_SANS_IO`) scope flags record whether an item or module
+/// sits inside a `#![blaze::sans_io]` crate, module file, or inline `mod { #![blaze::sans_io] }`
+/// block so ADT head freezing reads only `NameCell::Item` and never `NameCell::Whole(Items)`;
+/// a version-16 record is refused the same way.
+const VERSION: u32 = 17;
 const KEY_TAIL: usize = 24;
 const ALIGN: usize = 16;
 const HEADER: usize = 256;
@@ -157,6 +161,8 @@ const CTOR_OR_WRITTEN_BY: u8 = 1 << 2;
 /// Item only: an `extern` block declares it, and the row's ABI string ([`ItemRow::foreign`])
 /// is set.
 const FOREIGN: u8 = 1 << 3;
+/// Item only: defined inside a `#![blaze::sans_io]` crate, module file, or inline `mod` block.
+const SANS_IO: u8 = 1 << 4;
 
 // Impl marks.
 const HAS_TRAIT: u8 = 1;
@@ -173,6 +179,8 @@ const REFUSED_CALL: u8 = 1 << 4;
 const LISTED: u32 = 1;
 const MADE: u32 = 1 << 1;
 const HAS_PATH: u32 = 1 << 2;
+/// Module is inside a `#![blaze::sans_io]` crate, module file, or enclosing inline `mod` block.
+const MOD_SANS_IO: u32 = 1 << 3;
 
 // Macro flags and body kinds.
 const EXPORT: u8 = 1;
@@ -450,6 +458,267 @@ fn body_holds_items(detail: ItemDetail) -> bool {
         detail,
         ItemDetail::Fn { body_holds_items: true } | ItemDetail::Const { body_holds_items: true } | ItemDetail::Static { body_holds_items: true }
     )
+}
+
+/// Whether an attribute's path, as written, is `blaze::sans_io` (spaces around `::` allowed).
+fn is_sans_io_attr(path: &str) -> bool {
+    path.split_once("::").is_some_and(|(tool, rest)| tool.trim() == "blaze" && rest.trim() == "sans_io")
+}
+
+/// Skips leading whitespace, `//` line comments, and nested `/* ... */` block comments.
+fn skip_ws_and_comments(mut s: &str) -> &str {
+    loop {
+        let trimmed = s.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("//") {
+            match rest.find('\n') {
+                Some(nl) => s = &rest[nl + 1..],
+                None => return "",
+            }
+            continue;
+        }
+        if let Some(mut rest) = trimmed.strip_prefix("/*") {
+            let mut depth = 1usize;
+            while depth > 0 {
+                let open = rest.find("/*");
+                let close = rest.find("*/");
+                match (open, close) {
+                    (_, None) => return "",
+                    (Some(o), Some(c)) if o < c => {
+                        depth += 1;
+                        rest = &rest[o + 2..];
+                    }
+                    (_, Some(c)) => {
+                        depth -= 1;
+                        rest = &rest[c + 2..];
+                    }
+                }
+            }
+            s = rest;
+            continue;
+        }
+        return trimmed;
+    }
+}
+
+/// Scans past a balanced `[` ... `]` attribute body (starting just after `[`), returning
+/// `(inner_text, rest_after_close_bracket)`.
+fn scan_attr_bracket(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 1usize;
+    let mut in_str = false;
+    let mut escape = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&s[..i], &s[i + 1..]));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Returns `true` iff `text`'s leading inner attributes (`#![...]`) include `#![blaze::sans_io]`.
+fn has_leading_inner_sans_io(mut text: &str) -> bool {
+    if !text.contains("sans_io") {
+        return false;
+    }
+    for _ in 0..256 {
+        text = skip_ws_and_comments(text);
+        let Some(after_hash) = text.strip_prefix('#') else { return false };
+        let after_hash = skip_ws_and_comments(after_hash);
+        let Some(after_bang) = after_hash.strip_prefix('!') else { return false };
+        let after_bang = skip_ws_and_comments(after_bang);
+        let Some(after_open) = after_bang.strip_prefix('[') else { return false };
+        let Some((inner, rest)) = scan_attr_bracket(after_open) else { return false };
+        if is_sans_io_attr(inner.trim()) {
+            return true;
+        }
+        text = rest;
+    }
+    false
+}
+
+/// Scans `text[..target_offset]` with a tiny stack of enclosing `{` offsets (skipping comments,
+/// strings, and char literals) and returns `true` iff any enclosing `{ ... }` block starts with
+/// `#![blaze::sans_io]` (e.g. `mod core_mod { #![blaze::sans_io] ... }`).
+fn enclosing_block_has_sans_io(text: &str, target_offset: usize) -> bool {
+    let limit = target_offset.min(text.len());
+    if !text[..limit].contains("sans_io") {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let mut stack = [0usize; 64];
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < limit {
+        let b = bytes[i];
+        if b == b'/' && i + 1 < limit && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < limit && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < limit && bytes[i + 1] == b'*' {
+            i += 2;
+            let mut cdepth = 1usize;
+            while i < limit && cdepth > 0 {
+                if bytes[i] == b'/' && i + 1 < limit && bytes[i + 1] == b'*' {
+                    cdepth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && i + 1 < limit && bytes[i + 1] == b'/' {
+                    cdepth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if b == b'"' {
+            i += 1;
+            while i < limit {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                } else if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if b == b'\'' {
+            if i + 2 < limit && bytes[i + 1] == b'\\' {
+                if i + 3 < limit && bytes[i + 3] == b'\'' {
+                    i += 4;
+                    continue;
+                }
+            } else if i + 2 < limit && bytes[i + 2] == b'\'' {
+                i += 3;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'{' {
+            if depth < stack.len() {
+                stack[depth] = i;
+            }
+            depth += 1;
+        } else if b == b'}' && depth > 0 {
+            depth -= 1;
+        }
+        i += 1;
+    }
+    let kept = depth.min(stack.len());
+    for &brace in &stack[..kept] {
+        if let Some(after) = text.get(brace + 1..)
+            && has_leading_inner_sans_io(after)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns `true` iff module `module` sits inside a `#![blaze::sans_io]` crate, module file, or
+/// inline `mod { #![blaze::sans_io] ... }` block.
+///
+/// The one home of `#![blaze::sans_io]` scope detection (rule 30): called once per crate when
+/// writing [`ItemsRecord`] (stored on [`ItemIdentity::sans_io`] and [`ModuleRow::sans_io`]) and
+/// directly by the in-memory `NamesSource` so both sources answer alike without reading
+/// `NameCell::Whole { section: Items }`.
+pub fn module_in_sans_io_scope(names: &CrateNames<'_>, mut module: ItemKey) -> bool {
+    if let Some(root_file) = names.files.first()
+        && has_leading_inner_sans_io(root_file.text)
+    {
+        return true;
+    }
+    for _ in 0..64 {
+        let walked = names.tree.by_key.get(&module).map(|&i| &names.tree.modules[i]);
+        if let Some(w) = walked {
+            if let Ok(file_idx) = usize::try_from(w.file)
+                && let Some(file) = names.files.get(file_idx)
+            {
+                if w.file != 0 && has_leading_inner_sans_io(file.text) {
+                    return true;
+                }
+                if let Some(item_idx) = w.item {
+                    let entry = file.outline.item(item_idx);
+                    if let (Ok(start), Ok(end)) = (usize::try_from(entry.range.start), usize::try_from(entry.range.end)) {
+                        if let Some(mod_text) = file.text.get(start..end) {
+                            let head_len = crate::names_cells::module_head(mod_text).len();
+                            if let Some(after_brace) = mod_text.get(head_len + 1..)
+                                && has_leading_inner_sans_io(after_brace)
+                            {
+                                return true;
+                            }
+                        }
+                        if enclosing_block_has_sans_io(file.text, start) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            if let Some(parent_idx) = w.parent {
+                module = names.tree.modules[parent_idx].key;
+                continue;
+            }
+            return false;
+        }
+        if let Some(made) = names.made.get(&module)
+            && let Some(parent) = made.info.parent
+        {
+            module = parent;
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+/// Returns `true` iff item `key` (in `module`) sits inside a `#![blaze::sans_io]` crate, module
+/// file, or enclosing inline `mod { #![blaze::sans_io] ... }` block.
+pub fn item_in_sans_io_scope(names: &CrateNames<'_>, key: ItemKey, module: ItemKey) -> bool {
+    if module_in_sans_io_scope(names, module) {
+        return true;
+    }
+    if let Some((it, At::File(file))) = names.tables.texts.get(&key)
+        && let Ok(file_idx) = usize::try_from(*file)
+        && let Some(f) = names.files.get(file_idx)
+        && f.text.contains("sans_io")
+    {
+        if (*file != 0 && has_leading_inner_sans_io(f.text))
+            || span_in(f.text, it.text)
+                .and_then(|(start, _)| usize::try_from(start).ok())
+                .is_some_and(|start| enclosing_block_has_sans_io(f.text, start))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// The head of an impl's self type AS WRITTEN: what an impl index files the impl under without
@@ -856,6 +1125,10 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
         }
     };
 
+    // Pre-scan once whether any file of this crate even mentions `sans_io` so 99.9% of crates
+    // skip all `#![blaze::sans_io]` attribute/block scanning with zero overhead.
+    let any_file_mentions_sans_io = names.files.iter().any(|f| f.text.contains("sans_io"));
+
     let mut module_rows = RecordBytes::with_capacity_in(modules.len().saturating_mul(MODULE_ROW).next_multiple_of(ALIGN), alloc);
     for m in modules.iter() {
         let walked = names.tree.by_key.get(m).map(|i| &names.tree.modules[*i]);
@@ -875,6 +1148,9 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
         }
         if walked.is_none() && made.is_some() {
             flags |= MADE;
+        }
+        if any_file_mentions_sans_io && module_in_sans_io_scope(names, *m) {
+            flags |= MOD_SANS_IO;
         }
         let path = match names.path_of(*m) {
             Some(p) => {
@@ -1001,6 +1277,9 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
             }
             if tables.ctors.contains_key(key) {
                 flags |= CTOR_OR_WRITTEN_BY;
+            }
+            if any_file_mentions_sans_io && item_in_sans_io_scope(names, *key, it.module) {
+                flags |= SANS_IO;
             }
             let abi = match foreign {
                 Some(abi) => {
@@ -1623,6 +1902,9 @@ pub struct ItemIdentity<'a> {
     /// region walk reads, in any store): `Some` for a struct, enum, union, trait, trait alias
     /// and type alias, `None` for a kind that declares none here.
     pub lifetimes: Option<u16>,
+    /// Whether this item sits inside a `#![blaze::sans_io]` crate, module file, or inline `mod`
+    /// block (computed once during solve, covered by `NameCell::Item`, zero whole-crate reads).
+    pub sans_io: bool,
 }
 
 /// A member of a trait or an impl.
@@ -1707,6 +1989,9 @@ pub struct ModuleRow<'a> {
     pub path: Option<&'a str>,
     pub listed: bool,
     pub made: bool,
+    /// Whether this module sits inside a `#![blaze::sans_io]` crate, module file, or enclosing
+    /// inline `mod` block.
+    pub sans_io: bool,
 }
 
 /// A macro definition's body as its row holds it (question 21).
@@ -2636,6 +2921,7 @@ impl<'a> ItemsRecord<'a> {
             impl_row: (impl_row != NONE).then_some(impl_row),
             foreign: if flags & FOREIGN != 0 { Some(self.str_at("an item's block ABI", c.abi_at.get_u32(i), c.abi_len.get_u32(i))?) } else { None },
             lifetimes: lifetimes_of(lifetimes),
+            sans_io: flags & SANS_IO != 0,
         }))
     }
 
@@ -2874,6 +3160,7 @@ impl<'a> ItemsRecord<'a> {
             path: if flags & HAS_PATH != 0 { Some(self.str_at("a module's path", le32(b, r + 36), le32(b, r + 40))?) } else { None },
             listed: flags & LISTED != 0,
             made: flags & MADE != 0,
+            sans_io: flags & MOD_SANS_IO != 0,
         }))
     }
 

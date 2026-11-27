@@ -358,7 +358,9 @@ fn linux_sandbox_confines_writes_and_distinguishes_exit_101() {
 
     // Bind a real host pathname UNIX socket in `/tmp` outside the test's `$TMPDIR`: the sandbox's
     // empty `/tmp` tmpfs mask must make it completely unreachable from inside the test.
-    let host_sock_dir = std::env::temp_dir().join(format!("blaze_host_sock_{}", std::process::id()));
+    // Use `/tmp` directly (not `std::env::temp_dir()`, which follows `$TMPDIR` and may point
+    // outside `/tmp`, e.g. `/home/runner/.ci-tmp.*` on CI runners).
+    let host_sock_dir = std::path::Path::new("/tmp").join(format!("blaze_host_sock_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&host_sock_dir);
     std::fs::create_dir_all(&host_sock_dir).expect("create host_sock_dir");
     let host_sock_path = host_sock_dir.join("daemon.sock");
