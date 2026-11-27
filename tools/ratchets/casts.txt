@@ -77,7 +77,7 @@ blaze-inproc	70
 blaze-int	6
 blaze-keyed	677
 blaze-kit	2
-blaze-ladder	1366
+blaze-ladder	1365
 blaze-launch	174
 blaze-launch-rt	455
 blaze-launcher	5

@@ -3883,7 +3883,7 @@ impl<'n> Store<'n> {
             let decl = blaze_own::format_in!(alloc, "const _: bool = {body_expr};");
             let text: &'n str = locals.keep_text(decl.as_str());
             super::anon::file_parts_marks(anon_marks, cond_key, text, marks, &[(prefix_usize, body_expr)], alloc)
-                .map_err(|e| Why::Program(format!("{e}").into_boxed_str(), r))?;
+                .map_err(|e| Why::Program(blaze_own::format_in!(alloc, "{e}").as_str().into(), r))?;
             if let (Some((owner_item, offset)), Some(prefix)) = (located, prefix)
                 && blaze_file_items::nested::may_write_block(body_expr)
                 && let Ok(len) = u32::try_from(body_expr.len())
@@ -4059,7 +4059,7 @@ impl<'n> Store<'n> {
             let decl_buf = blaze_own::format_in!(alloc, "const _: bool = {body_expr};");
             let decl: &'n str = self.locals.keep_text(decl_buf.as_str());
             if let Err(e) = super::anon::file_parts_marks(&mut self.anon_marks, cond_key, decl, owner_marks, &[(prefix_usize, body_expr)], alloc) {
-                return Err(HeadError::Item(lib, Why::Program(format!("{e}").into_boxed_str(), Range::new(0, 0))));
+                return Err(HeadError::Item(lib, Why::Program(blaze_own::format_in!(alloc, "{e}").as_str().into(), Range::new(0, 0))));
             }
             let mut cp = Preds::new_in(Scope::new_in(alloc));
             for &cl in &clauses {
@@ -6128,7 +6128,7 @@ impl<'n> Store<'n> {
                 let ty_prefix = "const _: ".len();
                 let val_prefix = ty_prefix + ty_text.len() + " = ".len();
                 super::anon::file_parts_marks(&mut self.anon_marks, dk, text, marks, &[(ty_prefix, ty_text), (val_prefix, value_text)], alloc)
-                    .map_err(|e| Why::Program(format!("{e}").into_boxed_str(), r))?;
+                    .map_err(|e| Why::Program(blaze_own::format_in!(alloc, "{e}").as_str().into(), r))?;
                 if let Some((owner_item, offset)) = located
                     && blaze_file_items::nested::may_write_block(value_text)
                     && let (Ok(len), Ok(prefix)) = (u32::try_from(value_text.len()), u32::try_from(val_prefix))
@@ -7066,7 +7066,7 @@ impl<'n> Store<'n> {
                 let ty_prefix = "const _: ".len();
                 let val_prefix = ty_prefix + ty_text.len() + " = ".len();
                 super::anon::file_parts_marks(&mut self.anon_marks, dk, text, marks, &[(ty_prefix, ty_text), (val_prefix, value_text)], alloc)
-                    .map_err(|e| Why::Program(format!("{e}").into_boxed_str(), r))?;
+                    .map_err(|e| Why::Program(blaze_own::format_in!(alloc, "{e}").as_str().into(), r))?;
                 if let Some((owner_item, offset)) = located
                     && blaze_file_items::nested::may_write_block(value_text)
                     && let (Ok(len), Ok(prefix)) = (u32::try_from(value_text.len()), u32::try_from(val_prefix))

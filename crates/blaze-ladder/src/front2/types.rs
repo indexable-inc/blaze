@@ -2243,7 +2243,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 consts: cs,
                 body: None,
             };
-            let alias_builder = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks };
+            let alias_builder = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks, owner: Some((alias, alias_text.text)) };
             let mut full = blaze_own::Vec::with_capacity_in(want + 1, alloc);
             full.push(self_ty);
             full.extend_from_slice(given);
@@ -5753,7 +5753,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 consts: cs,
                 body: None,
             };
-            let alias_builder = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks };
+            let alias_builder = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks, owner: Some((alias_key, alias_text.text)) };
             // Fill any omitted defaulted type/const arguments declared by the trait alias
             // (`trait Alias<T = &'static u8> = Gen<T>;`, `trait Alias<const N: usize = 3> = Gen<N>;`)
             // into `all_args`/`all_pool`/`all_index` with `Slot::quiet`.

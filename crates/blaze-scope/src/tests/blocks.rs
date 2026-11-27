@@ -946,7 +946,7 @@ fn impl_header_where_const_block_creates_block_module_without_scanning_impl_body
     let outer_impl = impl_ending(&names, 0, "0},>,");
     assert_ne!(tag_impl.module, outer_impl.module);
     // Verify `block_modules` over `outer_impl.header` derives `tag_impl.module` deterministically.
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let nested = blaze_file_items::nested::scan(outer_impl.header, alloc);
     let mods = crate::blocks::block_modules(names.krate(0).key, outer_impl.key, &nested, alloc);
     let first_mod = mods.iter().copied().flatten().next().expect("header const block module");
@@ -976,18 +976,19 @@ static BODY_FREE_FN_WHERE_CONST_BLOCK_TEXTS: Texts = Texts(&[&[("/user/lib.rs", 
 #[test]
 fn body_free_fn_where_const_block_creates_block_module() {
     use blaze_surface::DefKind;
+    let alloc = blaze_own::testing::heap().alloc();
     let crates = [input("user", "/user/lib.rs", &[])];
     let names = resolved(&crates, &BODY_FREE_FN_WHERE_CONST_BLOCK_TEXTS);
     let root = names.root(0);
     let f_item = names
-        .item_at(root, Namespace::Values, Written { kind: PathKind::Plain, segments: &["f"] }, Alloc::global())
+        .item_at(root, Namespace::Values, Written { kind: PathKind::Plain, segments: &["f"] }, alloc)
         .unwrap_or_else(|e| panic!("`f`: {e}"));
     let at = BODY_FREE_FN_WHERE_CONST_BLOCK.find("pub fn f").expect("`pub fn f` in fixture");
-    let nested = blaze_file_items::nested::scan(&BODY_FREE_FN_WHERE_CONST_BLOCK[at..], Alloc::global());
-    let mods = crate::blocks::block_modules(names.krate(0).key, f_item.def.key, &nested, Alloc::global());
+    let nested = blaze_file_items::nested::scan(&BODY_FREE_FN_WHERE_CONST_BLOCK[at..], alloc);
+    let mods = crate::blocks::block_modules(names.krate(0).key, f_item.def.key, &nested, alloc);
     let block_mod = mods.iter().copied().flatten().next().expect("where-clause const block module");
     let e = names
-        .item_at(block_mod, Namespace::Types, Written { kind: PathKind::Plain, segments: &["E"] }, Alloc::global())
+        .item_at(block_mod, Namespace::Types, Written { kind: PathKind::Plain, segments: &["E"] }, alloc)
         .unwrap_or_else(|e| panic!("`E` in `f`'s where-clause block module: {e}"));
     assert_eq!(e.def.kind, DefKind::Enum);
 }
@@ -1040,7 +1041,7 @@ static ALL_ITEM_HEADS_CONST_BLOCKS_TEXTS: Texts = Texts(&[&[("/user/lib.rs", ALL
 #[test]
 fn all_item_heads_with_const_blocks_create_block_modules() {
     use blaze_surface::DefKind;
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let crates = [input("user", "/user/lib.rs", &[])];
     let names = resolved(&crates, &ALL_ITEM_HEADS_CONST_BLOCKS_TEXTS);
     let root = names.root(0);

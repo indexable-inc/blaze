@@ -50,15 +50,23 @@ const EDITION: &str = "blaze-2026.11";
 /// The most constants one fn's lowering may need evaluated before it converts.
 const MOST_LENS: u32 = 8;
 
+fn test_alloc() -> Alloc<'static> {
+    blaze_own::testing::heap().alloc()
+}
+
+fn open_toolchain() -> Toolchain {
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"))
+}
+
 /// Each fn of `fns` in the crate `text`, lowered and checked in order over one store, as
 /// tests/front2_const_open.rs `check_fns` does: its name and its outcome ("clean", the
 /// diagnostics, or the failure as printed). The test is the entry: the allocator it names
 /// here is handed down to every call.
 fn check_fns(text: &str, fns: &[&str]) -> Vec<(String, String)> {
-    let alloc = Alloc::global();
-    let home = std::env::var("HOME").expect("HOME is set");
-    let shelf = format!("{home}/.blaze/v2/toolchain");
-    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let alloc = test_alloc();
+    let tc = open_toolchain();
     let files = [("/hello-world/src/main.rs".to_string(), text.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
@@ -112,7 +120,10 @@ fn check_fns(text: &str, fns: &[&str]) -> Vec<(String, String)> {
 /// a diagnostic of the program (`false`); a gap or a refusal ("not checked", "not lowered")
 /// fails both. No outcome may name the lost marks (the refusal of class (1)).
 fn expect(what: &str, got: &[(String, String)], clean: &[bool]) {
-    let lines: Vec<String> = got.iter().map(|(n, o)| format!("{what}: {n}: {o}")).collect();
+    let mut lines = blaze_own::AVec::new_in(test_alloc());
+    for (n, o) in got {
+        lines.push(format!("{what}: {n}: {o}"));
+    }
     for l in &lines {
         println!("{l}");
     }
@@ -756,10 +767,8 @@ fn main() {}
 ";
 
     let freeze_impl = |text: &str| {
-        let alloc = Alloc::global();
-        let home = std::env::var("HOME").expect("HOME is set");
-        let shelf = format!("{home}/.blaze/v2/toolchain");
-        let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+        let alloc = test_alloc();
+        let tc = open_toolchain();
         let files = [("/hello-world/src/main.rs".to_string(), text.to_string())];
         let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
         let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
@@ -858,10 +867,8 @@ impl Check<{ file!().len() }> for S {}
 ";
 
     let freeze_in_file = |mod_file: &str| {
-        let alloc = Alloc::global();
-        let home = std::env::var("HOME").expect("HOME is set");
-        let shelf = format!("{home}/.blaze/v2/toolchain");
-        let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+        let alloc = test_alloc();
+        let tc = open_toolchain();
         let root_text = format!("#[path = \"{mod_file}\"]\nmod m;\nfn main() {{}}\n");
         let files = [
             ("/hello-world/src/main.rs".to_string(), root_text.clone()),
@@ -1119,10 +1126,8 @@ fn main() {}
     expect("nominal field default const block", &got, &[true, false]);
 
     // Also verify the frozen/seeded store path (`ensure_field_default_head_anon`).
-    let alloc = Alloc::global();
-    let home = std::env::var("HOME").expect("HOME is set");
-    let shelf = format!("{home}/.blaze/v2/toolchain");
-    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let alloc = test_alloc();
+    let tc = open_toolchain();
     let files = [("/hello-world/src/main.rs".to_string(), TEXT.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
@@ -1227,10 +1232,8 @@ fn main() {}
 ";
 
     let freeze_impl = |text: &str| {
-        let alloc = Alloc::global();
-        let home = std::env::var("HOME").expect("HOME is set");
-        let shelf = format!("{home}/.blaze/v2/toolchain");
-        let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+        let alloc = test_alloc();
+        let tc = open_toolchain();
         let files = [("/hello-world/src/main.rs".to_string(), text.to_string())];
         let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
         let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
@@ -1319,10 +1322,8 @@ fn main() {}
 
     // Also verify persisted `PClause::Const` keys differ and frozen/seeded reconstruction matches.
     let inspect_frozen = |text: &str| {
-        let alloc = Alloc::global();
-        let home = std::env::var("HOME").expect("HOME is set");
-        let shelf = format!("{home}/.blaze/v2/toolchain");
-        let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+        let alloc = test_alloc();
+        let tc = open_toolchain();
         let files = [("/hello-world/src/main.rs".to_string(), text.to_string())];
         let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
         let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
@@ -1395,10 +1396,8 @@ pub type Config = {
 };
 fn main() {}
 ";
-    let alloc = Alloc::global();
-    let home = std::env::var("HOME").expect("HOME is set");
-    let shelf = format!("{home}/.blaze/v2/toolchain");
-    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let alloc = test_alloc();
+    let tc = open_toolchain();
     let files = [("/hello-world/src/main.rs".to_string(), TEXT.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
@@ -1445,7 +1444,7 @@ fn main() {}
     seeded
         .file_heads(Want::Head(cfg), [(HeadAt::Fn(dk), blaze_own::Box::into_inner(decoded))])
         .unwrap_or_else(|e| panic!("file_heads dk: {e}"));
-    let mut seeded_defaults = blaze_own::Vec::new_in(alloc);
+    let mut seeded_defaults = blaze_own::AVec::new_in(alloc);
     seeded_defaults.push(Some(dk));
     seeded.field_defaults.insert(rk, seeded_defaults);
     let (mut buckets, mut consts) = (None, Consts::default());
@@ -1472,13 +1471,13 @@ fn exported_macro_field_default_and_where_const_preserve_dollar_crate_hygiene() 
     struct WithDep<'t> {
         base: &'t blaze_ladder::crates::Texts<'t>,
         dep: usize,
-        files: &'t [(String, String)],
+        files: &'t [(&'t str, &'t str)],
     }
 
     impl<'t> SourceTexts<'t> for WithDep<'t> {
         fn read(&self, krate: usize, path: &str) -> Option<&'t str> {
             if krate == self.dep {
-                return self.files.iter().find(|(p, _)| p == path).map(|(_, t)| t.as_str());
+                return self.files.iter().find(|(p, _)| *p == path).map(|(_, t)| *t);
             }
             self.base.read(krate, path)
         }
@@ -1525,18 +1524,16 @@ fn bad_len() -> [u8; DEF_VAL] {
 fn main() {}
 ";
 
-    let alloc = Alloc::global();
-    let home = std::env::var("HOME").expect("HOME is set");
-    let shelf = format!("{home}/.blaze/v2/toolchain");
-    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let alloc = test_alloc();
+    let tc = open_toolchain();
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
     let user_files = [("/user/src/main.rs".to_string(), APP.to_string())];
-    let dep_files = [("/dep/src/lib.rs".to_string(), DEP.to_string())];
+    let dep_files = [("/dep/src/lib.rs", DEP)];
     let user = UserCrate { name: "user", dir: "/user/", root: "/user/src/main.rs", files: &user_files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
-    let mut crates: Vec<CrateInput<'_>> = inputs.crates();
+    let mut crates = inputs.crates();
     let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(u32::try_from(i).expect("few crates")));
-    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
+    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd"), proc_macro: at("proc_macro") };
     let dep_at = crates.len();
     let user_deps: [(&str, usize); 1] = [("dep", dep_at)];
     let (cfg, crate_edition, implicit) = (crates[0].cfg, crates[0].edition, crates[0].implicit);
@@ -1564,7 +1561,7 @@ fn main() {}
     let sized = front.index.lang("sized");
     let mut store = Store::new(sized, &frame, alloc);
     let (mut buckets, mut consts) = (None, Consts::default());
-    let mut got = Vec::new();
+    let mut got = blaze_own::AVec::new_in(alloc);
     for &n in &["ok_all", "bad_len"] {
         let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &[n] }, alloc).unwrap_or_else(|e| panic!("`{n}`: {e}"));
         let k = found.whole(1).unwrap_or_else(|| panic!("`{n}` not named")).key;
@@ -1656,13 +1653,13 @@ fn macro_head_const_with_inherent_const_and_dollar_crate_preserves_hygiene() {
     struct WithDep<'t> {
         base: &'t blaze_ladder::crates::Texts<'t>,
         dep: usize,
-        files: &'t [(String, String)],
+        files: &'t [(&'t str, &'t str)],
     }
 
     impl<'t> SourceTexts<'t> for WithDep<'t> {
         fn read(&self, krate: usize, path: &str) -> Option<&'t str> {
             if krate == self.dep {
-                return self.files.iter().find(|(p, _)| p == path).map(|(_, t)| t.as_str());
+                return self.files.iter().find(|(p, _)| *p == path).map(|(_, t)| *t);
             }
             self.base.read(krate, path)
         }
@@ -1702,18 +1699,16 @@ fn tag_bad() { need_tag::<11, Pair>(); }
 fn main() {}
 ";
 
-    let alloc = Alloc::global();
-    let home = std::env::var("HOME").expect("HOME is set");
-    let shelf = format!("{home}/.blaze/v2/toolchain");
-    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let alloc = test_alloc();
+    let tc = open_toolchain();
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
     let user_files = [("/user/src/main.rs".to_string(), APP.to_string())];
-    let dep_files = [("/dep/src/lib.rs".to_string(), DEP.to_string())];
+    let dep_files = [("/dep/src/lib.rs", DEP)];
     let user = UserCrate { name: "user", dir: "/user/", root: "/user/src/main.rs", files: &user_files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
-    let mut crates: Vec<CrateInput<'_>> = inputs.crates();
+    let mut crates = inputs.crates();
     let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(u32::try_from(i).expect("few crates")));
-    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
+    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd"), proc_macro: at("proc_macro") };
     let dep_at = crates.len();
     let user_deps: [(&str, usize); 1] = [("dep", dep_at)];
     let (cfg, crate_edition, implicit) = (crates[0].cfg, crates[0].edition, crates[0].implicit);
@@ -1738,7 +1733,7 @@ fn main() {}
     let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut store = Store::new(front.index.lang("sized"), &frame, alloc);
     let (mut buckets, mut consts) = (None, Consts::default());
-    let mut got = Vec::new();
+    let mut got = blaze_own::AVec::new_in(alloc);
     for &n in &["self_ok", "self_bad", "tag_ok", "tag_bad"] {
         let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &[n] }, alloc).unwrap_or_else(|e| panic!("`{n}`: {e}"));
         let k = found.whole(1).unwrap_or_else(|| panic!("`{n}` not named")).key;
@@ -1865,7 +1860,7 @@ fn main() {}
 
     struct SolvedLoad<'n> {
         solved: &'n blaze_scope::resolve::Names<'n>,
-        records: Vec<(&'n [u8], &'n [u8])>,
+        records: &'n [(&'n [u8], &'n [u8])],
     }
 
     impl<'n> Load<'n> for SolvedLoad<'n> {
@@ -1885,21 +1880,26 @@ fn main() {}
         }
     }
 
-    let alloc = Alloc::global();
+    fn leak<T>(v: T, alloc: Alloc<'static>) -> &'static mut T {
+        blaze_own::Box::leak_static(blaze_own::Box::new_in(v, alloc))
+    }
+    let alloc = test_alloc();
     let bump = blaze_own::testing::bump();
-    let home = std::env::var("HOME").expect("HOME is set");
-    let shelf = format!("{home}/.blaze/v2/toolchain");
-    let tc: &'static Toolchain = Box::leak(Box::new(Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"))));
-    let files: &'static [(String, String)] = Box::leak(vec![("/hello-world/src/main.rs".to_string(), TEXT.to_string())].into_boxed_slice());
+    let tc: &'static Toolchain = leak(open_toolchain(), alloc);
+    let files: &'static [(String, String)] = leak([("/hello-world/src/main.rs".to_string(), TEXT.to_string())], alloc).as_slice();
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
-    let user: &'static UserCrate<'static> = Box::leak(Box::new(UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files, edition, panic: blaze_build::Panic::Unwind }));
-    let inputs: &'static Inputs<'static> = Box::leak(Box::new(Inputs::new(user, tc).unwrap_or_else(|e| panic!("the crates: {e}"))));
-    let crates: &'static [blaze_scope::resolve::CrateInput<'static>] = Vec::leak(inputs.crates());
-    let solved: &'static blaze_scope::resolve::Names<'static> = Box::leak(Box::new(inputs.resolve(crates, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"))));
+    let user: &'static UserCrate<'static> = leak(UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files, edition, panic: blaze_build::Panic::Unwind }, alloc);
+    let inputs: &'static Inputs<'static> = leak(Inputs::new(user, tc).unwrap_or_else(|e| panic!("the crates: {e}")), alloc);
+    let mut crates = blaze_own::AVec::new_in(alloc);
+    for c in inputs.crates() {
+        crates.push(c);
+    }
+    let crates: &'static [blaze_scope::resolve::CrateInput<'static>] = crates.leak_static();
+    let solved: &'static blaze_scope::resolve::Names<'static> = leak(inputs.resolve(crates, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}")), alloc);
 
-    let mut loaded = Vec::new();
-    let mut crate_keys = Vec::new();
-    let mut crate_names = Vec::new();
+    let mut loaded = blaze_own::AVec::new_in(alloc);
+    let mut crate_keys = blaze_own::AVec::new_in(alloc);
+    let mut crate_names = blaze_own::AVec::new_in(alloc);
     for i in 0..solved.crates().len() {
         let k = solved.krate(i);
         let nb = aligned(&encode_names(k, alloc).expect("encode names"), bump);
@@ -1908,10 +1908,10 @@ fn main() {}
         crate_keys.push(k.key);
         crate_names.push(k.name);
     }
-    let load: &'static SolvedLoad<'static> = Box::leak(Box::new(SolvedLoad { solved, records: loaded }));
-    let rec_frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("rec frame")));
-    let log: &'static Log<'static> = Box::leak(Box::new(Log::new(Vec::leak(crate_names), alloc)));
-    let records: &'static SourceRecords<'static> = Box::leak(Box::new(SourceRecords::new(Vec::leak(crate_keys), load, log, rec_frame, alloc)));
+    let load: &'static SolvedLoad<'static> = leak(SolvedLoad { solved, records: loaded.leak_static() }, alloc);
+    let rec_frame: &'static blaze_mem::Frame = leak(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("rec frame"), alloc);
+    let log: &'static Log<'static> = leak(Log::new(crate_names.leak_static(), alloc), alloc);
+    let records: &'static SourceRecords<'static> = leak(SourceRecords::new(crate_keys.leak_static(), load, log, rec_frame, alloc), alloc);
 
     let line_impl = solved.krate(0).tables.impls.iter().find(|i| i.header.contains("LineEnum")).expect("line impl").key;
     let plain_impl = solved.krate(0).tables.impls.iter().find(|i| i.header.contains("PlainTr")).expect("plain impl").key;
@@ -1923,11 +1923,11 @@ fn main() {}
     let prefix = solved.krate(0).key.prefix();
 
     let sources = [SourceFile { path: "src/main.rs", text: TEXT }];
-    let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame")));
+    let frame: &'static blaze_mem::Frame = leak(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame"), alloc);
     let front = Front2::new(solved, frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
     let sized = front.index.lang("sized");
 
-    let mut results: Vec<Vec<TableRead>> = Vec::new();
+    let mut results = blaze_own::AVec::new_in(alloc);
     for want in [Want::Impl(line_impl), Want::Adt(line_opts), Want::Impl(plain_impl)] {
         let rec = Recorder::new(RecorderOpts { alloc });
         {
@@ -1947,17 +1947,17 @@ fn main() {}
             });
             let _ = source.cell(want).unwrap_or_else(|e| panic!("freeze {want:?}: {e}"));
         }
-        results.push(rec.finish().expect("recorder finish").to_vec());
+        results.push(rec.finish().expect("recorder finish"));
     }
 
     let line_impl_reads = &results[0];
     assert!(
-        line_impl_reads.contains(&TableRead::File { krate: prefix, file: 0 }),
+        line_impl_reads.scan_for(&TableRead::File { krate: prefix, file: 0 }).is_some(),
         "impl with `where const {{ line!() }}` must record TableRead::File for invalidation: {line_impl_reads:?}"
     );
     let line_opts_reads = &results[1];
     assert!(
-        line_opts_reads.contains(&TableRead::File { krate: prefix, file: 0 }),
+        line_opts_reads.scan_for(&TableRead::File { krate: prefix, file: 0 }).is_some(),
         "ADT with `line!()` field default must record TableRead::File for invalidation: {line_opts_reads:?}"
     );
     let plain_impl_reads = &results[2];
@@ -2016,10 +2016,8 @@ fn call_trait_ok() -> usize { <S as Tr>::trait_ok() }
 fn main() {}
 ";
 
-    let alloc = Alloc::global();
-    let home = std::env::var("HOME").expect("HOME is set");
-    let shelf = format!("{home}/.blaze/v2/toolchain");
-    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let alloc = test_alloc();
+    let tc = open_toolchain();
     let files = [("/hello-world/src/main.rs".to_string(), TEXT.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
@@ -2046,7 +2044,7 @@ fn main() {}
     let impl_bad_k = front.keys.member(blaze_ladder::front2::keys::checker_of(impl_key), blaze_ladder::front2::keys::MemberKind::Fn, "impl_bad").expect("impl_bad key");
     let trait_ok_k = front.keys.member(blaze_ladder::front2::keys::checker_of(trait_key), blaze_ladder::front2::keys::MemberKind::Fn, "trait_ok").expect("trait_ok key");
 
-    let mut got = Vec::new();
+    let mut got = blaze_own::AVec::new_in(alloc);
     for &(name, k) in &[("S::impl_ok", impl_ok_k), ("S::impl_bad", impl_bad_k), ("Tr::trait_ok", trait_ok_k)] {
         let body = blaze_ladder::front2::body::lower_member(&names, prepared, &mut front.keys, &mut store, k).unwrap_or_else(|e| panic!("lower {name}: {e}"));
         let view = body.lowered.view();

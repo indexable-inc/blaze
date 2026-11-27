@@ -853,6 +853,7 @@ mod tests {
             site: DefSite { krate: CrateItemKey(ContentId([4; 32])), module: None },
             transparency: Transparency::Opaque,
             edition: Edition::E2021,
+            local_inner: false,
         };
         let mut marks_a = blaze_own::AVec::new_in(alloc);
         marks_a.push((0, mark));
