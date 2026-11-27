@@ -23,6 +23,7 @@ pub mod machine;
 pub mod parse;
 pub mod persist;
 pub mod protocol;
+pub mod schema;
 pub mod span;
 pub mod state;
 pub mod value;

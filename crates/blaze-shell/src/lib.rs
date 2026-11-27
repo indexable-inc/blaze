@@ -21,6 +21,7 @@ pub mod layout;
 pub mod prompt;
 pub mod remote_driver;
 pub mod rust_cell;
+pub mod schema_view;
 pub mod svg_icons;
 pub mod sysmon_driver;
 pub mod sysmon_view;

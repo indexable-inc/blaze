@@ -784,7 +784,8 @@ impl<'s, 't, 'a> Parser<'s, 't, 'a> {
                     }
                 }
 
-                // `./foo` is a command path.
+                // `./foo` is a command path; `.` / `.field.0` / `?.field` is an implicit-subject
+                // expression operating on the piped value (`$in`) or previous command output (`$_`).
                 TokKind::Dot => {
                     let touches_slash = matches!(
                         p.peek_at(1),
@@ -793,9 +794,10 @@ impl<'s, 't, 'a> Parser<'s, 't, 'a> {
                     if touches_slash {
                         p.parse_call(false)
                     } else {
-                        Err(p.err(tok.span, "unexpected `.` at start of expression"))
+                        p.parse_expr()
                     }
                 }
+                TokKind::QuestionDot => p.parse_expr(),
 
                 // `/bin/ls` or `~/bin/tool`
                 TokKind::Slash | TokKind::Tilde => p.parse_call(false),
@@ -1631,6 +1633,18 @@ impl<'s, 't, 'a> Parser<'s, 't, 'a> {
             return Ok(base);
         }
 
+        // Merge directly into `CellPath` if the base is already a `CellPath` (e.g. `.package.version`).
+        if let ExprKind::CellPath { steps: ref mut existing, .. } = base.kind {
+            if existing.len() + steps.len() > MAX_PATH_STEPS {
+                return Err(self.err_budget(span, "cell path exceeds maximum step count"));
+            }
+            for step in steps {
+                existing.push(step);
+            }
+            base.span = span;
+            return Ok(base);
+        }
+
         Ok(Expr {
             kind: ExprKind::CellPath {
                 base: Box::new_in(base, self.alloc),
@@ -1712,6 +1726,36 @@ impl<'s, 't, 'a> Parser<'s, 't, 'a> {
                 let name = name.share();
                 self.pos += 1;
                 Ok(Expr { kind: ExprKind::Var(name), span })
+            }
+            // Implicit-subject leading `.` / `.field.0` / `?.field` (operates on row, `$in`, or `$_`).
+            TokKind::Dot | TokKind::QuestionDot => {
+                let optional = matches!(tok.kind, TokKind::QuestionDot);
+                self.pos += 1;
+                let base = Expr { kind: ExprKind::DotSubject, span };
+                let touches_step = self
+                    .peek()
+                    .is_some_and(|next| next.span.start == span.end);
+                if optional || touches_step {
+                    if let Some(step) = self.try_parse_path_step(span, optional) {
+                        let full_span = span.merge(step.span);
+                        let mut steps = AVec::new_in(self.alloc);
+                        steps.push(step);
+                        return Ok(Expr {
+                            kind: ExprKind::CellPath {
+                                base: Box::new_in(base, self.alloc),
+                                steps,
+                            },
+                            span: full_span,
+                        });
+                    }
+                    if optional {
+                        return Err(self.err(
+                            self.cur_span(),
+                            "expected field name or integer index after `?.`",
+                        ));
+                    }
+                }
+                Ok(base)
             }
             // Bare cell-path literal `$.a.b` or `$?.a`
             TokKind::Dollar => {

@@ -2446,6 +2446,9 @@ fn layout_value(
                 layout_table(scene, block, t, x0, y0, width, m, clip_id, depth, now_ns)
             }
         }
+        Value::Record(r) if depth == 0 && crate::schema_view::is_schema_record(r) => {
+            crate::schema_view::layout_schema_card(scene, r, x0, y0, width, m, clip_id)
+        }
         Value::Record(r) => layout_record(scene, block, r, x0, y0, width, m, clip_id, depth, now_ns),
         Value::List(items) => layout_list(scene, block, items, x0, y0, width, m, clip_id, depth, now_ns),
         Value::Error(err) => {

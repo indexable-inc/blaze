@@ -240,6 +240,12 @@ pub static BUILTIN_SPECS: &[BuiltinSpec] = &[
         flags: &[],
     },
     BuiltinSpec {
+        name: "keys",
+        signature: "keys",
+        summary: "Return the keys of a record or column names of a table",
+        flags: &[],
+    },
+    BuiltinSpec {
         name: "values",
         signature: "values",
         summary: "Return the values of a record or columns of a table",
@@ -598,9 +604,15 @@ pub static BUILTIN_SPECS: &[BuiltinSpec] = &[
     },
     // Core / Meta / Session
     BuiltinSpec {
+        name: "schema",
+        signature: "schema [value]",
+        summary: "Inspect the inferred schema, patterns, and distributions of a value (or $_)",
+        flags: &[],
+    },
+    BuiltinSpec {
         name: "describe",
-        signature: "describe",
-        summary: "Describe the type or schema of the pipeline input",
+        signature: "describe [value]",
+        summary: "Inspect the inferred schema, patterns, and distributions of a value (alias of schema)",
         flags: &[],
     },
     BuiltinSpec {
@@ -1549,7 +1561,7 @@ pub(crate) fn dispatch_builtin<'a>(
         "enumerate" => builtin_enumerate(eval, input, span)?,
         "transpose" => builtin_transpose(eval, args, input, span)?,
         "headers" => builtin_headers(eval, input, span)?,
-        "columns" => builtin_columns(eval, input, span)?,
+        "columns" | "keys" => builtin_columns(eval, input, span)?,
         "values" => builtin_values(eval, input, span)?,
         "append" => builtin_append(eval, args, input, span)?,
         "prepend" => builtin_prepend(eval, args, input, span)?,
@@ -1566,7 +1578,7 @@ pub(crate) fn dispatch_builtin<'a>(
         "lines" => builtin_lines(eval, input, span)?,
         "parse" => builtin_parse(eval, args, input, span)?,
         // Core / Meta / Session
-        "describe" => builtin_describe(eval, input),
+        "schema" | "describe" => builtin_schema(eval, &args, input, span)?,
         "echo" => builtin_echo(eval, args),
         "print" => builtin_print(eval, args, input)?,
         "do" => builtin_do(eval, args, input, span)?,
@@ -5397,48 +5409,28 @@ fn builtin_from<'a>(
 // 6. Core / Meta / Session Builtins
 // =============================================================================
 
-fn builtin_describe<'a>(eval: &Evaluator<'a, '_>, input: Value<'a>) -> Value<'a> {
+fn builtin_schema<'a>(
+    eval: &Evaluator<'a, '_>,
+    args: &EvalArgs<'a>,
+    input: Value<'a>,
+    span: Span,
+) -> Result<Value<'a>, Control<'a>> {
     let alloc = eval.alloc();
-    match &input {
-        Value::Table(t) => {
-            if t.ncols() == 0 {
-                return Value::string("table", alloc);
-            }
-            let mut out = AString::from_str_in("table<", alloc);
-            for c in 0..t.ncols() {
-                if c > 0 {
-                    out.push_str(", ");
-                }
-                out.push_str(t.columns.get(c).unwrap().as_ref());
-                out.push_str(": ");
-                let ty = if t.nrows() > 0 {
-                    t.cell(0, c).unwrap().type_name()
-                } else {
-                    "any"
-                };
-                out.push_str(ty);
-            }
-            out.push('>');
-            Value::string(out.as_str(), alloc)
-        }
-        Value::Record(r) => {
-            if r.is_empty() {
-                return Value::string("record", alloc);
-            }
-            let mut out = AString::from_str_in("record<", alloc);
-            for (i, (k, v)) in r.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                out.push_str(k);
-                out.push_str(": ");
-                out.push_str(v.type_name());
-            }
-            out.push('>');
-            Value::string(out.as_str(), alloc)
-        }
-        other => Value::string(other.type_name(), alloc),
-    }
+    let target = if let Some((first, _)) = args.pos.first() {
+        first.share()
+    } else if !matches!(input, Value::Nothing) {
+        input
+    } else if let Some(slot) = eval.state().get_var("_") {
+        slot.value.share()
+    } else {
+        return Err(Control::Error(ShellError::new(
+            ErrorKind::Undefined,
+            span,
+            "no pipeline input, argument, or previous output (`$_`) to inspect with `schema`",
+            alloc,
+        )));
+    };
+    Ok(crate::schema::infer_schema_value(&target, alloc))
 }
 
 fn builtin_echo<'a>(eval: &Evaluator<'a, '_>, args: EvalArgs<'a>) -> Value<'a> {

@@ -765,3 +765,105 @@ fn tree_builtin_builds_hierarchical_dataframe() {
     assert_eq!(pipe_sort.exit_code, 0, "got {:?}", pipe_sort.value);
     assert_eq!(pipe_sort.value, Value::string("big.bin", alloc()));
 }
+
+#[test]
+fn dot_subject_queries_previous_output_pipeline_and_rows() {
+    use blaze_own::Share as _;
+    let mut host = FakeHost::new();
+    let mut st = EngineState::new("/work", &[], alloc());
+
+    // 1. Seed `$_` with a Cargo.toml-like nested record and query `.package.version` directly!
+    let r0 = host.run(
+        r#"{ package: { name: "hello-world", version: "0.1.0", edition: "blaze-2026.11" } }"#,
+        st.fork(),
+    );
+    assert_eq!(r0.exit_code, 0);
+    st.set_var("_", r0.value.share(), false);
+
+    let r1 = host.run(".package.version", st.fork());
+    assert_eq!(r1.exit_code, 0, "got {:?}", r1.value);
+    assert_eq!(r1.value, Value::string("0.1.0", alloc()));
+
+    let r2 = host.run(".package | keys | length", st.fork());
+    assert_eq!(r2.exit_code, 0, "got {:?}", r2.value);
+    assert_eq!(r2.value, Value::Int(3));
+
+    let r3 = host.run(".", st.fork());
+    assert_eq!(r3.exit_code, 0);
+    assert_eq!(r3.value, r0.value);
+
+    // 2. Works inside pipelines (`| .package.name`) and expressions (`.package.name ++ "@" ++ .package.version`).
+    let r4 = host.run(r#"{ package: { name: "blaze", version: "2.0.0" } } | .package.name"#, st.fork());
+    assert_eq!(r4.exit_code, 0, "got {:?}", r4.value);
+    assert_eq!(r4.value, Value::string("blaze", alloc()));
+
+    let r5 = host.run(r#".package.name ++ "@" ++ .package.version"#, st.fork());
+    assert_eq!(r5.exit_code, 0, "got {:?}", r5.value);
+    assert_eq!(r5.value, Value::string("hello-world@0.1.0", alloc()));
+
+    // 3. Works inside `where` predicates (`.v > 10`) and optional access (`?.missing?`).
+    let r6 = host.run("[{v: 5}, {v: 20}, {v: 30}] | where .v > 10 | length", st.fork());
+    assert_eq!(r6.exit_code, 0, "got {:?}", r6.value);
+    assert_eq!(r6.value, Value::Int(2));
+
+    let r7 = host.run(".package?.missing?", st.fork());
+    assert_eq!(r7.exit_code, 0, "got {:?}", r7.value);
+    assert_eq!(r7.value, Value::Nothing);
+}
+
+#[test]
+fn schema_infers_nested_lockfile_types_patterns_and_histograms() {
+    use blaze_own::Share as _;
+    let mut host = FakeHost::new();
+    let mut st = EngineState::new("/work", &[], alloc());
+
+    let lock_expr = r#"{
+        version: 4,
+        package: [
+            { name: "adler2", version: "2.0.1", source: "registry+https://github.com/rust-lang/crates.io-index", size: 10 },
+            { name: "ahash", version: "0.8.12", source: "registry+https://github.com/rust-lang/crates.io-index", size: 25 },
+            { name: "blaze-core", version: "0.0.0", source: null, size: 100 },
+            { name: "blaze-sh", version: "0.0.0", source: null, size: 200 }
+        ]
+    }"#;
+    let seed = host.run(lock_expr, st.fork());
+    assert_eq!(seed.exit_code, 0, "got {:?}", seed.value);
+    st.set_var("_", seed.value.share(), false);
+
+    // Bare `schema` inspects `$_` automatically!
+    let res = host.run("schema", st.fork());
+    assert_eq!(res.exit_code, 0, "got {:?}", res.value);
+    let Value::Record(rec) = res.value else {
+        panic!("expected schema record, got {:?}", res.value);
+    };
+    assert_eq!(rec.get(crate::schema::SCHEMA_MARKER_KEY), Some(&Value::Bool(true)));
+    assert_eq!(rec.get("kind").and_then(Value::as_str), Some("record"));
+
+    let Some(Value::Table(fields)) = rec.get("fields") else {
+        panic!("expected fields table");
+    };
+    let find_row = |path: &str| -> usize {
+        (0..fields.nrows())
+            .find(|&i| fields.get_by_name(i, "path").and_then(Value::as_str) == Some(path))
+            .unwrap_or_else(|| panic!("missing schema path {path}"))
+    };
+    let v_row = find_row(".package.version");
+    assert_eq!(fields.get_by_name(v_row, "pattern").and_then(Value::as_str), Some("x.y.z"));
+    let src_row = find_row(".package.source");
+    assert_eq!(fields.get_by_name(src_row, "type").and_then(Value::as_str), Some("string?"));
+    assert_eq!(fields.get_by_name(src_row, "present"), Some(&Value::Int(2)));
+    assert_eq!(fields.get_by_name(src_row, "total"), Some(&Value::Int(4)));
+    let sz_row = find_row(".package.size");
+    assert!(
+        fields
+            .get_by_name(sz_row, "hist")
+            .and_then(Value::as_str)
+            .is_some_and(|h| h.starts_with("num:")),
+        "numeric column must emit histogram"
+    );
+
+    // `describe` alias works identically via pipe.
+    let res2 = host.run("$_ | describe | .kind", st.fork());
+    assert_eq!(res2.exit_code, 0, "got {:?}", res2.value);
+    assert_eq!(res2.value, Value::string("record", alloc()));
+}
