@@ -1294,11 +1294,11 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             if s.parenthesized {
                 for &n in v.rows(s.args)? {
                     if let lf::GenericArg::Type(_) = lf::GenericArg::decode(n)? {
-                        out.push(next.next().ok_or(program(format!("a type argument is missing"), r))?);
+                        out.push(next.next().ok_or_else(|| Why::Program("a type argument is missing".into(), r))?);
                     }
                 }
                 if s.ty.is_some() {
-                    out.push(next.next().ok_or(program(format!("a type argument is missing"), r))?);
+                    out.push(next.next().ok_or_else(|| Why::Program("a type argument is missing".into(), r))?);
                 }
                 return Ok(());
             }
@@ -1306,11 +1306,11 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             for &n in v.rows(s.args)? {
                 let made = match lf::GenericArg::decode(n)? {
                     lf::GenericArg::Type(t) => match bare_name(v, t)? {
-                        None => next.next().ok_or(program(format!("a type argument is missing"), r))?,
+                        None => next.next().ok_or_else(|| Why::Program("a type argument is missing".into(), r))?,
                         Some(name) => {
                             let param = env.params.iter().find(|(n, _)| *n == Name::of(name)).map(|&(_, i)| i);
                             let is_const = param.is_some_and(|i| env.consts.iter().any(|(c, _)| *c == i));
-                            let lf::TypeRef::Path(tp) = v.ty(t)? else { return Err(program(format!("a one-name argument that is no path"), r)) };
+                            let lf::TypeRef::Path(tp) = v.ty(t)? else { return Err(Why::Program("a one-name argument that is no path".into(), r)) };
                             let ar = place(v, v.type_range(t))?;
                             let allow_bare_trait = self.allows_bare_trait_object_at(env, v, tp, ar)?;
                             // An item the body declares takes part as in a body path's own
@@ -1384,7 +1384,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                         self.const_term(tys, env, text, ar, &want)?
                     }
                     lf::GenericArg::AssocType { args, .. } if args.len == 0 => {
-                        let made = next.next().ok_or(program(format!("a type argument is missing"), r))?;
+                        let made = next.next().ok_or_else(|| Why::Program("a type argument is missing".into(), r))?;
                         out.push(made);
                         continue;
                     }
@@ -1873,7 +1873,8 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             if self.allows_bare_trait_object_at(env, v, p, r)? {
                 return self.bare_dyn_ty(tys, v, p, segs, found.key, found.kind == Kind::TraitAlias, kids, r);
             }
-            return Err(program(format!("`{shown}` is not a type (trait objects without `dyn` are invalid since Rust 2021: E0782)"), r));
+            let msg = blaze_own::format_in!(tys.alloc(), "`{shown}` is not a type (trait objects without `dyn` are invalid since Rust 2021: E0782)");
+            return Err(Why::Program(msg.as_str().into(), r));
         }
         if segs.last().is_some_and(|s| s.parenthesized) {
             return Err(Why::Unsupported("parenthesized generic arguments (`Fn(A) -> B`)", r));
@@ -2128,16 +2129,20 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         let head = self.heads.trait_alias(alias).ok_or(Why::Need(alias))?;
         let want = usize::try_from(head.generics).unwrap_or(0).saturating_sub(1);
         let alloc = tys.alloc();
+        let wrong_arity = || {
+            let msg = blaze_own::format_in!(alloc, "a trait alias written with {} type arguments; it takes {want}", given.len());
+            Why::Program(msg.as_str().into(), r)
+        };
         if given.len() == want {
             let mut out = blaze_own::Vec::with_capacity_in(want, alloc);
             out.extend_from_slice(given);
             return Ok(out);
         }
         if given.len() > want {
-            return Err(program(format!("a trait alias written with {} type arguments; it takes {want}", given.len()), r));
+            return Err(wrong_arity());
         }
         let Some(alias_text) = self.resolver.names.signature_text_of(alias) else {
-            return Err(program(format!("a trait alias written with {} type arguments; it takes {want}", given.len()), r));
+            return Err(wrong_arity());
         };
         let marks = super::item_site::item_marks(self.resolver.names, alias, alias_text.text)
             .map_err(|_| Why::Unsupported("trait alias token marks unavailable", r))?;
@@ -2189,7 +2194,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                         alias_builder.const_term(tys, &alias_env, av.text_at(at)?, cr, &|_| Ok(want_ty))?
                     }
                     None => {
-                        return Err(program(format!("a trait alias written with {} type arguments; it takes {want}", given.len()), r));
+                        return Err(wrong_arity());
                     }
                 };
                 let filled = subst(tys, raw, &full)?;
@@ -2201,7 +2206,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         });
         match lowered {
             Ok(res) => res,
-            Err(_) => Err(program(format!("a trait alias written with {} type arguments; it takes {want}", given.len()), r)),
+            Err(_) => Err(wrong_arity()),
         }
     }
 
@@ -5606,18 +5611,39 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         depth: u8,
     ) -> Result<Laid, Why> {
         const MOST_ALIAS_DEPTH: u8 = 8;
-        if depth >= MOST_ALIAS_DEPTH || s.default_depth >= MOST_DEFAULT_DEPTH {
-            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r)));
-        }
         let alloc = s.alloc;
-        let Some(alias_text) = self.resolver.names.signature_text_of(alias_key) else {
-            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r)));
-        };
-        let marks = match super::item_site::item_marks(self.resolver.names, alias_key, alias_text.text) {
-            Ok(m) => m,
-            Err(_) => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r))),
-        };
-        let lowered = super::heads::with_lowered(self.resolver.names, alias_key, alias_text.text, |av| -> Result<Laid, Why> {
+        let mut cur_alias_key = alias_key;
+        let mut cur_lts: blaze_own::Vec<SlotKind, Alloc<'s>> = blaze_own::Vec::with_capacity_in(use_lifetimes.len(), alloc);
+        cur_lts.extend_from_slice(use_lifetimes);
+        let mut cur_args: blaze_own::Vec<PTy, Alloc<'s>> = blaze_own::Vec::with_capacity_in(args.len(), alloc);
+        cur_args.extend_from_slice(args);
+        let mut cur_pool: blaze_own::Vec<Slot, Alloc<'s>> = blaze_own::Vec::with_capacity_in(pool.len(), alloc);
+        cur_pool.extend_from_slice(pool);
+        let mut cur_index: blaze_own::Vec<(u32, u32, u32), Alloc<'s>> = blaze_own::Vec::with_capacity_in(index.len(), alloc);
+        cur_index.extend_from_slice(index);
+        let mut cur_assoc_binds: blaze_own::Vec<(Name, PTy, (u32, u32, u32)), Alloc<'s>> = blaze_own::Vec::with_capacity_in(assoc_binds.len(), alloc);
+        cur_assoc_binds.extend_from_slice(assoc_binds);
+        let mut cur_depth = depth;
+        let mut post_stack: blaze_own::Vec<AliasDynPost, Alloc<'s>> = blaze_own::Vec::new_in(alloc);
+
+        loop {
+            if cur_depth >= MOST_ALIAS_DEPTH || s.default_depth >= MOST_DEFAULT_DEPTH {
+                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r)));
+            }
+            let alias_key = cur_alias_key;
+            let use_lifetimes = &cur_lts[..];
+            let args = &cur_args[..];
+            let pool = &cur_pool[..];
+            let index = &cur_index[..];
+            let assoc_binds = &cur_assoc_binds[..];
+            let Some(alias_text) = self.resolver.names.signature_text_of(alias_key) else {
+                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r)));
+            };
+            let marks = match super::item_site::item_marks(self.resolver.names, alias_key, alias_text.text) {
+                Ok(m) => m,
+                Err(_) => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r))),
+            };
+            let lowered = super::heads::with_lowered(self.resolver.names, alias_key, alias_text.text, |av| -> Result<Result<AliasDynStep<'s>, RegionRefusal>, Why> {
             let mut lt_names: blaze_own::Vec<Name, Alloc<'s>> = blaze_own::Vec::new_in(alloc);
             let mut ps: blaze_own::Vec<(Name, u32), Alloc<'s>> = blaze_own::Vec::new_in(alloc);
             let mut param_defaults: blaze_own::Vec<Option<AliasDefault>, Alloc<'s>> = blaze_own::Vec::new_in(alloc);
@@ -6173,53 +6199,21 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     sub_pool.extend_from_slice(bsl);
                     sub_assoc_binds.push((bn, bt, (new_start, blen, bb)));
                 }
-                let binders = match self.lay_trait_alias_dyn_regions(
-                    tys,
-                    made,
-                    sub_alias_key,
-                    &sub_lts,
-                    (&sub_args, &sub_pool, &sub_index),
-                    &sub_assoc_binds,
-                    whole,
-                    s,
-                    r,
-                    depth + 1,
-                )? {
-                    Ok(b) => b,
-                    Err(why) => return Ok(Err(why)),
-                };
-                if !b_names.is_empty() {
-                    let mut base = 0u32;
-                    for slot in s.scratch.iter() {
-                        if let SlotKind::Late { binder: 0, var } = slot.kind {
-                            base = base.max(var.saturating_add(1));
-                        }
-                    }
-                    for slot in s.scratch.iter_mut() {
-                        if let SlotKind::Bound(var) = slot.kind {
-                            slot.kind = SlotKind::Late { binder: 0, var: base.saturating_add(var) };
-                        }
-                    }
-                }
-                if let Some(first) = s.scratch.first_mut() {
-                    if let Some(explicit) = extra_obj_lt {
-                        *first = explicit;
-                    } else if extra_has_static {
-                        *first = Slot::quiet(SlotKind::Static);
-                    } else if extra_ambiguous {
-                        if !matches!(first.kind, SlotKind::Static) {
-                            return Ok(Err(RegionRefusal::ObjectDefault { at: r }));
-                        }
-                    } else if let Some(u) = extra_unique {
-                        match first.kind {
-                            SlotKind::ObjectDefault(_) => *first = Slot::quiet(u),
-                            SlotKind::Static => {}
-                            prev if same_region(prev, u) => {}
-                            _ => return Ok(Err(RegionRefusal::ObjectDefault { at: r })),
-                        }
-                    }
-                }
-                return Ok(Ok(binders));
+                return Ok(Ok(AliasDynStep::Next {
+                    alias_key: sub_alias_key,
+                    use_lifetimes: sub_lts,
+                    args: sub_args,
+                    pool: sub_pool,
+                    index: sub_index,
+                    assoc_binds: sub_assoc_binds,
+                    post: AliasDynPost {
+                        has_b_names: !b_names.is_empty(),
+                        extra_obj_lt,
+                        extra_has_static,
+                        extra_ambiguous,
+                        extra_unique,
+                    },
+                }));
             }
 
             // Direct trait bounds (`trait Alias<'a, U> = Gen<&'a u8, U> + Iter<Item = &'a u8> + ...;`):
@@ -6498,11 +6492,62 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     }
                 }
             }
-            Ok(Ok(db))
-        });
-        match lowered {
-            Ok(res) => res,
-            Err(_) => Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r))),
+            Ok(Ok(AliasDynStep::Done(db)))
+            });
+            let step = match lowered {
+                Ok(Ok(step)) => step,
+                Ok(Err(why)) => return Err(why),
+                Err(_) => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r))),
+            };
+            match step {
+                Ok(AliasDynStep::Next { alias_key, use_lifetimes, args, pool, index, assoc_binds, post }) => {
+                    post_stack.push(post);
+                    cur_alias_key = alias_key;
+                    cur_lts = use_lifetimes;
+                    cur_args = args;
+                    cur_pool = pool;
+                    cur_index = index;
+                    cur_assoc_binds = assoc_binds;
+                    cur_depth = cur_depth.saturating_add(1);
+                }
+                Ok(AliasDynStep::Done(binders)) => {
+                    while let Some(post) = post_stack.pop() {
+                        if post.has_b_names {
+                            let mut base = 0u32;
+                            for slot in s.scratch.iter() {
+                                if let SlotKind::Late { binder: 0, var } = slot.kind {
+                                    base = base.max(var.saturating_add(1));
+                                }
+                            }
+                            for slot in s.scratch.iter_mut() {
+                                if let SlotKind::Bound(var) = slot.kind {
+                                    slot.kind = SlotKind::Late { binder: 0, var: base.saturating_add(var) };
+                                }
+                            }
+                        }
+                        if let Some(first) = s.scratch.first_mut() {
+                            if let Some(explicit) = post.extra_obj_lt {
+                                *first = explicit;
+                            } else if post.extra_has_static {
+                                *first = Slot::quiet(SlotKind::Static);
+                            } else if post.extra_ambiguous {
+                                if !matches!(first.kind, SlotKind::Static) {
+                                    return Ok(Err(RegionRefusal::ObjectDefault { at: r }));
+                                }
+                            } else if let Some(u) = post.extra_unique {
+                                match first.kind {
+                                    SlotKind::ObjectDefault(_) => *first = Slot::quiet(u),
+                                    SlotKind::Static => {}
+                                    prev if same_region(prev, u) => {}
+                                    _ => return Ok(Err(RegionRefusal::ObjectDefault { at: r })),
+                                }
+                            }
+                        }
+                    }
+                    return Ok(Ok(binders));
+                }
+                Err(why) => return Ok(Err(why)),
+            }
         }
     }
 
@@ -6849,6 +6894,29 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         }
         Ok(Ok(binders))
     }
+}
+
+/// Post-processing frame for one nested trait alias step in `Builder::lay_trait_alias_dyn_regions`.
+struct AliasDynPost {
+    has_b_names: bool,
+    extra_obj_lt: Option<Slot>,
+    extra_has_static: bool,
+    extra_ambiguous: bool,
+    extra_unique: Option<SlotKind>,
+}
+
+/// One iteration result of `Builder::lay_trait_alias_dyn_regions`.
+enum AliasDynStep<'s> {
+    Done(u32),
+    Next {
+        alias_key: LibKey,
+        use_lifetimes: blaze_own::Vec<SlotKind, Alloc<'s>>,
+        args: blaze_own::Vec<PTy, Alloc<'s>>,
+        pool: blaze_own::Vec<Slot, Alloc<'s>>,
+        index: blaze_own::Vec<(u32, u32, u32), Alloc<'s>>,
+        assoc_binds: blaze_own::Vec<(Name, PTy, (u32, u32, u32)), Alloc<'s>>,
+        post: AliasDynPost,
+    },
 }
 
 /// A declared default argument on a trait alias generic parameter (either a type or a const).

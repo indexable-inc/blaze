@@ -467,16 +467,19 @@ b64.workspace = true
     };
     let (units, _) = tree.read_opts("crates/shell", true, true).expect("the nested workspace with its path packages");
     assert_eq!(units.manifests[units.root.0 as usize].as_str(), "crates/shell/Cargo.toml", "the nested workspace is its own root");
-    let members: std::vec::Vec<&str> = units.members.iter().map(|m| m.name.as_str()).collect();
-    assert_eq!(members, ["shell"], "a path package outside the root's folder is no member");
+    assert!(units.members.iter().map(|m| m.name.as_str()).eq(["shell"]), "a path package outside the root's folder is no member");
     match &units.members[0].dependencies[0].source {
         Source::Path(dir) => assert_eq!(dir.as_str(), "crates/bgit"),
         _ => panic!("`../bgit` from crates/shell is the path package at crates/bgit"),
     }
-    let found: std::vec::Vec<(&str, &str, Option<&str>)> =
-        units.path_packages.iter().map(|p| (p.dir.as_str(), p.name.as_str(), p.version.as_ref().map(|v| v.as_str()))).collect();
-    std::println!("path packages: {found:?}");
-    assert_eq!(found, [("crates/b64", "b64", Some("0.0.7")), ("crates/bgit", "bgit", Some("0.0.7"))], "bgit by shell's manifest, b64 through bgit's");
+    assert!(
+        units
+            .path_packages
+            .iter()
+            .map(|p| (p.dir.as_str(), p.name.as_str(), p.version.as_ref().map(|v| v.as_str())))
+            .eq([("crates/b64", "b64", Some("0.0.7")), ("crates/bgit", "bgit", Some("0.0.7"))]),
+        "bgit by shell's manifest, b64 through bgit's"
+    );
     let bgit = units.path_packages.iter().find(|p| p.name.as_str() == "bgit").expect("bgit");
     assert_eq!(bgit.lib.as_ref().map(|lib| lib.root.as_str()), Some("crates/bgit/src/lib.rs"), "anchor-relative, like a member's");
     match &bgit.dependencies[0].source {
