@@ -8053,7 +8053,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         if let Some(g) = arm.guard
             && self.cond_has_let(g)?
         {
-            return self.let_guard(g, arm.body, next);
+            return self.let_guard(g, arm.body, next, from);
         }
         self.work.push(Task::Eval(arm.body));
         if let Some(g) = arm.guard {

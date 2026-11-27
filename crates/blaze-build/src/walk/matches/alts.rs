@@ -191,16 +191,10 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
     }
 
-    /// The guard of an arm `test_alts` tested, its value on top: true goes on to the body;
-    /// false to the chain after the expansion that matched (its number is in `word`), which
-    /// for the last one is the next arm.
-    pub(in super::super) fn guard_alts(&mut self, word: SlotId, chains: u32, n: u32) -> Result<(), BuildError> {
-        let g = self.pop()?;
-        let c = self.cond(g)?;
-        let body = self.create();
-        let failed = self.create();
-        self.br(c, (body, &[]), (failed, &[]));
-        self.begin(failed);
+    /// Emits a block switching on `word` (the matching expansion index stored by `test_alts`)
+    /// to `arm_blocks[chains + k]`: shared by [`Self::guard_alts`] and `if let` match guards
+    /// whose arm pattern holds an or-pattern.
+    fn emit_guard_alts_switch(&mut self, word: SlotId, chains: u32, n: u32) -> Result<(), BuildError> {
         let a = self.b.slot_addr(word);
         let attrs = self.mem(WORD);
         let k = self.b.load(Ty::I32, Flags::NONE, a, 0, attrs);
@@ -212,6 +206,32 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
         let default = after(self, last)?;
         self.switch(k, default, &cases);
+        Ok(())
+    }
+
+    /// Creates and fills the failure dispatch block for an `if let` guard on an arm `test_alts`
+    /// expanded: any failed guard link jumps here, which switches on `word` to the chain after
+    /// the expansion that matched (or to the next arm after the last expansion). Must be called
+    /// before `self.begin(pass)` so it does not interrupt `pass`.
+    pub(super) fn guard_alts_fail(&mut self, word: SlotId, chains: u32, n: u32, pass_live: bool) -> Result<blaze_lir::Block, BuildError> {
+        let failed = self.create();
+        self.begin(failed);
+        self.live = pass_live;
+        self.emit_guard_alts_switch(word, chains, n)?;
+        Ok(failed)
+    }
+
+    /// The guard of an arm `test_alts` tested, its value on top: true goes on to the body;
+    /// false to the chain after the expansion that matched (its number is in `word`), which
+    /// for the last one is the next arm.
+    pub(in super::super) fn guard_alts(&mut self, word: SlotId, chains: u32, n: u32) -> Result<(), BuildError> {
+        let g = self.pop()?;
+        let c = self.cond(g)?;
+        let body = self.create();
+        let failed = self.create();
+        self.br(c, (body, &[]), (failed, &[]));
+        self.begin(failed);
+        self.emit_guard_alts_switch(word, chains, n)?;
         self.begin(body);
         Ok(())
     }

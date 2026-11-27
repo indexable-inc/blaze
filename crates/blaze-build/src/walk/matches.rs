@@ -362,6 +362,15 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 return Err(error);
             }
         };
+        let guard_has_let = match arm.guard {
+            Some(g) => self.cond_has_let(g)?,
+            None => false,
+        };
+        let let_guard_fail = if guard_has_let && let Some((word, chains, n)) = expanded {
+            self.guard_alts_fail(word, chains, n, self.reached[pass.index()])?
+        } else {
+            next
+        };
         self.begin(pass);
         let mark = u32::try_from(self.scope_pats.len()).map_err(|_| malformed("drop scope depth past u32::MAX"))?;
         self.scope_marks.push(mark);
@@ -377,14 +386,12 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
         self.work.push(Task::ArmEnd { m });
         self.work.push(Task::ScopeEnd(arm.body));
-        // An `if let` guard (walk/lets.rs `let_guard`): its links, each failure to `next`.
+        // An `if let` guard (walk/lets.rs `let_guard`): its links, each failure to
+        // `let_guard_fail` (either the next expansion of an or-pattern or `next` arm).
         if let Some(g) = arm.guard
-            && self.cond_has_let(g)?
+            && guard_has_let
         {
-            if expanded.is_some() {
-                return Err(unsupported(g, "an `if let` guard on an arm whose or-pattern binds (a guard per alternative)"));
-            }
-            return self.let_guard(g, arm.body, next);
+            return self.let_guard(g, arm.body, let_guard_fail, from);
         }
         self.work.push(Task::Eval(arm.body));
         if let Some(g) = arm.guard {
