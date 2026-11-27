@@ -281,3 +281,115 @@ pub fn check_filter_assoc(mut f: FilterWrap<U8Iter, Owned>) -> MyOpt<u8> {
     let (said, codes, notes) = check_text(SRC);
     assert!(error_lines(&said).is_empty(), "expected 0 errors (codes={codes:?}, notes={notes:?}):\n{said}");
 }
+
+/// Blocker C6 (`sqlx-core/src/migrate/source.rs` `ResolveError`): thiserror's comptime patch must
+/// unwrap `Option<E>` `#[source]` / implicit `source` fields via `Option::as_ref` before unsizing
+/// `&E as &(dyn Error + 'static)` (for both structs and enums), never casting `&Option<E>` directly
+/// (which front2 rejects with E0605 `NonPrimitiveCast`).
+#[test]
+fn thiserror_option_source_unwraps_instead_of_casting_option() {
+    const CLEAN: &str = r#"
+#[lang = "sized"]
+pub trait Sized {}
+#[lang = "unsize"]
+pub trait Unsize<T: ?Sized> {}
+#[lang = "coerce_unsized"]
+pub trait CoerceUnsized<T: ?Sized> {}
+impl<'a, 'b: 'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<&'a U> for &'b T {}
+
+pub trait Error {
+    fn source(&self) -> Opt<&(dyn Error + 'static)> { Opt::None }
+}
+pub enum Opt<T> {
+    None,
+    Some(T),
+}
+impl<T> Opt<T> {
+    pub fn as_ref(&self) -> Opt<&T> {
+        match self {
+            Opt::Some(x) => Opt::Some(x),
+            Opt::None => Opt::None,
+        }
+    }
+}
+pub struct IoErr;
+impl Error for IoErr {}
+
+pub struct ResolveError {
+    pub code: u8,
+    pub source: Opt<IoErr>,
+}
+impl Error for ResolveError {
+    fn source(&self) -> Opt<&(dyn Error + 'static)> {
+        match Opt::as_ref(&self.source) {
+            Opt::Some(__e) => Opt::Some(__e as &(dyn Error + 'static)),
+            Opt::None => Opt::None,
+        }
+    }
+}
+
+pub enum OptEnumErr {
+    Named { code: u8, cause: Opt<IoErr> },
+    Tuple(Opt<IoErr>),
+    Plain,
+}
+impl Error for OptEnumErr {
+    fn source(&self) -> Opt<&(dyn Error + 'static)> {
+        match self {
+            OptEnumErr::Named { code: __f0, cause: __f1 } => {
+                let _ = __f0;
+                match Opt::as_ref(__f1) {
+                    Opt::Some(__e) => Opt::Some(__e as &(dyn Error + 'static)),
+                    Opt::None => Opt::None,
+                }
+            }
+            OptEnumErr::Tuple(__f0) => match Opt::as_ref(__f0) {
+                Opt::Some(__e) => Opt::Some(__e as &(dyn Error + 'static)),
+                Opt::None => Opt::None,
+            },
+            OptEnumErr::Plain => Opt::None,
+        }
+    }
+}
+"#;
+    let (said, codes, notes) = check_text(CLEAN);
+    assert!(
+        error_lines(&said).is_empty() && !said.contains("NOT checked"),
+        "expected 0 errors and complete typecheck for unwrapped Option<E> source (codes={codes:?}, notes={notes:?}):\n{said}"
+    );
+
+    // Negative control: casting `&Opt<IoErr>` directly to `&(dyn Error + 'static)` fails E0605.
+    const BAD_CAST: &str = r#"
+#[lang = "sized"]
+pub trait Sized {}
+#[lang = "unsize"]
+pub trait Unsize<T: ?Sized> {}
+#[lang = "coerce_unsized"]
+pub trait CoerceUnsized<T: ?Sized> {}
+impl<'a, 'b: 'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<&'a U> for &'b T {}
+
+pub trait Error {
+    fn source(&self) -> Opt<&(dyn Error + 'static)> { Opt::None }
+}
+pub enum Opt<T> {
+    None,
+    Some(T),
+}
+pub struct IoErr;
+impl Error for IoErr {}
+
+pub struct ResolveError {
+    pub source: Opt<IoErr>,
+}
+impl Error for ResolveError {
+    fn source(&self) -> Opt<&(dyn Error + 'static)> {
+        Opt::Some(&self.source as &(dyn Error + 'static))
+    }
+}
+"#;
+    let (bad_said, bad_codes, _) = check_text(BAD_CAST);
+    assert!(
+        bad_said.contains("E0605"),
+        "negative control must catch E0605 NonPrimitiveCast on `&Opt<IoErr> as &(dyn Error + 'static)` (codes={bad_codes:?}):\n{bad_said}"
+    );
+}
