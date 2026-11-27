@@ -322,3 +322,32 @@ fn before_2024_the_words_name_the_unsafe_fn() {
         ]
     );
 }
+
+/// `#[rustc_deprecated_safe_2024(..)]` (e.g. `std::env::set_var` / `remove_var`): calling it
+/// without `unsafe` is clean in editions before 2024 and emits E0133 in edition 2024.
+#[test]
+fn deprecated_safe_2024_is_safe_before_2024_and_unsafe_in_2024() {
+    let text = r#"
+#[rustc_deprecated_safe_2024(audit_that_environment_accesses_are_single_threaded)]
+pub unsafe fn set_var_like() {}
+
+fn call_safe() { set_var_like() }
+fn call_unsafe() { unsafe { set_var_like() } }
+"#;
+    let got_2021 = check_fns("2021", text, &["call_safe", "call_unsafe"]);
+    assert_eq!(
+        got_2021,
+        vec![
+            ("call_safe".to_string(), "clean".to_string()),
+            ("call_unsafe".to_string(), "clean".to_string()),
+        ]
+    );
+    let got_2024 = check_fns("2024", text, &["call_safe", "call_unsafe"]);
+    assert_eq!(
+        got_2024,
+        vec![
+            ("call_safe".to_string(), "E0133 call to unsafe function `set_var_like` is unsafe and requires unsafe block (E0133 RequiresUnsafe)".to_string()),
+            ("call_unsafe".to_string(), "clean".to_string()),
+        ]
+    );
+}
