@@ -79,6 +79,11 @@ pub struct MacroDefinition<'a> {
     proc_name: Option<Text>,
     helpers: AVec<'a, Text>,
     at: DefAt,
+    /// When a macro-generating-macro of another crate wrote this definition (`token-mark-3`),
+    /// explicit `$crate` tokens in this definition's template name this crate while `at.site.krate`
+    /// remains the crate that defines this macro (so `local_inner_macros` bare calls still resolve
+    /// in the defining crate).
+    dollar_crate: Option<CrateItemKey>,
     transparency: Transparency,
     content: MacroContent,
 }
@@ -206,11 +211,24 @@ impl<'a> MacroDefinition<'a> {
             proc_name,
             helpers: helper_texts,
             at,
+            dollar_crate: None,
             transparency: at.transparency.unwrap_or(kind.own_transparency()),
             content: MacroContent(ContentId([0; 32])),
         };
         def.content = def.hash();
         Ok(def)
+    }
+
+    /// Overrides the crate that explicit `$crate` tokens in this macro's template name
+    /// (`token-mark-3`), keeping [`Self::site`] as the macro's own defining crate so
+    /// `local_inner_macros` bare calls still resolve in the defining crate. Recomputes
+    /// [`Self::content`] so [`crate::call_key`] keys on the override.
+    pub fn with_dollar_crate(mut self, krate: Option<CrateItemKey>) -> Self {
+        if self.dollar_crate != krate {
+            self.dollar_crate = krate;
+            self.content = self.hash();
+        }
+        self
     }
 
     /// The definition `view` and its token stream records hold, in `alloc`: `body` and
@@ -293,6 +311,12 @@ impl<'a> MacroDefinition<'a> {
         self.at.site
     }
 
+    /// The crate an explicit `$crate` in this macro's template names when overridden from
+    /// [`Self::site`] (`token-mark-3`).
+    pub fn dollar_crate(&self) -> Option<CrateItemKey> {
+        self.dollar_crate
+    }
+
     pub fn transparency(&self) -> Transparency {
         self.transparency
     }
@@ -363,6 +387,16 @@ impl<'a> MacroDefinition<'a> {
         Mark { of: MarkOf::This, transparency, edition: self.at.edition, site: self.at.site }
     }
 
+    /// The mark this definition's expansion puts on an explicit `$crate` token when
+    /// [`Self::dollar_crate`] overrides `self.at.site.krate` (`token-mark-3`).
+    pub(crate) fn dollar_crate_mark(&self, transparency: Transparency) -> Mark {
+        let site = match self.dollar_crate {
+            Some(krate) => DefSite { krate, module: None },
+            None => self.at.site,
+        };
+        Mark { of: MarkOf::This, transparency, edition: self.at.edition, site }
+    }
+
     fn hash(&self) -> MacroContent {
         let mut hasher = Hasher::new("blaze v2 expand macro content 1");
         match self.kind {
@@ -403,6 +437,10 @@ impl<'a> MacroDefinition<'a> {
         let export = u8::from(self.at.export == Export::Exported);
         let inner = u8::from(self.at.local_inner == LocalInner::Yes);
         hasher.put(&[self.at.edition.byte(), export, inner, self.transparency.byte()]);
+        if let Some(krate) = self.dollar_crate {
+            hasher.put(&[1]);
+            hasher.id(&krate.0);
+        }
         MacroContent(hasher.finish())
     }
 }

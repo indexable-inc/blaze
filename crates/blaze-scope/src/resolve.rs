@@ -5732,7 +5732,7 @@ fn definition_of_in<'m, 'd>(
 ) -> Result<MacroDefinition<'d>, ExpandNote<'m>> {
     let module = matches!(mac.body, MacroBody::Macro2 { .. }).then_some(mac.module);
     let def_at = DefAt {
-        site: DefSite { krate: mac.dollar_crate.unwrap_or(krate), module },
+        site: DefSite { krate, module },
         edition,
         export: if mac.export { Export::Exported } else { Export::Local },
         local_inner: if mac.local_inner { LocalInner::Yes } else { LocalInner::No },
@@ -5740,13 +5740,13 @@ fn definition_of_in<'m, 'd>(
     };
     let lexed = |text: &str, what: Lexed| lex(text, edition, alloc).map_err(|error| ExpandNote::Lex { macro_name: mac.name, what, error });
     Ok(match mac.body {
-        MacroBody::Rules(body) => MacroDefinition::rules(lexed(body, Lexed::Body)?, def_at),
+        MacroBody::Rules(body) => MacroDefinition::rules(lexed(body, Lexed::Body)?, def_at).with_dollar_crate(mac.dollar_crate),
         MacroBody::Macro2 { params, body } => {
             let params = match params {
                 Some(p) => Some(lexed(p, Lexed::Parameters)?),
                 None => None,
             };
-            MacroDefinition::macro2(params, lexed(body, Lexed::Body)?, def_at)
+            MacroDefinition::macro2(params, lexed(body, Lexed::Body)?, def_at).with_dollar_crate(mac.dollar_crate)
         }
         MacroBody::BuiltinFn(name) => match BuiltinFn::of_library(name) {
             Some(which) => MacroDefinition::builtin_fn(which, def_at, alloc),

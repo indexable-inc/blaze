@@ -291,7 +291,7 @@ pub(crate) fn transcribe<'f, B: Copying>(
                     let is_dollar_crate = matches!(engine.def.kind(tok), TokenKind::Ident { raw: Raw::No, .. })
                         && engine.def.text(tok) == "$crate";
                     let res = if is_dollar_crate {
-                        match out.preserve_dollar_crate_ctx(tok.origin()) {
+                        match out.dollar_crate_ctx(tok.origin()) {
                             Ok(Some(ctx)) => {
                                 join_prev(out, tok.origin());
                                 out.push_whole_ctx(written(engine.def.kind(tok)), WholeText::of("$crate"), tok.origin(), ctx)
@@ -309,7 +309,7 @@ pub(crate) fn transcribe<'f, B: Copying>(
                 }
                 Op::Crate(tok) => {
                     let kind = TokenKind::Ident { raw: Raw::No, spacing: Spacing::Alone };
-                    let res = match out.preserve_dollar_crate_ctx(tok.origin()) {
+                    let res = match out.dollar_crate_ctx(tok.origin()) {
                         Ok(Some(ctx)) => {
                             join_prev(out, tok.origin());
                             out.push_whole_ctx(kind, WholeText::of("$crate"), tok.origin(), ctx)

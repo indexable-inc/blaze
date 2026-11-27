@@ -313,3 +313,92 @@ fn mixed_dollar_crate_in_single_generated_macro_refuses_cleanly() {
     let has_mixed_here: Option<ItemKey> = names_here.krate(1).tables.macros.iter().find(|(_, m)| m.name == "mixed_m").map(|(&k, _)| k);
     assert!(has_mixed_here.is_none(), "refused mixed_m (dep+here) must not be lowered into app's macros");
 }
+
+#[test]
+fn local_inner_macros_resolves_in_defining_crate_while_dollar_crate_resolves_in_foreign_crate() {
+    // Regression for Codex P1: a generated `#[macro_export(local_inner_macros)] macro_rules! m`
+    // in `mid` (emitted by `dep_a`) invokes a bare `helper!()` AND references `$crate::TypeA`.
+    // `helper!()` MUST resolve to `mid::helper!` (emits `FromMidHelper`), NOT `dep_a::helper!`
+    // (emits `FromDepAHelper`), while `$crate::TypeA` MUST resolve to `dep_a::TypeA`.
+    const DEP_A_LOCAL_INNER: &str = "#![no_core]
+pub struct TypeA;
+
+#[macro_export]
+macro_rules! helper {
+    () => {
+        pub struct FromDepAHelper;
+    };
+}
+
+#[macro_export]
+macro_rules! gen_local_inner {
+    () => {
+        #[macro_export(local_inner_macros)]
+        macro_rules! m {
+            () => {
+                helper!();
+                pub type FromA = $crate::TypeA;
+            };
+        }
+    };
+}
+";
+    const MID_LOCAL_INNER: &str = "#![no_core]
+#[macro_export]
+macro_rules! helper {
+    () => {
+        pub struct FromMidHelper;
+    };
+}
+
+dep_a::gen_local_inner!();
+";
+    const CONSUMER_LOCAL_INNER: &str = "#![no_core]
+mid::m!();
+";
+    static FILES: WorldSources = WorldSources(&[
+        &[("/dep_a/src/lib.rs", DEP_A_LOCAL_INNER)],
+        &[("/mid/src/lib.rs", MID_LOCAL_INNER)],
+        &[("/consumer/src/lib.rs", CONSUMER_LOCAL_INNER)],
+    ]);
+    let crates = [
+        input("dep_a", "/dep_a/src/lib.rs", &[]),
+        input("mid", "/mid/src/lib.rs", &[("dep_a", 0)]),
+        input("consumer", "/consumer/src/lib.rs", &[("mid", 1)]),
+    ];
+    let bump = super::SyncFrame::leaked();
+    let g = blaze_own::testing::heap().alloc();
+    let names = resolve_crates(&crates, Sysroot::default(), &FILES, &Serial, bump)
+        .unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    assert!(names.notes(1).is_empty(), "mid notes: {:?}", names.notes(1));
+    assert!(names.notes(2).is_empty(), "consumer notes: {:?}", names.notes(2));
+
+    let dep_a_key = names.krate(0).key;
+    let mid_key = names.krate(1).key;
+
+    // `mid::helper!()` must have expanded (declaring `FromMidHelper`), NOT `dep_a::helper!()`.
+    let from_mid = names
+        .item_at(names.root(2), Namespace::Types, Written { kind: PathKind::Plain, segments: &["FromMidHelper"] }, g)
+        .unwrap_or_else(|e| panic!("consumer::FromMidHelper must exist (mid::helper! ran): {e:?}"));
+    assert_eq!(from_mid.krate, 2);
+    let from_dep_a = names.item_at(names.root(2), Namespace::Types, Written { kind: PathKind::Plain, segments: &["FromDepAHelper"] }, g);
+    assert!(from_dep_a.is_err(), "dep_a::helper! must NOT have been invoked: {from_dep_a:?}");
+
+    // `FromA` must exist and the `$crate` root written for `$crate::TypeA` must attribute to `dep_a`
+    // while the `local_inner_macros` prefix for `helper!()` must attribute to `mid`.
+    let from_a = names
+        .item_at(names.root(2), Namespace::Types, Written { kind: PathKind::Plain, segments: &["FromA"] }, g)
+        .unwrap_or_else(|e| panic!("consumer::FromA must exist: {e:?}"));
+    assert_eq!(from_a.krate, 2);
+
+    let consumer_roots: Vec<_> = names
+        .krate(2)
+        .expansions
+        .values()
+        .filter_map(|e| e.made.as_ref())
+        .filter_map(|made| crate::crate_roots::column_in(&made.origins).ok())
+        .flat_map(|col| (0..col.len()).filter_map(move |i| col.row(i).mark.map(|m| m.site.krate)))
+        .collect();
+    assert!(consumer_roots.contains(&dep_a_key), "consumer expansion must attribute `$crate::TypeA` to dep_a: {consumer_roots:?}");
+    assert!(consumer_roots.contains(&mid_key), "consumer expansion must attribute `local_inner_macros` `helper!()` to mid: {consumer_roots:?}");
+}
