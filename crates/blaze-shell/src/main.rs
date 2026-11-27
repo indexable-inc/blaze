@@ -4368,7 +4368,7 @@ mod macos_app {
                                     }
                                     Key::BracketLeft => {
                                         if !shell.editor.completions.is_empty() {
-                                            shell.editor.dismiss_completions();
+                                            shell.editor.suppress_completions();
                                             popup_engaged = false;
                                         } else {
                                             shell.editor.feed_vim_key(VimKeyEvent::key(VimKeyCode::Escape));
@@ -4470,7 +4470,7 @@ mod macos_app {
                                     }
                                     Key::Escape => {
                                         if !shell.editor.completions.is_empty() {
-                                            shell.editor.dismiss_completions();
+                                            shell.editor.suppress_completions();
                                             popup_engaged = false;
                                         } else {
                                             shell.editor.feed_vim_key(VimKeyEvent::key(VimKeyCode::Escape));
