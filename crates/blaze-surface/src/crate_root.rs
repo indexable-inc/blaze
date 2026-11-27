@@ -22,6 +22,9 @@ use crate::kind::{Edition, MacroShapes};
 
 mod in_place;
 
+/// rustc's default `#![recursion_limit = "128"]`.
+pub const DEFAULT_RECURSION_LIMIT: u32 = 128;
+
 /// What a crate's root record says of the crate itself.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct CrateRootHead {
@@ -37,6 +40,8 @@ pub struct CrateRootHead {
     pub no_core: bool,
     /// `#![blaze::arbitrary_ints]`: `u1`..`u127` and `i1`..`i127` are builtin types in it.
     pub arbitrary_ints: bool,
+    /// Effective macro expansion recursion limit (`#![recursion_limit = "N"]`, default 128).
+    pub recursion_limit: u32,
     /// The standard prelude module the crate's modules import (`std::prelude::rust_2021`, or
     /// core's under `no_std`), `None` under `#![no_core]`.
     pub prelude: Option<ItemKey>,
@@ -144,7 +149,9 @@ blaze_format::record! {
     #[derive(Clone, Copy, Debug)]
     /// 4: `features`, the root's `#![feature(..)]` names (a version-3 record is refused by
     /// `open`, and its crate's names are made again).
-    pub(crate) struct CrateRootRoot: 4 {
+    /// 5: `recursion_limit`, the crate's effective `#![recursion_limit = "N"]` (a version-4
+    /// record is refused by `open`, and its crate's names are made again).
+    pub(crate) struct CrateRootRoot: 5 {
         pub(crate) krate: ContentId,
         pub(crate) root_module: ContentId,
         pub(crate) root_file: ContentId,
@@ -161,6 +168,7 @@ blaze_format::record! {
         pub(crate) no_std: bool,
         pub(crate) no_core: bool,
         pub(crate) arbitrary_ints: bool,
+        pub(crate) recursion_limit: u32,
     }
 }
 
@@ -254,6 +262,7 @@ impl<N: AsRef<str>> CrateRootBuilder<'_, N> {
             no_std: head.no_std,
             no_core: head.no_core,
             arbitrary_ints: head.arbitrary_ints,
+            recursion_limit: head.recursion_limit,
         }))
     }
 }
@@ -329,6 +338,7 @@ impl<'a> CrateRootView<'a> {
                 no_std: root.no_std,
                 no_core: root.no_core,
                 arbitrary_ints: root.arbitrary_ints,
+                recursion_limit: root.recursion_limit,
                 prelude: key_of_word(root.prelude),
             },
             externs,

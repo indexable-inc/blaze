@@ -46,14 +46,19 @@ pub(crate) struct WriteIndex<'a, N> {
 
 impl<'a, N: crate::Name> Cells<'a, N> {
     /// How deep in macro expansions fragment `f` is written: 0 for a module's own text.
-    pub(super) fn depth(&self, f: FragId) -> u16 {
-        let mut depth = 0u16;
+    pub(super) fn depth(&self, f: FragId) -> u32 {
+        let mut depth = 0u32;
         let mut at = self.frags[f as usize].up;
         while let Some((up, _)) = at {
             depth = depth.saturating_add(1);
             at = self.frags[up as usize].up;
         }
         depth
+    }
+
+    /// [`Cells::depth`] narrowed to the `u16` expansion depth stored in scope records.
+    pub(super) fn depth_u16(&self, f: FragId) -> u16 {
+        u16::try_from(self.depth(f)).unwrap_or(u16::MAX)
     }
 
     /// A `#[macro_export]` macro of the root that the record writer publishes after the solve
@@ -86,7 +91,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     vis
                 }
             };
-            let binding = Binding { def, vis, origin, expansion: self.depth(frag), state: BindingState::Determined };
+            let binding = Binding { def, vis, origin, expansion: self.depth_u16(frag), state: BindingState::Determined };
             bindings.push(ScopeEntry { ns, name, binding });
         }
         for (&name, imports) in md.named.iter() {
@@ -98,7 +103,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         for ns in NAMESPACES {
                             let at = ns_at(ns);
                             if let (None, Some((def, vis))) = (bound[at], b[at]) {
-                                bound[at] = Some(Binding { def, vis, origin: Origin::Import, expansion: self.depth(it.at), state: BindingState::Determined });
+                                bound[at] = Some(Binding { def, vis, origin: Origin::Import, expansion: self.depth_u16(it.at), state: BindingState::Determined });
                             }
                         }
                     }
@@ -129,7 +134,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             // An enum's edge names the enum (its variants are the names it brings).
             let kind = if self.enum_mods.contains(&source) { DefKind::Enum } else { DefKind::Module };
             let source = self.modules[source as usize].key;
-            let expansion = self.depth(it.at);
+            let expansion = self.depth_u16(it.at);
             match globs.iter_mut().find(|e| e.source.key == source) {
                 Some(e) => {
                     e.vis = self.wider(e.vis, vis, m);
@@ -284,7 +289,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             match slot {
                 Slot::Rules(name, def, export) => {
                     let DefKind::Macro(shapes) = def.kind else { continue };
-                    let d = TextualDef { name, def: def.key, expansion: self.depth(f), shapes };
+                    let d = TextualDef { name, def: def.key, expansion: self.depth_u16(f), shapes };
                     out.textual.push(d);
                     if own && export && d.expansion > 0 {
                         out.macro_exports.push(d);

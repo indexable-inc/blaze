@@ -45,8 +45,8 @@
 //!
 //! The file's own inner attributes are no entry's: [`file_names_digest`] holds each one's text
 //! but a doc comment's (blaze-scope task/lower.rs `file_attrs`: the root's `register_tool`,
-//! `no_std`, `no_core`, a module's `cfg`, `macro_use`, `no_implicit_prelude`), and
-//! [`Outline::surface`](crate::Outline::surface) hashes it first (names-attr-4).
+//! `no_std`, `no_core`, `recursion_limit`, a module's `cfg`, `macro_use`, `no_implicit_prelude`),
+//! and [`Outline::surface`](crate::Outline::surface) hashes it first (names-attr-4).
 
 use blaze_ids::{ContentId, Domain};
 use blaze_own::AVec;

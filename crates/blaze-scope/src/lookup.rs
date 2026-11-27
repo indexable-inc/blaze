@@ -986,7 +986,7 @@ impl<'a, N: Name> Resolver<'a, N> {
             let f = &self.frags[cur_frag as usize];
             match f.slots[s] {
                 Slot::Rules { name: n, def, export, shapes } if n == name => {
-                    let hit = self.textual_hit(&TextualDef { name: n, def, expansion: f.expansion, shapes });
+                    let hit = self.textual_hit(&TextualDef { name: n, def, expansion: u16::try_from(f.expansion).unwrap_or(u16::MAX), shapes });
                     // rustc's `define_macro`: a `#[macro_export]` macro's textual binding is
                     // public, so `pub use m;` beside it re-exports it (core's `ub_checks`).
                     let vis = if export { Visibility::Public } else { hit.vis };
@@ -1034,7 +1034,7 @@ impl<'a, N: Name> Resolver<'a, N> {
             def: Def { key: d.def, kind: DefKind::Macro(d.shapes) },
             vis: Visibility::Crate(self.krate),
             origin: Origin::Declared,
-            expansion: d.expansion,
+            expansion: u32::from(d.expansion),
             frag: None,
             state: BindingState::Determined,
             layer: Layer::Textual,

@@ -993,11 +993,11 @@ impl<'a, N: Name> Work<'a, N> {
         let expanded = facts.expansion(key).map_err(|error| ResolveError::Surface { module, error })?;
         let Some(expanded) = expanded else { return Ok(false) };
         r.expansions += 1;
-        if r.expansions > MAX_EXPANSIONS {
+        if r.expansions > r.expansion_budget() {
             return Err(ResolveError::TooManyExpansions { module });
         }
         let at = r.calls[c as usize].at;
-        let depth = r.frags[at.frag as usize].expansion + 1;
+        let depth = r.frags[at.frag as usize].expansion.saturating_add(1);
         let before = r.upto();
         let frag = r.add_fragment(&expanded, Some(key), depth, Some(at))?;
         r.set_call_state(c as usize, CallState::Expanded { frag, def });

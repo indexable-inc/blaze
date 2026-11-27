@@ -1969,6 +1969,7 @@ fn crate_root(k: &Krate, tree: &Tree, low: &Lowering, fails: &mut Failures) -> C
         // The example's attribute reader does not read `#![blaze::arbitrary_ints]`; no crate
         // it is run on (tempo's graph) writes it.
         arbitrary_ints: false,
+        recursion_limit: blaze_surface::DEFAULT_RECURSION_LIMIT,
         prelude,
     };
     let mut cr = CrateRootBuilder::new_in(head, g());

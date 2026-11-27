@@ -572,6 +572,14 @@ impl<'s, 'a> Cfg<'s, 'a> {
                 "no_implicit_prelude" => attrs.no_implicit_prelude = true,
                 "no_std" => attrs.no_std = true,
                 "no_core" => attrs.no_core = true,
+                "recursion_limit" => {
+                    let parsed = parse_recursion_limit(content);
+                    match (attrs.recursion_limit, parsed) {
+                        (None, res) => attrs.recursion_limit = Some(res),
+                        (Some(Ok(_)), Err(err)) => attrs.recursion_limit = Some(Err(err)),
+                        _ => {}
+                    }
+                }
                 "feature" => {
                     for feature in SplitTop::new(args(content)) {
                         let feature = feature.trim();
@@ -805,6 +813,8 @@ pub struct Attrs<'t, 'a> {
     pub no_core: bool,
     /// `#![blaze::arbitrary_ints]` (docs/v2/plan/design/arbitrary-ints.md).
     pub arbitrary_ints: bool,
+    /// `#![recursion_limit = "N"]`: `Ok(limit)` when valid, `Err(content)` when malformed.
+    pub recursion_limit: Option<Result<u32, &'t str>>,
     pub tools: AVec<'a, &'t str>,
     /// `#![feature(a, b)]`'s names, as written (a crate root's: the crate root record's
     /// `features`, which a gate of the crate's code reads).
@@ -916,6 +926,7 @@ impl<'a> Attrs<'_, 'a> {
             no_std: false,
             no_core: false,
             arbitrary_ints: false,
+            recursion_limit: None,
             tools: AVec::new_in(alloc),
             features: AVec::new_in(alloc),
             others: AVec::new_in(alloc),
@@ -926,6 +937,44 @@ impl<'a> Attrs<'_, 'a> {
             proc_macro: None,
         }
     }
+}
+
+/// Parses `#![recursion_limit = "N"]` using Rust literal tokenization and escape decoding
+/// (allowing comments around `=`, string escapes like `"\x32\x35\x36"`, raw strings like
+/// `r#"256"#`, and one optional leading `+` as `usize::from_str` accepts), preserving the
+/// requested limit (up to `u32::MAX`) and returning `Err(content)` when the attribute or its
+/// decoded value is malformed or overflows `usize`.
+fn parse_recursion_limit<'t>(content: &'t str) -> Result<u32, &'t str> {
+    let trimmed = skip_attr_trivia(content);
+    let attr = head(trimmed);
+    let Some(rest) = trimmed.get(attr.len()..) else { return Err(content) };
+    let mut saw_any = false;
+    let mut has_digits = false;
+    let mut valid = true;
+    let mut value: usize = 0;
+    let decoded = blaze_expand::decode_name_value_str(rest, |ch| {
+        if !valid {
+            return;
+        }
+        if !saw_any && ch == '+' {
+            saw_any = true;
+            return;
+        }
+        saw_any = true;
+        let Some(digit) = ch.to_digit(10).and_then(|d| usize::try_from(d).ok()) else {
+            valid = false;
+            return;
+        };
+        has_digits = true;
+        match value.checked_mul(10).and_then(|v| v.checked_add(digit)) {
+            Some(next) => value = next,
+            None => valid = false,
+        }
+    });
+    if !decoded || !valid || !has_digits {
+        return Err(content);
+    }
+    Ok(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
 /// An attribute the lowering never takes for an item's attribute macro by its name alone: a
@@ -1887,7 +1936,7 @@ pub struct CallSrc<'t> {
     /// file, or the file an `include!` read on the way ([`Fragment::written`]). Where an
     /// `include!` call reads from (core `macros/mod.rs`: "relative to the current file").
     pub written: &'t str,
-    pub depth: u16,
+    pub depth: u32,
     /// An attribute call no attribute in the text names ([`IMPLICIT_MAIN`], D104): it stands
     /// outermost, and its item is the whole input (blaze-expand `ItemAttrs::implicit_call`).
     pub implicit: bool,
@@ -2035,7 +2084,7 @@ pub struct BodySrc<'t> {
     /// inline `mod` inside the body's blocks resolves from, matching `Made::dir`.
     pub included_dir: Option<&'t str>,
     /// How many expansions (and bodies) deep its text is.
-    pub depth: u16,
+    pub depth: u32,
     /// Where it is written: the fragment (its owner's key: the module's own text, or a call's
     /// expansion) and the last ordered entry's place before it there (`0`: none). A block's
     /// module reads the textual scope from this place on outward (Reference
@@ -2063,7 +2112,7 @@ impl<'t> BodySrc<'t> {
         text: &'t str,
         loc: Loc,
         written: &'t str,
-        depth: u16,
+        depth: u32,
         place: (ItemKey, u32),
         marks: Option<crate::crate_roots::TextMarks<'t>>,
         tokens: FragmentTokens<'_, 't>,
@@ -2358,7 +2407,7 @@ pub struct Fragment<'c, 't> {
     pub items: Option<ItemIndex>,
     pub at: Where,
     /// How many expansions deep it is.
-    pub depth: u16,
+    pub depth: u32,
     /// A module the walk did not see (a macro wrote it or its parent): its `mod` items are
     /// made, not looked up in the tree.
     pub made: bool,
@@ -2519,7 +2568,7 @@ struct Lower<'c, 'o, 's, 't, 'a, W: ?Sized> {
     at: Where,
     /// [`Fragment::written`].
     written: &'t str,
-    depth: u16,
+    depth: u32,
     made: bool,
     /// [`Fragment::kept`].
     kept: Option<u32>,
@@ -3377,6 +3426,7 @@ pub fn crate_root<'t, 'a>(
         no_std: attrs.no_std,
         no_core: attrs.no_core,
         arbitrary_ints: attrs.arbitrary_ints,
+        recursion_limit: attrs.recursion_limit.and_then(Result::ok).unwrap_or(u32::from(crate::RECURSION_LIMIT)),
         prelude,
     };
     let mut cr = CrateRootBuilder::new_in(head, alloc);

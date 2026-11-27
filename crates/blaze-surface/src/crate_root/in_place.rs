@@ -39,6 +39,7 @@ impl<'a> CrateRootView<'a> {
                 no_std: root.no_std,
                 no_core: root.no_core,
                 arbitrary_ints: root.arbitrary_ints,
+                recursion_limit: root.recursion_limit,
                 prelude: key_of_word(root.prelude),
             },
             externs: field!(root, CrateRootRoot, externs).items().as_slice(),

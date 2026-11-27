@@ -840,6 +840,8 @@ pub(crate) struct Cells<'a, N> {
     /// The root's `#![blaze::arbitrary_ints]`: `u24`, `i80` are builtin types in this crate's
     /// language prelude (docs/v2/plan/design/arbitrary-ints.md, "The opt-in").
     arbitrary_ints: bool,
+    /// The crate's effective macro expansion recursion limit (`#![recursion_limit = "N"]`).
+    recursion_limit: u32,
     /// The item each call is written on (`MacroCallDecl::item`), by call: a derive's helper
     /// scope is its item's ([`Cells::derive_helper`]).
     call_on: ABTreeMap<'a, ItemId, u32>,
@@ -1362,6 +1364,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             tools: AVec::new_in(alloc),
             builtin_attrs: AVec::new_in(alloc),
             arbitrary_ints: false,
+            recursion_limit: u32::from(crate::RECURSION_LIMIT),
             call_on: ABTreeMap::new_in(alloc),
             harness_calls: ABTreeSet::new_in(alloc),
             derives_on: ABTreeMap::new_in(alloc),
@@ -1409,6 +1412,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 cells.tools.extend(r.tools.iter().copied());
                 cells.builtin_attrs.extend(r.builtin_attrs.iter().copied());
                 cells.arbitrary_ints = r.head.arbitrary_ints;
+                cells.recursion_limit = r.head.recursion_limit;
             })
             .map_err(|error| CellError::Facts { module: root, error })?;
         Ok(cells)
@@ -1858,13 +1862,13 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 self.add_explicit(root, Namespace::Macros, r.name, (def, Visibility::Public, Origin::MacroExport, fid))?;
             }
         }
-        // The fragment's expansion depth: a call written at rustc's default `recursion_limit`
-        // or deeper is an error, not a call (the old core's `CallState::TooDeep`).
-        let depth = match up {
+        // The fragment's expansion depth: a call written at the crate's effective
+        // `recursion_limit` or deeper is an error, not a call (the old core's `CallState::TooDeep`).
+        let depth: u32 = match up {
             Some((u, _)) => self.depth(u).saturating_add(1),
             None => 0,
         };
-        let deep = depth >= crate::RECURSION_LIMIT && self.plant != CellPlant::NoRecursionLimit;
+        let deep = depth >= self.recursion_limit && self.plant != CellPlant::NoRecursionLimit;
         for c in d.calls.iter() {
             // A tool attribute (Reference `attributes.tool`: "The tool attributes are ..
             // `rustfmt` and `clippy`", and `register_tool`'s): inert, no call. The first segment

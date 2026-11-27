@@ -112,6 +112,7 @@ mod writes_tests;
 pub use crate::writes::{AnyWhy, By, CallWrites, Callee, Callees, MOST_NESTED, MOST_WALK_DEPTH, MacroWrites, Nested, Written, WrittenNs, macro_writes};
 pub use crate::attr_path::{PathWord, PathWords, path_words, same_path};
 pub use crate::attr_value::{AttrLiteralError, MOST_ATTR_VALUE_DEPTH, attr_literal};
+pub use crate::literal::decode_name_value_str;
 pub use crate::rules::{CopyPlant, rules_copy_plant, rules_oracle, rules_oracle_counts};
 pub use crate::{
     body::{

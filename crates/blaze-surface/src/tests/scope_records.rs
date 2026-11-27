@@ -308,6 +308,7 @@ fn a_crate_root_reads_back_sorted_and_refuses_two_crates_of_one_name() {
         no_std: true,
         no_core: false,
         arbitrary_ints: true,
+        recursion_limit: 256,
         prelude: Some(key(201)),
     };
     let core = Dep { name: "core", krate: CrateItemKey(ContentId([7; 32])), root: key(7) };

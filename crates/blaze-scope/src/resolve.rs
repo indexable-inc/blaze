@@ -788,6 +788,9 @@ pub enum NamesError<'a> {
     Cells { krate: &'a str, error: crate::cells::Unwritten },
     /// The module tree record was not written.
     TreeRecord { krate: &'a str, error: crate::tree_record::TreeRecordError },
+    /// The crate root's `#![recursion_limit]` attribute is malformed (not an unsigned decimal
+    /// integer string literal).
+    InvalidRecursionLimit { krate: &'a str, attr: &'a str },
     /// Two items' keys begin with the same 16 bytes (a checker key's, front2 keys.rs
     /// `checker_of`), so [`Names::key_beginning`] could not say which one a checker key names
     /// (rule 21: two values under one key is a refusal; the fix is the key). `first` and
@@ -817,6 +820,9 @@ impl fmt::Display for NamesError<'_> {
             }
             NamesError::Cells { krate, error } => write!(f, "crate `{krate}`: {error}"),
             NamesError::TreeRecord { krate, error } => write!(f, "crate `{krate}`: its module tree record: {error:?}"),
+            NamesError::InvalidRecursionLimit { krate, attr } => {
+                write!(f, "crate `{krate}`: malformed `#![{attr}]`: recursion limit must be an unsigned integer string literal")
+            }
             NamesError::KeyBeginning { first, second } => {
                 write!(f, "items {first:?} and {second:?}: their keys begin with the same 16 bytes, so a checker key cannot name one (rule 21, keys-cover-every-input)")
             }
@@ -2347,9 +2353,15 @@ fn walked_files<'a, S: SourceTexts<'a>, P: Par>(
     // module's lowering reads to know an item's taker (names-attr-3).
     let root = set.at(root_file as usize);
     let attrs = file_attrs(cfg, &root.outline, root.text, alloc);
+    let recursion_limit = effective_recursion_limit(input.name, &attrs)?;
     let tools = crate_tools(&attrs, alloc);
     let mut low = lower_modules(input.key, input.implicit.entry, input.implicit.proc_macro, edition, cfg, &tools, &set, &tree, listed, notes, par, opts, None, sources.attr_order(), bump);
-    let root_attrs = RootAttrs { no_std: attrs.no_std, no_core: attrs.no_core, arbitrary_ints: attrs.arbitrary_ints };
+    let root_attrs = RootAttrs {
+        no_std: attrs.no_std,
+        no_core: attrs.no_core,
+        arbitrary_ints: attrs.arbitrary_ints,
+        recursion_limit,
+    };
     let macro_exports = core::mem::replace(&mut low.macro_exports, AVec::new_in(alloc));
     let root_bytes = root_record_of(graph, input, id, root.id, &attrs, &tree, &mut low, &macro_exports, built, notes, bump)?;
     Ok(Prepared { set, tree, low, listed, root_attrs, root_bytes, record: None })
@@ -2372,7 +2384,13 @@ fn root_record_of<'a>(
     bump: Bump<'a>,
 ) -> Result<&'a [u8], NamesError<'a>> {
     let alloc = bump.alloc();
-    let root_attrs = RootAttrs { no_std: attrs.no_std, no_core: attrs.no_core, arbitrary_ints: attrs.arbitrary_ints };
+    let recursion_limit = effective_recursion_limit(input.name, attrs)?;
+    let root_attrs = RootAttrs {
+        no_std: attrs.no_std,
+        no_core: attrs.no_core,
+        arbitrary_ints: attrs.arbitrary_ints,
+        recursion_limit,
+    };
     let plan = root_plan(graph, id, root_attrs, built, notes, bump)?;
     // From 2018 the injected item's name is def-site (rustc's `std_inject`: `ident_span = if
     // edition >= Edition2018 { span } else { call_site }`, `span` with the pass's def-site
@@ -2512,7 +2530,11 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
     let (tools, attrs) = if root_member {
         let root = set.at(tree.modules[0].file as usize);
         let attrs = file_attrs(cfg, &root.outline, root.text, alloc);
-        (crate_tools(&attrs, alloc), Some((root.id, attrs)))
+        let recursion_limit = effective_recursion_limit(input.name, &attrs)?;
+        if recursion_limit != record.recursion_limit {
+            return Ok(None);
+        }
+        (crate_tools(&attrs, alloc), Some((root.id, attrs, recursion_limit)))
     } else {
         (AVec::from_slice_in(&record.tools, alloc), None)
     };
@@ -2539,14 +2561,37 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
         notes
     };
     let (root_attrs, root_bytes) = match attrs {
-        None => (RootAttrs { no_std: record.no_std, no_core: record.no_core, arbitrary_ints: record.arbitrary_ints }, stored),
-        Some((root_file, attrs)) => {
+        None => (
+            RootAttrs {
+                no_std: record.no_std,
+                no_core: record.no_core,
+                arbitrary_ints: record.arbitrary_ints,
+                recursion_limit: record.recursion_limit,
+            },
+            stored,
+        ),
+        Some((root_file, attrs, recursion_limit)) => {
             let exports: AVec<'a, (&'a str, ItemKey, MacroShapes)> = AVec::from_iter_in(stored_view.macro_exports(), alloc);
-            let root_attrs = RootAttrs { no_std: attrs.no_std, no_core: attrs.no_core, arbitrary_ints: attrs.arbitrary_ints };
+            let root_attrs = RootAttrs {
+                no_std: attrs.no_std,
+                no_core: attrs.no_core,
+                arbitrary_ints: attrs.arbitrary_ints,
+                recursion_limit,
+            };
             (root_attrs, root_record_of(graph, input, id, root_file, &attrs, &tree, &mut low, &exports, built, notes, bump)?)
         }
     };
     Ok(Some(Prepared { set, tree, low, listed, root_attrs, root_bytes, record: Some((bytes, record)) }))
+}
+
+/// The crate's effective macro expansion recursion limit from its root file's attributes, or a
+/// typed error when `#![recursion_limit]` is malformed.
+fn effective_recursion_limit<'a>(krate: &'a str, attrs: &Attrs<'a, 'a>) -> Result<u32, NamesError<'a>> {
+    match attrs.recursion_limit {
+        None => Ok(u32::from(crate::RECURSION_LIMIT)),
+        Some(Ok(limit)) => Ok(limit),
+        Some(Err(attr)) => Err(NamesError::InvalidRecursionLimit { krate, attr }),
+    }
 }
 
 /// Whether a member's `mod` lines or `#[macro_export]` macros (its record written and read
@@ -2663,6 +2708,7 @@ fn tree_record_of<'a>(
         no_std: root_attrs.no_std,
         no_core: root_attrs.no_core,
         arbitrary_ints: root_attrs.arbitrary_ints,
+        recursion_limit: root_attrs.recursion_limit,
         crate_root,
     };
     record.write(alloc)
@@ -3630,7 +3676,7 @@ impl<'r, 'a, 'rp, 'p: 'a, S: SourceTexts<'a>> FillCx<'r, 'a, 'rp, 'p, S> {
                             synthetic_blocks: &synthetic_blocks,
                         };
                         let mut work = |s: Alloc<'_>| {
-                            make_modules(self.base, self.run, src.module, &mods, place, src.depth + 1, &mut bodies, s);
+                            make_modules(self.base, self.run, src.module, &mods, place, src.depth.saturating_add(1), &mut bodies, s);
                         };
                         if (self.scratch)(&mut work) == crate::task::Scratch::Kept {
                             work(home);
@@ -4078,7 +4124,7 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
         outline: &made.outline,
         items: None,
         at: Where::Expansion(src.loc),
-        depth: src.depth + 1,
+        depth: src.depth.saturating_add(1),
         made: false,
         members_of: src.owner,
         written: src.written,
@@ -5285,7 +5331,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
         outline: &made.outline,
         items: None,
         at: Where::Expansion(src.loc),
-        depth: src.depth + 1,
+        depth: src.depth.saturating_add(1),
         made: false,
         members_of: src.owner,
         written,
@@ -5331,7 +5377,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
             tokens: FragmentTokens::LazyDeferBody(&get_tokens),
             synthetic_blocks: &synthetic_blocks,
         };
-        make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies, alloc);
+        make_modules(base, run, src.module, &mods, place, src.depth.saturating_add(1), &mut bodies, alloc);
     }
     let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(home));
     part(ExpandPart::Tables, mac.name, 0);
@@ -5419,7 +5465,7 @@ fn keep_item<'a, S: SourceTexts<'a>>(
         outline: &made.outline,
         items: None,
         at: Where::Expansion(src.loc),
-        depth: src.depth + 1,
+        depth: src.depth.saturating_add(1),
         made: false,
         members_of: src.owner,
         written: src.written,
@@ -5447,7 +5493,7 @@ fn keep_item<'a, S: SourceTexts<'a>>(
     let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
     let place = Made { text, outline: &made.outline, at: Where::Expansion(src.loc), place: At::Expansion(call), dir: None, written: src.written, marks: None, tokens: FragmentTokens::from_option(kept_tokens), synthetic_blocks: &[] };
     let mut bodies = core::mem::replace(&mut out.bodies, AVec::new_in(alloc));
-    make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies, alloc);
+    make_modules(base, run, src.module, &mods, place, src.depth.saturating_add(1), &mut bodies, alloc);
     let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(alloc));
     // The harness declares no name: rustc writes `_DECLS` def-site, so no path of the crate
     // reaches it. Its text, key and body are the call's (`add_lowered` below), named by its
@@ -5474,12 +5520,9 @@ enum KeepAs {
 /// What [`ExpandNote`]s and part marks name a proc-macro harness's expansion by.
 const HARNESS_NAME: &str = "proc-macro harness";
 
-/// The most bodies deep (past macro expansions up to [`crate::RECURSION_LIMIT`]) a block's module
-/// is made: `body.depth` accumulates both macro-expansion depth (e.g. `pin_project!` peeling 90+
-/// doc-comment attributes on `tokio::time::Sleep` before emitting `const _: () = { impl Sleep .. }`)
-/// and block-in-block nesting, so a block written at expansion depth `< RECURSION_LIMIT` must still
-/// be allowed to make its block module (rule 18).
-const MAX_BLOCK_DEPTH: u16 = crate::RECURSION_LIMIT + 64;
+/// The most nested lexical block-local item bodies [`make_blocks`] descends into from any
+/// starting body, kept independent of macro expansion depth (rule 18).
+const MAX_BLOCK_DEPTH: u32 = 192;
 
 /// Makes the modules of the blocks of `bodies` that hold an `impl` ([`crate::blocks`]): each
 /// body's text is scanned once by syntax; one that writes an impl in a block gets a fragment
@@ -5500,8 +5543,9 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
 
     let alloc = base.alloc;
     let bump = base.bump;
-    let mut work: AVec<'_, crate::task::BodySrc<'a>> = AVec::from_slice_in(bodies, scratch);
-    while let Some(body) = work.pop() {
+    let mut work: AVec<'_, (crate::task::BodySrc<'a>, u32)> = AVec::with_capacity_in(bodies.len(), scratch);
+    work.extend(bodies.iter().map(|&b| (b, 0u32)));
+    while let Some((body, block_depth)) = work.pop() {
         let nested = blaze_file_items::nested::scan(body.text, scratch);
         // An unbalanced body is the parser's error to report; nothing is read from it.
         // A block is a module when it holds an item that makes one (its head is made in the
@@ -5513,7 +5557,7 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
         if nested.end != blaze_file_items::nested::NestedEnd::Whole || !nested.writes() {
             continue;
         }
-        if body.depth >= MAX_BLOCK_DEPTH {
+        if block_depth >= MAX_BLOCK_DEPTH {
             run.note(NamesNote::Made { name: crate::blocks::BLOCK_MODULE, at: body.loc, note: MadeNote::TooMany });
             continue;
         }
@@ -5577,7 +5621,7 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
             outline: &made.outline,
             items: None,
             at: Where::Expansion(body.loc),
-            depth: body.depth + 1,
+            depth: body.depth,
             made: false,
             members_of: None,
             written: body.written,
@@ -5594,7 +5638,10 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
                 places.insert(m.key, body.place);
             }
         }
-        make_modules(base, run, body.module, &mods, place, body.depth + 1, &mut work, scratch);
+        let mut child_bodies: AVec<'_, crate::task::BodySrc<'a>> = AVec::new_in(scratch);
+        make_modules(base, run, body.module, &mods, place, body.depth, &mut child_bodies, scratch);
+        let next_block_depth = block_depth.saturating_add(1);
+        work.extend(child_bodies.into_iter().map(|b| (b, next_block_depth)));
         // The outermost block's `mod` declaration: dropped, so the body's module binds nothing.
         out.decls = DeclsBuilder::new_in(alloc);
         add_lowered(run, call, At::Expansion(call), out);
@@ -5933,7 +5980,7 @@ fn make_modules<'c, 'a, S: SourceTexts<'a>>(
     parent: ItemKey,
     mods: &[ModMade<'a>],
     made: Made<'c, 'a>,
-    depth: u16,
+    depth: u32,
     // The bodies lowered in the made modules that may write an impl in a block, added.
     bodies: &mut AVec<'_, crate::task::BodySrc<'a>>,
     scratch: Alloc<'_>,

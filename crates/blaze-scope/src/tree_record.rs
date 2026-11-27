@@ -26,7 +26,7 @@ use blaze_own::{AVec, Alloc};
 use crate::task::{Variant, WalkRow};
 
 const MAGIC: [u8; 4] = *b"BZMT";
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 const NONE: u32 = u32::MAX;
 
 /// One module of the tree, root first, each after its parent (the walk's order).
@@ -86,6 +86,7 @@ pub struct TreeRecord<'r> {
     pub no_std: bool,
     pub no_core: bool,
     pub arbitrary_ints: bool,
+    pub recursion_limit: u32,
     /// The crate root's `CrateRoot` record as the solve read it (before the cells added the
     /// macro-written `extern crate`s and exports).
     pub crate_root: &'r [u8],
@@ -168,6 +169,7 @@ impl<'r> TreeRecord<'r> {
         out.flag(self.no_std);
         out.flag(self.no_core);
         out.flag(self.arbitrary_ints);
+        out.bytes.extend_from_slice(&self.recursion_limit.to_le_bytes());
         out.u32(self.tools.len(), "tools")?;
         for t in self.tools.iter() {
             out.str(t, "tool")?;
@@ -235,6 +237,7 @@ impl<'r> TreeRecord<'r> {
             return Err(TreeRecordError::NotTree);
         }
         let (no_std, no_core, arbitrary_ints) = (flag(&mut r)?, flag(&mut r)?, flag(&mut r)?);
+        let recursion_limit = u32::from_le_bytes(*r.array::<4>().map_err(TreeRecordError::Short)?);
         let n = count(&mut r)?;
         let mut tools = AVec::with_capacity_in(n.min(bytes.len()), alloc);
         for _ in 0..n {
@@ -315,7 +318,7 @@ impl<'r> TreeRecord<'r> {
             enums.push(TreeEnum { key: enum_key, module, variants });
         }
         r.finish().map_err(TreeRecordError::Short)?;
-        Ok(TreeRecord { modules, enums, tools, no_std, no_core, arbitrary_ints, crate_root })
+        Ok(TreeRecord { modules, enums, tools, no_std, no_core, arbitrary_ints, recursion_limit, crate_root })
     }
 }
 
@@ -324,12 +327,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn previous_version_3_is_rejected() {
+    fn previous_version_4_is_rejected() {
         let heap = blaze_own::testing::heap();
         let alloc = heap.alloc();
         let mut bytes = AVec::new_in(alloc);
         bytes.extend_from_slice(&MAGIC);
-        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
         assert_eq!(TreeRecord::read(&bytes, alloc), Err(TreeRecordError::NotTree));
     }
 }

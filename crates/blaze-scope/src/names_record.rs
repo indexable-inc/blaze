@@ -67,7 +67,9 @@ const MAGIC: [u8; 4] = *b"BZNM";
 /// made again.
 /// 7: `MacroShapes` bit 3 marks Macros 2.0 (`pub macro`) definitions (excluded from the
 /// `#[macro_use]` prelude); a version-6 record is not read, and its names are made again.
-const VERSION: u32 = 7;
+/// 8: the crate root it holds is form 5 (blaze-surface `CrateRootRoot`: the crate's effective
+/// `#![recursion_limit = "N"]`); a version-7 record is not read, and its names are made again.
+const VERSION: u32 = 8;
 /// A refused call's row: call key, path at and length, record at and length, flags (bit 0
 /// implicit, byte 1 shape, byte 2 kind), file at and length, then the length of the name of the
 /// item a derive is on (0: none; its text follows the file's in the texts).

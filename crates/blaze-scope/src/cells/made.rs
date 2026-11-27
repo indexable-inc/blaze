@@ -196,7 +196,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             let name: &'s str = name.as_ref();
             let cell = cell_key(ns, name).0;
             taken.insert(cell);
-            let depth = self.depth(frag);
+            let depth = self.depth_u16(frag);
             // A `#[macro_export]` of the crate is a binding of the root for other crates, at any
             // depth and from any module (one table a crate, D116 point 6).
             if origin == Origin::MacroExport
@@ -224,7 +224,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             let name: &'s str = bound.as_ref();
             for &j in ids.iter() {
                 let it = &self.items[j as usize];
-                let depth = self.depth(it.at);
+                let depth = self.depth_u16(it.at);
                 for &ns in self.import_namespaces(j) {
                     // Each namespace's row is its own import's ([`Cells::row_import`]).
                     if self.row_import(ids, ns) != Some(j) {
@@ -259,7 +259,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
         for &j in md.glob_items.iter() {
             let it = &self.items[j as usize];
-            let depth = self.depth(it.at);
+            let depth = self.depth_u16(it.at);
             let table = if depth == 0 { &mut outline } else { made.get_or_insert_with(|| LinksBuilder::new_in(md.key, Table::Made, alloc)) };
             table.glob_path(self.table_kind(j), it.segments.iter().map(|s| s.as_ref()), it.vis, depth);
             match (md.edges.get(&it.index), it.outcome) {
