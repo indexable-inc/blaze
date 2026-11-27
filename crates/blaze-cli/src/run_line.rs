@@ -690,7 +690,7 @@ mod tests {
         assert!(pipe_err.contains("    Finished hello in "), "missing Finished line: {pipe_err:?}");
         assert!(pipe_err.contains("     Running `hello --port 8080`\n"), "missing Running line: {pipe_err:?}");
 
-        // TTY (color-capable): ANSI bold-cyan Checking, bold-green Finished + Running.
+        // TTY (color-capable): Cargo-style ANSI bold-green Checking, Finished, and Running.
         let tty = Io::simulated(SimWorld::new(12, Limits::USUAL));
         tty.script(|host| {
             host.ttys[1] = Tty::Terminal(Some(Size { cols: 100, rows: 24 }));
@@ -699,9 +699,17 @@ mod tests {
         let cx = tty.cx(Duration::from_secs(5), 1 << 20).expect("cx");
         let err = tty.need_err().expect("err");
         let clock = tty.need_clock().expect("clock");
-        let opts = LineOpts::new(&|_| None, &err, Choice::Auto, Command::Run, View::Person, false);
+        let opts = LineOpts::new(
+            &|k| (k == "COLORTERM").then(|| String::from("truecolor")),
+            &err,
+            Choice::Auto,
+            Command::Run,
+            View::Person,
+            false,
+        );
         assert!(opts.live);
         assert!(opts.terminal.caps.color);
+        assert_eq!(opts.terminal.colors, blaze_report::palette::Depth::True);
         let status = StatusOpts::for_run(Command::Run, View::Person, false, opts.terminal);
         assert!(status.enabled);
         watched_run(&cx, &err, &clock, opts, status, |watch, _bg, out| {
@@ -714,10 +722,18 @@ mod tests {
         let tty_err = tty
             .script(|host| std::string::String::from_utf8_lossy(&host.err).into_owned())
             .expect("sim host");
-        assert!(tty_err.contains("\x1b[1;"), "TTY stderr must style status verbs in bold color: {tty_err:?}");
-        assert!(tty_err.contains("Checking\x1b[0m scripts (rules)\n"), "missing colored Checking: {tty_err:?}");
-        assert!(tty_err.contains("Finished\x1b[0m scripts in "), "missing colored Finished: {tty_err:?}");
-        assert!(tty_err.contains("Running\x1b[0m `rules write`\n"), "missing colored Running: {tty_err:?}");
+        assert!(
+            tty_err.contains("    \x1b[1;32mChecking\x1b[0m scripts (rules)\n"),
+            "missing bold-green Checking: {tty_err:?}"
+        );
+        assert!(
+            tty_err.contains("    \x1b[1;32mFinished\x1b[0m scripts in "),
+            "missing bold-green Finished: {tty_err:?}"
+        );
+        assert!(
+            tty_err.contains("     \x1b[1;32mRunning\x1b[0m `rules write`\n"),
+            "missing bold-green Running: {tty_err:?}"
+        );
     }
 
     #[test]
