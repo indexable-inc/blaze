@@ -431,6 +431,66 @@ pub fn load_hover_preview(
     }
 }
 
+/// Hover preview for a `git status` row: the file's diff against `HEAD`, additions and deletions
+/// coloured, with the totals in the header. An entry with no text diff (untracked, binary, a
+/// folder) previews its content like any other entry.
+pub fn load_change_preview(
+    path: &Path,
+    name: &str,
+    icon: Option<&'static str>,
+    max_lines: usize,
+) -> HoverKind {
+    let line = |text: String, color: [f32; 4]| PreviewLine {
+        line_no: None,
+        spans: vec![PreviewSpan { text, color, bold: false, italic: false }],
+    };
+    let diff = match crate::prompt::read_git_file_diff(path) {
+        Ok(diff) => diff,
+        Err(e) => {
+            return HoverKind::FilePreview {
+                full_path: path.to_string_lossy().into_owned(),
+                name: name.to_owned(),
+                icon,
+                meta: "no diff".to_owned(),
+                lines: vec![line(format!("git diff could not run: {e}"), theme::DANGER)],
+                truncated: false,
+            };
+        }
+    };
+    // Everything before the first hunk is git's header (`diff --git`, `index`, `---`, `+++`).
+    let Some(header_end) = diff.find("\n@@") else {
+        return load_hover_preview(path, name, icon, max_lines);
+    };
+    let (mut added, mut deleted, mut total) = (0u32, 0u32, 0usize);
+    let mut lines = Vec::with_capacity(max_lines);
+    for text in diff[header_end + 1..].lines() {
+        let color = match text.as_bytes().first() {
+            Some(b'+') => {
+                added += 1;
+                theme::OK
+            }
+            Some(b'-') => {
+                deleted += 1;
+                theme::DANGER
+            }
+            Some(b'@') => theme::INK_4,
+            _ => theme::INK_2,
+        };
+        total += 1;
+        if lines.len() < max_lines {
+            lines.push(line(text.to_owned(), color));
+        }
+    }
+    HoverKind::FilePreview {
+        full_path: path.to_string_lossy().into_owned(),
+        name: name.to_owned(),
+        icon,
+        meta: format!("diff · +{added} −{deleted}"),
+        lines,
+        truncated: total > max_lines,
+    }
+}
+
 /// Read a bounded, rich styled file preview for `ls`/`git status` hover popovers (powered by
 /// `blaze-sniff` + `blaze-preview`: full syntax highlighting, rendered Markdown, & tabular lockfiles!).
 pub fn load_file_preview_lines(path: &Path, max_lines: usize) -> (String, Vec<PreviewLine>, bool) {

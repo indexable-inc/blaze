@@ -12,7 +12,7 @@ use objc2_core_foundation::{CFRange, CFRetained, CFString, CGFloat, CGPoint, CGS
 use objc2_core_graphics::{CGBitmapContextCreate, CGColorSpace, CGContext};
 use objc2_core_text::{CTFont, CTFontOrientation, CTFontUIFontType};
 
-use crate::view::{CellMetrics, TextFace, TextRun};
+use crate::view::{CellMetrics, FontSetId, TextFace, TextRun};
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 struct LigatureKey {
@@ -68,14 +68,14 @@ pub struct Slot {
     pub x_off: f32,
 }
 
-pub struct Fonts {
+struct Fonts {
     mono: [CFRetained<CTFont>; 4],
     mono_small: [CFRetained<CTFont>; 2],
     ui: [CFRetained<CTFont>; 2],
     ui_small: [CFRetained<CTFont>; 2],
     heading: CFRetained<CTFont>,
     chrome: [CFRetained<CTFont>; 2],
-    pub metrics: Metrics,
+    metrics: Metrics,
     mono_small_m: FaceMetrics,
     mono_small_cell_w: usize,
     ui_m: FaceMetrics,
@@ -90,11 +90,42 @@ pub struct Fonts {
     slots: HashMap<Key, Option<Slot>>,
     /// CoreText-shaped OpenType programming ligature slots (`->`, `-->`, `=>`, `!=`, `|>`, etc.).
     ligatures: HashMap<LigatureKey, Option<Slot>>,
+}
+
+/// Row packer for the one 2048×2048 alpha texture every [`Fonts`] set of a [`FontBook`] shares.
+struct GlyphAtlas {
     next_x: usize,
     next_y: usize,
     row_h: usize,
     /// Texels written since the last Metal texture upload: `(slot, alpha_bytes)`.
-    pub pending: Vec<(Slot, Vec<u8>)>,
+    pending: Vec<(Slot, Vec<u8>)>,
+}
+
+impl GlyphAtlas {
+    fn new() -> Self {
+        Self { next_x: 0, next_y: 0, row_h: 0, pending: Vec::new() }
+    }
+
+    /// Where a `w`×`h` bitmap would go, wrapping to a new row first; `None` when the atlas is full.
+    /// The space is only taken by [`GlyphAtlas::commit`].
+    fn reserve(&mut self, w: usize, h: usize) -> Option<(usize, usize)> {
+        if self.next_x + w > ATLAS {
+            self.next_x = 0;
+            self.next_y += self.row_h.max(h) + 1;
+            self.row_h = 0;
+        }
+        if self.next_y + h > ATLAS {
+            return None;
+        }
+        self.row_h = self.row_h.max(h);
+        Some((self.next_x, self.next_y))
+    }
+
+    /// Take the space [`GlyphAtlas::reserve`] returned for `slot` and queue its texels for upload.
+    fn commit(&mut self, slot: Slot, texels: Vec<u8>) {
+        self.next_x += slot.w + 1;
+        self.pending.push((slot, texels));
+    }
 }
 
 fn pick_font(names: &[&str], px: f64) -> CFRetained<CTFont> {
@@ -175,7 +206,7 @@ fn measure_face_metrics(f: &CTFont, mono_cell_h: usize, mono_baseline: f64) -> F
 }
 
 impl Fonts {
-    pub fn new(points: f64, scale: f64) -> Fonts {
+    fn new(points: f64, scale: f64) -> Fonts {
         let px = points * scale;
         let mono = [
             pick_font(
@@ -306,15 +337,11 @@ impl Fonts {
             chrome_ratio,
             slots: HashMap::new(),
             ligatures: HashMap::new(),
-            next_x: 0,
-            next_y: 0,
-            row_h: 0,
-            pending: Vec::new(),
         }
     }
 
     /// Logical CSS-pixel cell metrics for the layout engine, carrying exact CoreText advances.
-    pub fn cell_metrics(&self, scale: f64) -> CellMetrics {
+    fn cell_metrics(&self, scale: f64) -> CellMetrics {
         let inv_scale = 1.0 / (scale as f32).max(1.0);
         let mut ui_adv = [0.0f32; 95];
         let mut ui_bold_adv = [0.0f32; 95];
@@ -333,7 +360,7 @@ impl Fonts {
 
     /// Look up or CoreText-shape a 2..=4 char ASCII operator ligature (`->`, `-->`, `=>`, `!=`,
     /// `|>`, etc.). Returns `None` if the active mono font does not substitute a ligature glyph.
-    fn ligature_slot(&mut self, style: u8, seq: &[u8]) -> Option<Slot> {
+    fn ligature_slot(&mut self, atlas: &mut GlyphAtlas, style: u8, seq: &[u8]) -> Option<Slot> {
         if seq.len() < 2 || seq.len() > 4 {
             return None;
         }
@@ -343,12 +370,12 @@ impl Fonts {
         if let Some(&cached) = self.ligatures.get(&key) {
             return cached;
         }
-        let rastered = self.raster_ligature(style, seq);
+        let rastered = self.raster_ligature(atlas, style, seq);
         self.ligatures.insert(key, rastered);
         rastered
     }
 
-    fn raster_ligature(&mut self, style: u8, seq: &[u8]) -> Option<Slot> {
+    fn raster_ligature(&mut self, atlas: &mut GlyphAtlas, style: u8, seq: &[u8]) -> Option<Slot> {
         let text = core::str::from_utf8(seq).ok()?;
         let font = self.mono[(style as usize) & 3].clone();
 
@@ -368,49 +395,41 @@ impl Fonts {
             self.metrics.baseline,
         )?;
 
-        if self.next_x + w > ATLAS {
-            self.next_x = 0;
-            self.next_y += self.row_h.max(h) + 1;
-            self.row_h = 0;
-        }
-        if self.next_y + h > ATLAS {
-            return None;
-        }
-        self.row_h = self.row_h.max(h);
-        let slot = Slot {
-            x: self.next_x,
-            y: self.next_y,
-            w,
-            h,
-            advance: w as f32,
-            x_off: 0.0,
-        };
-        self.next_x += w + 1;
-        self.pending.push((slot, buf));
+        let (x, y) = atlas.reserve(w, h)?;
+        let slot = Slot { x, y, w, h, advance: w as f32, x_off: 0.0 };
+        atlas.commit(slot, buf);
         Some(slot)
     }
 
     /// Look up or rasterize `ch` in the given face & style; `None` for whitespace or a full atlas.
-    fn slot(&mut self, key: Key) -> Option<Slot> {
+    fn slot(&mut self, atlas: &mut GlyphAtlas, key: Key) -> Option<Slot> {
         if let Some(s) = self.slots.get(&key) {
             return *s;
         }
-        let s = self.raster(key);
+        let s = self.raster(atlas, key);
         self.slots.insert(key, s);
         s
     }
 
-    /// Convert visible [`TextRun`]s into GPU [`GlyphInst`] quads, culling offscreen runs outside
-    /// `[0, viewport_h]` so tall rendered documents scroll at locked 120fps.
-    pub fn rasterize_runs(&mut self, runs: &[TextRun], scale: f64, viewport_h: f32) -> Vec<GlyphInst> {
-        let mut glyphs = Vec::with_capacity(runs.len().min(256) * 12);
+    /// Append GPU [`GlyphInst`] quads for the visible [`TextRun`]s drawn in font set `set`,
+    /// culling offscreen runs outside `[0, viewport_h]` so tall rendered documents scroll at
+    /// locked 120fps.
+    fn rasterize_runs(
+        &mut self,
+        atlas: &mut GlyphAtlas,
+        runs: &[TextRun],
+        set: FontSetId,
+        scale: f64,
+        viewport_h: f32,
+        glyphs: &mut Vec<GlyphInst>,
+    ) {
         let inv_atlas = 1.0 / ATLAS as f32;
         let inv_scale = 1.0 / (scale as f32).max(1.0);
         let cw = self.metrics.cell_w as f32 * inv_scale;
         let ch = self.metrics.cell_h as f32 * inv_scale;
 
         for run in runs {
-            if run.y + ch * 1.6 < 0.0 || run.y > viewport_h + ch {
+            if run.font != set || run.y + ch * 1.6 < 0.0 || run.y > viewport_h + ch {
                 continue;
             }
             let mut x = run.x;
@@ -461,7 +480,7 @@ impl Fonts {
                         if end - i >= 2 {
                             let mut matched = None;
                             for cand_len in (2..=(end - i)).rev() {
-                                if let Some(s) = self.ligature_slot(style, &bytes[i..i + cand_len]) {
+                                if let Some(s) = self.ligature_slot(atlas, style, &bytes[i..i + cand_len]) {
                                     matched = Some((cand_len, s));
                                     break;
                                 }
@@ -494,7 +513,7 @@ impl Fonts {
                     i += ch.len_utf8();
                     let wide = is_wide_char(ch);
                     let key = Key { ch, face: TextFace::Mono, bold: run.bold, italic: run.italic, wide };
-                    if let Some(s) = self.slot(key) {
+                    if let Some(s) = self.slot(atlas, key) {
                         let gw = s.w as f32 * inv_scale;
                         let gh = s.h as f32 * inv_scale;
                         let draw_x = x + s.x_off * inv_scale;
@@ -527,7 +546,7 @@ impl Fonts {
                 }
                 let wide = run.face == TextFace::Mono && is_wide_char(ch);
                 let key = Key { ch, face: run.face, bold: run.bold, italic: run.italic, wide };
-                if let Some(s) = self.slot(key) {
+                if let Some(s) = self.slot(atlas, key) {
                     let gw = s.w as f32 * inv_scale;
                     let gh = s.h as f32 * inv_scale;
                     let draw_x = x + s.x_off * inv_scale;
@@ -552,10 +571,9 @@ impl Fonts {
                 }
             }
         }
-        glyphs
     }
 
-    fn raster(&mut self, key: Key) -> Option<Slot> {
+    fn raster(&mut self, atlas: &mut GlyphAtlas, key: Key) -> Option<Slot> {
         let (base_font, h, baseline) = match key.face {
             TextFace::Mono => {
                 let f = &self.mono[usize::from(key.bold) | (usize::from(key.italic) << 1)];
@@ -611,15 +629,7 @@ impl Fonts {
             (bw, adv as f32, pad)
         };
 
-        if self.next_x + w > ATLAS {
-            self.next_x = 0;
-            self.next_y += self.row_h.max(h) + 1;
-            self.row_h = 0;
-        }
-        if self.next_y + h > ATLAS {
-            return None;
-        }
-        self.row_h = self.row_h.max(h);
+        let (x, y) = atlas.reserve(w, h)?;
 
         let mut buf = vec![0u8; w * h];
         {
@@ -643,17 +653,79 @@ impl Fonts {
         if buf.iter().all(|&a| a == 0) {
             return None;
         }
-        let slot = Slot {
-            x: self.next_x,
-            y: self.next_y,
-            w,
-            h,
-            advance,
-            x_off: -(pad_l as f32),
-        };
-        self.next_x += w + 1;
-        self.pending.push((slot, buf));
+        let slot = Slot { x, y, w, h, advance, x_off: -(pad_l as f32) };
+        atlas.commit(slot, buf);
         Some(slot)
+    }
+}
+
+/// Every font size on screen: the window's own set (sidebar, palette, popups outside a pane) and
+/// one [`Fonts`] set per distinct pane text size, all packed into one shared glyph texture.
+///
+/// A set is made the first time its size is asked for. Rebuild the book (`FontBook::new`) when a
+/// pane's size or the display scale changes, so sizes no pane uses any more give their texels back.
+pub struct FontBook {
+    scale: f64,
+    /// `(points bits, set)`; index 0 is the window's set and a [`FontSetId`] is an index here.
+    sets: Vec<(u64, Fonts)>,
+    atlas: GlyphAtlas,
+}
+
+impl FontBook {
+    /// A book for a display of backing `scale` whose window chrome is set in `window_points`.
+    pub fn new(window_points: f64, scale: f64) -> Self {
+        Self {
+            scale,
+            sets: vec![(window_points.to_bits(), Fonts::new(window_points, scale))],
+            atlas: GlyphAtlas::new(),
+        }
+    }
+
+    /// The id text runs carry to be drawn at `points`, making that size's set on first use.
+    pub fn set_id(&mut self, points: f64) -> FontSetId {
+        let bits = points.to_bits();
+        let idx = match self.sets.iter().position(|(b, _)| *b == bits) {
+            Some(idx) => idx,
+            None => {
+                self.sets.push((bits, Fonts::new(points, self.scale)));
+                self.sets.len() - 1
+            }
+        };
+        FontSetId(u8::try_from(idx).expect("more than 255 distinct font sizes in one window"))
+    }
+
+    /// Device-pixel monospace cell of text set at `points`.
+    pub fn metrics(&mut self, points: f64) -> Metrics {
+        let id = self.set_id(points);
+        self.sets[usize::from(id.0)].1.metrics
+    }
+
+    /// Logical CSS-pixel cell metrics of text set at `points`, carrying exact CoreText advances.
+    pub fn cell_metrics(&mut self, points: f64) -> CellMetrics {
+        let id = self.set_id(points);
+        self.sets[usize::from(id.0)].1.cell_metrics(self.scale)
+    }
+
+    /// Convert visible [`TextRun`]s into GPU [`GlyphInst`] quads, each in the set its
+    /// [`TextRun::font`] names.
+    pub fn rasterize_runs(&mut self, runs: &[TextRun], viewport_h: f32) -> Vec<GlyphInst> {
+        let mut glyphs = Vec::with_capacity(runs.len().min(256) * 12);
+        for (idx, (_, set)) in self.sets.iter_mut().enumerate() {
+            set.rasterize_runs(
+                &mut self.atlas,
+                runs,
+                FontSetId(idx as u8),
+                self.scale,
+                viewport_h,
+                &mut glyphs,
+            );
+        }
+        glyphs
+    }
+
+    /// Texels rasterized since the last call, to upload to the glyph texture.
+    pub fn drain_pending(&mut self) -> std::vec::Drain<'_, (Slot, Vec<u8>)> {
+        self.atlas.pending.drain(..)
     }
 }
 
