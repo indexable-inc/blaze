@@ -63,6 +63,7 @@ pub enum CommandHighlightKind {
     Builtin,
     Abbrev,
     External,
+    DataFile,
     Unknown,
 }
 
@@ -110,7 +111,7 @@ pub fn is_external_command_in_path(name: &str) -> bool {
     set.contains(name)
 }
 
-/// Classify a command-position token as Builtin, Abbrev, External `$PATH` binary, or Unknown.
+/// Classify a command-position token as Builtin, Abbrev, External `$PATH` binary, DataFile, or Unknown.
 pub fn classify_command_token(
     token: &str,
     abbrevs: Option<&BTreeMap<String, String>>,
@@ -157,37 +158,110 @@ pub fn classify_command_token(
     {
         return CommandHighlightKind::Builtin;
     }
+    if is_bare_data_file(trimmed) || split_data_file_dot_prefix(trimmed).is_some() {
+        return CommandHighlightKind::DataFile;
+    }
     if trimmed.contains('/') || is_external_command_in_path(trimmed) {
         return CommandHighlightKind::External;
     }
     CommandHighlightKind::Unknown
 }
 
-/// True when `prefix` matches the start of any known builtin, abbreviation, or `$PATH` binary
-/// (used while typing so partial words like `cla` stay neutral instead of flashing red).
+/// Cached structured data files in `cwd` (re-read only when directory mtime changes).
+#[derive(Clone)]
+struct CwdDataFileEntry {
+    name: String,
+    size_bytes: u64,
+    ext: String,
+    sniff_label: &'static str,
+}
+
+fn cached_cwd_data_files(cwd: &str) -> Vec<CwdDataFileEntry> {
+    use std::cell::RefCell;
+    use std::time::SystemTime;
+    struct Cache {
+        cwd: String,
+        mtime: Option<SystemTime>,
+        entries: Vec<CwdDataFileEntry>,
+    }
+    thread_local! {
+        static CACHE: RefCell<Option<Cache>> = const { RefCell::new(None) };
+    }
+    let mtime = fs::metadata(cwd).ok().and_then(|m| m.modified().ok());
+    CACHE.with(|cell| {
+        if let Some(hit) = cell.borrow().as_ref()
+            && hit.cwd == cwd
+            && hit.mtime == mtime
+        {
+            return hit.entries.clone();
+        }
+        let mut entries = Vec::new();
+        if let Ok(rd) = fs::read_dir(cwd) {
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.is_empty() || name.starts_with('.') || !is_bare_data_file(&name) {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else { continue };
+                if !meta.is_file() {
+                    continue;
+                }
+                let ext = name
+                    .rsplit_once('.')
+                    .map(|(_, e)| e.to_ascii_lowercase())
+                    .unwrap_or_default();
+                let sniff = blaze_sniff::sniff_file(&name, &[]);
+                entries.push(CwdDataFileEntry {
+                    name,
+                    size_bytes: meta.len(),
+                    ext,
+                    sniff_label: sniff.label,
+                });
+            }
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        *cell.borrow_mut() = Some(Cache {
+            cwd: cwd.to_owned(),
+            mtime,
+            entries: entries.clone(),
+        });
+        entries
+    })
+}
+
+/// True when `prefix` matches the start of any known builtin, abbreviation, `$PATH` binary,
+/// or structured data file in `cwd` (case-insensitive so typing `Car` stays neutral instead
+/// of flashing red mid-word).
 pub fn is_known_command_prefix(
     prefix: &str,
+    cwd: Option<&str>,
     abbrevs: Option<&BTreeMap<String, String>>,
 ) -> bool {
     if prefix.is_empty() || prefix.starts_with('/') || prefix.starts_with('.') || prefix.starts_with('~') {
         return true;
     }
     let clean = prefix.strip_prefix('^').unwrap_or(prefix);
-    if abbrevs.is_some_and(|m| m.keys().any(|k| k.starts_with(clean))) {
+    let clean_lower = clean.to_ascii_lowercase();
+    if abbrevs.is_some_and(|m| m.keys().any(|k| k.to_ascii_lowercase().starts_with(&clean_lower))) {
         return true;
     }
-    if BUILTIN_SPECS.iter().any(|s| s.name.starts_with(clean)) || "bgit".starts_with(clean) {
+    if BUILTIN_SPECS.iter().any(|s| s.name.starts_with(&clean_lower)) || "bgit".starts_with(&clean_lower) {
         return true;
     }
-    if KEYWORDS.iter().any(|(k, _)| k.starts_with(clean)) {
+    if KEYWORDS.iter().any(|(k, _)| k.starts_with(&clean_lower)) {
+        return true;
+    }
+    if let Some(dir) = cwd
+        && cached_cwd_data_files(dir)
+            .iter()
+            .any(|f| f.name.to_ascii_lowercase().starts_with(&clean_lower))
+    {
         return true;
     }
     if let Ok(path_var) = std::env::var("PATH") {
-        // Quick check against cached PATH set via `is_external_command_in_path` isn't prefix-indexed,
-        // so scan only if needed; cache the sorted vec once.
         use std::sync::OnceLock;
-        static SORTED_BINS: OnceLock<Vec<String>> = OnceLock::new();
-        let bins = SORTED_BINS.get_or_init(|| {
+        static SORTED_LOWER_BINS: OnceLock<Vec<String>> = OnceLock::new();
+        let bins = SORTED_LOWER_BINS.get_or_init(|| {
             let mut seen = HashSet::new();
             let mut out = Vec::new();
             for dir in path_var.split(':') {
@@ -200,20 +274,21 @@ pub fn is_known_command_prefix(
                         break;
                     }
                     let fname = entry.file_name().to_string_lossy().into_owned();
-                    if fname.is_empty() || fname.starts_with('.') || seen.contains(&fname) {
+                    if fname.is_empty() || fname.starts_with('.') {
                         continue;
                     }
-                    if seen.insert(fname.clone()) {
-                        out.push(fname);
+                    let lower = fname.to_ascii_lowercase();
+                    if seen.insert(lower.clone()) {
+                        out.push(lower);
                     }
                 }
             }
             out.sort_unstable();
             out
         });
-        let idx = bins.partition_point(|b| b.as_str() < clean);
+        let idx = bins.partition_point(|b| b.as_str() < clean_lower.as_str());
         if let Some(cand) = bins.get(idx)
-            && cand.starts_with(clean)
+            && cand.starts_with(&clean_lower)
         {
             return true;
         }
@@ -513,7 +588,7 @@ pub struct Editor {
     vim: VimMachine<'static>,
     last_edit_op: EditOp,
     /// Lazily cached external executable names from `$PATH`.
-    path_bins: Option<Vec<String>>,
+    path_bins: Option<Vec<(String, String)>>,
     /// Command-position abbreviations expanded inline on Space / Enter (like Fish / Nushell).
     pub abbreviations: BTreeMap<String, String>,
     /// Cross-host CRDT frecency store backing zoxide-style `cd` completion & jumping.
@@ -609,7 +684,11 @@ const KEYWORDS: &[(&str, &str)] = &[
 
 const COLUMN_COMMANDS: &[&str] = &[
     "where",
+    "sort",
     "sort-by",
+    "top",
+    "freq",
+    "find",
     "select",
     "reject",
     "get",
@@ -1802,20 +1881,19 @@ impl Editor {
         }
         let start = clamp_char_boundary(&self.text, self.completion_replace_start).min(self.cursor);
         let prefix = &self.text[start..self.cursor];
-        if sel.insert.len() > prefix.len()
-            && sel
-                .insert
-                .get(..prefix.len())
-                .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
-        {
+        // Require EXACT case match so typing `Car` never synthesizes bogus hybrid ghost text
+        // like `Car` + `go-rm` = `Cargo-rm` when a lowercase binary is highlighted.
+        if sel.insert.len() > prefix.len() && sel.insert.starts_with(prefix) {
             let suffix = &sel.insert[prefix.len()..];
-            // Preserve a richer full-command ghost (e.g. `git log --oneline -n 20`) when it
-            // already starts with the selected token followed by whitespace.
+            // Preserve a richer full-command ghost (e.g. `git log --oneline -n 20` or
+            // `ls crates/blaze-sh/src | sort-by size -r`) when it already starts with the
+            // selected token followed by whitespace or `/`.
             let keep_richer_ghost = self.ghost.as_deref().is_some_and(|g| {
                 g.starts_with(suffix)
-                    && g.as_bytes()
-                        .get(suffix.len())
-                        .is_none_or(|b| b.is_ascii_whitespace())
+                    && (suffix.ends_with('/')
+                        || g.as_bytes()
+                            .get(suffix.len())
+                            .is_none_or(|b| b.is_ascii_whitespace() || *b == b'/'))
             });
             if !keep_richer_ghost {
                 self.ghost = Some(suffix.to_owned());
@@ -1823,10 +1901,10 @@ impl Editor {
         }
     }
 
-    /// True when the active cursor context has structured candidates that should auto-open in the
-    /// unified completion popup as the user types (zero-Tab): CLI subcommands (`git `, `git s`,
-    /// `bgit worktree `, `blaze `, `cargo `, …), flags (`-`), pipes (`| `), table column args,
-    /// and remote search commands (`git clone `, `cargo add `, …).
+    /// Unified auto-open rule: autocomplete opens BY DEFAULT as you type in Insert mode on a
+    /// single-line prompt (zero Tab required!), while staying out of the way inside comments,
+    /// quoted string literals, pure numbers, or finished leaf subcommands where the 1-line
+    /// signature hint should show instead.
     fn should_auto_open_completions(
         &self,
         before: &str,
@@ -1836,6 +1914,11 @@ impl Editor {
         if self.vim_mode() != VimMode::Insert || self.text.contains('\n') {
             return false;
         }
+        // Stay out of the way inside `# comments` or unclosed string literals (`"..."`, `'...'`).
+        if is_inside_comment_or_quotes(before) {
+            return false;
+        }
+
         let prev_non_ws = before[..token_start].trim_end();
         let at_expr_start = prev_non_ws.is_empty()
             || prev_non_ws.ends_with('|')
@@ -1859,6 +1942,11 @@ impl Editor {
             return true;
         }
 
+        // Pure numeric literals (`42`, `3.14`, `0xff`) don't need popup noise.
+        if !prefix.is_empty() && is_pure_number_token(prefix) {
+            return false;
+        }
+
         let stage_start = before.rfind(['|', ';', '\n']).map_or(0, |p| p + 1);
         let stage_raw = &before[stage_start..];
         let stage_trimmed = stage_raw.trim_start();
@@ -1867,8 +1955,13 @@ impl Editor {
         }
         let trailing_space = stage_raw.ends_with(char::is_whitespace);
         let words: Vec<&str> = stage_trimmed.split_whitespace().collect();
-        if words.is_empty() || (words.len() == 1 && !trailing_space) {
+        if words.is_empty() {
             return false;
+        }
+
+        // First token (command / bare data file / variable): auto-open by default as soon as >= 1 char is typed!
+        if words.len() == 1 && !trailing_space {
+            return !prefix.is_empty();
         }
 
         let cmd_base = words[0].trim_start_matches('^').rsplit('/').next().unwrap_or(words[0]);
@@ -1879,12 +1972,13 @@ impl Editor {
         };
         let has_done_sub = done_words.iter().any(|w| !w.starts_with('-'));
 
+        // Keep exact unique leaf subcommands (`git add`, `bgit wt add `) quiet so the 1-line
+        // `LiveHint::Signature` bar shows cleanly without a redundant 1-row popup.
         if cmd_base == "bgit" {
             let active = resolve_bgit_spec(done_words);
             if active.subcommands.is_empty() {
-                return false;
+                return !prefix.is_empty();
             }
-            // Exact unique leaf subcommand (e.g. `bgit wt add`) -> let LiveHint::Signature show.
             if !prefix.is_empty()
                 && let Some(exact) = active
                     .subcommands
@@ -1905,7 +1999,7 @@ impl Editor {
 
         if cmd_base == "git" {
             if has_done_sub {
-                return false;
+                return !prefix.is_empty();
             }
             if !prefix.is_empty()
                 && GIT_SUBCOMMAND_SIGNATURES.iter().any(|m| m.name == prefix)
@@ -1922,7 +2016,7 @@ impl Editor {
 
         if cmd_base == "blaze" {
             if has_done_sub {
-                return false;
+                return !prefix.is_empty();
             }
             let app = &blaze_cli_spec::blaze_app::BLAZE_APP;
             if !prefix.is_empty()
@@ -1957,7 +2051,12 @@ impl Editor {
             return true;
         }
 
-        false
+        // Auto-open immediately after space for commands whose primary argument is a live set
+        // (`cd `, `z `, `open `, `ssh `, `sftp `, `mosh `), and ALWAYS whenever typing any argument prefix!
+        if !prefix.is_empty() {
+            return true;
+        }
+        matches!(cmd_base, "cd" | "z" | "open" | "ssh" | "sftp" | "mosh")
     }
 
     fn sync_completion_scroll(&mut self) {
@@ -1988,14 +2087,16 @@ impl Editor {
         if self.path_bins.is_some() {
             return;
         }
+        let home = std::env::var("HOME").unwrap_or_default();
         let mut seen: HashSet<String> = HashSet::new();
-        let mut bins: Vec<String> = Vec::new();
+        let mut bins: Vec<(String, String)> = Vec::new();
         if let Ok(path_var) = std::env::var("PATH") {
             for dir in path_var.split(':') {
                 if dir.is_empty() {
                     continue;
                 }
                 let Ok(rd) = fs::read_dir(dir) else { continue };
+                let short_dir = crate::prompt::abbreviate_home(dir, &home);
                 for entry in rd.flatten() {
                     if bins.len() >= MAX_PATH_BINS {
                         break;
@@ -2019,12 +2120,12 @@ impl Editor {
                         .unwrap_or(false);
                     if is_exec {
                         seen.insert(name.clone());
-                        bins.push(name);
+                        bins.push((name, short_dir.clone()));
                     }
                 }
             }
         }
-        bins.sort_unstable();
+        bins.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         self.path_bins = Some(bins);
     }
 
@@ -2548,6 +2649,34 @@ impl Editor {
                     }
                 }
             }
+            // Descending `-col` shortcuts for `sort` / `sort-by` (e.g. `Cargo.lock.package | sort -name`).
+            if matches!(cmd_base, "sort" | "sort-by") && !prefix.starts_with("--") {
+                let col_query = prefix.trim_start_matches('-');
+                for (col_name, col_ty) in infer_pipeline_columns(before, state, recent_cols) {
+                    if let Some((score, mut idxs)) = fuzzy_match_score(&col_name, col_query) {
+                        for i in &mut idxs {
+                            *i += 1; // offset past `-`
+                        }
+                        let neg_tok = format!("-{col_name}");
+                        if seen_flags.insert(neg_tok.clone()) {
+                            scored.push((
+                                score + 75,
+                                CompletionItem {
+                                    label: neg_tok.clone(),
+                                    insert: neg_tok,
+                                    detail: format!("desc · {col_ty}"),
+                                    doc: format!("sort by `{col_name}` descending"),
+                                    kind: CompletionKind::Column,
+                                    icon: None,
+                                    avatar_path: None,
+                                    fs_meta: None,
+                                    match_indices: idxs,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
             if let Some(spec) = find_spec(cmd_base) {
                 for &flag in spec.flags {
                     if let Some((score, idxs)) = fuzzy_match_score(flag, prefix)
@@ -2694,18 +2823,76 @@ impl Editor {
                 }
             }
         } else if at_cmd_pos {
-            if !prefix.is_empty() {
-                for (abbr, exp) in &self.abbreviations {
-                    if let Some((score, idxs)) = fuzzy_match_score(abbr, prefix) {
-                        let exact_boost = if abbr == prefix { 80 } else { 35 };
+            let after_pipe = prev_non_ws.ends_with('|');
+            let is_explicit_path = prefix.starts_with("./")
+                || prefix.starts_with("../")
+                || prefix.starts_with('/')
+                || prefix.starts_with("~/");
+            if !after_pipe && is_explicit_path {
+                collect_path_completions(state.cwd.as_ref(), prefix, false, &mut scored);
+            } else {
+                // First-class bare structured data files in CWD (`Cargo.lock`, `Cargo.toml`,
+                // `blaze.lock`, `data.json`, `items.csv`) — exact-case matches like `Car` ->
+                // `Cargo.lock` / `Cargo.toml` jump straight to the top!
+                if !after_pipe && !prefix.is_empty() {
+                    for f in cached_cwd_data_files(state.cwd.as_ref()) {
+                        if let Some((score, idxs)) = fuzzy_match_score(&f.name, prefix) {
+                            let sz = crate::view::format_value_cell(&blaze_sh::Value::Size(Bytes(
+                                f.size_bytes.min(i64::MAX as u64) as i64,
+                            )));
+                            let doc = if f.sniff_label.is_empty() || f.sniff_label == "Plain text" {
+                                format!("data · {sz}")
+                            } else {
+                                format!("{} · {sz}", f.sniff_label)
+                            };
+                            scored.push((
+                                score + 65,
+                                CompletionItem {
+                                    label: f.name.clone(),
+                                    insert: f.name.clone(),
+                                    detail: f.ext,
+                                    doc,
+                                    kind: CompletionKind::File,
+                                    icon: Some(icon_name_for_file(&f.name, Some("file"))),
+                                    avatar_path: None,
+                                    fs_meta: None,
+                                    match_indices: idxs,
+                                },
+                            ));
+                        }
+                    }
+                }
+                if !prefix.is_empty() {
+                    for (abbr, exp) in &self.abbreviations {
+                        if let Some((score, idxs)) = fuzzy_match_score(abbr, prefix) {
+                            let exact_boost = if abbr == prefix { 80 } else { 35 };
+                            scored.push((
+                                score + exact_boost,
+                                CompletionItem {
+                                    label: abbr.clone(),
+                                    insert: exp.clone(),
+                                    detail: format!("→ {exp}"),
+                                    doc: format!("abbr `{abbr}` → `{exp}` (expands on Space/Enter)"),
+                                    kind: CompletionKind::Abbrev,
+                                    icon: None,
+                                    avatar_path: None,
+                                    fs_meta: None,
+                                    match_indices: idxs,
+                                },
+                            ));
+                        }
+                    }
+                }
+                for spec in BUILTIN_SPECS {
+                    if let Some((score, idxs)) = fuzzy_match_score(spec.name, prefix) {
                         scored.push((
-                            score + exact_boost,
+                            score + 40,
                             CompletionItem {
-                                label: abbr.clone(),
-                                insert: exp.clone(),
-                                detail: format!("→ {exp}"),
-                                doc: format!("abbr `{abbr}` → `{exp}` (expands on Space/Enter)"),
-                                kind: CompletionKind::Abbrev,
+                                label: spec.name.to_owned(),
+                                insert: spec.name.to_owned(),
+                                detail: "builtin".to_owned(),
+                                doc: spec.summary.to_owned(),
+                                kind: CompletionKind::Builtin,
                                 icon: None,
                                 avatar_path: None,
                                 fs_meta: None,
@@ -2714,75 +2901,66 @@ impl Editor {
                         ));
                     }
                 }
-            }
-            for spec in BUILTIN_SPECS {
-                if let Some((score, idxs)) = fuzzy_match_score(spec.name, prefix) {
-                    scored.push((
-                        score + 40,
-                        CompletionItem {
-                            label: spec.name.to_owned(),
-                            insert: spec.name.to_owned(),
-                            detail: "builtin".to_owned(),
-                            doc: format!("{} — {}", spec.name, spec.summary),
-                            kind: CompletionKind::Builtin,
-                            icon: None,
-                            avatar_path: None,
-                            fs_meta: None,
-                            match_indices: idxs,
-                        },
-                    ));
+                state.defs.for_each(&mut |k, _| {
+                    if let Some((score, idxs)) = fuzzy_match_score(k.as_ref(), prefix) {
+                        scored.push((
+                            score + 45,
+                            CompletionItem {
+                                label: k.as_ref().to_owned(),
+                                insert: k.as_ref().to_owned(),
+                                detail: "def".to_owned(),
+                                doc: format!("user command `{}`", k.as_ref()),
+                                kind: CompletionKind::Def,
+                                icon: None,
+                                avatar_path: None,
+                                fs_meta: None,
+                                match_indices: idxs,
+                            },
+                        ));
+                    }
+                });
+                for &(kw, desc) in KEYWORDS {
+                    if let Some((score, idxs)) = fuzzy_match_score(kw, prefix) {
+                        scored.push((
+                            score + 30,
+                            CompletionItem {
+                                label: kw.to_owned(),
+                                insert: kw.to_owned(),
+                                detail: "keyword".to_owned(),
+                                doc: desc.to_owned(),
+                                kind: CompletionKind::Keyword,
+                                icon: if kw == "rust" { Some("rust_dark") } else { None },
+                                avatar_path: None,
+                                fs_meta: None,
+                                match_indices: idxs,
+                            },
+                        ));
+                    }
                 }
-            }
-            state.defs.for_each(&mut |k, _| {
-                if let Some((score, idxs)) = fuzzy_match_score(k.as_ref(), prefix) {
-                    scored.push((
-                        score + 45,
-                        CompletionItem {
-                            label: k.as_ref().to_owned(),
-                            insert: k.as_ref().to_owned(),
-                            detail: "def".to_owned(),
-                            doc: format!("user command `{}`", k.as_ref()),
-                            kind: CompletionKind::Def,
-                            icon: None,
-                            avatar_path: None,
-                            fs_meta: None,
-                            match_indices: idxs,
-                        },
-                    ));
-                }
-            });
-            for &(kw, desc) in KEYWORDS {
-                if let Some((score, idxs)) = fuzzy_match_score(kw, prefix) {
-                    scored.push((
-                        score + 30,
-                        CompletionItem {
-                            label: kw.to_owned(),
-                            insert: kw.to_owned(),
-                            detail: "keyword".to_owned(),
-                            doc: desc.to_owned(),
-                            kind: CompletionKind::Keyword,
-                            icon: if kw == "rust" { Some("rust_dark") } else { None },
-                            avatar_path: None,
-                            fs_meta: None,
-                            match_indices: idxs,
-                        },
-                    ));
-                }
-            }
-            // External PATH commands (only when user has typed >= 1 char so empty `| ` stays clean).
-            if !prefix.is_empty() {
-                self.ensure_path_bins();
-                if let Some(bins) = &self.path_bins {
-                    let mut ext_added = 0usize;
-                    for bin in bins {
-                        if let Some((score, idxs)) = fuzzy_match_score(bin, prefix) {
+                // External PATH commands: score ALL matches first and keep the top 24 by score
+                // (never stop at the first 24 alphabetical matches!) so `cargo` always outranks
+                // `cargo-add` / `cargo-buckal` / `cargo-rm`.
+                if !prefix.is_empty() {
+                    self.ensure_path_bins();
+                    if let Some(bins) = &self.path_bins {
+                        let mut ext_matches: Vec<(i32, usize, Vec<usize>)> = Vec::new();
+                        for (idx, (bin, _)) in bins.iter().enumerate() {
+                            if let Some((score, idxs)) = fuzzy_match_score(bin, prefix) {
+                                ext_matches.push((score, idx, idxs));
+                            }
+                        }
+                        ext_matches.sort_by(|a, b| {
+                            b.0.cmp(&a.0).then_with(|| bins[a.1].0.cmp(&bins[b.1].0))
+                        });
+                        for (score, idx, idxs) in ext_matches.into_iter().take(24) {
+                            let (bin, dir) = &bins[idx];
                             scored.push((
                                 score,
                                 CompletionItem {
                                     label: bin.clone(),
                                     insert: bin.clone(),
                                     detail: "bin".to_owned(),
-                                    doc: format!("external command `{bin}` on $PATH"),
+                                    doc: dir.clone(),
                                     kind: CompletionKind::External,
                                     icon: None,
                                     avatar_path: None,
@@ -2790,10 +2968,6 @@ impl Editor {
                                     match_indices: idxs,
                                 },
                             ));
-                            ext_added += 1;
-                            if ext_added >= 24 {
-                                break;
-                            }
                         }
                     }
                 }
@@ -3043,18 +3217,20 @@ impl Editor {
                 }
             }
 
-            // Column-aware completion for table pipeline operators (`where`, `sort-by`, `select`, `get`, ...).
+            // Column-aware completion for table pipeline operators (`where`, `sort`, `sort-by`, `top`, `freq`, `select`, `get`, ...).
             if !handled_specialized && expects_column_arg(before) {
-                let cols = infer_pipeline_columns(before, recent_cols);
+                let cols = infer_pipeline_columns(before, state, recent_cols);
+                let mut added_col = false;
                 for (col_name, col_ty) in cols {
                     if let Some((score, idxs)) = fuzzy_match_score(&col_name, prefix) {
+                        added_col = true;
                         scored.push((
-                            score + 50,
+                            score + 55,
                             CompletionItem {
                                 label: col_name.clone(),
                                 insert: col_name.clone(),
                                 detail: format!("col · {col_ty}"),
-                                doc: format!("table column `{col_name}` ({col_ty})"),
+                                doc: format!("column `{col_name}` · {col_ty}"),
                                 kind: CompletionKind::Column,
                                 icon: None,
                                 avatar_path: None,
@@ -3063,6 +3239,9 @@ impl Editor {
                             },
                         ));
                     }
+                }
+                if added_col {
+                    handled_specialized = true;
                 }
             }
             // Remote sans-IO repository & package search (`git clone`, `gh repo clone`, `cargo add`,
@@ -3431,15 +3610,18 @@ pub fn fuzzy_match_score(candidate: &str, query: &str) -> Option<(i32, Vec<usize
         return None;
     }
 
-    // Fast exact/case-insensitive prefix match gets top score.
+    // Fast exact / exact-case prefix / case-insensitive prefix match gets top score.
     let prefix_exact = cand_chars
         .iter()
         .zip(query_chars.iter())
         .all(|(c, q)| c.eq_ignore_ascii_case(q));
     if prefix_exact {
-        let case_bonus = if candidate.starts_with(query) { 30 } else { 15 };
+        if candidate == query {
+            return Some((340, (0..query_chars.len()).collect()));
+        }
+        let case_bonus = if candidate.starts_with(query) { 60 } else { 15 };
         let len_penalty = (cand_chars.len() - query_chars.len()).min(40) as i32;
-        return Some((220 + case_bonus - len_penalty, (0..query_chars.len()).collect()));
+        return Some((200 + case_bonus - len_penalty, (0..query_chars.len()).collect()));
     }
 
     // Subsequence match preferring word boundaries and consecutive runs.
@@ -3559,10 +3741,97 @@ fn expects_column_arg(before_cursor: &str) -> bool {
     COLUMN_COMMANDS.contains(&cmd)
 }
 
-fn infer_pipeline_columns(before_cursor: &str, recent_cols: &[String]) -> Vec<(String, String)> {
-    // Look at the upstream stage command before the last `|`.
+fn is_inside_comment_or_quotes(before: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for ch in before.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            }
+            continue;
+        }
+        if in_double {
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_double = false;
+            }
+            continue;
+        }
+        match ch {
+            '#' => return true,
+            '\'' => in_single = true,
+            '"' => in_double = true,
+            _ => {}
+        }
+    }
+    in_single || in_double
+}
+
+fn is_pure_number_token(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_digit() {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_hexdigit() || matches!(c, '.' | '_' | 'x' | 'X' | 'b' | 'B' | 'o' | 'O'))
+}
+
+fn infer_pipeline_columns(
+    before_cursor: &str,
+    state: &EngineState<'_>,
+    recent_cols: &[String],
+) -> Vec<(String, String)> {
+    // 1. Live upstream structured value resolution (`Cargo.lock.package | sort `,
+    //    `open Cargo.lock | .package | where `, `| sort ` continuing from `$_`)!
     if let Some(pipe_idx) = before_cursor.rfind('|') {
         let upstream = &before_cursor[..pipe_idx];
+        let live_val = if upstream.trim().is_empty() {
+            state.get_var("_").map(|s| clone_value_global(&s.value))
+        } else {
+            resolve_piped_value_for_dot(upstream, state)
+        };
+        if let Some(val) = live_val {
+            match &val {
+                Value::Table(t) => {
+                    let mut cols = Vec::with_capacity(t.ncols());
+                    for ci in 0..t.ncols() {
+                        if let Some(name) = t.columns.get(ci) {
+                            let ty = (0..t.nrows().min(16))
+                                .find_map(|ri| {
+                                    t.cell(ri, ci).and_then(|v| {
+                                        (!matches!(v, Value::Nothing)).then(|| v.type_name())
+                                    })
+                                })
+                                .unwrap_or("any");
+                            cols.push((name.as_ref().to_owned(), ty.to_owned()));
+                        }
+                    }
+                    if !cols.is_empty() {
+                        return cols;
+                    }
+                }
+                Value::Record(r) => {
+                    let mut cols = Vec::new();
+                    for (k, v) in r.iter() {
+                        cols.push((k.to_owned(), v.type_name().to_owned()));
+                    }
+                    if !cols.is_empty() {
+                        return cols;
+                    }
+                }
+                _ => {}
+            }
+        }
         let first_cmd = upstream
             .rsplit([';', '\n'])
             .next()
@@ -5634,6 +5903,72 @@ mod tests {
         ed.refresh_assist(&state, &[], false);
         assert_eq!(ed.completions[0].label, "package");
         assert_eq!(ed.completions[0].insert, ".package.");
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn default_auto_open_ranks_data_files_exact_case_and_never_flashes_red() {
+        let alloc = Alloc::global();
+        let tmp_dir = std::env::temp_dir().join(format!("blaze-ac-overhaul-{}", std::process::id()));
+        let _ = fs::create_dir_all(&tmp_dir);
+        fs::write(
+            tmp_dir.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"adler2\"\nversion = \"2.0.1\"\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp_dir.join("Cargo.toml"),
+            "[package]\nname = \"hello\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let tmp_cwd = tmp_dir.to_string_lossy().into_owned();
+        let state = EngineState::new(&tmp_cwd, &[], alloc);
+        let mut ed = Editor::new();
+
+        // 1. Typing `Car` auto-opens BY DEFAULT (open_popup = false!) with `Cargo.lock` & `Cargo.toml`
+        //    ranked above lowercase `$PATH` binaries, exact-case ghost, and NEVER red!
+        ed.set_text_initial("Car".to_owned());
+        ed.refresh_assist(&state, &[], false);
+        assert!(!ed.completions.is_empty(), "Car must auto-open by default without Tab");
+        assert!(
+            matches!(ed.completions[0].label.as_str(), "Cargo.lock" | "Cargo.toml"),
+            "expected Cargo.lock or Cargo.toml at #1 for `Car`, got {:?}",
+            ed.completions.iter().take(5).map(|c| &c.label).collect::<Vec<_>>()
+        );
+        assert!(
+            ed.ghost.as_deref().is_some_and(|g| g == "go.lock" || g == "go.toml"),
+            "ghost must match exact case (never `go-rm`), got {:?}",
+            ed.ghost
+        );
+        assert!(
+            is_known_command_prefix("Car", Some(&tmp_cwd), None),
+            "`Car` must not flash red while typing"
+        );
+
+        // 2. Lexer highlights bare `Cargo.lock.package` as String + Punct + Var (never Command/red!).
+        let spans = blaze_sh::lex::highlight("Cargo.lock.package", alloc);
+        assert!(
+            spans.iter().all(|s| s.kind != blaze_sh::lex::HighlightKind::Command),
+            "bare data file must never highlight as Command, got {:?}",
+            spans.as_slice()
+        );
+        assert_eq!(spans[0].kind, blaze_sh::lex::HighlightKind::String);
+
+        // 3. `Cargo.lock.package | sort ` and `sort -` auto-open live table columns!
+        ed.set_text_initial("Cargo.lock.package | sort ".to_owned());
+        ed.refresh_assist(&state, &[], false);
+        assert!(ed.completions.iter().any(|c| c.label == "name" && c.kind == CompletionKind::Column));
+        assert!(ed.completions.iter().any(|c| c.label == "version" && c.kind == CompletionKind::Column));
+
+        ed.set_text_initial("Cargo.lock.package | sort -".to_owned());
+        ed.refresh_assist(&state, &[], false);
+        assert!(ed.completions.iter().any(|c| c.label == "-name" && c.kind == CompletionKind::Column));
+
+        // 4. Inside quotes or comments, popup stays quiet by default.
+        ed.set_text_initial("echo \"hello".to_owned());
+        ed.refresh_assist(&state, &[], false);
+        assert!(ed.completions.is_empty(), "must not auto-open inside string literal");
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }
