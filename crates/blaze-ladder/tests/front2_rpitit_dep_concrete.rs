@@ -85,7 +85,7 @@ fn check_bodies(bodies: &[&str]) -> Vec<(bool, Vec<&'static str>, String)> {
     let mut crates: Vec<CrateInput<'_>> = inputs.crates();
     let dep_files = [("/rdep/src/lib.rs".to_owned(), DEP.to_owned())];
     let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(i as u32));
-    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
+    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), proc_macro: at("proc_macro"), bstd: at("bstd") };
     let dep_at = crates.len();
     let user_deps: &'static [(&'static str, usize)] = Box::leak(vec![("rdep", dep_at)].into_boxed_slice());
     let (cfg, crate_edition, implicit) = (crates[0].cfg, crates[0].edition, crates[0].implicit);

@@ -103,7 +103,7 @@ fn two_crates(user: &'static str, dep: &'static str) -> (&'static [CrateInput<'s
     let inputs: &'static Inputs<'static> = Box::leak(Box::new(Inputs::new(user, tc).unwrap_or_else(|e| panic!("the crates: {e}"))));
     let mut crates: Vec<CrateInput<'static>> = inputs.crates();
     let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(u32::try_from(i).expect("few crates")));
-    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
+    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), proc_macro: at("proc_macro"), bstd: at("bstd") };
     let dep_at = crates.len();
     let user_deps: &'static [(&'static str, usize)] = Box::leak(vec![("dep", dep_at)].into_boxed_slice());
     let (cfg, crate_edition, implicit) = (crates[0].cfg, crates[0].edition, crates[0].implicit);

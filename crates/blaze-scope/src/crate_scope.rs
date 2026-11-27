@@ -1062,7 +1062,7 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                 own_deps.push((name, place(index, &mut local)));
             }
             let own_deps: &'a [(&'a str, usize)] = own_deps.into_bump_slice();
-            let mut mapped = [None; 4];
+            let mut mapped = [None; 5];
             for (slot, s) in mapped.iter_mut().zip(sysroot.all()) {
                 *slot = s.filter(|s| s.index() != at && pos[s.index()] < pos[at]).map(|s| place(s.index(), &mut local));
             }
@@ -1101,7 +1101,8 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                     core: ids[0].or(own(all[0])),
                     alloc: ids[1].or(own(all[1])),
                     std: ids[2].or(own(all[2])),
-                    bstd: ids[3].or(own(all[3])),
+                    proc_macro: ids[3].or(own(all[3])),
+                    bstd: ids[4].or(own(all[4])),
                 };
                 let deps = {
                     let q = locked(&queue);

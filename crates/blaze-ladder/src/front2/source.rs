@@ -2571,7 +2571,7 @@ mod tests {
                 script: None,
             },
         ];
-        let solved = resolve_crates(&inputs, Sysroot { core: None, alloc: None, std: None, bstd: None }, &MemTexts, &blaze_scope::task::Serial, bump)
+        let solved = resolve_crates(&inputs, Sysroot::default(), &MemTexts, &blaze_scope::task::Serial, bump)
             .expect("solve test crates");
         let n0 = aligned(&names_record::encode(&solved.crates()[0], g).expect("encode n0"), bump);
         let n1 = aligned(&names_record::encode(&solved.crates()[1], g).expect("encode n1"), bump);

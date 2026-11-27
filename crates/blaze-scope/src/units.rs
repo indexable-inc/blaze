@@ -473,6 +473,9 @@ fn toolchain_crates<'a>(
     todo.extend([sys.core.0 as usize, sys.alloc.0 as usize]);
     if rust_std {
         todo.push(sys.std.0 as usize);
+        if let Ok(pm) = usize::try_from(sys.proc_macro.0) {
+            todo.push(pm);
+        }
     }
     if blaze {
         todo.push(sys.bstd.0 as usize);
@@ -504,7 +507,7 @@ fn toolchain_crates<'a>(
     let mut cfg_base: AVec<'a, (&'a str, Option<&'a str>)> = AVec::new_in(alloc);
     cfg_base.extend(target_cfg);
     cfg_base.extend(PROFILE.iter().copied());
-    let mut sysroot = Sysroot { core: None, alloc: None, std: None, bstd: None };
+    let mut sysroot = Sysroot::default();
     let mut test_crate: Option<usize> = None;
     for (u, row) in all.iter().enumerate() {
         if at_of[u] == usize::MAX {
@@ -556,6 +559,7 @@ fn toolchain_crates<'a>(
             Role::Core if !row.for_host => sysroot.core = id,
             Role::Alloc if !row.for_host => sysroot.alloc = id,
             Role::Std if !row.for_host => sysroot.std = id,
+            Role::ProcMacro if !row.for_host => sysroot.proc_macro = id,
             Role::Bstd if !row.for_host => sysroot.bstd = id,
             _ => {}
         }

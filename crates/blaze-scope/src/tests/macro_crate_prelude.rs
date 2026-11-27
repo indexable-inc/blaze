@@ -192,3 +192,64 @@ fn a_proc_macro_test_harness_has_proc_macro_in_its_extern_prelude() {
         assert_eq!(imported(&names, pm), Some(side_proc_macro), "the proc macro itself was never the case");
     }
 }
+
+/// Target-side `extern crate proc_macro;` on a non-`proc-macro` Rust library (e.g., `proc_macro2`
+/// with `feature = "proc-macro"`):
+/// - Positive: with `extern crate proc_macro;`, `proc_macro::TokenStream` resolves to the target
+///   toolchain's `proc_macro` crate via `Externs::deps` (NOT `Externs::prelude`), with 0 errors.
+/// - Negative control: the exact same non-`proc-macro` library WITHOUT `extern crate proc_macro;`
+///   MUST fail to resolve `proc_macro::TokenStream` (proving `proc_macro` is NOT leaked into
+///   `Externs::prelude`).
+#[test]
+fn target_lib_resolves_explicit_extern_crate_proc_macro_and_rejects_unimported() {
+    const WITH_EXTERN: &str = "#![no_std]
+extern crate proc_macro;
+pub use proc_macro::TokenStream;
+pub fn id(t: proc_macro::TokenStream) -> proc_macro::TokenStream { t }
+";
+    const WITHOUT_EXTERN: &str = "#![no_std]
+pub use proc_macro::TokenStream;
+pub fn id(t: proc_macro::TokenStream) -> proc_macro::TokenStream { t }
+";
+    let lock = Lock::read(LOCK.as_bytes(), a()).expect("the lock");
+    let members = [Member::new(LockId(0), "app").expect("a plain dir")];
+    let mut units = AVec::new_in(a());
+    units.push(unit(0, "app", UnitKind::Lib, false, &[]));
+    let g = UnitGraph { units, resolver: Resolver::V3, meta: AVec::new_in(a()), left_out: AVec::new_in(a()) };
+    let bytes = toolchain(false);
+    let view = ToolchainView::open(&bytes, ToolchainView::id_of_bytes(&bytes)).expect("its own id");
+    let crates = unit_crates(&g, &lock, &members, view, HOST, a()).expect("the crates");
+    let app = of_unit(&crates, 0);
+    let target_pm = crates.sysroot.proc_macro.expect("target sysroot holds proc_macro").index();
+    assert!(!crates.crates[app].implicit.proc_macro, "app is a plain library, not a proc-macro crate");
+
+    let run = |app_src: &'static str| {
+        let mut roots = AVec::with_capacity_in(crates.crates.len(), a());
+        for c in crates.crates.iter() {
+            let text = match c.name {
+                "app" => app_src,
+                "proc_macro" => PROC_MACRO,
+                _ => EMPTY,
+            };
+            roots.push((c.root.as_str(), text));
+        }
+        let texts = Texts { texts: roots };
+        let inputs = crates.inputs();
+        resolve_crates(&inputs, crates.sysroot, &texts, &Serial, crate::tests::SyncFrame::leaked()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))
+    };
+
+    // Positive: `extern crate proc_macro;` resolves `proc_macro::TokenStream` cleanly.
+    let pos = run(WITH_EXTERN);
+    let pos_ext = pos.graph().externs(crate::graph::CrateId(app as u32), crate::graph::RootAttrs { no_std: true, ..crate::graph::RootAttrs::default() });
+    assert!(pos_ext.prelude.iter().all(|d| d.name != "proc_macro"), "proc_macro must NOT be in Externs::prelude");
+    assert!(pos_ext.deps.iter().any(|d| d.name == "proc_macro" && d.krate.index() == target_pm), "proc_macro must be in Externs::deps");
+    assert_eq!(imported(&pos, app), Some(target_pm), "`extern crate proc_macro;` resolves `proc_macro::TokenStream` to target `proc_macro`");
+    let pos_errors: usize = pos.krate(app).done.values().map(|r| r.scope.errors.len()).sum();
+    assert_eq!(pos_errors, 0, "expected 0 resolution errors with `extern crate proc_macro;`, notes: {:?}", pos.notes(app));
+
+    // Negative control: without `extern crate proc_macro;`, `proc_macro` is NOT in scope.
+    let neg = run(WITHOUT_EXTERN);
+    assert_eq!(imported(&neg, app), None, "without `extern crate proc_macro;`, `proc_macro::TokenStream` must NOT resolve");
+    let neg_errors: usize = neg.krate(app).done.values().map(|r| r.scope.errors.len()).sum();
+    assert!(neg_errors > 0, "expected unresolved error without `extern crate proc_macro;`");
+}

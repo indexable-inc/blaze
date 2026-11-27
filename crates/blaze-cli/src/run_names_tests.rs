@@ -127,7 +127,7 @@ fn by_need_scope_defers_dependency_opens_and_matches_opened_answers() {
         mk_input("dep_a", "/1/dep_a/lib.rs", &[]),
         mk_input("dep_b", "/2/dep_b/lib.rs", &[]),
     ];
-    let sysroot = Sysroot { core: None, alloc: None, std: None, bstd: None };
+    let sysroot = Sysroot::default();
     let solved = blaze_scope::resolve::resolve_crates(&inputs, sysroot, &MemTexts, &blaze_scope::task::Serial, blaze_own::testing::bump())
         .unwrap_or_else(|e| panic!("resolve test crates: {e:?}"));
 

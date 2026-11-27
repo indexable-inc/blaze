@@ -221,7 +221,7 @@ pub(crate) fn world_of(app: &'static str) -> (Src, Option<LibKey>, &'static blaz
     let frame: &'static blaze_mem::Frame = blaze_own::Box::leak_static(blaze_own::Box::new_in(frame, g));
     let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
     let crates = [input("app", "/app/lib.rs", &[("core", CORE_AT)]), input("core", "/core/lib.rs", &[])];
-    let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), alloc: None, std: None, bstd: None };
+    let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), ..Sysroot::default() };
     let solved = resolve_crates(&crates, sysroot, &Texts { app }, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let solved: &'static Names<'static> = blaze_own::Box::leak_static(blaze_own::Box::new_in(solved, g));
     let mut kept = Kept { names: AVec::new_in(g), items: AVec::new_in(g), files: AVec::new_in(g), expansions: AVec::new_in(g) };

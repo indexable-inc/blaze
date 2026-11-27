@@ -611,20 +611,17 @@ fn a_members_directory_is_in_its_crate_key() {
 }
 
 /// D96 P1: a dependency's scope and items records are a function of the dependency, not of the
-/// workspace using it. The second workspace has no proc macro (derive_it is a plain library
-/// there), so it keeps one toolchain crate fewer (`proc_macro`): bstd and every fetched package
-/// sit at another tree number. The same crate under the same key must still write byte-equal
-/// names and items records (before D96 the items record's file rows held `/<tree>/...`).
+/// workspace using it. The second workspace has no blaze-edition member (`blz` is Rust 2021
+/// there), so it keeps one toolchain crate fewer (`bstd`): every fetched package sits at another
+/// tree number. The same crate under the same key must still write byte-equal names and items
+/// records (before D96 the items record's file rows held `/<tree>/...`).
 /// Prints `D96 P1: <n> crates' records equal in two workspaces`.
 #[test]
 fn a_dependencys_records_are_equal_in_two_workspaces() {
     let first = made(&IN_ORDER);
     let lock = lock();
     let mut units = graph(lock, &IN_ORDER).units.clone();
-    units[3].kind = UnitKind::Lib;
-    units[3].for_host = false;
-    // A target-side library depends on the target's helper, not the host's.
-    units[3].deps[0].unit = UnitId(8);
+    units[7].edition = RUST21;
     let other: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(g()), left_out: AVec::new_in(g()) }));
     let mut store = store(lock);
     let listed = listed(other, lock, &mut store);
@@ -635,7 +632,7 @@ fn a_dependencys_records_are_equal_in_two_workspaces() {
     let a = first.resolve(&a_inputs, &Serial, b()).unwrap_or_else(|e| panic!("{e}"));
     let b = second.resolve(&b_inputs, &Serial, b()).unwrap_or_else(|e| panic!("{e}"));
     let mut equal = 0;
-    for name in ["util", "testkit", "bstd", "std", "core"] {
+    for name in ["util", "testkit", "std", "proc_macro", "core"] {
         let at = |w: &World<'static>| w.crates.iter().position(|c| c.input.name == name).unwrap_or_else(|| panic!("no crate `{name}`"));
         let (i, j) = (at(&first), at(&second));
         assert_eq!(first.crates[i].input.key, second.crates[j].input.key, "`{name}`: another key");
@@ -652,4 +649,68 @@ fn a_dependencys_records_are_equal_in_two_workspaces() {
         equal += 1;
     }
     std::println!("D96 P1: {equal} crates' records equal in two workspaces");
+}
+
+/// Target-side `extern crate proc_macro;` on a non-`proc-macro` Rust library (e.g. `proc_macro2`
+/// with `feature = "proc-macro"`) resolves through `World::sysroot.proc_macro` and round-trips
+/// through `CrateList` v9; without `extern crate proc_macro;`, the same library fails with
+/// unresolved `proc_macro` (proving `proc_macro` is NOT leaked into `Externs::prelude`).
+#[test]
+fn target_lib_extern_crate_proc_macro_resolves_and_negative_control_fails() {
+    use crate::crate_list::{CrateGraph as _, CrateList, differences, encode};
+    const PM2_LOCK: &str = r#"version = 4
+
+[[package]]
+name = "pm2"
+version = "0.1.0"
+"#;
+    let lock: &'static Lock<'static> = StdBox::leak(StdBox::new(Lock::read(PM2_LOCK.as_bytes(), g()).expect("lock")));
+    let mut units = AVec::new_in(g());
+    units.push(unit(lock, "pm2", UnitKind::Lib, false, RUST21, &[], None));
+    let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(g()), left_out: AVec::new_in(g()) }));
+
+    struct OneMember;
+    impl Packages<'static> for OneMember {
+        fn place(&mut self, _package: LockId) -> Result<Place<'static>, WorldError<'static>> {
+            Ok(Place::Checkout { dir: "pm2" })
+        }
+    }
+
+    let resolve_with = |src: &'static str| {
+        let mut places = OneMember;
+        let (id, files) = crate::fixture::shelf(TRIPLE, crate::fixture::STD, &[("target_os", Some("macos")), ("unix", None)], g());
+        let listed = StdBox::leak(StdBox::new(open_list(&mut Memory(files.into_iter().collect()), id, TRIPLE, graph, lock, &mut places, b()).unwrap_or_else(|e| panic!("{e}"))));
+        let mut m = StdMap::new();
+        m.insert("pm2/src/lib.rs", src);
+        let co: &'static Files = StdBox::leak(StdBox::new(Files(m)));
+        let w = world(graph, lock, listed, &mut places, co, b()).unwrap_or_else(|e| panic!("{e}"));
+        let pm_id = w.sysroot.proc_macro.expect("Rust target world populates Sysroot::proc_macro");
+        assert_eq!(w.crates[pm_id.index()].input.name, "proc_macro");
+        let bytes = encode(&w, &|_| None, g()).unwrap_or_else(|e| panic!("{e}"));
+        let cl = CrateList::open(&bytes).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(differences(&w, &cl), 0);
+        assert_eq!(cl.sysroot()[3], Some(pm_id.index()));
+        let inputs = w.inputs(g());
+        let names = w.resolve(&inputs, &Serial, b()).unwrap_or_else(|e| panic!("{e}"));
+        let at = w.crate_of_unit[0].expect("pm2") as usize;
+        let errors: usize = names.krate(at).done.values().map(|r| r.scope.errors.len()).sum();
+        let bound = names
+            .lookup(names.root(at), blaze_surface::Namespace::Types, "TokenStream")
+            .and_then(|b| names.crate_of(b.def.key));
+        (errors, bound, pm_id.index())
+    };
+
+    // Positive: explicit `extern crate proc_macro;` resolves `proc_macro::TokenStream` cleanly.
+    let (pos_errors, pos_bound, pm_idx) = resolve_with(
+        "#![no_std]\nextern crate proc_macro;\npub use proc_macro::TokenStream;\npub fn id(t: proc_macro::TokenStream) -> proc_macro::TokenStream { t }\n",
+    );
+    assert_eq!(pos_errors, 0, "positive control must resolve with 0 errors");
+    assert_eq!(pos_bound, Some(pm_idx), "`TokenStream` must resolve to target `proc_macro`");
+
+    // Negative control: without `extern crate proc_macro;`, `proc_macro` is NOT in scope.
+    let (neg_errors, neg_bound, _) = resolve_with(
+        "#![no_std]\npub use proc_macro::TokenStream;\npub fn id(t: proc_macro::TokenStream) -> proc_macro::TokenStream { t }\n",
+    );
+    assert!(neg_errors > 0, "negative control must fail with unresolved `proc_macro`");
+    assert_eq!(neg_bound, None, "negative control must NOT bind `TokenStream`");
 }

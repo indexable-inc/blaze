@@ -370,8 +370,14 @@ impl<'t> Inputs<'t> {
         for u in &tc.units {
             packs.push(PackView::open_verified(u.pack.as_ref()).map_err(|_| CratesError::Pack { krate: u.name.clone() })?);
         }
-        let role = |r: Role| tc.units.iter().position(|u| u.role == r).map(|i| CrateId(i as u32 + 1));
-        let sysroot = Sysroot { core: role(Role::Core), alloc: role(Role::Alloc), std: role(Role::Std), bstd: role(Role::Bstd) };
+        let role = |r: Role| {
+            tc.units
+                .iter()
+                .position(|u| u.role == r && !u.proc_macro)
+                .and_then(|i| u32::try_from(i + 1).ok())
+                .map(CrateId)
+        };
+        let sysroot = Sysroot { core: role(Role::Core), alloc: role(Role::Alloc), std: role(Role::Std), proc_macro: role(Role::ProcMacro), bstd: role(Role::Bstd) };
         let mut features = vec![Vec::new()];
         let mut deps = vec![Vec::new()];
         for u in &tc.units {

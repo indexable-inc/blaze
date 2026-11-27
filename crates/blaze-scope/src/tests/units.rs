@@ -140,20 +140,21 @@ fn a_proc_macro_is_kept_without_its_host_deps_and_a_dropped_dep_is_refused() {
     ]);
     let crates = unit_crates(&g, &lock, &members, view, TRIPLE, a()).expect("the crates");
     let names: Vec<&str> = crates.crates.iter().map(|c| c.name).collect();
-    assert_eq!(names, ["core", "alloc", "std", "app", "dep", "pm"]);
-    assert_eq!(crates.toolchain, 3);
+    assert_eq!(names, ["core", "alloc", "std", "proc_macro", "app", "dep", "pm"]);
+    assert_eq!(crates.toolchain, 4);
     assert_eq!(crates.build_scripts, 1);
-    let app = &crates.crates[3];
+    let app = &crates.crates[4];
     assert_eq!(app.origin, Origin::Unit(UnitId(0)));
-    assert_eq!(app.deps.as_slice(), [("dep", 4), ("pm", 5)]);
+    assert_eq!(app.deps.as_slice(), [("dep", 5), ("pm", 6)]);
     assert_eq!(app.root.as_str(), "/package/0/src/lib.rs");
-    assert!(crates.crates[5].deps.is_empty(), "a proc macro's host deps are not followed");
-    assert!(crates.crates[5].implicit.proc_macro);
+    assert!(crates.crates[6].deps.is_empty(), "a proc macro's host deps are not followed");
+    assert!(crates.crates[6].implicit.proc_macro);
     assert_eq!(crates.crates[2].deps.as_slice(), [("alloc", 1), ("core", 0)]);
     assert_eq!(crates.sysroot.std.map(|it| it.0), Some(2));
+    assert_eq!(crates.sysroot.proc_macro.map(|it| it.0), Some(3));
     assert_eq!(crates.sysroot.bstd, None);
     let keys: std::collections::BTreeSet<_> = crates.crates.iter().map(|c| c.key).collect();
-    assert_eq!(keys.len(), 6, "every crate's key is its own");
+    assert_eq!(keys.len(), 7, "every crate's key is its own");
 
     // app on syn directly: syn is a host unit, not kept.
     let g = graph(std::vec![unit(0, "app", UnitKind::Lib, false, &[("syn", 1)]), unit(3, "syn", UnitKind::Lib, true, &[])]);
@@ -191,15 +192,15 @@ fn a_members_test_units_are_crates_with_test_in_their_cfg() {
     ]);
     let crates = unit_crates(&g, &lock, &members, view, TRIPLE, a()).expect("the crates");
     let names: Vec<&str> = crates.crates.iter().map(|c| c.name).collect();
-    assert_eq!(names, ["core", "alloc", "std", "app", "dep", "app", "app", "app"]);
+    assert_eq!(names, ["core", "alloc", "std", "proc_macro", "app", "dep", "app", "app", "app"]);
     let has_test = |at: usize| crates.crates[at].cfg.iter().any(|(name, value)| *name == "test" && value.is_none());
-    assert!(!has_test(3), "the library's own unit is compiled without `test`");
-    assert!(has_test(5) && has_test(6) && has_test(7), "each test unit is compiled with `test`");
-    assert_eq!(crates.crates[5].origin, Origin::Unit(UnitId(2)));
-    assert_eq!(crates.crates[5].deps.as_slice(), [("dep", 4)], "the dev-dependency is followed from the test unit");
-    assert_eq!(crates.crates[6].deps.as_slice(), [("app", 3)]);
+    assert!(!has_test(4), "the library's own unit is compiled without `test`");
+    assert!(has_test(6) && has_test(7) && has_test(8), "each test unit is compiled with `test`");
+    assert_eq!(crates.crates[6].origin, Origin::Unit(UnitId(2)));
+    assert_eq!(crates.crates[6].deps.as_slice(), [("dep", 5)], "the dev-dependency is followed from the test unit");
+    assert_eq!(crates.crates[7].deps.as_slice(), [("app", 4)]);
     let keys: std::collections::BTreeSet<_> = crates.crates.iter().map(|c| c.key).collect();
-    assert_eq!(keys.len(), 8, "every crate's key is its own: the library's, its test unit's and each binary's test unit's");
+    assert_eq!(keys.len(), 9, "every crate's key is its own: the library's, its test unit's and each binary's test unit's");
 }
 
 /// D89 (a): a MEMBER's proc macro (`pm`, package 2) is built for `wasm32-wasip1` (rule 10), so
@@ -268,15 +269,15 @@ fn a_member_proc_macro_resolves_its_dependencies_on_the_macro_side() {
     let g1 = g();
     let crates = unit_crates(&g1, &lock, &members, view, TRIPLE, a()).expect("the crates");
     let names: Vec<&str> = crates.crates.iter().map(|c| c.name).collect();
-    assert_eq!(names, ["core", "alloc", "std", "app", "syn", "pm", "core", "alloc", "std", "proc_macro", "syn"]);
+    assert_eq!(names, ["core", "alloc", "std", "proc_macro", "app", "syn", "pm", "core", "alloc", "std", "proc_macro", "syn"]);
     assert!(crates.refused.is_empty(), "with the cut, nothing is refused");
-    let (target_syn, pm, side_core, side_syn) = (&crates.crates[4], &crates.crates[5], &crates.crates[6], &crates.crates[10]);
+    let (target_syn, pm, side_core, side_syn) = (&crates.crates[5], &crates.crates[6], &crates.crates[7], &crates.crates[11]);
     assert_eq!(side_syn.origin, Origin::Unit(UnitId(3)));
     assert_eq!(side_core.origin, Origin::Toolchain { unit: 0, krate: 0 });
     assert_eq!(side_core.root.as_str(), "/macro/toolchain/0/core/src/lib.rs", "never the target side's `/toolchain/0/`");
-    assert_eq!(pm.deps.as_slice(), [("syn", 10), ("core", 6), ("alloc", 7), ("std", 8), ("proc_macro", 9)]);
-    assert_eq!(side_syn.deps.as_slice(), [("core", 6), ("alloc", 7), ("std", 8), ("proc_macro", 9)]);
-    assert_eq!(crates.crates[3].deps.as_slice(), [("pm", 5), ("syn", 4)], "the target side is unchanged");
+    assert_eq!(pm.deps.as_slice(), [("syn", 11), ("core", 7), ("alloc", 8), ("std", 9), ("proc_macro", 10)]);
+    assert_eq!(side_syn.deps.as_slice(), [("core", 7), ("alloc", 8), ("std", 9), ("proc_macro", 10)]);
+    assert_eq!(crates.crates[4].deps.as_slice(), [("pm", 6), ("syn", 5)], "the target side is unchanged");
     assert_ne!(side_syn.key, target_syn.key, "the macro side's syn is another crate than the target's");
     assert_ne!(side_core.key, crates.crates[0].key, "one pack on two sides: two keys (rule 21)");
     assert!(side_syn.cfg.contains(&("target_arch", Some("wasm32"))) && !side_syn.cfg.contains(&("unix", None)), "the macro side's cfg is wasm32-wasip1's");
@@ -291,13 +292,13 @@ fn a_member_proc_macro_resolves_its_dependencies_on_the_macro_side() {
     let g2 = g();
     let crates = unit_crates(&g2, &lock, &members, view, TRIPLE, a()).expect("the list is made: one crate's refusal is that crate's");
     let names: Vec<&str> = crates.crates.iter().map(|c| c.name).collect();
-    assert_eq!(names, ["core", "alloc", "std", "app", "syn", "pm"]);
-    assert_eq!(crates.crates[3].deps.as_slice(), [("pm", 5), ("syn", 4)]);
-    assert_eq!(crates.refusal(3), None, "the normal member is not refused");
-    assert!(crates.crates[5].deps.is_empty(), "the refused proc macro is given no host crates");
+    assert_eq!(names, ["core", "alloc", "std", "proc_macro", "app", "syn", "pm"]);
+    assert_eq!(crates.crates[4].deps.as_slice(), [("pm", 6), ("syn", 5)]);
+    assert_eq!(crates.refusal(4), None, "the normal member is not refused");
+    assert!(crates.crates[6].deps.is_empty(), "the refused proc macro is given no host crates");
     assert_eq!(
         crates.refused.as_slice(),
-        [RefusedCrate { krate: 5, why: UnitsError::NoMacroToolchain { krate: "pm", target: MACRO } }]
+        [RefusedCrate { krate: 6, why: UnitsError::NoMacroToolchain { krate: "pm", target: MACRO } }]
     );
-    assert_eq!(crates.refusal(5), Some(&UnitsError::NoMacroToolchain { krate: "pm", target: MACRO }));
+    assert_eq!(crates.refusal(6), Some(&UnitsError::NoMacroToolchain { krate: "pm", target: MACRO }));
 }

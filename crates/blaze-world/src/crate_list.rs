@@ -31,9 +31,9 @@
 //! corrected text)`, read in place of the pack's bytes as the world reads them.
 //!
 //! Form (little endian), checked whole once at [`CrateList::open`], then read without checks:
-//! a 60-byte header (magic, version, rows `n`, deps `d`, heap length, sysroot core, alloc, std,
-//! bstd as row indices or `NONE`, trees `t`, corrected files `c`, modules `m`, runs `u`,
-//! producers `q`, macros `p`), `n` rows of [`ROW`] bytes, `d` dependency entries of [`DEP`]
+//! a 64-byte header (magic, version, rows `n`, deps `d`, heap length, sysroot core, alloc, std,
+//! proc_macro, bstd as row indices or `NONE`, trees `t`, corrected files `c`, modules `m`, runs
+//! `u`, producers `q`, macros `p`), `n` rows of [`ROW`] bytes, `d` dependency entries of [`DEP`]
 //! bytes, `t` trees of [`TREE`] bytes, `c` corrected files of [`CORRECTED`] bytes, the by-key
 //! table (`n` rows, 4 bytes each), `m` modules of [`MODULE`] bytes, `u` runs of [`RUN`] bytes,
 //! `q` producers and `p` macros of [`SUBJECT`] bytes, then the string heap.
@@ -57,11 +57,12 @@ const MAGIC: &[u8; 4] = b"BZCL";
 /// so a reader of the list knows a tree's kind without mapping its pack; a version-6 list is
 /// refused by name and made again. 8: each row's package binaries ([`BIN_EXES_AT`]: an
 /// integration test's `CARGO_BIN_EXE_<name>`); a version-7 list is refused by name and made
-/// again.
-pub const VERSION: u16 = 8;
-/// magic 4, version 2, pad 2, `n` 4, `d` 4, heap 4, sysroot 16, `t` 4, `c` 4, `m` 4, `u` 4,
+/// again. 9: the header's sysroot array holds `proc_macro` (`[core, alloc, std, proc_macro,
+/// bstd]`, 20 bytes, `HEADER_LEN = 64`); a version-8 list is refused by name and made again.
+pub const VERSION: u16 = 9;
+/// magic 4, version 2, pad 2, `n` 4, `d` 4, heap 4, sysroot 20, `t` 4, `c` 4, `m` 4, `u` 4,
 /// `q` 4, `p` 4.
-pub const HEADER_LEN: usize = 60;
+pub const HEADER_LEN: usize = 64;
 /// A build-script module: row 4, placement 1 (its maker's byte, never 0), pad 3, subject 32,
 /// the script's root file (package-relative) 8.
 pub const MODULE: usize = 48;
@@ -250,8 +251,8 @@ pub trait CrateGraph<'n> {
     fn refused(&self, at: usize) -> bool;
     /// The crates `at` depends on, by index, in its own order.
     fn deps(&self, at: usize) -> impl Iterator<Item = usize> + '_;
-    /// `core`, `alloc`, Rust's `std`, bstd.
-    fn sysroot(&self) -> [Option<usize>; 4];
+    /// `core`, `alloc`, Rust's `std`, `proc_macro`, bstd.
+    fn sysroot(&self) -> [Option<usize>; 5];
 }
 
 impl<'w> CrateGraph<'w> for World<'w> {
@@ -276,9 +277,8 @@ impl<'w> CrateGraph<'w> for World<'w> {
     fn deps(&self, at: usize) -> impl Iterator<Item = usize> + '_ {
         self.crates[at].input.deps.iter().map(|(_, dep)| *dep)
     }
-    fn sysroot(&self) -> [Option<usize>; 4] {
-        let s = self.sysroot;
-        [s.core, s.alloc, s.std, s.bstd].map(|id| id.map(|id| id.0 as usize))
+    fn sysroot(&self) -> [Option<usize>; 5] {
+        self.sysroot.all().map(|id| id.map(|id| id.0 as usize))
     }
 }
 
@@ -531,8 +531,7 @@ pub fn encode_with<'a>(world: &World<'_>, facts: &dyn ListFacts, alloc: Alloc<'a
     out.extend_from_slice(&u32_of(n, "row count")?.to_le_bytes());
     out.extend_from_slice(&u32_of(d, "dependency count")?.to_le_bytes());
     out.extend_from_slice(&u32_of(heap.len(), "string heap")?.to_le_bytes());
-    let s = world.sysroot;
-    for id in [s.core, s.alloc, s.std, s.bstd] {
+    for id in world.sysroot.all() {
         out.extend_from_slice(&id.map_or(NONE, |id| row_of.get(id.0 as usize).copied().unwrap_or(NONE)).to_le_bytes());
     }
     out.extend_from_slice(&u32_of(packs.len(), "tree count")?.to_le_bytes());
@@ -598,7 +597,7 @@ pub struct CrateList<'b> {
     macros: &'b [u8],
     heap: &'b str,
     n: usize,
-    sysroot: [u32; 4],
+    sysroot: [u32; 5],
 }
 
 /// The first of `0..len` for which `before` is false (`before` true on a prefix).
@@ -637,29 +636,29 @@ impl<'b> CrateList<'b> {
         let n = le32(bytes, 8) as usize;
         let d = le32(bytes, 12) as usize;
         let h = le32(bytes, 16) as usize;
-        let t = le32(bytes, 36) as usize;
-        let c = le32(bytes, 40) as usize;
-        let m = le32(bytes, 44) as usize;
-        let u = le32(bytes, 48) as usize;
-        let q = le32(bytes, 52) as usize;
-        let p = le32(bytes, 56) as usize;
+        let t = le32(bytes, 40) as usize;
+        let c = le32(bytes, 44) as usize;
+        let m = le32(bytes, 48) as usize;
+        let u = le32(bytes, 52) as usize;
+        let q = le32(bytes, 56) as usize;
+        let p = le32(bytes, 60) as usize;
         let after = |start: usize, count: usize, size: usize, at: usize| {
             count.checked_mul(size).and_then(|len| start.checked_add(len)).ok_or(form("a table's length overflows", at))
         };
         let rows_end = after(HEADER_LEN, n, ROW, 8)?;
         let deps_end = after(rows_end, d, DEP, 12)?;
-        let trees_end = after(deps_end, t, TREE, 36)?;
-        let corrected_end = after(trees_end, c, CORRECTED, 40)?;
+        let trees_end = after(deps_end, t, TREE, 40)?;
+        let corrected_end = after(trees_end, c, CORRECTED, 44)?;
         let by_key_end = after(corrected_end, n, 4, 8)?;
-        let modules_end = after(by_key_end, m, MODULE, 44)?;
-        let runs_end = after(modules_end, u, RUN, 48)?;
-        let producers_end = after(runs_end, q, SUBJECT, 52)?;
-        let macros_end = after(producers_end, p, SUBJECT, 56)?;
+        let modules_end = after(by_key_end, m, MODULE, 48)?;
+        let runs_end = after(modules_end, u, RUN, 52)?;
+        let producers_end = after(runs_end, q, SUBJECT, 56)?;
+        let macros_end = after(producers_end, p, SUBJECT, 60)?;
         if macros_end.checked_add(h) != Some(bytes.len()) {
             return Err(form("the lengths do not add up to the bytes", 16));
         }
         let heap = core::str::from_utf8(&bytes[macros_end..]).map_err(|_| form("the string heap is not UTF-8", macros_end))?;
-        let mut sysroot = [NONE; 4];
+        let mut sysroot = [NONE; 5];
         for (i, s) in sysroot.iter_mut().enumerate() {
             *s = le32(bytes, 20 + 4 * i);
             if *s != NONE && *s as usize >= n {
@@ -993,7 +992,7 @@ impl<'b> CrateGraph<'b> for CrateList<'b> {
     fn deps(&self, at: usize) -> impl Iterator<Item = usize> + '_ {
         self.deps_named(at).map(|(_, row)| row)
     }
-    fn sysroot(&self) -> [Option<usize>; 4] {
+    fn sysroot(&self) -> [Option<usize>; 5] {
         self.sysroot.map(|r| (r != NONE).then_some(r as usize))
     }
 }

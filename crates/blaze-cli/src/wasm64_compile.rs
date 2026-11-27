@@ -2280,7 +2280,7 @@ fn compile_unit_in<'a>(
     let role_id = |r: Role| {
         tc_units
             .iter()
-            .position(|u| u.role == r)
+            .position(|u| u.role == r && !u.proc_macro)
             .and_then(|i| u32::try_from(tc_base + i).ok())
             .map(CrateId)
     };
@@ -2288,6 +2288,7 @@ fn compile_unit_in<'a>(
         core: role_id(Role::Core),
         alloc: role_id(Role::Alloc),
         std: role_id(Role::Std),
+        proc_macro: role_id(Role::ProcMacro),
         bstd: role_id(Role::Bstd),
     };
 

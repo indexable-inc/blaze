@@ -258,7 +258,7 @@ fn cross_crate_value_path_args_are_inferred_not_defaulted() {
     // The sysroot `Inputs::resolve` gives, by the units' library names (the crate's index is
     // its `CrateId`).
     let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(i as u32));
-    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
+    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), proc_macro: at("proc_macro"), bstd: at("bstd") };
     assert!(sysroot.core.is_some() && sysroot.std.is_some(), "the toolchain at {shelf} has `core` and `std` units");
     let dep = crates.len();
     let user_deps: &'static [(&'static str, usize)] = Box::leak(vec![("dep", dep)].into_boxed_slice());

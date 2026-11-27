@@ -89,7 +89,7 @@ fn the_blaze_prelude_names_what_its_globs_reach_fresh_and_from_records() {
     let bump = super::SyncFrame::leaked();
     let g = bump.alloc();
     let inputs = [input("core", "/core/lib.rs", RUST), input("bstd", "/bstd/lib.rs", RUST), input("hello", "/hello/main.rs", BLAZE)];
-    let sys = Sysroot { core: Some(CrateId(0)), alloc: None, std: None, bstd: Some(CrateId(1)) };
+    let sys = Sysroot { core: Some(CrateId(0)), bstd: Some(CrateId(1)), ..Sysroot::default() };
     let (solved, _) = resolve_by_records(&inputs, sys, &TEXTS, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("solve: {e:?}"));
     let all: Vec<&'static CrateNames<'static>> = solved.iter().map(|s| s.names).collect();
     for (i, c) in all.iter().enumerate() {
