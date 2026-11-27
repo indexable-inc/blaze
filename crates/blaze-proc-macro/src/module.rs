@@ -230,12 +230,127 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&blaze_sha256::digest(bytes))
 }
 
-/// Current proc-macro module identity header (`blaze proc-macro module 8`): bumped when
-/// proc-macro compilation semantics, codegen, export synthesis, target-specific dependency
-/// resolution, or sysroot closure change (form 8: wasm64 self-compilation resolves
-/// `[target.'cfg(...)'.dependencies]` against `wasm64-blaze-wasip1` instead of the host triple)
-/// so stale form-7 modules map to a distinct key.
-pub const MODULE_HEADER: &str = "blaze proc-macro module 8";
+/// Current proc-macro module identity header (`blaze proc-macro module wasm64 8`): target-bearing
+/// so on-demand `wasm64-blaze-wasip1` self-compiled modules never share a write-once key with
+/// `wasm32-wasip1` bootstrap records (`blaze proc-macro module wasm32 7`) or pre-v8 records.
+/// Form 8 resolves `[target.'cfg(...)'.dependencies]` against `wasm64-blaze-wasip1` and folds
+/// WASI-side unified dependency features into `deps`.
+pub const MODULE_HEADER: &str = "blaze proc-macro module wasm64 8";
+
+/// Folds the resolved `wasm64-blaze-wasip1` dependency closure's unified feature sets into a
+/// proc-macro crate's `deps` digest so enabling or removing a feature on any WASI-only (or host)
+/// dependency via a sibling workspace build script or proc macro invalidates the module key
+/// (rule 21).
+pub fn deps_with_wasm_features<S: AsRef<str>, A: core::alloc::Allocator + Copy>(
+    lock_deps: &str,
+    wasm_graph: &blaze_unit_graph::UnitGraph<'_>,
+    package: blaze_manifest::lock::LockId,
+    features: &[S],
+    alloc: A,
+) -> blaze_own::String<A> {
+    use core::fmt::Write as _;
+    let mut want_feats = blaze_own::Vec::with_capacity_in(features.len(), alloc);
+    for f in features {
+        want_feats.push(f.as_ref());
+    }
+    want_feats.sort_unstable();
+    want_feats.dedup();
+    let feats_match = |u: &blaze_unit_graph::Unit<'_>| -> bool {
+        let mut got = blaze_own::Vec::with_capacity_in(u.features.len(), alloc);
+        for f in u.features.iter() {
+            got.push(f.as_str());
+        }
+        got.sort_unstable();
+        got.dedup();
+        got.as_slice() == want_feats.as_slice()
+    };
+    let root_idx = wasm_graph
+        .units
+        .iter()
+        .position(|u| u.package == package && u.kind == blaze_unit_graph::UnitKind::ProcMacro && feats_match(u))
+        .or_else(|| {
+            wasm_graph
+                .units
+                .iter()
+                .position(|u| u.package == package && u.kind == blaze_unit_graph::UnitKind::ProcMacro)
+        });
+    let mut rows = blaze_own::Vec::<blaze_own::String<A>, A>::new_in(alloc);
+    if let Some(root_idx) = root_idx {
+        let mut visited = blaze_own::Vec::with_capacity_in(wasm_graph.units.len(), alloc);
+        visited.resize(wasm_graph.units.len(), false);
+        if let Some(slot) = visited.get_mut(root_idx) {
+            *slot = true;
+        }
+        let mut stack = blaze_own::Vec::new_in(alloc);
+        if let Some(root_u) = wasm_graph.units.get(root_idx) {
+            for dep in root_u.deps.iter() {
+                let idx = dep.unit.index();
+                if wasm_graph
+                    .units
+                    .get(idx)
+                    .is_some_and(|du| matches!(du.kind, blaze_unit_graph::UnitKind::Lib | blaze_unit_graph::UnitKind::ProcMacro))
+                    && let Some(slot) = visited.get_mut(idx)
+                    && !*slot
+                {
+                    *slot = true;
+                    stack.push(idx);
+                }
+            }
+        }
+        while let Some(idx) = stack.pop() {
+            let Some(u) = wasm_graph.units.get(idx) else { continue };
+            for dep in u.deps.iter() {
+                let didx = dep.unit.index();
+                if wasm_graph
+                    .units
+                    .get(didx)
+                    .is_some_and(|du| matches!(du.kind, blaze_unit_graph::UnitKind::Lib | blaze_unit_graph::UnitKind::ProcMacro))
+                    && let Some(slot) = visited.get_mut(didx)
+                    && !*slot
+                {
+                    *slot = true;
+                    stack.push(didx);
+                }
+            }
+            let mut ufeats = blaze_own::Vec::with_capacity_in(u.features.len(), alloc);
+            for f in u.features.iter() {
+                ufeats.push(f.as_str());
+            }
+            ufeats.sort_unstable();
+            ufeats.dedup();
+            let kind_word = match u.kind {
+                blaze_unit_graph::UnitKind::ProcMacro => "proc-macro",
+                _ => "lib",
+            };
+            let mut row = blaze_own::String::new_in(alloc);
+            let _ = write!(row, "{} {} {} ", u.name.as_str(), u.version.as_str(), kind_word);
+            for (i, f) in ufeats.iter().enumerate() {
+                if i > 0 {
+                    row.push(',');
+                }
+                row.push_str(f);
+            }
+            rows.push(row);
+        }
+    }
+    rows.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    rows.dedup_by(|a, b| a.as_str() == b.as_str());
+    let mut joined = blaze_own::String::new_in(alloc);
+    joined.push_str(lock_deps);
+    joined.push_str("\nwasm64-dep-features\n");
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            joined.push('\n');
+        }
+        joined.push_str(row.as_str());
+    }
+    let digest = blaze_sha256::digest(joined.as_str().as_bytes());
+    let mut out = blaze_own::String::with_capacity_in(64, alloc);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
 
 /// The crate's identity as text: what the module key is the digest of.
 pub fn identity(id: &CrateId<'_>) -> String {
@@ -484,17 +599,20 @@ mod header_tests {
             features: &["default"],
         };
         let v8_identity = identity(&id);
-        assert_eq!(MODULE_HEADER, "blaze proc-macro module 8");
+        assert_eq!(MODULE_HEADER, "blaze proc-macro module wasm64 8");
         assert_eq!(v8_identity.lines().next(), Some(MODULE_HEADER));
+        let v7_w32_identity = v8_identity.replacen(MODULE_HEADER, "blaze proc-macro module wasm32 7", 1);
         let v7_identity = v8_identity.replacen(MODULE_HEADER, "blaze proc-macro module 7", 1);
         let v6_identity = v8_identity.replacen(MODULE_HEADER, "blaze proc-macro module 6", 1);
         let v5_identity = v8_identity.replacen(MODULE_HEADER, "blaze proc-macro module 5", 1);
         let v4_identity = v8_identity.replacen(MODULE_HEADER, "blaze proc-macro module 4", 1);
+        let v7_w32_key = sha256_hex(v7_w32_identity.as_bytes());
         let v7_key = sha256_hex(v7_identity.as_bytes());
         let v6_key = sha256_hex(v6_identity.as_bytes());
         let v5_key = sha256_hex(v5_identity.as_bytes());
         let v4_key = sha256_hex(v4_identity.as_bytes());
         let v8_key = module_key(&id);
+        assert_ne!(v7_w32_key, v8_key, "wasm64 form 8 key must differ from wasm32 bootstrap form 7 key");
         assert_ne!(v7_key, v8_key, "form 8 key must differ from stale form 7 key");
         assert_ne!(v6_key, v8_key, "form 8 key must differ from stale form 6 key");
         assert_ne!(v5_key, v8_key, "form 8 key must differ from stale form 5 key");
@@ -507,6 +625,7 @@ mod header_tests {
             (&v5_key, &v5_identity, "feedface\n"),
             (&v6_key, &v6_identity, "badc0ffe\n"),
             (&v7_key, &v7_identity, "01234567\n"),
+            (&v7_w32_key, &v7_w32_identity, "76543210\n"),
         ] {
             let stale_dir = store.join("proc-macro/modules").join(stale_key);
             std::fs::create_dir_all(&stale_dir).expect("create stale dir");
@@ -516,7 +635,7 @@ mod header_tests {
             std::fs::write(stale_dir.join("decls"), "__rustc_proc_macro_decls_blaze__\n").expect("write stale decls");
         }
 
-        // Lookup by current form 8 misses stale form 7, 6, 5, and 4 directories cleanly.
+        // Lookup by current wasm64 form 8 misses wasm32 form 7 and stale form 7, 6, 5, and 4 directories cleanly.
         assert!(matches!(find_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v8_key));
         assert!(matches!(read_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v8_key));
 
@@ -538,5 +657,60 @@ mod header_tests {
         assert_eq!(rec.macros[0].name, "Demo");
 
         let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn deps_with_wasm_features_invalidates_when_wasi_dep_feature_changes() {
+        use blaze_manifest::lock::LockId;
+        use blaze_own::Vec as OwnVec;
+        use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
+        let alloc = blaze_own::testing::heap().alloc();
+
+        let mk_wasm_graph = |wasi_feats: &[&str]| {
+            let mut pm_deps = OwnVec::new_in(alloc);
+            pm_deps.push(UnitDep { name: Text::from_str_in("wasi_helper", alloc), unit: UnitId(1) });
+            let mut dep_feats = OwnVec::new_in(alloc);
+            for f in wasi_feats {
+                dep_feats.push(Text::from_str_in(f, alloc));
+            }
+            let mut units = OwnVec::new_in(alloc);
+            units.push(Unit {
+                package: LockId(0),
+                name: Text::from_str_in("demo_pm", alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind: UnitKind::ProcMacro,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in("demo_pm", alloc),
+                root: Text::from_str_in("src/lib.rs", alloc),
+                features: OwnVec::new_in(alloc),
+                cfg: OwnVec::new_in(alloc),
+                deps: pm_deps,
+                build_script: None,
+                links: None,
+            });
+            units.push(Unit {
+                package: LockId(1),
+                name: Text::from_str_in("wasi_helper", alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind: UnitKind::Lib,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in("wasi_helper", alloc),
+                root: Text::from_str_in("src/lib.rs", alloc),
+                features: dep_feats,
+                cfg: OwnVec::new_in(alloc),
+                deps: OwnVec::new_in(alloc),
+                build_script: None,
+                links: None,
+            });
+            UnitGraph { units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) }
+        };
+
+        let wg_on = mk_wasm_graph(&["extra_wasi"]);
+        let wg_off = mk_wasm_graph(&[]);
+        let d_on = deps_with_wasm_features("same-lock-closure", &wg_on, LockId(0), &[] as &[&str], std::alloc::Global);
+        let d_off = deps_with_wasm_features("same-lock-closure", &wg_off, LockId(0), &[] as &[&str], std::alloc::Global);
+        assert_ne!(d_on.as_str(), d_off.as_str(), "proc-macro deps digest must change when a WASI-only dep feature toggles");
     }
 }

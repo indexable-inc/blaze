@@ -84,6 +84,9 @@ static SYSROOT_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub(crate) struct CompileInputs<'a> {
     /// Decodable `UnitGraph` section bytes (`graph_payload::sections(payload)?.graph`).
     pub graph: &'a [u8],
+    /// Optional decodable `wasm64-blaze-wasip1` host-unit graph bytes
+    /// (`graph_payload::sections(payload)?.wasm_graph`).
+    pub wasm_graph: &'a [u8],
     /// Raw `Cargo.lock` bytes, alive for the duration of the command.
     pub lock: &'a [u8],
     /// Resolved checkout root on disk; `None` in simulated test worlds (no on-disk self-compile).
@@ -635,6 +638,15 @@ pub(crate) fn compile_build_script(
     let alloc = erased.handle();
     let decoded = blaze_unit_graph::record::decode(inputs.graph, alloc)
         .map_err(|e| SelfCompileError::Failed(std::format!("unit graph decode failed at byte {}: {}", e.at, e.why)))?;
+    let wasm_decoded = if inputs.wasm_graph.is_empty() {
+        None
+    } else {
+        Some(
+            blaze_unit_graph::record::decode(inputs.wasm_graph, alloc).map_err(|e| {
+                SelfCompileError::Failed(bstd::mem::format_in!(&frame, "wasm64 unit graph decode failed at byte {}: {}", e.at, e.why).as_str().into())
+            })?,
+        )
+    };
     let lock = Lock::read(inputs.lock, alloc)
         .map_err(|e| SelfCompileError::Failed(std::format!("Cargo.lock parse failed: {e}")))?;
     let mut want_sorted: std::vec::Vec<&str> = features.to_vec();
@@ -651,7 +663,17 @@ pub(crate) fn compile_build_script(
         )));
     };
     let script_id = UnitId(unit_idx as u32);
-    ensure_build_script_unit(store, &decoded.graph, &lock, checkout, inputs.members, inputs.heap, script_id, 0)
+    ensure_build_script_unit(
+        store,
+        &decoded.graph,
+        wasm_decoded.as_ref().map(|d| &d.graph),
+        &lock,
+        checkout,
+        inputs.members,
+        inputs.heap,
+        script_id,
+        0,
+    )
 }
 
 fn path_pkg_files_digest(
@@ -671,10 +693,11 @@ fn path_pkg_files_digest(
 
 /// Recursively compiles `script_id` (and any build-script dependencies of its build-dependencies)
 /// into `<store>/build-script/modules/<key>` and returns its `wasm-sha256` digest.
-#[expect(clippy::too_many_arguments, reason = "recursive build-script compilation over store, graph, lock, checkout, members, heap, unit, and depth")]
+#[expect(clippy::too_many_arguments, reason = "recursive build-script compilation over store, graph, wasm_graph, lock, checkout, members, heap, unit, and depth")]
 fn ensure_build_script_unit(
     store: &Path,
     graph: &UnitGraph<'_>,
+    wasm_graph: Option<&UnitGraph<'_>>,
     lock: &Lock<'_>,
     checkout: &blaze_proc_macro::script_sandbox::RealRoot,
     members: &[(LockId, &str, blaze_world::PathKind)],
@@ -704,9 +727,14 @@ fn ensure_build_script_unit(
             })
         })
         .transpose()?;
-    let deps_digest = script_unit::script_deps_digest(graph, lock, script_id, |dep_pkg| {
+    let deps_digest = script_unit::script_deps_digest(graph, wasm_graph, lock, script_id, |dep_pkg| {
         path_pkg_files_digest(checkout, members, dep_pkg)
-    });
+    })
+    .map_err(|e| {
+        let mut msg = blaze_own::String::new_in(heap.alloc());
+        let _ = write!(msg, "build-script deps digest of {}: {e}", unit.name.as_str());
+        SelfCompileError::Failed(msg.as_str().into())
+    })?;
 
     // Fast path: already compiled and cached on disk.
     if let Ok(Some(record_dir)) = script_unit::module_of_files_and_deps(
@@ -724,6 +752,7 @@ fn ensure_build_script_unit(
     let wasm = compile_unit_to_wasm64(
         store,
         graph,
+        wasm_graph,
         lock,
         checkout,
         members,
@@ -796,7 +825,8 @@ fn ensure_proc_macro_unit(
         Ok(Some(blaze_proc_macro::module::files_digest(&mut files)))
     })
     .map_err(|e| std::format!("identifying proc-macro dep {} {}: {e}", unit.name.as_str(), unit.version.as_str()))?
-    .map_err(|e| std::format!("proc-macro dep {} {} not identified: {e}", unit.name.as_str(), unit.version.as_str()))?;
+    .map_err(|e| std::format!("proc-macro dep {} {} not identified: {e}", unit.name.as_str(), unit.version.as_str()))?
+    .with_wasm_features(graph, unit.package, heap.alloc());
 
     let (mod_key, id_text, existing) = identity.with_id(|id| {
         (
@@ -812,6 +842,7 @@ fn ensure_proc_macro_unit(
             let built = compile_unit_to_wasm64(
                 store,
                 graph,
+                Some(graph),
                 lock,
                 checkout,
                 members,
@@ -868,6 +899,15 @@ pub(crate) fn compile_proc_macro(
     let alloc = erased.handle();
     let decoded = blaze_unit_graph::record::decode(inputs.graph, alloc)
         .map_err(|e| SelfCompileError::Failed(std::format!("unit graph decode failed at byte {}: {}", e.at, e.why)))?;
+    let wasm_decoded = if inputs.wasm_graph.is_empty() {
+        None
+    } else {
+        Some(
+            blaze_unit_graph::record::decode(inputs.wasm_graph, alloc).map_err(|e| {
+                SelfCompileError::Failed(bstd::mem::format_in!(&frame, "wasm64 unit graph decode failed at byte {}: {}", e.at, e.why).as_str().into())
+            })?,
+        )
+    };
     let lock = Lock::read(inputs.lock, alloc)
         .map_err(|e| SelfCompileError::Failed(std::format!("Cargo.lock parse failed: {e}")))?;
     let mut want_sorted: std::vec::Vec<std::string::String> =
@@ -891,6 +931,7 @@ pub(crate) fn compile_proc_macro(
     let built = compile_unit_to_wasm64(
         store,
         &decoded.graph,
+        wasm_decoded.as_ref().map(|d| &d.graph),
         &lock,
         checkout,
         inputs.members,
@@ -1060,8 +1101,8 @@ fn run_dep_build_script(
     tc_feature_rows: &[blaze_build_script::probe::Row],
     depth: u8,
 ) -> Result<std::vec::Vec<u8>, SelfCompileError> {
-    // Ensure the build script's own wasm64 module exists first.
-    let _ = ensure_build_script_unit(store, graph, lock, checkout, members, heap, bs_id, depth + 1)?;
+    // Ensure the build script's own wasm64 module exists first (`graph` here is already `wasm_graph`).
+    let _ = ensure_build_script_unit(store, graph, Some(graph), lock, checkout, members, heap, bs_id, depth + 1)?;
     let frame = Frame::with_reserve(128 << 20, Tag::Other)
         .map_err(|_| SelfCompileError::Failed(std::string::String::from("failed to reserve dep build-script frame")))?;
     let erased = Erased::new(&frame);
@@ -1134,9 +1175,12 @@ fn run_dep_build_script(
             };
             script_unit::script_files_digest(&pkg_dir, unit.root.as_str()).ok()
         });
-    let deps_digest = script_unit::script_deps_digest(graph, lock, bs_id, |dep_pkg| {
+    let deps_digest = script_unit::script_deps_digest(graph, Some(graph), lock, bs_id, |dep_pkg| {
         path_pkg_files_digest(checkout, members, dep_pkg)
-    });
+    })
+    .map_err(|e| {
+        SelfCompileError::Failed(bstd::mem::format_in!(&frame, "dep build-script deps digest of {}: {e}", unit.name.as_str()).as_str().into())
+    })?;
     let setting = Setting {
         store,
         target: WASM64_TARGET,
@@ -1282,6 +1326,72 @@ fn checkout_package_from_member<'a>(
     package
 }
 
+/// Locates the matching `BuildScript` or `ProcMacro` unit in `wasm_graph` corresponding to
+/// `root_unit` in `host_graph`, preserving distinct `HostFeatureSide` namespaces and exact
+/// feature sets.
+fn locate_root_in_wasm_graph(
+    host_graph: &UnitGraph<'_>,
+    wasm_graph: &UnitGraph<'_>,
+    root_unit: UnitId,
+    mode: CompileMode,
+    alloc: Alloc<'_>,
+) -> Result<UnitId, SelfCompileError> {
+    let fail = |msg: core::fmt::Arguments<'_>| {
+        let mut s = blaze_own::String::new_in(alloc);
+        let _ = s.write_fmt(msg);
+        SelfCompileError::Failed(s.as_str().into())
+    };
+    let Some(root) = host_graph.units.get(root_unit.index()) else {
+        return Err(fail(format_args!("host unit graph missing root unit {}", root_unit.0)));
+    };
+    let want_kind = match mode {
+        CompileMode::BuildScript => UnitKind::BuildScript,
+        CompileMode::ProcMacro => UnitKind::ProcMacro,
+    };
+    let want_side = host_graph.host_unit_side(root_unit);
+    let mut want_root_feats: AVec<'_, &str> = OwnVec::with_capacity_in(root.features.len(), alloc);
+    for f in root.features.iter() {
+        want_root_feats.push(f.as_str());
+    }
+    want_root_feats.sort_unstable();
+    let root_idx = wasm_graph
+        .units
+        .iter()
+        .enumerate()
+        .position(|(i, u)| {
+            u32::try_from(i).is_ok_and(|uid| {
+                u.package == root.package
+                    && u.kind == want_kind
+                    && wasm_graph.host_unit_side(UnitId(uid)) == want_side
+                    && sorted_features_match(u, want_root_feats.as_slice())
+            })
+        })
+        .or_else(|| {
+            wasm_graph.units.iter().position(|u| {
+                u.package == root.package
+                    && u.kind == want_kind
+                    && sorted_features_match(u, want_root_feats.as_slice())
+            })
+        })
+        .or_else(|| {
+            wasm_graph
+                .units
+                .iter()
+                .position(|u| u.package == root.package && u.kind == want_kind)
+        });
+    let Some(root_idx) = root_idx else {
+        return Err(fail(format_args!(
+            "wasm64 resolution for {} {} produced no matching {:?} unit",
+            root.name.as_str(),
+            root.version.as_str(),
+            want_kind
+        )));
+    };
+    let root_u32 = u32::try_from(root_idx)
+        .map_err(|_| fail(format_args!("wasm64 unit index overflow: {root_idx}")))?;
+    Ok(UnitId(root_u32))
+}
+
 /// Resolves `root_unit` (a `BuildScript` or `ProcMacro` from the host `UnitGraph`) and its
 /// transitive dependency closure strictly against `wasm64-blaze-wasip1`'s `TargetDesc`, so
 /// `[target.'cfg(...)'.dependencies]` (including renamed deps like `libc_errno -> errno`, weak
@@ -1331,21 +1441,24 @@ fn resolve_wasm64_graph<'r>(
     let wasm_desc = TargetDesc::new(WASM64_TARGET, cfg_atoms, alloc);
 
     // Seed the wasm64 host resolution with ALL `BuildScript` and `ProcMacro` units from
-    // `host_graph` (matching `UnitGraphSession` in `unit_graph_task.rs`) so workspace-wide host
-    // feature unification across sibling build scripts and proc macros is preserved before we
-    // select `root_unit`'s dependency closure.
+    // `host_graph` (preserving each unit's `HostFeatureSide`, matching `UnitGraphSession` in
+    // `unit_graph_task.rs`) so workspace-wide host feature unification across sibling build
+    // scripts and proc macros is preserved without bleeding target-side features into host-side
+    // build scripts.
     let mut roots: AVec<'r, HostUnitAsk<'r>> = OwnVec::new_in(alloc);
-    for unit in host_graph.units.iter() {
+    for (idx, unit) in host_graph.units.iter().enumerate() {
         let kind = match unit.kind {
             UnitKind::BuildScript => HostUnitKind::BuildScript,
             UnitKind::ProcMacro => HostUnitKind::ProcMacro,
             _ => continue,
         };
+        let Ok(uid) = u32::try_from(idx) else { continue };
+        let side = host_graph.host_unit_side(UnitId(uid));
         let mut features: AVec<'r, GraphText<'r>> = OwnVec::with_capacity_in(unit.features.len(), alloc);
         for feat in unit.features.iter() {
             features.push(GraphText::from_str_in(feat.as_str(), alloc));
         }
-        roots.push(HostUnitAsk { package: unit.package, kind, features });
+        roots.push(HostUnitAsk { package: unit.package, kind, side, features });
     }
     let mut res = Resolution::for_host_units(lock, &wasm_desc, roots, host_graph.resolver, alloc);
 
@@ -1363,40 +1476,8 @@ fn resolve_wasm64_graph<'r>(
             ))
         })? {
             GraphPass::Done(wasm_graph) => {
-                let want_kind = match mode {
-                    CompileMode::BuildScript => UnitKind::BuildScript,
-                    CompileMode::ProcMacro => UnitKind::ProcMacro,
-                };
-                let mut want_root_feats: AVec<'r, &str> = OwnVec::with_capacity_in(root.features.len(), alloc);
-                for f in root.features.iter() {
-                    want_root_feats.push(f.as_str());
-                }
-                want_root_feats.sort_unstable();
-                let root_idx = wasm_graph
-                    .units
-                    .iter()
-                    .position(|u| {
-                        u.package == root.package
-                            && u.kind == want_kind
-                            && sorted_features_match(u, want_root_feats.as_slice())
-                    })
-                    .or_else(|| {
-                        wasm_graph
-                            .units
-                            .iter()
-                            .position(|u| u.package == root.package && u.kind == want_kind)
-                    });
-                let Some(root_idx) = root_idx else {
-                    return Err(fail(format_args!(
-                        "wasm64 resolution for {} {} produced no matching {:?} unit",
-                        root.name.as_str(),
-                        root.version.as_str(),
-                        want_kind
-                    )));
-                };
-                let root_u32 = u32::try_from(root_idx)
-                    .map_err(|_| fail(format_args!("wasm64 unit index overflow: {root_idx}")))?;
-                return Ok((wasm_graph, UnitId(root_u32)));
+                let wasm_root = locate_root_in_wasm_graph(host_graph, &wasm_graph, root_unit, mode, alloc)?;
+                return Ok((wasm_graph, wasm_root));
             }
             GraphPass::Partial(partial) => {
                 let mut missing = blaze_own::String::new_in(alloc);
@@ -1481,11 +1562,12 @@ fn resolve_wasm64_graph<'r>(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "whole-program wasm64 compilation over store, graph, lock, checkout, members, root unit, mode, and recursion depth"
+    reason = "whole-program wasm64 compilation over store, graph, pre-resolved wasm_graph, lock, checkout, members, root unit, mode, and recursion depth"
 )]
 fn compile_unit_to_wasm64(
     store: &Path,
     graph: &UnitGraph<'_>,
+    pre_wasm_graph: Option<&UnitGraph<'_>>,
     lock: &Lock<'_>,
     checkout: &blaze_proc_macro::script_sandbox::RealRoot,
     members: &[(LockId, &str, blaze_world::PathKind)],
@@ -1494,25 +1576,38 @@ fn compile_unit_to_wasm64(
     mode: CompileMode,
     depth: u8,
 ) -> Result<CompiledWasm64, SelfCompileError> {
-    // 0. Resolve `root_unit`'s dependency closure against `wasm64-blaze-wasip1`'s `TargetDesc`
-    //    (not the host `UnitGraph`), so `[target.'cfg(...)'.dependencies]` (e.g. `libc` and
-    //    `libc_errno = { package = "errno" }` under `rustix` on Linux hosts) and any newly-active
-    //    dependency build scripts (e.g. `libc/build.rs`) are accurately included.
+    // 0. Reuse the pre-resolved `wasm64-blaze-wasip1` host-unit graph from `graph_payload` when
+    //    available (Rule 30: one resolution shared with `script_deps_digest` and `macros.rs`),
+    //    or resolve on demand when invoked without one.
     let resolve_frame = Frame::with_reserve(64 << 20, Tag::Other)
         .map_err(|_| SelfCompileError::Failed("failed to reserve wasm64 resolve frame".into()))?;
     let resolve_erased = Erased::new(&resolve_frame);
     let resolve_alloc = resolve_erased.handle();
-    let (wasm_graph, wasm_root_unit) = resolve_wasm64_graph(
-        store,
-        graph,
-        lock,
-        checkout,
-        members,
-        root_unit,
-        mode,
-        &resolve_frame,
-        resolve_erased.bump(),
-    )?;
+    let owned_wasm_graph: Option<UnitGraph<'_>>;
+    let (wasm_graph, wasm_root_unit): (&UnitGraph<'_>, UnitId) = match pre_wasm_graph {
+        Some(wg) => {
+            let root_id = locate_root_in_wasm_graph(graph, wg, root_unit, mode, resolve_alloc)?;
+            (wg, root_id)
+        }
+        None => {
+            let (wg, root_id) = resolve_wasm64_graph(
+                store,
+                graph,
+                lock,
+                checkout,
+                members,
+                root_unit,
+                mode,
+                &resolve_frame,
+                resolve_erased.bump(),
+            )?;
+            owned_wasm_graph = Some(wg);
+            let Some(wg_ref) = owned_wasm_graph.as_ref() else {
+                return Err(SelfCompileError::Failed("missing resolved wasm64 graph".into()));
+            };
+            (wg_ref, root_id)
+        }
+    };
 
     // Collect `wasm_root_unit` + transitive `wasm_graph` dependency closure in deterministic sorted
     // order (Rule 25: independent of workspace unit-index ordering) up front so any dependency
@@ -1579,7 +1674,7 @@ fn compile_unit_to_wasm64(
         if wasm_graph.units.get(uid.index()).is_some_and(|u| u.kind == UnitKind::ProcMacro) {
             let (pm_key, record, pkg, ver) = ensure_proc_macro_unit(
                 store,
-                &wasm_graph,
+                wasm_graph,
                 lock,
                 checkout,
                 members,
@@ -1627,7 +1722,7 @@ fn compile_unit_to_wasm64(
     let bump = erased.bump();
     let result = compile_unit_in(
         store,
-        &wasm_graph,
+        wasm_graph,
         lock,
         checkout,
         members,
@@ -3322,6 +3417,7 @@ mod tests {
         let compiled = compile_unit_to_wasm64(
             &store_dir,
             &graph,
+            None,
             &lock,
             &checkout,
             &members,

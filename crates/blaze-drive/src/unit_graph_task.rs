@@ -108,6 +108,9 @@ impl fmt::Display for UnitGraphTaskError<'_> {
 /// [`UnitGraphTaskError::Missing`]); the task maps each finding to a finding record naming it.
 pub struct UnitGraphMade<'a> {
     pub record: AVec<'a, u8>,
+    /// Optional encoded `wasm64-blaze-wasip1` host-unit graph record (present when `wasm_host`
+    /// was supplied and the host graph had at least one build script or proc macro).
+    pub wasm_record: Option<AVec<'a, u8>>,
     pub findings: AVec<'a, SourceError<'a>>,
     /// The roots' targets left out by `required-features` (also in the record): the task
     /// says each as a note, never quietly (rule 3).
@@ -119,6 +122,7 @@ pub struct UnitGraphMade<'a> {
 /// left-out entries live in the session's scratch allocator `'a`.
 pub struct UnitGraphMadeIn<'a, 'r> {
     pub record: AVec<'r, u8>,
+    pub wasm_record: Option<AVec<'r, u8>>,
     pub findings: AVec<'a, SourceError<'a>>,
     pub left_out: AVec<'a, LeftOut<'a>>,
 }
@@ -228,7 +232,7 @@ impl<'l, 'b, 'a> UnitGraphSession<'l, 'b, 'a> {
         unheld: Unheld<'_>,
     ) -> Result<Entry<'a>, UnitGraphTaskError<'a>> {
         match self.step_encoded(records, unheld, self.alloc)? {
-            SessionEntry::Made(made) => Ok(Entry::Made(UnitGraphMade { record: made.record, findings: made.findings, left_out: made.left_out })),
+            SessionEntry::Made(made) => Ok(Entry::Made(UnitGraphMade { record: made.record, wasm_record: made.wasm_record, findings: made.findings, left_out: made.left_out })),
             SessionEntry::Need(needs) => Ok(Entry::Need(needs)),
             SessionEntry::NotFetched { count } => Ok(Entry::NotFetched { count }),
         }
@@ -267,14 +271,18 @@ impl<'l, 'b, 'a> UnitGraphSession<'l, 'b, 'a> {
                 }
                 self.wasm_passes += 1;
                 match wasm_res.pass().map_err(UnitGraphTaskError::Resolve)? {
-                    Pass::Done(_) => {
+                    Pass::Done(wasm_graph) => {
                         if self.not_fetched > 0 {
                             return Ok(SessionEntry::NotFetched { count: self.not_fetched });
                         }
                         if let Some(graph) = self.done_graph.take() {
                             let record = record::encode(&graph, self.target, self.host, record_alloc).map_err(UnitGraphTaskError::Cfg)?;
+                            let wasm_record = match self.wasm_host {
+                                Some(wasm_desc) => Some(record::encode(&wasm_graph, wasm_desc, wasm_desc, record_alloc).map_err(UnitGraphTaskError::Cfg)?),
+                                None => None,
+                            };
                             let findings = core::mem::replace(&mut self.findings, AVec::new_in(alloc));
-                            return Ok(SessionEntry::Made(UnitGraphMadeIn { record, findings, left_out: graph.left_out }));
+                            return Ok(SessionEntry::Made(UnitGraphMadeIn { record, wasm_record, findings, left_out: graph.left_out }));
                         }
                         return Err(UnitGraphTaskError::Passes);
                     }
@@ -328,17 +336,19 @@ impl<'l, 'b, 'a> UnitGraphSession<'l, 'b, 'a> {
                     }
                     if let Some(wasm_desc) = self.wasm_host {
                         let mut roots = AVec::new_in(alloc);
-                        for unit in graph.units.iter() {
+                        for (idx, unit) in graph.units.iter().enumerate() {
                             let kind = match unit.kind {
                                 UnitKind::BuildScript => HostUnitKind::BuildScript,
                                 UnitKind::ProcMacro => HostUnitKind::ProcMacro,
                                 _ => continue,
                             };
+                            let Ok(uid) = u32::try_from(idx) else { continue };
+                            let side = graph.host_unit_side(blaze_unit_graph::UnitId(uid));
                             let mut features = AVec::with_capacity_in(unit.features.len(), alloc);
                             for feat in unit.features.iter() {
                                 features.push(Text::from_str_in(feat.as_str(), alloc));
                             }
-                            roots.push(HostUnitAsk { package: unit.package, kind, features });
+                            roots.push(HostUnitAsk { package: unit.package, kind, side, features });
                         }
                         if !roots.is_empty() {
                             let mut wasm_res = Resolution::for_host_units(self.lock, wasm_desc, roots, self.resolver, alloc);
@@ -350,7 +360,7 @@ impl<'l, 'b, 'a> UnitGraphSession<'l, 'b, 'a> {
                     }
                     let record = record::encode(&graph, self.target, self.host, record_alloc).map_err(UnitGraphTaskError::Cfg)?;
                     let findings = core::mem::replace(&mut self.findings, AVec::new_in(alloc));
-                    return Ok(SessionEntry::Made(UnitGraphMadeIn { record, findings, left_out: graph.left_out }));
+                    return Ok(SessionEntry::Made(UnitGraphMadeIn { record, wasm_record: None, findings, left_out: graph.left_out }));
                 }
                 Pass::Partial(partial) => {
                     // A package not fetched this command is asked again by the next one.

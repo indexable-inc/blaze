@@ -187,79 +187,157 @@ pub fn module_of_native_files(store: &Path, name: &str, version: &str, features:
     Ok(None)
 }
 
+/// Failure allocating the scratch frame needed to walk a build script's dependency closure
+/// (`script_deps_digest`). Never falls back to a weaker digest (rule 3, rule 21).
+#[derive(Debug)]
+pub struct DepsDigestError(pub bstd::mem::MemError);
+
+impl core::fmt::Display for DepsDigestError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "allocating build-script dependency-digest scratch frame: {:?}", self.0)
+    }
+}
+
+impl core::error::Error for DepsDigestError {}
+
 /// Canonical SHA-256 digest of a build-script unit's transitive `UnitKind::Lib | UnitKind::ProcMacro`
-/// build-dependencies AND their transitive `Cargo.lock` dependency closure (rule 21: covers
-/// version, kind, sorted features, and source pin — registry checksum, git commit, or path
-/// package `files_digest` — including platform-specific `wasm64-blaze-wasip1` transitive deps
-/// such as `errno`/`libc` under `rustix` that are inactive on a Linux host `UnitGraph`). Returns
-/// `None` when the build script has no build-dependencies.
+/// build-dependencies (resolved against `wasm_graph` when present, so every WASI-side unified
+/// dependency feature enters the module key) AND the script package's transitive `Cargo.lock`
+/// dependency closure (rule 21: covers version, kind, sorted features, and source pin — registry
+/// checksum, git commit, or path package `files_digest`). Returns `Ok(None)` when the build
+/// script has no build-dependencies and no lock dependencies.
 pub fn script_deps_digest(
     graph: &UnitGraph<'_>,
+    wasm_graph: Option<&UnitGraph<'_>>,
     lock: &blaze_manifest::lock::Lock<'_>,
     script: UnitId,
-    mut path_files: impl FnMut(blaze_manifest::lock::LockId) -> Option<String>,
-) -> Option<String> {
+    mut path_files: impl FnMut(blaze_manifest::lock::LockId) -> Option<String>,) -> Result<Option<String>, DepsDigestError> {
     use blaze_manifest::lock::{Checksum, LockId, LockSource};
-    let mut visited = vec![false; graph.units.len()];
-    let mut stack: Vec<UnitId> = Vec::new();
-    let Some(root) = graph.units.get(script.index()) else { return None };
-    visited[script.index()] = true;
-    for dep in root.deps.iter() {
-        let idx = dep.unit.index();
-        if let Some(du) = graph.units.get(idx)
-            && matches!(du.kind, UnitKind::Lib | UnitKind::ProcMacro)
-            && !visited[idx]
-        {
-            visited[idx] = true;
-            stack.push(dep.unit);
+    use core::fmt::Write as _;
+    let Some(root) = graph.units.get(script.index()) else { return Ok(None) };
+    let frame = bstd::mem::Frame::new(bstd::mem::Tag::Other).map_err(DepsDigestError)?;
+
+    // When the resolved `wasm64-blaze-wasip1` host-unit graph is available, walk its closure for
+    // `script` so every WASI-only dependency and workspace-unified WASI feature set enters the
+    // digest (rule 21).
+    let (active_graph, active_root) = match wasm_graph {
+        Some(wg) => {
+            let want_side = graph.host_unit_side(script);
+            let mut want_feats = blaze_own::Vec::with_capacity_in(root.features.len(), &frame);
+            for f in root.features.iter() {
+                want_feats.push(f.as_str());
+            }
+            want_feats.sort_unstable();
+            want_feats.dedup();
+            let feats_match = |u: &Unit<'_>| -> bool {
+                let mut got = blaze_own::Vec::with_capacity_in(u.features.len(), &frame);
+                for f in u.features.iter() {
+                    got.push(f.as_str());
+                }
+                got.sort_unstable();
+                got.dedup();
+                got.as_slice() == want_feats.as_slice()
+            };
+            let found = wg
+                .units
+                .iter()
+                .enumerate()
+                .find_map(|(i, u)| {
+                    let uid = UnitId(u32::try_from(i).ok()?);
+                    (u.package == root.package
+                        && u.kind == UnitKind::BuildScript
+                        && wg.host_unit_side(uid) == want_side
+                        && feats_match(u))
+                    .then_some(uid)
+                })
+                .or_else(|| {
+                    wg.units.iter().enumerate().find_map(|(i, u)| {
+                        let uid = UnitId(u32::try_from(i).ok()?);
+                        (u.package == root.package && u.kind == UnitKind::BuildScript && feats_match(u)).then_some(uid)
+                    })
+                })
+                .or_else(|| {
+                    wg.units.iter().enumerate().find_map(|(i, u)| {
+                        let uid = UnitId(u32::try_from(i).ok()?);
+                        (u.package == root.package && u.kind == UnitKind::BuildScript).then_some(uid)
+                    })
+                });
+            match found {
+                Some(uid) => (wg, uid),
+                None => (graph, script),
+            }
+        }
+        None => (graph, script),
+    };
+
+    let mut visited = blaze_own::Vec::with_capacity_in(active_graph.units.len(), &frame);
+    visited.resize(active_graph.units.len(), false);
+    let mut stack = blaze_own::Vec::<UnitId, _>::new_in(&frame);
+    if let Some(slot) = visited.get_mut(active_root.index()) {
+        *slot = true;
+    }
+    if let Some(active_root_unit) = active_graph.units.get(active_root.index()) {
+        for dep in active_root_unit.deps.iter() {
+            let idx = dep.unit.index();
+            if active_graph
+                .units
+                .get(idx)
+                .is_some_and(|du| matches!(du.kind, UnitKind::Lib | UnitKind::ProcMacro))
+                && let Some(slot) = visited.get_mut(idx)
+                && !*slot
+            {
+                *slot = true;
+                stack.push(dep.unit);
+            }
         }
     }
-    let mut lines: Vec<String> = Vec::new();
-    let scratch = bstd::mem::Frame::new(bstd::mem::Tag::Other).ok();
-    let mut lock_seen = scratch.as_ref().map(|f| {
-        let mut v = blaze_own::Vec::with_capacity_in(lock.packages.len(), f);
-        v.resize(lock.packages.len(), false);
-        v
-    });
-    let mut lock_stack = scratch.as_ref().map(|f| blaze_own::Vec::<LockId, _>::new_in(f));
+
+    let mut lock_seen = blaze_own::Vec::with_capacity_in(lock.packages.len(), &frame);
+    lock_seen.resize(lock.packages.len(), false);
+    let mut lock_stack = blaze_own::Vec::<LockId, _>::new_in(&frame);
     // Seed the lock walk from the build-script package's own `Cargo.lock` dependencies so
     // direct target-specific WASI-only build-dependencies (absent from the host `UnitGraph`,
     // whether alongside host-active deps or as the script's only build-dep) still enter the
     // module cache key (rule 21). Mark `root.package` seen so the script package itself is
     // covered by `files_digest`, not hashed as one of its own dependencies.
-    if let (Some(seen), Some(lstack)) = (lock_seen.as_mut(), lock_stack.as_mut()) {
-        if let Some(slot) = seen.get_mut(root.package.index()) {
-            *slot = true;
-        }
-        for &child in lock.package(root.package).deps.iter() {
-            if let Some(slot) = seen.get_mut(child.index())
-                && !*slot
-            {
-                *slot = true;
-                lstack.push(child);
-            }
-        }
+    if let Some(slot) = lock_seen.get_mut(root.package.index()) {
+        *slot = true;
     }
-    while let Some(uid) = stack.pop() {
-        let u = &graph.units[uid.index()];
-        for dep in u.deps.iter() {
-            let idx = dep.unit.index();
-            if let Some(du) = graph.units.get(idx)
-                && matches!(du.kind, UnitKind::Lib | UnitKind::ProcMacro)
-                && !visited[idx]
-            {
-                visited[idx] = true;
-                stack.push(dep.unit);
-            }
-        }
-        if let (Some(seen), Some(lstack)) = (lock_seen.as_mut(), lock_stack.as_mut())
-            && let Some(slot) = seen.get_mut(u.package.index())
+    for &child in lock.package(root.package).deps.iter() {
+        if let Some(slot) = lock_seen.get_mut(child.index())
             && !*slot
         {
             *slot = true;
-            lstack.push(u.package);
+            lock_stack.push(child);
         }
-        let mut feats: Vec<&str> = u.features.iter().map(|f| f.as_str()).collect();
+    }
+
+    let mut lines = blaze_own::Vec::<blaze_own::String<&bstd::mem::Frame>, _>::new_in(&frame);
+    while let Some(uid) = stack.pop() {
+        let Some(u) = active_graph.units.get(uid.index()) else { continue };
+        for dep in u.deps.iter() {
+            let idx = dep.unit.index();
+            if active_graph
+                .units
+                .get(idx)
+                .is_some_and(|du| matches!(du.kind, UnitKind::Lib | UnitKind::ProcMacro))
+                && let Some(slot) = visited.get_mut(idx)
+                && !*slot
+            {
+                *slot = true;
+                stack.push(dep.unit);
+            }
+        }
+        if let Some(slot) = lock_seen.get_mut(u.package.index())
+            && !*slot
+        {
+            *slot = true;
+            lock_stack.push(u.package);
+        }
+        let mut feats = blaze_own::Vec::with_capacity_in(u.features.len(), &frame);
+        for f in u.features.iter() {
+            feats.push(f.as_str());
+        }
         feats.sort_unstable();
         feats.dedup();
         let kind_word = match u.kind {
@@ -267,82 +345,88 @@ pub fn script_deps_digest(
             _ => "lib",
         };
         let pkg = lock.package(u.package);
-        let pin = match (&pkg.checksum, &pkg.source) {
-            (Checksum::Sha256(sum), _) => format!("checksum:{}", sum.as_str()),
-            (Checksum::Absent, LockSource::Path) => match path_files(u.package) {
-                Some(hex) => format!("files:{hex}"),
-                None => String::from("path:unpinned"),
-            },
-            (Checksum::Absent, LockSource::Git { commit, .. }) => format!("git:{}", commit.as_str()),
-            (Checksum::Absent, LockSource::Registry { .. }) => format!("source:{}", pkg.source_text.as_str()),
-        };
-        lines.push(format!("{} {} {} {} {}", u.name.as_str(), u.version.as_str(), kind_word, feats.join(","), pin));
-    }
-    // Walk the transitive `Cargo.lock` closure of the script package and every build-dependency
-    // so platform-specific `wasm64-blaze-wasip1` deps (direct or transitive, e.g. `errno` and
-    // `libc` under `rustix` on Linux) enter the module cache key (rule 21).
-    if let (Some(frame), Some(seen), Some(lstack)) = (scratch.as_ref(), lock_seen.as_mut(), lock_stack.as_mut()) {
-        use core::fmt::Write as _;
-        let mut lock_lines = blaze_own::Vec::<blaze_own::String<&bstd::mem::Frame>, _>::new_in(frame);
-        while let Some(pkg_id) = lstack.pop() {
-            let pkg = lock.package(pkg_id);
-            for &child in pkg.deps.iter() {
-                if let Some(slot) = seen.get_mut(child.index())
-                    && !*slot
-                {
-                    *slot = true;
-                    lstack.push(child);
-                }
-            }
-            let mut row = blaze_own::String::new_in(frame);
-            let _ = write!(row, "lock {} {} ", pkg.name.as_str(), pkg.version);
-            match (&pkg.checksum, &pkg.source) {
-                (Checksum::Sha256(sum), _) => {
-                    let _ = write!(row, "checksum:{}", sum.as_str());
-                }
-                (Checksum::Absent, LockSource::Path) => match path_files(pkg_id) {
-                    Some(hex) => {
-                        let _ = write!(row, "files:{hex}");
-                    }
-                    None => row.push_str("path:unpinned"),
-                },
-                (Checksum::Absent, LockSource::Git { commit, .. }) => {
-                    let _ = write!(row, "git:{}", commit.as_str());
-                }
-                (Checksum::Absent, LockSource::Registry { .. }) => {
-                    let _ = write!(row, "source:{}", pkg.source_text.as_str());
-                }
-            }
-            lock_lines.push(row);
-        }
-        if lines.is_empty() && lock_lines.is_empty() {
-            return None;
-        }
-        lines.sort_unstable();
-        lines.dedup();
-        lock_lines.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
-        lock_lines.dedup_by(|a, b| a.as_str() == b.as_str());
-        let mut joined = blaze_own::String::new_in(frame);
-        for (i, l) in lines.iter().enumerate() {
+        let mut row = blaze_own::String::new_in(&frame);
+        let _ = write!(row, "{} {} {} ", u.name.as_str(), u.version.as_str(), kind_word);
+        for (i, f) in feats.iter().enumerate() {
             if i > 0 {
-                joined.push('\n');
+                row.push(',');
             }
-            joined.push_str(l.as_str());
+            row.push_str(f);
         }
-        for l in lock_lines.iter() {
-            if !joined.is_empty() {
-                joined.push('\n');
+        row.push(' ');
+        match (&pkg.checksum, &pkg.source) {
+            (Checksum::Sha256(sum), _) => {
+                let _ = write!(row, "checksum:{}", sum.as_str());
             }
-            joined.push_str(l.as_str());
+            (Checksum::Absent, LockSource::Path) => match path_files(u.package) {
+                Some(hex) => {
+                    let _ = write!(row, "files:{hex}");
+                }
+                None => row.push_str("path:unpinned"),
+            },
+            (Checksum::Absent, LockSource::Git { commit, .. }) => {
+                let _ = write!(row, "git:{}", commit.as_str());
+            }
+            (Checksum::Absent, LockSource::Registry { .. }) => {
+                let _ = write!(row, "source:{}", pkg.source_text.as_str());
+            }
         }
-        return Some(crate::module::sha256_hex(joined.as_str().as_bytes()));
+        lines.push(row);
     }
-    if lines.is_empty() {
-        return None;
+
+    let mut lock_lines = blaze_own::Vec::<blaze_own::String<&bstd::mem::Frame>, _>::new_in(&frame);
+    while let Some(pkg_id) = lock_stack.pop() {
+        let pkg = lock.package(pkg_id);
+        for &child in pkg.deps.iter() {
+            if let Some(slot) = lock_seen.get_mut(child.index())
+                && !*slot
+            {
+                *slot = true;
+                lock_stack.push(child);
+            }
+        }
+        let mut row = blaze_own::String::new_in(&frame);
+        let _ = write!(row, "lock {} {} ", pkg.name.as_str(), pkg.version);
+        match (&pkg.checksum, &pkg.source) {
+            (Checksum::Sha256(sum), _) => {
+                let _ = write!(row, "checksum:{}", sum.as_str());
+            }
+            (Checksum::Absent, LockSource::Path) => match path_files(pkg_id) {
+                Some(hex) => {
+                    let _ = write!(row, "files:{hex}");
+                }
+                None => row.push_str("path:unpinned"),
+            },
+            (Checksum::Absent, LockSource::Git { commit, .. }) => {
+                let _ = write!(row, "git:{}", commit.as_str());
+            }
+            (Checksum::Absent, LockSource::Registry { .. }) => {
+                let _ = write!(row, "source:{}", pkg.source_text.as_str());
+            }
+        }
+        lock_lines.push(row);
     }
-    lines.sort_unstable();
-    lines.dedup();
-    Some(crate::module::sha256_hex(lines.join("\n").as_bytes()))
+    if lines.is_empty() && lock_lines.is_empty() {
+        return Ok(None);
+    }
+    lines.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    lines.dedup_by(|a, b| a.as_str() == b.as_str());
+    lock_lines.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    lock_lines.dedup_by(|a, b| a.as_str() == b.as_str());
+    let mut joined = blaze_own::String::new_in(&frame);
+    for (i, l) in lines.iter().enumerate() {
+        if i > 0 {
+            joined.push('\n');
+        }
+        joined.push_str(l.as_str());
+    }
+    for l in lock_lines.iter() {
+        if !joined.is_empty() {
+            joined.push('\n');
+        }
+        joined.push_str(l.as_str());
+    }
+    Ok(Some(crate::module::sha256_hex(joined.as_str().as_bytes())))
 }
 
 /// Relative paths under a package directory that contribute to a workspace-member or path
@@ -482,13 +566,12 @@ pub fn records_named(store: &Path, name: &str, version: &str) -> Result<Vec<(Pat
 /// (scripts proc_macro_modules build_scripts.rs `library`), the same digest of the same file.
 const SHIM: &[u8] = include_bytes!("../guest/script_process.rs");
 
-/// Current wasm build-script module identity header (`blaze build-script module 6`): bumped when
-/// wasm64 build-script compilation semantics or codegen change (v5: `blaze-build` `bind_let_place`
-/// peeled-reference deref fix; v6: resolves `[target.'cfg(...)'.dependencies]` against
-/// `wasm64-blaze-wasip1` instead of the host triple and includes lock-closure transitive deps in
-/// `deps_digest`) so stale cached wasm modules are never reused and never collide as `Ambiguous`
-/// with newly compiled ones.
-pub const WASM_MODULE_HEADER: &str = "blaze build-script module 6";
+/// Current wasm64 build-script module identity header (`blaze build-script module wasm64 6`):
+/// target-bearing so on-demand `wasm64-blaze-wasip1` self-compiled modules never collide with
+/// `wasm32-wasip1` bootstrap records (`blaze build-script module wasm32 5`) or stale pre-v6
+/// modules. v6 resolves `[target.'cfg(...)'.dependencies]` against `wasm64-blaze-wasip1` and
+/// includes WASI-side unified dependency features + lock closure in `deps_digest`.
+pub const WASM_MODULE_HEADER: &str = "blaze build-script module wasm64 6";
 
 /// Current native host build-script module identity header (`blaze build-script module 3`): kept
 /// at v3 so existing Tier-2 native host records remain usable without re-bootstrapping while
@@ -1078,21 +1161,26 @@ mod tests {
         )
         .expect("write v3 identity");
 
-        // Stale v3, v4, and v5 wasm modules are not returned (forces recompile with current semantics).
-        for stale_ver in ["3", "4", "5"] {
-            let stale_dir = store.join(format!("build-script/modules/stale-v{stale_ver}"));
+        // Stale v3, v4, v5, and wasm32-bootstrap v5 modules are not returned (forces recompile with current semantics).
+        for (dir_name, stale_header) in [
+            ("stale-v3", "blaze build-script module 3"),
+            ("stale-v4", "blaze build-script module 4"),
+            ("stale-v5", "blaze build-script module 5"),
+            ("stale-wasm32-v5", "blaze build-script module wasm32 5"),
+        ] {
+            let stale_dir = store.join(format!("build-script/modules/{dir_name}"));
             std::fs::create_dir_all(&stale_dir).expect("create stale dir");
             std::fs::write(
                 stale_dir.join("identity"),
-                format!("blaze build-script module {stale_ver}\nname demo\nversion 0.1.0\nfeatures \n{shim}\nbuilder blaze-wasm64\n"),
+                format!("{stale_header}\nname demo\nversion 0.1.0\nfeatures \n{shim}\nbuilder blaze-wasm64\n"),
             )
             .expect("write stale identity");
         }
         let miss = super::module_of_files_and_deps(&store, "demo", "0.1.0", &[], None, None).expect("lookup stale");
-        assert_eq!(miss, None, "stale v3/v4/v5 wasm modules must not match WASM_MODULE_HEADER ({})", super::WASM_MODULE_HEADER);
+        assert_eq!(miss, None, "stale/wasm32 modules must not match WASM_MODULE_HEADER ({})", super::WASM_MODULE_HEADER);
 
-        // Current v6 module placed alongside stale v3/v4/v5 matches uniquely (never Ambiguous).
-        let fresh_dir = store.join("build-script/modules/fresh-v6");
+        // Current wasm64 v6 module placed alongside stale/wasm32 modules matches uniquely (never Ambiguous).
+        let fresh_dir = store.join("build-script/modules/fresh-wasm64-v6");
         std::fs::create_dir_all(&fresh_dir).expect("create fresh dir");
         std::fs::write(
             fresh_dir.join("identity"),
@@ -1210,8 +1298,12 @@ mod tests {
         });
         let graph = UnitGraph { units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
 
-        let d1 = super::script_deps_digest(&graph, &lock_a, UnitId(0), |_| None).expect("digest a");
-        let d2 = super::script_deps_digest(&graph, &lock_b, UnitId(0), |_| None).expect("digest b");
+        let d1 = super::script_deps_digest(&graph, None, &lock_a, UnitId(0), |_| None)
+            .expect("frame ok")
+            .expect("digest a");
+        let d2 = super::script_deps_digest(&graph, None, &lock_b, UnitId(0), |_| None)
+            .expect("frame ok")
+            .expect("digest b");
         assert_ne!(d1, d2, "script_deps_digest must change when a wasm64-only transitive locked dep (`errno`) changes");
     }
 
@@ -1252,15 +1344,17 @@ mod tests {
             links: None,
         });
         let graph_empty = UnitGraph { units: units_empty, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
-        let only_a = super::script_deps_digest(&graph_empty, &lock_only_a, UnitId(0), |_| None)
+        let only_a = super::script_deps_digest(&graph_empty, None, &lock_only_a, UnitId(0), |_| None)
+            .expect("frame ok")
             .expect("must return Some even when host Unit.deps is empty");
-        let only_b = super::script_deps_digest(&graph_empty, &lock_only_b, UnitId(0), |_| None)
+        let only_b = super::script_deps_digest(&graph_empty, None, &lock_only_b, UnitId(0), |_| None)
+            .expect("frame ok")
             .expect("must return Some for lock b");
         assert_ne!(only_a, only_b, "digest must change when the sole WASI-only direct build-dep changes");
 
-        // Control: when `app` truly has NO lock deps at all, still returns `None`.
+        // Control: when `app` truly has NO lock deps at all, still returns `Ok(None)`.
         let lock_none = Lock::read(b"version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n", alloc).expect("lock_none");
-        assert_eq!(super::script_deps_digest(&graph_empty, &lock_none, UnitId(0), |_| None), None);
+        assert_eq!(super::script_deps_digest(&graph_empty, None, &lock_none, UnitId(0), |_| None).expect("frame ok"), None);
 
         // Case B: `app` has a host-active build-dep `host_dep` AND a sibling WASI-only direct path build-dep `wasi_path`.
         let lock_sib_txt = "version = 4\n\n\
@@ -1302,18 +1396,72 @@ mod tests {
             links: None,
         });
         let graph_sib = UnitGraph { units: units_sib, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
-        let sib_a = super::script_deps_digest(&graph_sib, &lock_sib, UnitId(0), |id| match id {
+        let sib_a = super::script_deps_digest(&graph_sib, None, &lock_sib, UnitId(0), |id| match id {
             LockId(1) => Some(String::from("host-v1")),
             LockId(2) => Some(String::from("wasi-v1")),
             _ => None,
         })
+        .expect("frame ok")
         .expect("sib a");
-        let sib_b = super::script_deps_digest(&graph_sib, &lock_sib, UnitId(0), |id| match id {
+        let sib_b = super::script_deps_digest(&graph_sib, None, &lock_sib, UnitId(0), |id| match id {
             LockId(1) => Some(String::from("host-v1")),
             LockId(2) => Some(String::from("wasi-v2")),
             _ => None,
         })
+        .expect("frame ok")
         .expect("sib b");
         assert_ne!(sib_a, sib_b, "digest must change when a sibling direct WASI-only path build-dep changes");
+
+        // Case C: when `wasm_graph` toggles a WASI-only dep feature (e.g. unified from a sibling),
+        // `script_deps_digest` changes even when host `UnitGraph` and `Cargo.lock` are identical!
+        let mk_wg = |wasi_feats: &[&str]| {
+            let mut wg_bs_deps = OwnVec::new_in(alloc);
+            wg_bs_deps.push(UnitDep { name: Text::from_str_in("wasi_only", alloc), unit: UnitId(1) });
+            let mut wf = OwnVec::new_in(alloc);
+            for f in wasi_feats {
+                wf.push(Text::from_str_in(f, alloc));
+            }
+            let mut u = OwnVec::new_in(alloc);
+            u.push(Unit {
+                package: LockId(0),
+                name: Text::from_str_in("app", alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind: UnitKind::BuildScript,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in("build_script_build", alloc),
+                root: Text::from_str_in("build.rs", alloc),
+                features: OwnVec::new_in(alloc),
+                cfg: OwnVec::new_in(alloc),
+                deps: wg_bs_deps,
+                build_script: None,
+                links: None,
+            });
+            u.push(Unit {
+                package: LockId(1),
+                name: Text::from_str_in("wasi_only", alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind: UnitKind::Lib,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in("wasi_only", alloc),
+                root: Text::from_str_in("src/lib.rs", alloc),
+                features: wf,
+                cfg: OwnVec::new_in(alloc),
+                deps: OwnVec::new_in(alloc),
+                build_script: None,
+                links: None,
+            });
+            UnitGraph { units: u, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) }
+        };
+        let wg_on = mk_wg(&["extra_wasi"]);
+        let wg_off = mk_wg(&[]);
+        let feat_on = super::script_deps_digest(&graph_empty, Some(&wg_on), &lock_only_a, UnitId(0), |_| None)
+            .expect("frame ok")
+            .expect("feat_on");
+        let feat_off = super::script_deps_digest(&graph_empty, Some(&wg_off), &lock_only_a, UnitId(0), |_| None)
+            .expect("frame ok")
+            .expect("feat_off");
+        assert_ne!(feat_on, feat_off, "script_deps_digest must change when a WASI-only dep feature toggles in wasm_graph");
     }
 }

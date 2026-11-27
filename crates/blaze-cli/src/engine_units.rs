@@ -972,6 +972,7 @@ pub(crate) fn discover<'f>(
                         &cx,
                         root,
                         record.payload_bytes()?,
+                        graph.wasm_record_bytes(),
                         Some(lockfile.lock),
                         Some(graph.member_dirs()),
                         graph.mapped_slice(),
@@ -980,13 +981,13 @@ pub(crate) fn discover<'f>(
                     )
                 };
                 // The record sealed with the crate list as work.rs's arm seals it: its readers
-                // (a `Script` job, a macro module's lookup) open its two sections
+                // (a `Script` job, a macro module's lookup) open its sections
                 // (graph_payload.rs); unsealed, they were refused "no trailer mark". Version 6
                 // (crate_list.rs), written with the world (names.rs `world`): the planners' facts
                 // too, so a later request plans from the list alone.
                 match world {
                     Ok(made) => {
-                        record.out = crate::work::seal_graph(&mut record, sealed(made.list_bytes(), frame));
+                        record.out = crate::work::seal_graph(&mut record, sealed(made.list_bytes(), frame), graph.wasm_record_bytes());
                         crate::names::tell_public(store, &made);
                         names = Some(made);
                         Ok(record)
@@ -999,7 +1000,7 @@ pub(crate) fn discover<'f>(
                     Err(error) => {
                         let words = bstd::mem::format_in!(frame, "names not resolved: {error}");
                         record.find(crate::fetch::SOURCE_REFUSED, (0, 0), &[words.as_str()]);
-                        record.out = crate::work::seal_graph(&mut record, &[]);
+                        record.out = crate::work::seal_graph(&mut record, &[], graph.wasm_record_bytes());
                         Ok(record)
                     }
                 }

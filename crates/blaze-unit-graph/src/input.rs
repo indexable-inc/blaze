@@ -356,11 +356,21 @@ pub enum HostUnitKind {
     ProcMacro,
 }
 
+/// Which feature namespace a host-executed unit belongs to in [`crate::Resolution::for_host_units`]:
+/// `Target` for a build script serving target-side units (features decoupled from host deps
+/// under resolver 2/3) vs `Host` for proc macros and build scripts serving host-side deps.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum HostFeatureSide {
+    Target,
+    Host,
+}
+
 /// One host-executed unit seed for [`crate::Resolution::for_host_units`]: the package's lock id,
-/// target kind, and exact resolved feature set.
+/// target kind, feature namespace side, and exact resolved feature set.
 #[derive(Clone, Debug)]
 pub struct HostUnitAsk<'a> {
     pub package: blaze_manifest::lock::LockId,
     pub kind: HostUnitKind,
+    pub side: HostFeatureSide,
     pub features: AVec<'a, Text<'a>>,
 }

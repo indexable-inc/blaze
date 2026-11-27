@@ -164,11 +164,17 @@ impl core::fmt::Display for MacrosError {
     }
 }
 
-/// Every macro crate of the graph `graph_record` with its identity, over `lock`, the module
-/// store `modules` (its git folders) and `place` (a member's folder). The decoded graph is the
-/// task's scratch, made over `scratch`.
-pub(crate) fn list(graph_record: &[u8], lock: &crate::fetch::Lockfile<'_>, modules: &std::path::Path, place: &Place<'_, '_>, scratch: Alloc<'_>) -> Result<MacroCrates, MacrosError> {
-    let decoded = blaze_unit_graph::record::decode(graph_record, scratch).map_err(MacrosError::Graph)?;
+/// Every macro crate of the graph `sections` with its identity, over `lock`, the module
+/// store `modules` (its git folders) and `place` (a member's folder). When `sections.wasm_graph`
+/// is present, folds each proc-macro's resolved `wasm64-blaze-wasip1` dependency closure features
+/// into its module identity (rule 21). The decoded graph is the task's scratch, made over `scratch`.
+pub(crate) fn list(sections: crate::graph_payload::Sections<'_>, lock: &crate::fetch::Lockfile<'_>, modules: &std::path::Path, place: &Place<'_, '_>, scratch: Alloc<'_>) -> Result<MacroCrates, MacrosError> {
+    let decoded = blaze_unit_graph::record::decode(sections.graph, scratch).map_err(MacrosError::Graph)?;
+    let wasm_decoded = if sections.wasm_graph.is_empty() {
+        None
+    } else {
+        Some(blaze_unit_graph::record::decode(sections.wasm_graph, scratch).map_err(MacrosError::Graph)?)
+    };
     let locked = LockedPackages::of(lock.lock);
     let folders = git_folders(modules).map_err(MacrosError::Procs)?;
     let mut crates = std::vec::Vec::new_in(Global);
@@ -176,6 +182,10 @@ pub(crate) fn list(graph_record: &[u8], lock: &crate::fetch::Lockfile<'_>, modul
         // A member macro crate's identity is its files' digest, read from its folder; a path
         // package that is no member has no folder here and is named as not identified.
         let identity = identify(lock.lock, &locked, &folders, unit, |id| Ok(place.member_files(id))).map_err(MacrosError::Procs)?;
+        let identity = match (&wasm_decoded, identity) {
+            (Some(wg), Ok(id)) => Ok(id.with_wasm_features(&wg.graph, unit.package, scratch)),
+            (_, other) => other,
+        };
         crates.push((subject(unit), identity));
     }
     crates.sort_unstable_by_key(|(subject, _)| *subject);
@@ -212,7 +222,7 @@ pub(crate) fn run<'b>(
         // The task's frame carries no header: erased here, for this task's scratch.
         let scratch = blaze_own::Erased::new(frame);
         let listed = match lock {
-            Some(lock) => list(read.unit_graph(graph.name)?.graph, lock, &modules, &place, scratch.handle()),
+            Some(lock) => list(read.unit_graph(graph.name)?, lock, &modules, &place, scratch.handle()),
             None => Err(MacrosError::NoLock),
         };
         match listed {

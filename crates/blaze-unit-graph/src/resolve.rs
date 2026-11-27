@@ -6,7 +6,7 @@ use blaze_manifest::layout::{DepKind, ExtraKind};
 use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::{AVec, Alloc, BTreeMap, String, Vec};
 
-use crate::input::{Ask, Bin, CfgAtom, DepSource, FeatureValue, HostUnitAsk, HostUnitKind, Lib, Package, Resolver, TargetDesc};
+use crate::input::{Ask, Bin, CfgAtom, DepSource, FeatureValue, HostFeatureSide, HostUnitAsk, HostUnitKind, Lib, Package, Resolver, TargetDesc};
 use crate::extra::{Extra, has_test_cfg};
 use crate::{LeftOut, LeftOutKind, Pass, PartialGraph, Plant, Text, Unit, UnitDep, UnitError, UnitGraph, UnitId, UnitKind};
 
@@ -468,9 +468,9 @@ impl<'l, 'a> Resolution<'l, 'a> {
                     if self.facts(root.package, &mut st.needs).is_none() {
                         continue;
                     }
-                    let side = match root.kind {
-                        HostUnitKind::BuildScript => Side::Target,
-                        HostUnitKind::ProcMacro => Side::Host,
+                    let side = match root.side {
+                        HostFeatureSide::Target => Side::Target,
+                        HostFeatureSide::Host => Side::Host,
                     };
                     let n = node(root.package, side);
                     for feature in root.features.iter() {
@@ -738,15 +738,19 @@ impl<'l, 'a> Resolution<'l, 'a> {
                             continue;
                         }
                     };
+                    let fside = match root.side {
+                        HostFeatureSide::Target => Side::Target,
+                        HostFeatureSide::Host => Side::Host,
+                    };
                     match root.kind {
                         HostUnitKind::BuildScript => {
                             if let Some(script) = &package.build {
-                                add(root.package, Target::BuildScript(script), Side::Host, Side::Target, &mut keys, &mut index, &mut tmp);
+                                add(root.package, Target::BuildScript(script), Side::Host, fside, &mut keys, &mut index, &mut tmp);
                             }
                         }
                         HostUnitKind::ProcMacro => {
                             if let Some(lib) = &package.lib {
-                                add(root.package, Target::ProcMacro(lib), Side::Host, Side::Host, &mut keys, &mut index, &mut tmp);
+                                add(root.package, Target::ProcMacro(lib), Side::Host, fside, &mut keys, &mut index, &mut tmp);
                             }
                         }
                     }

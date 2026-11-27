@@ -144,7 +144,7 @@ use edition::PackageEdition;
 pub use blaze_manifest::layout::{PackageMeta, PackageMetaVars};
 pub use extra::{Extra, ExtraUnit};
 pub use implicit::{Implicit, Prelude, StdIs, Sysroot, ToolchainUnit, implicit};
-pub use input::{Ask, Bin, CfgAtom, Dep, DepSource, FeatureDef, FeatureValue, HostUnitAsk, HostUnitKind, Lib, NoResolver, Package, Platform, Resolver, TargetDesc};
+pub use input::{Ask, Bin, CfgAtom, Dep, DepSource, FeatureDef, FeatureValue, HostFeatureSide, HostUnitAsk, HostUnitKind, Lib, NoResolver, Package, Platform, Resolver, TargetDesc};
 pub use resolve::{Resolution, ignores_profile_panic};
 pub use sources::{ExternalRecords, Open, Records, SourceError, StoreSources};
 
@@ -314,6 +314,32 @@ impl<'a> UnitGraph<'a> {
     /// The metadata of `package`, when the graph knows it ([`UnitGraph::meta`]).
     pub fn meta_of(&self, package: LockId) -> Option<&PackageMeta<'a>> {
         self.meta.binary_search_by(|(id, _)| id.cmp(&package)).ok().map(|at| &self.meta[at].1)
+    }
+
+    /// The feature namespace side of a host-executed unit (`BuildScript` or `ProcMacro`) in this
+    /// graph, preserving separate target-side vs host-side build-script feature namespaces when
+    /// resolver 2/3 builds the same package for both target and host with distinct features.
+    pub fn host_unit_side(&self, unit: UnitId) -> HostFeatureSide {
+        let Some(u) = self.units.get(unit.index()) else {
+            return HostFeatureSide::Host;
+        };
+        if u.kind != UnitKind::BuildScript {
+            return HostFeatureSide::Host;
+        }
+        let mut saw_server = false;
+        for server in self.units.iter() {
+            if server.build_script == Some(unit) {
+                saw_server = true;
+                if !server.for_host {
+                    return HostFeatureSide::Target;
+                }
+            }
+        }
+        if saw_server {
+            HostFeatureSide::Host
+        } else {
+            HostFeatureSide::Target
+        }
     }
 }
 

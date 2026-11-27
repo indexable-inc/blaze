@@ -261,6 +261,10 @@ pub struct Graph<'f> {
     dirs: Vec<CheckoutDir, Alloc<'static>>,
     /// The rustflags blaze does not apply, said on the graph's record ([`RUSTFLAGS_NOT_APPLIED`]).
     told: Option<&'f str>,
+    /// Optional encoded `wasm64-blaze-wasip1` host-unit graph produced alongside the host graph
+    /// during discovery, sealed into `graph_payload` so every downstream reader shares one
+    /// resolved WASI-side feature set (Rule 21, Rule 30).
+    wasm_record: Option<AVec<'static, u8>>,
 }
 
 impl<'f> Graph<'f> {
@@ -314,7 +318,13 @@ impl<'f> Graph<'f> {
             wasm_host.map(|desc| &*blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(desc, frame)));
         let ask: &'f Ask<'static> = std::boxed::Box::leak(std::boxed::Box::new_in(ask, frame));
         let inputs = UnitGraphInputs { lock: lockfile.text, workspace_read, members, path_packages, resolver: parts.resolver, target, host, wasm_host, ask };
-        Graph { source: unit_graph_task::source(&inputs), inputs, mapped: Vec::new_in(frame), dirs: parts.dirs, told: None }
+        Graph { source: unit_graph_task::source(&inputs), inputs, mapped: Vec::new_in(frame), dirs: parts.dirs, told: None, wasm_record: None }
+    }
+
+    /// Encoded `wasm64-blaze-wasip1` host-unit graph bytes produced during discovery (empty when
+    /// none was built).
+    pub(crate) fn wasm_record_bytes(&self) -> &[u8] {
+        self.wasm_record.as_deref().unwrap_or(&[])
     }
 
     /// Each checkout path package's lock entry, directory (anchor-relative), and kind.
@@ -650,6 +660,7 @@ pub(crate) fn run_session<'s, 'f: 's, 'b>(
             Ok(Did::Hole(TaskFailure { name, why: Why::Refused { what: "the dependency graph: sources not fetched", rule: "unit_graph_task" } }, held_str(words.as_str(), held)))
         }
         Ok(SessionEntry::Made(made)) => {
+            graph.wasm_record = made.wasm_record;
             let mut record = Made::new_in(name, held);
             hand_graph(&mut record, made.record)?;
             record.out = ContentId::of(GRAPH_OUT_DOMAIN, record.payload_bytes()?);

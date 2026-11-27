@@ -15,8 +15,8 @@ use blaze_own::{Alloc, String, Vec};
 use blaze_sim::{Broke, Config, Tape};
 use edition::{Edition, PackageEdition};
 
-use crate::input::{Ask, Bin, CfgAtom, Dep, DepSource, FeatureDef, FeatureValue, HostUnitAsk, HostUnitKind, Lib, Package, Platform, Resolver, TargetDesc};
-use crate::{Extra, LeftOutKind, Pass, Plant, Resolution, UnitError, UnitGraph, UnitKind, record};
+use crate::input::{Ask, Bin, CfgAtom, Dep, DepSource, FeatureDef, FeatureValue, HostFeatureSide, HostUnitAsk, HostUnitKind, Lib, Package, Platform, Resolver, TargetDesc};
+use crate::{Extra, LeftOutKind, Pass, Plant, Resolution, UnitError, UnitGraph, UnitId, UnitKind, record};
 
 /// tempo-primitives and reth-codecs in miniature: dev-dependency unification (src/tests/dev_unify.rs).
 mod dev_unify;
@@ -1691,7 +1691,7 @@ fn host_units_resolves_wasm64_target_specific_renamed_deps_weak_features_and_dep
     //    propagates `std` via `libc?/std` and `libc_errno?/std`, includes `libc`'s BuildScript,
     //    and omits `linux_raw_sys` and `normal_only`.
     let mut wasm_roots = Vec::new_in(a());
-    wasm_roots.push(HostUnitAsk { package: LockId(0), kind: HostUnitKind::BuildScript, features: Vec::new_in(a()) });
+    wasm_roots.push(HostUnitAsk { package: LockId(0), kind: HostUnitKind::BuildScript, side: HostFeatureSide::Target, features: Vec::new_in(a()) });
     let mut wasm_res = Resolution::for_host_units(&lock, &wasi_desc, wasm_roots, Resolver::V2, a());
     host_res.move_packages_into(&mut wasm_res).expect("move packages");
     let wasm_graph = match wasm_res.pass().expect("wasm64 pass") {
@@ -1725,4 +1725,88 @@ fn host_units_resolves_wasm64_target_specific_renamed_deps_weak_features_and_dep
     assert_eq!(errno_unit.features.iter().map(|f| f.as_str()).collect::<std::vec::Vec<_>>(), ["std"]);
     let errno_deps: std::vec::Vec<&str> = errno_unit.deps.iter().map(|d| d.name.as_str()).collect();
     assert_eq!(errno_deps, ["libc"]);
+}
+
+/// Under resolver 2/3, a package built for BOTH target (feature `feat_a`) and host (feature
+/// `feat_b`) has two distinct `BuildScript` units with separate feature namespaces.
+/// `Resolution::for_host_units` must preserve `HostFeatureSide::Target` vs `HostFeatureSide::Host`
+/// so `feat_a` and `feat_b` never bleed into each other.
+#[test]
+fn host_units_preserves_target_and_host_build_script_feature_namespaces_distinct() {
+    let linux_desc = {
+        let mut cfg = Vec::new_in(a());
+        cfg.push(CfgAtom::pair("target_os", "linux", a()));
+        TargetDesc::new("x86_64-unknown-linux-gnu", cfg, a())
+    };
+    let wasi_desc = {
+        let mut cfg = Vec::new_in(a());
+        cfg.push(CfgAtom::pair("target_os", "wasi", a()));
+        TargetDesc::new("wasm64-blaze-wasip1", cfg, a())
+    };
+
+    let ps = vec![
+        // 0: app depends on `shared` normally with `feat_a` AND as a build-dep with `feat_b`.
+        pkg("app")
+            .member()
+            .build()
+            .dep(dep("shared").no_default().features(&["feat_a"]))
+            .dep(dep("shared").build().no_default().features(&["feat_b"])),
+        // 1: shared has its own build.rs and two disjoint features.
+        pkg("shared").build().feature("feat_a", &[]).feature("feat_b", &[]),
+    ];
+    let text = lock_text(&ps);
+    let lock = Lock::read(text.as_bytes(), a()).expect("lock");
+
+    let mut ask_roots = Vec::new_in(a());
+    ask_roots.push(LockId(0));
+    let ask = Ask { roots: ask_roots, features: Vec::new_in(a()), all_features: false, no_default_features: false, tests: false };
+    let mut host_res = Resolution::new(&lock, &linux_desc, &linux_desc, &ask, Resolver::V2, a());
+    host_res.member(LockId(0), ps[0].facts()).expect("app");
+    host_res.package(LockId(1), Some(ps[1].facts())).expect("shared");
+    let host_graph = match host_res.pass().expect("host pass") {
+        Pass::Done(g) => g,
+        _ => panic!("expected Done on host"),
+    };
+
+    // Host graph must have two distinct BuildScript units for `shared`: Target(`feat_a`) and Host(`feat_b`).
+    let mut wasm_roots = Vec::new_in(a());
+    for (idx, unit) in host_graph.units.iter().enumerate() {
+        let kind = match unit.kind {
+            UnitKind::BuildScript => HostUnitKind::BuildScript,
+            UnitKind::ProcMacro => HostUnitKind::ProcMacro,
+            _ => continue,
+        };
+        let mut features = Vec::new_in(a());
+        for f in unit.features.iter() {
+            features.push(f.clone());
+        }
+        wasm_roots.push(HostUnitAsk {
+            package: unit.package,
+            kind,
+            side: host_graph.host_unit_side(UnitId(idx as u32)),
+            features,
+        });
+    }
+    let shared_asks: std::vec::Vec<_> = wasm_roots.iter().filter(|r| r.package == LockId(1)).collect();
+    assert_eq!(shared_asks.len(), 2, "host graph must produce 2 distinct BuildScript units for shared");
+
+    let mut wasm_res = Resolution::for_host_units(&lock, &wasi_desc, wasm_roots, Resolver::V2, a());
+    host_res.move_packages_into(&mut wasm_res).expect("move packages");
+    let wasm_graph = match wasm_res.pass().expect("wasm64 pass") {
+        Pass::Done(g) => g,
+        _ => panic!("expected Done on wasm64"),
+    };
+
+    let mut shared_bs_feats: std::vec::Vec<std::vec::Vec<&str>> = wasm_graph
+        .units
+        .iter()
+        .filter(|u| u.name.as_str() == "shared" && u.kind == UnitKind::BuildScript)
+        .map(|u| u.features.iter().map(|f| f.as_str()).collect())
+        .collect();
+    shared_bs_feats.sort();
+    assert_eq!(
+        shared_bs_feats,
+        vec![vec!["feat_a"], vec!["feat_b"]],
+        "target-side and host-side build scripts for `shared` must stay separate with zero feature bleed"
+    );
 }
