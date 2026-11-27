@@ -377,6 +377,54 @@ fn a_format_template_made_by_a_macro_is_one_node() {
     assert!(dump.contains("(format-args \"a b\""), "{dump}");
 }
 
+/// `format_args!` whose template invokes a user `macro_rules!` (`csi!`) that itself expands to
+/// `concat!(..)`, plus a multi-level chain (`concat!(row_select!(), " tail")` ->
+/// `row_select!()` -> `concat!("SELECT ", vouched_through!(), " AS v")` -> `"CASE"`).
+#[test]
+fn a_format_template_nested_macro_rules_chain_expands_eagerly() {
+    const CSI: (&str, &str) = ("csi", "($($l:expr),*) => { concat!(\"\\x1B[\", $($l),*) }");
+    const ROW_SELECT: (&str, &str) = ("row_select", "() => { concat!(\"SELECT \", vouched_through!(), \" AS v\") }");
+    const VOUCHED: (&str, &str) = ("vouched_through", "() => { \"CASE\" }");
+    const LOOP_M: (&str, &str) = ("loop_m", "() => { loop_m!() }");
+
+    let l = expanding(&[CSI], "fn f(a: u32, b: u32) { format_args!(csi!(\"{};{}H\"), a, b); }");
+    let dump = dump_of(&l);
+    assert!(dump.contains(r#"(format-args "\\u{1b}[{};{}H""#), "{dump}");
+    assert_eq!(l.view().unhandled().count(), 0, "{dump}");
+
+    let l = expanding(
+        &[ROW_SELECT, VOUCHED],
+        "fn f() { format_args!(concat!(row_select!(), \" tail\"), X = 1u32); }",
+    );
+    let dump = dump_of(&l);
+    assert!(dump.contains("(format-args \"SELECT CASE AS v tail\""), "{dump}");
+    assert_eq!(l.view().unhandled().count(), 0, "{dump}");
+
+    // Negative control: an infinite macro_rules! loop inside an eager builtin hits `EAGER_DEPTH`
+    // cleanly without looping forever or panicking.
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut expander = by_name(&[Def { name: LOOP_M.0, body: LOOP_M.1, macro2: false, external: false }]);
+    let l = lower_body_expanding(
+        "fn f() -> &'static str { concat!(loop_m!()) }",
+        Edition::E2021,
+        &mut Unix,
+        &mut crate::NoModule,
+        &mut expander,
+        alloc,
+    )
+    .unwrap_or_else(|need| panic!("needs {:?}", need.atoms));
+    assert_eq!(l.view().unhandled().count(), 1);
+    assert_eq!(expander.findings().len(), 1, "{:?}", expander.findings());
+    assert!(
+        matches!(
+            expander.findings()[0].why,
+            crate::by_name::NotExpanded::Failed(crate::by_name::Failure::EagerAgain { depth }) if depth == crate::by_name::EAGER_DEPTH
+        ),
+        "expected EagerAgain at EAGER_DEPTH, got: {:?}",
+        expander.findings()[0]
+    );
+}
+
 /// `unreachable!("m")` in edition 2021: a placeholder whose argument is another
 /// `format_args!`, as core's `unreachable_2021` writes it.
 #[test]

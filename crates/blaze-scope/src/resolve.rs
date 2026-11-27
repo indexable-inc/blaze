@@ -36,7 +36,7 @@ use std::sync::{LockResult, Mutex, RwLock};
 use blaze_expand::{
     BuiltinAttr, BuiltinDerive, Call, CallSite, Ctx, DefAt, ItemAttrs, ItemAttrsError, NextAttr, DefSite, Delim, Diagnostic, ExpandCx, ExpandError, Expanded,
     Export, HostAsk, HostError, HostWhy, IncludeAs, Included, LexError, LitKind, LocalInner,
-    MacroDefinition, Place as HostPlace, PlaceOf, ProcCall, Produced, Raw, TokenKind,
+    MacroDefinition, Place as HostPlace, PlaceOf, ProcCall, Produced, Raw, Spacing, TokenKind,
     TokenStream, expand, lex, CallKind, Inside, NestedCall, NestedKind, PathScope, call_key,
 };
 use blaze_file_items::{Outline, outline};
@@ -3690,6 +3690,14 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
     let eager_checked_cell: core::cell::RefCell<AVec<'a, &'a str>> = core::cell::RefCell::new(AVec::new_in(par_alloc));
     let refused_env = crate::refused::EnvRefusal::new_in(par_bump);
 
+    let format_args_builtin = matches!(
+        mac.body,
+        MacroBody::BuiltinFn(name)
+            if matches!(
+                BuiltinFn::of_library(name),
+                Some(BuiltinFn::FormatArgs | BuiltinFn::FormatArgsNl | BuiltinFn::ConstFormatArgs)
+            )
+    );
     if src.kind == CallShape::FnLike && in_call.in_block {
         if matches!(mac.body, MacroBody::BuiltinFn(name) if LITERAL_BUILTINS.iter().any(|b| *b == name)) {
             return ParCallResult::Empty { notes, eager_checked: eager_checked_cell.into_inner(), called_seen: false };
@@ -3705,7 +3713,12 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
             }),
             MacroBody::BuiltinDerive { .. } | MacroBody::BuiltinOther(_) | MacroBody::Proc { .. } => None,
         };
-        if def_may == Some(false) && !blaze_file_items::nested::may_declare(src.input) {
+        let input_may = if format_args_builtin {
+            blaze_file_items::nested::may_declare_format_args(src.input)
+        } else {
+            blaze_file_items::nested::may_declare(src.input)
+        };
+        if def_may == Some(false) && !input_may {
             return ParCallResult::Empty { notes, eager_checked: eager_checked_cell.into_inner(), called_seen: false };
         }
     }
@@ -3851,7 +3864,14 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
         local_inner: LocalInner::No,
         transparency: None,
     };
-    let eager = EagerDriver { macro_name: mac.name, def_at: nested_at, shadowed: &shadowed, keep: par_bump, alloc };
+    let eager = EagerDriver {
+        macro_name: mac.name,
+        def_at: nested_at,
+        shadowed: &shadowed,
+        opaque_template: in_call.in_block && format_args_builtin,
+        keep: par_bump,
+        alloc,
+    };
     let expanded = match base.script {
         Some(out) => {
             let script_host = ScriptCx { inner: par_host, out };
@@ -4647,9 +4667,18 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
     // such a block no ordinal). The body's lowering expands it alone, as before it was listed.
     // A builtin writes no item but `include!`'s file and `global_asm!`; a proc macro's output
     // is not known before it runs, so a proc macro is always expanded.
-    if src.kind == CallShape::FnLike
-        && held(run.made.read(), "made modules").get(&src.module).is_some_and(|m| m.info.name.is_some_and(crate::blocks::is_block_module))
-    {
+    let format_args_builtin = matches!(
+        mac.body,
+        MacroBody::BuiltinFn(name)
+            if matches!(
+                BuiltinFn::of_library(name),
+                Some(BuiltinFn::FormatArgs | BuiltinFn::FormatArgsNl | BuiltinFn::ConstFormatArgs)
+            )
+    );
+    let in_block_module = held(run.made.read(), "made modules")
+        .get(&src.module)
+        .is_some_and(|m| m.info.name.is_some_and(crate::blocks::is_block_module));
+    if src.kind == CallShape::FnLike && in_block_module {
         // A builtin whose output holds no token of its input is a literal, a path to `Option`
         // or nothing (core `macros/mod.rs`: `include_str!` "expands to an expression of type
         // `&'static str`", `concat!` "yields an expression of type `&'static str`", `env!`,
@@ -4685,7 +4714,12 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
             }),
             MacroBody::BuiltinDerive { .. } | MacroBody::BuiltinOther(_) | MacroBody::Proc { .. } => None,
         };
-        if def_may == Some(false) && !blaze_file_items::nested::may_declare(src.input) {
+        let input_may = if format_args_builtin {
+            blaze_file_items::nested::may_declare_format_args(src.input)
+        } else {
+            blaze_file_items::nested::may_declare(src.input)
+        };
+        if def_may == Some(false) && !input_may {
             return Some((DeclsBuilder::new_in(home), None));
         }
     }
@@ -4963,7 +4997,14 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
             || held(run.tables.read(), "tables").macros.values().any(|m| m.name == name && !matches!(m.body, MacroBody::BuiltinFn(b) if b == name))
     };
     let nested_at = DefAt { site: DefSite { krate: def_krate, module: None }, edition: def_edition, export: Export::Exported, local_inner: LocalInner::No, transparency: None };
-    let eager = EagerDriver { macro_name: mac.name, def_at: nested_at, shadowed: &shadowed, keep: home_bump, alloc };
+    let eager = EagerDriver {
+        macro_name: mac.name,
+        def_at: nested_at,
+        shadowed: &shadowed,
+        opaque_template: in_block_module && format_args_builtin,
+        keep: home_bump,
+        alloc,
+    };
     let run_part = match mac.body {
         MacroBody::Rules(_) | MacroBody::Macro2 { .. } => ExpandPart::RunRules,
         MacroBody::BuiltinFn(_) => ExpandPart::RunBuiltin,
@@ -5578,6 +5619,13 @@ struct EagerDriver<'s, 'a, 'w> {
     /// Where the builtins the nested calls name are defined.
     def_at: DefAt,
     shadowed: &'s dyn Fn(&str) -> bool,
+    /// True for `format_args!` / `format_args_nl!` / `const_format_args!` expanded inside a block
+    /// module: the template argument must expand to a string literal (0 items, 0 blocks) and is
+    /// expanded with full macro resolution during body lowering (`blaze-lower` `ByName::call`), so
+    /// a user `macro_rules!` in the template (`format_args!(csi!("{}"), { struct Local; 1 })`)
+    /// stands in as `""` here while the trailing value arguments are still expanded for their
+    /// block modules.
+    opaque_template: bool,
     /// Where a note's text is kept: the crate's bump arena (a note outlives the call).
     keep: Bump<'a>,
     /// Where the work is done: the call's scratch ([`crate::task::Par::call_scratch`]), or the
@@ -5679,10 +5727,23 @@ impl<'a, 'w> EagerDriver<'_, 'a, 'w> {
                 [name] | ["core" | "std", name] => BuiltinFn::of_library(name),
                 _ => None,
             };
-            let Some(which) = which else { return Err(self.refused(&path, EagerRefusal::NotBuiltin)) };
-            if (self.shadowed)(segments[segments.len() - 1]) {
-                return Err(self.refused(&path, EagerRefusal::Shadowed));
-            }
+            let is_shadowed = which.is_some() && (self.shadowed)(segments[segments.len() - 1]);
+            let which = match (which, is_shadowed) {
+                (Some(which), false) => which,
+                (why_which, _) if self.opaque_template => {
+                    let _ = why_which;
+                    let mut empty = TokenStream::new_in(alloc);
+                    let kind = TokenKind::Literal { kind: LitKind::Str, suffix_len: 0, spacing: Spacing::Alone };
+                    if empty.push(kind, "", Ctx::root(site.edition)).is_err() {
+                        return Err(self.refused(&path, EagerRefusal::Stream));
+                    }
+                    stack.clear();
+                    root.push(empty);
+                    continue;
+                }
+                (None, _) => return Err(self.refused(&path, EagerRefusal::NotBuiltin)),
+                (Some(_), true) => return Err(self.refused(&path, EagerRefusal::Shadowed)),
+            };
             let inner = call.inner();
             let Ok(args) = input.copy_in(inner.start as usize..inner.end as usize, alloc) else {
                 return Err(self.refused(&path, EagerRefusal::Stream));

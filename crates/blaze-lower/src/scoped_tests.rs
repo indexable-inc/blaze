@@ -119,6 +119,19 @@ macro_rules! env { ($name:expr $(,)?) => {{}}; ($name:expr, $error_msg:expr $(,)
 #[macro_export]
 #[rustc_builtin_macro]
 macro_rules! concat { ($($arg:expr),* $(,)?) => {{}} }
+#[macro_export]
+#[rustc_builtin_macro]
+macro_rules! format_args { ($fmt:expr) => {{}}; ($fmt:expr, $($args:tt)*) => {{}}; }
+#[macro_export]
+macro_rules! inner_str { () => { \"ok:\" } }
+#[macro_export]
+macro_rules! csi { ($($l:expr),*) => { $crate::concat!(\"\\x1B[\", $crate::inner_str!(), $($l),*) } }
+#[macro_export]
+macro_rules! vouched_through { () => { \"CASE\" } }
+#[macro_export]
+macro_rules! row_select { () => { $crate::concat!(\"SELECT \", $crate::vouched_through!(), \" AS v\") } }
+#[macro_export]
+macro_rules! loop_m { () => { $crate::loop_m!() } }
 pub mod panicking {
     pub fn panic(_: &str) {}
     pub fn panic_str_2015(_: &str) {}
@@ -795,4 +808,28 @@ fn calls_in_two_expansions_are_read_at_their_own_written_calls() {
     let seen = read_at(text);
     let ranges: StdVec<_> = seen.iter().map(|(_, r)| *r).collect();
     assert_eq!(ranges, [range(first), range(first), range(second), range(second)], "{seen:?}");
+}
+
+/// Cross-crate hygiene for nested `macro_rules!` inside eager `format_args!` / `concat!`:
+/// `dep::csi!` expands to `$crate::concat!("\x1B[", $crate::inner_str!(), ..)`, where `user`
+/// imports neither `concat` nor `inner_str`; `$crate` resolves in `dep` across every eager step.
+/// Also verifies multi-level `dep::row_select!()` -> `$crate::vouched_through!()` and that
+/// `dep::loop_m!()` hits `EAGER_DEPTH` cleanly.
+#[test]
+fn eager_nested_macro_rules_preserves_dollar_crate_across_crates() {
+    let (dump, unhandled, findings) = lowered("fn f(a: u32, b: u32) { dep::format_args!(dep::csi!(\"{};{}H\"), a, b); }");
+    assert_eq!((unhandled, findings.len()), (0, 0), "{findings:?}\n{dump}");
+    assert!(dump.contains(r#"(format-args "\\u{1b}[ok:{};{}H""#), "{dump}");
+
+    let (dump, unhandled, findings) = lowered("fn g() { dep::format_args!(dep::concat!(dep::row_select!(), \" tail\"), X = 1u32); }");
+    assert_eq!((unhandled, findings.len()), (0, 0), "{findings:?}\n{dump}");
+    assert!(dump.contains("(format-args \"SELECT CASE AS v tail\""), "{dump}");
+
+    let (_, unhandled, findings) = lowered("fn h() -> &'static str { dep::concat!(dep::loop_m!()) }");
+    assert_eq!(unhandled, 1);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(
+        findings[0].2.contains("eager depth"),
+        "expected EagerAgain at EAGER_DEPTH, got: {findings:?}"
+    );
 }

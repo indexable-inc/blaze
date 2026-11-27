@@ -12,8 +12,8 @@
 //! the answers, to [`EAGER_DEPTH`] deep.
 
 use blaze_expand::{
-    BuiltinDerive, BuiltinFn, Call, CallSite, Ctx, DefAt, DefSite, DeriveFacts, Eager, ExpandCx, Expanded, Export, Hole, HoleOf, Inside, LitKind, LocalInner,
-    LexError, MacroDefinition, NestedCall, NestedKind, Place, PlaceOf, Prepared, ProcKind, ReadAnswer, ReadKind, Reads, Spacing, StreamError, TokenKind, TokenStream, call_key, expand, expand_prepared, lex, prepare,
+    BuiltinDerive, BuiltinFn, Call, CallSite, Ctx, DefAt, DefSite, Delim, DeriveFacts, Eager, ExpandCx, Expanded, Export, Hole, HoleOf, Inside, LitKind, LocalInner,
+    LexError, MacroDefinition, NestedCall, NestedKind, PathScope, Place, PlaceOf, Prepared, ProcKind, Raw, ReadAnswer, ReadKind, Reads, Spacing, StreamError, TokenKind, TokenStream, call_key, expand, expand_prepared, lex, prepare,
 };
 use blaze_ids::ContentId;
 use blaze_own::{AString, AVec, Alloc, Vec};
@@ -330,11 +330,12 @@ impl PathAt {
         PathAt { mark: first.and_then(|it| tokens.get(it)).and_then(|t| stream.non_transparent_mark(t.ctx)).map(crate::mark_site::TextMark::of), written: None, block: None }
     }
 
-    /// The first word of the path at `start` (a nested call's path) in `stream`: an invisible
-    /// group's `(` there is no word of it (a `$p:path` fragment's: [`PathAt::before`]).
-    fn of(stream: &TokenStream<'_>, start: u32) -> PathAt {
-        let tokens = stream.tokens();
-        let first = tokens.iter().skip(start as usize).find(|t| !matches!(t.kind, TokenKind::Open(blaze_expand::Delim::Invisible)));
+    /// The first identifier token of the path in `start..end` of `stream`, skipping any
+    /// leading `::`, `$`, or `Delim::Invisible` delimiters (e.g. a `$p:path` fragment's
+    /// invisible group: [`PathAt::before`]).
+    fn of_range(stream: &TokenStream<'_>, start: usize, end: usize) -> PathAt {
+        let slice = stream.tokens().get(start..end).unwrap_or(&[]);
+        let first = slice.iter().find(|t| matches!(t.kind, TokenKind::Ident { .. }));
         let mark = first.and_then(|t| stream.non_transparent_mark(t.ctx));
         PathAt { mark: mark.map(crate::mark_site::TextMark::of), written: None, block: None }
     }
@@ -620,6 +621,8 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
             inside,
             depth,
             written,
+            written_range: at.written,
+            block: at.block,
             answers: Vec::new_in(self.alloc),
             pending: Vec::new_in(self.alloc),
         })
@@ -646,13 +649,21 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
                 if n.kind != NestedKind::FnLike {
                     return Err(Refused::Failed(Failure::EagerNotFnLike { kind: n.kind }));
                 }
-                let child_path = path_text(&current.input, n.path.start, n.path.end, self.alloc);
+                let path_start = usize::try_from(n.path.start).unwrap_or(0);
+                let path_end = usize::try_from(n.path.end).unwrap_or(0);
+                let child_path = path_text(&current.input, path_start, path_end, self.alloc);
                 let inner = n.inner();
+                let inner_start = usize::try_from(inner.start).unwrap_or(0);
+                let inner_end = usize::try_from(inner.end).unwrap_or(0);
                 let args = current
                     .input
-                    .copy_in(inner.start as usize..inner.end as usize, self.alloc)
+                    .copy_in(inner_start..inner_end, self.alloc)
                     .map_err(|e| Refused::Failed(Failure::Stream(e)))?;
-                let child_at = PathAt::of(&current.input, n.path.start);
+                let child_at = PathAt {
+                    written: current.written_range,
+                    block: current.block,
+                    ..PathAt::of_range(&current.input, path_start, path_end)
+                };
                 let child = self.call_frame(
                     &child_path,
                     child_at,
@@ -707,21 +718,58 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
                     } else {
                         self.fill_holes(&exp.tokens, &exp.holes, current.written)?
                     };
-                    match parents.pop() {
-                        Some(mut parent) => {
-                            let mut tokens = tokens;
-                            tokens.seal(key);
+                    if !parents.is_empty() {
+                        let mut tokens = tokens;
+                        tokens.seal(key);
+                        // An eager-input call (e.g. `csi!("{};{}H")` inside `format_args!`, or
+                        // `row_select!()` inside `concat!`) may expand to another macro call
+                        // (`concat!("\x1B[", "{};{}H")`, `$crate::helper!(..)`): keep reducing
+                        // single function-like calls up to `EAGER_DEPTH` before answering the
+                        // enclosing eager builtin.
+                        if let Some(next_call) = one_call(&tokens) {
+                            if current.depth >= EAGER_DEPTH {
+                                return Err(Refused::Failed(Failure::EagerAgain { depth: current.depth }));
+                            }
+                            let def_crate = exp.nested.iter().any(|c| {
+                                c.scope == PathScope::DefCrate
+                                    && usize::try_from(c.path.start).ok() == Some(next_call.path.0)
+                            });
+                            let mut next_path = AString::new_in(self.alloc);
+                            if def_crate {
+                                next_path.push_str("$crate::");
+                            }
+                            push_path_text(&tokens, next_call.path.0, next_call.path.1, &mut next_path);
+                            let next_args = tokens
+                                .copy_in(next_call.open + 1..next_call.close, self.alloc)
+                                .map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+                            let next_at = PathAt {
+                                written: current.written_range,
+                                block: current.block,
+                                ..PathAt::of_range(&tokens, next_call.path.0, next_call.path.1)
+                            };
+                            current = self.call_frame(
+                                &next_path,
+                                next_at,
+                                next_args,
+                                edition,
+                                Inside::EagerInput,
+                                current.depth + 1,
+                                locals,
+                                current.written,
+                            )?;
+                            continue;
+                        }
+                        if let Some(mut parent) = parents.pop() {
                             parent.answers.push(tokens);
                             current = parent;
                         }
-                        None => {
-                            let def_krate = match &current.resolved {
-                                Resolved::Def(def) => def.site().krate,
-                                Resolved::Prepared(prepared) => prepared.def().site().krate,
-                            };
-                            let non_local = self.local_site().is_some_and(|local| def_krate != local.krate);
-                            return Ok((key, tokens, non_local));
-                        }
+                    } else {
+                        let def_krate = match &current.resolved {
+                            Resolved::Def(def) => def.site().krate,
+                            Resolved::Prepared(prepared) => prepared.def().site().krate,
+                        };
+                        let non_local = self.local_site().is_some_and(|local| def_krate != local.krate);
+                        return Ok((key, tokens, non_local));
                     }
                 }
                 Ok(Expanded::NeedsExpanded(mut nested)) if current.answers.is_empty() && current.depth < EAGER_DEPTH => {
@@ -817,6 +865,8 @@ struct CallFrame<'d, 'a> {
     inside: Inside,
     depth: u32,
     written: Option<u32>,
+    written_range: Option<blaze_surface::Range>,
+    block: Option<blaze_surface::ItemKey>,
     answers: AVec<'a, TokenStream<'a>>,
     pending: AVec<'a, NestedCall>,
 }
@@ -905,15 +955,140 @@ impl<C: ExpandCx> ExpandCx for BodyCx<'_, '_, '_, C> {
     }
 }
 
-/// The path `stream`'s tokens `start..end` write, as source text (`a::b`).
-fn path_text<'a>(stream: &TokenStream<'_>, start: u32, end: u32, alloc: Alloc<'a>) -> AString<'a> {
-    let mut out = AString::new_in(alloc);
-    for at in start..end {
-        match stream.tokens()[at as usize].kind {
-            TokenKind::Ident { .. } => out.push_str(stream.text_at(at as usize)),
-            _ => out.push(':'),
+/// A single function-like macro call found in an eager-input expansion (`path!(args)`).
+struct EagerCall {
+    path: (usize, usize),
+    open: usize,
+    close: usize,
+}
+
+/// `lo..hi` of `stream` without the invisible groups around all of it.
+fn peeled(stream: &TokenStream<'_>, mut lo: usize, mut hi: usize) -> (usize, usize) {
+    let tokens = stream.tokens();
+    while hi >= lo + 2
+        && tokens.get(lo).is_some_and(|t| t.kind == TokenKind::Open(Delim::Invisible))
+        && stream.close_of(lo) == Some(hi - 1)
+    {
+        lo += 1;
+        hi -= 1;
+    }
+    (lo, hi)
+}
+
+fn is_punct(stream: &TokenStream<'_>, at: usize, c: char) -> bool {
+    matches!(stream.tokens().get(at).map(|t| t.kind), Some(TokenKind::Punct { char, .. }) if char == c)
+}
+
+fn is_colons(stream: &TokenStream<'_>, at: usize) -> bool {
+    is_punct(stream, at, ':') && is_punct(stream, at + 1, ':')
+}
+
+/// `$crate` at `at`: either a `$` followed by `crate`, or one `$crate` identifier token.
+fn dollar_crate(stream: &TokenStream<'_>, at: usize) -> Option<usize> {
+    if is_punct(stream, at, '$')
+        && matches!(stream.tokens().get(at + 1).map(|t| t.kind), Some(TokenKind::Ident { .. }))
+        && stream.text_at(at + 1) == "crate"
+    {
+        return Some(2);
+    }
+    match stream.tokens().get(at).map(|t| t.kind) {
+        Some(TokenKind::Ident { .. }) if stream.text_at(at) == "$crate" => Some(1),
+        _ => None,
+    }
+}
+
+/// The stream as ONE function-like call `path!(..)` (any delimiter; path segments words or
+/// `$crate`, joined by `::`, a leading `::` allowed, `Delim::Invisible` wrappers peeled), or
+/// `None`.
+fn one_call(stream: &TokenStream<'_>) -> Option<EagerCall> {
+    let (lo, hi) = peeled(stream, 0, stream.len());
+    let tokens = stream.tokens();
+    let skip_inv = |mut i: usize| -> usize {
+        while i < hi
+            && tokens.get(i).is_some_and(|t| matches!(t.kind, TokenKind::Open(Delim::Invisible) | TokenKind::Close(Delim::Invisible)))
+        {
+            i += 1;
+        }
+        i
+    };
+    let path_start = skip_inv(lo);
+    let mut i = path_start;
+    if is_colons(stream, i) {
+        i = skip_inv(i + 2);
+    }
+    let mut last_ident;
+    loop {
+        match (dollar_crate(stream, i), tokens.get(i).map(|t| t.kind)) {
+            (Some(n), _) => {
+                last_ident = None;
+                i = skip_inv(i + n);
+            }
+            (None, Some(TokenKind::Ident { .. })) => {
+                last_ident = Some(i);
+                i = skip_inv(i + 1);
+            }
+            _ => return None,
+        }
+        if is_colons(stream, i) {
+            i = skip_inv(i + 2);
+        } else {
+            break;
         }
     }
+    let last = last_ident?;
+    if tokens.get(last).is_some_and(|t| matches!(t.kind, TokenKind::Ident { raw: Raw::No, .. }))
+        && matches!(
+            stream.text_at(last),
+            "crate"
+                | "self"
+                | "super"
+                | "Self"
+                | "$crate"
+                | "if"
+                | "while"
+                | "match"
+                | "return"
+                | "in"
+                | "break"
+                | "yield"
+                | "else"
+                | "move"
+                | "mut"
+                | "ref"
+        )
+    {
+        return None;
+    }
+    let path = (path_start, i);
+    if !is_punct(stream, i, '!') {
+        return None;
+    }
+    let open = i + 1;
+    match tokens.get(open).map(|t| t.kind) {
+        Some(TokenKind::Open(Delim::Paren | Delim::Bracket | Delim::Brace)) => {}
+        _ => return None,
+    }
+    let close = stream.close_of(open)?;
+    (close + 1 == hi).then_some(EagerCall { path, open, close })
+}
+
+/// Appends the path `stream`'s tokens `start..end` write (`a::b`, `$crate::b`, `::core::concat`)
+/// to `out`, skipping `Delim::Invisible` wrappers.
+fn push_path_text(stream: &TokenStream<'_>, start: usize, end: usize, out: &mut AString<'_>) {
+    for at in start..end {
+        match stream.tokens().get(at).map(|t| t.kind) {
+            Some(TokenKind::Ident { .. }) => out.push_str(stream.text_at(at)),
+            Some(TokenKind::Punct { char: ':', .. }) => out.push(':'),
+            Some(TokenKind::Punct { char: '$', .. }) => out.push('$'),
+            _ => {}
+        }
+    }
+}
+
+/// The path `stream`'s tokens `start..end` write, as source text (`a::b`).
+fn path_text<'a>(stream: &TokenStream<'_>, start: usize, end: usize, alloc: Alloc<'a>) -> AString<'a> {
+    let mut out = AString::new_in(alloc);
+    push_path_text(stream, start, end, &mut out);
     out
 }
 
