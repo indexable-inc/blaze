@@ -45,10 +45,14 @@ trait Sized: MetaSized {}
 trait LegacyReceiver: PointeeSized {}
 
 impl<T: PointeeSized> LegacyReceiver for &T {}
+impl<T: PointeeSized> LegacyReceiver for &mut T {}
 
 #[lang = \"clone\"]
 trait Clone: Sized {
     fn clone(&self) -> Self;
+    fn clone_from(&mut self, source: &Self) {
+        *self = source.clone();
+    }
 }
 
 #[lang = \"copy\"]
@@ -256,4 +260,63 @@ pub extern \"C\" fn main() -> i32 {
     println!("NOT CLONE: {got:?}");
     let said = got.expect_err("a tuple with a non-`Clone` field is not `Clone`");
     assert!(said.contains("E0277") || said.contains("Unsatisfied"), "{said}");
+}
+
+/// `Clone::clone_from` on tuples (Copy and non-Copy), closures, fn items, fn pointers,
+/// fn-pointer reification, and explicit `clone_from` override control on the whole-program walk.
+#[test]
+fn clone_from_on_language_types_and_override_control() {
+    let got = run("
+fn seven() -> u32 { 7 }
+fn nine() -> u32 { 9 }
+fn get(a: &A) -> u32 { a.0 }
+
+struct Over(u32);
+impl Clone for Over {
+    fn clone(&self) -> Over { Over(self.0 + 1) }
+    fn clone_from(&mut self, source: &Over) { self.0 = source.0 + 20; }
+}
+
+fn overwrite<T: Clone>(dst: &mut T, src: &T) {
+    dst.clone_from(src);
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    // Copy tuple via generic overwrite + fn-pointer reification
+    let mut pt = (1u32, 2u32);
+    overwrite(&mut pt, &(3u32, 4u32)); // 3 + 4 = 7
+    let cf: fn(&mut (u32, u32), &(u32, u32)) = Clone::clone_from;
+    let mut pt2 = (0u32, 0u32);
+    cf(&mut pt2, &pt); // 3 + 4 = 7
+
+    // Non-Copy tuple: field-wise clone runs on source
+    let mut nt = (A(0), A(0));
+    let nsrc = (A(1), A(2));
+    nt.clone_from(&nsrc); // (A(11), A(12)) -> 23
+
+    // Closure
+    let a = A(3);
+    let mut clo = move || get(&a);
+    let clo2 = clo.clone(); // A(13)
+    clo.clone_from(&clo2);  // A(23) -> 23
+
+    // Fn pointer + fn item
+    let mut fp: fn() -> u32 = seven;
+    let fp_src: fn() -> u32 = nine;
+    fp.clone_from(&fp_src); // 9
+    let mut fi = seven;
+    let fi_src = seven;
+    fi.clone_from(&fi_src); // 7
+
+    // Explicit override control
+    let mut ov = Over(0);
+    ov.clone_from(&Over(5)); // 25 (default would be 6)
+
+    // 7 + 7 + 23 + 23 + 9 + 7 + 25 = 101
+    (pt.0 + pt.1 + pt2.0 + pt2.1 + nt.0.0 + nt.1.0 + clo() + fp() + fi() + ov.0) as i32
+}
+");
+    println!("CLONE_FROM LANGUAGE TYPES: {got:?}");
+    assert_eq!(got, Ok(101));
 }

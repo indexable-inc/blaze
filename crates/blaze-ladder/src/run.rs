@@ -3292,7 +3292,8 @@ fn build_from<P: FrontEnd>(
             // itself, and nothing is selected, so a caller with no body of its own (the `Fn*`
             // shim of a ctor's fn item, tabled at the ctor's bodiless row) asks no world.
             let is_ctor = program.fn_index(called.item).is_some_and(|c| program.function(c).kind == FnKind::Ctor);
-            let selected = match is_ctor {
+            let is_lang_clone_from = crate::clone_shim::language_clone_from_unconditional(program, called, &ground).is_some();
+            let selected = match is_ctor || is_lang_clone_from {
                 true => Ok((called.item, called.args)),
                 false => program.resolve(world_of, called.item, called.args, &mut ground),
             };
@@ -3345,17 +3346,35 @@ fn build_from<P: FrontEnd>(
                             }
                             continue;
                         }
-                        None => {
-                            let refusal = resolve_refusal(program, &adts, &ground, name(), called, blaze_typeck::ResolveError::NoImpl { trait_, item: err_item });
-                            match unresolved(&mut survey, &mut reached, called, i, refusal)? {
-                                Some(slot) => {
-                                    via.push(Via::Slot);
-                                    targets.push(Target::Slot(slot));
+                        None => match crate::clone_shim::language_clone_from_adt(program, world_of, called, trait_, &mut ground) {
+                            Ok(Some(clone_from)) => (clone_from, called.args),
+                            Ok(None) => {
+                                let refusal = resolve_refusal(program, &adts, &ground, name(), called, blaze_typeck::ResolveError::NoImpl { trait_, item: err_item });
+                                match unresolved(&mut survey, &mut reached, called, i, refusal)? {
+                                    Some(slot) => {
+                                        via.push(Via::Slot);
+                                        targets.push(Target::Slot(slot));
+                                    }
+                                    None => broken = true,
                                 }
-                                None => broken = true,
+                                continue;
                             }
-                            continue;
-                        }
+                            Err(blaze_typeck::ResolveError::Missing(_)) if may_ask => {
+                                ask_again = true;
+                                break;
+                            }
+                            Err(error) => {
+                                let refusal = resolve_refusal(program, &adts, &ground, name(), called, error);
+                                match unresolved(&mut survey, &mut reached, called, i, refusal)? {
+                                    Some(slot) => {
+                                        via.push(Via::Slot);
+                                        targets.push(Target::Slot(slot));
+                                    }
+                                    None => broken = true,
+                                }
+                                continue;
+                            }
+                        },
                     }
                 }
                 Err(error) => {

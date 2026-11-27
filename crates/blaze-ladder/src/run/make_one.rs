@@ -3157,23 +3157,31 @@ fn name_ref<'p, 'f, P: FrontEnd>(
     // Known by its ADT's head (`ctor_of`), whether or not a row tables it yet: a lazy front end
     // tables a body's CALLEES, and a ctor used as a value (`let p: fn(..) -> S = S`) is none.
     let is_ctor = program.ctor_of(called.item).is_some();
-    let selected = match is_ctor {
+    let is_lang_clone_from = crate::clone_shim::language_clone_from_unconditional(program, called, ground).is_some();
+    let selected = match is_ctor || is_lang_clone_from {
         true => Ok((called.item, called.args)),
         false => asking.resolve(called, ground, alloc),
     };
     let (item, resolved) = match selected {
         Ok(r) => r,
-        Err(blaze_typeck::ResolveError::NoImpl { trait_, .. }) => match crate::clone_shim::language_clone_adt(program, i, called, trait_, ground) {
-            Ok(Some(crate::clone_shim::LanguageClone { clone, .. })) => {
+        Err(blaze_typeck::ResolveError::NoImpl { trait_, .. }) => {
+            if let Some(crate::clone_shim::LanguageClone { clone, .. }) = crate::clone_shim::language_clone_adt(program, i, called, trait_, ground)
+                .map_err(|error| resolve_refusal(program, adts, ground, name(), called, error))?
+            {
                 let Some(c) = program.fn_index(clone) else {
                     let refusal = callee_refusal(program, name(), at, called, crate::callee_shown::CalleeGap::NotTabled, ground.view());
                     return Ok(Named1::Untabled(clone, refusal));
                 };
                 return reach.declare(program.function(c).key, called, ground, alloc).map(Named1::Instance).map_err(|e| named(e, called, &*ground));
             }
-            Ok(None) => return Err(resolve_refusal(program, adts, ground, name(), called, blaze_typeck::ResolveError::NoImpl { trait_, item: called.item })),
-            Err(error) => return Err(resolve_refusal(program, adts, ground, name(), called, error)),
-        },
+            if let Some(clone_from) = crate::clone_shim::language_clone_from_adt(program, i, called, trait_, ground)
+                .map_err(|error| resolve_refusal(program, adts, ground, name(), called, error))?
+            {
+                (clone_from, called.args)
+            } else {
+                return Err(resolve_refusal(program, adts, ground, name(), called, blaze_typeck::ResolveError::NoImpl { trait_, item: called.item }));
+            }
+        }
         Err(error) => return Err(resolve_refusal(program, adts, ground, name(), called, error)),
     };
     let callee = Instance { item, args: resolved };
