@@ -303,12 +303,14 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
         let lb = names.chains.get(&b.1).map_or(0, |c| c.len());
         lb.cmp(&la).then_with(|| a.1.cmp(&b.1))
     });
-    let total_chain_keys: usize = names.chains.values().map(|c| c.len()).sum();
-    let mut chains = RecordBytes::with_capacity_in(total_chain_keys.saturating_mul(KEY), alloc);
-    let mut chain_keys = 0usize;
-    let mut chain_places: HashMap<&[ItemKey], u32, Alloc<'b>> = HashMap::with_capacity_in(total_chain_keys.saturating_mul(2), alloc);
+    // Pass 1: deduplicate chains longest-first into `emitted` while `chain_places` is the only
+    // growable table (sized from `chain_order.len() * 2`, not the pre-dedup quadratic sum), then
+    // Pass 2 allocates `chains` at the exact deduplicated `chain_keys * KEY` byte length.
+    let mut emitted: AVec<'b, &[ItemKey]> = AVec::with_capacity_in(chain_order.len(), alloc);
     let mut module_chain_at: AVec<'b, u32> = AVec::with_capacity_in(modules.len(), alloc);
     module_chain_at.resize(modules.len(), NONE);
+    let mut chain_places: HashMap<&[ItemKey], u32, Alloc<'b>> = HashMap::with_capacity_in(chain_order.len().saturating_mul(2), alloc);
+    let mut chain_keys = 0usize;
     for &(idx, m) in chain_order.iter() {
         let Some(chain) = names.chains.get(&m) else { continue };
         let slice = chain.as_slice();
@@ -316,9 +318,7 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
             existing
         } else {
             let start = u32_of(chain_keys, "names chains")?;
-            for k in slice.iter() {
-                chains.extend_from_slice(&k.0.0);
-            }
+            emitted.push(slice);
             for len in 1..=slice.len() {
                 chain_places.entry(&slice[..len]).or_insert(start);
             }
@@ -333,26 +333,21 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
             *slot = at;
         }
     }
+    let mut chains = RecordBytes::with_capacity_in(chain_keys.saturating_mul(KEY), alloc);
+    for slice in emitted.iter() {
+        for k in slice.iter() {
+            chains.extend_from_slice(&k.0.0);
+        }
+    }
 
-    let mut rows = RecordBytes::with_capacity_in(modules.len().saturating_mul(ROW), alloc);
-    let blob_est: usize = names
-        .done
-        .values()
-        .map(|done| {
-            128usize
-                .saturating_add(done.scope.bindings.len().saturating_mul(96))
-                .saturating_add(done.scope.globs.len().saturating_mul(48))
-                .saturating_add(done.scope.textual.len().saturating_mul(64))
-                .saturating_add(done.scope.marks.len().saturating_mul(16))
-                .saturating_add(done.scope.traits.len().saturating_mul(32))
-                .saturating_add(done.scope.errors.len().saturating_mul(64))
-        })
-        .sum();
-    let mut blob = RecordBytes::with_capacity_in(blob_est, alloc);
+    // Serialize each module's scope first (they already live in the bump `alloc`) so `blob` is
+    // allocated once at its exact 16-byte-padded byte length — covering `macro_exports`,
+    // `vis_keys`, and arbitrary-length names/paths/errors with zero reallocation or heuristic gap.
+    let mut written_scopes: AVec<'b, Option<RecordBytes<'b>>> = AVec::with_capacity_in(modules.len(), alloc);
+    let mut blob_len = 0usize;
     #[cfg(test)]
     let mut planted_once = false;
-    for (idx, m) in modules.iter().enumerate() {
-        rows.extend_from_slice(&m.0.0);
+    for m in modules.iter() {
         match names.done.get(m) {
             Some(done) => {
                 #[cfg(test)]
@@ -363,9 +358,21 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
                 #[cfg(not(test))]
                 let bytes = done.scope.write(alloc);
                 let bytes = bytes.map_err(NamesRecordError::Write)?;
+                blob_len = blob_len.saturating_add(bytes.len().next_multiple_of(ALIGN));
+                written_scopes.push(Some(bytes));
+            }
+            None => written_scopes.push(None),
+        }
+    }
+    let mut rows = RecordBytes::with_capacity_in(modules.len().saturating_mul(ROW), alloc);
+    let mut blob = RecordBytes::with_capacity_in(blob_len, alloc);
+    for ((idx, m), scope_bytes) in modules.iter().enumerate().zip(written_scopes.iter()) {
+        rows.extend_from_slice(&m.0.0);
+        match scope_bytes {
+            Some(bytes) => {
                 rows.extend_from_slice(&u32_of(blob.len(), "names blob")?.to_le_bytes());
                 rows.extend_from_slice(&u32_of(bytes.len(), "a module scope")?.to_le_bytes());
-                blob.extend_from_slice(&bytes);
+                blob.extend_from_slice(bytes);
                 pad(&mut blob);
             }
             None => {
@@ -1249,5 +1256,146 @@ impl<'m, N: Name> World<N> for NamesRecord<'m> {
 
     fn anonymous(&self, module: ItemKey) -> bool {
         NamesRecord::anonymous(self, module)
+    }
+}
+
+#[cfg(test)]
+mod sizing_tests {
+    use core::fmt::Write as _;
+
+    use blaze_id::{ContentId, CrateItemKey};
+    use blaze_surface::Edition;
+    use blaze_unit_graph::{Implicit, Prelude, StdIs};
+
+    use super::*;
+    use crate::crate_scope::{Ready, resolve_by_records};
+    use crate::graph::Sysroot;
+    use crate::resolve::{CrateInput, SourceTexts, aligned};
+    use crate::task::Serial;
+
+    struct OneFile<'a>(&'a str, &'a str);
+    impl<'a> SourceTexts<'a> for OneFile<'a> {
+        fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+            (krate == 0 && path == self.0).then_some(self.1)
+        }
+    }
+
+    /// Deep nested module chains deduplicate via suffix sharing: `chains` and `chain_places`
+    /// must size from the deduplicated chain output rather than the quadratic pre-dedup sum
+    /// `D * (D + 1) / 2`.
+    #[test]
+    fn deep_module_chains_size_by_deduplicated_output() {
+        const DEPTH: usize = 48;
+        let mut src = std::string::String::with_capacity(4096);
+        src.push_str("#![no_core]\n");
+        for i in 0..DEPTH {
+            let _ = writeln!(src, "pub mod m{i} {{");
+        }
+        src.push_str("pub struct Leaf;\n");
+        for _ in 0..DEPTH {
+            src.push_str("}\n");
+        }
+        let texts = OneFile("/deep/lib.rs", src.as_str());
+        let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false };
+        let input = CrateInput {
+            name: "deep_chains",
+            key: CrateItemKey(ContentId::of("blaze-scope deep chains test", b"deep_chains")),
+            edition: Edition::E2021,
+            implicit,
+            root: "/deep/lib.rs",
+            shown_from: "/",
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let solve_frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("solve frame");
+        let solve_erased = blaze_own::Erased::new(&solve_frame);
+        let (solved, _) = resolve_by_records(&[input], Sysroot::default(), &texts, &Serial, &Ready::serial(std::time::Duration::from_secs(60)), solve_erased.bump())
+            .expect("solve deep chain crate");
+        let krate = solved.first().expect("solved crate").names;
+
+        let pre_dedup_keys: usize = krate.chains.values().map(|c| c.len()).sum();
+        assert!(pre_dedup_keys > DEPTH * DEPTH / 2, "pre-dedup sum should be quadratic (got {pre_dedup_keys})");
+
+        let enc_frame = blaze_mem::Frame::with_reserve(2 << 20, blaze_mem::Tag::Nameres).expect("encode frame");
+        let enc_erased = blaze_own::Erased::new(&enc_frame);
+        let enc_bump = enc_erased.bump();
+        let bytes = encode(krate, enc_bump.alloc()).expect("encode deep chains names record");
+        let proof = Verified::check(aligned(&bytes, enc_bump)).expect("verify deep chains names record");
+        assert_eq!(proof.head.chain_keys, DEPTH + 1, "chains must deduplicate to the single longest chain");
+        assert!(
+            proof.head.chain_keys * 10 < pre_dedup_keys,
+            "deduplicated chain keys ({}) must be far smaller than pre-dedup sum ({pre_dedup_keys})",
+            proof.head.chain_keys
+        );
+        // Pre-dedup reservation would have reserved `pre_dedup_keys * 2` HashMap slots (~64 KiB+)
+        // plus `pre_dedup_keys * 32` chain bytes (~40 KiB) on top of everything else; verify
+        // peak stayed tight and abandonment stayed small.
+        assert!(
+            enc_frame.abandoned().bytes < u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            "deep chain encode abandoned {} bytes for a {}-byte record (peak {})",
+            enc_frame.abandoned().bytes,
+            bytes.len(),
+            enc_frame.peak()
+        );
+    }
+
+    /// Modules with many macro-generated `#[macro_export]` definitions and long (>200-byte)
+    /// binding/error names must size `blob` from exact serialized scope lengths without
+    /// reallocating `blob` on the bump allocator.
+    #[test]
+    fn macro_exports_and_long_names_do_not_reallocate_blob() {
+        let long_prefix = "very_long_module_scope_identifier_prefix_".repeat(6);
+        assert!(long_prefix.len() > 240);
+        let mut src = std::string::String::with_capacity(64 << 10);
+        src.push_str("#![no_core]\n#[macro_export]\nmacro_rules! emit_exported { ($name:ident) => { #[macro_export] macro_rules! $name { () => {} } }; }\n");
+        for m in 0..8usize {
+            let _ = writeln!(src, "pub mod sub_{m} {{");
+            for i in 0..16usize {
+                let _ = writeln!(src, "    crate::emit_exported!({long_prefix}mac_{m}_{i});");
+                let _ = writeln!(src, "    pub struct {long_prefix}Ty_{m}_{i};");
+            }
+            let _ = writeln!(src, "    use nonexistent::{long_prefix}Missing_{m};");
+            src.push_str("}\n");
+        }
+        let texts = OneFile("/long_blob/lib.rs", src.as_str());
+        let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false };
+        let input = CrateInput {
+            name: "long_blob_crate",
+            key: CrateItemKey(ContentId::of("blaze-scope long blob test", b"long_blob_crate")),
+            edition: Edition::E2021,
+            implicit,
+            root: "/long_blob/lib.rs",
+            shown_from: "/",
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let solve_frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("solve frame");
+        let solve_erased = blaze_own::Erased::new(&solve_frame);
+        let (solved, _) = resolve_by_records(&[input], Sysroot::default(), &texts, &Serial, &Ready::serial(std::time::Duration::from_secs(60)), solve_erased.bump())
+            .expect("solve long blob crate");
+        let krate = solved.first().expect("solved crate").names;
+
+        let total_macro_exports: usize = krate.done.values().map(|d| d.scope.macro_exports.len()).sum();
+        assert_eq!(total_macro_exports, 8 * 16, "all macro-generated #[macro_export] entries must populate scope.macro_exports");
+
+        let enc_frame = blaze_mem::Frame::with_reserve(16 << 20, blaze_mem::Tag::Nameres).expect("encode frame");
+        let enc_erased = blaze_own::Erased::new(&enc_frame);
+        let enc_bump = enc_erased.bump();
+        let bytes = encode(krate, enc_bump.alloc()).expect("encode long blob names record");
+        let proof = Verified::check(aligned(&bytes, enc_bump)).expect("verify long blob names record");
+        assert!(proof.head.blob_len > 60_000, "blob must be substantial with long names and macro_exports (got {})", proof.head.blob_len);
+        // `blob` itself never reallocates (exact sum of written scope lengths); only internal
+        // `ScopeBuilder::write` small temporaries may grow inside `write()`.
+        assert!(
+            enc_frame.abandoned().bytes < u64::try_from(proof.head.blob_len).unwrap_or(u64::MAX),
+            "encode abandoned {} bytes for a {}-byte blob (peak {})",
+            enc_frame.abandoned().bytes,
+            proof.head.blob_len,
+            enc_frame.peak()
+        );
     }
 }
