@@ -15,8 +15,9 @@ use blaze_surface::{Attr, AttrKind, Edition, Item, ItemDetail, ItemIndex, ItemKi
 use crate::columns::View;
 use crate::form::ROW_LOCAL_ITEM;
 use crate::{
-    Cfg, CfgAnswer, ItemWords, Lowered, Need, anon_const_key, body_key, lower_anon_const_expanding, lower_body_expanding,
-    lower_body_words_expanding, lower_signature, lower_signature_words, signature_key, ValueNames,
+    Cfg, CfgAnswer, ItemContext, ItemWords, Lowered, Need, ValueNames, anon_const_key, body_key, lower_anon_const_expanding,
+    lower_body_expanding_in_context, lower_body_words_expanding_in_context, lower_signature_in_context, lower_signature_words_in_context,
+    signature_key,
 };
 
 /// How deep item macros may expand into item macros (rustc's `recursion_limit` default).
@@ -769,12 +770,16 @@ impl<'a> Driver<'_, 'a> {
                 }
                 _ => item_text,
             };
-            let key = signature_key(key_text, self.edition, has_body);
+            let context = match item.parent.and_then(|p| items.get(p.at())) {
+                Some(parent) if matches!(parent.detail, ItemDetail::Trait) => ItemContext::Trait,
+                _ => ItemContext::TopLevel,
+            };
+            let key = signature_key(key_text, self.edition, has_body, context);
             let padded = own.as_ref().map(|w| w.padded(self.alloc));
             let item_words = own.as_ref().zip(padded.as_ref()).map(|(o, p)| ItemWords { words: p, ranges: &o.ranges });
             let result = match item_words {
-                None => lower_signature(item_text, self.edition, self.cfg, self.alloc),
-                Some(w) => lower_signature_words(item_text, w, self.edition, self.cfg, self.alloc),
+                None => lower_signature_in_context(item_text, self.edition, context, self.cfg, self.alloc),
+                Some(w) => lower_signature_words_in_context(item_text, w, self.edition, context, self.cfg, self.alloc),
             };
             self.stats.signatures += 1;
             let live = self.emit(&at, What::Signature, key, &result, &mut consts, None);
@@ -788,10 +793,10 @@ impl<'a> Driver<'_, 'a> {
                 self.derives(&at, own.as_ref(), outline.attrs(item), source, expand, jobs);
             }
             if has_body {
-                let key = body_key(item_text, self.edition);
+                let key = body_key(item_text, self.edition, context);
                 let result = match item_words {
-                    None => lower_body_expanding(item_text, self.edition, self.cfg, self.values, expand, self.alloc),
-                    Some(w) => lower_body_words_expanding(item_text, w, self.edition, self.cfg, self.values, expand, self.alloc),
+                    None => lower_body_expanding_in_context(item_text, self.edition, context, self.cfg, self.values, expand, self.alloc),
+                    Some(w) => lower_body_words_expanding_in_context(item_text, w, self.edition, context, self.cfg, self.values, expand, self.alloc),
                 };
                 self.stats.bodies += 1;
                 self.emit(&at, What::Body, key, &result, &mut consts, Some((jobs, own.as_ref())));

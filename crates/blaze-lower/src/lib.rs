@@ -475,11 +475,43 @@ pub use crate::type_text::{TypeTextRefused, lower_type_text, lower_type_text_exp
 /// The domain of [`signature_key`], a subject key: what is asked, never which code answers
 /// (decision D105: a cache of lowered records mixes in the lowering's `ProducerId`). Its number
 /// is the key's layout.
-pub const SIGNATURE_KEY_DOMAIN: &str = "blaze v2 lower signature key 1";
+pub const SIGNATURE_KEY_DOMAIN: &str = "blaze v2 lower signature key 2";
 /// The domain of [`body_key`], a subject key (see [`SIGNATURE_KEY_DOMAIN`]).
-pub const BODY_KEY_DOMAIN: &str = "blaze v2 lower body key 1";
+pub const BODY_KEY_DOMAIN: &str = "blaze v2 lower body key 2";
 /// The domain of [`anon_const_key`], a subject key (see [`SIGNATURE_KEY_DOMAIN`]).
 pub const ANON_CONST_KEY_DOMAIN: &str = "blaze v2 lower anon const key 1";
+
+/// Syntactic context in which a single item's text is parsed by `blaze-lower`.
+///
+/// Outside a trait, `fn` parameters always require a pattern before `:`
+/// ([`parser::Reparser::top_level_item`]). Inside a `trait` block in Rust 2015, method
+/// declarations may omit parameter names and write only types ([`parser::Reparser::trait_item`],
+/// RFC 1685).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ItemContext {
+    /// A top-level, module, `extern`, `impl`, or block-local item.
+    #[default]
+    TopLevel = 0,
+    /// An associated item written inside a `trait { ... }` block.
+    Trait = 1,
+}
+
+impl ItemContext {
+    pub(crate) fn reparser(self) -> parser::Reparser {
+        match self {
+            ItemContext::TopLevel => parser::Reparser::top_level_item(),
+            ItemContext::Trait => parser::Reparser::trait_item(),
+        }
+    }
+
+    const fn byte(self) -> u8 {
+        match self {
+            ItemContext::TopLevel => 0,
+            ItemContext::Trait => 1,
+        }
+    }
+}
 
 /// What one name is in the value namespace at a body's module, as an identifier pattern sees
 /// it (the Reference, "Identifier patterns": "Path patterns take precedence over identifier
@@ -641,18 +673,19 @@ pub(crate) const fn parser_edition(edition: Edition) -> parser::Edition {
     }
 }
 
-/// The key of an item's signature record: its signature text (`key_text`), the edition, and
-/// whether a body follows the text (`fn f();` and `fn f() {}` share their text before it).
-pub fn signature_key(key_text: &str, edition: Edition, has_body: bool) -> ContentId {
+/// The key of an item's signature record: its signature text (`key_text`), the edition,
+/// whether a body follows the text (`fn f();` and `fn f() {}` share their text before it), and
+/// its syntactic [`ItemContext`] (trait vs top-level).
+pub fn signature_key(key_text: &str, edition: Edition, has_body: bool, context: ItemContext) -> ContentId {
     Hasher::new(SIGNATURE_KEY_DOMAIN)
-        .part(&[edition_byte(edition), has_body as u8])
+        .part(&[edition_byte(edition), has_body as u8, context.byte()])
         .part(key_text.as_bytes())
         .finish()
 }
 
-/// The key of an item's body record: its whole text and the edition.
-pub fn body_key(item_text: &str, edition: Edition) -> ContentId {
-    Hasher::new(BODY_KEY_DOMAIN).part(&[edition_byte(edition)]).part(item_text.as_bytes()).finish()
+/// The key of an item's body record: its whole text, the edition, and its [`ItemContext`].
+pub fn body_key(item_text: &str, edition: Edition, context: ItemContext) -> ContentId {
+    Hasher::new(BODY_KEY_DOMAIN).part(&[edition_byte(edition), context.byte()]).part(item_text.as_bytes()).finish()
 }
 
 /// The key of an anonymous constant's body record: its text and where it starts in the item
@@ -681,7 +714,19 @@ pub fn lower_signature<'a, 't>(
     cfg: &mut dyn Cfg,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
-    lower_signature_with_scratch(text, edition, cfg, alloc, alloc)
+    lower_signature_in_context_with_scratch(text, edition, ItemContext::TopLevel, cfg, alloc, alloc)
+}
+
+/// [`lower_signature`] in an explicit [`ItemContext`] (e.g. [`ItemContext::Trait`] for
+/// associated items of a trait, where Rust 2015 allows anonymous method parameters).
+pub fn lower_signature_in_context<'a, 't>(
+    text: &'t str,
+    edition: Edition,
+    context: ItemContext,
+    cfg: &mut dyn Cfg,
+    alloc: Alloc<'a>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
+    lower_signature_in_context_with_scratch(text, edition, context, cfg, alloc, alloc)
 }
 
 /// [`lower_signature`] separating the output allocator `alloc` (kept in [`Lowered`]) from
@@ -693,15 +738,27 @@ pub fn lower_signature_with_scratch<'a, 's, 't>(
     alloc: Alloc<'a>,
     scratch: Alloc<'s>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
+    lower_signature_in_context_with_scratch(text, edition, ItemContext::TopLevel, cfg, alloc, scratch)
+}
+
+/// [`lower_signature_with_scratch`] in an explicit [`ItemContext`].
+pub fn lower_signature_in_context_with_scratch<'a, 's, 't>(
+    text: &'t str,
+    edition: Edition,
+    context: ItemContext,
+    cfg: &mut dyn Cfg,
+    alloc: Alloc<'a>,
+    scratch: Alloc<'s>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
     // A text that spells `$crate` is read from its words, `$crate` one of them ([`spelled_words`]).
     if let Some(w) = spelled_words(text, edition, scratch) {
-        return lower_signature_words_with_scratch(text, w.item_words(), edition, cfg, alloc, scratch);
+        return lower_signature_words_in_context_with_scratch(text, w.item_words(), edition, context, cfg, alloc, scratch);
     }
     let end = u32::try_from(text.len()).expect("an item of over 4 GiB: ranges are u32 pairs");
     let pe = parser_edition(edition);
     let lexed = parser::LexedStr::new_outline(pe, text);
     let (words, ranges) = input_columns(&lexed, pe, scratch);
-    let output = parser::Reparser::top_level_item().parse_outline(parser::Tokens::new(&words, true));
+    let output = context.reparser().parse_outline(parser::Tokens::new(&words, true));
     let mut m = machine::Machine::new_with_scratch(text, Mode::Signature, edition, cfg, None, alloc, scratch);
     feed::feed_input(&mut m, &output, ranges, end);
     m.finish()
@@ -746,14 +803,27 @@ pub fn lower_signature_with_extensions_and_scratch<'a, 's, 't>(
     alloc: Alloc<'a>,
     scratch: Alloc<'s>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
+    lower_signature_in_context_with_extensions_and_scratch(text, edition, ItemContext::TopLevel, extensions, cfg, alloc, scratch)
+}
+
+/// [`lower_signature_with_extensions_and_scratch`] in an explicit [`ItemContext`].
+pub fn lower_signature_in_context_with_extensions_and_scratch<'a, 's, 't>(
+    text: &'t str,
+    edition: Edition,
+    context: ItemContext,
+    extensions: parser::Extensions,
+    cfg: &mut dyn Cfg,
+    alloc: Alloc<'a>,
+    scratch: Alloc<'s>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
     if extensions.is_none() {
-        return lower_signature_with_scratch(text, edition, cfg, alloc, scratch);
+        return lower_signature_in_context_with_scratch(text, edition, context, cfg, alloc, scratch);
     }
     let pe = parser_edition(edition);
     let lexed = parser::LexedStr::new(pe, text);
     let mut input = lexed.to_input(pe);
     input.mark_extensions(0, extensions);
-    let output = parser::Reparser::top_level_item().parse_outline(input.tokens());
+    let output = context.reparser().parse_outline(input.tokens());
     let mut m = machine::Machine::new_with_scratch(text, Mode::Signature, edition, cfg, None, alloc, scratch);
     feed::feed(&mut m, &lexed, &output, 0);
     m.finish()
@@ -933,14 +1003,27 @@ pub fn lower_body_expanding<'a, 't>(
     expand: &mut dyn Expand,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
+    lower_body_expanding_in_context(text, edition, ItemContext::TopLevel, cfg, values, expand, alloc)
+}
+
+/// [`lower_body_expanding`] in an explicit [`ItemContext`].
+pub fn lower_body_expanding_in_context<'a, 't>(
+    text: &'t str,
+    edition: Edition,
+    context: ItemContext,
+    cfg: &mut dyn Cfg,
+    values: &mut dyn ValueNames,
+    expand: &mut dyn Expand,
+    alloc: Alloc<'a>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
     // A text that spells `$crate`: from its words ([`spelled_words`]).
     if let Some(w) = spelled_words(text, edition, alloc) {
-        return lower_body_words_expanding(text, w.item_words(), edition, cfg, values, expand, alloc);
+        return lower_body_words_expanding_in_context(text, w.item_words(), edition, context, cfg, values, expand, alloc);
     }
     let pe = parser_edition(edition);
     let lexed = parser::LexedStr::new(pe, text);
     let input = lexed.to_input(pe);
-    let output = parser::Reparser::top_level_item().parse(input.tokens());
+    let output = context.reparser().parse(input.tokens());
     let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
     expand.begin_body();
     feed::feed_expanding(&mut m, &lexed, &output, 0, expand);
@@ -959,12 +1042,25 @@ pub fn lower_body_expanding_marked<'a, 't>(
     expand: &mut dyn Expand,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
+    lower_body_expanding_marked_in_context(marks, edition, ItemContext::TopLevel, cfg, values, expand, alloc)
+}
+
+/// [`lower_body_expanding_marked`] in an explicit [`ItemContext`].
+pub fn lower_body_expanding_marked_in_context<'a, 't>(
+    marks: mark_site::ItemMarks<'t>,
+    edition: Edition,
+    context: ItemContext,
+    cfg: &mut dyn Cfg,
+    values: &mut dyn ValueNames,
+    expand: &mut dyn Expand,
+    alloc: Alloc<'a>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
     let text = marks.text();
     // A copy of a body expansion's item spells `$crate` (blaze-ladder front2 locals.rs): read
     // from its words, `$crate` one of them, its mark at the `$` ([`spelled_words`];
     // `mark_site::column_of_copy` starts the `$crate` row there).
     if let Some(w) = spelled_words(text, edition, alloc) {
-        let output = parser::Reparser::top_level_item().parse(parser::Tokens::new(&w.words, false));
+        let output = context.reparser().parse(parser::Tokens::new(&w.words, false));
         let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
         m.mark_item(marks);
         expand.begin_body();
@@ -974,7 +1070,7 @@ pub fn lower_body_expanding_marked<'a, 't>(
     let pe = parser_edition(edition);
     let lexed = parser::LexedStr::new(pe, text);
     let input = lexed.to_input(pe);
-    let output = parser::Reparser::top_level_item().parse(input.tokens());
+    let output = context.reparser().parse(input.tokens());
     let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
     m.mark_item(marks);
     expand.begin_body();
@@ -992,17 +1088,31 @@ pub fn lower_body_expanding_with_extensions<'a, 't>(
     expand: &mut dyn Expand,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
+    lower_body_expanding_in_context_with_extensions(text, edition, ItemContext::TopLevel, extensions, cfg, values, expand, alloc)
+}
+
+/// [`lower_body_expanding_with_extensions`] in an explicit [`ItemContext`].
+pub fn lower_body_expanding_in_context_with_extensions<'a, 't>(
+    text: &'t str,
+    edition: Edition,
+    context: ItemContext,
+    extensions: parser::Extensions,
+    cfg: &mut dyn Cfg,
+    values: &mut dyn ValueNames,
+    expand: &mut dyn Expand,
+    alloc: Alloc<'a>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
     if extensions.is_none() {
-        return lower_body_expanding(text, edition, cfg, values, expand, alloc);
+        return lower_body_expanding_in_context(text, edition, context, cfg, values, expand, alloc);
     }
     if let Some(w) = spelled_words(text, edition, alloc) {
-        return lower_body_words_expanding(text, w.item_words(), edition, cfg, values, expand, alloc);
+        return lower_body_words_expanding_in_context(text, w.item_words(), edition, context, cfg, values, expand, alloc);
     }
     let pe = parser_edition(edition);
     let lexed = parser::LexedStr::new(pe, text);
     let mut input = lexed.to_input(pe);
     input.mark_extensions(0, extensions);
-    let output = parser::Reparser::top_level_item().parse(input.tokens());
+    let output = context.reparser().parse(input.tokens());
     let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
     expand.begin_body();
     feed::feed_expanding(&mut m, &lexed, &output, 0, expand);
@@ -1019,12 +1129,26 @@ pub fn lower_body_expanding_marked_with_extensions<'a, 't>(
     expand: &mut dyn Expand,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
+    lower_body_expanding_marked_in_context_with_extensions(marks, edition, ItemContext::TopLevel, extensions, cfg, values, expand, alloc)
+}
+
+/// [`lower_body_expanding_marked_with_extensions`] in an explicit [`ItemContext`].
+pub fn lower_body_expanding_marked_in_context_with_extensions<'a, 't>(
+    marks: mark_site::ItemMarks<'t>,
+    edition: Edition,
+    context: ItemContext,
+    extensions: parser::Extensions,
+    cfg: &mut dyn Cfg,
+    values: &mut dyn ValueNames,
+    expand: &mut dyn Expand,
+    alloc: Alloc<'a>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
     if extensions.is_none() {
-        return lower_body_expanding_marked(marks, edition, cfg, values, expand, alloc);
+        return lower_body_expanding_marked_in_context(marks, edition, context, cfg, values, expand, alloc);
     }
     let text = marks.text();
     if let Some(w) = spelled_words(text, edition, alloc) {
-        let output = parser::Reparser::top_level_item().parse(parser::Tokens::new(&w.words, false));
+        let output = context.reparser().parse(parser::Tokens::new(&w.words, false));
         let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
         m.mark_item(marks);
         expand.begin_body();
@@ -1035,7 +1159,7 @@ pub fn lower_body_expanding_marked_with_extensions<'a, 't>(
     let lexed = parser::LexedStr::new(pe, text);
     let mut input = lexed.to_input(pe);
     input.mark_extensions(0, extensions);
-    let output = parser::Reparser::top_level_item().parse(input.tokens());
+    let output = context.reparser().parse(input.tokens());
     let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
     m.mark_item(marks);
     expand.begin_body();
@@ -1061,7 +1185,19 @@ pub fn lower_signature_words<'a, 't>(
     cfg: &mut dyn Cfg,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
-    lower_signature_words_with_scratch(text, words, edition, cfg, alloc, alloc)
+    lower_signature_words_in_context_with_scratch(text, words, edition, ItemContext::TopLevel, cfg, alloc, alloc)
+}
+
+/// [`lower_signature_words`] in an explicit [`ItemContext`].
+pub fn lower_signature_words_in_context<'a, 't>(
+    text: &'t str,
+    words: ItemWords<'_>,
+    edition: Edition,
+    context: ItemContext,
+    cfg: &mut dyn Cfg,
+    alloc: Alloc<'a>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
+    lower_signature_words_in_context_with_scratch(text, words, edition, context, cfg, alloc, alloc)
 }
 
 /// [`lower_signature_words`] separating output allocator `alloc` from temporary `scratch`.
@@ -1073,7 +1209,20 @@ pub fn lower_signature_words_with_scratch<'a, 's, 't>(
     alloc: Alloc<'a>,
     scratch: Alloc<'s>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
-    let output = parser::Reparser::top_level_item().parse_outline(parser::Tokens::new(words.words, false));
+    lower_signature_words_in_context_with_scratch(text, words, edition, ItemContext::TopLevel, cfg, alloc, scratch)
+}
+
+/// [`lower_signature_words_with_scratch`] in an explicit [`ItemContext`].
+pub fn lower_signature_words_in_context_with_scratch<'a, 's, 't>(
+    text: &'t str,
+    words: ItemWords<'_>,
+    edition: Edition,
+    context: ItemContext,
+    cfg: &mut dyn Cfg,
+    alloc: Alloc<'a>,
+    scratch: Alloc<'s>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
+    let output = context.reparser().parse_outline(parser::Tokens::new(words.words, false));
     let mut m = machine::Machine::new_with_scratch(text, Mode::Signature, edition, cfg, None, alloc, scratch);
     feed::feed_words(&mut m, &output, words.ranges, None);
     m.finish()
@@ -1089,7 +1238,21 @@ pub fn lower_body_words_expanding<'a, 't>(
     expand: &mut dyn Expand,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
-    let output = parser::Reparser::top_level_item().parse(parser::Tokens::new(words.words, false));
+    lower_body_words_expanding_in_context(text, words, edition, ItemContext::TopLevel, cfg, values, expand, alloc)
+}
+
+/// [`lower_body_words_expanding`] in an explicit [`ItemContext`].
+pub fn lower_body_words_expanding_in_context<'a, 't>(
+    text: &'t str,
+    words: ItemWords<'_>,
+    edition: Edition,
+    context: ItemContext,
+    cfg: &mut dyn Cfg,
+    values: &mut dyn ValueNames,
+    expand: &mut dyn Expand,
+    alloc: Alloc<'a>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
+    let output = context.reparser().parse(parser::Tokens::new(words.words, false));
     let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
     expand.begin_body();
     feed::feed_words(&mut m, &output, words.ranges, Some(expand));

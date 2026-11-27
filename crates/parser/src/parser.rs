@@ -223,6 +223,57 @@ impl<'t, S: Sink> Parser<'t, S> {
         self.inp.kind(self.pos + n)
     }
 
+    /// Bounded lookahead for a Rust 2015 trait method parameter (`Flavor::TraitFn2015`): whether
+    /// the current parameter is a `PAT: TYPE` (such as `ref x: T`, `(a, b): (T, U)`, `[a, b]:
+    /// [T; 2]`, or `S { a }: S`) rather than an anonymous bare `TYPE`.
+    ///
+    /// A bare type in a parameter list never has a single `:` (not `::`) at delimiter depth 0
+    /// before `,` or `)`. Angle depth is tracked only outside `()`, `[]`, `{}` so `<` in an
+    /// array length expression cannot mask a following `:`; `->` and `=>` are skipped together
+    /// so their `>` does not close an angle pair.
+    pub(crate) fn trait2015_param_is_pattern(&self) -> bool {
+        const MAX_LOOKAHEAD: usize = 4096;
+        if self.inp.kind(self.pos) == T![ref] {
+            return true;
+        }
+        let limit = self.inp.len().min(self.pos.saturating_add(MAX_LOOKAHEAD));
+        let mut pos = self.pos;
+        let (mut paren, mut brack, mut brace, mut angle) = (0u32, 0u32, 0u32, 0u32);
+        while pos < limit {
+            let kind = self.inp.kind(pos);
+            let at_top = paren == 0 && brack == 0 && brace == 0 && angle == 0;
+            if at_top {
+                if kind == T![:] {
+                    if self.inp.is_joint(pos) && self.inp.kind(pos + 1) == T![:] {
+                        pos += 2;
+                        continue;
+                    }
+                    return true;
+                }
+                if matches!(kind, T![,] | T![')'] | T![;] | T!['}'] | EOF) {
+                    return false;
+                }
+            }
+            match kind {
+                T!['('] => paren += 1,
+                T![')'] => paren = paren.saturating_sub(1),
+                T!['['] => brack += 1,
+                T![']'] => brack = brack.saturating_sub(1),
+                T!['{'] => brace += 1,
+                T!['}'] => brace = brace.saturating_sub(1),
+                T![-] | T![=] if self.inp.is_joint(pos) && self.inp.kind(pos + 1) == T![>] => {
+                    pos += 2;
+                    continue;
+                }
+                T![<] if paren == 0 && brack == 0 && brace == 0 => angle += 1,
+                T![>] if paren == 0 && brack == 0 && brace == 0 => angle = angle.saturating_sub(1),
+                _ => {}
+            }
+            pos += 1;
+        }
+        false
+    }
+
     /// The index of the current token, for [`Parser::curly_closes`].
     pub(crate) fn token_index(&self) -> usize {
         self.pos

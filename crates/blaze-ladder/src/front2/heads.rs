@@ -3220,18 +3220,19 @@ fn own_defaults<'n, S: NamesSource<'n>, O: Extend<Option<PTy>>>(b: &Builder<'_, 
 pub(super) fn lower_alloc<'n, S: super::source::NamesSource<'n>>(names: S, key: LibKey, text: &'n str, alloc: Alloc<'static>) -> Result<Lowered<'static, 'n>, HeadError> {
     blaze_mem::frame::task(blaze_mem::Tag::Parse, |frame| {
         let scratch = blaze_own::Erased::new(frame);
-        lower_in_with_scratch(names, key, text, alloc, scratch.handle())
+        lower_in_with_scratch(names, key, text, blaze_lower::ItemContext::TopLevel, alloc, scratch.handle())
     })
 }
 
 pub(super) fn lower_in<'a, 'n, S: super::source::NamesSource<'n>>(names: S, key: LibKey, text: &'n str, alloc: Alloc<'a>) -> Result<Lowered<'a, 'n>, HeadError> {
-    lower_in_with_scratch(names, key, text, alloc, alloc)
+    lower_in_with_scratch(names, key, text, blaze_lower::ItemContext::TopLevel, alloc, alloc)
 }
 
 fn lower_in_with_scratch<'a, 's, 'n, S: super::source::NamesSource<'n>>(
     names: S,
     key: LibKey,
     text: &'n str,
+    context: blaze_lower::ItemContext,
     alloc: Alloc<'a>,
     scratch: Alloc<'s>,
 ) -> Result<Lowered<'a, 'n>, HeadError> {
@@ -3242,7 +3243,7 @@ fn lower_in_with_scratch<'a, 's, 'n, S: super::source::NamesSource<'n>>(
     let edition = names.edition_of(krate).ok_or(HeadError::NoText(key))?;
     let extensions = names.blaze_extensions(krate);
     HeadLowerings::starting(names);
-    blaze_lower::lower_signature_with_extensions_and_scratch(text, edition, extensions, &mut cfg, alloc, scratch).map_err(|_| HeadError::Cfg(key))
+    blaze_lower::lower_signature_in_context_with_extensions_and_scratch(text, edition, context, extensions, &mut cfg, alloc, scratch).map_err(|_| HeadError::Cfg(key))
 }
 
 /// Lowers `text` into a short-lived scratch `blaze_mem::Frame` (zero `Global` allocations for
@@ -3253,9 +3254,21 @@ pub(super) fn with_lowered<'n, S: super::source::NamesSource<'n>, R>(
     text: &'n str,
     f: impl FnOnce(&View<'_>) -> R,
 ) -> Result<R, HeadError> {
+    with_lowered_in_context(names, key, text, blaze_lower::ItemContext::TopLevel, f)
+}
+
+/// [`with_lowered`] in an explicit [`blaze_lower::ItemContext`] (e.g. `ItemContext::Trait` for
+/// trait members so Rust 2015 anonymous method parameters parse as types).
+pub(super) fn with_lowered_in_context<'n, S: super::source::NamesSource<'n>, R>(
+    names: S,
+    key: LibKey,
+    text: &'n str,
+    context: blaze_lower::ItemContext,
+    f: impl FnOnce(&View<'_>) -> R,
+) -> Result<R, HeadError> {
     blaze_mem::frame::task(blaze_mem::Tag::Parse, |frame| {
         let erased = blaze_own::Erased::new(frame);
-        let low = lower_in(names, key, text, erased.handle())?;
+        let low = lower_in_with_scratch(names, key, text, context, erased.handle(), erased.handle())?;
         Ok(f(&low.view()))
     })
 }
@@ -3267,6 +3280,7 @@ fn with_lowered_in<'n, S: super::source::NamesSource<'n>, R>(
     names: S,
     key: LibKey,
     text: &'n str,
+    context: blaze_lower::ItemContext,
     f: impl FnOnce(&View<'_>) -> R,
 ) -> Result<R, HeadError> {
     if scratch.is_none()
@@ -3277,11 +3291,11 @@ fn with_lowered_in<'n, S: super::source::NamesSource<'n>, R>(
     if let Some(frame) = scratch.as_mut() {
         frame.scope(|frame| {
             let erased = blaze_own::Erased::new(frame);
-            let low = lower_in(names, key, text, erased.handle())?;
+            let low = lower_in_with_scratch(names, key, text, context, erased.handle(), erased.handle())?;
             Ok(f(&low.view()))
         })
     } else {
-        with_lowered(names, key, text, f)
+        with_lowered_in_context(names, key, text, context, f)
     }
 }
 
@@ -3389,9 +3403,20 @@ impl<'n> Store<'n> {
     /// One item's signature lowered from `text` into `alloc` using this store's reusable scratch
     /// frame (zero `blaze_mem::frame::task` churn).
     fn lower_alloc_here<S: super::source::NamesSource<'n>>(&self, names: S, key: LibKey, text: &'n str, alloc: Alloc<'static>) -> Result<Lowered<'static, 'n>, HeadError> {
+        self.lower_alloc_in_context_here(names, key, text, blaze_lower::ItemContext::TopLevel, alloc)
+    }
+
+    fn lower_alloc_in_context_here<S: super::source::NamesSource<'n>>(
+        &self,
+        names: S,
+        key: LibKey,
+        text: &'n str,
+        context: blaze_lower::ItemContext,
+        alloc: Alloc<'static>,
+    ) -> Result<Lowered<'static, 'n>, HeadError> {
         self.with_parse_scratch(|frame| {
             let scratch = blaze_own::Erased::new(frame);
-            lower_in_with_scratch(names, key, text, alloc, scratch.handle())
+            lower_in_with_scratch(names, key, text, context, alloc, scratch.handle())
         })
     }
 
@@ -4949,7 +4974,7 @@ impl<'n> Store<'n> {
         };
         let mut life_names: Vec<Name, Alloc<'static>> = Vec::new_in(self.tys.alloc());
         let mut scratch = self.take_parse_scratch();
-        let life_res = with_lowered_in(&mut scratch, names, impl_, text, |v| lifetime_names(v, &mut life_names));
+        let life_res = with_lowered_in(&mut scratch, names, impl_, text, blaze_lower::ItemContext::TopLevel, |v| lifetime_names(v, &mut life_names));
         self.put_parse_scratch(scratch);
         life_res?.map_err(|why| HeadError::Item(impl_, why))?;
         let self_ty = self.impls.get(&ck).ok_or(HeadError::Filed { want, at, what: "an impl's members' scope asked before its head is filed" })?.self_ty;
@@ -5201,7 +5226,7 @@ impl<'n> Store<'n> {
         let mut members = blaze_own::Vec::new_in(alloc);
         let mut scratch = self.take_parse_scratch();
         for m in &ms {
-            with_lowered_in(&mut scratch, names, key, m.text, |mv| -> Result<(), Why> {
+            with_lowered_in(&mut scratch, names, key, m.text, blaze_lower::ItemContext::Trait, |mv| -> Result<(), Why> {
                 if mv.cfg_out() {
                     return Ok(());
                 }
@@ -5337,7 +5362,7 @@ impl<'n> Store<'n> {
             if self.regions.made(item).is_some() || self.regions.unread(item).why != tc::region_facts::UnreadWhy::NoHead {
                 continue;
             }
-            let Ok(low) = self.lower_alloc_here(names, key, m.text, alloc) else { continue };
+            let Ok(low) = self.lower_alloc_in_context_here(names, key, m.text, blaze_lower::ItemContext::Trait, alloc) else { continue };
             let mv = low.view();
             if mv.cfg_out() {
                 continue;
@@ -5637,7 +5662,7 @@ impl<'n> Store<'n> {
                 }
                 _ => None,
             };
-            with_lowered_in(&mut member_scratch, names, key, m.text, |mv| -> Result<(), Why> {
+            with_lowered_in(&mut member_scratch, names, key, m.text, blaze_lower::ItemContext::Trait, |mv| -> Result<(), Why> {
                 if mv.cfg_out() {
                     return Ok(());
                 }
@@ -6264,7 +6289,7 @@ impl<'n> Store<'n> {
         let mut pending_assoc: blaze_own::Vec<Name, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         let mut scratch = self.take_parse_scratch();
         for m in &ms {
-            with_lowered_in(&mut scratch, names, key, m.text, |mv| -> Result<(), Why> {
+            with_lowered_in(&mut scratch, names, key, m.text, blaze_lower::ItemContext::TopLevel, |mv| -> Result<(), Why> {
                 if mv.cfg_out() {
                     return Ok(());
                 }
@@ -6372,7 +6397,7 @@ impl<'n> Store<'n> {
                 let mut scratch = self.take_parse_scratch();
                 let res: Result<(), Why> = (|| {
                     for &(assoc_name, m_text, m_written_by, value) in &assoc_to_lay {
-                        with_lowered_in(&mut scratch, names, key, m_text, |mv| -> Result<(), Why> {
+                        with_lowered_in(&mut scratch, names, key, m_text, blaze_lower::ItemContext::TopLevel, |mv| -> Result<(), Why> {
                             let t = mv.head_opt(head::TY).ok_or(Why::Unsupported("an associated type with no type", whole))?;
                             let marks = super::item_site::member_marks(names, key, m_written_by, m_text).map_err(MarksLost::why)?;
                             let mb = Builder { resolver: Paths { names }, heads: &self.maps, marks };
@@ -6503,7 +6528,7 @@ impl<'n> Store<'n> {
     fn impl_const<S: NamesSource<'n>>(&mut self, names: S, key: LibKey, ck: ItemKey, mk: ItemKey, text: &'n str, written_by: Option<LibKey>, env: &Env<'_>, (scope, clauses): (&Scope, &[PClause]), bounds: &[ParamBound], generics: u32) -> Result<(), Why> {
         let whole = Range::new(0, 0);
         let mut scratch = self.take_parse_scratch();
-        let res = with_lowered_in(&mut scratch, names, key, text, |cv| -> Result<(), Why> {
+        let res = with_lowered_in(&mut scratch, names, key, text, blaze_lower::ItemContext::TopLevel, |cv| -> Result<(), Why> {
             let at = Range::new(0, text.len() as u32);
             let t = cv.head_opt(head::TY).ok_or(Why::Unsupported("an associated constant with no type", at))?;
             let marks = super::item_site::member_marks(names, key, written_by, text).map_err(MarksLost::why)?;
@@ -6988,6 +7013,9 @@ impl<'n> Store<'n> {
             }
             let r = v.site(v.row_range(list.start + k as u32)?)?;
             sink.set_part(SigPart::Input(inputs.len() as u32));
+            if says_misses && prm.self_kind == lf::SelfKind::No && prm.pat.is_none() {
+                return Err(Why::Unsupported("a parameter of a function with a body has no pattern", r));
+            }
             let ty = match (prm.self_kind, self_ty) {
                 (lf::SelfKind::No | lf::SelfKind::Typed, _) => ty_or_miss(&b, &mut self.tys, &env, v, prm.ty.ok_or(Why::Unsupported("a parameter with no type", r))?, text, &mut misses, &mut sink)?,
                 (lf::SelfKind::Value, Some(s)) => {
