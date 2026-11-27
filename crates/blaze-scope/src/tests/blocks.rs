@@ -1128,3 +1128,56 @@ fn direct_macro_call_in_type_alias_head_creates_expansion_block_module() {
         .unwrap_or_else(|e| panic!("`HeadMacroEnum` in expansion block module: {e}"));
     assert_eq!(e.def.kind, DefKind::Enum);
 }
+
+const CFG_GATED_HEAD_MACRO_CALLS: &str = r#"#![no_core]
+macro_rules! make_len {
+    () => {
+        {
+            pub enum HeadCfgEnum { A = 0, B = 1 }
+            pub trait Mark {}
+            impl Mark for HeadCfgEnum {}
+            2
+        }
+    };
+}
+pub fn f(#[cfg(any())] _: [u8; missing!()], #[cfg(all())] _ok: [u8; make_len!()]) {}
+pub struct S {
+    #[cfg(any())]
+    pub a: [u8; missing!()],
+    #[cfg(all())]
+    pub b: [u8; make_len!()],
+}
+pub struct T(#[cfg(any())] pub [u8; missing!()], #[cfg(all())] pub [u8; make_len!()]);
+"#;
+
+static CFG_GATED_HEAD_MACRO_CALLS_TEXTS: Texts = Texts(&[&[("/user/lib.rs", CFG_GATED_HEAD_MACRO_CALLS)]]);
+
+/// Round 9 P1: `#[cfg(any())]` on a fn parameter, struct field, or tuple field containing a
+/// direct macro call prevents `blaze-scope` from expanding the disabled `missing!()` call,
+/// while a sibling `#[cfg(all())]` call is still expanded at its preserved ordinal.
+#[test]
+fn cfg_disabled_head_macro_calls_are_not_expanded_while_enabled_ones_are() {
+    use blaze_surface::DefKind;
+    let alloc = blaze_own::testing::heap().alloc();
+    let crates = [input("user", "/user/lib.rs", &[])];
+    let names = resolved(&crates, &CFG_GATED_HEAD_MACRO_CALLS_TEXTS);
+    assert!(
+        !names.notes(0).iter().any(|n| matches!(n, crate::resolve::NamesNote::Expand { .. })),
+        "cfg-disabled `missing!()` must NOT be expanded: {:?}",
+        names.notes(0)
+    );
+
+    let root = names.root(0);
+    // For `fn f`, `missing!()` was ordinal 0 (cfg-removed, still counted) so `make_len!()` is ordinal 1.
+    let f_item = names
+        .item_at(root, Namespace::Values, Written { kind: PathKind::Plain, segments: &["f"] }, alloc)
+        .unwrap_or_else(|e| panic!("`f`: {e}"));
+    let head_mod = crate::blocks::head_call_module(names.krate(0).key, f_item.def.key);
+    let call_key = crate::task::key_of(names.krate(0).key, head_mod, "MacroCall", "", 1);
+    let exp_name = crate::expanded_blocks::expansion_block_name(call_key, 0, alloc);
+    let exp_mod = crate::task::key_of(names.krate(0).key, call_key, "mod", exp_name.as_str(), 0);
+    let e = names
+        .item_at(exp_mod, Namespace::Types, Written { kind: PathKind::Plain, segments: &["HeadCfgEnum"] }, alloc)
+        .unwrap_or_else(|e| panic!("`HeadCfgEnum` in fn `f` enabled head call: {e}"));
+    assert_eq!(e.def.kind, DefKind::Enum);
+}

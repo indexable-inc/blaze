@@ -55,7 +55,7 @@ blaze-engine	203
 blaze-expand	471
 blaze-export	381
 blaze-fetch	170
-blaze-file-items	288
+blaze-file-items	287
 blaze-flow	475
 blaze-flow-lower	228
 blaze-fmt	352
@@ -119,7 +119,7 @@ blaze-rng	3
 blaze-roots	24
 blaze-run	273
 blaze-rungs	2
-blaze-scope	1669
+blaze-scope	1667
 blaze-screen	30
 blaze-script	91
 blaze-semver	9

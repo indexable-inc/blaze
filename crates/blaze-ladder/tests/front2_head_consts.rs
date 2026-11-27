@@ -2116,3 +2116,55 @@ fn main() {}
         &[true, false, true, false, true, false, true, false],
     );
 }
+
+/// Round 9 P1: `#[cfg(any())]` on a fn parameter, record struct field, or tuple struct field
+/// prevents expanding `missing!()` while a sibling `#[cfg(all())]` macro call still expands and
+/// resolves its local enum cleanly.
+#[test]
+fn cfg_disabled_head_macro_calls_are_skipped_while_enabled_ones_resolve() {
+    const TEXT: &str = "
+macro_rules! make_len {
+    () => {
+        {
+            #[repr(u16)]
+            enum CfgHeadEnum { A = 0, B = 1 }
+            core::mem::size_of::<CfgHeadEnum>()
+        }
+    };
+}
+
+pub fn f(
+    #[cfg(any())] _gone: [u8; missing!()],
+    #[cfg(all())] _ok: [u8; make_len!()],
+) {}
+
+pub struct S {
+    #[cfg(any())]
+    pub gone: [u8; missing!()],
+    #[cfg(all())]
+    pub ok: [u8; make_len!()],
+}
+
+pub struct T(
+    #[cfg(any())] pub [u8; missing!()],
+    #[cfg(all())] pub [u8; make_len!()],
+);
+
+fn fn_ok() { f([0u8; 2]); }
+fn fn_bad() { f([0u8; 3]); }
+fn struct_ok() -> S { S { ok: [0u8; 2] } }
+fn struct_bad() -> S { S { ok: [0u8; 3] } }
+fn tuple_ok() -> T { T([0u8; 2]) }
+fn tuple_bad() -> T { T([0u8; 3]) }
+fn main() {}
+";
+    let got = check_fns(
+        TEXT,
+        &["fn_ok", "fn_bad", "struct_ok", "struct_bad", "tuple_ok", "tuple_bad"],
+    );
+    expect(
+        "cfg-gated head macro calls",
+        &got,
+        &[true, false, true, false, true, false],
+    );
+}

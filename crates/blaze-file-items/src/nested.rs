@@ -40,6 +40,10 @@ pub struct Block {
     /// attributes, `cfg` among them, apply to the whole statement, so a false `cfg` removes
     /// every block in it.
     pub attrs: Range,
+    /// Additional outer attributes from an enclosing paren/bracket/generic head element (e.g.
+    /// `enum E { #[cfg(a)] V(#[cfg(b)] [u8; { ... }]) }` where `attrs` holds `#[cfg(a)]` and
+    /// `elem_attrs` holds `#[cfg(b)]`); empty when none.
+    pub elem_attrs: Range,
     /// The offset of its `{`.
     pub open: u32,
     /// The offset after its `}`.
@@ -133,6 +137,9 @@ pub struct NestedCall {
     /// and "Conditional compilation": a false `cfg` removes it, every call in it with it,
     /// before expansion.
     pub attrs: Range,
+    /// Additional outer attributes from an enclosing paren/bracket element inside a block (e.g.
+    /// `enum E { #[cfg(a)] V(#[cfg(b)] [u8; m!()]) }`); empty when none.
+    pub elem_attrs: Range,
 }
 
 /// How the scan ended.
@@ -305,6 +312,110 @@ fn offset(at: usize) -> u32 {
 pub fn may_write_block(text: &str) -> bool {
     const WORDS: [&str; 8] = ["impl", "struct", "enum", "union", "type", "trait", "mod", "extern"];
     text.contains('!') || WORDS.into_iter().any(|word| text.contains(word))
+}
+
+/// Calls `f` with the byte range in `text` of every outer `#[cfg(...)]` or `#[cfg_attr(...)]`
+/// attribute inside `range` (skipping `#![...]` inner attributes and non-cfg attributes such as
+/// `#[serde(...)]`, `#[doc = ...]`, `#[allow(...)]`, `#[default]`).
+pub fn for_each_cfg_attr(text: &str, range: Range, mut f: impl FnMut(Range)) {
+    if range.end <= range.start {
+        return;
+    }
+    let (Ok(r_start), Ok(r_end)) = (usize::try_from(range.start), usize::try_from(range.end)) else {
+        return;
+    };
+    let Some(slice) = text.get(r_start..r_end) else {
+        return;
+    };
+    if !slice.contains("cfg") {
+        return;
+    }
+    #[derive(Clone, Copy)]
+    enum State {
+        Idle,
+        Pound { start: usize },
+        SkipInner { depth: u32 },
+        Path { start: usize, is_cfg: bool },
+        Body { start: usize, depth: u32, is_cfg: bool },
+    }
+    let mut state = State::Idle;
+    let mut at = 0usize;
+    for tok in tokenize(slice, FrontmatterAllowed::No, Cpu::BASELINE) {
+        let t_start = at;
+        let Ok(len) = usize::try_from(tok.len) else {
+            return;
+        };
+        at += len;
+        let kind = tok.kind;
+        if matches!(kind, TokenKind::Whitespace | TokenKind::LineComment { .. } | TokenKind::BlockComment { .. }) {
+            continue;
+        }
+        let open = matches!(kind, TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace);
+        let close = matches!(kind, TokenKind::CloseParen | TokenKind::CloseBracket | TokenKind::CloseBrace);
+        state = match state {
+            State::Idle => {
+                if kind == TokenKind::Pound {
+                    State::Pound { start: t_start }
+                } else {
+                    State::Idle
+                }
+            }
+            State::Pound { start } => match kind {
+                TokenKind::OpenBracket => State::Path { start, is_cfg: false },
+                TokenKind::Bang => State::SkipInner { depth: 0 },
+                TokenKind::Pound => State::Pound { start: t_start },
+                _ => State::Idle,
+            },
+            State::SkipInner { depth } => {
+                if depth == 0 {
+                    if kind == TokenKind::OpenBracket { State::SkipInner { depth: 1 } } else { State::Idle }
+                } else if open {
+                    State::SkipInner { depth: depth.saturating_add(1) }
+                } else if close {
+                    let next = depth - 1;
+                    if next == 0 { State::Idle } else { State::SkipInner { depth: next } }
+                } else {
+                    State::SkipInner { depth }
+                }
+            }
+            State::Path { start, is_cfg } => match kind {
+                TokenKind::Ident => {
+                    let w = slice.get(t_start..at);
+                    State::Path { start, is_cfg: matches!(w, Some("cfg" | "cfg_attr")) }
+                }
+                TokenKind::Colon => State::Path { start, is_cfg },
+                TokenKind::CloseBracket => {
+                    if is_cfg
+                        && let (Ok(s), Ok(e)) = (u32::try_from(r_start + start), u32::try_from(r_start + at))
+                    {
+                        f(Range { start: s, end: e });
+                    }
+                    State::Idle
+                }
+                _ if open => State::Body { start, depth: 2, is_cfg },
+                _ => State::Body { start, depth: 1, is_cfg: false },
+            },
+            State::Body { start, depth, is_cfg } => {
+                if open {
+                    State::Body { start, depth: depth.saturating_add(1), is_cfg }
+                } else if close {
+                    let next = depth - 1;
+                    if next == 0 {
+                        if is_cfg
+                            && let (Ok(s), Ok(e)) = (u32::try_from(r_start + start), u32::try_from(r_start + at))
+                        {
+                            f(Range { start: s, end: e });
+                        }
+                        State::Idle
+                    } else {
+                        State::Body { start, depth: next, is_cfg }
+                    }
+                } else {
+                    State::Body { start, depth, is_cfg }
+                }
+            }
+        };
+    }
 }
 
 /// Whether `text` contains a direct macro invocation `ident!(...)`, `ident![...]`, or
@@ -1487,24 +1598,43 @@ struct CallHead {
 struct BlockState {
     /// Outer attributes of the statement/arm/field currently under way in this block.
     attrs: Option<Range>,
-    /// True for a `match` body or struct literal whose top-level entries are comma-separated
-    /// arms/fields that may each carry their own outer attributes (`#[cfg(..)]`).
+    /// True for a `match` body, struct literal, or `struct`/`enum`/`union` body whose top-level
+    /// entries are comma-separated arms/fields/variants that may each carry their own outer
+    /// attributes (`#[cfg(..)]`).
     comma_entries: bool,
+    /// True for a `struct`/`enum`/`union` body `{ fields/variants }`, where generic `<...>`
+    /// arguments appear in field types without `::` and field names cannot start item declarations.
+    is_adt_body: bool,
+    /// True after `:` and before `=` in an ADT field declaration (`a: Foo<u8, [u8; m!()]>`).
+    in_field_type: bool,
     /// True while inside a top-level closure parameter list (`|a, b|`) in a `comma_entries`
     /// block, so commas between parameters do not terminate the enclosing arm/field.
     in_closure_params: bool,
-    /// Depth inside turbofish generic arguments (`::<A, B>`) in a `comma_entries` block.
+    /// Depth inside turbofish or field-type generic arguments (`::<A, B>`, `Foo<A, B>`) in a
+    /// `comma_entries` block.
     angle_depth: u32,
 }
 
 /// Per-open-group expression header state, parallel to `stack`, used to distinguish `match`
-/// bodies and struct literals from statement blocks when an `{` opens.
+/// bodies and struct literals from statement blocks when an `{` opens, and to track outer
+/// attributes (`#[cfg(..)]`) on comma-separated elements inside paren/bracket groups
+/// (`fn f(#[cfg(..)] _: [u8; m!()])`, `struct T(#[cfg(..)] [u8; m!()])`).
 #[derive(Clone, Copy, Default)]
 struct GroupHead {
     match_head: bool,
     ctrl_head: bool,
     in_if_let_pat: bool,
     arrow_head: bool,
+    /// Outer attributes of the current comma-separated element in this paren/bracket group.
+    elem_attrs: Option<Range>,
+    /// Start of the leading attribute chain for the current element.
+    attr_start: Option<u32>,
+    /// End of the last outer attribute in the leading attribute chain.
+    attr_end: u32,
+    /// True at the start of an element (before non-attribute tokens).
+    elem_fresh: bool,
+    /// Depth inside `<...>` generic argument lists inside this group.
+    angle_depth: u32,
 }
 
 /// Keywords that cannot end a struct literal path (`Path { .. }`).
@@ -1604,6 +1734,18 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
     let mut after_match_kw = false;
     let mut after_struct_head = false;
     let mut can_start_closure = false;
+    // Top-level item header tracking (at `stack.is_empty()`): whether this item is a `struct`,
+    // `enum`, or `union` (so its outer `{ ... }` body uses `comma_entries`), whether the previous
+    // top-level token was `const` (so `where const { ... }` is not mistaken for the ADT body),
+    // and outer attributes on top-level generic parameters `<#[cfg(..)] const N: usize = m!()>`.
+    let mut top_item_is_adt = false;
+    let mut top_seen_adt_body = false;
+    let mut top_prev_const = false;
+    let mut top_angle_depth = 0u32;
+    let mut top_elem_attrs: Option<Range> = None;
+    let mut top_attr_start: Option<u32> = None;
+    let mut top_attr_end = 0u32;
+    let mut top_elem_fresh = false;
     // The listed call whose arguments are open: `(is_head_call, index)`.
     let mut open_call: Option<(bool, usize)> = None;
     let mut at = 0usize;
@@ -1703,6 +1845,19 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
         };
         // The innermost block around, through paren and square groups (`f(m!())`).
         let enclosing = block.or_else(|| stack.iter().rev().find_map(|o| if let Open::Brace(b) = o { Some(*b) } else { None }));
+        // The innermost outer attribute range from a paren/bracket group above `enclosing` (or
+        // from top-level generic parameters `<#[cfg(..)] ...>` when `enclosing.is_none()`).
+        let active_head_attrs = || -> Option<Range> {
+            for (o, h) in stack.iter().zip(heads.iter()).rev() {
+                if matches!(o, Open::Brace(_)) {
+                    break;
+                }
+                if h.elem_attrs.is_some() {
+                    return h.elem_attrs;
+                }
+            }
+            if enclosing.is_none() { top_elem_attrs } else { None }
+        };
         if is_open {
             // The Reference, "Attributes": an attribute's input is any "delimited token
             // tree" (`#[allow(a, b)]`, `#[doc(hidden)]`, `#[cfg_attr(x, derive(Y))]`,
@@ -1720,6 +1875,7 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                 // .. }`, reth's `with_adapter!` writes `{ type $A = ..; $body }`).
                 (_, Some(head)) => {
                     if let Some(head) = head {
+                        let head_attrs = active_head_attrs();
                         if let Some(block) = enclosing {
                             open_call = Some((false, out.calls.len()));
                             let none = Range { start: head.path.start, end: head.path.start };
@@ -1730,6 +1886,7 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                                 range: Range { start: head.start, end: head.path.end },
                                 expr: !bang_stmt,
                                 attrs,
+                                elem_attrs: head_attrs.unwrap_or(none),
                             });
                         } else {
                             open_call = Some((true, out.head_calls.len()));
@@ -1739,7 +1896,8 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                                 path: head.path,
                                 range: Range { start: head.start, end: head.path.end },
                                 expr: true,
-                                attrs: none,
+                                attrs: head_attrs.unwrap_or(none),
+                                elem_attrs: none,
                             });
                         }
                     }
@@ -1759,17 +1917,36 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                     let id = offset(out.blocks.len());
                     let parent = stack.iter().rev().find_map(|o| if let Open::Brace(b) = o { Some(*b) } else { None });
                     let none = Range { start: offset(start), end: offset(start) };
-                    let attrs = match (block, parent) {
+                    let head_attrs = active_head_attrs();
+                    let (attrs, elem_attrs) = match (block, parent) {
                         // A block statement: its own attributes; a new statement of the parent.
                         (Some(b), _) if fresh => {
                             blocks_state[b as usize].attrs = None;
-                            outer_attrs(text, stmt_start, attrs_end).unwrap_or(none)
+                            (outer_attrs(text, stmt_start, attrs_end).unwrap_or(none), none)
                         }
-                        // Inside a statement of the parent, maybe within its parens.
-                        (_, Some(p)) => blocks_state[p as usize].attrs.unwrap_or(none),
-                        (_, None) => none,
+                        // Inside a statement/variant of the parent, maybe within its parens.
+                        (_, Some(p)) => (blocks_state[p as usize].attrs.unwrap_or(none), head_attrs.unwrap_or(none)),
+                        // Outside every block: may be inside a cfg-gated fn param, tuple field,
+                        // or generic param (`fn f(#[cfg(..)] _: [u8; { .. }])`).
+                        (_, None) => (head_attrs.unwrap_or(none), none),
                     };
-                    let comma_entries = if parent.is_none() || (block.is_some() && fresh) {
+                    let is_adt_body = parent.is_none()
+                        && top_item_is_adt
+                        && !top_seen_adt_body
+                        && stack.is_empty()
+                        && top_angle_depth == 0
+                        && !top_prev_const;
+                    if is_adt_body {
+                        top_seen_adt_body = true;
+                    }
+                    let is_struct_variant_body = !is_adt_body
+                        && parent.and_then(|p| usize::try_from(p).ok()).and_then(|i| blocks_state.get(i)).is_some_and(|s| s.is_adt_body)
+                        && block.is_some()
+                        && !fresh
+                        && was_struct_head;
+                    let comma_entries = if is_adt_body || is_struct_variant_body {
+                        true
+                    } else if parent.is_none() || (block.is_some() && fresh) {
                         false
                     } else if let Some(top) = heads.last_mut() {
                         if top.in_if_let_pat {
@@ -1791,8 +1968,15 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                     } else {
                         false
                     };
-                    blocks_state.push(BlockState { attrs: None, comma_entries, in_closure_params: false, angle_depth: 0 });
-                    out.blocks.push(Block { parent, attrs, open: offset(start), close: 0 });
+                    blocks_state.push(BlockState {
+                        attrs: None,
+                        comma_entries,
+                        is_adt_body: is_adt_body || is_struct_variant_body,
+                        in_field_type: false,
+                        in_closure_params: false,
+                        angle_depth: 0,
+                    });
+                    out.blocks.push(Block { parent, attrs, elem_attrs, open: offset(start), close: 0 });
                     Open::Brace(id)
                 }
                 // `#[..]`, `#![..]` (inside a block at statement start, or outside blocks in a
@@ -1806,14 +1990,28 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
             if let (true, false, Some(b), Open::Other { .. }) = (fresh, keeps, block, open) {
                 blocks_state[b as usize].attrs = outer_attrs(text, stmt_start, attrs_end);
             }
+            if !keeps && block.is_none() {
+                if let Some(top) = heads.last_mut() {
+                    top.elem_fresh = false;
+                } else if top_angle_depth == 1 {
+                    top_elem_fresh = false;
+                }
+            }
             stack.push(open);
-            heads.push(GroupHead::default());
+            let mut next_head = GroupHead::default();
+            if matches!(open, Open::Other { stmt: false }) {
+                next_head.elem_fresh = true;
+            }
+            heads.push(next_head);
             if !keeps {
                 fresh = matches!(open, Open::Brace(_));
                 stmt_start = None;
                 if matches!(kind, TokenKind::OpenParen | TokenKind::OpenBracket) {
                     can_start_closure = true;
                 }
+            }
+            if stack.len() == 1 {
+                top_prev_const = false;
             }
             lead = Lead::None;
             path_start = None;
@@ -1834,14 +2032,39 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                     stmt_start = None;
                 }
                 Some(Open::Other { stmt: true }) => {
-                    // An attribute at a statement's start closed: an outer one ends the
-                    // statement's attributes so far; an inner one is the block's, and the
-                    // statement starts after it.
-                    if kind == TokenKind::CloseBracket && matches!(stack.last(), Some(Open::Brace(_))) {
-                        if core::mem::take(&mut inner_attr) {
-                            stmt_start = None;
-                        } else {
-                            attrs_end = offset(at);
+                    // An attribute closed: update the enclosing block, paren/bracket group, or
+                    // top-level generic-param list unless it was an inner `#![..]`.
+                    if kind == TokenKind::CloseBracket {
+                        let was_inner = core::mem::take(&mut inner_attr);
+                        match stack.last() {
+                            Some(Open::Brace(_)) => {
+                                if was_inner {
+                                    stmt_start = None;
+                                } else {
+                                    attrs_end = offset(at);
+                                }
+                            }
+                            Some(Open::Other { stmt: false }) => {
+                                if let Some(top) = heads.last_mut()
+                                    && top.elem_fresh
+                                {
+                                    if was_inner {
+                                        top.attr_start = None;
+                                    } else {
+                                        top.attr_end = offset(at);
+                                        top.elem_attrs = outer_attrs(text, top.attr_start, top.attr_end);
+                                    }
+                                }
+                            }
+                            None if top_angle_depth == 1 && top_elem_fresh => {
+                                if was_inner {
+                                    top_attr_start = None;
+                                } else {
+                                    top_attr_end = offset(at);
+                                    top_elem_attrs = outer_attrs(text, top_attr_start, top_attr_end);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -1857,13 +2080,12 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
         }
         let Some(block) = block else {
             // Outside every block (the item's own header), or directly in a paren or square
-            // group: no statement starts here. In a group inside a block, a call's path is
-            // read as in an expression of that block (`f(m!())`, `[m!(), 1]`); outside every
-            // block, a call is passed over and not listed.
+            // group: track element attributes (`#[cfg(..)]`) and direct macro calls.
             let word = matches!(kind, TokenKind::Ident).then_some(&text[start..at]);
-            if let Some(top) = heads.last_mut()
-                && !matches!(stack.last(), Some(Open::Other { stmt: true }))
-            {
+            if matches!(stack.last(), Some(Open::Other { stmt: true })) {
+                continue;
+            }
+            if let Some(top) = heads.last_mut() {
                 match (kind, word) {
                     (TokenKind::Ident, Some("match")) if !was_dot && was_sep != 2 => {
                         top.match_head = true;
@@ -1878,6 +2100,9 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                     (TokenKind::Eq, _) if top.in_if_let_pat => {
                         top.in_if_let_pat = false;
                     }
+                    (TokenKind::Lt, _) => {
+                        top.angle_depth = top.angle_depth.saturating_add(1);
+                    }
                     (TokenKind::Gt, _) if was_minus => {
                         top.arrow_head = true;
                     }
@@ -1885,13 +2110,25 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                         top.ctrl_head = false;
                         top.in_if_let_pat = false;
                     }
+                    (TokenKind::Gt, _) if top.angle_depth > 0 => {
+                        top.angle_depth -= 1;
+                    }
                     (TokenKind::Comma, _) => {
                         top.match_head = false;
                         top.ctrl_head = false;
                         top.in_if_let_pat = false;
                         top.arrow_head = false;
+                        if top.angle_depth == 0 {
+                            top.elem_attrs = None;
+                            top.attr_start = None;
+                            top.attr_end = 0;
+                            top.elem_fresh = true;
+                        }
                     }
                     _ => {}
+                }
+                if !matches!(kind, TokenKind::Pound | TokenKind::Comma) && !(kind == TokenKind::Bang && was_pound) {
+                    top.elem_fresh = false;
                 }
                 after_struct_head = match (kind, word) {
                     (TokenKind::Ident, Some(w)) => !not_struct_head(w),
@@ -1902,19 +2139,67 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                 after_dot = kind == TokenKind::Dot;
                 after_eq = kind == TokenKind::Eq;
                 after_minus = kind == TokenKind::Minus;
-            }
-            if matches!(stack.last(), Some(Open::Other { stmt: true })) {
-                continue;
+            } else {
+                // Directly at top level (`stack.is_empty()`): track ADT keyword, `const` before
+                // `{`, and generic parameter `<#[cfg(..)] const N: usize = ...>` attributes.
+                match (kind, word) {
+                    (TokenKind::Ident, Some("struct" | "enum" | "union")) if top_angle_depth == 0 && !top_seen_adt_body => {
+                        top_item_is_adt = true;
+                    }
+                    (TokenKind::Lt, _) => {
+                        top_angle_depth = top_angle_depth.saturating_add(1);
+                        if top_angle_depth == 1 {
+                            top_elem_attrs = None;
+                            top_attr_start = None;
+                            top_attr_end = 0;
+                            top_elem_fresh = true;
+                        }
+                    }
+                    (TokenKind::Gt, _) if !was_minus && !was_eq && top_angle_depth > 0 => {
+                        top_angle_depth -= 1;
+                        if top_angle_depth == 0 {
+                            top_elem_attrs = None;
+                            top_attr_start = None;
+                            top_attr_end = 0;
+                            top_elem_fresh = false;
+                        }
+                    }
+                    (TokenKind::Comma, _) if top_angle_depth == 1 => {
+                        top_elem_attrs = None;
+                        top_attr_start = None;
+                        top_attr_end = 0;
+                        top_elem_fresh = true;
+                    }
+                    _ => {}
+                }
+                if top_angle_depth == 1
+                    && !matches!(kind, TokenKind::Pound | TokenKind::Comma | TokenKind::Lt)
+                    && !(kind == TokenKind::Bang && was_pound)
+                {
+                    top_elem_fresh = false;
+                }
+                top_prev_const = matches!((kind, word), (TokenKind::Ident, Some("const")));
+                after_eq = kind == TokenKind::Eq;
+                after_minus = kind == TokenKind::Minus;
             }
             after_ident = matches!(kind, TokenKind::Ident | TokenKind::RawIdent) && !not_a_macro(&text[start..at]);
             match kind {
                 TokenKind::Pound => {
                     after_pound = true;
+                    inner_attr = false;
+                    if let Some(top) = heads.last_mut() {
+                        if top.elem_fresh {
+                            top.attr_start.get_or_insert(offset(start));
+                        }
+                    } else if top_angle_depth == 1 && top_elem_fresh {
+                        top_attr_start.get_or_insert(offset(start));
+                    }
                     path_start = None;
                     call_start = None;
                 }
                 TokenKind::Bang if was_pound => {
                     after_pound = true;
+                    inner_attr = true;
                     path_start = None;
                     call_start = None;
                 }
@@ -1986,20 +2271,26 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
             }
         }
         if blocks_state[block as usize].comma_entries {
+            let st = &mut blocks_state[block as usize];
             match kind {
                 TokenKind::Or => {
-                    let st = &mut blocks_state[block as usize];
                     if st.in_closure_params {
                         st.in_closure_params = false;
                     } else if was_can_start_closure {
                         st.in_closure_params = true;
                     }
                 }
-                TokenKind::Lt if was_sep == 2 || blocks_state[block as usize].angle_depth > 0 => {
-                    blocks_state[block as usize].angle_depth += 1;
+                TokenKind::Colon if st.is_adt_body && st.angle_depth == 0 && !was_sep.eq(&1) => {
+                    st.in_field_type = true;
                 }
-                TokenKind::Gt if !was_eq && !was_minus && blocks_state[block as usize].angle_depth > 0 => {
-                    blocks_state[block as usize].angle_depth -= 1;
+                TokenKind::Eq if st.is_adt_body && st.angle_depth == 0 => {
+                    st.in_field_type = false;
+                }
+                TokenKind::Lt if was_sep == 2 || st.angle_depth > 0 || (st.is_adt_body && st.in_field_type) => {
+                    st.angle_depth += 1;
+                }
+                TokenKind::Gt if !was_eq && !was_minus && st.angle_depth > 0 => {
+                    st.angle_depth -= 1;
                 }
                 _ => {}
             }
@@ -2028,6 +2319,7 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                     && blocks_state[block as usize].angle_depth == 0 =>
             {
                 blocks_state[block as usize].attrs = None;
+                blocks_state[block as usize].in_field_type = false;
                 if let Some(top) = heads.last_mut() {
                     *top = GroupHead::default();
                 }
@@ -2067,6 +2359,25 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
             TokenKind::Ident if fresh => {
                 let word = &text[start..at];
                 let begin = stmt_start.unwrap_or(offset(start));
+                // Inside a `struct`/`enum`/`union` body `{ fields/variants }`, entries are fields
+                // or variants (not item declarations), so only `pub` stays a visibility lead.
+                if blocks_state[block as usize].is_adt_body {
+                    if word == "pub" {
+                        after_pub = true;
+                        stmt_start = Some(begin);
+                        continue;
+                    }
+                    blocks_state[block as usize].attrs = outer_attrs(text, stmt_start, attrs_end);
+                    fresh = false;
+                    stmt_start = None;
+                    let is_path = !not_a_macro(word);
+                    path_start = is_path.then_some(offset(start));
+                    call_start = is_path.then_some(begin);
+                    after_ident = is_path;
+                    path_stmt = false;
+                    lead = Lead::None;
+                    continue;
+                }
                 // What `word` makes of the statement: an item, more keywords, or neither.
                 let item = match (lead, word) {
                     (Lead::Union, _) => Some(NestedKind::Union),
@@ -2851,5 +3162,51 @@ fn h() {
         // `digest_body_blocks` returns `whole = true` for direct head macro calls so edits invalidate surface.
         let mut buf = blaze_own::AVec::new_in(heap.alloc());
         assert!(super::digest_body_blocks(text, &mut |b| buf.extend_from_slice(b)));
+    }
+
+    #[test]
+    fn cfg_attrs_are_preserved_on_head_calls_and_adt_fields_and_filtered_to_cfg() {
+        let heap = blaze_own::testing::heap();
+
+        // Fn params: cfg(any()) stays on param 0 and clears before param 1.
+        let fn_src = "fn f(#[allow(unused)] #[cfg(any())] _: [u8; missing!()], #[cfg(all())] _ok: [u8; make_len!()]) {}";
+        let n = scan(fn_src, heap.alloc());
+        assert_eq!(n.head_calls.len(), 2);
+        assert_eq!(&fn_src[n.head_calls[0].attrs.start as usize..n.head_calls[0].attrs.end as usize], "#[allow(unused)] #[cfg(any())]");
+        assert_eq!(&fn_src[n.head_calls[1].attrs.start as usize..n.head_calls[1].attrs.end as usize], "#[cfg(all())]");
+        let mut cfgs = blaze_own::AVec::new_in(heap.alloc());
+        super::for_each_cfg_attr(fn_src, n.head_calls[0].attrs, |r| cfgs.push(&fn_src[r.start as usize..r.end as usize]));
+        assert_eq!(cfgs.as_slice(), &["#[cfg(any())]"]);
+
+        // Tuple struct fields: cfg(any()) stays on field 0 and clears on `,`.
+        let tup_src = "struct T(#[cfg(any())] pub [u8; missing!()], [u8; make_len!()]);";
+        let n = scan(tup_src, heap.alloc());
+        assert_eq!(n.head_calls.len(), 2);
+        assert_eq!(&tup_src[n.head_calls[0].attrs.start as usize..n.head_calls[0].attrs.end as usize], "#[cfg(any())]");
+        assert_eq!(n.head_calls[1].attrs.start, n.head_calls[1].attrs.end);
+
+        // Record struct fields: cfg(any()) on field 0 clears on `,`, and cfg(any()) on field 1 after a plain field is captured.
+        let rec_src = "pub struct S { #[cfg(any())] pub a: Foo<u8, [u8; missing!()]>, b: [u8; make_len!()], #[cfg(any())] pub c: [u8; gone!()] }";
+        let n = scan(rec_src, heap.alloc());
+        assert_eq!(n.calls.len(), 3);
+        assert_eq!(&rec_src[n.calls[0].attrs.start as usize..n.calls[0].attrs.end as usize], "#[cfg(any())]");
+        assert_eq!(n.calls[1].attrs.start, n.calls[1].attrs.end);
+        assert_eq!(&rec_src[n.calls[2].attrs.start as usize..n.calls[2].attrs.end as usize], "#[cfg(any())]");
+
+        // Enum tuple variant with nested cfg on both variant and field.
+        let enum_src = "pub enum E { #[cfg(any())] V(#[cfg(all())] [u8; missing!()]), B([u8; make_len!()]) }";
+        let n = scan(enum_src, heap.alloc());
+        assert_eq!(n.calls.len(), 2);
+        assert_eq!(&enum_src[n.calls[0].attrs.start as usize..n.calls[0].attrs.end as usize], "#[cfg(any())]");
+        assert_eq!(&enum_src[n.calls[0].elem_attrs.start as usize..n.calls[0].elem_attrs.end as usize], "#[cfg(all())]");
+        assert_eq!(n.calls[1].attrs.start, n.calls[1].attrs.end);
+        assert_eq!(n.calls[1].elem_attrs.start, n.calls[1].elem_attrs.end);
+
+        // Generic param with cfg(any()).
+        let gen_src = "struct G<#[cfg(any())] const N: usize = missing!(), const M: usize = make_len!()>;";
+        let n = scan(gen_src, heap.alloc());
+        assert_eq!(n.head_calls.len(), 2);
+        assert_eq!(&gen_src[n.head_calls[0].attrs.start as usize..n.head_calls[0].attrs.end as usize], "#[cfg(any())]");
+        assert_eq!(n.head_calls[1].attrs.start, n.head_calls[1].attrs.end);
     }
 }

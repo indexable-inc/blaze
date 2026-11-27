@@ -144,6 +144,8 @@ pub(crate) fn module_text_with_blocks<'a>(
         synthetic_blocks.push(name_start);
         let _ = writeln!(out, "mod {HEAD_BLOCK_MODULE} {{\nuse super::*;");
         for c in nested.head_calls.iter() {
+            crate::expanded_blocks::emit_cfg_attrs(text, c.attrs, &mut out, copied);
+            crate::expanded_blocks::emit_cfg_attrs(text, c.elem_attrs, &mut out, copied);
             let r = c.range;
             if let (Ok(start), Ok(end)) = (usize::try_from(r.start), usize::try_from(r.end))
                 && let Some(call) = text.get(start..end)
