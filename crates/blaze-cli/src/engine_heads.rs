@@ -5624,8 +5624,8 @@ mod nested {
         assert!(by_path.any_at(path, |idx| outlined[idx].name == second_slot));
         assert_eq!(by_path.canonical_of(first_slot), first_slot);
         assert_eq!(by_path.canonical_of(second_slot), first_slot);
-        let mut siblings = std::vec::Vec::new();
+        let mut siblings = blaze_own::Vec::new_in(alloc);
         by_path.for_each_sibling(&outlined, second_slot, |slot| siblings.push(slot));
-        assert_eq!(siblings, [first_slot, second_slot]);
+        assert_eq!(siblings.as_slice(), [first_slot, second_slot]);
     }
 }

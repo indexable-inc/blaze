@@ -83,7 +83,11 @@ const WASM64_SYSROOT_DIR_DOMAIN: &str = "blaze-cli wasm64 sysroot dir 1";
 
 /// Computes the content-addressed directory name under `<store>/wasm64-sysroot-v2/` covering
 /// `tc_id` and all producer rows that produce or decode sysroot records stored there.
-fn wasm64_sysroot_dir_name(tc_id: ToolchainId, producers: &Producers) -> std::string::String {
+fn wasm64_sysroot_dir_name<'a>(
+    tc_id: ToolchainId,
+    producers: &Producers,
+    alloc: Alloc<'a>,
+) -> blaze_own::AString<'a> {
     let mut h = blaze_ids::Hasher::new(WASM64_SYSROOT_DIR_DOMAIN);
     h.part(&tc_id.0);
     h.id(producers.get::<blaze_ids::producer::Names>().id());
@@ -92,7 +96,9 @@ fn wasm64_sysroot_dir_name(tc_id: ToolchainId, producers: &Producers) -> std::st
     h.id(producers.get::<blaze_ids::producer::CodeBuilder>().id());
     h.id(producers.get::<blaze_ids::producer::Whole>().id());
     let key = h.finish();
-    std::format!("{tc_id}-{}", hex_bytes(&key.0))
+    let hex_buf = hex_bytes_buf(&key.0);
+    let hex = core::str::from_utf8(&hex_buf).unwrap_or("");
+    bstd::mem::format_in!(alloc, "{tc_id}-{hex}")
 }
 
 /// Single-flight guard used ONLY when `<store>/wasm64-sysroot-v2/<dir>/` has missing sysroot
@@ -2354,7 +2360,7 @@ fn compile_unit_in<'a>(
     let par = CompilePar::new();
     let sysroot_dir = store
         .join("wasm64-sysroot-v2")
-        .join(wasm64_sysroot_dir_name(tc_id, producers));
+        .join(wasm64_sysroot_dir_name(tc_id, producers, alloc).as_str());
     let mut sysroot_kept = Wasm64SysrootKept::open(&sysroot_dir, tc_base, crates.as_slice(), bump);
     let sysroot_guard = if sysroot_kept.has_missing() {
         let guard = SYSROOT_INIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -2447,8 +2453,9 @@ fn compile_unit_in<'a>(
                     && let Some(fresh) = fresh_sysroot.get(&krate)
                 {
                     let exp_bytes = encode_expansions_table(&e_map, &o_map);
-                    let key_hex = hex_content_id(crates[krate].key.0);
-                    let _ = publish_sysroot_crate(&sysroot_dir, &key_hex, fresh, &exp_bytes);
+                    let key_hex_buf = hex_bytes_buf(&crates[krate].key.0.0);
+                    let key_hex = core::str::from_utf8(&key_hex_buf).unwrap_or("");
+                    let _ = publish_sysroot_crate(&sysroot_dir, key_hex, fresh, &exp_bytes);
                 }
                 kept.expansions.push(e_map);
                 kept.origins.push(o_map);
@@ -2846,7 +2853,8 @@ impl<'a> Wasm64SysrootKept<'a> {
                 loaded.push(None);
                 continue;
             }
-            let dir = sysroot_dir.join(hex_content_id(input.key.0));
+            let key_hex_buf = hex_bytes_buf(&input.key.0.0);
+            let dir = sysroot_dir.join(core::str::from_utf8(&key_hex_buf).unwrap_or(""));
             let rec = (|| -> Option<CachedSysrootCrate<'a>> {
                 let exports = std::fs::read(dir.join("exports.bin")).ok()?;
                 let inner = std::fs::read(dir.join("inner.bin")).ok()?;
@@ -2945,16 +2953,16 @@ fn classify_scope_resolve_error(
     }
 }
 
-fn hex_bytes(bytes: &[u8; 32]) -> std::string::String {
-    let mut s = std::string::String::with_capacity(64);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
+fn hex_bytes_buf(bytes: &[u8; 32]) -> [u8; 64] {
+    const HEX: [u8; 16] = *b"0123456789abcdef";
+    let mut out = [0u8; 64];
+    for (b, slot) in bytes.iter().zip(out.chunks_exact_mut(2)) {
+        if let [hi, lo] = slot {
+            *hi = HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0');
+            *lo = HEX.get(usize::from(b & 0x0f)).copied().unwrap_or(b'0');
+        }
     }
-    s
-}
-
-fn hex_content_id(id: ContentId) -> std::string::String {
-    hex_bytes(&id.0)
+    out
 }
 
 fn encode_expansions_table(
@@ -3617,7 +3625,7 @@ mod tests {
         // (never bstd / sonic-rs) under its producer-keyed directory.
         let sysroot_dir = store_dir
             .join("wasm64-sysroot-v2")
-            .join(super::wasm64_sysroot_dir_name(tc_id, &producers));
+            .join(super::wasm64_sysroot_dir_name(tc_id, &producers, heap.alloc()).as_str());
         let cached_count = std::fs::read_dir(&sysroot_dir)
             .expect("read wasm64-sysroot-v2")
             .filter_map(Result::ok)
@@ -3635,19 +3643,20 @@ mod tests {
     fn wasm64_sysroot_dir_key_moves_on_each_producer_row_and_toolchain() {
         use blaze_ids::producer::Row;
 
+        let alloc = blaze_own::testing::heap().alloc();
         let tc_a = blaze_toolchain::PINNED;
         let tc_b = blaze_toolchain::ToolchainId([0x5a; 32]);
         let base = Producers::for_tests(b"sysroot-key-base");
-        let base_dir = super::wasm64_sysroot_dir_name(tc_a, &base);
+        let base_dir = super::wasm64_sysroot_dir_name(tc_a, &base, alloc);
 
         // Deterministic for identical inputs.
-        assert_eq!(base_dir, super::wasm64_sysroot_dir_name(tc_a, &base));
-        assert!(base_dir.starts_with(&std::format!("{tc_a}-")));
+        assert_eq!(base_dir, super::wasm64_sysroot_dir_name(tc_a, &base, alloc));
+        assert!(base_dir.starts_with(bstd::mem::format_in!(alloc, "{tc_a}-").as_str()));
 
         // Changing the toolchain id moves the directory key.
         assert_ne!(
             base_dir,
-            super::wasm64_sysroot_dir_name(tc_b, &base),
+            super::wasm64_sysroot_dir_name(tc_b, &base, alloc),
             "toolchain id must change wasm64-sysroot-v2 key"
         );
 
@@ -3656,7 +3665,7 @@ mod tests {
         // so format bumps miss cleanly instead of reading stale `NotThisRecord` bytes (Rule 21).
         for row in [Row::Names, Row::Expander, Row::Lowering, Row::CodeBuilder, Row::Whole] {
             let moved = base.planted_for_tests(row, b"sysroot-key-bumped");
-            let moved_dir = super::wasm64_sysroot_dir_name(tc_a, &moved);
+            let moved_dir = super::wasm64_sysroot_dir_name(tc_a, &moved, alloc);
             assert_ne!(
                 base_dir, moved_dir,
                 "moving producer row {row:?} must change wasm64-sysroot-v2 key"

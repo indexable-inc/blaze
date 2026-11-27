@@ -221,25 +221,18 @@ pub mod cold {
     /// Public umbrella library always loaded in every macOS process.
     const LIBSYSTEM_PATH: &CStr = c"/usr/lib/libSystem.B.dylib";
 
-    /// Cached handle to `/usr/lib/libSystem.B.dylib`. Using libSystem's handle directly skips
-    /// this file's `#[unsafe(no_mangle)]` definitions in AOT executables AND works when
-    /// `resolve_cold` executes from JIT-mapped memory (where macOS `dyld`'s `RTLD_NEXT` fails
-    /// because the caller's return address is not inside any loaded Mach-O image).
+    /// Look up `/usr/lib/libSystem.B.dylib` (already loaded in every macOS process). Using
+    /// libSystem's handle directly skips this file's `#[unsafe(no_mangle)]` definitions in AOT
+    /// executables AND works when `resolve_cold` executes from JIT-mapped memory (where macOS
+    /// `dyld`'s `RTLD_NEXT` fails because the caller's return address is not inside any loaded
+    /// Mach-O image). Only called from cold first-use symbol resolution.
     fn libsystem() -> *mut c_void {
-        static HANDLE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
-        let cached = HANDLE.load(Ordering::Relaxed);
-        if !cached.is_null() {
-            return cached;
-        }
         // SAFETY: `LIBSYSTEM_PATH` is a live NUL-terminated path; `RTLD_LAZY | RTLD_NOLOAD`
         // queries the already-loaded dyld image without loading new libraries.
         let handle = unsafe { super::ffi::dlopen(LIBSYSTEM_PATH.as_ptr(), RTLD_LAZY | RTLD_NOLOAD) };
         if handle.is_null() {
-            panic!(
-                "blaze_sys::macos::cold: dlopen({LIBSYSTEM_PATH:?}, RTLD_LAZY | RTLD_NOLOAD) returned null (rule 3: no other is put in its place)"
-            );
+            missing(LIBSYSTEM_PATH);
         }
-        HANDLE.store(handle, Ordering::Relaxed);
         handle
     }
 

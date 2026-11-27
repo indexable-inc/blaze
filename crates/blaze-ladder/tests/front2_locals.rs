@@ -364,9 +364,12 @@ pub fn does_not_leak_later_prelude(x: u32) -> Result<u16, core::num::TryFromIntE
 }
 
 mod front2_locals {
+    mod box_deref_captures;
     mod closure_uncaptured_place_run;
     mod deep_interior_stall;
     mod deref_dyn_run;
+    mod local_inner_hygiene;
     mod or_pat_whole_local_move;
     mod scope_end_adjusted_run;
+    mod transparent_mark_edition;
 }

@@ -2043,7 +2043,7 @@ mod tests {
             other => panic!("expected the recursion limit, got {other:?}"),
         }
         assert_eq!(rows, 129, "depths 0..=128 are rows");
-        let shown = std::format!("{}", WalkError::<NameError>::RecursionLimit { tabled: ItemKey(R), item: ItemKey(R), declarer: Some(ItemKey(R)), depth: 129, limit: 128 });
+        let shown = blaze_own::format_in!(blaze_own::testing::heap().alloc(), "{}", WalkError::<NameError>::RecursionLimit { tabled: ItemKey(R), item: ItemKey(R), declarer: Some(ItemKey(R)), depth: 129, limit: 128 });
         assert!(shown.starts_with("reached the recursion limit while instantiating fn 0xc001"), "{shown}");
         let (ran, rows) = walk_to(Some(200), u32::MAX);
         assert!(matches!(ran, Err(WalkError::RecursionLimit { depth: 201, limit: 200, .. })), "control: the crate's limit is the one read: {ran:?}");
@@ -2119,7 +2119,7 @@ mod tests {
         let producer = model_producer();
         let mut entry: AVec<'_, u8> = Vec::new_in(alloc);
         name_of(MAIN, None, &mut entry);
-        let mut printed = std::string::String::new();
+        let mut printed = blaze_own::AString::new_in(alloc);
         for recorded in [true, false] {
             let mut ids = Ids::new([0, 0]);
             ids.recorded = recorded;
@@ -2135,7 +2135,7 @@ mod tests {
             let mut scratch = Scratch::new_in(alloc);
             split.root::<NameError>((ItemKey(MAIN), &entry), 64).expect("main is reached");
             loop {
-                let mut wave: std::vec::Vec<(Pending, AVec<'_, u8>)> = std::vec::Vec::new();
+                let mut wave: AVec<'_, (Pending, AVec<'_, u8>)> = AVec::new_in(alloc);
                 for row in 0..split.len() {
                     if split.how(row) != How::Waiting {
                         continue;
@@ -2146,7 +2146,8 @@ mod tests {
                         Begun::Make(pending) => pending,
                     };
                     assert_eq!(split.how(row), How::Making);
-                    let name: std::vec::Vec<u8> = split.name(row).to_vec();
+                    let mut name: AVec<'_, u8> = AVec::new_in(alloc);
+                    name.extend_from_slice(split.name(row));
                     let mut made: AVec<'_, u8> = Vec::new_in(alloc);
                     pending.order().make(&mut split_model, &GRANT, &name, &mut made).expect("made apart from the walk");
                     wave.push((pending, made));
@@ -2160,7 +2161,11 @@ mod tests {
             }
 
             assert_eq!((split.len(), split_model.calls, split_store.puts), (serial.len(), serial_model.calls, serial_store.puts));
-            let declared = |walk: &Walk<'_>, row: usize| -> std::vec::Vec<Symbol> { walk.declared(row).iter().map(|&c| walk.symbol(c as usize)).collect() };
+            let declared = |walk: &Walk<'_>, row: usize| -> AVec<'_, Symbol> {
+                let mut out = AVec::new_in(alloc);
+                out.extend(walk.declared(row).iter().map(|&c| walk.symbol(c as usize)));
+                out
+            };
             for row in 0..serial.len() {
                 let other = split.row_of(&serial.symbol(row)).expect("the split walk reached every row the serial one did");
                 assert_eq!(split.how(other), serial.how(row), "row {row}");
@@ -2183,7 +2188,8 @@ mod tests {
             let refused = split.finish::<NameError>(foreign, &[], &ids, &mut split_store, &Toy, 64, &mut scratch).map(|one| one.stepped);
             assert!(matches!(refused, Err(WalkError::NotBegun { tabled: ItemKey(MAIN) })), "control: {refused:?}");
             assert_eq!(split.how(0), before);
-            printed.push_str(&std::format!("{} {} rows {} makes; ", if recorded { "keyed" } else { "unkeyed" }, split.len(), split_model.calls));
+            use core::fmt::Write;
+            let _ = write!(printed, "{} {} rows {} makes; ", if recorded { "keyed" } else { "unkeyed" }, split.len(), split_model.calls);
         }
         println!("split_steps_equal_one: {}", printed.trim_end_matches("; "));
     }
@@ -2354,8 +2360,8 @@ mod tests {
     fn toolchain_fn_declaring_program_item_is_classified_as_program() {
         struct RecordingStore<'a> {
             inner: MemoryStore<'a>,
-            put_classes: std::vec::Vec<(CodeKey, CodeClass)>,
-            point_classes: std::vec::Vec<(CodeKey, CodeClass)>,
+            put_classes: AVec<'a, (CodeKey, CodeClass)>,
+            point_classes: AVec<'a, (CodeKey, CodeClass)>,
         }
         impl CodeStore for RecordingStore<'_> {
             fn get(&self, key: CodeKey) -> Result<Option<&[u8]>, StoreError> {
@@ -2405,8 +2411,8 @@ mod tests {
         name_of(MAIN, None, &mut entry);
         let mut store = RecordingStore {
             inner: MemoryStore::new_in(alloc),
-            put_classes: std::vec::Vec::new(),
-            point_classes: std::vec::Vec::new(),
+            put_classes: AVec::new_in(alloc),
+            point_classes: AVec::new_in(alloc),
         };
         let mut model = Model { alloc, calls: 0 };
         let mut walk = Walk::new_in(alloc);
@@ -2425,8 +2431,8 @@ mod tests {
         name_of(PLAIN, None, &mut plain_name);
         let mut tool_store = RecordingStore {
             inner: MemoryStore::new_in(alloc),
-            put_classes: std::vec::Vec::new(),
-            point_classes: std::vec::Vec::new(),
+            put_classes: AVec::new_in(alloc),
+            point_classes: AVec::new_in(alloc),
         };
         let mut walk_tool = Walk::new_in(alloc);
         let plain_root = walk_tool.root::<NameError>((ItemKey(PLAIN), &plain_name), 64).expect("plain reached");

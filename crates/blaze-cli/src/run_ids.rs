@@ -959,7 +959,7 @@ impl<'a> CutCache<'a> {
     fn parents_of(&self, child: Name) -> impl Iterator<Item = Name> + '_ {
         let from = self.parents.partition_point(|&(c, _)| c < child);
         let to = self.parents.partition_point(|&(c, _)| c <= child);
-        self.parents[from..to].iter().map(|&(_, parent)| parent)
+        self.parents.get(from..to).unwrap_or(&[]).iter().map(|&(_, parent)| parent)
     }
 
     fn load(&mut self, cx: &Cx, answer: &mut dyn Answer, file: Name) -> Result<usize, RunIdsError<'static>> {
@@ -1016,16 +1016,17 @@ impl<'a> CutCache<'a> {
             let Err(slot) = seen.binary_search(&cur) else { continue };
             seen.insert_shift(slot, cur);
             let idx = self.load(cx, answer, cur)?;
-            if self.files[idx].cuts.as_ref().is_some_and(|c| c.own.cuts(test_atom)) {
+            let Some(info) = self.files.get(idx) else { continue };
+            if info.cuts.as_ref().is_some_and(|c| c.own.cuts(test_atom)) {
                 continue;
             }
             if cur == target {
                 return Ok(true);
             }
             outgoing.clear();
-            for &(child, place) in self.files[idx].file_parts.iter() {
+            for &(child, place) in info.file_parts.iter() {
                 if ancestors.binary_search(&child).is_ok()
-                    && !self.files[idx].cuts.as_ref().is_some_and(|c| c.of(place).cuts(test_atom))
+                    && !info.cuts.as_ref().is_some_and(|c| c.of(place).cuts(test_atom))
                 {
                     outgoing.push((child, place));
                 }
@@ -1059,11 +1060,11 @@ impl<'a> CutCache<'a> {
             let file_idx = self.load(cx, answer, file)?;
             body_cuts.clear();
             {
-                let info = &self.files[file_idx];
+                let Some(info) = self.files.get(file_idx) else { return Ok(false) };
                 let Some(cuts) = info.cuts.as_ref() else { return Ok(false) };
                 let from = info.body_places.partition_point(|&(n, _)| n < check);
                 let to = info.body_places.partition_point(|&(n, _)| n <= check);
-                for &(_, place) in &info.body_places[from..to] {
+                for &(_, place) in info.body_places.get(from..to).unwrap_or(&[]) {
                     body_cuts.push(cuts.of(place));
                 }
             }

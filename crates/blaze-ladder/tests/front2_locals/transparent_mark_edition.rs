@@ -24,13 +24,11 @@
 //!
 //! Self-contained `#![no_core]`: needs no toolchain.
 
-use std::alloc::Global;
-
 use blaze_expand::{HostAsk, HostError, HostWhy, MacroDefinition, ProcCall, ProcKind, Produced, Reads, TokenOrigin, Transparency, lex};
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_ladder::front2::body_host::{BodySources, Sourced};
 use blaze_ladder::front2::program::Front2Program;
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AString, AVec, Alloc};
 use blaze_scope::graph::Sysroot;
 use blaze_scope::resolve::{CrateInput, Names, SourceTexts, resolve_crates};
 use blaze_scope::task::Serial;
@@ -325,7 +323,7 @@ fn fn_named(names: &Names<'_>, name: &str) -> blaze_id::ItemKey {
 
 #[test]
 fn transparent_proc_macro_preserves_defining_edition_for_binding_modifiers() {
-    let g = blaze_own::Alloc::global();
+    let g = blaze_own::testing::heap().alloc();
     let crates = [
         crate_input(
             "user",
@@ -344,15 +342,19 @@ fn transparent_proc_macro_preserves_defining_edition_for_binding_modifiers() {
     let names = resolve_crates(&crates, Sysroot::default(), &FILES, &Serial, blaze_own::testing::bump())
         .unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
-    let sources: &'static dyn BodySources = Box::leak(Box::new(Sourced(&FILES)));
+    let sources_val = Sourced(&FILES);
+    let sources: &dyn BodySources = &sources_val;
 
     // Positive: edition-2021 transparent derive + body proc-macro (both direct AND nested inside
     // edition-2024 `macro_rules!`) check cleanly with 0 diagnostics (`BindingModifier2024` NOT
     // fired) while preserving `macro_rules!` local hygiene (`helper: u32`).
-    let mut left_out = Vec::new_in(Global);
+    let mut left_out = Vec::new();
     let _ok = Front2Program::survey_from(&names, &frame, &[], &[fn_named(&names, "main_ok")], &mut left_out, Some(sources), g)
         .unwrap_or_else(|e| panic!("edition-2021 transparent proc-macros must succeed: {e}"));
-    let ok_rows: Vec<String> = left_out.iter().map(|(f, row)| format!("{f}: {}", row.class)).collect();
+    let mut ok_rows: AVec<'_, AString<'_>> = AVec::new_in(g);
+    for (f, row) in left_out.iter() {
+        ok_rows.push(blaze_own::format_in!(g, "{f}: {}", row.class));
+    }
     assert!(ok_rows.is_empty(), "edition-2021 transparent proc-macros (direct + nested in E2024 rules) must have 0 errors: {ok_rows:?}");
 
     // Negative controls: edition-2024 transparent derive, edition-2024 transparent body proc-macro,
@@ -365,10 +367,13 @@ fn transparent_proc_macro_preserves_defining_edition_for_binding_modifiers() {
         ("main_nested_body_2024_in_2021", "nested_body_2024_in_2021"),
         ("main_direct_2024", "direct_2024"),
     ] {
-        let mut left_out = Vec::new_in(Global);
+        left_out.clear();
         let res = Front2Program::survey_from(&names, &frame, &[], &[fn_named(&names, root_name)], &mut left_out, Some(sources), g);
-        let rows: Vec<String> = left_out.iter().map(|(f, row)| format!("{f}: {}", row.class)).collect();
-        let err_text = res.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+        let mut rows: AVec<'_, AString<'_>> = AVec::new_in(g);
+        for (f, row) in left_out.iter() {
+            rows.push(blaze_own::format_in!(g, "{f}: {}", row.class));
+        }
+        let err_text = res.as_ref().err().map(|e| blaze_own::format_in!(g, "{e}")).unwrap_or_else(|| AString::new_in(g));
         assert!(
             rows.iter().any(|r| r.contains(target_fn) && r.contains("check: Diags: E0000")),
             "negative control `{root_name}` (`{target_fn}`) must fire E0000 (BindingModifier2024); left_out={rows:?}; err={err_text}"
@@ -377,9 +382,12 @@ fn transparent_proc_macro_preserves_defining_edition_for_binding_modifiers() {
 
     // Negative control for E2015 vs E2024 keyword parsing: `async`/`try` emitted by an E2024
     // transparent proc-macro must be rejected as keywords (failing to parse as identifiers).
-    let mut left_out = Vec::new_in(Global);
+    left_out.clear();
     let res = Front2Program::survey_from(&names, &frame, &[], &[fn_named(&names, "main_body_2024_async_ident")], &mut left_out, Some(sources), g);
-    let rows: Vec<String> = left_out.iter().map(|(f, row)| format!("{f}: {}", row.class)).collect();
+    let mut rows: AVec<'_, AString<'_>> = AVec::new_in(g);
+    for (f, row) in left_out.iter() {
+        rows.push(blaze_own::format_in!(g, "{f}: {}", row.class));
+    }
     assert!(
         rows.iter().any(|r| r.contains("body_2024_async_ident")) || res.is_err(),
         "negative control `main_body_2024_async_ident` must fail parsing `async`/`try` as identifiers in E2024; left_out={rows:?}"

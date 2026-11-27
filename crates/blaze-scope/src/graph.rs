@@ -535,7 +535,7 @@ mod tests {
         GraphCrate { name, edition: Edition::E2024, implicit, features: AVec::new_in(a()), cfg: AVec::new_in(a()), deps: d }
     }
 
-    fn graph(crates: std::vec::Vec<GraphCrate<'static, &'static str>>, sys: Sysroot) -> Result<CrateGraph<'static, &'static str>, GraphError<'static, &'static str>> {
+    fn graph(crates: impl IntoIterator<Item = GraphCrate<'static, &'static str>>, sys: Sysroot) -> Result<CrateGraph<'static, &'static str>, GraphError<'static, &'static str>> {
         let mut v = AVec::new_in(a());
         v.extend(crates);
         CrateGraph::new_in(v, sys, a())
@@ -623,7 +623,7 @@ mod tests {
             bstd: None,
         };
         let g = graph(
-            std::vec![
+            [
                 krate("core", &[], rust()),
                 krate("alloc", &[("core", 0)], rust()),
                 krate("std", &[("alloc", 1), ("core", 0)], rust()),
@@ -635,17 +635,17 @@ mod tests {
         )
         .expect("no cycle");
         let lib = g.externs(CrateId(4), RootAttrs::default());
-        assert_eq!(names(&lib.prelude), std::vec![("core", 0), ("std", 2)], "non-proc-macro lib must NOT have `proc_macro` in extern prelude");
-        assert_eq!(names(&lib.deps), std::vec![("alloc", 1), ("core", 0), ("proc_macro", 3), ("std", 2)], "non-proc-macro lib must have `proc_macro` in deps for `extern crate proc_macro;`");
+        assert_eq!(names(&lib.prelude).as_slice(), [("core", 0), ("std", 2)], "non-proc-macro lib must NOT have `proc_macro` in extern prelude");
+        assert_eq!(names(&lib.deps).as_slice(), [("alloc", 1), ("core", 0), ("proc_macro", 3), ("std", 2)], "non-proc-macro lib must have `proc_macro` in deps for `extern crate proc_macro;`");
         assert!(lib.dropped.is_empty(), "{:?}", lib.dropped);
         // `#![no_std]` non-proc-macro lib also gets `proc_macro` in deps (not prelude).
         let lib_no_std = g.externs(CrateId(4), RootAttrs { no_std: true, ..RootAttrs::default() });
-        assert_eq!(names(&lib_no_std.prelude), std::vec![("core", 0)]);
-        assert_eq!(names(&lib_no_std.deps), std::vec![("alloc", 1), ("core", 0), ("proc_macro", 3), ("std", 2)]);
+        assert_eq!(names(&lib_no_std.prelude).as_slice(), [("core", 0)]);
+        assert_eq!(names(&lib_no_std.deps).as_slice(), [("alloc", 1), ("core", 0), ("proc_macro", 3), ("std", 2)]);
         // A proc-macro crate gets `proc_macro` in BOTH prelude and deps.
         let pm = g.externs(CrateId(5), RootAttrs::default());
-        assert_eq!(names(&pm.prelude), std::vec![("core", 0), ("proc_macro", 3), ("std", 2)]);
-        assert_eq!(names(&pm.deps), std::vec![("alloc", 1), ("core", 0), ("proc_macro", 3), ("std", 2)]);
+        assert_eq!(names(&pm.prelude).as_slice(), [("core", 0), ("proc_macro", 3), ("std", 2)]);
+        assert_eq!(names(&pm.deps).as_slice(), [("alloc", 1), ("core", 0), ("proc_macro", 3), ("std", 2)]);
         assert!(pm.dropped.is_empty(), "{:?}", pm.dropped);
         // `std` (built into `proc_macro`) does not name `proc_macro` (no cycle).
         let std_ext = g.externs(CrateId(2), RootAttrs { no_std: true, ..RootAttrs::default() });

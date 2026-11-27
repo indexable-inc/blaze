@@ -731,35 +731,41 @@ fn main() {}
     assert_eq!(laid(&got[18], "f_direct_flip_static").col, [P0, ST, ST], "direct `&'r dyn FlipStatic<'e>` defaults object lifetime to `'static`");
 
     // Deep supertrait chain (> 64 states, e.g. 70 levels): traverses past 64 and resolves `'e`.
-    let mut deep = String::from("trait S0<'a>: 'a {}\n");
+    use core::fmt::Write as _;
+    let alloc = blaze_own::testing::heap().alloc();
+    let bump = blaze_own::testing::bump();
+    let mut deep = blaze_own::AString::new_in(alloc);
+    deep.push_str("trait S0<'a>: 'a {}\n");
     for i in 1..=70 {
-        deep.push_str(&format!("trait S{i}<'a>: S{}<'a> {{}}\n", i - 1));
+        let _ = writeln!(deep, "trait S{i}<'a>: S{}<'a> {{}}", i - 1);
     }
     deep.push_str("fn f_deep<'a, 'e>(_: &'a dyn S70<'e>) {}\nfn main() {}\n");
-    let deep_got = heads(Box::leak(deep.into_boxed_str()), &[Ask::Free("f_deep")]);
+    let deep_got = heads(bump.alloc_str(deep.as_str()), &[Ask::Free("f_deep")]);
     assert_eq!(laid(&deep_got[0], "f_deep").col, [P0, P1, P1], "70-level supertrait chain derives `'e`");
 
     // 20-level binary lifetime fan-out (> 1,000,000 distinct `(trait, lifetime-args)` tuple states,
     // 22 traits total): O((V + E) * S) per-parameter propagation resolves `'e` instantaneously.
-    let mut wide = String::from("trait Root<'r>: 'r {}\n");
+    let mut wide = blaze_own::AString::new_in(alloc);
+    wide.push_str("trait Root<'r>: 'r {}\n");
     let extras = |n: usize| {
-        let mut s = String::new();
+        let mut s = blaze_own::AString::new_in(alloc);
         for i in 0..n {
-            s.push_str(&format!(", 'x{i}"));
+            let _ = write!(s, ", 'x{i}");
         }
         s
     };
-    wide.push_str(&format!("trait D0<'r, 'a, 'b{}>: Root<'r> {{}}\n", extras(20)));
+    let _ = writeln!(wide, "trait D0<'r, 'a, 'b{}>: Root<'r> {{}}", extras(20));
     for k in 1..=20 {
         let ex = extras(20 - k);
-        wide.push_str(&format!(
-            "trait D{k}<'r, 'a, 'b{ex}>: D{}<'r, 'a, 'b{ex}, 'a> + D{}<'r, 'a, 'b{ex}, 'b> {{}}\n",
+        let _ = writeln!(
+            wide,
+            "trait D{k}<'r, 'a, 'b{ex}>: D{}<'r, 'a, 'b{ex}, 'a> + D{}<'r, 'a, 'b{ex}, 'b> {{}}",
             k - 1,
             k - 1,
-        ));
+        );
     }
     wide.push_str("fn f_wide<'r, 'e, 'a, 'b>(_: &'r dyn D20<'e, 'a, 'b>) {}\nfn main() {}\n");
-    let wide_got = heads(Box::leak(wide.into_boxed_str()), &[Ask::Free("f_wide")]);
+    let wide_got = heads(bump.alloc_str(wide.as_str()), &[Ask::Free("f_wide")]);
     assert_eq!(laid(&wide_got[0], "f_wide").col, [P0, P1, P1, P2, Region::Param(3)], "20-level binary fan-out (>1M tuple states) derives `'e`");
     println!("front2_region_rules: rfc1156_default_trait_object_lifetime_columns: 21 heads verified");
 }
