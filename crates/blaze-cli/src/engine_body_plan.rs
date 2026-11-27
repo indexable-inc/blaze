@@ -45,7 +45,7 @@ use core::fmt;
 
 use blaze_drive::cells::Cell;
 use blaze_drive::key::ABSENT;
-use blaze_drive::view::{UnitView, ViewKey, ViewPlan, at_view};
+use blaze_drive::view::{MemberView, UnitView, ViewKey, ViewPlan, at_view};
 use blaze_drive::{Kind, Locate, Name};
 use blaze_engine::{CellId, Task, View};
 use blaze_ids::ContentId;
@@ -480,12 +480,44 @@ pub(crate) fn root_file(list: &CrateList<'_>, at: usize) -> Name {
     Name::file(list.root(at).strip_prefix("/0/").unwrap_or(list.root(at)).as_bytes())
 }
 
+fn member_view_of<'b>(list: &CrateList<'b>, at: usize) -> MemberView<'b> {
+    let env = list.env_facts(at);
+    MemberView {
+        root: list.root(at).as_bytes(),
+        name: CrateGraph::name(list, at).as_bytes(),
+        test: list.test(at),
+        macro_side: CrateGraph::side(list, at) == blaze_world::Side::Macro,
+        proc_macro: CrateGraph::proc_macro(list, at),
+        test_or_bench: env.test_or_bench,
+        bin: env.bin.map(str::as_bytes),
+        package: list.package(at).as_bytes(),
+    }
+}
+
 /// The view of crate list row `at`, a member unit (blaze-drive view.rs `ViewKey::of_member`):
-/// its root, its crate's name and whether it is a test build, never its crate key (which holds
-/// its dependencies' keys: a dependency bumped would rename every view row). The one spelling
-/// check (here) and run (run_ids.rs `unit_roots`) both ask rows by.
+/// its root, crate name, `test` flag, build side (`Side::Target` vs `Side::Macro`), target-kind
+/// flags, binary name, and package name — never its crate key (which holds its dependencies'
+/// keys: a dependency bumped would rename every view row, rule 77), unless another member row in
+/// `list` shares every one of those fields (e.g. a lib and an example pointing at the same file
+/// with the same crate name), in which case `ViewKey::disambiguate` folds in `list.key(at)` so no
+/// two member rows can ever collide on one view key (D191, rule 21). Scanning the full `list`
+/// keeps every unit's view key invariant under scope narrowing (`CheckScope`). The one spelling
+/// check (here) and run (run_ids.rs `unit_roots_scoped`) both ask rows by.
 pub(crate) fn unit_view(list: &CrateList<'_>, at: usize) -> ViewKey {
-    ViewKey::of_member(list.root(at).as_bytes(), CrateGraph::name(list, at).as_bytes(), list.test(at))
+    let mv = member_view_of(list, at);
+    let base = ViewKey::of_member(mv);
+    let collides = (0..CrateGraph::len(list)).any(|other| {
+        other != at
+            && list.member(other)
+            && list.root(other).as_bytes() == mv.root
+            && list.test(other) == mv.test
+            && member_view_of(list, other) == mv
+    });
+    if collides {
+        ViewKey::disambiguate(base, list.key(at))
+    } else {
+        base
+    }
 }
 
 /// One member unit as the plan ranks it (D191): its `CrateScope` task's name ([`Unit::name`])
