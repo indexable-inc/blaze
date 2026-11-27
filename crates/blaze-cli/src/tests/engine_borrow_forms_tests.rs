@@ -247,6 +247,36 @@ pub fn check_bytes() -> bool {
 pub fn check_owned() -> u32 {
     (&&Infer::<Owned>::new()).pick()
 }
+pub enum MyOpt<T> {
+    None,
+    Some(T),
+}
+pub trait MyIter {
+    type Item;
+    fn next_item(&mut self) -> MyOpt<Self::Item>;
+}
+pub struct FilterWrap<I, P> {
+    iter: I,
+    pred: P,
+}
+impl<I: MyIter, P> MyIter for FilterWrap<I, P>
+where
+    P: for<'a> MyFrom<&'a I::Item>,
+{
+    type Item = I::Item;
+    fn next_item(&mut self) -> MyOpt<Self::Item> { MyOpt::None }
+}
+pub struct U8Iter;
+impl MyIter for U8Iter {
+    type Item = u8;
+    fn next_item(&mut self) -> MyOpt<u8> { MyOpt::None }
+}
+impl<'a> MyFrom<&'a u8> for Owned {
+    fn from_val(_: &'a u8) -> Self { Owned }
+}
+pub fn check_filter_assoc(mut f: FilterWrap<U8Iter, Owned>) -> MyOpt<u8> {
+    f.next_item()
+}
 "#;
     let (said, codes, notes) = check_text(SRC);
     assert!(error_lines(&said).is_empty(), "expected 0 errors (codes={codes:?}, notes={notes:?}):\n{said}");

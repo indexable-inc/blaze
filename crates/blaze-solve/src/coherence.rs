@@ -660,7 +660,7 @@ fn overlap_inner<'a, T: Tys, F: Facts>(
     if la.len != lb.len {
         return Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred())));
     }
-    let mut goals: Vec<Pred, Alloc<'a>> = Vec::new_in(alloc);
+    let mut goals: Vec<(Pred, u32), Alloc<'a>> = Vec::new_in(alloc);
     let mut deferred: Vec<(Ty, Ty), Alloc<'a>> = Vec::new_in(alloc);
     for i in 0..la.len {
         let (x, y) = (tys.list_get(la, i), tys.list_get(lb, i));
@@ -675,29 +675,31 @@ fn overlap_inner<'a, T: Tys, F: Facts>(
                 _ => VarKind::Ty,
             };
             let fresh = tys.fresh(kind)?;
-            goals.push(Pred::Projection { alias, term: fresh });
+            goals.push((Pred::Projection { alias, term: fresh }, 0));
             if !tys.unify(fresh, other, Relate::Lazy, &mut deferred)? {
                 return Ok(Overlap::Disjoint);
             }
         }
     }
-    for &wc in ha.where_clauses {
-        goals.push(import_pred(tys, &mut s, ha.portable, wc, &va, alloc)?);
+    for (i, &wc) in ha.where_clauses.iter().enumerate() {
+        let bound = ha.where_clause_bounds.get(i).copied().unwrap_or(0);
+        goals.push((import_pred(tys, &mut s, ha.portable, wc, &va, alloc)?, bound));
     }
-    for &wc in hb.where_clauses {
-        goals.push(import_pred(tys, &mut s, hb.portable, wc, &vb, alloc)?);
+    for (i, &wc) in hb.where_clauses.iter().enumerate() {
+        let bound = hb.where_clause_bounds.get(i).copied().unwrap_or(0);
+        goals.push((import_pred(tys, &mut s, hb.portable, wc, &vb, alloc)?, bound));
     }
     let env = solver.env(tys, facts, &[], reads)?;
     let mut pending = goals;
-    let mut next: Vec<Pred, Alloc<'a>> = Vec::new_in(alloc);
+    let mut next: Vec<(Pred, u32), Alloc<'a>> = Vec::new_in(alloc);
     for _ in 0..MAX_ROUNDS {
         let bound_before = tys.bindings_len();
         next.clear();
-        for &pred in pending.iter() {
-            match solver.evaluate(tys, facts, TypingMode::Coherence, Goal { env, pred, bound: 0 }, reads)? {
+        for &(pred, bound) in pending.iter() {
+            match solver.evaluate(tys, facts, TypingMode::Coherence, Goal { env, pred, bound }, reads)? {
                 Answer::No => return Ok(Overlap::Disjoint),
                 Answer::Yes => {}
-                Answer::Maybe(_) => next.push(pred),
+                Answer::Maybe(_) => next.push((pred, bound)),
             }
         }
         if next.is_empty() {

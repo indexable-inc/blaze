@@ -1031,9 +1031,10 @@ fn step_impl<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, stage
         if !cx.eq_lists(gtr, itr)? {
             return Ok(Step::No);
         }
-        for &wc in h.where_clauses {
+        for (i, &wc) in h.where_clauses.iter().enumerate() {
             let p = cx.import_pred(h.portable, wc, iargs)?;
-            cx.add(GoalSource::ImplWhereBound, p);
+            let bound = h.where_clause_bounds.get(i).copied().unwrap_or(0);
+            cx.add_bound(GoalSource::ImplWhereBound, p, bound);
         }
         // The impl's arguments, kept for stage 1 as one term.
         cand.b = cx.mk(TyKind::Tuple(iargs))?;
