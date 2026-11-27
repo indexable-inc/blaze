@@ -126,6 +126,57 @@ pub(crate) fn language_clone_adt<P: FrontEnd>(
     }
 }
 
+/// Builtin `Clone::clone_from` for types that can never have a user-written `impl Clone`
+/// (checked before `FrontEnd::resolve`). Unlike `Clone::clone`, `Clone::clone_from` has a real
+/// default body in `core` (`*self = source.clone()`), so resolving to the trait's own
+/// `clone_from` item lets normal checking and lowering compile that default body at `[Self]`,
+/// whose inner `source.clone()` hits [`language_clone_unconditional`]. `PNode::Adt` is
+/// intentionally excluded here so an explicit `impl Clone for S` (which may override
+/// `clone_from`) always wins via `resolve`; see [`language_clone_from_adt`].
+pub(crate) fn language_clone_from_unconditional<P: FrontEnd>(program: &P, called: Instance, ground: &PortableTys<'_>) -> Option<ItemKey> {
+    let clone_from = program.lang_trait_fn(LangItem::Clone, "clone_from")?;
+    if called.item != clone_from {
+        return None;
+    }
+    let view = ground.view();
+    let &[me] = view.list(called.args).ok()? else { return None };
+    match view.node(me).ok()? {
+        PNode::FnDef(..) | PNode::FnPtr(..) | PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Closure { .. } => {
+            Some(clone_from)
+        }
+        _ => None,
+    }
+}
+
+/// Builtin `Clone::clone_from` fallback for a Blaze-edition `AUTO_COPY_PUB` struct after
+/// `FrontEnd::resolve` returned `ResolveError::NoImpl`: confirms `Self: Clone` holds via the
+/// solver before falling back to the trait's provided `clone_from` body.
+pub(crate) fn language_clone_from_adt<P: FrontEnd>(
+    program: &P,
+    caller: usize,
+    called: Instance,
+    trait_: ItemKey,
+    ground: &mut PortableTys<'_>,
+) -> Result<Option<ItemKey>, ResolveError> {
+    let Some(clone_from) = program.lang_trait_fn(LangItem::Clone, "clone_from") else {
+        return Ok(None);
+    };
+    if called.item != clone_from {
+        return Ok(None);
+    }
+    let me = {
+        let view = ground.view();
+        let Ok(&[me]) = view.list(called.args) else { return Ok(None) };
+        let Ok(PNode::Adt(..)) = view.node(me) else { return Ok(None) };
+        me
+    };
+    if program.holds(caller, trait_, me, ground)? {
+        Ok(Some(clone_from))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Builtin `From::from` for structural error unions (`Self = A | B`, `T = A` or strict sub-union).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LanguageFrom {
@@ -424,6 +475,9 @@ trait Copy: Clone {}
 #[lang = \"clone\"]
 trait Clone {
     fn clone(&self) -> Self;
+    fn clone_from(&mut self, source: &Self) {
+        *self = source.clone();
+    }
 }
 
 #[lang = \"drop\"]
@@ -645,5 +699,44 @@ pub extern \"C\" fn main() -> i32 {
 ",
         );
         assert!(res.is_err(), "Rust 2024 structs must NOT get auto-Copy");
+    }
+
+    #[test]
+    fn blaze_auto_copy_pub_clone_from_and_explicit_override() {
+        let got = run_edition(
+            BLAZE,
+            "
+pub struct Pos { pub x: i32, pub y: i32 }
+
+pub struct CustomCf { pub x: i32 }
+impl Clone for CustomCf {
+    fn clone(&self) -> Self { CustomCf { x: self.x + 1 } }
+    fn clone_from(&mut self, source: &Self) { self.x = source.x + 50; }
+}
+
+fn overwrite<T: Clone>(dst: &mut T, src: &T) {
+    dst.clone_from(src);
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let src = Pos { x: 10, y: 20 };
+    let mut a = Pos { x: 0, y: 0 };
+    a.clone_from(&src);                                 // 30
+    let mut b = Pos { x: 0, y: 0 };
+    overwrite(&mut b, &src);                            // 30
+    let mut c = Pos { x: 0, y: 0 };
+    let f: fn(&mut Pos, &Pos) = Clone::clone_from;
+    f(&mut c, &src);                                    // 30
+
+    let mut ov = CustomCf { x: 0 };
+    ov.clone_from(&CustomCf { x: 7 });                  // 57 (default would be 8)
+
+    // 30 + 30 + 30 + 57 = 147
+    a.x + a.y + b.x + b.y + c.x + c.y + ov.x
+}
+",
+        );
+        assert_eq!(got, Ok(147));
     }
 }
