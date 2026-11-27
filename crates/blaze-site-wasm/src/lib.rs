@@ -460,6 +460,44 @@ pub extern "C" fn site_pointer_up(h: *mut SiteHandle, sx: f32, sy: f32, now_ms: 
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn site_touch_hit_selection(h: *mut SiteHandle, sx: f32, sy: f32) -> u32 {
+    with_handle(h).map_or(0, |st| u32::from(st.site.on_touch_hit_selection(sx, sy)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn site_touch_long_press(h: *mut SiteHandle, sx: f32, sy: f32, now_ms: f64) -> u32 {
+    let Some(st) = with_handle(h) else { return 0 };
+    if st.site.on_touch_long_press(sx, sy, now_ms).unwrap_or(false) { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn site_touch_drag_selection(h: *mut SiteHandle, sx: f32, sy: f32, now_ms: f64) -> u32 {
+    let Some(st) = with_handle(h) else { return 0 };
+    if st.site.on_touch_drag_selection(sx, sy, now_ms).unwrap_or(false) { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn site_touch_end_selection(h: *mut SiteHandle) {
+    if let Some(st) = with_handle(h) {
+        st.site.on_touch_end_selection();
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn site_touch_tap(h: *mut SiteHandle, sx: f32, sy: f32, now_ms: f64) -> u32 {
+    let Some(st) = with_handle(h) else { return 0 };
+    st.site.on_touch_tap(sx, sy, now_ms).unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn site_has_selection(h: *mut SiteHandle) -> u32 {
+    match with_handle(h) {
+        Some(st) if st.site.has_selection() => 1,
+        _ => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn site_wheel(h: *mut SiteHandle, dx: f32, dy: f32) {
     if let Some(st) = with_handle(h) {
         st.site.on_wheel(dx, dy);

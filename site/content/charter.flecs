@@ -10,7 +10,7 @@ site {
     Lede lede("blaze is Rust, plus a place to try what Rust could become. These are the rules for both.")
 
     Section compat(title: "1. Rust that builds keeps building") {
-      P what("Every crate that builds with rustc 1.99.0 builds with blaze and means the same thing: editions 2015 to 2024, std, crates.io as it is. blaze is a superset; it does not remove or change anything in stable Rust.")
+      P what("Every crate that builds with rustc 1.100.0 builds with blaze and means the same thing: editions 2015 to 2024, std, crates.io as it is. blaze is a superset; it does not remove or change anything in stable Rust.")
       P how("When a change would break existing code, it does not ship in the existing editions. That is what editions are for.")
     }
 

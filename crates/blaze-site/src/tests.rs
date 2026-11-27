@@ -451,3 +451,82 @@ fn flecs_script_ecs_scene_macro_declares_prefabs_relations_tags_singletons_and_h
         .expect("c");
     assert_eq!(orbiters, 1);
 }
+
+#[test]
+fn ios_touch_selection_long_press_handles_drag_copy_and_dismiss() {
+    let a = alloc();
+    let mut site = BlazeSite::new_in(a).expect("site");
+    site.load_page_json(SAMPLE_PAGE_JSON).expect("load");
+    let _ = site.render_frame(390.0, 844.0, 2.0, 100.0).expect("render");
+    assert!(!site.has_selection());
+
+    // Find a character in the title ("What if Rust compiled instantly?")
+    let total_chars = site.layout.chars.len();
+    assert!(total_chars > 20, "expected laid out chars");
+    let target_idx = site
+        .layout
+        .chars
+        .as_slice()
+        .iter()
+        .position(|c| c.ch == 'R')
+        .expect("expected 'R' in sample page");
+    let c = site.layout.chars.as_slice()[target_idx];
+    let (sx, sy) = site.page_to_screen((c.x0 + c.x1) * 0.5, (c.top + c.bottom) * 0.5);
+
+    // 1. Long-press selects the single word cleanly (never crossing space boundaries)
+    assert!(site.on_touch_long_press(sx, sy, 500.0).expect("long_press"));
+    assert!(site.has_selection());
+    let word_sel = site.selection_range().expect("word_sel");
+    let mut word_txt = OwnString::new_in(a);
+    crate::layout::copy_text(&site.layout, word_sel.from, word_sel.to, &mut word_txt).expect("copy");
+    assert_eq!(word_txt.as_str(), "Rust");
+
+    // 2. Dragging while still holding long-press extends selection to a later word
+    let last_c = site.layout.chars.as_slice()[word_sel.to + 4];
+    let (ex, ey) = site.page_to_screen((last_c.x0 + last_c.x1) * 0.5, (last_c.top + last_c.bottom) * 0.5);
+    assert!(site.on_touch_drag_selection(ex, ey, 550.0).expect("drag"));
+    let ext_sel = site.selection_range().expect("ext_sel");
+    assert!(ext_sel.to > word_sel.to, "expected extended selection");
+
+    // 3. Releasing drag reveals the floating Copy | Select All pill and handles
+    site.on_touch_end_selection();
+    let inst_before = site.insts.len();
+    let _ = site.render_frame(390.0, 844.0, 2.0, 600.0).expect("render with handles & pill");
+    assert!(site.insts.len() > inst_before, "expected handle + menu instances");
+
+    // 4. Hitting end handle grabs mode 2 and drags cleanly
+    let end_char = site.layout.chars.as_slice()[ext_sel.to - 1];
+    let (hx, hy) = site.page_to_screen(end_char.x1, end_char.bottom + 5.0);
+    assert_eq!(site.on_touch_hit_selection(hx, hy), 2);
+    let more_c = site.layout.chars.as_slice()[(ext_sel.to + 3).min(total_chars - 1)];
+    let (mx, my) = site.page_to_screen(more_c.x1, (more_c.top + more_c.bottom) * 0.5);
+    assert!(site.on_touch_drag_selection(mx, my + 8.0, 650.0).expect("handle drag"));
+    site.on_touch_end_selection();
+
+    // 5. Tapping the Copy button in the floating pill copies the selected text
+    let sel_now = site.selection_range().expect("sel_now");
+    let mut expected_copy = OwnString::new_in(a);
+    crate::layout::copy_text(&site.layout, sel_now.from, sel_now.to, &mut expected_copy).expect("expected");
+    let first_c = site.layout.chars.as_slice()[sel_now.from];
+    let (fx, fy) = site.page_to_screen(first_c.x0, first_c.top);
+    // Pill sits above the selection (center_x, min_y - 36 - 18)
+    let pill_y = if fy - 54.0 >= 12.0 { fy - 36.0 } else { fy + 40.0 };
+    // Find pill hit via scan near expected position
+    let mut hit_x = None;
+    for dx in (-120..=120).step_by(10) {
+        let test_x = (fx + f32::from(i16::try_from(dx).unwrap_or(0))).clamp(14.0, 376.0);
+        if site.on_touch_hit_selection(test_x, pill_y) == 3 {
+            hit_x = Some(test_x);
+            break;
+        }
+    }
+    let copy_tap_x = hit_x.expect("expected to hit floating Copy pill");
+    assert_eq!(site.on_touch_tap(copy_tap_x, pill_y, 700.0).expect("tap copy"), 1);
+    let mut copied = OwnString::new_in(a);
+    assert!(site.take_pending_copy(&mut copied).expect("pending copy"));
+    assert_eq!(copied.as_str(), expected_copy.as_str());
+
+    // 6. Tapping outside dismisses selection cleanly
+    assert_eq!(site.on_touch_tap(10.0, 800.0, 1200.0).expect("dismiss"), 1);
+    assert!(!site.has_selection());
+}

@@ -97,6 +97,26 @@ struct FindBarGeometry {
     close_btn: Rect,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SelectionHandles {
+    start_x: f32,
+    start_top: f32,
+    start_bottom: f32,
+    start_knob_y: f32,
+    end_x: f32,
+    end_top: f32,
+    end_bottom: f32,
+    end_knob_y: f32,
+    bounds: Rect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SelectionMenuGeometry {
+    bar: Rect,
+    copy_btn: Rect,
+    select_all_btn: Rect,
+}
+
 struct ActiveTip<A: Allocator + Copy> {
     key: OwnString<A>,
     layout: TipLayout<A>,
@@ -148,6 +168,10 @@ pub struct BlazeSite<A: Allocator + Copy + 'static> {
     dragging: bool,
     press_button: bool,
     selection: Option<SelectionState>,
+    touch_selection: bool,
+    touch_drag_mode: u8, // 0 none, 1 start handle, 2 end handle, 3 long-press drag
+    touch_drag_word: Option<CharRange>,
+    sel_copied_until_ms: f64,
     copied_range: Option<CharRange>,
     copied_at_ms: f64,
     copied_label_until_ms: f64,
@@ -221,6 +245,10 @@ impl<A: Allocator + Copy + 'static> BlazeSite<A> {
             dragging: false,
             press_button: false,
             selection: None,
+            touch_selection: false,
+            touch_drag_mode: 0,
+            touch_drag_word: None,
+            sel_copied_until_ms: -10_000.0,
             copied_range: None,
             copied_at_ms: -10_000.0,
             copied_label_until_ms: -10_000.0,
@@ -263,6 +291,9 @@ impl<A: Allocator + Copy + 'static> BlazeSite<A> {
         self.layout_dirty = true;
         self.active_tip = None;
         self.selection = None;
+        self.touch_selection = false;
+        self.touch_drag_mode = 0;
+        self.touch_drag_word = None;
         self.find_matches.clear();
         Ok(())
     }
@@ -482,6 +513,84 @@ impl<A: Allocator + Copy + 'static> BlazeSite<A> {
         let w = 124.0;
         let h = 30.0;
         Some(Rect::new((self.vp_w - 16.0 - w).max(12.0), (self.vp_h - 16.0 - h).max(12.0), w, h))
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some_and(|s| s.anchor != s.focus)
+    }
+
+    pub fn selection_range(&self) -> Option<CharRange> {
+        let sel = self.selection?;
+        let lo = sel.anchor.min(sel.focus);
+        let hi = sel.anchor.max(sel.focus).min(self.layout.chars.len());
+        if lo < hi { Some(CharRange { from: lo, to: hi }) } else { None }
+    }
+
+    fn selection_handles(&self) -> Option<SelectionHandles> {
+        if !self.touch_selection {
+            return None;
+        }
+        let r = self.selection_range()?;
+        let first = self.layout.chars.get(r.from)?;
+        let last = self.layout.chars.get(r.to.saturating_sub(1))?;
+        let (start_x, start_top) = self.page_to_screen(first.x0, first.top);
+        let (_, start_bottom) = self.page_to_screen(first.x0, first.bottom);
+        let (end_x, end_top) = self.page_to_screen(last.x1, last.top);
+        let (_, end_bottom) = self.page_to_screen(last.x1, last.bottom);
+
+        let mut min_x = start_x.min(end_x);
+        let mut max_x = start_x.max(end_x);
+        let mut min_y = start_top.min(end_top);
+        let mut max_y = start_bottom.max(end_bottom);
+        for ci in r.from..r.to {
+            let Some(c) = self.layout.chars.get(ci) else { continue };
+            let (cx0, ctop) = self.page_to_screen(c.x0, c.top);
+            let (cx1, cbot) = self.page_to_screen(c.x1, c.bottom);
+            if cbot < 0.0 || ctop > self.vp_h {
+                continue;
+            }
+            min_x = min_x.min(cx0);
+            max_x = max_x.max(cx1);
+            min_y = min_y.min(ctop);
+            max_y = max_y.max(cbot);
+        }
+        Some(SelectionHandles {
+            start_x,
+            start_top,
+            start_bottom,
+            start_knob_y: start_top - 5.5,
+            end_x,
+            end_top,
+            end_bottom,
+            end_knob_y: end_bottom + 5.5,
+            bounds: Rect::new(min_x, min_y, (max_x - min_x).max(1.0), (max_y - min_y).max(1.0)),
+        })
+    }
+
+    fn selection_menu_geom(&self) -> Option<SelectionMenuGeometry> {
+        if !self.touch_selection || self.touch_drag_mode != 0 {
+            return None;
+        }
+        let handles = self.selection_handles()?;
+        let copy_w = 72.0;
+        let all_w = 96.0;
+        let w = copy_w + 1.0 + all_w;
+        let h = 36.0;
+        let center_x = handles.bounds.x + handles.bounds.w * 0.5;
+        let x = (center_x - w * 0.5).clamp(12.0, (self.vp_w - w - 12.0).max(12.0));
+        let above_y = handles.bounds.y - h - 18.0;
+        let below_y = handles.bounds.y + handles.bounds.h + 18.0;
+        let y = if above_y >= 12.0 && above_y + h <= self.vp_h - 12.0 {
+            above_y
+        } else if below_y >= 12.0 && below_y + h <= self.vp_h - 12.0 {
+            below_y
+        } else {
+            14.0
+        };
+        let bar = Rect::new(x, y, w, h);
+        let copy_btn = Rect::new(x, y, copy_w, h);
+        let select_all_btn = Rect::new(x + copy_w + 1.0, y, all_w, h);
+        Some(SelectionMenuGeometry { bar, copy_btn, select_all_btn })
     }
 
     // -------------------------------------------------------------------------
@@ -734,6 +843,9 @@ impl<A: Allocator + Copy + 'static> BlazeSite<A> {
         self.now_ms = now_ms;
         self.pointer_sx = sx;
         self.pointer_sy = sy;
+        self.touch_selection = false;
+        self.touch_drag_mode = 0;
+        self.touch_drag_word = None;
         self.ensure_layout()?;
 
         // Find bar buttons
@@ -855,6 +967,285 @@ impl<A: Allocator + Copy + 'static> BlazeSite<A> {
         Ok(())
     }
 
+    // -------------------------------------------------------------------------
+    // Mobile / iOS Touch Text Selection (Long-Press, Handles, Copy/Select All)
+    // -------------------------------------------------------------------------
+
+    fn point_near_text(&self, px: f32, py: f32) -> bool {
+        self.layout.chars.as_slice().iter().any(|c| {
+            px >= c.x0 - 28.0 && px <= c.x1 + 28.0 && py >= c.top - 18.0 && py <= c.bottom + 18.0
+        })
+    }
+
+    fn copy_active_selection(&mut self, now_ms: f64) -> Result<bool, SiteError> {
+        let Some(r) = self.selection_range() else {
+            return Ok(false);
+        };
+        let mut buf = OwnString::new_in(self.alloc);
+        copy_text(&self.layout, r.from, r.to, &mut buf)?;
+        self.pending_copy = buf;
+        self.copied_range = Some(r);
+        self.copied_at_ms = now_ms;
+        Ok(true)
+    }
+
+    /// Hit-test active iOS selection handles / floating action pill on `touchstart`.
+    /// Returns: `0` = none, `1` = start handle, `2` = end handle, `3` = Copy/Select All pill.
+    pub fn on_touch_hit_selection(&mut self, sx: f32, sy: f32) -> u8 {
+        if !self.touch_selection {
+            return 0;
+        }
+        if let Some(menu) = self.selection_menu_geom() {
+            let expanded = Rect::new(menu.bar.x - 6.0, menu.bar.y - 6.0, menu.bar.w + 12.0, menu.bar.h + 12.0);
+            if point_in_rect(sx, sy, expanded) {
+                return 3;
+            }
+        }
+        let Some(h) = self.selection_handles() else {
+            return 0;
+        };
+        let start_dist = dist_to_handle(sx, sy, h.start_x, h.start_knob_y, h.start_top, h.start_bottom);
+        let end_dist = dist_to_handle(sx, sy, h.end_x, h.end_knob_y, h.end_top, h.end_bottom);
+        let max_r = 32.0;
+        if start_dist <= max_r && start_dist <= end_dist {
+            self.touch_drag_mode = 1;
+            self.touch_drag_word = None;
+            return 1;
+        }
+        if end_dist <= max_r {
+            self.touch_drag_mode = 2;
+            self.touch_drag_word = None;
+            return 2;
+        }
+        0
+    }
+
+    /// Long-press on touch (~380ms): selects the word under the finger and enters live drag-extend mode.
+    pub fn on_touch_long_press(&mut self, sx: f32, sy: f32, now_ms: f64) -> Result<bool, SiteError> {
+        self.now_ms = now_ms;
+        self.pointer_sx = sx;
+        self.pointer_sy = sy;
+        self.ensure_layout()?;
+        if self.layout.chars.is_empty() {
+            return Ok(false);
+        }
+        let (px, py) = self.screen_to_page(sx, sy);
+        if self.layout.button.is_some_and(|r| point_in_rect(px, py, r)) {
+            return Ok(false);
+        }
+        if !self.point_near_text(px, py) {
+            return Ok(false);
+        }
+        let idx = char_at_point(&self.layout, px, py);
+        let mut word = word_range(&self.layout, idx);
+        if word.from >= word.to {
+            let clamped = idx.min(self.layout.chars.len().saturating_sub(1));
+            word = CharRange { from: clamped, to: (clamped + 1).min(self.layout.chars.len()) };
+        }
+        self.selection = Some(SelectionState { anchor: word.from, focus: word.to });
+        self.touch_selection = true;
+        self.touch_drag_mode = 3;
+        self.touch_drag_word = Some(word);
+        self.active_tip = None;
+        self.focus_link = None;
+        Ok(true)
+    }
+
+    /// Drag either iOS selection handle (`1`/`2`) or extend directly after long-press (`3`), with edge auto-scroll.
+    pub fn on_touch_drag_selection(&mut self, sx: f32, sy: f32, now_ms: f64) -> Result<bool, SiteError> {
+        self.now_ms = now_ms;
+        self.pointer_sx = sx;
+        self.pointer_sy = sy;
+        if !self.touch_selection || self.touch_drag_mode == 0 {
+            return Ok(false);
+        }
+        self.ensure_layout()?;
+        let len = self.layout.chars.len();
+        if len == 0 {
+            return Ok(false);
+        }
+
+        // Gentle auto-scroll when dragging near top/bottom edges of the viewport
+        let edge = 64.0f32.min(self.vp_h * 0.2);
+        let z = self.zoom();
+        if sy < edge {
+            let t = ((edge - sy) / edge.max(1.0)).clamp(0.0, 1.0);
+            self.scroll_y -= (4.0 + 14.0 * t) / z;
+            self.clamp_camera();
+        } else if sy > self.vp_h - edge {
+            let t = ((sy - (self.vp_h - edge)) / edge.max(1.0)).clamp(0.0, 1.0);
+            self.scroll_y += (4.0 + 14.0 * t) / z;
+            self.clamp_camera();
+        }
+
+        let target_sy = match self.touch_drag_mode {
+            1 => sy + 8.0,
+            2 => sy - 8.0,
+            _ => sy,
+        };
+        let (px, py) = self.screen_to_page(sx, target_sy);
+        let idx = char_at_point(&self.layout, px, py);
+
+        match self.touch_drag_mode {
+            1 => {
+                let hi = self.selection.map_or(len, |s| s.anchor.max(s.focus)).min(len);
+                if idx > hi {
+                    // Seamless handle crossover: start handle crosses past end handle
+                    self.touch_drag_mode = 2;
+                    self.selection = Some(SelectionState { anchor: hi, focus: idx });
+                } else {
+                    let lo = idx.min(hi.saturating_sub(1));
+                    self.selection = Some(SelectionState { anchor: hi, focus: lo });
+                }
+            }
+            2 => {
+                let lo = self.selection.map_or(0, |s| s.anchor.min(s.focus)).min(len);
+                if idx < lo {
+                    // Seamless handle crossover: end handle crosses before start handle
+                    self.touch_drag_mode = 1;
+                    self.selection = Some(SelectionState { anchor: lo, focus: idx });
+                } else {
+                    let hi = idx.max((lo + 1).min(len));
+                    self.selection = Some(SelectionState { anchor: lo, focus: hi });
+                }
+            }
+            3 => {
+                if let Some(w) = self.touch_drag_word {
+                    if idx < w.from {
+                        self.selection = Some(SelectionState { anchor: w.to, focus: idx });
+                    } else if idx >= w.to {
+                        let hi = (idx + 1).min(len);
+                        self.selection = Some(SelectionState { anchor: w.from, focus: hi });
+                    } else {
+                        self.selection = Some(SelectionState { anchor: w.from, focus: w.to });
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    /// Finish dragging an iOS selection handle or long-press drag, revealing the Copy / Select All pill.
+    pub fn on_touch_end_selection(&mut self) {
+        self.touch_drag_mode = 0;
+        self.touch_drag_word = None;
+    }
+
+    /// Clean touch tap handler: handles floating Copy/Select All pill, double/triple-tap word/item
+    /// selection, tap-outside dismissal, plus normal links, Copy button, footnotes, and HUD pills.
+    pub fn on_touch_tap(&mut self, sx: f32, sy: f32, now_ms: f64) -> Result<u32, SiteError> {
+        self.now_ms = now_ms;
+        self.pointer_sx = sx;
+        self.pointer_sy = sy;
+        self.ensure_layout()?;
+
+        // 1. Floating Copy | Select All pill
+        if let Some(menu) = self.selection_menu_geom() {
+            let expanded = Rect::new(menu.bar.x - 6.0, menu.bar.y - 6.0, menu.bar.w + 12.0, menu.bar.h + 12.0);
+            if point_in_rect(sx, sy, expanded) {
+                let split_x = menu.copy_btn.x + menu.copy_btn.w;
+                if sx <= split_x {
+                    if self.copy_active_selection(now_ms)? {
+                        self.sel_copied_until_ms = now_ms + 900.0;
+                    }
+                } else if !self.layout.chars.is_empty() {
+                    self.selection = Some(SelectionState { anchor: 0, focus: self.layout.chars.len() });
+                    self.touch_selection = true;
+                    self.touch_drag_mode = 0;
+                }
+                return Ok(1);
+            }
+        }
+
+        // 2. Viewport-pinned HUD (Find bar / Zoom pill)
+        if self.find_open() {
+            let g = self.find_bar_geom();
+            if point_in_rect(sx, sy, g.bar) {
+                self.on_pointer_down(sx, sy, now_ms)?;
+                self.on_pointer_up(sx, sy, now_ms)?;
+                return Ok(2);
+            }
+        }
+        if let Some(zr) = self.zoom_pill_rect() {
+            if point_in_rect(sx, sy, zr) {
+                let _ = self.reset_zoom()?;
+                return Ok(2);
+            }
+        }
+
+        let (px, py) = self.screen_to_page(sx, sy);
+
+        // 3. Double/triple tap detection (wider 24px thumb tolerance than desktop)
+        let dt = now_ms - self.last_click_ms;
+        let dist = (sx - self.last_click_x).abs() + (sy - self.last_click_y).abs();
+        let is_multi = dt < 420.0 && dist < 24.0;
+
+        // If an active touch selection exists and this is NOT a triple-tap upgrade, dismiss it cleanly
+        if self.touch_selection && self.has_selection() {
+            if is_multi && self.click_count == 2 && self.point_near_text(px, py) {
+                self.click_count = 3;
+                self.last_click_ms = now_ms;
+                self.last_click_x = sx;
+                self.last_click_y = sy;
+                let idx = char_at_point(&self.layout, px, py);
+                let r = block_item_range(&self.layout, idx);
+                if r.from < r.to {
+                    self.selection = Some(SelectionState { anchor: r.from, focus: r.to });
+                    self.touch_selection = true;
+                    self.touch_drag_mode = 0;
+                    return Ok(1);
+                }
+            }
+            self.selection = None;
+            self.touch_selection = false;
+            self.touch_drag_mode = 0;
+            self.touch_drag_word = None;
+            self.click_count = 0;
+            return Ok(1);
+        }
+
+        // 4. Copy command button / Links take priority on single tap
+        if self.layout.button.is_some_and(|r| point_in_rect(px, py, r)) || self.hit_link(px, py).is_some() {
+            self.click_count = 0;
+            self.on_pointer_move(sx, sy, now_ms)?;
+            self.on_pointer_down(sx, sy, now_ms)?;
+            self.on_pointer_up(sx, sy, now_ms)?;
+            return Ok(2);
+        }
+
+        // 5. Double-tap on text selects word with iOS handles + Copy pill
+        if is_multi && self.point_near_text(px, py) {
+            self.click_count = self.click_count.saturating_add(1).min(3);
+            self.last_click_ms = now_ms;
+            self.last_click_x = sx;
+            self.last_click_y = sy;
+            let idx = char_at_point(&self.layout, px, py);
+            let r = if self.click_count >= 3 {
+                block_item_range(&self.layout, idx)
+            } else {
+                word_range(&self.layout, idx)
+            };
+            if r.from < r.to {
+                self.selection = Some(SelectionState { anchor: r.from, focus: r.to });
+                self.touch_selection = true;
+                self.touch_drag_mode = 0;
+                self.active_tip = None;
+                self.focus_link = None;
+                return Ok(1);
+            }
+        }
+
+        // 6. Plain single tap: update hover/part tooltips and record tap timing for double-tap
+        self.click_count = 1;
+        self.last_click_ms = now_ms;
+        self.last_click_x = sx;
+        self.last_click_y = sy;
+        self.focus_link = None;
+        self.on_pointer_move(sx, sy, now_ms)?;
+        Ok(2)
+    }
+
     fn trigger_copy_command(&mut self, now_ms: f64) -> Result<(), SiteError> {
         self.pending_copy.clear();
         for blk in self.model.blocks.as_slice() {
@@ -950,6 +1341,9 @@ impl<A: Allocator + Copy + 'static> BlazeSite<A> {
             }
         } else if code == key::ESCAPE {
             self.selection = None;
+            self.touch_selection = false;
+            self.touch_drag_mode = 0;
+            self.touch_drag_word = None;
             self.active_tip = None;
             return Ok(true);
         }
@@ -1371,6 +1765,17 @@ impl<A: Allocator + Copy + 'static> BlazeSite<A> {
             }
         }
 
+        // 7b. iOS / Touch Selection Handles & Floating Copy / Select All Pill
+        if let Some(handles) = self.selection_handles() {
+            self.emit_selection_handles(handles, safe_dpr, theme)?;
+        }
+        if let Some(menu) = self.selection_menu_geom() {
+            if now_ms < self.sel_copied_until_ms {
+                wants_frame = true;
+            }
+            self.emit_selection_menu(menu, safe_dpr, theme, now_ms)?;
+        }
+
         // 8. Native WebGPU `Cmd+F` Find Bar (viewport-pinned at 1.0 * dpr, Slug vector text!)
         if self.find_open() {
             wants_frame = true; // blinking caret
@@ -1644,6 +2049,11 @@ impl<A: Allocator + Copy + 'static> BlazeSite<A> {
         let Some(inst) = self.table.find_instance(family, wght, opsz).copied() else {
             return Ok(start_x_css);
         };
+        let fallback_inst = if wght != 400 {
+            self.table.find_instance(family, 400, opsz).copied()
+        } else {
+            None
+        };
         let ppe = (size_css * dpr).max(1.0);
         let pad_em = 1.0 / ppe;
         let mut cx = start_x_css;
@@ -1654,7 +2064,11 @@ impl<A: Allocator + Copy + 'static> BlazeSite<A> {
                 cx += if family == 1 { 0.60 * size_css } else { 0.28 * size_css };
                 continue;
             }
-            if let Some(gid) = self.table.lookup_glyph(&inst, ch) {
+            let gid_opt = self
+                .table
+                .lookup_glyph(&inst, ch)
+                .or_else(|| fallback_inst.as_ref().and_then(|fi| self.table.lookup_glyph(fi, ch)));
+            if let Some(gid) = gid_opt {
                 if let Some(meta) = self.table.glyphs.get(usize::try_from(gid).unwrap_or(usize::MAX)).copied() {
                     if meta.drawable {
                         let x0 = meta.bbox[0] - pad_em;
@@ -1896,6 +2310,160 @@ impl<A: Allocator + Copy + 'static> BlazeSite<A> {
         )?;
         Ok(())
     }
+
+    fn emit_selection_handles(
+        &mut self,
+        h: SelectionHandles,
+        dpr: f32,
+        theme: SiteTheme,
+    ) -> Result<(), SiteError> {
+        // Crisp iOS-style selection accent blue matching `theme.selection`
+        let accent = if theme.dark {
+            vec4(0.32, 0.60, 1.0, 1.0)
+        } else {
+            vec4(0.05, 0.46, 0.98, 1.0)
+        };
+        let stem_w = (2.0 * dpr).max(2.0);
+        let knob_r = 5.5 * dpr;
+        let knob_d = knob_r * 2.0;
+
+        // Start handle: vertical stem + top circular lollipop
+        if h.start_bottom >= -16.0 && h.start_top <= self.vp_h + 16.0 {
+            let sx = gpu::math::round(h.start_x * dpr);
+            let sy0 = gpu::math::round(h.start_top * dpr);
+            let sy1 = gpu::math::round(h.start_bottom * dpr);
+            self.push_inst(SiteInst {
+                rect: vec4(sx - stem_w * 0.5, sy0, stem_w, (sy1 - sy0).max(2.0)),
+                a: vec4(stem_w * 0.5, stem_w * 0.5, stem_w * 0.5, stem_w * 0.5),
+                color: accent,
+                fx: vec4(site_kind::PLATE, 0.0, 0.0, 0.0),
+                band_tf: ZERO_V4,
+                gdata: ZERO_U4,
+            })?;
+            let ky = h.start_knob_y * dpr;
+            self.push_inst(SiteInst {
+                rect: vec4(sx - knob_r, ky - knob_r, knob_d, knob_d),
+                a: vec4(knob_r, knob_r, knob_r, knob_r),
+                color: accent,
+                fx: vec4(site_kind::PLATE, 0.0, 0.0, 0.0),
+                band_tf: ZERO_V4,
+                gdata: ZERO_U4,
+            })?;
+        }
+
+        // End handle: vertical stem + bottom circular lollipop
+        if h.end_bottom >= -16.0 && h.end_top <= self.vp_h + 16.0 {
+            let ex = gpu::math::round(h.end_x * dpr);
+            let ey0 = gpu::math::round(h.end_top * dpr);
+            let ey1 = gpu::math::round(h.end_bottom * dpr);
+            self.push_inst(SiteInst {
+                rect: vec4(ex - stem_w * 0.5, ey0, stem_w, (ey1 - ey0).max(2.0)),
+                a: vec4(stem_w * 0.5, stem_w * 0.5, stem_w * 0.5, stem_w * 0.5),
+                color: accent,
+                fx: vec4(site_kind::PLATE, 0.0, 0.0, 0.0),
+                band_tf: ZERO_V4,
+                gdata: ZERO_U4,
+            })?;
+            let ky = h.end_knob_y * dpr;
+            self.push_inst(SiteInst {
+                rect: vec4(ex - knob_r, ky - knob_r, knob_d, knob_d),
+                a: vec4(knob_r, knob_r, knob_r, knob_r),
+                color: accent,
+                fx: vec4(site_kind::PLATE, 0.0, 0.0, 0.0),
+                band_tf: ZERO_V4,
+                gdata: ZERO_U4,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn emit_selection_menu(
+        &mut self,
+        menu: SelectionMenuGeometry,
+        dpr: f32,
+        theme: SiteTheme,
+        now_ms: f64,
+    ) -> Result<(), SiteError> {
+        let r = 10.0 * dpr;
+        let sr = r + 12.0 * dpr;
+        // Soft drop shadow
+        self.push_inst(SiteInst {
+            rect: vec4(
+                (menu.bar.x - 12.0) * dpr,
+                (menu.bar.y + 6.0 - 12.0) * dpr,
+                (menu.bar.w + 24.0) * dpr,
+                (menu.bar.h + 24.0) * dpr,
+            ),
+            a: vec4(sr, sr, sr, sr),
+            color: vec4(0.0, 0.0, 0.0, if theme.dark { 0.46 } else { 0.18 }),
+            fx: vec4(site_kind::SHADOW, 0.0, 12.0 * dpr, 0.0),
+            band_tf: ZERO_V4,
+            gdata: ZERO_U4,
+        })?;
+        // Pill plate + crisp ring
+        self.push_inst(SiteInst {
+            rect: vec4(menu.bar.x * dpr, menu.bar.y * dpr, menu.bar.w * dpr, menu.bar.h * dpr),
+            a: vec4(r, r, r, r),
+            color: color_vec(theme.bg_3, 0.98),
+            fx: vec4(site_kind::PLATE, 0.0, 0.0, 0.0),
+            band_tf: ZERO_V4,
+            gdata: ZERO_U4,
+        })?;
+        self.push_inst(SiteInst {
+            rect: vec4(menu.bar.x * dpr, menu.bar.y * dpr, menu.bar.w * dpr, menu.bar.h * dpr),
+            a: vec4(r, r, r, r),
+            color: color_vec(theme.line_2, 1.0),
+            fx: vec4(site_kind::RING, 0.0, 1.0 * dpr, 0.0),
+            band_tf: ZERO_V4,
+            gdata: ZERO_U4,
+        })?;
+        // Vertical divider between Copy and Select All
+        let div_x = gpu::math::round((menu.copy_btn.x + menu.copy_btn.w) * dpr);
+        self.push_inst(SiteInst {
+            rect: vec4(div_x, (menu.bar.y + 8.0) * dpr, 1.0, (menu.bar.h - 16.0) * dpr),
+            a: ZERO_V4,
+            color: color_vec(theme.line_2, 1.0),
+            fx: vec4(site_kind::PLATE, 0.0, 0.0, 0.0),
+            band_tf: ZERO_V4,
+            gdata: ZERO_U4,
+        })?;
+
+        let copied = now_ms < self.sel_copied_until_ms;
+        let copy_label = if copied { "Copied" } else { "Copy" };
+        let copy_x = menu.copy_btn.x + if copied { 13.0 } else { 19.0 };
+        let baseline = menu.bar.y + 22.5;
+        let _ = self.emit_ui_slug_text(
+            copy_label,
+            copy_x,
+            baseline,
+            13.0,
+            0,
+            500,
+            14.0,
+            color_vec(if copied { theme.fire } else { theme.ink_1 }, 1.0),
+            dpr,
+        )?;
+        let _ = self.emit_ui_slug_text(
+            "Select All",
+            menu.select_all_btn.x + 15.0,
+            baseline,
+            13.0,
+            0,
+            500,
+            14.0,
+            color_vec(theme.ink_1, 1.0),
+            dpr,
+        )?;
+        Ok(())
+    }
+}
+
+#[inline]
+fn dist_to_handle(sx: f32, sy: f32, hx: f32, knob_y: f32, stem_top: f32, stem_bot: f32) -> f32 {
+    let clamped_y = sy.clamp(stem_top.min(knob_y), stem_bot.max(knob_y));
+    let dx = sx - hx;
+    let dy = sy - clamped_y;
+    gpu::math::sqrt(dx * dx + dy * dy)
 }
 
 #[inline]

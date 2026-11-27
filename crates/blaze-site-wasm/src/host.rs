@@ -60,13 +60,17 @@ pub const SITE_HTML: &str = r##"<!doctype html>
     margin: 0;
     padding: 0;
     width: 100%;
-    height: 100%;
+    min-height: 100%;
     background: var(--bg);
     color: var(--ink-1);
     font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
     -webkit-font-smoothing: antialiased;
   }
   body.mode-gpu {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
     overflow: hidden;
     touch-action: none;
     overscroll-behavior: none;
@@ -74,14 +78,21 @@ pub const SITE_HTML: &str = r##"<!doctype html>
     -webkit-user-select: none;
   }
   body.mode-html {
+    position: static;
+    height: auto;
+    min-height: 100%;
     overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    touch-action: auto;
     user-select: text;
     -webkit-user-select: text;
   }
   canvas#c {
     display: block;
-    width: 100vw;
-    height: 100vh;
+    width: 100%;
+    height: 100%;
+    touch-action: none;
+    -webkit-touch-callout: none;
     outline: none;
   }
   body.mode-html canvas#c { display: none; }
@@ -811,11 +822,32 @@ async function boot() {
 
   buildSvgAtlas(window.devicePixelRatio || 1);
 
+  const copyText = (text) => {
+    if (!text) return;
+    const fallback = () => {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0;font-size:16px;';
+        document.body.appendChild(ta);
+        ta.focus({ preventScroll: true });
+        ta.setSelectionRange(0, text.length);
+        document.execCommand('copy');
+        ta.remove();
+      } catch (_) {}
+    };
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).catch(fallback);
+    } else {
+      fallback();
+    }
+  };
+
   const flushSideEffects = () => {
     const cLen = w.site_take_copy_len(h);
     if (cLen > 0) {
-      const text = readStr(w.site_copy_ptr(h), cLen);
-      navigator.clipboard?.writeText(text).catch(() => {});
+      copyText(readStr(w.site_copy_ptr(h), cLen));
     }
     const nLen = w.site_take_nav_len(h);
     if (nLen > 0) {
@@ -831,6 +863,19 @@ async function boot() {
 
   let dirty = true;
   let rafId = 0;
+  let touchActive = false;
+  let tMode = 'scroll'; // 'scroll' | 'handle' | 'pill'
+  let handleX = 0, handleY = 0;
+  let momVx = 0;
+  let momVy = 0;
+  let momActive = false;
+  let momPrevMs = 0;
+  const stopMomentum = () => {
+    momActive = false;
+    momVx = 0;
+    momVy = 0;
+    momPrevMs = 0;
+  };
   const kick = () => {
     if (!rafId) rafId = requestAnimationFrame(frame);
   };
@@ -838,8 +883,28 @@ async function boot() {
   const frame = (now) => {
     rafId = 0;
     const dpr = Math.max(1, Math.min(4, window.devicePixelRatio || 1));
-    const cssW = window.innerWidth;
-    const cssH = window.innerHeight;
+    const cssW = canvas.clientWidth || window.innerWidth;
+    const cssH = canvas.clientHeight || window.innerHeight;
+    let handleEdgeScroll = false;
+    if (tMode === 'handle' && touchActive) {
+      const edge = Math.min(64, cssH * 0.2);
+      if (handleY < edge || handleY > cssH - edge) {
+        w.site_touch_drag_selection?.(h, handleX, handleY, now);
+        handleEdgeScroll = true;
+      }
+    }
+    if (momActive) {
+      const dt = momPrevMs ? Math.max(1, Math.min(40, now - momPrevMs)) : 16;
+      momPrevMs = now;
+      w.site_wheel(h, momVx * dt, momVy * dt);
+      const decay = Math.exp(-dt / 325);
+      momVx *= decay;
+      momVy *= decay;
+      if (Math.hypot(momVx, momVy) < 0.025) {
+        stopMomentum();
+      }
+    }
+
     const devW = Math.max(1, Math.round(cssW * dpr));
     const devH = Math.max(1, Math.round(cssH * dpr));
     if (canvas.width !== devW || canvas.height !== devH) {
@@ -888,14 +953,16 @@ async function boot() {
     device.queue.submit([enc.finish()]);
 
     dirty = false;
-    if (wantsNext) kick();
+    if (wantsNext || momActive || handleEdgeScroll) kick();
   };
 
   // Smooth macOS Trackpad Pinch-to-Zoom + 2-Finger Scroll/Pan.
   let inGesture = false;
   let gestureScale = 1;
+  let lastTouchEndMs = -10000;
   canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
+    stopMomentum();
     if (inGesture) return;
     const scale = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? window.innerHeight : 1;
     const dx = e.deltaX * scale;
@@ -914,12 +981,13 @@ async function boot() {
 
   canvas.addEventListener('gesturestart', (e) => {
     e.preventDefault();
+    if (touchActive) return;
     inGesture = true;
     gestureScale = e.scale || 1;
   });
   canvas.addEventListener('gesturechange', (e) => {
     e.preventDefault();
-    if (!inGesture || !e.scale || !Number.isFinite(e.scale)) return;
+    if (touchActive || !inGesture || !e.scale || !Number.isFinite(e.scale)) return;
     const f = Math.max(0.5, Math.min(2.0, e.scale / (gestureScale || 1)));
     gestureScale = e.scale;
     w.site_pinch(h, e.clientX || window.innerWidth * 0.5, e.clientY || window.innerHeight * 0.5, f);
@@ -928,16 +996,228 @@ async function boot() {
   });
   const endGesture = (e) => { e?.preventDefault?.(); inGesture = false; gestureScale = 1; };
   canvas.addEventListener('gestureend', endGesture);
-  window.addEventListener('blur', () => { inGesture = false; gestureScale = 1; });
+  window.addEventListener('blur', () => {
+    inGesture = false;
+    gestureScale = 1;
+    touchActive = false;
+    tMode = 'scroll';
+    clearLongPress();
+    stopMomentum();
+  });
 
-  // Pointer interaction
+  // Mobile Touch: 1-finger pan + inertia, 2-finger pinch-to-zoom, and iOS-style text selection
+  let longPressTimer = 0;
+  let tStartX = 0, tStartY = 0;
+  let tLastX = 0, tLastY = 0, tLastMs = 0;
+  let tMoved = false;
+  let tWasPinch = false;
+  let tVx = 0, tVy = 0;
+  let pinchDist = 0, pinchMidX = 0, pinchMidY = 0;
+
+  const clearLongPress = () => {
+    if (longPressTimer) {
+      clearTimeout(longPressTimer);
+      longPressTimer = 0;
+    }
+  };
+
+  canvas.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 0) return;
+    touchActive = true;
+    stopMomentum();
+    clearLongPress();
+    const now = performance.now();
+    if (e.touches.length === 1) {
+      const t = e.touches[0];
+      tStartX = tLastX = t.clientX;
+      tStartY = tLastY = t.clientY;
+      tLastMs = now;
+      tMoved = false;
+      tWasPinch = false;
+      tVx = 0;
+      tVy = 0;
+      pinchDist = 0;
+
+      const selHit = w.site_touch_hit_selection ? w.site_touch_hit_selection(h, t.clientX, t.clientY) : 0;
+      if (selHit === 1 || selHit === 2) {
+        e.preventDefault();
+        tMode = 'handle';
+        tMoved = true;
+        handleX = t.clientX;
+        handleY = t.clientY;
+        dirty = true;
+        kick();
+      } else if (selHit === 3) {
+        e.preventDefault();
+        tMode = 'pill';
+      } else {
+        tMode = 'scroll';
+        longPressTimer = setTimeout(() => {
+          longPressTimer = 0;
+          if (!touchActive || tMoved || tWasPinch || tMode !== 'scroll') return;
+          const lpNow = performance.now();
+          if (w.site_touch_long_press?.(h, tStartX, tStartY, lpNow)) {
+            tMode = 'handle';
+            tMoved = true;
+            handleX = tLastX;
+            handleY = tLastY;
+            navigator.vibrate?.(10);
+            dirty = true;
+            kick();
+          }
+        }, 380);
+      }
+    } else if (e.touches.length >= 2) {
+      e.preventDefault();
+      if (tMode === 'handle') w.site_touch_end_selection?.(h);
+      tMode = 'scroll';
+      const a = e.touches[0], b = e.touches[1];
+      tMoved = true;
+      tWasPinch = true;
+      tVx = 0;
+      tVy = 0;
+      pinchDist = Math.hypot(b.clientX - a.clientX, b.clientY - a.clientY);
+      pinchMidX = (a.clientX + b.clientX) * 0.5;
+      pinchMidY = (a.clientY + b.clientY) * 0.5;
+      w.site_pointer_move(h, -1000, -1000, now);
+    }
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', (e) => {
+    if (e.touches.length === 0) return;
+    e.preventDefault();
+    const now = performance.now();
+    if (e.touches.length === 1 && tMode === 'handle') {
+      const t = e.touches[0];
+      handleX = t.clientX;
+      handleY = t.clientY;
+      w.site_touch_drag_selection?.(h, handleX, handleY, now);
+      dirty = true;
+      kick();
+    } else if (e.touches.length === 1 && tMode === 'pill') {
+      const t = e.touches[0];
+      if (Math.hypot(t.clientX - tStartX, t.clientY - tStartY) > 12) {
+        tMoved = true;
+      }
+    } else if (e.touches.length === 1 && !tWasPinch) {
+      const t = e.touches[0];
+      if (!tMoved) {
+        if (Math.hypot(t.clientX - tStartX, t.clientY - tStartY) < 5) return;
+        clearLongPress();
+        tMoved = true;
+        w.site_pointer_move(h, -1000, -1000, now);
+      }
+      const dx = tLastX - t.clientX;
+      const dy = tLastY - t.clientY;
+      const dt = Math.max(1, now - tLastMs);
+      if (dx !== 0 || dy !== 0) {
+        w.site_wheel(h, dx, dy);
+        tVx = tVx * 0.55 + (dx / dt) * 0.45;
+        tVy = tVy * 0.55 + (dy / dt) * 0.45;
+        tLastX = t.clientX;
+        tLastY = t.clientY;
+        tLastMs = now;
+        dirty = true;
+        kick();
+      }
+    } else if (e.touches.length === 1 && tWasPinch) {
+      const t = e.touches[0];
+      const dx = tLastX - t.clientX;
+      const dy = tLastY - t.clientY;
+      tLastX = t.clientX;
+      tLastY = t.clientY;
+      tLastMs = now;
+      if (dx !== 0 || dy !== 0) {
+        w.site_wheel(h, dx, dy);
+        dirty = true;
+        kick();
+      }
+    } else if (e.touches.length >= 2) {
+      clearLongPress();
+      const a = e.touches[0], b = e.touches[1];
+      const dist = Math.hypot(b.clientX - a.clientX, b.clientY - a.clientY);
+      const mx = (a.clientX + b.clientX) * 0.5;
+      const my = (a.clientY + b.clientY) * 0.5;
+      if (pinchDist > 4 && dist > 4) {
+        const panDx = pinchMidX - mx;
+        const panDy = pinchMidY - my;
+        if (panDx !== 0 || panDy !== 0) w.site_wheel(h, panDx, panDy);
+        const factor = Math.max(0.5, Math.min(2.0, dist / pinchDist));
+        w.site_pinch(h, mx, my, factor);
+        dirty = true;
+        kick();
+      }
+      pinchDist = dist;
+      pinchMidX = mx;
+      pinchMidY = my;
+    }
+  }, { passive: false });
+
+  const finishTouch = (e, cancelled) => {
+    clearLongPress();
+    const now = performance.now();
+    if (e.touches.length === 1) {
+      const t = e.touches[0];
+      tLastX = t.clientX;
+      tLastY = t.clientY;
+      tLastMs = now;
+      pinchDist = 0;
+      return;
+    }
+    if (e.touches.length > 1) return;
+    const mode = tMode;
+    tMode = 'scroll';
+    touchActive = false;
+    lastTouchEndMs = now;
+    pinchDist = 0;
+    if (mode === 'handle') {
+      e.preventDefault();
+      w.site_touch_end_selection?.(h);
+      dirty = true;
+      kick();
+    } else if (!cancelled && !tMoved && !tWasPinch) {
+      e.preventDefault();
+      if (w.site_touch_tap) {
+        w.site_touch_tap(h, tStartX, tStartY, now);
+        flushSideEffects();
+      } else {
+        w.site_pointer_move(h, tStartX, tStartY, now);
+        w.site_pointer_down(h, tStartX, tStartY, now);
+        flushSideEffects();
+        w.site_pointer_up(h, tStartX, tStartY, now);
+        flushSideEffects();
+      }
+      dirty = true;
+      kick();
+    } else if (!cancelled && tMoved && !tWasPinch && mode === 'scroll') {
+      if (now - tLastMs < 100 && Math.hypot(tVx, tVy) > 0.08) {
+        momVx = Math.max(-4, Math.min(4, tVx));
+        momVy = Math.max(-4, Math.min(4, tVy));
+        momActive = true;
+        momPrevMs = now;
+        dirty = true;
+        kick();
+      }
+    }
+  };
+  canvas.addEventListener('touchend', (e) => finishTouch(e, false), { passive: false });
+  canvas.addEventListener('touchcancel', (e) => finishTouch(e, true), { passive: false });
+  canvas.addEventListener('contextmenu', (e) => {
+    if (touchActive || performance.now() - lastTouchEndMs < 800) e.preventDefault();
+  });
+
+  // Pointer interaction (mouse / stylus; touch is handled above)
+  const isTouchPointer = (e) => e.pointerType === 'touch' || touchActive || (performance.now() - lastTouchEndMs < 500);
   canvas.addEventListener('pointermove', (e) => {
+    if (isTouchPointer(e)) return;
     w.site_pointer_move(h, e.clientX, e.clientY, performance.now());
     flushSideEffects();
     dirty = true;
     kick();
   });
   canvas.addEventListener('pointerdown', (e) => {
+    if (isTouchPointer(e)) return;
+    stopMomentum();
     canvas.focus();
     canvas.setPointerCapture?.(e.pointerId);
     w.site_pointer_down(h, e.clientX, e.clientY, performance.now());
@@ -946,6 +1226,7 @@ async function boot() {
     kick();
   });
   canvas.addEventListener('pointerup', (e) => {
+    if (isTouchPointer(e)) return;
     w.site_pointer_up(h, e.clientX, e.clientY, performance.now());
     flushSideEffects();
     dirty = true;
@@ -990,6 +1271,7 @@ async function boot() {
   });
 
   window.addEventListener('resize', () => { dirty = true; kick(); });
+  window.visualViewport?.addEventListener('resize', () => { dirty = true; kick(); });
 
   window.__BLAZE_SITE__ = {
     mode: () => 'webgpu-slug',

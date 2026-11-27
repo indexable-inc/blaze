@@ -1,7 +1,6 @@
-// Lesson: generic const expressions, blaze's own gate `blaze_const_exprs` (crates/hir-def/src/unstable_features.rs;
-// tests in crates/hir-ty-mir/src/tests/where_const.rs; ledger row E16). Not rustc's `generic_const_exprs`: concrete
-// arguments are compared by evaluating them, generic ones by a normal form over + - * and literals; nothing is solved
-// for. `where const { .. }` bounds are in docs/v2/plan/design/comptime.md.
+// Lesson: generic const expressions and `where const` bounds (`crates/blaze-lower`, `crates/blaze-solve`,
+// `crates/blaze-typeck`, `crates/blaze-ladder`). Concrete arguments compare by evaluating them, generic ones
+// by a normal form over `+`, `-`, `*` and literals; nothing is solved for.
 site {
   learn {
     const_exprs : Page {
@@ -60,7 +59,7 @@ site {
       }
 
       Step status("Where it stands") {
-        P now("Experimental: written and tested inside blaze. Next: [compile-time reflection](/learn/comptime) with `for const`.")
+        P now("Experimental: written and tested inside blaze. Next: [compile-time reflection](/learn/comptime) with `inline for`.")
         Dim design("Design: [comptime.md](https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/design/comptime.md).")
       }
     }
