@@ -867,3 +867,79 @@ fn schema_infers_nested_lockfile_types_patterns_and_histograms() {
     assert_eq!(res2.exit_code, 0, "got {:?}", res2.value);
     assert_eq!(res2.value, Value::string("record", alloc()));
 }
+
+#[test]
+fn modern_data_shell_syntax_leading_pipe_brackets_projection_files_and_verbs() {
+    use blaze_own::Share as _;
+    let mut host = FakeHost::new();
+    host.files.insert(
+        "/work/Cargo.lock".into(),
+        b"version = 4\n\n[[package]]\nname = \"adler2\"\nversion = \"2.0.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n[[package]]\nname = \"blaze-sh\"\nversion = \"0.0.0\"\ndependencies = [\"cfg-if\", \"once_cell\"]\n\n[[package]]\nname = \"blaze-core\"\nversion = \"0.0.0\"\ndependencies = [\"cfg-if\", \"libc\"]\n".to_vec(),
+    );
+    let mut st = EngineState::new("/work", &[], alloc());
+
+    // 1. Bare structured data file + flatten+skip-nulls `[]` + `uniq` + `sort` + `count`!
+    let deps = host.run("Cargo.lock.package.dependencies[] | uniq | sort", st.fork());
+    assert_eq!(deps.exit_code, 0, "got {:?}", deps.value);
+    match &deps.value {
+        Value::List(l) => {
+            assert_eq!(l.len(), 3);
+            assert_eq!(l.get(0), Some(&Value::string("cfg-if", alloc())));
+            assert_eq!(l.get(1), Some(&Value::string("libc", alloc())));
+            assert_eq!(l.get(2), Some(&Value::string("once_cell", alloc())));
+        }
+        other => panic!("expected flattened deduped list, got {other:?}"),
+    }
+
+    // 2. Bare `Cargo.toml.package.version`!
+    let ver = host.run("Cargo.toml.package.version", st.fork());
+    assert_eq!(ver.exit_code, 0, "got {:?}", ver.value);
+    assert_eq!(ver.value, Value::string("0.1.0", alloc()));
+
+    // 3. Inline filter `[source == null]` + projection `.{name, v: .version}` + negative index `[-1]` + slice `[..2]`!
+    let proj = host.run("Cargo.lock.package[source == null].{name, v: .version} | sort -name", st.fork());
+    assert_eq!(proj.exit_code, 0, "got {:?}", proj.value);
+    let Value::Table(tbl) = &proj.value else {
+        panic!("expected projected table, got {:?}", proj.value);
+    };
+    assert_eq!(tbl.nrows(), 2);
+    assert_eq!(tbl.get_by_name(0, "name").and_then(Value::as_str), Some("blaze-sh"));
+    assert_eq!(tbl.get_by_name(0, "v").and_then(Value::as_str), Some("0.0.0"));
+    assert_eq!(tbl.get_by_name(1, "name").and_then(Value::as_str), Some("blaze-core"));
+
+    let last_pkg = host.run("Cargo.lock.package[-1].name", st.fork());
+    assert_eq!(last_pkg.exit_code, 0, "got {:?}", last_pkg.value);
+    assert_eq!(last_pkg.value, Value::string("blaze-core", alloc()));
+
+    // `..` is inclusive (`0..=2` -> 3 items) and `..<` is exclusive (`0..2` -> 2 items).
+    let first_two = host.run("Cargo.lock.package[..<2] | count", st.fork());
+    assert_eq!(first_two.exit_code, 0, "got {:?}", first_two.value);
+    assert_eq!(first_two.value, Value::Int(2));
+
+    let first_three = host.run("Cargo.lock.package[..2] | count", st.fork());
+    assert_eq!(first_three.exit_code, 0, "got {:?}", first_three.value);
+    assert_eq!(first_three.value, Value::Int(3));
+
+    // 4. Leading `|` continues from `$_`!
+    st.set_var("_", proj.value.share(), false);
+    let lead = host.run("| find \"core\" | count", st.fork());
+    assert_eq!(lead.exit_code, 0, "got {:?}", lead.value);
+    assert_eq!(lead.value, Value::Int(1));
+
+    // 5. `freq`, `top`, and zero-param `map`!
+    let freq = host.run("Cargo.lock.package.version | freq", st.fork());
+    assert_eq!(freq.exit_code, 0, "got {:?}", freq.value);
+    let Value::Table(ftbl) = &freq.value else {
+        panic!("expected freq table, got {:?}", freq.value);
+    };
+    assert_eq!(ftbl.get_by_name(0, "value").and_then(Value::as_str), Some("0.0.0"));
+    assert_eq!(ftbl.get_by_name(0, "count"), Some(&Value::Int(2)));
+
+    let top = host.run("data.json | top 1 n | .0.name", st.fork());
+    assert_eq!(top.exit_code, 0, "got {:?}", top.value);
+    assert_eq!(top.value, Value::string("beta", alloc()));
+
+    let mapped = host.run(r#"Cargo.lock.package | map $"(.name)@(.version)" | .0"#, st.fork());
+    assert_eq!(mapped.exit_code, 0, "got {:?}", mapped.value);
+    assert_eq!(mapped.value, Value::string("adler2@2.0.1", alloc()));
+}

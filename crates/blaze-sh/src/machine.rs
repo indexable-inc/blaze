@@ -881,6 +881,23 @@ impl<'a, 'm> Evaluator<'a, 'm> {
                 }
                 Ok(cur)
             }
+            ExprKind::Flatten { base } => {
+                let val = self.eval_expr_inner(base, input, false)?;
+                self.eval_flatten(val, expr.span)
+            }
+            ExprKind::IndexSlice { base, index } => {
+                let val = self.eval_expr_inner(base, input, false)?;
+                let idx_val = self.eval_expr_inner(index, Value::Nothing, false)?;
+                self.eval_index_slice(val, idx_val, expr.span)
+            }
+            ExprKind::Filter { base, pred } => {
+                let val = self.eval_expr_inner(base, input, false)?;
+                self.eval_filter(val, pred, expr.span)
+            }
+            ExprKind::Project { base, fields } => {
+                let val = self.eval_expr_inner(base, input, false)?;
+                self.eval_project(val, fields.as_slice(), expr.span)
+            }
             ExprKind::BarePath(steps) => {
                 if let Some(row) = self.row_ctx.as_ref().map(Share::share) {
                     let mut cur = row;
@@ -1106,6 +1123,288 @@ impl<'a, 'm> Evaluator<'a, 'm> {
         msg.push_str(name);
         msg.push('`');
         Err(Control::Error(ShellError::new(ErrorKind::Undefined, span, msg.as_str(), self.alloc)))
+    }
+
+    /// `base[]`: flatten one level and drop nulls (`Value::Nothing`).
+    fn eval_flatten(&mut self, val: Value<'a>, span: Span) -> Result<Value<'a>, Control<'a>> {
+        let alloc = self.alloc;
+        match val {
+            Value::Nothing => Ok(Value::List(PVec::new(alloc))),
+            Value::List(items) => {
+                let mut out = PVec::new(alloc);
+                for i in 0..items.len() {
+                    self.charge(1, span)?;
+                    match items.get(i).unwrap() {
+                        Value::Nothing => {}
+                        Value::List(inner) => {
+                            for j in 0..inner.len() {
+                                self.charge(1, span)?;
+                                let v = inner.get(j).unwrap();
+                                if !matches!(v, Value::Nothing) {
+                                    out.push(v.share());
+                                }
+                            }
+                        }
+                        Value::Table(t) => {
+                            for r in 0..t.nrows() {
+                                self.charge(1, span)?;
+                                if let Some(rec) = t.row_record(r) {
+                                    out.push(Value::Record(rec));
+                                }
+                            }
+                        }
+                        other => out.push(other.share()),
+                    }
+                }
+                if let Some(tbl) = Table::try_from_list(&out, alloc) {
+                    Ok(Value::Table(tbl))
+                } else {
+                    Ok(Value::List(out))
+                }
+            }
+            Value::Table(t) => {
+                let mut out = PVec::new(alloc);
+                for r in 0..t.nrows() {
+                    self.charge(1, span)?;
+                    if let Some(rec) = t.row_record(r) {
+                        out.push(Value::Record(rec));
+                    }
+                }
+                Ok(Value::List(out))
+            }
+            Value::Record(r) => {
+                let mut out = PVec::new(alloc);
+                for (_, v) in r.iter() {
+                    self.charge(1, span)?;
+                    if !matches!(v, Value::Nothing) {
+                        out.push(v.share());
+                    }
+                }
+                Ok(Value::List(out))
+            }
+            other => {
+                let mut msg = AString::from_str_in("cannot flatten ", alloc);
+                msg.push_str(other.type_name());
+                msg.push_str(" with `[]`");
+                Err(Control::Error(ShellError::new(ErrorKind::Type, span, msg.as_str(), alloc)))
+            }
+        }
+    }
+
+    /// `base[idx]` / `base[-1]` / `base[a..b]` / `base["key"]`.
+    fn eval_index_slice(
+        &mut self,
+        val: Value<'a>,
+        index: Value<'a>,
+        span: Span,
+    ) -> Result<Value<'a>, Control<'a>> {
+        let alloc = self.alloc;
+        match index {
+            Value::String(k) => {
+                let member = PathMember::Field { name: k, optional: false };
+                val.follow_member(&member, span, alloc).map_err(Control::Error)
+            }
+            Value::Int(i) => {
+                let resolve_idx = |len: usize| -> Result<usize, Control<'a>> {
+                    let pos = if i < 0 {
+                        (len as i64).checked_add(i)
+                    } else {
+                        Some(i)
+                    };
+                    match pos {
+                        Some(p) if p >= 0 && (p as usize) < len => Ok(p as usize),
+                        _ => Err(Control::Error(ShellError::new(
+                            ErrorKind::IndexOutOfBounds,
+                            span,
+                            "index out of bounds",
+                            alloc,
+                        ))),
+                    }
+                };
+                match val {
+                    Value::List(l) => {
+                        let idx = resolve_idx(l.len())?;
+                        Ok(l.get(idx).unwrap().share())
+                    }
+                    Value::Table(t) => {
+                        let idx = resolve_idx(t.nrows())?;
+                        Ok(Value::Record(t.row_record(idx).unwrap()))
+                    }
+                    Value::String(s) => {
+                        let len = s.as_ref().chars().count();
+                        let idx = resolve_idx(len)?;
+                        let ch = s.as_ref().chars().nth(idx).unwrap();
+                        let mut buf = [0u8; 4];
+                        Ok(Value::string(ch.encode_utf8(&mut buf), alloc))
+                    }
+                    other => {
+                        let mut msg = AString::from_str_in("cannot index ", alloc);
+                        msg.push_str(other.type_name());
+                        Err(Control::Error(ShellError::new(ErrorKind::Type, span, msg.as_str(), alloc)))
+                    }
+                }
+            }
+            Value::Range(r) => {
+                let clamp_bounds = |len: usize| -> (usize, usize) {
+                    let n = len as i64;
+                    let start_i = if r.start < 0 { (n + r.start).max(0) } else { r.start.min(n) };
+                    let end_i = match r.end {
+                        None => n,
+                        Some(e) => {
+                            let adj = if e < 0 { n + e } else { e };
+                            let excl = if r.inclusive { adj.saturating_add(1) } else { adj };
+                            excl.clamp(0, n)
+                        }
+                    };
+                    let s = start_i as usize;
+                    let e = (end_i as usize).max(s);
+                    (s, e)
+                };
+                match val {
+                    Value::List(l) => {
+                        let (s, e) = clamp_bounds(l.len());
+                        let mut out = PVec::new(alloc);
+                        for idx in s..e {
+                            self.charge(1, span)?;
+                            out.push(l.get(idx).unwrap().share());
+                        }
+                        Ok(Value::List(out))
+                    }
+                    Value::Table(t) => {
+                        let (s, e) = clamp_bounds(t.nrows());
+                        let mut out = t.empty_like();
+                        for idx in s..e {
+                            self.charge(1, span)?;
+                            out.push_record(&t.row_record(idx).unwrap());
+                        }
+                        Ok(Value::Table(out))
+                    }
+                    Value::String(st) => {
+                        let len = st.as_ref().chars().count();
+                        let (s, e) = clamp_bounds(len);
+                        let mut out = AString::new_in(alloc);
+                        for ch in st.as_ref().chars().skip(s).take(e.saturating_sub(s)) {
+                            out.push(ch);
+                        }
+                        Ok(Value::string(out.as_str(), alloc))
+                    }
+                    other => {
+                        let mut msg = AString::from_str_in("cannot slice ", alloc);
+                        msg.push_str(other.type_name());
+                        Err(Control::Error(ShellError::new(ErrorKind::Type, span, msg.as_str(), alloc)))
+                    }
+                }
+            }
+            other => {
+                let mut msg = AString::from_str_in("invalid index type ", alloc);
+                msg.push_str(other.type_name());
+                Err(Control::Error(ShellError::new(ErrorKind::Type, span, msg.as_str(), alloc)))
+            }
+        }
+    }
+
+    /// `base[source == null]` inline row/item filter predicate.
+    fn eval_filter(
+        &mut self,
+        val: Value<'a>,
+        pred: &Expr<'a>,
+        span: Span,
+    ) -> Result<Value<'a>, Control<'a>> {
+        let alloc = self.alloc;
+        match val {
+            Value::Table(t) => {
+                let mut out = t.empty_like();
+                for r in 0..t.nrows() {
+                    self.charge(1, span)?;
+                    let rec = t.row_record(r).unwrap();
+                    let keep = self.eval_expr_with_row(pred, Value::Record(rec.share()))?;
+                    if keep.is_truthy() {
+                        out.push_record(&rec);
+                    }
+                }
+                Ok(Value::Table(out))
+            }
+            Value::List(items) => {
+                let mut out = PVec::new(alloc);
+                for i in 0..items.len() {
+                    self.charge(1, span)?;
+                    let item = items.get(i).unwrap().share();
+                    let keep = self.eval_expr_with_row(pred, item.share())?;
+                    if keep.is_truthy() {
+                        out.push(item);
+                    }
+                }
+                Ok(Value::List(out))
+            }
+            other => {
+                let mut msg = AString::from_str_in("cannot filter ", alloc);
+                msg.push_str(other.type_name());
+                msg.push_str(" with `[...]`");
+                Err(Control::Error(ShellError::new(ErrorKind::Type, span, msg.as_str(), alloc)))
+            }
+        }
+    }
+
+    /// `base.{name, ver: .version}` inline field/column pick & reshape.
+    fn eval_project(
+        &mut self,
+        val: Value<'a>,
+        fields: &[(ARc<'a, str>, Option<Expr<'a>>)],
+        span: Span,
+    ) -> Result<Value<'a>, Control<'a>> {
+        let alloc = self.alloc;
+        let eval_one_row = |this: &mut Self, row: Value<'a>| -> Result<Record<'a>, Control<'a>> {
+            let mut rec = Record::new(alloc);
+            for (name, expr_opt) in fields {
+                let v = match expr_opt {
+                    Some(e) => this.eval_expr_with_row(e, row.share())?,
+                    None => {
+                        let member = PathMember::Field { name: name.share(), optional: true };
+                        row.follow_member(&member, span, alloc).map_err(Control::Error)?
+                    }
+                };
+                rec.insert(name.share(), v);
+            }
+            Ok(rec)
+        };
+
+        match val {
+            Value::Record(r) => Ok(Value::Record(eval_one_row(self, Value::Record(r))?)),
+            Value::Table(t) => {
+                let mut cols = PVec::new(alloc);
+                for (name, _) in fields {
+                    cols.push(name.share());
+                }
+                let mut out = Table::new(cols, alloc);
+                for r in 0..t.nrows() {
+                    self.charge(1, span)?;
+                    let row = Value::Record(t.row_record(r).unwrap());
+                    let projected = eval_one_row(self, row)?;
+                    out.push_record(&projected);
+                }
+                Ok(Value::Table(out))
+            }
+            Value::List(items) => {
+                let mut cols = PVec::new(alloc);
+                for (name, _) in fields {
+                    cols.push(name.share());
+                }
+                let mut out = Table::new(cols, alloc);
+                for i in 0..items.len() {
+                    self.charge(1, span)?;
+                    let item = items.get(i).unwrap().share();
+                    let projected = eval_one_row(self, item)?;
+                    out.push_record(&projected);
+                }
+                Ok(Value::Table(out))
+            }
+            other => {
+                let mut msg = AString::from_str_in("cannot project ", alloc);
+                msg.push_str(other.type_name());
+                msg.push_str(" with `.{...}`");
+                Err(Control::Error(ShellError::new(ErrorKind::Type, span, msg.as_str(), alloc)))
+            }
+        }
     }
 
     fn eval_unary(&self, op: UnaryOp, val: Value<'a>, span: Span) -> Result<Value<'a>, Control<'a>> {
@@ -1726,7 +2025,12 @@ impl<'a, 'm> Evaluator<'a, 'm> {
         self.call_depth += 1;
         let saved_vars = self.state.vars.fork();
         let saved_input = core::mem::replace(&mut self.current_input, input.share());
-        let saved_row = self.row_ctx.take();
+        let next_row = if closure.params.is_empty() && !matches!(input, Value::Nothing) {
+            Some(input.share())
+        } else {
+            None
+        };
+        let saved_row = core::mem::replace(&mut self.row_ctx, next_row);
 
         // Build lexical closure environment from captured snapshot + parameter bindings.
         let mut c_vars = PMap::new(alloc);

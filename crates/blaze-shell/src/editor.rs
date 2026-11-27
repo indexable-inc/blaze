@@ -1845,8 +1845,10 @@ impl Editor {
             && prefix.starts_with('.')
             && !prefix.starts_with("./")
             && !prefix.starts_with("..");
+        let is_data_file_dot_path = at_expr_start && split_data_file_dot_prefix(prefix).is_some();
         let is_var_dot_path = prefix.starts_with('$') && prefix.contains('.');
         if is_dot_subject_path
+            || is_data_file_dot_path
             || is_var_dot_path
             || prefix.starts_with('-')
             || prev_non_ws.ends_with('|')
@@ -2342,13 +2344,24 @@ impl Editor {
         {
             if prev_non_ws.ends_with('|') {
                 let before_pipe = &prev_non_ws[..prev_non_ws.len() - 1];
-                if let Some(piped_val) = resolve_piped_value_for_dot(before_pipe, state) {
+                if before_pipe.trim().is_empty() {
+                    if let Some(slot) = state.get_var("_") {
+                        collect_value_path_completions(&slot.value, "", &prefix[1..], &mut scored);
+                    }
+                } else if let Some(piped_val) = resolve_piped_value_for_dot(before_pipe, state) {
                     collect_value_path_completions(&piped_val, "", &prefix[1..], &mut scored);
                 } else {
                     collect_piped_command_schema_dot_completions(before_pipe, &prefix[1..], &mut scored);
                 }
             } else if let Some(slot) = state.get_var("_") {
                 collect_value_path_completions(&slot.value, "", &prefix[1..], &mut scored);
+            }
+        } else if at_expr_start
+            && let Some((file_part, rest_after_dot)) = split_data_file_dot_prefix(prefix)
+        {
+            let abs = resolve_preview_path(state.cwd.as_ref(), file_part, state.get_env("HOME"));
+            if let Some(parsed) = load_cached_open_preview(&abs) {
+                collect_value_path_completions(&parsed, file_part, rest_after_dot, &mut scored);
             }
         } else if let Some(var_prefix) = prefix.strip_prefix('$') {
             if let Some((var_name, rest_after_dot)) = var_prefix.split_once('.') {
@@ -3352,6 +3365,7 @@ impl Editor {
         let mut insert = item.insert;
         let is_cell_path_insert = insert.starts_with('.')
             || insert.ends_with('.')
+            || split_data_file_dot_prefix(&insert).is_some()
             || (insert.starts_with('$') && insert.contains('.'));
         if !is_cell_path_insert
             && matches!(
@@ -4839,6 +4853,21 @@ fn resolve_stage0_value(stage: &str, state: &EngineState<'_>) -> Option<Value<'s
         };
     }
 
+    // `Cargo.lock` or `Cargo.lock.package` bare structured file stage!
+    if let Some((file_part, rest)) = split_data_file_dot_prefix(stage) {
+        let abs = resolve_preview_path(state.cwd.as_ref(), file_part, state.get_env("HOME"));
+        let parsed = load_cached_open_preview(&abs)?;
+        return if rest.is_empty() {
+            Some(parsed)
+        } else {
+            walk_dot_steps(&parsed, rest)
+        };
+    }
+    if is_bare_data_file(stage) {
+        let abs = resolve_preview_path(state.cwd.as_ref(), stage, state.get_env("HOME"));
+        return load_cached_open_preview(&abs);
+    }
+
     // `open <file>` -> parse structured file with mtime-keyed thread-local cache (<10us on hits!).
     let mut toks = stage.split_whitespace();
     let head = toks.next()?;
@@ -4948,6 +4977,24 @@ fn walk_dot_steps(root: &Value<'static>, dotted: &str) -> Option<Value<'static>>
         cur = next?;
     }
     Some(cur)
+}
+
+fn split_data_file_dot_prefix(tok: &str) -> Option<(&str, &str)> {
+    const EXTS: &[&str] = &[".toml.", ".lock.", ".json.", ".jsonl.", ".ndjson.", ".csv.", ".tsv."];
+    for &ext in EXTS {
+        if let Some(pos) = tok.find(ext) {
+            let file_end = pos + ext.len() - 1;
+            return Some((&tok[..file_end], &tok[file_end + 1..]));
+        }
+    }
+    None
+}
+
+fn is_bare_data_file(tok: &str) -> bool {
+    !tok.contains(char::is_whitespace)
+        && [".toml", ".lock", ".json", ".jsonl", ".ndjson", ".csv", ".tsv"]
+            .iter()
+            .any(|ext| tok.ends_with(ext))
 }
 
 fn resolve_preview_path(cwd: &str, raw: &str, home: Option<&str>) -> PathBuf {
@@ -5565,11 +5612,28 @@ mod tests {
         assert!(ed.completions.iter().any(|c| c.label == "version"));
         assert!(ed.completions.iter().any(|c| c.label == "source"));
 
-        // 5. Also supports `$lock | .pack` and `open Cargo.lock | .package | .ver`!
+        // 5. Also supports `$lock | .pack`, `open Cargo.lock | .package | .ver`,
+        // bare structured file `Cargo.lock.pac`, and leading `| .pac`!
         ed.set_text_initial("open Cargo.lock | .package | .ver".to_owned());
         ed.refresh_assist(&tmp_state, &[], false);
         assert_eq!(ed.completions[0].label, "version");
         assert_eq!(ed.completions[0].insert, ".version");
+
+        ed.set_text_initial("Cargo.lock.pac".to_owned());
+        ed.refresh_assist(&tmp_state, &[], false);
+        assert_eq!(ed.completions[0].label, "package");
+        assert_eq!(ed.completions[0].insert, "Cargo.lock.package.");
+        assert!(ed.apply_selected_completion());
+        assert_eq!(ed.text, "Cargo.lock.package.");
+
+        ed.refresh_assist(&tmp_state, &[], false);
+        assert!(ed.completions.iter().any(|c| c.label == "name"));
+        assert!(ed.completions.iter().any(|c| c.label == "version"));
+
+        ed.set_text_initial("| .pac".to_owned());
+        ed.refresh_assist(&state, &[], false);
+        assert_eq!(ed.completions[0].label, "package");
+        assert_eq!(ed.completions[0].insert, ".package.");
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }
