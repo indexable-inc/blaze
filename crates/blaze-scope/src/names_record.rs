@@ -303,9 +303,10 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
         let lb = names.chains.get(&b.1).map_or(0, |c| c.len());
         lb.cmp(&la).then_with(|| a.1.cmp(&b.1))
     });
-    let mut chains = RecordBytes::with_capacity_in(modules.len().saturating_mul(KEY), alloc);
+    let total_chain_keys: usize = names.chains.values().map(|c| c.len()).sum();
+    let mut chains = RecordBytes::with_capacity_in(total_chain_keys.saturating_mul(KEY), alloc);
     let mut chain_keys = 0usize;
-    let mut chain_places: HashMap<&[ItemKey], u32, Alloc<'b>> = HashMap::with_capacity_in(modules.len(), alloc);
+    let mut chain_places: HashMap<&[ItemKey], u32, Alloc<'b>> = HashMap::with_capacity_in(total_chain_keys.saturating_mul(2), alloc);
     let mut module_chain_at: AVec<'b, u32> = AVec::with_capacity_in(modules.len(), alloc);
     module_chain_at.resize(modules.len(), NONE);
     for &(idx, m) in chain_order.iter() {
@@ -337,7 +338,15 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
     let blob_est: usize = names
         .done
         .values()
-        .map(|done| 128usize.saturating_add(done.scope.bindings.len().saturating_mul(80)))
+        .map(|done| {
+            128usize
+                .saturating_add(done.scope.bindings.len().saturating_mul(96))
+                .saturating_add(done.scope.globs.len().saturating_mul(48))
+                .saturating_add(done.scope.textual.len().saturating_mul(64))
+                .saturating_add(done.scope.marks.len().saturating_mul(16))
+                .saturating_add(done.scope.traits.len().saturating_mul(32))
+                .saturating_add(done.scope.errors.len().saturating_mul(64))
+        })
         .sum();
     let mut blob = RecordBytes::with_capacity_in(blob_est, alloc);
     #[cfg(test)]

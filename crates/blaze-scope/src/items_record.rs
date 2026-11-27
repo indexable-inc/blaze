@@ -780,18 +780,24 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
 
     // The impl rows (columnar, single-allocation SoA buffer), and each impl's row by its key.
     let total_members: usize = tables.members.values().map(|list| list.len()).sum();
-    let col_scratch_cap = impls
-        .len()
-        .max(tables.texts.len())
-        .max(total_members)
-        .saturating_mul(8)
-        .saturating_add(1024);
+    let has_trait_roots = impls.iter().any(|i| i.trait_root.is_some());
+    let has_self_roots = impls.iter().any(|i| i.self_root.is_some());
+    let col_scratch_cap = if has_trait_roots || has_self_roots {
+        cols::id_col_bound(impls.len())
+    } else {
+        cols::int_col_bound(impls.len())
+    }
+    .max(cols::int_col_bound(tables.texts.len()))
+    .max(cols::int_col_bound(total_members));
     let mut col_scratch: AVec<'b, u8> = AVec::with_capacity_in(col_scratch_cap, alloc);
     let impl_rows_cap = if impls.is_empty() {
         0
     } else {
+        let id_cols = usize::from(has_trait_roots).saturating_add(usize::from(has_self_roots));
         (9 * 4usize)
-            .saturating_add(impls.len().saturating_mul(KEY_TAIL + 24))
+            .saturating_add(impls.len().saturating_mul(KEY_TAIL))
+            .saturating_add(cols::int_col_bound(impls.len()).saturating_mul(7))
+            .saturating_add(cols::id_col_bound(impls.len()).saturating_mul(id_cols))
             .next_multiple_of(ALIGN)
     };
     let mut impl_rows = RecordBytes::with_capacity_in(impl_rows_cap, alloc);
@@ -839,9 +845,15 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
     let item_rows_cap = if items.is_empty() {
         0
     } else {
+        let csr_bytes = if names.files.is_empty() {
+            0
+        } else {
+            names.files.len().saturating_add(1).saturating_add(items.len()).saturating_mul(4)
+        };
         (13 * 4usize)
-            .saturating_add(items.len().saturating_mul(KEY_TAIL + 28))
-            .saturating_add(names.files.len().saturating_add(1).saturating_mul(4))
+            .saturating_add(items.len().saturating_mul(KEY_TAIL))
+            .saturating_add(cols::int_col_bound(items.len()).saturating_mul(12))
+            .saturating_add(csr_bytes)
             .next_multiple_of(ALIGN)
     };
     let mut item_rows = RecordBytes::with_capacity_in(item_rows_cap, alloc);
@@ -978,7 +990,8 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
         0
     } else {
         (6 * 4usize)
-            .saturating_add(total_members.saturating_mul(KEY_TAIL + 20))
+            .saturating_add(total_members.saturating_mul(KEY_TAIL))
+            .saturating_add(cols::int_col_bound(total_members).saturating_mul(6))
             .next_multiple_of(ALIGN)
     };
     let mut member_rows = RecordBytes::with_capacity_in(member_rows_cap, alloc);
@@ -1164,21 +1177,10 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
     };
     let owners_cap = ALIGN.saturating_add(owned.len().saturating_mul(owners::OWNED_ROW));
     let total_variants: usize = tables.enums.values().map(|v| v.len()).sum();
-    let variants_cap = if total_variants > 0 {
-        ALIGN.saturating_add(8).saturating_add(total_variants.saturating_mul(78)).saturating_add(256)
-    } else {
-        ALIGN
-    };
+    let variants_cap = variants::encoded_len_bound(total_variants);
     let filed_impls = impls.iter().filter(|i| matches!(i.filing, buckets::Filing::At(_))).count();
     let unfiled_impls = impls.len().saturating_sub(filed_impls);
-    let buckets_cap = ALIGN
-        .saturating_add(if filed_impls > 0 {
-            16usize.saturating_add(filed_impls.saturating_mul(92)).saturating_add(512)
-        } else {
-            0
-        })
-        .saturating_add(ALIGN)
-        .saturating_add(unfiled_impls.saturating_mul(buckets::UNFILED_ROW));
+    let buckets_cap = buckets::encoded_len_bound(filed_impls, unfiled_impls);
     let values_cap = values::encoded_len_bound(&names.values);
     let out_cap = at
         .saturating_add(strings.bytes.len())
