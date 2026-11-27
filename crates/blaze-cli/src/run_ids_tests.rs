@@ -1335,18 +1335,23 @@ fn target_and_macro_side_member_units_get_distinct_views_and_walk_without_clash(
         side: Side,
         is_test: bool,
     }
-    let encode_list = |specs: &[RowSpec<'_>]| -> std::vec::Vec<u8> {
-        let mut heap = std::vec::Vec::new();
+    let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
+    let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context");
+    let heap = blaze_own::testing::heap();
+    let alloc = heap.alloc();
+
+    let encode_list = |specs: &[RowSpec<'_>]| -> blaze_own::AVec<'_, u8> {
+        let mut str_heap = blaze_own::AVec::new_in(alloc);
         let mut put_str = |s: &str| -> [u8; 8] {
-            let off = u32::try_from(heap.len()).unwrap();
+            let off = u32::try_from(str_heap.len()).unwrap();
             let len = u32::try_from(s.len()).unwrap();
-            heap.extend_from_slice(s.as_bytes());
+            str_heap.extend_from_slice(s.as_bytes());
             let mut out = [0u8; 8];
             out[..4].copy_from_slice(&off.to_le_bytes());
             out[4..].copy_from_slice(&len.to_le_bytes());
             out
         };
-        let mut rows = std::vec::Vec::with_capacity(specs.len() * ROW);
+        let mut rows = blaze_own::AVec::with_capacity_in(specs.len() * ROW, alloc);
         for spec in specs {
             let start = rows.len();
             rows.extend_from_slice(&[spec.key_byte; 32]); // key
@@ -1376,15 +1381,16 @@ fn target_and_macro_side_member_units_get_distinct_views_and_walk_without_clash(
             rows.extend_from_slice(&put_str("")); // bin_exes
             assert_eq!(rows.len() - start, ROW);
         }
-        let mut by_key: std::vec::Vec<usize> = (0..specs.len()).collect();
+        let mut by_key = blaze_own::AVec::with_capacity_in(specs.len(), alloc);
+        by_key.extend(0..specs.len());
         by_key.sort_unstable_by_key(|&i| [specs[i].key_byte; 32]);
-        let mut out = std::vec::Vec::with_capacity(HEADER_LEN + rows.len() + specs.len() * 4 + heap.len());
+        let mut out = blaze_own::AVec::with_capacity_in(HEADER_LEN + rows.len() + specs.len() * 4 + str_heap.len(), alloc);
         out.extend_from_slice(b"BZCL");
         out.extend_from_slice(&VERSION.to_le_bytes());
         out.extend_from_slice(&[0, 0]);
         out.extend_from_slice(&u32::try_from(specs.len()).unwrap().to_le_bytes()); // n
         out.extend_from_slice(&0u32.to_le_bytes()); // d
-        out.extend_from_slice(&u32::try_from(heap.len()).unwrap().to_le_bytes()); // heap
+        out.extend_from_slice(&u32::try_from(str_heap.len()).unwrap().to_le_bytes()); // heap
         for _ in 0..4 {
             out.extend_from_slice(&NONE.to_le_bytes()); // sysroot
         }
@@ -1396,14 +1402,9 @@ fn target_and_macro_side_member_units_get_distinct_views_and_walk_without_clash(
         for idx in by_key {
             out.extend_from_slice(&u32::try_from(idx).unwrap().to_le_bytes());
         }
-        out.extend_from_slice(&heap);
+        out.extend_from_slice(&str_heap);
         out
     };
-
-    let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
-    let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context");
-    let heap = blaze_own::testing::heap();
-    let alloc = heap.alloc();
 
     let encoded = encode_list(&[
         RowSpec { key_byte: 0x11, name: "blaze_int", pkg: "blaze-int", dir: "crates/blaze-int", root: "/0/crates/blaze-int/src/lib.rs", side: Side::Target, is_test: false },
@@ -1440,14 +1441,17 @@ fn target_and_macro_side_member_units_get_distinct_views_and_walk_without_clash(
     assert_ne!(row_test, row_target);
     assert_ne!(row_macro, row_test);
 
-    let mut answer = Held(std::vec![
-        (Name::units(), std::vec![part(pkg, source)], None),
-        (pkg, std::vec![part(lib_rs, rust)], None),
-        (lib_rs, std::vec![part(body, source)], None),
-        (row_target, std::vec::Vec::new(), payload(lib_rs, body_text, &[item(0x11, 1)])),
-        (row_macro, std::vec::Vec::new(), payload(lib_rs, body_text, &[item(0x22, 1)])),
-        (row_test, std::vec::Vec::new(), payload(lib_rs, body_text, &[item(0x33, 1)])),
-    ]);
+    let mk_held = |r0: Name, r1: Name, r2: Name| {
+        let mut entries = std::vec::Vec::new();
+        for (n, p) in [(Name::units(), part(pkg, source)), (pkg, part(lib_rs, rust)), (lib_rs, part(body, source))] {
+            entries.push((n, [p].into(), None));
+        }
+        for (r, k) in [(r0, 0x11), (r1, 0x22), (r2, 0x33)] {
+            entries.push((r, [].into(), payload(lib_rs, body_text, &[item(k, 1)])));
+        }
+        Held(entries)
+    };
+    let mut answer = mk_held(row_target, row_macro, row_test);
     let tool = tools()[Kind::BodyCheck.index()];
     let active = [u_target, u_macro, u_test];
     let walk = workspace_of(&cx, &mut answer, tool, &active, None, alloc).unwrap_or_else(|e| panic!("expected clean walk: {e}"));
@@ -1462,14 +1466,7 @@ fn target_and_macro_side_member_units_get_distinct_views_and_walk_without_clash(
     let colliding_macro = UnitRoot { view: u_target.view, ..u_macro };
     let bad_views = [u_target.view, colliding_macro.view, u_test.view];
     let bad_macro_row = at_view(body, Full::view_of(&bad_views, 1));
-    let mut bad_answer = Held(std::vec![
-        (Name::units(), std::vec![part(pkg, source)], None),
-        (pkg, std::vec![part(lib_rs, rust)], None),
-        (lib_rs, std::vec![part(body, source)], None),
-        (body, std::vec::Vec::new(), payload(lib_rs, body_text, &[item(0x11, 1)])),
-        (bad_macro_row, std::vec::Vec::new(), payload(lib_rs, body_text, &[item(0x22, 1)])),
-        (row_test, std::vec::Vec::new(), payload(lib_rs, body_text, &[item(0x33, 1)])),
-    ]);
+    let mut bad_answer = mk_held(body, bad_macro_row, row_test);
     let bad_active = [u_target, colliding_macro, u_test];
     match workspace_of(&cx, &mut bad_answer, tool, &bad_active, None, alloc) {
         Err(RunIdsError::ViewOfAnotherUnit { check, unit, covered }) => {

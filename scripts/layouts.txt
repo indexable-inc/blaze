@@ -83,6 +83,7 @@ crates/blaze-cli/src/test_cache.rs	STATE_VERSION	test decode_state_refuses_previ
 crates/blaze-cli/src/unused_deps.rs	FILE_REFS_MAGIC	none
 crates/blaze-cli/src/test_cache.rs	VERIFIED_MAGIC	none
 crates/blaze-cli/src/test_cache.rs	VERIFIED_VERSION	test decode_verified_refuses_previous_v1_layout
+crates/blaze-cli/src/wasm64_compile.rs	WASM64_LAYOUT_PASSES	not persisted: maximum loop pass count for checkout manifest layout
 crates/blaze-code/src/datum.rs	DATUM_MAGIC	none
 crates/blaze-code/src/record.rs	MAGIC	none
 crates/blaze-cunit/src/index.rs	INDEX_MAGIC	none
@@ -146,6 +147,7 @@ crates/blaze-ladder/src/front2/tables/task.rs	STRETCH_FRONT_MAGIC	test previous_
 crates/blaze-ladder/src/native_links.rs	TABLE_MAGIC	none
 crates/blaze-ladder/src/natives.rs	AR_MAGIC	none
 crates/blaze-ladder/src/natives.rs	NATIVE_FORMAT	none
+crates/blaze-ladder/src/run/export_lto_all.rs	LTO_SCC_CACHE_MAGIC	none
 crates/blaze-ladder/src/static_entry.rs	STATIC_ENTRY_MAGIC	none
 crates/blaze-launch-rt/src/viewer/pump.rs	BIN_EVENT_MAGIC	none
 crates/blaze-launch-rt/src/viewer/pump.rs	BIN_EVENT_VERSION	none
@@ -227,7 +229,7 @@ crates/blaze-scope/src/scope_record.rs	VERSION	none
 crates/blaze-scope/src/tests_record.rs	MAGIC	none
 crates/blaze-scope/src/tests_record.rs	VERSION	none
 crates/blaze-scope/src/tree_record.rs	MAGIC	none
-crates/blaze-scope/src/tree_record.rs	VERSION	test previous_version_3_is_rejected
+crates/blaze-scope/src/tree_record.rs	VERSION	test previous_version_4_is_rejected
 crates/blaze-script/src/engine.rs	STATUS_FORMAT	not persisted: a status line's form
 crates/blaze-script/src/finding.rs	SCHEMA	none
 crates/blaze-shell/src/render.rs	PIXEL_FORMAT	not persisted: Metal BGRA8Unorm swapchain pixel format constant

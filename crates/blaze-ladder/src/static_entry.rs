@@ -264,20 +264,23 @@ where
                         (d.target(Target { space: Space::Static, symbol: static_symbol(k) }), addend)
                     }
                 }
-                DataTarget::Fn(key) => match fn_target(key)
-                    .map_err(|error| StaticRecordError::FnName { alloc: n as u32, at: reloc.offset, error })?
-                    .ok_or(StaticRecordError::Fn { alloc: n as u32, at: reloc.offset })?
-                {
-                    StaticFnTarget::Instance { tabled, name } => {
-                        let symbol = fn_symbol_of_name(&name);
-                        declared.push((tabled, name));
-                        (d.target(Target { space: Space::Func, symbol }), addend)
+                DataTarget::Fn(key) => {
+                    let alloc_idx = u32::try_from(n).unwrap_or(u32::MAX);
+                    match fn_target(key)
+                        .map_err(|error| StaticRecordError::FnName { alloc: alloc_idx, at: reloc.offset, error })?
+                        .ok_or(StaticRecordError::Fn { alloc: alloc_idx, at: reloc.offset })?
+                    {
+                        StaticFnTarget::Instance { tabled, name } => {
+                            let symbol = fn_symbol_of_name(&name);
+                            declared.push((tabled, name));
+                            (d.target(Target { space: Space::Func, symbol }), addend)
+                        }
+                        StaticFnTarget::Foreign { symbol, weak } => {
+                            let target = if weak { d.weak_outside(symbol) } else { d.outside(symbol) };
+                            (target, addend)
+                        }
                     }
-                    StaticFnTarget::Foreign { symbol, weak } => {
-                        let target = if weak { d.weak_outside(symbol) } else { d.outside(symbol) };
-                        (target, addend)
-                    }
-                },
+                }
                 DataTarget::Vtable(key) => {
                     let alloc_idx = u32::try_from(n).unwrap_or(u32::MAX);
                     let symbol = vtable_target(key)

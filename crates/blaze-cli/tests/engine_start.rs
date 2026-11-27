@@ -108,6 +108,7 @@ fn write(dir: &Path, name: &str, source: &str) {
 fn blaze(dir: &Path, home: &Path, command: &str, args: &[&str]) -> Said {
     let stdout = home.join("command.stdout");
     let stderr = home.join("command.stderr");
+    let create = |p: &Path, w| std::fs::File::create(p).expect(w);
     let mut child = Command::new(env!("CARGO_BIN_EXE_blaze"))
         .arg(command)
         .args(args)
@@ -116,8 +117,8 @@ fn blaze(dir: &Path, home: &Path, command: &str, args: &[&str]) -> Said {
         .env("HOME", home)
         .env("CARGO_HOME", home.join(".cargo"))
         .stdin(Stdio::null())
-        .stdout(std::fs::File::create(&stdout).expect("capture blaze's standard output"))
-        .stderr(std::fs::File::create(&stderr).expect("capture blaze's standard error"))
+        .stdout(create(&stdout, "capture blaze's standard output"))
+        .stderr(create(&stderr, "capture blaze's standard error"))
         .spawn()
         .expect("blaze starts");
     let started = Instant::now();
@@ -132,9 +133,10 @@ fn blaze(dir: &Path, home: &Path, command: &str, args: &[&str]) -> Said {
         }
         pause_poll();
     };
+    let read = |p: &Path, what: &str| std::fs::read(p).expect(what);
     Said {
-        stdout: std::fs::read_to_string(stdout).expect("read blaze's standard output"),
-        stderr: String::from_utf8_lossy(&std::fs::read(stderr).expect("read blaze's standard error")).into_owned(),
+        stdout: String::from_utf8(read(&stdout, "read blaze's standard output")).expect("utf8 stdout"),
+        stderr: String::from_utf8_lossy(&read(&stderr, "read blaze's standard error")).into_owned(),
         code: status.code(),
     }
 }

@@ -1501,9 +1501,9 @@ fn crate_ptr_bytes<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, mut item: Ite
             && let Some(bits) = atoms
                 .iter()
                 .find(|(n, _)| *n == "target_pointer_width")
-                .and_then(|(_, w)| w.and_then(|w| w.parse::<u32>().ok()))
+                .and_then(|(_, w)| w.and_then(|w| w.parse::<u8>().ok()))
         {
-            return (bits / 8) as u8;
+            return bits / 8;
         }
         if let Some(h) = r.store.locals.head(item)
             && let Some(krate) = r.names.crate_of(h.module)
@@ -1511,9 +1511,9 @@ fn crate_ptr_bytes<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, mut item: Ite
             && let Some(bits) = atoms
                 .iter()
                 .find(|(n, _)| *n == "target_pointer_width")
-                .and_then(|(_, w)| w.and_then(|w| w.parse::<u32>().ok()))
+                .and_then(|(_, w)| w.and_then(|w| w.parse::<u8>().ok()))
         {
-            return (bits / 8) as u8;
+            return bits / 8;
         }
         match r.keys.origin(item) {
             Some(super::keys::Origin::Member { container, .. }) if *container != item => item = *container,

@@ -20,7 +20,7 @@ blaze-body-flow	24
 blaze-body-lower	22
 blaze-borrow	43
 blaze-bstd-convert	9
-blaze-build	736
+blaze-build	729
 blaze-build-script	109
 blaze-c	4
 blaze-cad	105
@@ -34,7 +34,7 @@ blaze-cast	40
 blaze-cc	17
 blaze-cert	14
 blaze-check	108
-blaze-cli	618
+blaze-cli	617
 blaze-cli-spec	9
 blaze-code	139
 blaze-columns	2
@@ -77,14 +77,14 @@ blaze-inproc	70
 blaze-int	6
 blaze-keyed	677
 blaze-kit	2
-blaze-ladder	1375
+blaze-ladder	1373
 blaze-launch	174
 blaze-launch-rt	455
 blaze-launcher	5
 blaze-lint	187
 blaze-lint-defs	21
 blaze-lir	1363
-blaze-lower	308
+blaze-lower	303
 blaze-manifest	6
 blaze-math	15
 blaze-mem	171
@@ -95,7 +95,7 @@ blaze-own	191
 blaze-pbr	71
 blaze-phf	26
 blaze-preview	2
-blaze-proc-macro	232
+blaze-proc-macro	231
 blaze-producers	3
 blaze-protocol	107
 blaze-radix	30
@@ -105,7 +105,7 @@ blaze-remote	238
 blaze-report	137
 blaze-rng	3
 blaze-run	110
-blaze-scope	933
+blaze-scope	931
 blaze-screen	13
 blaze-script	11
 blaze-sh	145

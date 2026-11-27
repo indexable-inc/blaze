@@ -334,8 +334,8 @@ impl<'a> BoundRef<'a> {
     /// so content-addressed whole-program LTO SCC keys invalidate if soft-float bindings change
     /// (Rule 21).
     pub fn hash_into(&self, hasher: &mut blaze_ids::Hasher) {
-        for r in SoftFloat::ALL {
-            match self.symbols.get(r as usize).copied().flatten() {
+        for (idx, r) in SoftFloat::ALL.into_iter().enumerate() {
+            match self.symbols.get(idx).copied().flatten() {
                 Some(sym) => {
                     hasher.update(&[1]);
                     hasher.update(&sym.0);

@@ -87,7 +87,8 @@ impl MacroIdentity {
         alloc: A,
     ) -> Self {
         let folded = blaze_proc_macro::module::deps_with_wasm_features(&self.deps, lock, wasm_graph, package, &self.features, path_files, alloc);
-        self.deps = folded.as_str().to_string();
+        self.deps.clear();
+        self.deps.push_str(folded.as_str());
         self
     }
 }
@@ -126,13 +127,14 @@ pub fn git_folders(modules: &Path) -> Result<BTreeMap<String, String>, ProcsErro
 /// package's files as the caller read them (blaze-cli: its `MacroFiles` leaf row, whose id the
 /// module lookup's key holds; [`register_macro_crates`]: the folder read here), or `None` for a
 /// path package it has no files of (then `PathWithoutFolder`, by name). Called at most once.
-pub fn identify<D: AsRef<str>>(
+pub fn identify<D: AsRef<str>, A: core::alloc::Allocator + Copy>(
     lock: &Lock<'_>,
     locked: &LockedPackages<'_, '_>,
     git_folders: &BTreeMap<String, String>,
     graph: &blaze_unit_graph::UnitGraph<'_>,
     unit: &Unit<'_>,
     mut path_files: impl FnMut(LockId) -> Result<Option<D>, ProcsError>,
+    alloc: A,
 ) -> Result<Result<MacroIdentity, Unidentified>, ProcsError> {
     let (package, version) = (unit.name.as_str(), unit.version.as_str());
     let named = || (package.to_string(), version.to_string());
@@ -157,61 +159,72 @@ pub fn identify<D: AsRef<str>>(
             }
         },
     };
-    let unit_deps = unit_dep_packages(graph, unit);
+    let unit_deps = unit_dep_packages(graph, unit, alloc);
     let has_path = matches!(locked_package.source, LockSource::Path)
         || unit_deps.iter().any(|&dep| matches!(lock.package(dep).source, LockSource::Path));
-    let deps_res = if has_path {
+    let deps = if has_path {
         // Cargo.lock mixes workspace members' `dev-dependencies` and inactive optional/target
         // dependencies into `[[package]].dependencies`; walk only the UnitGraph's compiled
         // normal/build dependency closure so uncompiled dev-deps do not poison the key or fail
         // with `ClosureError::Unpinned`.
-        locked.closure_of_packages(unit.package, unit_deps, &mut path_files)?
+        match locked.closure_of_packages(unit.package, unit_deps, &mut path_files, alloc)? {
+            Ok(s) => s.as_str().into(),
+            Err(error) => return Ok(Err(Unidentified::Closure(error))),
+        }
     } else {
-        locked.closure_with(package, version, &mut path_files)?
-    };
-    let deps = match deps_res {
-        Ok(deps) => deps,
-        Err(error) => return Ok(Err(Unidentified::Closure(error))),
+        match locked.closure_with(package, version, &mut path_files)? {
+            Ok(deps) => deps,
+            Err(error) => return Ok(Err(Unidentified::Closure(error))),
+        }
     };
     let features = unit.features.iter().map(|f| f.as_str().to_string()).collect();
     Ok(Ok(MacroIdentity { package: package.to_string(), version: version.to_string(), source, deps, features }))
 }
 
 /// Every `LockId` transitively depended on by `unit` in `graph` (normal deps and build scripts).
-fn unit_dep_packages(graph: &blaze_unit_graph::UnitGraph<'_>, unit: &Unit<'_>) -> Vec<LockId> {
-    let mut seen_units = std::vec![false; graph.units.len()];
-    let mut stack = Vec::new();
+fn unit_dep_packages<A: core::alloc::Allocator + Copy>(
+    graph: &blaze_unit_graph::UnitGraph<'_>,
+    unit: &Unit<'_>,
+    alloc: A,
+) -> blaze_own::Vec<LockId, A> {
+    let mut seen_units = blaze_own::Vec::with_capacity_in(graph.units.len(), alloc);
+    seen_units.resize(graph.units.len(), false);
+    let mut stack = blaze_own::Vec::new_in(alloc);
     for dep in unit.deps.iter() {
         let idx = dep.unit.index();
-        if idx < seen_units.len() && !seen_units[idx] {
-            seen_units[idx] = true;
+        if let Some(slot) = seen_units.get_mut(idx)
+            && !*slot
+        {
+            *slot = true;
             stack.push(dep.unit);
         }
     }
-    if let Some(bs) = unit.build_script {
-        let idx = bs.index();
-        if idx < seen_units.len() && !seen_units[idx] {
-            seen_units[idx] = true;
-            stack.push(bs);
-        }
+    if let Some(bs) = unit.build_script
+        && let Some(slot) = seen_units.get_mut(bs.index())
+        && !*slot
+    {
+        *slot = true;
+        stack.push(bs);
     }
-    let mut packages = Vec::new();
+    let mut packages = blaze_own::Vec::new_in(alloc);
     while let Some(uid) = stack.pop() {
-        let u = &graph.units[uid.index()];
+        let Some(u) = graph.units.get(uid.index()) else { continue };
         packages.push(u.package);
         for dep in u.deps.iter() {
             let idx = dep.unit.index();
-            if idx < seen_units.len() && !seen_units[idx] {
-                seen_units[idx] = true;
+            if let Some(slot) = seen_units.get_mut(idx)
+                && !*slot
+            {
+                *slot = true;
                 stack.push(dep.unit);
             }
         }
-        if let Some(bs) = u.build_script {
-            let idx = bs.index();
-            if idx < seen_units.len() && !seen_units[idx] {
-                seen_units[idx] = true;
-                stack.push(bs);
-            }
+        if let Some(bs) = u.build_script
+            && let Some(slot) = seen_units.get_mut(bs.index())
+            && !*slot
+        {
+            *slot = true;
+            stack.push(bs);
         }
     }
     packages
@@ -260,13 +273,14 @@ pub struct Registered {
 /// `modules` is the module store (its `proc-macro/modules`). A crate with no module is
 /// registered without one; the hook answers its calls with a refusal naming it.
 #[cfg(feature = "procs-run")]
-pub fn register_macro_crates<'u>(
+pub fn register_macro_crates<'u, A: core::alloc::Allocator + Copy>(
     procs: &mut ProcMacros<'_>,
     modules: &Path,
     lock: &Lock<'_>,
     graph: &blaze_unit_graph::UnitGraph<'_>,
     crates: impl IntoIterator<Item = (usize, &'u Unit<'u>)>,
     path_dir: impl Fn(LockId) -> Option<PathBuf>,
+    alloc: A,
 ) -> Result<Registered, ProcsError> {
     let git_folders = git_folders(modules)?;
     let locked = LockedPackages::of(lock);
@@ -280,7 +294,7 @@ pub fn register_macro_crates<'u>(
                 Ok(Some(blaze_proc_macro::module::files_digest(&mut listed)))
             }
         };
-        let identity = match identify(lock, &locked, &git_folders, graph, unit, path_files)? {
+        let identity = match identify(lock, &locked, &git_folders, graph, unit, path_files, alloc)? {
             Ok(identity) => identity,
             Err(why) => {
                 made.unregistered.push((index, Unregistered::Unidentified(why)));

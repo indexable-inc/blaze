@@ -69,10 +69,12 @@ impl<'a> ItemsRecord<'a> {
     /// Item row `i`'s chain, read directly from the grain section without opening its source file.
     pub fn chain_at(&self, i: usize) -> Result<ContentId, ItemsRecordError> {
         let short = ItemsRecordError::Short { what: "an item grain row", at: i };
-        if i >= self.counts[T_ITEMS] {
+        if self.counts.get(T_ITEMS).is_none_or(|&n| i >= n) {
             return Err(short);
         }
-        let base = self.field(F_GRAIN_AT) as usize;
+        let Ok(base) = usize::try_from(self.field(F_GRAIN_AT)) else {
+            return Err(short);
+        };
         if base == 0 {
             return Err(short);
         }
@@ -93,10 +95,12 @@ impl<'a> ItemsRecord<'a> {
     /// Item row `i`'s pieces, as the solve saw them.
     pub fn pieces_at(&self, i: usize) -> Result<ItemPieces, ItemsRecordError> {
         let short = ItemsRecordError::Short { what: "an item grain row", at: i };
-        if i >= self.counts[T_ITEMS] {
+        if self.counts.get(T_ITEMS).is_none_or(|&n| i >= n) {
             return Err(short);
         }
-        let base = self.field(F_GRAIN_AT) as usize;
+        let Ok(base) = usize::try_from(self.field(F_GRAIN_AT)) else {
+            return Err(short);
+        };
         if base == 0 {
             return Err(short);
         }

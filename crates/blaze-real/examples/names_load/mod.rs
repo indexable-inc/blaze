@@ -423,7 +423,7 @@ fn procs_of(
         }
     }
     let path_dir = |id: blaze_manifest::lock::LockId| member_dirs.get(&id.0).cloned();
-    let made = blaze_world::procs::register_macro_crates(&mut procs, modules, lock, graph, macro_units, path_dir).map_err(|e| LoadError::Procs(e.to_string()))?;
+    let made = blaze_world::procs::register_macro_crates(&mut procs, modules, lock, graph, macro_units, path_dir, heap.alloc()).map_err(|e| LoadError::Procs(e.to_string()))?;
     for (i, why) in &made.unregistered {
         println!("  procs: crate {}: not registered: {why:?}", crates.crates[*i].name);
     }

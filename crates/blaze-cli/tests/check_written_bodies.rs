@@ -115,10 +115,10 @@ fn check_package(tag: &str, pkg: &str, manifest: &str, lock: &str, src_rel: &str
     let base = fresh_home(tag, true);
     let dir = base.join(pkg);
     std::fs::create_dir_all(dir.join("src")).expect("the package's folders");
-    std::fs::write(dir.join("Cargo.toml"), manifest).expect("the manifest");
     // A lock to match, so the command has a unit graph and checks types (body_types.rs `NO_GRAPH`).
-    std::fs::write(dir.join("Cargo.lock"), lock).expect("the lock");
-    std::fs::write(dir.join(src_rel), src).expect(src_rel);
+    for (rel, body) in [("Cargo.toml", manifest), ("Cargo.lock", lock), (src_rel, src)] {
+        std::fs::write(dir.join(rel), body).expect(rel);
+    }
     let said = check(&dir, &base.join("home"));
     let _ = std::fs::remove_dir_all(&base);
     check_said(&said);

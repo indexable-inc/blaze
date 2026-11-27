@@ -518,11 +518,11 @@ impl Server {
         Ok(toks)
     }
 
-    fn get(&self, method: Method, handle: u32) -> Result<&Vec<Tok, Global>, ServerError> {
+    fn get(&self, method: Method, handle: u32) -> Result<&[Tok], ServerError> {
         handle
             .checked_sub(1)
             .and_then(|at| self.streams.get(at as usize))
-            .and_then(Option::as_ref)
+            .and_then(Option::as_deref)
             .ok_or(ServerError::NoSuchStream { method, handle })
     }
 
@@ -575,7 +575,7 @@ impl Server {
             }
             Method::TsClone => {
                 let handle = r.handle().map_err(bad)?;
-                let toks = self.get(method, handle)?.clone();
+                let toks = self.get(method, handle)?.to_vec();
                 let held = self.hold(toks)?;
                 w.handle(held);
             }

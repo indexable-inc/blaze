@@ -499,22 +499,19 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 let PNode::Tuple(cl_el) = self.ground_node(parts.env).map_err(err)? else {
                     return Err(malformed("a closure environment that is not a tuple"));
                 };
-                let mut co_tys: Vec<PTy, A> = Vec::with_capacity_in(fields.len(), self.alloc);
-                let mut cl_tys: Vec<PTy, A> = Vec::with_capacity_in(fields.len(), self.alloc);
+                let mut co_tys = blaze_own::Vec::with_capacity_in(fields.len(), self.alloc);
+                let mut cl_tys = blaze_own::Vec::with_capacity_in(fields.len(), self.alloc);
                 let view = self.ground.view();
                 let co_list = view.list(co_el).map_err(|_| malformed("a list past the ground table"))?;
                 let cl_list = view.list(cl_el).map_err(|_| malformed("a list past the ground table"))?;
-                if co_list.len() < fields.len() || cl_list.len() < fields.len() {
-                    copyable_ref_call = false;
-                } else {
-                    co_tys.extend_from_slice(&co_list[..fields.len()]);
-                    cl_tys.extend_from_slice(&cl_list[..fields.len()]);
-                    for j in 0..fields.len() {
-                        if fields[j].how != CaptureKind::ByValue {
+                if let (Some(co_slice), Some(cl_slice)) = (co_list.get(..fields.len()), cl_list.get(..fields.len())) {
+                    co_tys.extend_from_slice(co_slice);
+                    cl_tys.extend_from_slice(cl_slice);
+                    for (field, (&ty, &cl_ty)) in fields.iter().zip(co_tys.iter().zip(cl_tys.iter())) {
+                        if field.how != CaptureKind::ByValue {
                             continue;
                         }
-                        let ty = co_tys[j];
-                        if cl_tys[j] != ty || self.needs_drop(ty).map_err(err)? {
+                        if cl_ty != ty || self.needs_drop(ty).map_err(err)? {
                             copyable_ref_call = false;
                             break;
                         }
@@ -526,6 +523,8 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                             break;
                         }
                     }
+                } else {
+                    copyable_ref_call = false;
                 }
             }
             if !copyable_ref_call {

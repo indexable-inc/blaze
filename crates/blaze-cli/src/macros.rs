@@ -199,7 +199,7 @@ pub(crate) fn list(sections: crate::graph_payload::Sections<'_>, lock: &crate::f
     for unit in decoded.graph.units.iter().filter(|unit| matches!(unit.kind, UnitKind::ProcMacro)) {
         // A member macro crate's identity is its files' digest, read from its folder; a path
         // package that is no member has no folder here and is named as not identified.
-        let identity = identify(lock.lock, &locked, &folders, &decoded.graph, unit, |id| Ok(place.member_files(id))).map_err(MacrosError::Procs)?;
+        let identity = identify(lock.lock, &locked, &folders, &decoded.graph, unit, |id| Ok(place.member_files(id)), scratch).map_err(MacrosError::Procs)?;
         let identity = match (&wasm_decoded, identity) {
             (Some(wg), Ok(id)) => Ok(id.with_wasm_features(lock.lock, &wg.graph, unit.package, |dep_id| place.member_files(dep_id), scratch)),
             (_, other) => other,

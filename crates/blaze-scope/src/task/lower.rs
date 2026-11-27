@@ -573,7 +573,7 @@ impl<'s, 'a> Cfg<'s, 'a> {
                 "no_std" => attrs.no_std = true,
                 "no_core" => attrs.no_core = true,
                 "recursion_limit" => {
-                    let parsed = parse_recursion_limit(content);
+                    let parsed = parse_recursion_limit(content).ok_or(content);
                     match (attrs.recursion_limit, parsed) {
                         (None, res) => attrs.recursion_limit = Some(res),
                         (Some(Ok(_)), Err(err)) => attrs.recursion_limit = Some(Err(err)),
@@ -942,12 +942,12 @@ impl<'a> Attrs<'_, 'a> {
 /// Parses `#![recursion_limit = "N"]` using Rust literal tokenization and escape decoding
 /// (allowing comments around `=`, string escapes like `"\x32\x35\x36"`, raw strings like
 /// `r#"256"#`, and one optional leading `+` as `usize::from_str` accepts), preserving the
-/// requested limit (up to `u32::MAX`) and returning `Err(content)` when the attribute or its
+/// requested limit (up to `u32::MAX`) and returning `None` when the attribute or its
 /// decoded value is malformed or overflows `usize`.
-fn parse_recursion_limit<'t>(content: &'t str) -> Result<u32, &'t str> {
+fn parse_recursion_limit(content: &str) -> Option<u32> {
     let trimmed = skip_attr_trivia(content);
     let attr = head(trimmed);
-    let Some(rest) = trimmed.get(attr.len()..) else { return Err(content) };
+    let rest = trimmed.get(attr.len()..)?;
     let mut saw_any = false;
     let mut has_digits = false;
     let mut valid = true;
@@ -972,9 +972,9 @@ fn parse_recursion_limit<'t>(content: &'t str) -> Result<u32, &'t str> {
         }
     });
     if !decoded || !valid || !has_digits {
-        return Err(content);
+        return None;
     }
-    Ok(u32::try_from(value).unwrap_or(u32::MAX))
+    Some(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
 /// An attribute the lowering never takes for an item's attribute macro by its name alone: a

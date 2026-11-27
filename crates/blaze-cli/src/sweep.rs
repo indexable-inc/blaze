@@ -1439,7 +1439,7 @@ impl<S: Stamps> Follow<S> {
             };
             now.push(old.kind, flags, path, stamp, id);
             was.push(old_state);
-            if old.kind != LeafKind::Slot && !old.kind.by_script() && !old.post_graph_macro() && now.rows[i].state() != old_state {
+            if old.kind != LeafKind::Slot && !old.kind.by_script() && !old.post_graph_macro() && now.rows.get(i).is_some_and(|r| r.state() != old_state) {
                 layout_moved = true;
             }
         }
@@ -1450,11 +1450,12 @@ impl<S: Stamps> Follow<S> {
         // from `units_source` and therefore do not set `layout_moved` so `Stood` graph read-back
         // still succeeds and only the affected `MacroModule` task updates.
         for &i in crates.iter() {
-            let stands = crate::macro_files::proven(&now, &was, now.path(&now.rows[i]));
-            if !stands {
-                let post_graph = now.rows[i].flags & POST_GRAPH_MACRO;
-                now.rows[i].flags = post_graph;
-                now.rows[i].id = ContentId([0; 32]);
+            let Some(row) = now.rows.get(i) else { continue };
+            let stands = crate::macro_files::proven(&now, &was, now.path(row));
+            if !stands && let Some(row) = now.rows.get_mut(i) {
+                let post_graph = row.flags & POST_GRAPH_MACRO;
+                row.flags = post_graph;
+                row.id = ContentId([0; 32]);
                 if post_graph == 0 {
                     layout_moved = true;
                 }

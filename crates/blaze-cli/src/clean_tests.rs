@@ -31,13 +31,19 @@ fn world(files: &[(&str, &str)]) -> Io {
 
 /// `blaze clean <words>` with `HOME=/h`, on the files `io` holds now: its result and what it
 /// printed.
-fn clean(io: &Io, words: &[&str]) -> (Result<bstd::entry::Status, CliError>, std::string::String) {
+fn clean(io: &Io, words: &[&str]) -> (Result<bstd::entry::Status, CliError>, blaze_own::AString<'static>) {
     let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
     let before = io.script(|host| host.out.len()).expect("a simulated world");
     let fs = io.need_fs().expect("fs");
     let result = super::run_with(&cx, &fs, words.iter().copied(), Some("/h"), &io.need_out().expect("out"));
-    let said = io.script(|host| host.out[before..].to_vec()).expect("a simulated world");
-    (result, std::string::String::from_utf8(said).expect("text"))
+    let alloc = blaze_own::testing::heap().alloc();
+    let said = io
+        .script(|host| {
+            let text = core::str::from_utf8(&host.out[before..]).expect("text");
+            blaze_own::AString::from_str_in(text, alloc)
+        })
+        .expect("a simulated world");
+    (result, said)
 }
 
 fn there(io: &Io, path: &str) -> bool {
@@ -93,7 +99,7 @@ fn clean_removes_the_other_forms_and_keeps_this_blazes_store() {
     assert!(result.is_ok(), "{result:?}");
     let legacy = "old head".len() + "old segment".len();
     assert_eq!(
-        said,
+        said.as_str(),
         format!(
             "removed the format 4 store's files directly in /h/.blaze/v2/store: 2 files, {legacy} bytes freed\nremoved /h/.blaze/v2/store/f4s2, a store of another blaze's forms: 1 file, 5 bytes freed\n"
         )
@@ -106,7 +112,7 @@ fn clean_removes_the_other_forms_and_keeps_this_blazes_store() {
     }
     let (again, said) = clean(&io, &["ws"]);
     assert!(again.is_ok(), "{again:?}");
-    assert_eq!(said, format!("{NOTHING}\n"));
+    assert_eq!(said.as_str(), format!("{NOTHING}\n"));
 }
 
 #[test]
@@ -128,7 +134,7 @@ fn clean_removes_exactly_the_checkouts_state() {
     println!("blaze clean ws:\n{said}");
     assert!(result.is_ok(), "{result:?}");
     let freed = "profile\n".len() + "0123456789".len() + "abc".len();
-    assert_eq!(said, format!("removed ws/.blaze/v2: 3 files, {freed} bytes freed\n"));
+    assert_eq!(said.as_str(), format!("removed ws/.blaze/v2: 3 files, {freed} bytes freed\n"));
     assert!(!there(&io, "ws/.blaze/v2"));
     for kept in ["ws/Cargo.toml", "ws/src/lib.rs", "ws/.blaze", "h/.blaze/v2/store/CACHEDIR.TAG", "h/.blaze/v2/toolchain/abc/lib.rlib"] {
         assert!(there(&io, kept), "{kept} was removed");
@@ -136,7 +142,7 @@ fn clean_removes_exactly_the_checkouts_state() {
     let (again, said) = clean(&io, &["ws"]);
     println!("blaze clean ws, again:\n{said}");
     assert!(again.is_ok(), "{again:?}");
-    assert_eq!(said, format!("{NOTHING}\n"));
+    assert_eq!(said.as_str(), format!("{NOTHING}\n"));
 }
 
 /// `--store`: the store goes too; the toolchain shelf and the sources beside it stay.
@@ -148,7 +154,7 @@ fn clean_store_removes_the_store_and_leaves_the_toolchain() {
     assert!(result.is_ok(), "{result:?}");
     let checkout = "profile\n".len() + "0123456789".len() + "abc".len();
     let store = TAG.len() + "segment bytes".len() + "head".len();
-    assert_eq!(said, format!("removed ws/.blaze/v2: 3 files, {checkout} bytes freed\nremoved /h/.blaze/v2/store: 3 files, {store} bytes freed\n"));
+    assert_eq!(said.as_str(), format!("removed ws/.blaze/v2: 3 files, {checkout} bytes freed\nremoved /h/.blaze/v2/store: 3 files, {store} bytes freed\n"));
     assert!(!there(&io, "h/.blaze/v2/store"));
     for kept in ["h/.blaze/v2/toolchain/abc/lib.rlib", "h/.blaze/v2/sources/x.crate", "ws/src/lib.rs"] {
         assert!(there(&io, kept), "{kept} was removed");
@@ -156,7 +162,7 @@ fn clean_store_removes_the_store_and_leaves_the_toolchain() {
     let (again, said) = clean(&io, &["ws", "--store"]);
     println!("blaze clean ws --store, again:\n{said}");
     assert!(again.is_ok(), "{again:?}");
-    assert_eq!(said, format!("{NOTHING}\n"));
+    assert_eq!(said.as_str(), format!("{NOTHING}\n"));
 }
 
 /// A `.blaze/v2` holding a name blaze does not write is refused by that name, and nothing is
@@ -263,13 +269,13 @@ fn a_home_with_no_store_is_nothing_to_remove() {
         let io = world(&[("ws/src/lib.rs", "fn f() {}\n"), ("h/.blaze/v2/toolchain/abc/lib.rlib", "toolchain")]);
         let (result, said) = clean(&io, words);
         assert!(matches!(result, Ok(bstd::entry::Status::OK)), "{words:?}: {result:?}");
-        assert_eq!(said, format!("{NOTHING}\n"), "{words:?}");
+        assert_eq!(said.as_str(), format!("{NOTHING}\n"), "{words:?}");
         assert!(there(&io, "h/.blaze/v2/toolchain/abc/lib.rlib"));
         let io = world(&[("ws/src/lib.rs", "fn f() {}\n")]);
         assert!(!there(&io, "h"), "the fixture has a home");
         let (result, said) = clean(&io, words);
         assert!(matches!(result, Ok(bstd::entry::Status::OK)), "{words:?}, no home folder: {result:?}");
-        assert_eq!(said, format!("{NOTHING}\n"), "{words:?}, no home folder");
+        assert_eq!(said.as_str(), format!("{NOTHING}\n"), "{words:?}, no home folder");
     }
 }
 
@@ -295,7 +301,7 @@ fn nothing_there_is_nothing_to_remove() {
     let io = world(&[("ws/src/lib.rs", "fn f() {}\n"), ("h/.profile", "")]);
     let (result, said) = clean(&io, &["ws", "--store"]);
     assert!(matches!(result, Ok(bstd::entry::Status::OK)), "{result:?}");
-    assert_eq!(said, format!("{NOTHING}\n"));
+    assert_eq!(said.as_str(), format!("{NOTHING}\n"));
 }
 
 /// `--all`: removes the checkout state, the home store, AND all derived caches listed in

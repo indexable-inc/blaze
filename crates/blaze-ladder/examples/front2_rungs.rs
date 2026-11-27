@@ -412,22 +412,22 @@ mod tests {
     /// doc), which is why they return a static word and an empty rest.
     #[test]
     fn a_hang_and_a_crash_cost_one_line_each() {
-        let names: Vec<String> = ["x-1-passes", "x-2-sleeps", "x-3-aborts"].iter().map(|n| n.to_string()).collect();
+        let names = ["x-1-passes", "x-2-sleeps", "x-3-aborts"].map(str::to_owned);
         let mut rung = |name: &str| -> (&'static str, String) {
             match name {
-                "x-1-passes" => ("PASS", String::new()),
+                "x-1-passes" => ("PASS", "".into()),
                 "x-2-sleeps" => {
                     std::thread::sleep(Duration::from_secs(30));
-                    ("PASS", String::new())
+                    ("PASS", "".into())
                 }
                 _ => std::process::abort(),
             }
         };
-        let mut lines: Vec<String> = Vec::new();
+        let mut lines = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
         let started = Instant::now();
         let counts = table(&names, Duration::from_secs(1), &mut rung, &mut |line| lines.push(line.to_string()));
         assert_eq!(
-            lines,
+            lines.as_slice(),
             [
                 "[core] x-1-passes: PASS",
                 "[core] x-2-sleeps: HUNG after 1 s",

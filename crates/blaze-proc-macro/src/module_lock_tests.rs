@@ -358,22 +358,28 @@ version = "0.0.0"
 
     // UnitGraph closure contains only `shared`, not `dev-only`: pins cleanly and changes when
     // `shared`'s files digest changes.
+    let alloc = blaze_own::testing::heap().alloc();
     let d1 = locked
-        .closure_of_packages(pm, [shared], |id| {
-            assert_ne!(id, dev_only, "uncompiled dev-dep must never be queried");
-            Ok::<Option<&str>, core::convert::Infallible>((id == shared).then_some("aaa"))
-        })
+        .closure_of_packages(
+            pm,
+            [shared],
+            |id| {
+                assert_ne!(id, dev_only, "uncompiled dev-dep must never be queried");
+                Ok::<Option<&str>, core::convert::Infallible>((id == shared).then_some("aaa"))
+            },
+            alloc,
+        )
         .unwrap()
         .expect("compiled path dep pinned");
     let d2 = locked
-        .closure_of_packages(pm, [shared], |id| Ok::<Option<&str>, core::convert::Infallible>((id == shared).then_some("bbb")))
+        .closure_of_packages(pm, [shared], |id| Ok::<Option<&str>, core::convert::Infallible>((id == shared).then_some("bbb")), alloc)
         .unwrap()
         .expect("compiled path dep pinned");
-    assert_ne!(d1, d2, "changing a compiled path dep's digest must change the closure key");
+    assert_ne!(d1.as_str(), d2.as_str(), "changing a compiled path dep's digest must change the closure key");
 
     // Negative: missing pin for an actual compiled path dep is still refused.
     let missing = locked
-        .closure_of_packages(pm, [shared], |_| Ok::<Option<&str>, core::convert::Infallible>(None))
+        .closure_of_packages(pm, [shared], |_| Ok::<Option<&str>, core::convert::Infallible>(None), alloc)
         .unwrap();
     assert_eq!(missing, Err(ClosureError::Unpinned { name: "shared".into(), version: "0.0.0".into() }));
 }

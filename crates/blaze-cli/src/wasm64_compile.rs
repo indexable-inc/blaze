@@ -852,7 +852,8 @@ fn ensure_build_script_unit(
     );
     let key = sha256_hex(identity.as_bytes());
     let wasm_sha256 = sha256_hex(&wasm);
-    publish_build_script_module(store, &key, &identity, &wasm, &wasm_sha256)?;
+    publish_build_script_module(store, &key, &identity, &wasm, &wasm_sha256)
+        .map_err(|e| std::format!("{e}"))?;
     Ok(wasm_sha256)
 }
 
@@ -891,7 +892,7 @@ fn ensure_proc_macro_unit(
         let mut files = blaze_proc_macro::module::package_files(&pkg_dir)
             .map_err(|e| blaze_world::procs::ProcsError::Files { at: pkg_dir, error: e })?;
         Ok(Some(blaze_proc_macro::module::files_digest(&mut files)))
-    })
+    }, heap.alloc())
     .map_err(|e| std::format!("identifying proc-macro dep {} {}: {e}", unit.name.as_str(), unit.version.as_str()))?
     .map_err(|e| std::format!("proc-macro dep {} {} not identified: {e}", unit.name.as_str(), unit.version.as_str()))?
     .with_wasm_features(lock, graph, unit.package, |dep_id| path_pkg_files_digest(checkout, members, dep_id), heap.alloc());
@@ -928,7 +929,8 @@ fn ensure_proc_macro_unit(
                 &wasm_sha256,
                 &built.macros,
                 PROC_MACRO_DECLS_GLOBAL,
-            )?;
+            )
+            .map_err(|e| std::format!("{e}"))?;
             identity
                 .with_id(|id| blaze_proc_macro::module::read_module(store, id))
                 .map_err(|e| {
@@ -995,7 +997,7 @@ pub(crate) fn compile_proc_macro(
             want_refs.join(",")
         )));
     };
-    let pm_id = UnitId(unit_idx as u32);
+    let pm_id = UnitId(u32::try_from(unit_idx).unwrap_or(u32::MAX));
     let built = compile_unit_to_wasm64(
         store,
         &decoded.graph,
@@ -1021,7 +1023,8 @@ pub(crate) fn compile_proc_macro(
         &wasm_sha256,
         &built.macros,
         PROC_MACRO_DECLS_GLOBAL,
-    )?;
+    )
+    .map_err(|e| std::format!("{e}"))?;
     Ok(wasm_sha256)
 }
 
@@ -2278,7 +2281,8 @@ fn compile_unit_in<'a>(
         tc_units
             .iter()
             .position(|u| u.role == r)
-            .map(|i| CrateId((tc_base + i) as u32))
+            .and_then(|i| u32::try_from(tc_base + i).ok())
+            .map(CrateId)
     };
     let sysroot = Sysroot {
         core: role_id(Role::Core),
@@ -2333,7 +2337,7 @@ fn compile_unit_in<'a>(
                 .map(str::to_owned)
                 .collect();
             exported_macros.push(Exported {
-                index: idx as u32,
+                index: u32::try_from(idx).unwrap_or(u32::MAX),
                 kind: match entry.kind {
                     blaze_surface::ProcKind::Derive => ProcKind::Derive,
                     blaze_surface::ProcKind::Attr => ProcKind::Attr,
@@ -2626,19 +2630,44 @@ fn emit_wasm64_from_records<'n>(
     Ok(wasm_out.as_slice().to_vec())
 }
 
-fn publish_build_script_module(
+#[derive(Debug)]
+enum PublishModuleOp {
+    CreateDir(std::path::PathBuf),
+    WriteFile(&'static str),
+    Publish(std::path::PathBuf),
+}
+
+#[derive(Debug)]
+struct PublishModuleError {
+    op: PublishModuleOp,
+    source: std::io::Error,
+}
+
+impl core::fmt::Display for PublishModuleError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match &self.op {
+            PublishModuleOp::CreateDir(path) => write!(f, "create {}: {}", path.display(), self.source),
+            PublishModuleOp::WriteFile(name) => write!(f, "write {name}: {}", self.source),
+            PublishModuleOp::Publish(path) => write!(f, "publish {}: {}", path.display(), self.source),
+        }
+    }
+}
+
+fn ensure_module_dir(path: std::path::PathBuf) -> Result<std::path::PathBuf, PublishModuleError> {
+    match std::fs::create_dir_all(&path) {
+        Ok(()) => Ok(path),
+        Err(source) => Err(PublishModuleError { op: PublishModuleOp::CreateDir(path), source }),
+    }
+}
+
+fn publish_staged_module(
     store: &Path,
+    subdir: &str,
     key: &str,
-    identity: &str,
-    wasm: &[u8],
-    wasm_sha256: &str,
-) -> Result<(), std::string::String> {
-    let base = store.join("build-script/modules");
-    let stage_root = store.join("build-script/.stage");
-    std::fs::create_dir_all(&base)
-        .map_err(|e| std::format!("create {}: {e}", base.display()))?;
-    std::fs::create_dir_all(&stage_root)
-        .map_err(|e| std::format!("create {}: {e}", stage_root.display()))?;
+    files: &[(&'static str, &[u8])],
+) -> Result<(), PublishModuleError> {
+    let base = ensure_module_dir(store.join(subdir).join("modules"))?;
+    let stage_root = ensure_module_dir(store.join(subdir).join(".stage"))?;
     let final_dir = base.join(key);
     if final_dir.join("wasm-sha256").is_file() {
         return Ok(());
@@ -2646,23 +2675,40 @@ fn publish_build_script_module(
     let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
     let stage = stage_root.join(std::format!("{key}.{}.{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&stage);
-    std::fs::create_dir_all(&stage)
-        .map_err(|e| std::format!("create {}: {e}", stage.display()))?;
-    std::fs::write(stage.join("identity"), identity)
-        .map_err(|e| std::format!("write identity: {e}"))?;
-    std::fs::write(stage.join("module.wasm"), wasm)
-        .map_err(|e| std::format!("write module.wasm: {e}"))?;
-    std::fs::write(stage.join("wasm-sha256"), std::format!("{wasm_sha256}\n"))
-        .map_err(|e| std::format!("write wasm-sha256: {e}"))?;
-    if let Err(err) = std::fs::rename(&stage, &final_dir) {
-        if final_dir.join("wasm-sha256").is_file() {
-            let _ = std::fs::remove_dir_all(&stage);
+    let stage = ensure_module_dir(stage)?;
+    for &(name, bytes) in files {
+        std::fs::write(stage.join(name), bytes)
+            .map_err(|source| PublishModuleError { op: PublishModuleOp::WriteFile(name), source })?;
+    }
+    if let Err(source) = std::fs::rename(&stage, &final_dir) {
+        let published = final_dir.join("wasm-sha256").is_file();
+        let _ = std::fs::remove_dir_all(&stage);
+        if published {
             return Ok(());
         }
-        let _ = std::fs::remove_dir_all(&stage);
-        return Err(std::format!("publish {}: {err}", final_dir.display()));
+        return Err(PublishModuleError { op: PublishModuleOp::Publish(final_dir), source });
     }
     Ok(())
+}
+
+fn publish_build_script_module(
+    store: &Path,
+    key: &str,
+    identity: &str,
+    wasm: &[u8],
+    wasm_sha256: &str,
+) -> Result<(), PublishModuleError> {
+    let digest_line = std::format!("{wasm_sha256}\n");
+    publish_staged_module(
+        store,
+        "build-script",
+        key,
+        &[
+            ("identity", identity.as_bytes()),
+            ("module.wasm", wasm),
+            ("wasm-sha256", digest_line.as_bytes()),
+        ],
+    )
 }
 
 fn publish_proc_macro_module(
@@ -2673,22 +2719,7 @@ fn publish_proc_macro_module(
     wasm_sha256: &str,
     macros: &[Exported],
     decls_global: &str,
-) -> Result<(), std::string::String> {
-    let base = store.join("proc-macro/modules");
-    let stage_root = store.join("proc-macro/.stage");
-    std::fs::create_dir_all(&base)
-        .map_err(|e| std::format!("create {}: {e}", base.display()))?;
-    std::fs::create_dir_all(&stage_root)
-        .map_err(|e| std::format!("create {}: {e}", stage_root.display()))?;
-    let final_dir = base.join(key);
-    if final_dir.join("wasm-sha256").is_file() {
-        return Ok(());
-    }
-    let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let stage = stage_root.join(std::format!("{key}.{}.{seq}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&stage);
-    std::fs::create_dir_all(&stage)
-        .map_err(|e| std::format!("create {}: {e}", stage.display()))?;
+) -> Result<(), PublishModuleError> {
     let mut macros_text = std::string::String::new();
     for m in macros {
         let kind_word = match m.kind {
@@ -2708,25 +2739,20 @@ fn publish_proc_macro_module(
             );
         }
     }
-    std::fs::write(stage.join("identity"), identity)
-        .map_err(|e| std::format!("write identity: {e}"))?;
-    std::fs::write(stage.join("module.wasm"), wasm)
-        .map_err(|e| std::format!("write module.wasm: {e}"))?;
-    std::fs::write(stage.join("wasm-sha256"), std::format!("{wasm_sha256}\n"))
-        .map_err(|e| std::format!("write wasm-sha256: {e}"))?;
-    std::fs::write(stage.join("macros"), macros_text)
-        .map_err(|e| std::format!("write macros: {e}"))?;
-    std::fs::write(stage.join("decls"), std::format!("{decls_global}\n"))
-        .map_err(|e| std::format!("write decls: {e}"))?;
-    if let Err(err) = std::fs::rename(&stage, &final_dir) {
-        if final_dir.join("wasm-sha256").is_file() {
-            let _ = std::fs::remove_dir_all(&stage);
-            return Ok(());
-        }
-        let _ = std::fs::remove_dir_all(&stage);
-        return Err(std::format!("publish {}: {err}", final_dir.display()));
-    }
-    Ok(())
+    let digest_line = std::format!("{wasm_sha256}\n");
+    let decls_line = std::format!("{decls_global}\n");
+    publish_staged_module(
+        store,
+        "proc-macro",
+        key,
+        &[
+            ("identity", identity.as_bytes()),
+            ("module.wasm", wasm),
+            ("wasm-sha256", digest_line.as_bytes()),
+            ("macros", macros_text.as_bytes()),
+            ("decls", decls_line.as_bytes()),
+        ],
+    )
 }
 
 struct CachedSysrootCrate<'a> {
@@ -2856,13 +2882,13 @@ fn encode_expansions_table(
     origins: &blaze_own::BTreeMap<LibKey, &[u8], Alloc<'_>>,
 ) -> std::vec::Vec<u8> {
     let mut out = std::vec::Vec::new();
-    let count = expansions.len() as u32;
+    let count = u32::try_from(expansions.len()).unwrap_or(u32::MAX);
     out.extend_from_slice(&count.to_le_bytes());
     for (&call, &text) in expansions.iter() {
         let orig = origins.get(&call).copied().unwrap_or(&[]);
         out.extend_from_slice(&call.0.0);
-        out.extend_from_slice(&(text.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(orig.len() as u32).to_le_bytes());
+        out.extend_from_slice(&u32::try_from(text.len()).unwrap_or(u32::MAX).to_le_bytes());
+        out.extend_from_slice(&u32::try_from(orig.len()).unwrap_or(u32::MAX).to_le_bytes());
         out.extend_from_slice(text.as_bytes());
         out.extend_from_slice(orig);
     }
@@ -2877,7 +2903,7 @@ fn decode_expansions_table<'a>(
     if bytes.len() < 4 {
         return Err(std::string::String::from("truncated wasm64 sysroot expansions table"));
     }
-    let count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let count = usize::try_from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])).unwrap_or(0);
     let mut at = 4usize;
     for _ in 0..count {
         if at + 40 > bytes.len() {
@@ -2886,8 +2912,8 @@ fn decode_expansions_table<'a>(
         let mut id = [0u8; 32];
         id.copy_from_slice(&bytes[at..at + 32]);
         let key = LibKey(ContentId(id));
-        let tlen = u32::from_le_bytes([bytes[at + 32], bytes[at + 33], bytes[at + 34], bytes[at + 35]]) as usize;
-        let olen = u32::from_le_bytes([bytes[at + 36], bytes[at + 37], bytes[at + 38], bytes[at + 39]]) as usize;
+        let tlen = usize::try_from(u32::from_le_bytes([bytes[at + 32], bytes[at + 33], bytes[at + 34], bytes[at + 35]])).unwrap_or(0);
+        let olen = usize::try_from(u32::from_le_bytes([bytes[at + 36], bytes[at + 37], bytes[at + 38], bytes[at + 39]])).unwrap_or(0);
         at += 40;
         if at + tlen + olen > bytes.len() {
             return Err(std::string::String::from("truncated wasm64 sysroot expansion entry payload"));
@@ -3066,11 +3092,15 @@ mod wasm64_probe_table_tests {
                 let sys = blaze_toolchain::sysroot(&view, WASM64_TARGET, false).expect("real sysroot");
                 let all: std::vec::Vec<_> = view.units(WASM64_TARGET).expect("real units").collect();
                 let mut keep = std::vec![false; all.len()];
-                let mut todo = std::vec![sys.core.0 as usize, sys.alloc.0 as usize, sys.std.0 as usize];
+                let mut todo = std::vec![
+                    usize::try_from(sys.core.0).unwrap_or(0),
+                    usize::try_from(sys.alloc.0).unwrap_or(0),
+                    usize::try_from(sys.std.0).unwrap_or(0),
+                ];
                 while let Some(u) = todo.pop() {
                     if keep[u] { continue; }
                     keep[u] = true;
-                    todo.extend(all[u].deps().map(|(_, d)| d as usize));
+                    todo.extend(all[u].deps().filter_map(|(_, d)| usize::try_from(d).ok()));
                 }
                 let real_cfg: std::vec::Vec<_> = view
                     .cfg(WASM64_TARGET)

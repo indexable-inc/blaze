@@ -101,7 +101,8 @@ fn items_of(names: &Names<'_>, name: Option<&str>, is: fn(ItemDetail) -> bool) -
 /// control)` and `test token_mark_heads ... ok`
 #[test]
 fn token_mark_heads() {
-    let tc = Toolchain::none(blaze_own::Alloc::global());
+    let alloc = blaze_own::testing::heap().alloc();
+    let tc = Toolchain::none(alloc);
     let cfg = tc.program_cfg(blaze_build::Panic::Unwind);
     let rust = PackageEdition { syntax: edition::Edition::Edition2024, blaze: None };
     let lib = implicit(rust, &blaze_unit_graph::UnitKind::Lib);
@@ -135,8 +136,8 @@ fn token_mark_heads() {
     let names = resolve_crates(&crates, Sysroot::default(), &Files, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: ROOT }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
-    let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
+    let mut front = Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
     let mut failed: Vec<String> = Vec::new();
     let mut said: Vec<String> = Vec::new();
 
@@ -274,7 +275,8 @@ dep::define_plain_crate!(PlainId);
         }
     }
 
-    let tc = Toolchain::none(blaze_own::Alloc::global());
+    let alloc = blaze_own::testing::heap().alloc();
+    let tc = Toolchain::none(alloc);
     let cfg = tc.program_cfg(blaze_build::Panic::Unwind);
     let rust = PackageEdition { syntax: edition::Edition::Edition2024, blaze: None };
     let lib = implicit(rust, &blaze_unit_graph::UnitKind::Lib);
@@ -323,8 +325,8 @@ dep::define_plain_crate!(PlainId);
         .unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: ROOT_KEPT_SRC }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
-    let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
+    let mut front = Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
 
     let is_struct = |d: ItemDetail| matches!(d, ItemDetail::Struct);
     for (name, must_resolve) in [("NodeId", true), ("NestedId", true), ("PlainId", false)] {
