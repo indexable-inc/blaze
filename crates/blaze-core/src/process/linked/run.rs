@@ -374,7 +374,7 @@ mod tests {
         let child = start_run(&sh("printf '\\000\\000\\000\\002hi' >&3"), &link(&given, null)).expect("sh starts").child;
         drop(end);
         let clock = Monotonic::new();
-        let mut inbox = Vec::new();
+        let mut inbox = blaze_own::Vec::new_in(std::alloc::Global);
         let got = parent.recv_message(&mut inbox, 64, Deadline::after(clock.now(), Duration::from_secs(20)), &clock);
         assert_eq!(got.expect("a message"), Message::Whole { len: 6 });
         assert_eq!(&inbox[..], b"\0\0\0\x02hi");

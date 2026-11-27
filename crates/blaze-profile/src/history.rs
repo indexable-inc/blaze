@@ -658,6 +658,16 @@ pub enum CompactError {
     SchemaDiffers,
 }
 
+/// Pure in-memory `io::Error` constructors for `history::files` (keeps `std::io` out of the
+/// `#![blaze::sans_io]` core module).
+pub(super) fn io_other<E: Into<Box<dyn std::error::Error + Send + Sync>>>(error: E) -> io::Error {
+    io::Error::other(error)
+}
+
+pub(super) fn io_would_block() -> io::Error {
+    io::ErrorKind::WouldBlock.into()
+}
+
 impl fmt::Display for CompactError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

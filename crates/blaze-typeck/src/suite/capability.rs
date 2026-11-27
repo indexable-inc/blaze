@@ -236,3 +236,30 @@ fn body_check_emits_typed_finding_when_constructing_violating_sans_io_struct() {
         checked.findings[0]
     );
 }
+
+#[test]
+fn deep_diamond_dag_terminates_without_subst_blowup() {
+    let mut fx = Fx::new();
+    let u32_ = fx.u32();
+
+    // Build a 26-level diamond DAG: each level has two fields of the next level (2^26 paths
+    // without monomorphic memoization + LIFO subst popping + step budget).
+    const NAMES: [&str; 26] = [
+        "L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8", "L9", "L10", "L11", "L12",
+        "L13", "L14", "L15", "L16", "L17", "L18", "L19", "L20", "L21", "L22", "L23", "L24", "L25",
+    ];
+    let mut next_ty = u32_;
+    let mut top_adt = ItemKey(0);
+    for (level, name) in NAMES.iter().enumerate() {
+        let adt = fx.strukt(name, 0, &[("a", next_ty), ("b", next_ty)]);
+        if level == 25 {
+            fx.set_attrs(adt, TypeAttrs(TypeAttrs::SANS_IO));
+            top_adt = adt;
+        }
+        next_ty = fx.adt(adt, &[]);
+    }
+    fx.finish();
+
+    let findings = check_adt_capabilities(&fx, top_adt, alloc()).expect("diamond DAG check");
+    assert!(findings.is_empty(), "pure diamond DAG must have 0 findings: {findings:?}");
+}

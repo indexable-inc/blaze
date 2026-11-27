@@ -179,7 +179,7 @@ impl<'s> SimChild<'s> {
     }
 
     /// Up to `n` in-flight bytes appended to `into`, across acts.
-    fn deliver<A: Allocator>(&mut self, into: &mut Vec<u8, A>, mut n: usize) {
+    fn deliver<A: Allocator>(&mut self, into: &mut blaze_own::Vec<u8, A>, mut n: usize) {
         while n > 0 && self.reading < self.next {
             let bytes = self.sent(self.reading);
             let rest = &bytes[self.read_off..];
@@ -219,7 +219,7 @@ impl SimChild<'_> {
     /// [`RunChild::recv_message`].
     pub(super) fn recv_in<A: Allocator>(
         &mut self,
-        into: &mut Vec<u8, A>,
+        into: &mut blaze_own::Vec<u8, A>,
         most: u32,
         deadline: Deadline,
     ) -> Result<Message, RunError> {
@@ -335,7 +335,7 @@ impl RunChild for &mut SimChild<'_> {
 
     fn recv_message<A: Allocator>(
         &mut self,
-        into: &mut Vec<u8, A>,
+        into: &mut blaze_own::Vec<u8, A>,
         most: u32,
         deadline: Deadline,
     ) -> Result<Message, RunError> {

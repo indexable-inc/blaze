@@ -3323,7 +3323,7 @@ impl<'c> Launched<'c, '_, '_> {
         let stderr_pipe = given.stderr.ok_or(OneError::MissingPipe { stream: "stderr" })?;
         let mut pipes = [Some(stdout), Some(stderr_pipe)];
         let mut relay = Relay::new(GRACE);
-        let mut inbox = run_parent::wire_out(alloc);
+        let mut inbox = blaze_own::Vec::new_in(alloc);
         let mut reply = ahead;
         let mut reply_at = 0usize;
         let mut write_since: Option<Duration> = None;
@@ -3784,7 +3784,7 @@ impl<'c> Launched<'c, '_, '_> {
         published: usize,
         needs: &Needs<'_>,
         over: &mut Option<bstd::procs::ServedEnd>,
-        inbox: &mut run_parent::WireOut<Alloc<'_>>,
+        inbox: &mut blaze_own::AVec<'_, u8>,
         mut torn: Option<ProcError>,
         frame: &Frame,
         places: &mut P,

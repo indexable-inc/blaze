@@ -99,7 +99,7 @@ impl UnwoundChannel {
                 Duration::ZERO
             }
         }
-        let mut buf: Vec<u8, A> = Vec::new_in(alloc);
+        let mut buf: blaze_own::Vec<u8, A> = blaze_own::Vec::new_in(alloc);
         matches!(
             self.channel.recv_message(&mut buf, 16, Deadline::PASSED, &ZeroClock),
             Ok(Message::Whole { .. }) if buf.get(PREFIX..) == Some(b"1")
@@ -195,7 +195,7 @@ pub trait RunChild: Sized {
     /// [`ChannelError::Torn`], a body past `most` [`ChannelError::TooLong`].
     fn recv_message<A: Allocator>(
         &mut self,
-        into: &mut Vec<u8, A>,
+        into: &mut blaze_own::Vec<u8, A>,
         most: u32,
         deadline: Deadline,
     ) -> Result<Message, RunError>;
@@ -444,7 +444,7 @@ impl Rest {
     }
 
     /// A read of `channel` by `deadline` (capped by the task's).
-    fn recv<A: Allocator>(&self, channel: &mut Channel, into: &mut Vec<u8, A>, most: u32, deadline: Deadline) -> Result<Message, RunError> {
+    fn recv<A: Allocator>(&self, channel: &mut Channel, into: &mut blaze_own::Vec<u8, A>, most: u32, deadline: Deadline) -> Result<Message, RunError> {
         let (until, task_first) = self.capped(deadline);
         match channel.recv_message(into, most, until, &DriverClock(&self.io)) {
             Ok(Message::Deadline) if task_first => Err(self.stopped(RunStep::Recv, until)),
@@ -524,7 +524,7 @@ impl RunChild for Served {
 
     fn recv_message<A: Allocator>(
         &mut self,
-        into: &mut Vec<u8, A>,
+        into: &mut blaze_own::Vec<u8, A>,
         most: u32,
         deadline: Deadline,
     ) -> Result<Message, RunError> {
@@ -593,7 +593,7 @@ impl ServedEnd {
 
     /// What the child wrote before its end, as [`RunChild::recv_message`] reads it; then
     /// [`Message::Closed`] (its end closed the channel).
-    pub fn recv_message<A: Allocator>(&mut self, into: &mut Vec<u8, A>, most: u32, deadline: Deadline) -> Result<Message, RunError> {
+    pub fn recv_message<A: Allocator>(&mut self, into: &mut blaze_own::Vec<u8, A>, most: u32, deadline: Deadline) -> Result<Message, RunError> {
         self.rest.recv(&mut self.channel, into, most, deadline)
     }
 }
