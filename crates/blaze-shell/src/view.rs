@@ -14,9 +14,11 @@ pub enum TextFace {
     /// Primary monospace (`1.0×` SF Mono / Berkeley Mono / JetBrains Mono): commands, code, paths, PTY, tabular numbers.
     #[default]
     Mono,
-    /// Proportional UI sans (`0.94×` Apple SF Pro): prose, directory headers, command palette — scales with zoom.
+    /// Compact monospace (`0.84×` of the primary mono family): scrollback table headers, status labels, exit/meta pills.
+    MonoSmall,
+    /// Proportional UI sans (`0.94×` Apple SF Pro): prose, overlays, command palette — scales with zoom.
     Ui,
-    /// Compact proportional UI sans (`0.84×` Apple SF Pro): table headers, `blaze-sniff` tags, metadata, hints — scales with zoom.
+    /// Compact proportional UI sans (`0.84×` Apple SF Pro): overlay hints, popover docs, sidebar metadata — scales with zoom.
     UiSmall,
     /// Scaled proportional heading (`1.18×` Apple SF Pro Semibold): rendered Markdown headings — scales with zoom.
     Heading,
@@ -73,12 +75,15 @@ impl CellMetrics {
         if face == TextFace::Mono {
             return text.chars().count() as f32 * self.cw;
         }
+        if face == TextFace::MonoSmall {
+            return text.chars().count() as f32 * (self.cw * 0.84);
+        }
         // Use exact measured CoreText glyph advances when populated (`Fonts::cell_metrics`).
         let use_bold_table = (bold || face == TextFace::Heading) && self.ui_bold_adv[b'n' as usize - 32] > 0.0;
         let table = if use_bold_table { &self.ui_bold_adv } else { &self.ui_adv };
         if table[b'n' as usize - 32] > 0.0 {
             let ratio = match face {
-                TextFace::Mono => 1.0,
+                TextFace::Mono | TextFace::MonoSmall => 1.0,
                 TextFace::Ui => 1.0,
                 TextFace::UiSmall => 0.84 / 0.94,
                 TextFace::Heading => 1.18 / 0.94,
@@ -106,6 +111,7 @@ impl CellMetrics {
         let base_cw = if face == TextFace::Chrome { 7.8 } else { self.cw };
         let scale = match face {
             TextFace::Mono => 1.0,
+            TextFace::MonoSmall => 0.84,
             TextFace::Ui => 0.92,
             TextFace::UiSmall => 0.82,
             TextFace::Heading => 1.15,
@@ -131,6 +137,7 @@ impl CellMetrics {
     pub fn line_h(&self, face: TextFace) -> f32 {
         match face {
             TextFace::Mono => self.ch,
+            TextFace::MonoSmall => self.ch * 0.88,
             TextFace::Ui => self.ch * 0.96,
             TextFace::UiSmall => self.ch * 0.88,
             TextFace::Heading => self.ch * 1.22,
@@ -299,6 +306,8 @@ pub enum HitAction {
     SwitchGitBranch(String),
     ChangeDir(String),
     InsertToken(String),
+    /// Replace `[replace_start..cursor]` in the active editor with `insert` (from the zero-Tab live hint strip).
+    InsertLiveHint { replace_start: usize, insert: String },
     /// Submit a command directly into the focused pane (e.g. clicking `git help tutorial ↗` or `?` in help cards).
     RunCommand(String),
     /// In-app tiling window manager & workspace tab actions.
@@ -1250,6 +1259,20 @@ impl Scene {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn mono_small(
+        &mut self,
+        x: f32,
+        y: f32,
+        text: impl Into<String>,
+        color: [f32; 4],
+        bold: bool,
+        italic: bool,
+        clip_id: u32,
+    ) {
+        self.text_with_face(x, y, text, color, bold, italic, TextFace::MonoSmall, clip_id);
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn ui_text(
         &mut self,
         x: f32,
@@ -1347,6 +1370,20 @@ impl Scene {
         clip_id: u32,
     ) {
         self.overlay_text_with_face(x, y, text, color, bold, italic, TextFace::Ui, clip_id);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn overlay_mono_small(
+        &mut self,
+        x: f32,
+        y: f32,
+        text: impl Into<String>,
+        color: [f32; 4],
+        bold: bool,
+        italic: bool,
+        clip_id: u32,
+    ) {
+        self.overlay_text_with_face(x, y, text, color, bold, italic, TextFace::MonoSmall, clip_id);
     }
 
     #[allow(clippy::too_many_arguments)]

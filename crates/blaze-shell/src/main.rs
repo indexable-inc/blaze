@@ -5555,6 +5555,15 @@ mod macos_app {
                                             shell.refresh_editor_assist(false);
                                             dirty = true;
                                         }
+                                        HitAction::InsertLiveHint { replace_start, insert } => {
+                                            active_popover = None;
+                                            shell.editor.enter_vim_insert();
+                                            shell.editor.apply_live_hint(replace_start, &insert);
+                                            popup_engaged = false;
+                                            shell.auto_scroll_bottom = true;
+                                            shell.refresh_editor_assist(false);
+                                            dirty = true;
+                                        }
                                         HitAction::RunCommand(cmd) => {
                                             active_popover = None;
                                             let (cols, rows) = grid_for(size, &fonts, scale);

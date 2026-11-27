@@ -2027,6 +2027,7 @@ fn with_shaped_md_spans<R>(
     }
     let face_id = match prose_face {
         TextFace::Mono => 0u8,
+        TextFace::MonoSmall => 5,
         TextFace::Ui => 1,
         TextFace::UiSmall => 2,
         TextFace::Heading => 3,
