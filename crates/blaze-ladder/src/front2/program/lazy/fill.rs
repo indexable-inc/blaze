@@ -170,8 +170,8 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         // Again after the callees' and async items' heads: their types name ADTs too (the
         // rounds over the store's table pick them up; nothing missing is nothing made).
         self.adt_rows(checked)?;
-        self.body_consts(checked)?;
-        self.body_statics(checked, function)?;
+        self.body_consts(checked, fmt_owner)?;
+        self.body_statics(checked, fmt_owner, function)?;
         self.body_objects(checked, function)?;
         // Its async blocks' state recipes (coroutine_recipes.rs, as `Front2Program::make_from`
         // makes them), AFTER its callees' heads are in the store: the lowering relates a call
@@ -886,7 +886,38 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
 
     /// Each constant `checked` reads by value, evaluated once ([`const_values`], the one home),
     /// filed in key order.
-    fn body_consts(&mut self, checked: &Checked<'static>) -> Result<(), LazyRefusal> {
+    fn body_consts(&mut self, checked: &Checked<'static>, owner: ItemKey) -> Result<(), LazyRefusal> {
+        let at_args = checked.const_args.column::<0>();
+        let pat_at_args = checked.pat_const_args.column::<0>();
+        let mut to_locate: Vec<ItemKey, Global> = Vec::new_in(Global);
+        for (e, d) in checked.expr_defs.column::<0>().iter().zip(checked.expr_defs.column::<1>().iter()) {
+            if let tc::Def::Const(k) = *d
+                && at_args.binary_search(e).is_err()
+                && self.const_values.binary_search_by_key(&k, |(x, _)| *x).is_err()
+            {
+                to_locate.push(k);
+            }
+        }
+        for (p, d) in checked.pat_defs.column::<0>().iter().zip(checked.pat_defs.column::<1>().iter()) {
+            if let tc::Def::Const(k) = *d
+                && pat_at_args.binary_search(p).is_err()
+                && self.const_values.binary_search_by_key(&k, |(x, _)| *x).is_err()
+            {
+                to_locate.push(k);
+            }
+        }
+        if to_locate.is_empty() {
+            return Ok(());
+        }
+        to_locate.sort_unstable();
+        to_locate.dedup();
+        for k in to_locate {
+            // Locate cold constants (associated consts of traits/impls or body-local consts)
+            // when `checked` was read from a cached typed record without running `check_body`,
+            // so `self.front.keys` holds their `Origin` before `consts.value` lowers them.
+            self.prepare_local(k, &[owner]);
+            self.locate(k)?;
+        }
         let (values, refused) = {
             let mut r = self.records(true);
             const_values(&mut r, core::iter::once(checked))
@@ -906,13 +937,23 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// records point at, evaluated once (statics.rs `static_values`, the one home) and merged
     /// into the sorted `statics`. A refused static stops the run, naming it (as `make_from`'s
     /// run does: never an empty answer to the getter).
-    fn body_statics(&mut self, checked: &Checked<'static>, function: &str) -> Result<(), LazyRefusal> {
-        let new = checked.expr_defs.column::<1>().iter().any(|d| match d {
-            tc::Def::Static(k, _) => self.statics.kind(*k).is_none(),
-            _ => false,
-        });
-        if !new {
+    fn body_statics(&mut self, checked: &Checked<'static>, owner: ItemKey, function: &str) -> Result<(), LazyRefusal> {
+        let mut to_locate: Vec<ItemKey, Global> = Vec::new_in(Global);
+        for d in checked.expr_defs.column::<1>() {
+            if let tc::Def::Static(k, _) = *d
+                && self.statics.kind(k).is_none()
+            {
+                to_locate.push(k);
+            }
+        }
+        if to_locate.is_empty() {
             return Ok(());
+        }
+        to_locate.sort_unstable();
+        to_locate.dedup();
+        for k in to_locate {
+            self.prepare_local(k, &[owner]);
+            self.locate(k)?;
         }
         let (made, refused) = {
             let mut r = self.records(true);
