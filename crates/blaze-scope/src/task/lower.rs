@@ -2955,6 +2955,24 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
                 let header = self.impl_header(item);
                 let loc = self.loc(at);
                 self.out.impls.push(ImplSrc { module: self.module, key, header, loc, marks: self.marks });
+                // An `impl` header's const generic arguments (`where (): Trait<{ pub enum Tag .. }>`)
+                // may declare items or invoke macros; scan the header (excluding the assoc-item body)
+                // so `make_blocks` creates block modules that `front2` maps the head's anonymous
+                // constant back to. `names_digest` already hashes `item.signature_hash` for `Impl`.
+                if header.contains('{') && blaze_file_items::nested::may_write_block(header) {
+                    self.out.bodies.push(BodySrc {
+                        key,
+                        module: self.module,
+                        text: header,
+                        loc,
+                        written: self.written,
+                        included_dir: None,
+                        depth: self.depth,
+                        place: (self.owner, self.pos),
+                        marks: self.marks,
+                        tokens: self.tokens.get_for_body(),
+                    });
+                }
                 self.assoc(Some(idx), key);
             }
             ItemDetail::Mod { inline, .. } => {

@@ -437,12 +437,8 @@ impl<'a> PatternBlocks<'a> {
     /// of crate `krate`.
     pub fn of<'n, S: NamesSource<'n>>(names: S, locals: &super::locals::Locals<'n>, keys: &super::keys::Keys, krate: usize, item: LibKey, owner: ItemKey, text: &str, alloc: Alloc<'a>) -> PatternBlocks<'a> {
         let nested = blaze_file_items::nested::scan(text, alloc);
-        // The library's key of the body, the one answer `Locals::keep` takes too.
-        let body = locals.library_body(names, keys, item, owner, text);
-        let modules = match (body, names.crate_key(krate)) {
-            (Some(body), Some(crate_key)) if nested.end == NestedEnd::Whole => Some(blaze_scope::blocks::block_modules(crate_key, body, &nested, alloc)),
-            _ => None,
-        };
+        // The library's block modules, the one answer `Locals::keep` and `body::lower_at` take too.
+        let modules = names.crate_key(krate).and_then(|crate_key| locals.body_block_modules(names, keys, crate_key, item, owner, text, &nested, alloc).0);
         PatternBlocks { nested, modules }
     }
 }

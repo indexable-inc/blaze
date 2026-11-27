@@ -406,6 +406,17 @@ pub(super) fn library_item_or_member<'n, S: NamesSource<'n>>(names: S, keys: &Ke
     found
 }
 
+/// Enclosing library item and byte alignment for a head-level anonymous constant
+/// (`"const _: TY = { <expr> };"`), used to map its blocks back to the enclosing item's
+/// `blaze-scope` block modules.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct HeadAnon {
+    pub owner_item: LibKey,
+    pub expr_offset: u32,
+    pub expr_len: u32,
+    pub prefix: u32,
+}
+
 /// The local items of every body lowered in this command, kept in the command's frame.
 pub struct Locals<'n> {
     frame: &'n Frame,
@@ -419,6 +430,9 @@ pub struct Locals<'n> {
     /// constant's own body continues there ([`Locals::find`]), as a local item's does; the
     /// constant is no item, so it is not in `heads`.
     anons: HashMap<ItemKey, (ItemKey, u32), &'n Frame>,
+    /// Head-level anonymous constants that may declare items or invoke macros inside a block,
+    /// mapped back to the enclosing library item whose `blaze-scope` block modules hold them.
+    head_anons: HashMap<ItemKey, HeadAnon, &'n Frame>,
     /// Each block module (`__blaze_block_*`) owned by a lowered body, mapping the block module's
     /// library key back to its enclosing body's checker key: what `type_name` prints items
     /// declared in that block (`struct LocalStruct;` in `fn outer`) under (`crate::outer::LocalStruct`).
@@ -445,6 +459,7 @@ impl<'n> Locals<'n> {
             heads: HashMap::new_in(frame),
             foreign: HashMap::new_in(frame),
             anons: HashMap::new_in(frame),
+            head_anons: HashMap::new_in(frame),
             block_owners: HashMap::new_in(frame),
             planted: super::scope_table::Planted::None,
             body_scopes: None,
@@ -452,11 +467,12 @@ impl<'n> Locals<'n> {
     }
 
     pub fn clear(&mut self) {
-        let Locals { frame: _, bodies, heads, foreign, anons, block_owners, planted, body_scopes } = self;
+        let Locals { frame: _, bodies, heads, foreign, anons, head_anons, block_owners, planted, body_scopes } = self;
         bodies.clear();
         heads.clear();
         foreign.clear();
         anons.clear();
+        head_anons.clear();
         block_owners.clear();
         *planted = super::scope_table::Planted::None;
         *body_scopes = None;
@@ -473,6 +489,17 @@ impl<'n> Locals<'n> {
     /// key is never filed at two places.
     pub(super) fn file_anon(&mut self, key: ItemKey, owner: ItemKey, scope: u32) {
         self.anons.insert(key, (owner, scope));
+    }
+
+    /// Files the head-level anonymous constant `key` as originating from `owner` in its enclosing
+    /// library item, wrapped with a `prefix`-byte synthetic `"const _: TY = { "` header.
+    pub(super) fn file_head_anon(&mut self, key: ItemKey, owner: super::anon::HeadOwner, prefix: u32) {
+        self.head_anons.insert(key, HeadAnon { owner_item: owner.item, expr_offset: owner.offset, expr_len: owner.len, prefix });
+    }
+
+    /// The enclosing library item alignment of a head-level anonymous constant, if any.
+    pub(super) fn head_anon(&self, key: ItemKey) -> Option<HeadAnon> {
+        self.head_anons.get(&key).copied()
     }
 
     /// Plants the scope table's bug for every body kept after this (tests only:
@@ -565,13 +592,10 @@ impl<'n> Locals<'n> {
         // The body's blocks as the names library made them modules: the same scan of the same
         // text, so the same keys (`blaze_scope::blocks::block_modules`). A local fn's, const's
         // or static's own body is the library's item of its block's module when its blocks
-        // are written (`Self::library_twin`). None when the library has no such body.
+        // are written (`Self::library_twin`). A head-level anonymous constant maps its blocks
+        // back to its enclosing library item's block modules (`self.head_anons`).
         let nested = blaze_file_items::nested::scan(at.text, alloc);
-        let library_body = self.library_body(names, keys, at.item, at.owner, at.text);
-        let modules = match library_body {
-            Some(body) if nested.end == blaze_file_items::nested::NestedEnd::Whole => Some(blaze_scope::blocks::block_modules(crate_key, body, &nested, alloc)),
-            _ => None,
-        };
+        let (modules, scope_body) = self.body_block_modules(names, keys, crate_key, at.item, at.owner, at.text, &nested, alloc);
         // The module of each block scope of the body, by the scope (super::scope_table): built
         // once, here, and kept with the body. A refusal names the whole item: the table is the
         // body's.
@@ -786,13 +810,81 @@ impl<'n> Locals<'n> {
         }
         let names_of_blocks = match self.body_scopes {
             None => super::scope_table::BlockNames::Modules,
-            Some(s) => match library_body.ok_or(NoBodyScope::NoLibraryBody).and_then(|body| s.of(body)) {
+            Some(s) => match scope_body.ok_or(NoBodyScope::NoLibraryBody).and_then(|body| s.of(body)) {
                 Ok(view) => super::scope_table::BlockNames::Bodies(view),
                 Err(why) => return Err(bad(Why::Unsupported(why.form(), whole))),
             },
         };
         self.bodies.insert(at.owner, BodyLocals { parents, rows, blocks, scopes, names_of_blocks });
         Ok(())
+    }
+
+    /// The names-library block modules for `nested` (the scan of `text`, lowered as body `owner`
+    /// under `item`), returning `(modules, scope_body)` where `scope_body` is the library key
+    /// owning those block modules (for `--block-scopes=bodies`).
+    ///
+    /// For a library item/member body (or a local fn/const/static twin), derives modules directly
+    /// via `blaze_scope::blocks::block_modules`. For a synthetic head-level anonymous constant
+    /// (`"const _: TY = { <expr> };"`), maps each block back to the enclosing library item's
+    /// `blaze-scope` block modules (`self.head_anons`).
+    #[expect(clippy::too_many_arguments, reason = "one shared lookup of a body's block modules across keep, body_blocks, and PatternBlocks")]
+    pub(super) fn body_block_modules<'a, S: NamesSource<'n>>(
+        &self,
+        names: S,
+        keys: &Keys,
+        crate_key: blaze_id::CrateItemKey,
+        item: LibKey,
+        owner: ItemKey,
+        text: &str,
+        nested: &blaze_file_items::nested::Nested<'_>,
+        alloc: Alloc<'a>,
+    ) -> (Option<blaze_own::AVec<'a, Option<LibKey>>>, Option<LibKey>) {
+        if nested.end != blaze_file_items::nested::NestedEnd::Whole {
+            return (None, None);
+        }
+        if let Some(body) = self.library_body(names, keys, item, owner, text) {
+            return (Some(blaze_scope::blocks::block_modules(crate_key, body, nested, alloc)), Some(body));
+        }
+        let Some(ha) = self.head_anons.get(&owner).copied() else {
+            return (None, None);
+        };
+        let Some(it) = names.seeded_text_of(ha.owner_item) else {
+            return (None, None);
+        };
+        let owner_text = it.impl_header.unwrap_or(it.text);
+        let owner_nested = blaze_file_items::nested::scan(owner_text, alloc);
+        if owner_nested.end != blaze_file_items::nested::NestedEnd::Whole {
+            return (None, None);
+        }
+        let owner_modules = blaze_scope::blocks::block_modules(crate_key, ha.owner_item, &owner_nested, alloc);
+        let expr_end = ha.expr_offset.saturating_add(ha.expr_len);
+        // When `const_term` stripped the outer `{ ... }` of a const generic argument, the
+        // synthetic outer wrapper `{` (`open < prefix`) stands for the innermost block of
+        // `owner_nested` strictly enclosing `[expr_offset, expr_end]`.
+        let enclosing_module = owner_nested
+            .blocks
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, b)| b.open < ha.expr_offset && expr_end < b.close)
+            .and_then(|(idx, _)| owner_modules.get(idx).copied().flatten());
+        let mut mapped: blaze_own::AVec<'a, Option<LibKey>> = blaze_own::AVec::with_capacity_in(nested.blocks.len(), alloc);
+        let mut any = false;
+        for blk in nested.blocks.iter() {
+            let module = if blk.open >= ha.prefix {
+                let target_open = ha.expr_offset.saturating_add(blk.open - ha.prefix);
+                owner_nested
+                    .blocks
+                    .binary_search_by_key(&target_open, |b| b.open)
+                    .ok()
+                    .and_then(|idx| owner_modules.get(idx).copied().flatten())
+            } else {
+                enclosing_module
+            };
+            any |= module.is_some();
+            mapped.push(module);
+        }
+        if any { (Some(mapped), Some(ha.owner_item)) } else { (None, None) }
     }
 
     /// The library's key of the body of `item` lowered from `text`, when the names library

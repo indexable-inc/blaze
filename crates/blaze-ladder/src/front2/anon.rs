@@ -52,6 +52,24 @@ use super::keys::{KeyClash, Keys, MemberKind, anon_const_key, checker_of};
 use super::preds::Preds;
 use super::types::{PRIMS, SelfTy, Why, intern};
 
+/// The enclosing library item whose scanned text (`blaze_scope::blocks`) owns the block modules
+/// of a head-level anonymous constant expression (`where (): Trait<{ pub enum Tag .. }>`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadOwner {
+    pub item: LibKey,
+    /// Byte offset of `Ask::text` inside `item`'s scanned text (`impl_header` for an impl,
+    /// whole text for a fn/const/static body).
+    pub offset: u32,
+    /// Byte length of `Ask::text` inside `item`'s scanned text.
+    pub len: u32,
+}
+
+#[derive(Clone, Debug)]
+struct HeadOwned {
+    owner: HeadOwner,
+    member: AString<'static>,
+}
+
 /// One anonymous constant a head asked for: filed as a head by [`file_asked`] before the
 /// evaluator is asked its value.
 #[derive(Clone, Debug)]
@@ -74,6 +92,9 @@ pub struct Ask {
     /// an item declared in the body ([`Ask::in_body`]): its names are read there first, then
     /// at the module. `None`: a constant of the module.
     pub body: Option<(ItemKey, u32)>,
+    /// The enclosing library item whose `blaze-scope` block modules hold items declared inside
+    /// this head-level anonymous constant expression ([`Ask::in_head_item`]).
+    head_owner: Option<HeadOwned>,
     /// Marks are relative to the expression, independent of its position in the enclosing text.
     marked: Option<Marked>,
 }
@@ -235,7 +256,7 @@ impl Ask {
         }
         let name = format!("{prim}: {text}").into_boxed_str();
         let need = need_key(anon_const_key(checker_of(module), &name));
-        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: None, body: None, marked: None })
+        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: None, body: None, head_owner: None, marked: None })
     }
 
     /// The anonymous constant `text` of type `ty` written in block `scope` of the body `owner`
@@ -266,7 +287,7 @@ impl Ask {
         }
         .into_boxed_str();
         let need = body_need_key(anon_const_key(checker_of(module), &name));
-        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: self_.map(|(t, _)| t), body: Some((owner, scope)), marked: None })
+        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: self_.map(|(t, _)| t), body: Some((owner, scope)), head_owner: None, marked: None })
     }
 
     /// The anonymous constant `text` of type `ty` written in `module` where `Self` is the
@@ -291,13 +312,29 @@ impl Ask {
         }
         .into_boxed_str();
         let need = need_key(anon_const_key(checker_of(module), &name));
-        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: Some(self_ty), body: None, marked: None })
+        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: Some(self_ty), body: None, head_owner: None, marked: None })
+    }
+
+    pub(super) fn in_head_item(mut self, owner: HeadOwner, alloc: Alloc<'static>) -> Self {
+        let mut hash = blaze_ids::Hasher::new("blaze-ladder head item anonymous constant 1");
+        hash.part(self.member_name().as_bytes());
+        hash.update(&owner.item.0.0);
+        hash.update(&owner.offset.to_le_bytes());
+        let member = blaze_own::format_in!(alloc, "head {:x}", hash.finish());
+        let key = anon_const_key(checker_of(self.module), &member);
+        self.need = if self.body.is_some() { body_need_key(key) } else { need_key(key) };
+        self.head_owner = Some(HeadOwned { owner, member });
+        self
+    }
+
+    pub(super) fn head_owner(&self) -> Option<HeadOwner> {
+        self.head_owner.as_ref().map(|h| h.owner)
     }
 
     pub(super) fn carry_marks(mut self, rows: AVec<'static, (u32, TextMark)>) -> Self {
         if !rows.is_empty() {
             let mut hash = blaze_ids::Hasher::new("blaze-ladder marked anonymous constant 1");
-            hash.part(self.name.as_bytes());
+            hash.part(self.member_name().as_bytes());
             for &(offset, mark) in &rows {
                 hash.update(&offset.to_le_bytes()).update(&mark.to_bytes());
             }
@@ -310,7 +347,13 @@ impl Ask {
     }
 
     fn member_name(&self) -> &str {
-        self.marked.as_ref().map_or(&self.name, |m| m.member.as_str())
+        if let Some(m) = &self.marked {
+            m.member.as_str()
+        } else if let Some(h) = &self.head_owner {
+            h.member.as_str()
+        } else {
+            &self.name
+        }
     }
 }
 
@@ -344,17 +387,45 @@ fn file_marks<'n>(
 /// [`Why::NeedConst`] naming it until the driver's `eval_len` has filed and evaluated it.
 /// An expression whose type is unknown or is not `bool`, `char` or an integer is
 /// [`Why::ConstPath`] naming its text.
-pub fn self_value<H: super::types::Heads + ?Sized>(heads: &H, module: LibKey, ty: Option<PNode>, text: &str, self_ty: tc::PTy, self_node: PNode, r: blaze_surface::Range) -> Result<u128, Why> {
-    let text = text.trim();
-    let Some(ask) = ty.and_then(|ty| Ask::of_self(module, ty, text, self_ty, self_node)) else { return Err(Why::ConstPath(Box::from(text), r)) };
+#[expect(clippy::too_many_arguments, reason = "self-typed anonymous constant lookup with head owner and token marks")]
+pub fn self_value<H: super::types::Heads + ?Sized>(
+    heads: &H,
+    module: LibKey,
+    ty: Option<PNode>,
+    text: &str,
+    self_ty: tc::PTy,
+    self_node: PNode,
+    marks: Option<TextMarks<'_>>,
+    head_owner: Option<HeadOwner>,
+    r: blaze_surface::Range,
+) -> Result<u128, Why> {
+    let source = text.trim();
+    let Some(mut ask) = ty.and_then(|ty| Ask::of_self(module, ty, source, self_ty, self_node)) else { return Err(Why::ConstPath(Box::from(source), r)) };
+    if let Some(alloc) = heads.mark_alloc() {
+        if let Some(owner) = head_owner {
+            ask = ask.in_head_item(owner, alloc);
+        }
+        if let Some(marks) = marks {
+            match head_marks(marks, source, None, alloc, r)? {
+                Some(rows) => ask = ask.carry_marks(rows),
+                None if names_crate(source) => {
+                    return Err(Why::Unsupported(
+                        "a `crate` path in a constant expression of a macro-written head whose text is not the item's (its tokens' marks are not read: anon.rs `self_value`)",
+                        r,
+                    ));
+                }
+                None => {}
+            }
+        }
+    }
     if let Some(bits) = heads.const_bits(ask.need) {
         return Ok(bits);
     }
     if let Some(why) = heads.anon_failed(ask.need) {
-        return Err(Why::ConstPath(format!("{text}: {why}").into_boxed_str(), r));
+        return Err(Why::ConstPath(format!("{source}: {why}").into_boxed_str(), r));
     }
     let need = ask.need;
-    if heads.ask_anon(ask) { Err(Why::NeedConst(need, r)) } else { Err(Why::ConstPath(Box::from(text), r)) }
+    if heads.ask_anon(ask) { Err(Why::NeedConst(need, r)) } else { Err(Why::ConstPath(Box::from(source), r)) }
 }
 
 /// The token marks of a HEAD's constant expression `source` (a slice of the text `marks` are
@@ -481,10 +552,16 @@ pub fn file_asked<'n>(store: &mut Store<'n>, keys: &mut Keys) -> Result<Vec<LibK
         if let Some((owner, scope)) = a.body {
             store.locals.file_anon(key, owner, scope);
         }
+        let prim = written_ty(a.ty, &a.text).ok_or(FileFail::NoName(a.ty))?;
+        if let Some(owner) = a.head_owner() {
+            let prefix = "const _: ".len() + prim.len() + " = { ".len();
+            if let Ok(prefix) = u32::try_from(prefix) {
+                store.locals.file_head_anon(key, owner, prefix);
+            }
+        }
         if store.fns.contains_key(&key) {
             continue;
         }
-        let prim = written_ty(a.ty, &a.text).ok_or(FileFail::NoName(a.ty))?;
         let alloc = store.tys.alloc();
         let mut declaration = blaze_own::format_in!(alloc, "const _: {prim} = {{ ");
         let prefix = declaration.len();
@@ -566,5 +643,34 @@ mod tests {
         assert_ne!(left, ask.need, "the unmarked root selects the calling crate");
         assert_ne!(left, key(0, 5), "the left root selects a different defining crate");
         assert_ne!(left, key(expr.rfind("crate").expect("second root") as u32, 4), "the foreign root now qualifies B");
+    }
+
+    #[test]
+    fn anonymous_const_key_distinguishes_head_owner_and_offset() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let module = LibKey(ContentId([1; 32]));
+        let expr = "pub enum Tag { A } core::mem::size_of::<Tag>()";
+        let base = Ask::of(module, PNode::Uint(tc::UintTy::Usize), expr).expect("usize anon const");
+        let item_a = LibKey(ContentId([2; 32]));
+        let item_b = LibKey(ContentId([3; 32]));
+        let a_at_10 = base.clone().in_head_item(HeadOwner { item: item_a, offset: 10, len: expr.len() as u32 }, alloc);
+        let a_at_10_again = base.clone().in_head_item(HeadOwner { item: item_a, offset: 10, len: expr.len() as u32 }, alloc);
+        let a_at_20 = base.clone().in_head_item(HeadOwner { item: item_a, offset: 20, len: expr.len() as u32 }, alloc);
+        let b_at_10 = base.clone().in_head_item(HeadOwner { item: item_b, offset: 10, len: expr.len() as u32 }, alloc);
+        assert_eq!(a_at_10.need, a_at_10_again.need, "identical head owner and offset share one key");
+        assert_ne!(a_at_10.need, base.need, "head-owned anon const differs from unowned");
+        assert_ne!(a_at_10.need, a_at_20.need, "different offsets in the same item get distinct keys");
+        assert_ne!(a_at_10.need, b_at_10.need, "different enclosing items get distinct keys");
+        // Marks compose with head owner without dropping owner identity.
+        let mark = TextMark {
+            site: DefSite { krate: CrateItemKey(ContentId([4; 32])), module: None },
+            transparency: Transparency::Opaque,
+            edition: Edition::E2021,
+        };
+        let mut marks_a = blaze_own::AVec::new_in(alloc);
+        marks_a.push((0, mark));
+        let mut marks_b = blaze_own::AVec::new_in(alloc);
+        marks_b.push((0, mark));
+        assert_ne!(a_at_10.carry_marks(marks_a).need, b_at_10.carry_marks(marks_b).need, "marks preserve head owner distinction");
     }
 }

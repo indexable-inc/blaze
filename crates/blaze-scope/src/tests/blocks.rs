@@ -897,3 +897,62 @@ fn format_args_nested_user_macro_rules_in_block() {
     assert_eq!(named_in(&names, by_chain, &["LocalFromChain"]), 0);
     assert_eq!(named_in(&names, by_comma, &["LocalAfterCommaInLiteral"]), 0);
 }
+
+const IMPL_WHERE_CONST_BLOCK: &str = r#"#![no_core]
+pub trait Immutable {}
+pub trait PaddingFree<T, const N: usize> {}
+pub trait IntoBytes {}
+pub enum AddressSpace { SystemMemory = 0, SystemIo = 1 }
+
+const _: () = {
+    unsafe impl IntoBytes for AddressSpace
+    where
+        (): PaddingFree<
+            Self,
+            {
+                pub enum ___ZerocopyTag {
+                    SystemMemory = 0,
+                    SystemIo = 1,
+                }
+                unsafe impl Immutable for ___ZerocopyTag {
+                    fn only_derive() {}
+                }
+                0
+            },
+        >,
+    {
+        fn only_derive() {
+            struct BodyOnly;
+            impl Immutable for BodyOnly {}
+        }
+    }
+};
+"#;
+
+static IMPL_WHERE_CONST_BLOCK_TEXTS: Texts = Texts(&[&[("/user/lib.rs", IMPL_WHERE_CONST_BLOCK)]]);
+
+/// An `impl` header's `where`-clause const block (`zerocopy::IntoBytes` shape) creates a block
+/// module under the `impl` key holding `___ZerocopyTag` and registering `impl Immutable for
+/// ___ZerocopyTag`, while the `impl`'s own assoc-item body `{ fn only_derive() { ... } }` is NOT
+/// scanned under the `impl` key (its method's body is scanned separately under the method member).
+#[test]
+fn impl_header_where_const_block_creates_block_module_without_scanning_impl_body() {
+    let crates = [input("user", "/user/lib.rs", &[])];
+    let names = resolved(&crates, &IMPL_WHERE_CONST_BLOCK_TEXTS);
+    let tag_impl = impl_ending(&names, 0, "Immutablefor___ZerocopyTag");
+    assert_eq!(named_in(&names, tag_impl, &["___ZerocopyTag"]), 0);
+    // The `impl` itself lives in `const _`'s `__blaze_block_0`, and `___ZerocopyTag`'s impl lives
+    // in the `impl` header's own block module (distinct from `const _`'s block module).
+    let outer_impl = impl_ending(&names, 0, "0},>,");
+    assert_ne!(tag_impl.module, outer_impl.module);
+    // Verify `block_modules` over `outer_impl.header` derives `tag_impl.module` deterministically.
+    let alloc = Alloc::global();
+    let nested = blaze_file_items::nested::scan(outer_impl.header, alloc);
+    let mods = crate::blocks::block_modules(names.krate(0).key, outer_impl.key, &nested, alloc);
+    let first_mod = mods.iter().copied().flatten().next().expect("header const block module");
+    assert_eq!(first_mod, tag_impl.module);
+    // The method body's `BodyOnly` impl lives under the method's own block module, NOT under `tag_impl.module`.
+    let body_impl = impl_ending(&names, 0, "ImmutableforBodyOnly");
+    assert_ne!(body_impl.module, tag_impl.module);
+    assert_ne!(body_impl.module, outer_impl.module);
+}

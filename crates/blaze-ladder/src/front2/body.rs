@@ -1628,6 +1628,13 @@ fn body_at<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, ite
     let mut fixed = false;
     for _ in 0..MOST_LOCAL_LEVELS {
         let Some(h) = store.locals.head(key) else {
+            if let Some(ha) = store.locals.head_anon(key) {
+                let header_off = names
+                    .seeded_text_of(ha.owner_item)
+                    .and_then(|it| it.impl_header.and_then(|hdr| blaze_scope::expansion_origins::offset_in(it.text, hdr)))
+                    .unwrap_or(0);
+                return Some(super::body_host::BodyAt { lib: ha.owner_item, off: header_off.saturating_add(ha.expr_offset), fixed: true });
+            }
             // A library body: the lowered body itself (a free fn: its item; a member: the member
             // whose text it is, never its container, whose first byte is not the member's), or
             // the enclosing body a local was declared in, lowered from its own item's or
@@ -1682,14 +1689,15 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     let atoms = names.cfg_atoms(krate).ok_or(BodyError::NoText(item))?;
 
     // The body's blocks the names library made modules: a call in one, written by hand or by
-    // an expansion, reads its path there (scoped.rs `body_blocks`). Uses `store.locals.library_body`
-    // so both top-level items/members AND local fns/consts/statics whose blocks the names library
-    // wrote (`Locals::library_twin`, e.g. `std::sys::process::unix::<impl Command>::posix_spawn::get_posix_spawn_addchdir`)
-    // resolve block-local macro imports like `use crate::sys::weak::weak; weak!(...);`.
-    let blocks = match (store.locals.library_body(names, keys, item, owner, text), names.crate_key(krate)) {
-        (Some(body), Some(crate_key)) => super::scoped::body_blocks(crate_key, body, text, alloc),
-        _ => None,
-    };
+    // an expansion, reads its path there (scoped.rs `body_blocks`). Uses `store.locals.body_block_modules`
+    // so top-level items/members, local fns/consts/statics whose blocks the names library wrote
+    // (`Locals::library_twin`), AND head-level anonymous constants mapped onto their enclosing item
+    // all resolve block-local items and macro imports.
+    let blocks = names.crate_key(krate).and_then(|crate_key| {
+        let nested = blaze_file_items::nested::scan(text, alloc);
+        let (hand, _) = store.locals.body_block_modules(names, keys, crate_key, item, owner, text, &nested, alloc);
+        hand.map(|hand| super::scoped::body_blocks_from(crate_key, nested, hand, alloc))
+    });
     let scoped = ScopedBy { names, module, prepared: Some(prepared), blocks: blocks.as_ref().map(super::scoped::BodyBlocks::modules) };
     // The crate's host, the one item-level expansion answers from (census 13, brief 13): env,
     // includes, proc macros; `NoHost` refused them all.
@@ -1890,7 +1898,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             // Every word's mark is in the lowered record (`View::mark_of_path`): an expansion's
             // lowered into the body, and the item's own when a macro wrote it
             // (`lower_body_expanding_marked`), so the builder needs no second copy of them.
-            builder: Builder { resolver: Paths { names }, heads: &store.maps, marks: None },
+            builder: Builder { resolver: Paths { names }, heads: &store.maps, marks: None, owner: None },
             // A written type's first segment is asked of the blocks' named imports first
             // (super::block_type_uses): a block holding only `use`s is no module to read at.
             env: Env {

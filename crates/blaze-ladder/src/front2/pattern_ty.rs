@@ -59,7 +59,7 @@ impl<'n, H: Heads, S: NamesSource<'n>> Builder<'_, H, S> {
         }
         // The expansion is a text of its own, read at `env.module`: the item's marks are not
         // its tokens' (front2 item_site.rs).
-        let own = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks: None };
+        let own = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks: None, owner: None };
         let own_env = Env { anon: &[], ..*env };
         match sink {
             Some(s) => {

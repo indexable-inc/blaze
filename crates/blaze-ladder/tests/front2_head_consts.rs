@@ -353,3 +353,215 @@ fn main() {}
     let got = check_fns(TEXT, &["sixteen", "seventeen"]);
     expect("block stmt arg", &got, &[true, false]);
 }
+
+/// Positive 1: a hand-written `impl` with a head-level anonymous const block in its `where` clause
+/// declaring both an `enum` and a trait `impl` for it (both without `Self` via `const_value_bits`
+/// and with ground `Self` via `self_value`, matching `zerocopy::IntoBytes`). The enclosing `impl`'s
+/// `blaze-scope` block module binds `Tag` and registers `impl Marker for Tag`, so the synthetic
+/// anonymous constant maps its blocks back to that module, evaluates cleanly, and produces the
+/// true size (not a hole).
+#[test]
+fn a_head_anon_const_block_with_enum_and_impl_maps_to_enclosing_impl_block_module() {
+    const TEXT: &str = "
+trait Marker {}
+trait PaddingFree<T, const N: usize> {}
+trait IntoBytes {}
+trait CheckSize<const N: usize> {}
+
+#[repr(u8)]
+enum AddressSpace {
+    SystemMemory = 0,
+    SystemIo = 1,
+}
+
+#[repr(u16)]
+enum WideSpace {
+    SystemMemory = 0,
+    SystemIo = 1,
+}
+
+impl<T> PaddingFree<T, 1> for () {}
+impl CheckSize<1> for () {}
+
+impl IntoBytes for AddressSpace
+where
+    (): PaddingFree<
+        Self,
+        {
+            #[repr(u8)]
+            pub enum Tag {
+                A = 0,
+                B = 1,
+            }
+            impl Marker for Tag {}
+            const fn require_marker<T: Marker>() -> usize {
+                core::mem::size_of::<T>()
+            }
+            let _ = core::mem::size_of::<Self>();
+            require_marker::<Tag>()
+        },
+    >,
+{
+}
+
+// Same shape, but `Self` has size 2 while `Tag` has size 1 -> evaluates to 2, so `PaddingFree<Self, 1>` does NOT hold.
+impl IntoBytes for WideSpace
+where
+    (): PaddingFree<
+        Self,
+        {
+            #[repr(u8)]
+            pub enum Tag {
+                A = 0,
+                B = 1,
+            }
+            impl Marker for Tag {}
+            core::mem::size_of::<Self>()
+        },
+    >,
+{
+}
+
+// Without `Self` (`Builder::const_value_bits` path): two distinct impls in the same module with
+// identical const-block text must not collide on block module keys.
+struct S1;
+struct S2;
+trait Ok1 {}
+trait Ok2 {}
+impl Ok1 for S1
+where
+    (): CheckSize<{
+        #[repr(u8)]
+        pub enum LocalTag {
+            X = 0,
+        }
+        impl Marker for LocalTag {}
+        core::mem::size_of::<LocalTag>()
+    }>,
+{
+}
+impl Ok2 for S2
+where
+    (): CheckSize<{
+        #[repr(u8)]
+        pub enum LocalTag {
+            X = 0,
+        }
+        impl Marker for LocalTag {}
+        core::mem::size_of::<LocalTag>()
+    }>,
+{
+}
+
+fn need_into_bytes<T: IntoBytes>() {}
+fn need_ok1<T: Ok1>() {}
+fn need_ok2<T: Ok2>() {}
+
+fn addr_ok() { need_into_bytes::<AddressSpace>() }
+fn wide_fails() { need_into_bytes::<WideSpace>() }
+fn s1_ok() { need_ok1::<S1>() }
+fn s2_ok() { need_ok2::<S2>() }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["addr_ok", "wide_fails", "s1_ok", "s2_ok"]);
+    expect("head anon block module", &got, &[true, false, true, true]);
+}
+
+/// Positive 2: `zerocopy::IntoBytes` macro-expansion shape: a macro expands to
+/// `const _: () = { unsafe impl IntoBytes for AddressSpace where (): PaddingFree<Self, {
+///     #[repr(u8)] #[derive(Copy, Clone)] pub enum ___ZerocopyTag { ... }
+///     unsafe impl Immutable for ___ZerocopyTag {}
+///     enum_padding!(Self, ___ZerocopyTag)
+/// }> {} };`.
+/// Verifies block module keys match `blaze-scope` for macro-expanded impls nested inside `const _`.
+#[test]
+fn a_macro_expanded_impl_with_where_const_block_enum_evaluates_cleanly() {
+    const TEXT: &str = "
+pub trait Immutable {}
+pub trait PaddingFree<T, const PADDING: usize> {}
+pub trait IntoBytes {}
+
+impl<T> PaddingFree<T, 0> for () {}
+
+macro_rules! enum_padding {
+    ($t:ty, $disc:ty) => {{
+        const _: [(); 1] = [(); 1];
+        core::mem::size_of::<$t>() - core::mem::size_of::<$disc>()
+    }};
+}
+
+macro_rules! derive_into_bytes_enum {
+    ($name:ident, $tag_repr:ident, $($v:ident),+ $(,)?) => {
+        const _: () = {
+            unsafe impl IntoBytes for $name
+            where
+                (): PaddingFree<
+                    Self,
+                    {
+                        #[repr($tag_repr)]
+                        #[derive(Copy, Clone)]
+                        pub enum ___ZerocopyTag {
+                            $($v,)+
+                        }
+                        unsafe impl Immutable for ___ZerocopyTag {}
+                        const fn check_imm<T: Immutable>() -> usize { 0 }
+                        check_imm::<___ZerocopyTag>() + enum_padding!(Self, ___ZerocopyTag)
+                    },
+                >,
+            {
+            }
+        };
+    };
+}
+
+#[repr(u8)]
+pub enum AddressSpace {
+    SystemMemory = 0,
+    SystemIo = 1,
+}
+derive_into_bytes_enum!(AddressSpace, u8, SystemMemory, SystemIo);
+
+// Mismatched tag repr (`u8` tag for `u16` enum) => padding = 2 - 1 = 1 != 0 => IntoBytes does not hold.
+#[repr(u16)]
+pub enum PaddedEnum {
+    A = 0,
+    B = 1,
+}
+derive_into_bytes_enum!(PaddedEnum, u8, A, B);
+
+fn need_into_bytes<T: IntoBytes>() {}
+fn addr_ok() { need_into_bytes::<AddressSpace>() }
+fn padded_fails() { need_into_bytes::<PaddedEnum>() }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["addr_ok", "padded_fails"]);
+    expect("macro expanded head anon block", &got, &[true, false]);
+}
+
+/// Negative control: an enum declared inside a block that a body-level macro expansion wrote in an
+/// expression position (outside any filed `blaze-scope` block module, here an expression call at a
+/// `const` initializer's top level) must still be refused explicitly with `LocalKind::Enum.unplaced()`,
+/// never silently dropped or mis-keyed.
+#[test]
+fn an_unplaced_enum_in_an_expression_macro_expansion_stays_refused() {
+    const TEXT: &str = "
+macro_rules! make_expr_enum {
+    () => {
+        {
+            enum Unplaced { A }
+            core::mem::size_of::<Unplaced>()
+        }
+    };
+}
+const BAD: usize = make_expr_enum!();
+fn use_bad() -> [u8; BAD] { [0u8; BAD] }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["use_bad"]);
+    assert_eq!(got.len(), 1);
+    let (name, outcome) = &got[0];
+    assert!(
+        outcome.contains("an enum in a block that a macro call wrote or that is in a local item's body"),
+        "`{name}` must refuse the genuinely unplaced macro enum explicitly, got: {outcome}"
+    );
+}

@@ -811,9 +811,25 @@ pub struct Builder<'b, H: Heads, S> {
     /// The marks of the tokens of the text this builder reads paths from (front2 item_site.rs,
     /// token-mark-F1): `None` for a text written in a file, or one that keeps no column.
     pub marks: Option<blaze_scope::crate_roots::TextMarks<'b>>,
+    /// The enclosing library item and the exact scanned text (`impl_header` for an `impl`, whole
+    /// text for a `fn`/`const`/`static` with `body_holds_items`) that `blaze-scope` built block
+    /// modules for: carried onto head-level anonymous constants (`anon::HeadOwner`) so blocks
+    /// declared inside them resolve to their `blaze-scope` block modules.
+    pub owner: Option<(LibKey, &'b str)>,
 }
 
 impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
+    /// If `text` is an unmodified subslice of `self.owner`'s scanned text and may declare items or
+    /// invoke macros, returns its [`super::anon::HeadOwner`] coordinates.
+    fn head_owner_of(&self, text: &str) -> Option<super::anon::HeadOwner> {
+        let (item, owner_text) = self.owner?;
+        if !blaze_file_items::nested::may_write_block(text) {
+            return None;
+        }
+        let offset = blaze_scope::expansion_origins::offset_in(owner_text, text)?;
+        let len = u32::try_from(text.len()).ok()?;
+        Some(super::anon::HeadOwner { item, offset, len })
+    }
     /// The portable type of `t`, by a work list (no recursion).
     pub fn ty(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId) -> Result<PTy, Why> {
         self.walk_ty(tys, env, v, t, None)
@@ -979,6 +995,11 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             }
         }
         let Some(mut ask) = ty.and_then(|ty| super::anon::Ask::of(env.module, ty, text)) else { return Err(other()) };
+        if with_values.is_none()
+            && let (Some(owner), Some(alloc)) = (self.head_owner_of(text), self.heads.mark_alloc())
+        {
+            ask = ask.in_head_item(owner, alloc);
+        }
         // A macro-written head's expression is lowered with its tokens' marks (anon.rs
         // `head_marks`), and keyed by them (`Ask::carry_marks`): zerocopy's
         // `{ $crate::cryptocorrosion_derive_traits!(..) }` in an impl it writes in ppv-lite86.
@@ -1096,7 +1117,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // anonymous constant is filed with that `Self` in scope. Every other expression is
         // read as before; one over a generic parameter is refused there by name.
         let bits = match super::const_open::ground_self(tys.view(), env, text) {
-            Some((self_ty, self_node)) => super::anon::self_value(self.heads, env.module, node, text, self_ty, self_node, r)?,
+            Some((self_ty, self_node)) => super::anon::self_value(self.heads, env.module, node, text, self_ty, self_node, self.marks, self.head_owner_of(text), r)?,
             None => self.const_value_bits(env, text, r, node)?,
         };
         intern(tys, PNode::ConstValue { ty, bits })
@@ -4146,7 +4167,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 consts: cs,
                 body: None,
             };
-            let def_builder = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks };
+            let def_builder = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks, owner: None };
             let mut def_sink = RegionSink::new_in(alloc);
             def_sink.default_depth = s.default_depth + 1;
             let raw_ty = match def_builder.ty_regions(tys, &def_env, dv, default_ty, &mut def_sink) {

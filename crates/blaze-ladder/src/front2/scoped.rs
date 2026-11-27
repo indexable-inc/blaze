@@ -92,8 +92,19 @@ pub fn body_blocks<'a>(krate: blaze_id::CrateItemKey, body: ItemKey, text: &str,
         return None;
     }
     let hand = blaze_scope::blocks::block_modules(krate, body, &nested, alloc);
+    Some(body_blocks_from(krate, nested, hand, alloc))
+}
+
+/// [`body_blocks`] from an already-scanned `nested` and mapped `hand` block modules (used for both
+/// direct library bodies and head-level anonymous constants mapped onto their enclosing item).
+pub fn body_blocks_from<'a>(
+    krate: blaze_id::CrateItemKey,
+    nested: blaze_file_items::nested::Nested<'a>,
+    hand: AVec<'a, Option<ItemKey>>,
+    alloc: Alloc<'a>,
+) -> BodyBlocks<'a> {
     let read = ReadExpansions { made: Vec::new_in(alloc), at: Vec::new_in(alloc) };
-    Some(BodyBlocks { krate, nested, hand, read: core::cell::RefCell::new(read), alloc })
+    BodyBlocks { krate, nested, hand, read: core::cell::RefCell::new(read), alloc }
 }
 
 /// The two questions [`ScopedBy`] asks of a body's blocks ([`BodyBlocks`]). It holds them
