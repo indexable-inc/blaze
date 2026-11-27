@@ -424,6 +424,11 @@ fn encode_table_read<A: core::alloc::Allocator>(read: TableRead, out: &mut blaze
             out.extend_from_slice(&krate);
             out.extend_from_slice(&bucket);
         }
+        TableRead::File { krate, file } => {
+            out.push(5);
+            out.extend_from_slice(&krate);
+            out.extend_from_slice(&file.to_le_bytes());
+        }
     }
 }
 
@@ -434,6 +439,7 @@ fn decode_table_read(r: &mut BsfReader<'_>) -> Result<TableRead, StretchFrontErr
         2 => Ok(TableRead::Text { key: r.take_item_key()? }),
         3 => Ok(TableRead::Head { item: r.take_array::<16>()?, part: r.take_u8()? }),
         4 => Ok(TableRead::Impls { krate: r.take_array::<16>()?, bucket: r.take_array::<16>()? }),
+        5 => Ok(TableRead::File { krate: r.take_array::<8>()?, file: r.take_u32()? }),
         tag => Err(StretchFrontError::ReadTag { tag }),
     }
 }
@@ -925,7 +931,7 @@ struct ObservedReads<'r, 'a, 't, 'n, 'k> {
 impl ReadSink for ObservedReads<'_, '_, '_, '_, '_> {
     fn read(&self, read: TableRead) {
         let keyer = match read {
-            TableRead::Head { .. } | TableRead::Signature { .. } | TableRead::Text { .. } => self.item_keyer,
+            TableRead::Head { .. } | TableRead::Signature { .. } | TableRead::Text { .. } | TableRead::File { .. } => self.item_keyer,
             TableRead::Names(_) | TableRead::Impls { .. } => self.keyer,
         };
         let Some(keyer) = keyer else {
@@ -2290,6 +2296,11 @@ pub fn cell_id(view: Tables<'_, '_>, read: TableRead) -> Result<Option<CellId>, 
         }
         ReadOf::Source { key } if key.crate_prefix() == blaze_scope::BUILTIN_PREFIX => return Ok(None),
         ReadOf::Source { key } => blaze_drive::key::fact_of(&key.0.0),
+        ReadOf::File { krate, .. } if krate == blaze_scope::BUILTIN_PREFIX => return Ok(None),
+        ReadOf::File { krate, .. } => {
+            let key = crate_by(&krate).ok_or(TaskError::NoCrate { prefix: krate })?;
+            blaze_drive::key::crate_scope_name(&key)
+        }
         ReadOf::Head { item } => super::head::signature_name(item),
         ReadOf::Impls { krate } if krate == [0; 16] => Name::new(Kind::ImplBucket, ABSENT),
         ReadOf::Impls { krate } => impls_name(view, krate)?,
@@ -5617,6 +5628,7 @@ pub fn entry(x: u8) -> u8 {
             TableRead::Names(NameCell::Whole { krate: c8(23), section: Section::Expansions }),
             TableRead::Signature { key: k(24) },
             TableRead::Text { key: k(25) },
+            TableRead::File { krate: c8(29), file: 3 },
             TableRead::Head { item: c16(26), part: 7 },
             TableRead::Impls { krate: c16(27), bucket: c16(28) },
         ]);

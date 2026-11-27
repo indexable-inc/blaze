@@ -2068,8 +2068,12 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     defaults_gate(names, krate, &typeck).map_err(|why| BodyError::Record { item, owner, why })?;
     if Store::view_has_record_type(&view) {
         let body_env = Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts, body: None };
-        let rec_owner = names.seeded_text_of(item).map(|it| (item, it.text));
-        store.register_record_defaults(names, keys, item, rec_owner, &body_env, text_marks, &view).map_err(|why| BodyError::Record { item, owner, why })?;
+        let rec_owner = store
+            .locals
+            .local_head_owner(names, owner, text)
+            .or_else(|| store.locals.library_body(names, keys, item, owner, text).map(|body_lib| (body_lib, text)));
+        let rec_lib = rec_owner.map_or(item, |(k, _)| k);
+        store.register_record_defaults(names, keys, rec_lib, rec_owner, &body_env, text_marks, &view).map_err(|why| BodyError::Record { item, owner, why })?;
     }
 
     let in_scope = names.traits_in_scope(module, alloc).map_err(|error| BodyError::Traits { item, error })?;

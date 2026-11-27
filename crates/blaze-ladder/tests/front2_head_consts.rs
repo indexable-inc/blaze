@@ -1828,3 +1828,246 @@ fn main() {}
     let got = check_fns(TEXT, &["ok_outer", "bad_local_fn", "bad_local_const", "bad_local_static"]);
     expect("local fn/const/static head const blocks", &got, &[true, false, false, false]);
 }
+
+/// Round 7 P1 #1: freezing an owner head whose `where const` or field default observes `line!()`
+/// through `Tables` + `Recorder` must record `TableRead::File` (mapped by `blaze-cli` onto
+/// `Kind::FileItems` `WHOLE`) so inserting a blank line above the item invalidates the cached
+/// owner head instead of reusing a stale `PClause::Const` key. Normal heads without `!` must NOT
+/// record `TableRead::File`.
+#[test]
+fn line_sensitive_where_const_and_field_default_record_file_read_for_invalidation() {
+    use blaze_ladder::front2::heads::Want;
+    use blaze_ladder::front2::source::{Load, Log, Records as SourceRecords};
+    use blaze_ladder::front2::tables::head::{HeadCells, SeededHeads, SeededHeadsOpts, StoreConsts};
+    use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts, TableRead};
+    use blaze_ladder::front2::tables::view::{Tables, TablesOpts};
+    use blaze_scope::items_record::encode as encode_items;
+    use blaze_scope::names_record::encode as encode_names;
+    use blaze_scope::resolve::aligned;
+
+    const TEXT: &str = "#![feature(default_field_values)]
+trait OkTr {}
+trait PlainTr {}
+struct S;
+impl OkTr for S
+where
+    const { #[repr(u16)] enum LineEnum { A = 0, B = 1 } line!() == 7 && core::mem::size_of::<LineEnum>() == 2 }
+{}
+impl PlainTr for S
+where
+    const { 1 + 1 == 2 }
+{}
+pub struct LineOpts {
+    pub n: u32 = line!(),
+}
+fn main() {}
+";
+
+    struct SolvedLoad<'n> {
+        solved: &'n blaze_scope::resolve::Names<'n>,
+        records: Vec<(&'n [u8], &'n [u8])>,
+    }
+
+    impl<'n> Load<'n> for SolvedLoad<'n> {
+        fn names(&self, krate: usize) -> Option<&'n [u8]> {
+            self.records.get(krate).map(|c| c.0)
+        }
+        fn items(&self, krate: usize) -> Option<&'n [u8]> {
+            self.records.get(krate).map(|c| c.1)
+        }
+        fn file(&self, krate: usize, path: blaze_scope::package_path::PackagePath<'_>) -> Option<&'n str> {
+            let k = self.solved.crates().get(krate)?;
+            let want = path.as_str();
+            k.files.iter().find(|f| f.path == want || f.path.ends_with(want)).map(|f| f.text)
+        }
+        fn expansion(&self, _krate: usize, _call: blaze_id::ItemKey) -> Option<blaze_ladder::front2::source::LoadedExpansion<'n>> {
+            None
+        }
+    }
+
+    let alloc = Alloc::global();
+    let bump = blaze_own::testing::bump();
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    let tc: &'static Toolchain = Box::leak(Box::new(Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"))));
+    let files: &'static [(String, String)] = Box::leak(vec![("/hello-world/src/main.rs".to_string(), TEXT.to_string())].into_boxed_slice());
+    let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
+    let user: &'static UserCrate<'static> = Box::leak(Box::new(UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files, edition, panic: blaze_build::Panic::Unwind }));
+    let inputs: &'static Inputs<'static> = Box::leak(Box::new(Inputs::new(user, tc).unwrap_or_else(|e| panic!("the crates: {e}"))));
+    let crates: &'static [blaze_scope::resolve::CrateInput<'static>] = Vec::leak(inputs.crates());
+    let solved: &'static blaze_scope::resolve::Names<'static> = Box::leak(Box::new(inputs.resolve(crates, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"))));
+
+    let mut loaded = Vec::new();
+    let mut crate_keys = Vec::new();
+    let mut crate_names = Vec::new();
+    for i in 0..solved.crates().len() {
+        let k = solved.krate(i);
+        let nb = aligned(&encode_names(k, alloc).expect("encode names"), bump);
+        let ib = aligned(&encode_items(k, alloc).expect("encode items"), bump);
+        loaded.push((nb, ib));
+        crate_keys.push(k.key);
+        crate_names.push(k.name);
+    }
+    let load: &'static SolvedLoad<'static> = Box::leak(Box::new(SolvedLoad { solved, records: loaded }));
+    let rec_frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("rec frame")));
+    let log: &'static Log<'static> = Box::leak(Box::new(Log::new(Vec::leak(crate_names), alloc)));
+    let records: &'static SourceRecords<'static> = Box::leak(Box::new(SourceRecords::new(Vec::leak(crate_keys), load, log, rec_frame, alloc)));
+
+    let line_impl = solved.krate(0).tables.impls.iter().find(|i| i.header.contains("LineEnum")).expect("line impl").key;
+    let plain_impl = solved.krate(0).tables.impls.iter().find(|i| i.header.contains("PlainTr")).expect("plain impl").key;
+    let line_opts = names::path(solved, solved.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments: &["LineOpts"] }, alloc)
+        .unwrap_or_else(|e| panic!("LineOpts: {e}"))
+        .whole(1)
+        .expect("LineOpts key")
+        .key;
+    let prefix = solved.krate(0).key.prefix();
+
+    let sources = [SourceFile { path: "src/main.rs", text: TEXT }];
+    let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame")));
+    let front = Front2::new(solved, frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
+    let sized = front.index.lang("sized");
+
+    let mut results: Vec<Vec<TableRead>> = Vec::new();
+    for want in [Want::Impl(line_impl), Want::Adt(line_opts), Want::Impl(plain_impl)] {
+        let rec = Recorder::new(RecorderOpts { alloc });
+        {
+            let view = Tables::new(TablesOpts { records, impls: None, lang_crates: &[], reads: &rec });
+            let prepared = Prepares::new_in(blaze_own::testing::bump());
+            let mut evaluator = StoreConsts { names: view, index: &front.index, prepared };
+            let mut source = SeededHeads::new(SeededHeadsOpts {
+                names: view,
+                sized,
+                pointers: blaze_ladder::front2::receiver::Pointers::NOT_LOOKED_UP,
+                frame,
+                scratch: alloc,
+                alloc,
+                consts: Some(&mut evaluator),
+                known: None,
+                owners: None,
+            });
+            let _ = source.cell(want).unwrap_or_else(|e| panic!("freeze {want:?}: {e}"));
+        }
+        results.push(rec.finish().expect("recorder finish").to_vec());
+    }
+
+    let line_impl_reads = &results[0];
+    assert!(
+        line_impl_reads.contains(&TableRead::File { krate: prefix, file: 0 }),
+        "impl with `where const {{ line!() }}` must record TableRead::File for invalidation: {line_impl_reads:?}"
+    );
+    let line_opts_reads = &results[1];
+    assert!(
+        line_opts_reads.contains(&TableRead::File { krate: prefix, file: 0 }),
+        "ADT with `line!()` field default must record TableRead::File for invalidation: {line_opts_reads:?}"
+    );
+    let plain_impl_reads = &results[2];
+    assert!(
+        !plain_impl_reads.iter().any(|r| matches!(r, TableRead::File { .. })),
+        "normal `where const` without `!` must NOT record TableRead::File: {plain_impl_reads:?}"
+    );
+}
+
+/// Round 7 P1 #2: structural record field defaults declaring local items inside an `impl` method
+/// body or a `trait` default method body must attach their `HeadAnon` owner to the method's
+/// member body (not the enclosing `impl`/`trait` container) so local items resolve cleanly.
+#[test]
+fn structural_record_default_in_impl_and_trait_method_bodies_resolves_local_enum() {
+    const TEXT: &str = "#![blaze::records]
+pub struct S;
+impl S {
+    pub fn impl_ok() -> [u8; 2] {
+        let r: {
+            n: usize = {
+                #[repr(u16)]
+                enum ImplMethodRecEnum { A = 0, B = 1 }
+                core::mem::size_of::<ImplMethodRecEnum>()
+            },
+        } = { .. };
+        [r.n as u8; 2]
+    }
+    pub fn impl_bad() -> [u8; 3] {
+        let r: {
+            n: usize = {
+                #[repr(u16)]
+                enum ImplMethodRecBad { A = 0, B = 1 }
+                core::mem::size_of::<ImplMethodRecBad>()
+            },
+        } = { .. };
+        let _ = r.n;
+        [0u8; 2]
+    }
+}
+pub trait Tr {
+    fn trait_ok() -> usize {
+        let r: {
+            n: usize = {
+                #[repr(u16)]
+                enum TraitMethodRecEnum { A = 0, B = 1 }
+                core::mem::size_of::<TraitMethodRecEnum>()
+            },
+        } = { .. };
+        r.n
+    }
+}
+impl Tr for S {}
+fn call_impl_ok() -> [u8; 2] { S::impl_ok() }
+fn call_impl_bad() -> [u8; 3] { S::impl_bad() }
+fn call_trait_ok() -> usize { <S as Tr>::trait_ok() }
+fn main() {}
+";
+
+    let alloc = Alloc::global();
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let files = [("/hello-world/src/main.rs".to_string(), TEXT.to_string())];
+    let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let sources = [SourceFile { path: "src/main.rs", text: TEXT }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+    let mut front = Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
+    let mut store = Store::new(front.index.lang("sized"), &frame, alloc);
+    let (mut buckets, mut consts) = (None, Consts::default());
+
+    let impl_key = names.krate(0).tables.impls.iter().find(|i| i.header.contains("impl S")).expect("impl S").key;
+    let trait_key = names::path(&names, names.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments: &["Tr"] }, alloc)
+        .unwrap_or_else(|e| panic!("Tr: {e}"))
+        .whole(1)
+        .expect("Tr key")
+        .key;
+    store.ensure(&names, &mut front.keys, blaze_ladder::front2::heads::Want::Impl(impl_key)).expect("ensure impl S");
+    store.ensure(&names, &mut front.keys, blaze_ladder::front2::heads::Want::Members(trait_key)).expect("ensure trait Tr");
+
+    let impl_ok_k = front.keys.member(blaze_ladder::front2::keys::checker_of(impl_key), blaze_ladder::front2::keys::MemberKind::Fn, "impl_ok").expect("impl_ok key");
+    let impl_bad_k = front.keys.member(blaze_ladder::front2::keys::checker_of(impl_key), blaze_ladder::front2::keys::MemberKind::Fn, "impl_bad").expect("impl_bad key");
+    let trait_ok_k = front.keys.member(blaze_ladder::front2::keys::checker_of(trait_key), blaze_ladder::front2::keys::MemberKind::Fn, "trait_ok").expect("trait_ok key");
+
+    let mut got = Vec::new();
+    for &(name, k) in &[("S::impl_ok", impl_ok_k), ("S::impl_bad", impl_bad_k), ("Tr::trait_ok", trait_ok_k)] {
+        let body = blaze_ladder::front2::body::lower_member(&names, prepared, &mut front.keys, &mut store, k).unwrap_or_else(|e| panic!("lower {name}: {e}"));
+        let view = body.lowered.view();
+        let spell = Spelling::of(&view).unwrap_or_else(|e| panic!("spelling {name}: {e:?}"));
+        let scope = body.scope(&spell);
+        let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
+        let outcome = match check_body(&mut records, &body, &scope) {
+            Ok(done) if done.diags.is_empty() => "clean".to_string(),
+            Ok(done) => format!("diags {:?}", done.diags),
+            Err(CheckFail::Diags { diags, .. }) => format!("diags {diags:?}"),
+            Err(e) => format!("not checked: {e}"),
+        };
+        got.push((name.to_string(), outcome));
+    }
+    expect("record defaults in impl/trait method bodies", &got, &[true, false, true]);
+
+    // Also evaluate the registered default constants directly to confirm `size_of::<Enum>() == 2`
+    // (not just type-checked without running the constant evaluator).
+    let schema = blaze_typeck::RecordSchema::of_sorted_names(&[blaze_typeck::Name::of("n")]);
+    let dk = store.field_defaults.get(&schema.defaults_key()).expect("record field_defaults")[0].expect("n default key");
+    let mut r = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: None };
+    let val = consts.value(&mut r, prepared, dk).unwrap_or_else(|e| panic!("eval method record default: {e}"));
+    assert_eq!(blaze_ladder::front2::consts::int_of(val), Some(2), "method structural record default must evaluate size_of::<Enum>() == 2");
+}

@@ -381,9 +381,14 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.file_paths(krate, file)
     }
 
-    /// WHOLE: a whole file's text, read only to print a position (rule 71).
+    /// WHOLE: a whole file's text, read when observing line/column positions or printing a site
+    /// (rule 71). Records both `Section::Items` and `TableRead::File` so shifting a line in the
+    /// physical file invalidates any head or body that observed `line!()`/`column!()`.
     fn file_text(self, krate: usize, file: u32) -> Option<&'n str> {
         self.whole(krate, Section::Items);
+        if let Some(prefix) = self.prefix(krate) {
+            self.reads.read(TableRead::File { krate: prefix, file });
+        }
         self.records.file_text(krate, file)
     }
 
