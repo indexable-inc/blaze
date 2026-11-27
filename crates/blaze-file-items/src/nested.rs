@@ -2849,7 +2849,7 @@ fn h() {
         assert!(n.writes());
 
         // `digest_body_blocks` returns `whole = true` for direct head macro calls so edits invalidate surface.
-        let mut buf = AVec::new_in(heap.alloc());
+        let mut buf = blaze_own::AVec::new_in(heap.alloc());
         assert!(super::digest_body_blocks(text, &mut |b| buf.extend_from_slice(b)));
     }
 }
