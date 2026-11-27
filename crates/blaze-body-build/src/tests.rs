@@ -1169,6 +1169,7 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
         panic: Panic,
         tracked_drop: bool,
         has_drop_in_place: bool,
+        def_site_item_override: Option<ItemKey>,
     }
 
     impl LayoutFacts for ShimWorld {
@@ -1228,7 +1229,7 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
             Ok(Some(inst.item == TRACKED_FN || (self.tracked_drop && inst.item == DROP_IMPL_FN)))
         }
         fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
-            Ok(blaze_build::CallerSite { file: "shims.rs", item, offset: 7 })
+            Ok(blaze_build::CallerSite { file: "shims.rs", item: self.def_site_item_override.unwrap_or(item), offset: 7 })
         }
     }
 
@@ -1268,6 +1269,7 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
         panic: Panic::Unwind,
         tracked_drop: false,
         has_drop_in_place: true,
+        def_site_item_override: None,
     };
 
     // 1. `build_drop_glue`: struct with two droppable fields (unwind ladder), enum, slice, and plain ZST/Copy.
@@ -1304,6 +1306,23 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
             "missing drop_in_place error should name `drop_in_place`: {missing_dip_err}"
         );
         w_unwind.has_drop_in_place = true;
+
+        // Macro-defined `drop_in_place`: `Adts::def_site` may return an expansion anchor whose
+        // `item != drop_in_place`; `def_site_location` must preserve `def.item` unchanged.
+        const MACRO_ANCHOR: ItemKey = ItemKey(0x70ff);
+        w_unwind.def_site_item_override = Some(MACRO_ANCHOR);
+        let b_macro_drop = build_drop_glue(&mut Subst { args: &[g_drop], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
+        let mview = b_macro_drop.func.view();
+        let mut found_positions = 0usize;
+        for d in (0..mview.datas.len() as u32).map(blaze_lir::func::DataId) {
+            for pos in mview.data_positions_of(d) {
+                assert_eq!(pos.item_key(), MACRO_ANCHOR.0, "PositionFix must preserve CallerSite::item from Adts::def_site");
+                assert_eq!(pos.site, 7);
+                found_positions += 1;
+            }
+        }
+        assert_eq!(found_positions, 2, "expected line and col PositionFixes for macro-anchored drop_in_place");
+        w_unwind.def_site_item_override = None;
         w_unwind.tracked_drop = false;
 
         let b_wrap = build_drop_glue(&mut Subst { args: &[g_wrap], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();

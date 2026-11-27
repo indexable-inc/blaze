@@ -27,7 +27,7 @@ use blaze_build::drop_facts::needs_drop;
 use blaze_build::intrinsics::{Call, IntrinsicCx, Out, Site, Which, lir, read_discriminant, resize_in};
 use blaze_build::layout::{DynChain, Fields, LayoutCx, LayoutError, LayoutId, Layouts, Tail, Variants, mask};
 use blaze_build::vtable::VtableRef;
-use blaze_build::{Abi, Adts, Built, CallerSite, FnTrait, Instance, Panic, Subst, abi, ground};
+use blaze_build::{Abi, Adts, Built, FnTrait, Instance, Panic, Subst, abi, ground};
 use blaze_lir::builder::{MemAttrs, Param, Variadic};
 use blaze_lir::func::{BlockKind, Conv, Ext, RefId, RefKind, SigId, SlotId, SlotKind};
 use blaze_lir::{Builder, Flags, Full, IntCond, Op, Ty, Value};
@@ -521,7 +521,7 @@ impl<'a, 'g, 't, A: Allocator + Copy> ShimCx<'a, 'g, 't, A> {
         let loc_ty = self.subst.ground.intern(PNode::Adt(loc_adt, List::EMPTY)).map_err(|_| self.malformed("the ground table is full"))?;
         let ret = self.subst.ground.intern(PNode::Ref(Mutbl::Not, loc_ty)).map_err(|_| self.malformed("the ground table is full"))?;
         let def = self.adts.def_site(site_item).map_err(|_| self.malformed("`#[track_caller]` shim without `def_site`"))?;
-        let here = Site::Here(CallerSite { file: def.file, item: site_item, offset: def.offset });
+        let here = Site::Here(def);
         let call = Call { which: Which::CallerLocation, generics: &[], args: &[], ret, site: Some((here, loc_ty)) };
         let adts = self.adts;
         let needs_drop_cb = |_: PTy| false;
