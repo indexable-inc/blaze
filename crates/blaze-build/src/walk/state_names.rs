@@ -311,12 +311,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
     }
 
-    /// Names `slot` as the saved temporary of expression `e`: tries `Role::Value`, `Role::Result`
-    /// (e.g. an `.await` or overloaded `Deref::deref` result temporary held across a subsequent
-    /// `.await`), and `Role::Borrow` (e.g. a deref-coerced fat reference `&self.vec` -> `&[u8]`
-    /// evaluated as a call argument before a later `.await` argument), requiring the saved field
-    /// to fit `slot`'s size and alignment.
-    pub(super) fn name_temp_slot(&mut self, slot: SlotId, e: ExprId) {
+    fn name_temp_roles(&mut self, slot: SlotId, e: ExprId, roles: &[Role]) {
         let (slot_size, slot_align) = self
             .b
             .func()
@@ -325,7 +320,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             .get(usize::try_from(slot.0).unwrap_or(usize::MAX))
             .map_or((0, 0), |s| (s.size, s.align));
         let align_mask = 1u32.checked_shl(u32::from(slot_align)).map_or(0, |a| a.saturating_sub(1));
-        for role in [Role::Value, Role::Result, Role::Borrow] {
+        for &role in roles {
             let id = Identity::Temp(e, role);
             let fits = self
                 .names
@@ -341,6 +336,15 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
     }
 
+    /// Names `slot` as the saved temporary of expression `e`: tries `Role::Value`, `Role::Result`
+    /// (e.g. an `.await` or overloaded `Deref::deref` result temporary held across a subsequent
+    /// `.await`), and `Role::Borrow` (e.g. a deref-coerced fat reference `&self.vec` -> `&[u8]`
+    /// evaluated as a call argument before a later `.await` argument), requiring the saved field
+    /// to fit `slot`'s size and alignment.
+    pub(super) fn name_temp_slot(&mut self, slot: SlotId, e: ExprId) {
+        self.name_temp_roles(slot, e, &[Role::Value, Role::Result, Role::Borrow]);
+    }
+
     /// Names the slot whose whole storage `at` is, if it is one, as `e`'s saved temporary.
     pub(super) fn name_temp_at(&mut self, at: (Value, i32), e: ExprId) {
         if self.names.is_none() || at.1 != 0 {
@@ -354,10 +358,14 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
     }
 
-    /// A fresh slot of `temp`, named as the running task's expression's saved temporary.
+    /// A fresh slot of `temp`, named as the running task's expression's saved value or borrow
+    /// temporary. Deliberately excludes `Role::Result` so short-lived internal slots made inside
+    /// `await_poll` (such as `Poll<Output>`, which shares the size of `Output` under niche
+    /// optimization) never steal `Identity::Temp(e, Role::Result)` from the final unpacked
+    /// `.await` result temporary named later by `name_temp_slot`.
     pub(super) fn name_temp(&mut self, slot: SlotId) {
         if let Some(x) = self.names.as_ref().map(|n| n.at) {
-            self.name_temp_slot(slot, x);
+            self.name_temp_roles(slot, x, &[Role::Value, Role::Borrow]);
         }
     }
 
