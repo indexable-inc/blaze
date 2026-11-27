@@ -798,7 +798,7 @@ mod macos_app {
         /// When an inline PTY is running (`!pty_fullscreen`), whether keyboard & scroll focus is
         /// captured by the inline PTY (`true`) or returned to the shell composer (`false`).
         pty_focused: bool,
-        /// Optional row-count override for the inline PTY box, adjusted with `Cmd+`/`Cmd-`/`Cmd+0`
+        /// Optional row-count override for the inline PTY box, adjusted with `Cmd+Opt+`/`-`/`0`
         /// while focused inside the inline alternate-screen terminal.
         pty_inline_rows_override: Option<u16>,
         active_sysmon: Option<BlockId>,
@@ -1546,9 +1546,10 @@ mod macos_app {
             let (cols, rows) = if self.pty_fullscreen {
                 (cols, rows)
             } else {
+                let max_inline = rows.saturating_sub(3).max(12);
                 (
                     cols.saturating_sub(4).max(20),
-                    (rows.saturating_mul(65) / 100).clamp(18, 34),
+                    (rows.saturating_mul(65) / 100).max(12).min(max_inline),
                 )
             };
             let px = (
@@ -1854,7 +1855,7 @@ mod macos_app {
                     (raw_cols, raw_rows)
                 } else {
                     let max_inline = raw_rows.saturating_sub(3).max(12);
-                    let default_rows = (raw_rows.saturating_mul(65) / 100).clamp(18, 34).min(max_inline);
+                    let default_rows = (raw_rows.saturating_mul(65) / 100).max(12).min(max_inline);
                     let target_rows = pane
                         .pty_inline_rows_override
                         .map_or(default_rows, |r| r.clamp(8, max_inline));
@@ -3465,10 +3466,9 @@ mod macos_app {
                                     continue;
                                 }
 
-                                // Context-aware resize / zoom (`Cmd+=`/`Cmd++`, `Cmd+-`, `Cmd+0`):
-                                // - Inside a focused inline alternate-screen PTY: enlarge / shrink / reset that TUI box.
-                                // - Inside a multi-pane split tab: enlarge / shrink / equalize the focused pane.
-                                // - Otherwise (or anytime with `Cmd+Opt+/-/0`): zoom global font size.
+                                // Font zoom (`Cmd+=`/`Cmd++`, `Cmd+-`, `Cmd+0`) ALWAYS zooms text size
+                                // (including inside an inline alternate-screen PTY and in split tabs).
+                                // Optional box/pane resize lives on `Cmd+Opt+=`/`-`/`0`.
                                 let resize_dir: Option<i8> = if matches!(lower.as_str(), "=" | "+")
                                     || matches!(key, Key::Equal | Key::NumpadAdd)
                                 {
@@ -3482,15 +3482,15 @@ mod macos_app {
                                 };
                                 if let Some(dir) = resize_dir {
                                     let focused_pid = wm.focused_pane();
-                                    let inline_pty_focused = !alt
+                                    let inline_pty_resize = alt
                                         && panes.get(&focused_pid).is_some_and(|p| {
                                             p.active_pty.is_some() && !p.pty_fullscreen && p.pty_focused
                                         });
-                                    let split_pane_active = !alt
+                                    let split_pane_resize = alt
                                         && wm.active_tab().root.leaf_count() > 1
                                         && !wm.active_tab().zoomed;
 
-                                    if inline_pty_focused {
+                                    if inline_pty_resize {
                                         if let Some(pane) = panes.get_mut(&focused_pid) {
                                             let pane_rect: HitRect = tile_layout
                                                 .panes
@@ -3508,7 +3508,7 @@ mod macos_app {
                                             let (_, raw_rows) = grid_for_rect(pane_rect, &fonts, scale);
                                             let max_inline = raw_rows.saturating_sub(3).max(12);
                                             let default_rows =
-                                                (raw_rows.saturating_mul(65) / 100).clamp(18, 34).min(max_inline);
+                                                (raw_rows.saturating_mul(65) / 100).max(12).min(max_inline);
                                             let cur = pane.pty_inline_rows_override.unwrap_or(default_rows);
                                             pane.pty_inline_rows_override = match dir {
                                                 1 => Some(cur.saturating_add(5).min(max_inline)),
@@ -3518,7 +3518,7 @@ mod macos_app {
                                             pty_sizes_dirty = true;
                                             dirty = true;
                                         }
-                                    } else if split_pane_active {
+                                    } else if split_pane_resize {
                                         match dir {
                                             1 => {
                                                 wm.resize_focused_pane(0.06);
