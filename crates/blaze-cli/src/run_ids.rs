@@ -801,7 +801,7 @@ impl PartialOrd for Edge {
 const MOST_WALKED: usize = 1 << 22;
 
 /// One unit of the checkout as the walk asks its rows (D191): its crate root's `FileItems`
-/// name, its view (blaze-drive view.rs `ViewKey::of_unit` of its crate key: the one spelling)
+/// name, its view (engine_body_plan.rs `unit_view`: the one spelling)
 /// and its crate key's prefix, which every key its checks cover begins with. Ordered by root,
 /// so the units of one root (a library and its test build) are one run.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -3273,7 +3273,7 @@ mod delta_tests {
     fn unit_root(byte: u8, root: Name, is_test: bool) -> UnitRoot {
         UnitRoot {
             root,
-            view: ViewKey::of_member(&[byte], b"pkg", is_test),
+            view: ViewKey::of_member(blaze_drive::view::MemberView::simple(&[byte], b"pkg", is_test)),
             prefix: CrateItemKey(ContentId([byte; 32])).prefix(),
         }
     }

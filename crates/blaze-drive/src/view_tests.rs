@@ -16,7 +16,7 @@ use std::vec::Vec;
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_sim::{Broke, Config as SimConfig, Tape, check, control};
 
-use super::{Full, UnitView, ViewKey, ViewPlan, at_view};
+use super::{Full, MemberView, UnitView, ViewKey, ViewPlan, at_view};
 use crate::key::{Kind, Name};
 
 fn subject(tape: &Tape, label: &'static str) -> Result<ContentId, Broke> {
@@ -26,7 +26,7 @@ fn subject(tape: &Tape, label: &'static str) -> Result<ContentId, Broke> {
 
 /// Unit `unit` of the model: its own root, the package's name, not a test build.
 fn view(unit: usize) -> ViewKey {
-    ViewKey::of_member(&unit.to_le_bytes(), b"pkg", false)
+    ViewKey::of_member(MemberView::simple(&unit.to_le_bytes(), b"pkg", false))
 }
 
 /// PLANTED CONTROL: the view as it was spelled before (a digest of the unit's crate key, which
@@ -37,32 +37,38 @@ fn view_by_crate_key(key: &CrateItemKey) -> ViewKey {
 
 /// A unit's crate key as the graph makes it: its own parts and its dependencies' keys, so an
 /// edge added moves it. The model of what the view must NOT follow.
-fn crate_key(root: &[u8], name: &[u8], test: bool, deps: &[ContentId]) -> CrateItemKey {
+fn crate_key(member: MemberView<'_>, deps: &[ContentId]) -> CrateItemKey {
     let mut h = blaze_ids::Hasher::new("blaze-drive view test crate key");
-    h.update(&[u8::from(test)]).part(root).part(name);
+    h.update(&[u8::from(member.test), u8::from(member.macro_side), u8::from(member.proc_macro), u8::from(member.test_or_bench)])
+        .part(member.root)
+        .part(member.name)
+        .part(member.bin.unwrap_or(b""))
+        .part(member.package);
     for dep in deps {
         h.id(dep);
     }
     CrateItemKey(h.finish())
 }
 
-/// Over drawn member units (a library, its test build, bins, an integration test), each with
-/// drawn dependencies: a dependency edge added to one member moves NO view's name, and the
-/// views of the units stay distinct. CONTROL: the view spelled from the crate key moves for the
+/// Over drawn member units (a library on target side, the same library on macro side, its test
+/// build, a bin sharing the same root, a bin with its own root, and an integration test), each
+/// with drawn dependencies: a dependency edge added to one member moves NO view's name, and the
+/// views of all units stay distinct. CONTROL: the view spelled from the crate key moves for the
 /// member the edge was added to ("a view moved"), so the stillness is the new key's.
 fn an_edge_added_moves_no_view(tape: &Tape, by_key: bool) -> Result<(), Broke> {
-    // (root, name, test): the library and its test build share a root; a bin has its own.
-    let units: [(&[u8], &[u8], bool); 4] = [
-        (b"/0/a/src/lib.rs", b"a", false),
-        (b"/0/a/src/lib.rs", b"a", true),
-        (b"/0/a/src/main.rs", b"a", false),
-        (b"/0/a/tests/it.rs", b"it", true),
+    let units: [MemberView<'_>; 6] = [
+        MemberView { root: b"/0/a/src/lib.rs", name: b"a", test: false, macro_side: false, proc_macro: false, test_or_bench: false, bin: None, package: b"a" },
+        MemberView { root: b"/0/a/src/lib.rs", name: b"a", test: false, macro_side: true, proc_macro: false, test_or_bench: false, bin: None, package: b"a" },
+        MemberView { root: b"/0/a/src/lib.rs", name: b"a", test: true, macro_side: false, proc_macro: false, test_or_bench: false, bin: None, package: b"a" },
+        MemberView { root: b"/0/a/src/lib.rs", name: b"a", test: false, macro_side: false, proc_macro: false, test_or_bench: false, bin: Some(b"a"), package: b"a" },
+        MemberView { root: b"/0/a/src/main.rs", name: b"a", test: false, macro_side: false, proc_macro: false, test_or_bench: false, bin: Some(b"a"), package: b"a" },
+        MemberView { root: b"/0/a/tests/it.rs", name: b"it", test: true, macro_side: false, proc_macro: false, test_or_bench: true, bin: None, package: b"a" },
     ];
     let deps: Vec<ContentId> = (0..1 + tape.index(4, "deps")).map(|d| subject(tape, if d == 0 { "dep 0" } else { "dep" })).collect::<Result<_, _>>()?;
     let added = subject(tape, "added edge")?;
     let to = tape.index(units.len(), "member the edge is added to");
-    let view_of = |(root, name, test): (&[u8], &[u8], bool), deps: &[ContentId]| {
-        if by_key { view_by_crate_key(&crate_key(root, name, test, deps)) } else { ViewKey::of_member(root, name, test) }
+    let view_of = |member: MemberView<'_>, deps: &[ContentId]| {
+        if by_key { view_by_crate_key(&crate_key(member, deps)) } else { ViewKey::of_member(member) }
     };
     let before: Vec<ViewKey> = units.iter().map(|u| view_of(*u, &deps)).collect();
     let mut grown = deps.clone();
