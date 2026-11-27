@@ -85,6 +85,14 @@ fn nested_body_2024_in_2021(x: &mut Cmd) -> u32 {
     rules_2021::call_2024_in_2021!(x)
 }
 
+fn body_2015_async_ident() -> u32 {
+    macros_2015::async_try_ident!()
+}
+
+fn body_2024_async_ident() -> u32 {
+    macros_2024::async_try_ident!()
+}
+
 pub fn main_ok() -> u32 {
     let mut c = Cmd::Check(1);
     let mut n = NestedCmd2021::Check(2);
@@ -92,7 +100,12 @@ pub fn main_ok() -> u32 {
     let _b = body_2021(&mut c);
     let _c = n.nested_update_2021();
     let _d = nested_body_2021_in_2024(&mut c);
+    let _e = body_2015_async_ident();
     a
+}
+
+pub fn main_body_2024_async_ident() -> u32 {
+    body_2024_async_ident()
 }
 
 pub fn main_derive_2024() -> u32 {
@@ -132,6 +145,11 @@ pub fn derive_subcommand_nested_2021(input: TokenStream) -> TokenStream { input 
 pub fn match_ref_mut(input: TokenStream) -> TokenStream { input }
 ";
 
+const MACROS_2015: &str = "#![no_core]
+#[proc_macro]
+pub fn async_try_ident(input: TokenStream) -> TokenStream { input }
+";
+
 const MACROS_2024: &str = "#![no_core]
 #[proc_macro_derive(Subcommand)]
 pub fn derive_subcommand(input: TokenStream) -> TokenStream { input }
@@ -141,6 +159,9 @@ pub fn derive_subcommand_nested_2024(input: TokenStream) -> TokenStream { input 
 
 #[proc_macro]
 pub fn match_ref_mut(input: TokenStream) -> TokenStream { input }
+
+#[proc_macro]
+pub fn async_try_ident(input: TokenStream) -> TokenStream { input }
 ";
 
 const RULES_2024: &str = "#![no_core]
@@ -183,6 +204,7 @@ macro_rules! call_2024_in_2021 {
 }
 ";
 
+const RUNNER_2015: CrateItemKey = CrateItemKey(ContentId([15; 32]));
 const RUNNER_2021: CrateItemKey = CrateItemKey(ContentId([21; 32]));
 const RUNNER_2024: CrateItemKey = CrateItemKey(ContentId([24; 32]));
 
@@ -196,6 +218,7 @@ impl SourceTexts<'static> for TransparentEditionRunner {
             ("/macros_2024/lib.rs", MACROS_2024),
             ("/rules_2024/lib.rs", RULES_2024),
             ("/rules_2021/lib.rs", RULES_2021),
+            ("/macros_2015/lib.rs", MACROS_2015),
         ]
         .get(krate)
         .filter(|(p, _)| *p == path)
@@ -206,6 +229,7 @@ impl SourceTexts<'static> for TransparentEditionRunner {
         match krate {
             1 => Some(RUNNER_2021),
             2 => Some(RUNNER_2024),
+            5 => Some(RUNNER_2015),
             _ => None,
         }
     }
@@ -219,6 +243,14 @@ impl SourceTexts<'static> for TransparentEditionRunner {
     ) -> Result<Produced<'b>, HostError> {
         let refused = HostError { ask: HostAsk::ProcMacro, why: HostWhy::Refused };
         let (edition, text) = match (def.site().krate, call.kind, def.proc_name()) {
+            (k, ProcKind::FnLike, Some("async_try_ident")) if k == RUNNER_2015 => (
+                Edition::E2015,
+                "{ let async: u32 = 7; let try: u32 = async; try }",
+            ),
+            (k, ProcKind::FnLike, Some("async_try_ident")) if k == RUNNER_2024 => (
+                Edition::E2024,
+                "{ let async: u32 = 7; let try: u32 = async; try }",
+            ),
             (k, ProcKind::Derive, Some("Subcommand")) if k == RUNNER_2021 => (
                 Edition::E2021,
                 "impl Cmd { pub fn update_2021(&mut self) -> u32 { match self { Self::Check(ref mut arg) => *arg } } }",
@@ -300,13 +332,14 @@ fn transparent_proc_macro_preserves_defining_edition_for_binding_modifiers() {
             "/user/lib.rs",
             Edition::E2024,
             edition::Edition::Edition2024,
-            &[("macros_2021", 1), ("macros_2024", 2), ("rules_2024", 3), ("rules_2021", 4)],
+            &[("macros_2021", 1), ("macros_2024", 2), ("rules_2024", 3), ("rules_2021", 4), ("macros_2015", 5)],
             false,
         ),
         crate_input("macros_2021", "/macros_2021/lib.rs", Edition::E2021, edition::Edition::Edition2021, &[], true),
         crate_input("macros_2024", "/macros_2024/lib.rs", Edition::E2024, edition::Edition::Edition2024, &[], true),
         crate_input("rules_2024", "/rules_2024/lib.rs", Edition::E2024, edition::Edition::Edition2024, &[("macros_2021", 1)], false),
         crate_input("rules_2021", "/rules_2021/lib.rs", Edition::E2021, edition::Edition::Edition2021, &[("macros_2024", 2)], false),
+        crate_input("macros_2015", "/macros_2015/lib.rs", Edition::E2015, edition::Edition::Edition2015, &[], true),
     ];
     let names = resolve_crates(&crates, Sysroot::default(), &FILES, &Serial, blaze_own::testing::bump())
         .unwrap_or_else(|e| panic!("resolve_crates: {e}"));
@@ -341,4 +374,14 @@ fn transparent_proc_macro_preserves_defining_edition_for_binding_modifiers() {
             "negative control `{root_name}` (`{target_fn}`) must fire E0000 (BindingModifier2024); left_out={rows:?}; err={err_text}"
         );
     }
+
+    // Negative control for E2015 vs E2024 keyword parsing: `async`/`try` emitted by an E2024
+    // transparent proc-macro must be rejected as keywords (failing to parse as identifiers).
+    let mut left_out = Vec::new_in(Global);
+    let res = Front2Program::survey_from(&names, &frame, &[], &[fn_named(&names, "main_body_2024_async_ident")], &mut left_out, Some(sources), g);
+    let rows: Vec<String> = left_out.iter().map(|(f, row)| format!("{f}: {}", row.class)).collect();
+    assert!(
+        rows.iter().any(|r| r.contains("body_2024_async_ident")) || res.is_err(),
+        "negative control `main_body_2024_async_ident` must fail parsing `async`/`try` as identifiers in E2024; left_out={rows:?}"
+    );
 }

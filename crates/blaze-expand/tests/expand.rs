@@ -2395,3 +2395,101 @@ fn nested_transparent_proc_macro_over_semi_opaque_call_site_preserves_innermost_
     let bw_2 = body_words(&exp_2.tokens, ContentId([0x62; 32]), alloc);
     assert!(bw_2.words.iter().all(|w| w.mark == Some(want_2) && w.hygiene != 0));
 }
+
+#[test]
+fn transparent_edition_drives_parser_words_keyword_classification() {
+    use blaze_expand::{
+        HostAsk, HostError, HostWhy, ProcCall, ProcKind, Produced, Reads, Transparency, body_words,
+    };
+    use blaze_own::AVec;
+    use parser::SyntaxKind;
+
+    struct EmitText(Edition, &'static str);
+    impl ExpandCx for EmitText {
+        fn cfg(&self, _: &TokenStream<'_>) -> Result<bool, HostError> {
+            Err(HostError { ask: HostAsk::Cfg, why: HostWhy::Refused })
+        }
+        fn env(&self, _: &str) -> Result<Option<&str>, HostError> {
+            Err(HostError { ask: HostAsk::Env, why: HostWhy::Refused })
+        }
+        fn include(&self, _: &str, _: IncludeAs) -> Result<Included<'_>, HostError> {
+            Err(HostError { ask: HostAsk::Include, why: HostWhy::Refused })
+        }
+        fn place(&self, _: PlaceOf) -> Result<Place<'_>, HostError> {
+            Err(HostError { ask: HostAsk::Place, why: HostWhy::Refused })
+        }
+        fn run_proc_macro<'a>(&self, _: &MacroDefinition<'_>, _: ProcCall<'_>, alloc: Alloc<'a>) -> Result<Produced<'a>, HostError> {
+            let tokens = lex(self.1, self.0, alloc).expect("lex");
+            let mut origins = AVec::new_in(alloc);
+            origins.extend(tokens.tokens().iter().map(|_| TokenOrigin::Made(Transparency::Transparent)));
+            Ok(Produced { tokens, origins, reads: Reads::new_in(alloc), diagnostics: AVec::new_in(alloc), text: AVec::new_in(alloc) })
+        }
+    }
+
+    let alloc = Alloc::global();
+    let empty_2024 = TokenStream::new_in(alloc);
+    let call_2024 = Call::fn_like(&empty_2024, CallSite { edition: Edition::E2024, panic_edition: Edition::E2024, ctx: Ctx::root(Edition::E2024) });
+    let empty_2015 = TokenStream::new_in(alloc);
+    let call_2015 = Call::fn_like(&empty_2015, CallSite { edition: Edition::E2015, panic_edition: Edition::E2015, ctx: Ctx::root(Edition::E2015) });
+
+    // 1. E2015 transparent proc-macro emitting `async try gen` into an E2024 caller:
+    //    `ParserWords` classifies all three as `IDENT` (not edition-2018/2024 keywords).
+    let proc_2015 = MacroDefinition::proc_macro(
+        CrateItemKey(ContentId([0x71; 32])),
+        ProcKind::FnLike,
+        "emit",
+        &[],
+        DefAt { edition: Edition::E2015, ..at(0x71) },
+        alloc,
+    )
+    .expect("proc_2015");
+    let exp_2015 = done(expand(&proc_2015, &call_2024, &EmitText(Edition::E2015, "async try gen"), alloc));
+    let bw_2015 = body_words(&exp_2015.tokens, ContentId([0x81; 32]), alloc);
+    let toks_2015 = parser::Tokens::new(&bw_2015.parser.words, true);
+    assert_eq!(exp_2015.tokens.edition_of(exp_2015.tokens.tokens()[0].ctx), Edition::E2015);
+    assert_eq!((toks_2015.kind(0), toks_2015.kind(1), toks_2015.kind(2)), (SyntaxKind::IDENT, SyntaxKind::IDENT, SyntaxKind::IDENT));
+
+    // 2. E2021 transparent proc-macro emitting `async gen` into an E2024 caller:
+    //    `async` is `ASYNC_KW` (E2021) and `gen` is `IDENT` (not E2024 `GEN_KW`).
+    let proc_2021 = MacroDefinition::proc_macro(
+        CrateItemKey(ContentId([0x72; 32])),
+        ProcKind::FnLike,
+        "emit",
+        &[],
+        DefAt { edition: Edition::E2021, ..at(0x72) },
+        alloc,
+    )
+    .expect("proc_2021");
+    let exp_2021 = done(expand(&proc_2021, &call_2024, &EmitText(Edition::E2021, "async gen"), alloc));
+    let bw_2021 = body_words(&exp_2021.tokens, ContentId([0x82; 32]), alloc);
+    let toks_2021 = parser::Tokens::new(&bw_2021.parser.words, true);
+    assert_eq!((toks_2021.kind(0), toks_2021.kind(1)), (SyntaxKind::ASYNC_KW, SyntaxKind::IDENT));
+
+    // 3. Negative control: E2024 transparent proc-macro emitting `async try gen` into E2015 caller:
+    //    `ParserWords` classifies all three as keywords (`ASYNC_KW`, `TRY_KW`, `GEN_KW`).
+    let proc_2024 = MacroDefinition::proc_macro(
+        CrateItemKey(ContentId([0x73; 32])),
+        ProcKind::FnLike,
+        "emit",
+        &[],
+        DefAt { edition: Edition::E2024, ..at(0x73) },
+        alloc,
+    )
+    .expect("proc_2024");
+    let exp_2024 = done(expand(&proc_2024, &call_2015, &EmitText(Edition::E2024, "async try gen"), alloc));
+    let bw_2024 = body_words(&exp_2024.tokens, ContentId([0x83; 32]), alloc);
+    let toks_2024 = parser::Tokens::new(&bw_2024.parser.words, true);
+    assert_eq!((toks_2024.kind(0), toks_2024.kind(1), toks_2024.kind(2)), (SyntaxKind::ASYNC_KW, SyntaxKind::TRY_KW, SyntaxKind::GEN_KW));
+
+    // 4. Negative control (`include!`): `include!` defined in E2015 invoked from an E2021 caller
+    //    parses `async try` under the caller's E2021 (`ASYNC_KW`, `TRY_KW`), NOT `include!`'s E2015.
+    let cx = TestCx { files: &[("kw.rs", b"async try")], ..TestCx::new() };
+    let inc_2015 = MacroDefinition::builtin_fn(BuiltinFn::Include, DefAt { edition: Edition::E2015, ..at(0x74) }, alloc);
+    let inc_in = lex("\"kw.rs\"", Edition::E2021, alloc).expect("lex");
+    let inc_call = Call::fn_like(&inc_in, CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: Ctx::root(Edition::E2021) });
+    let inc_exp = done(expand(&inc_2015, &inc_call, &cx, alloc));
+    assert!(inc_exp.diagnostics.is_empty(), "{:?}", inc_exp.diagnostics);
+    let bw_inc = body_words(&inc_exp.tokens, ContentId([0x84; 32]), alloc);
+    let toks_inc = parser::Tokens::new(&bw_inc.parser.words, true);
+    assert_eq!((toks_inc.kind(0), toks_inc.kind(1)), (SyntaxKind::ASYNC_KW, SyntaxKind::TRY_KW));
+}

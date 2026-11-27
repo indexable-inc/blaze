@@ -482,30 +482,25 @@ impl<'a> TokenStream<'a> {
         ctx.node().and_then(|at| self.contexts.get(at as usize)).copied()
     }
 
-    /// The edition a token of `ctx` is read in: its innermost non-transparent mark's edition,
-    /// walking past [`Transparency::Transparent`] marks (call-site / `include!`) to its root's.
+    /// The edition a token of `ctx` is read in: its innermost mark's edition (including
+    /// [`Transparency::Transparent`] proc-macro marks), or its root's edition when `ctx` carries
+    /// no mark (`include!` strips leading transparent marks in `builtin::included_tokens`, so
+    /// included files still inherit the caller's edition).
     pub fn edition_of(&self, ctx: Ctx) -> Edition {
-        self.hygiene(ctx).edition
+        match (ctx.root_edition(), self.node(ctx)) {
+            (Some(edition), _) => edition,
+            (None, Some(node)) => node.mark.edition,
+            (None, None) => unreachable!(
+                "a token's context is checked to be its stream's when it is pushed (`TokenStream::push`)"
+            ),
+        }
     }
 
     /// What resolves the names of a token of `ctx`: its innermost non-transparent mark (`None`
-    /// when every mark on `ctx` is [`Transparency::Transparent`] — call-site / `include!` — or
-    /// `ctx` is a root) and its edition.
-    pub fn hygiene(&self, mut ctx: Ctx) -> TokenHygiene {
-        loop {
-            match (ctx.root_edition(), self.node(ctx)) {
-                (Some(edition), _) => return TokenHygiene { mark: None, edition },
-                (None, Some(node)) if node.mark.transparency == Transparency::Transparent => {
-                    ctx = node.parent;
-                }
-                (None, Some(node)) => {
-                    return TokenHygiene { mark: Some(node.mark), edition: node.mark.edition };
-                }
-                (None, None) => unreachable!(
-                    "a token's context is checked to be its stream's when it is pushed (`TokenStream::push`)"
-                ),
-            }
-        }
+    /// when every mark on `ctx` is [`Transparency::Transparent`] — call-site — or `ctx` is a
+    /// root) and its edition ([`TokenStream::edition_of`]).
+    pub fn hygiene(&self, ctx: Ctx) -> TokenHygiene {
+        TokenHygiene { mark: self.non_transparent_mark(ctx), edition: self.edition_of(ctx) }
     }
 
     /// The innermost mark of `ctx` that is not [`Transparency::Transparent`], walking parent
