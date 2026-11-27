@@ -74,7 +74,7 @@ const COMPILE_FRAME_RESERVE: usize = 2 << 30;
 /// Atomic counter for unique staging directory names during atomic module publication.
 static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Single-flight guard used ONLY when `<store>/wasm64-sysroot-v1/<tc_id>/` has missing sysroot
+/// Single-flight guard used ONLY when `<store>/wasm64-sysroot-v2/<tc_id>/` has missing sysroot
 /// crate records on a completely cold store, preventing N parallel build-script/proc-macro
 /// workers from simultaneously re-parsing `core`/`alloc`/`std` (~3.5x peak RSS reduction).
 static SYSROOT_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -457,6 +457,33 @@ impl<'a> SourceTexts<'a> for Wasm64Sources<'a, '_> {
         let package = self.caller_package(krate);
         procs.run(def, &call, edition, &package, alloc)
     }
+}
+
+/// Builds a [`CrateEnv`] for a toolchain or synthesized crate (`package: None`,
+/// `seen: SeenRoot::Package`), matching `blaze_world::list`'s toolchain crates so
+/// `CARGO_CRATE_NAME` (e.g. `"std"` for `env!("STD_ENV_ARCH")`), `CARGO_MANIFEST_DIR`,
+/// and `file!()` resolve instead of failing with `HostError { ask: Env, why: Refused }`.
+fn toolchain_crate_env<'a>(
+    crate_name: &'a str,
+    read_folder: &'a str,
+    alloc: Alloc<'a>,
+) -> Option<CrateEnv<'a>> {
+    CrateEnv::of(
+        EnvFacts {
+            crate_name,
+            package: None,
+            bin: None,
+            seen: SeenRoot::Package,
+            read_folder,
+            build_script: false,
+            script: None,
+            test_or_bench: false,
+            bin_exes: BinNames::NONE,
+            meta: None,
+        },
+        alloc,
+    )
+    .ok()
 }
 
 struct KeptRecords<'a> {
@@ -1810,7 +1837,7 @@ fn unit_closure_needs_bstd(graph: &UnitGraph<'_>, unit_order: &[UnitId]) -> bool
 /// Marks the transitive `wasm64-blaze-wasip1` toolchain sysroot closure needed by a compile in
 /// `keep_tc`. Always starts from `core`, `alloc`, `std`, and `proc_macro`; only seeds `bstd`
 /// when `needs_bstd` is true so ordinary Rust build scripts and proc macros never pull in
-/// `blaze-std` (80+ crates including `sonic-rs`) into `Records` or `wasm64-sysroot-v1`.
+/// `blaze-std` (80+ crates including `sonic-rs`) into `Records` or `wasm64-sysroot-v2`.
 fn mark_wasm64_sysroot<'a>(
     all_tc: &[blaze_toolchain::UnitRow<'_>],
     sys: blaze_unit_graph::Sysroot,
@@ -2200,7 +2227,7 @@ fn compile_unit_in<'a>(
             script: None,
         });
         origins.push(CrateOrigin::Virtual { root: shim_root, text: WASM64_PROC_MACRO_SHIM });
-        envs.push(None);
+        envs.push(toolchain_crate_env("blaze_wasm64_pm_shim", "/virtual/shim/", alloc));
         editions.push(Edition::E2024);
     }
 
@@ -2243,7 +2270,7 @@ fn compile_unit_in<'a>(
             script: None,
         });
         origins.push(CrateOrigin::Toolchain { view: u.pack, prefix: u.prefix });
-        envs.push(None);
+        envs.push(toolchain_crate_env(u.name, u.prefix, alloc));
         editions.push(u.edition);
     }
 
@@ -2262,7 +2289,7 @@ fn compile_unit_in<'a>(
 
     // 5. Resolve all crates together with `blaze-scope`, reusing persisted disk records for
     //    `wasm64-blaze-wasip1` sysroot crates (`krate >= tc_base`) under
-    //    `<store>/wasm64-sysroot-v1/<tc_id>/` (Rule 51: content-addressed records on disk, page
+    //    `<store>/wasm64-sysroot-v2/<tc_id>/` (Rule 51: content-addressed records on disk, page
     //    cache only, zero in-memory cross-command cache).
     let sources: &'a Wasm64Sources<'a, 'a> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
         Wasm64Sources {
@@ -2276,7 +2303,9 @@ fn compile_unit_in<'a>(
         frame,
     ));
     let par = CompilePar::new();
-    let sysroot_dir = store.join("wasm64-sysroot-v1").join(std::format!("{tc_id}"));
+    let sysroot_dir = store
+        .join("wasm64-sysroot-v2")
+        .join(bstd::mem::format_in!(frame, "{tc_id}").as_str());
     let mut sysroot_kept = Wasm64SysrootKept::open(&sysroot_dir, tc_base, crates.as_slice(), bump);
     let sysroot_guard = if sysroot_kept.has_missing() {
         let guard = SYSROOT_INIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -2719,7 +2748,7 @@ struct FreshSysrootCrate {
 }
 
 /// Persisted disk record store for resolved `wasm64-blaze-wasip1` sysroot crates
-/// (`<store>/wasm64-sysroot-v1/<tc_id>/<crate_key_hex>/`). Follows Rule 51: content-addressed
+/// (`<store>/wasm64-sysroot-v2/<tc_id>/<crate_key_hex>/`). Follows Rule 51: content-addressed
 /// records written once via atomic staging-dir rename, read in place via the kernel page cache,
 /// and verified by `resolve_kept`'s read-list check (`blaze_scope::asked::check`).
 struct Wasm64SysrootKept<'a> {
@@ -3474,9 +3503,9 @@ mod tests {
 
         // Verify the persisted sysroot cache contains ONLY the minimal Rust sysroot closure
         // (never bstd / sonic-rs).
-        let sysroot_dir = store_dir.join("wasm64-sysroot-v1").join(tc_id.to_string());
+        let sysroot_dir = store_dir.join("wasm64-sysroot-v2").join(tc_id.to_string());
         let cached_count = std::fs::read_dir(&sysroot_dir)
-            .expect("read wasm64-sysroot-v1")
+            .expect("read wasm64-sysroot-v2")
             .filter_map(Result::ok)
             .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
             .count();
@@ -3598,6 +3627,24 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         assert_ne!(
             target_digest, host_digest,
             "same-(pkg, version, features) target-side and host-side build scripts with distinct WASI deps must have distinct digests"
+        );
+    }
+
+    #[test]
+    fn wasm64_toolchain_crate_env_exposes_std_crate_name_for_std_env_arch() {
+        let frame = Frame::with_reserve(4 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let a = erased.handle();
+
+        let env = toolchain_crate_env("std", "/toolchain/3/", a)
+            .expect("toolchain CrateEnv must construct with package: None");
+        assert_eq!(env.get("CARGO_CRATE_NAME"), Ok(Some("std")));
+        assert_eq!(env.get("CARGO_MANIFEST_DIR"), Ok(Some("/package")));
+        assert_eq!(env.get("CARGO_PKG_NAME"), Err(blaze_scope::crate_env::EnvUnknown));
+        assert_eq!(
+            env.get("STD_ENV_ARCH"),
+            Ok(None),
+            "STD_ENV_ARCH must be unset (Ok(None)) so BodyHost/Host falls back to target_arch"
         );
     }
 }

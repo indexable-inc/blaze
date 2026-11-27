@@ -38,6 +38,10 @@ fn write_files(dir: &Path, files: &[(&str, &str)]) {
     }
 }
 
+fn cleanup(dir: &Path) {
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn macos_sdkroot() -> Option<String> {
     if !cfg!(target_os = "macos") {
         return None;
@@ -254,8 +258,8 @@ fn pure_rust_build_script_self_compiles_runs_deterministically_and_invalidates_o
     let mods_a2 = published_modules(&home_a.join(".blaze/v2/build-script/modules"));
     assert_eq!(mods_a2.len(), 2, "editing build_helper must publish a new build-script module key: {mods_a2:?}");
 
-    let _ = std::fs::remove_dir_all(base_a);
-    let _ = std::fs::remove_dir_all(base_b);
+    cleanup(&base_a);
+    cleanup(&base_b);
 }
 
 fn proc_macro_workspace(dir: &Path, offset: u32, attr_val: u32, with_extra_member: bool) {
@@ -401,8 +405,8 @@ fn pure_rust_proc_macro_derive_attr_fn_like_with_path_dep_self_compiles_and_runs
     let mods_a2 = published_modules(&home_a.join(".blaze/v2/proc-macro/modules"));
     assert_eq!(mods_a2.len(), 2, "editing mac_helper must publish a new proc-macro module key: {mods_a2:?}");
 
-    let _ = std::fs::remove_dir_all(base_a);
-    let _ = std::fs::remove_dir_all(base_b);
+    cleanup(&base_a);
+    cleanup(&base_b);
 }
 
 #[test]
@@ -774,4 +778,92 @@ version = "0.1.0"
     );
 
     let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn wasm64_build_script_and_proc_macro_read_std_env_consts_arch() {
+    let base = fresh_home("wasm64_std_env_arch_e2e", true);
+    let (home, ws) = (base.join("home"), base.join("ws"));
+    let lock = r#"version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = [
+ "mac",
+]
+
+[[package]]
+name = "mac"
+version = "0.1.0"
+"#;
+    let mac_lib = r#"use proc_macro::TokenStream;
+
+const PM_ARCH_CONST: &str = std::env::consts::ARCH;
+
+#[proc_macro]
+pub fn pm_std_arch(_input: TokenStream) -> TokenStream {
+    let arch = std::env::consts::ARCH;
+    assert_eq!(arch, "wasm64");
+    assert_eq!(PM_ARCH_CONST, "wasm64");
+    format!("\"{arch}\"").parse().expect("parse arch literal")
+}
+"#;
+    let app_build_rs = r#"const BS_ARCH_CONST: &str = std::env::consts::ARCH;
+
+fn main() {
+    let arch = std::env::consts::ARCH;
+    assert_eq!(arch, "wasm64");
+    assert_eq!(BS_ARCH_CONST, "wasm64");
+    println!("cargo:rustc-env=BS_STD_ARCH={arch}");
+}
+"#;
+    let app_main_rs = r#"fn main() {
+    println!("STD_ARCH={}:{}", env!("BS_STD_ARCH"), mac::pm_std_arch!());
+}
+"#;
+    write_files(
+        &ws,
+        &[
+            ("Cargo.toml", "[workspace]\nmembers = [\"mac\", \"app\"]\nresolver = \"2\"\n"),
+            ("Cargo.lock", lock),
+            (
+                "mac/Cargo.toml",
+                "[package]\nname = \"mac\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nproc-macro = true\n",
+            ),
+            ("mac/src/lib.rs", mac_lib),
+            (
+                "app/Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nmac = { path = \"../mac\" }\n",
+            ),
+            ("app/build.rs", app_build_rs),
+            ("app/src/main.rs", app_main_rs),
+        ],
+    );
+
+    let (_, check_out) = run_blaze(&ws, &home, "check1", &["check"]);
+    assert!(
+        !check_out.contains("error[") && !check_out.contains("error:") && !check_out.contains("not checked because"),
+        "cold blaze check with std::env::consts::ARCH in build.rs + proc-macro failed:\n{check_out}"
+    );
+    let bs_mods = published_modules(&home.join(".blaze/v2/build-script/modules"));
+    assert_eq!(bs_mods.len(), 1, "expected 1 published wasm64 build-script module: {bs_mods:?}");
+    let pm_mods = published_modules(&home.join(".blaze/v2/proc-macro/modules"));
+    assert_eq!(pm_mods.len(), 1, "expected 1 published wasm64 proc-macro module: {pm_mods:?}");
+    assert!(
+        home.join(".blaze/v2/wasm64-sysroot-v2").is_dir(),
+        "expected wasm64-sysroot-v2 cache directory to be populated"
+    );
+    assert!(
+        !home.join(".blaze/v2/wasm64-sysroot-v1").exists(),
+        "stale wasm64-sysroot-v1 directory must not be written"
+    );
+
+    let (ok_run, run_out) = run_app(&ws, &home, "run1", "app");
+    assert!(
+        ok_run && run_out.contains("STD_ARCH=wasm64:wasm64"),
+        "expected build.rs and proc-macro std::env::consts::ARCH to evaluate to wasm64:\n{run_out}"
+    );
+
+    cleanup(&base);
 }
