@@ -215,3 +215,62 @@ fn with_no_inherent_impl_whose_clauses_hold_the_method_is_not_found() {
     let got = codes(&fx, q, "wrap", false);
     assert_eq!(got, ["E0599"], "q");
 }
+
+/// Type-relative associated consts (`SyncP::<T>::YES` over `NoSync::YES`, the `impls` /
+/// `check_speed` pattern):
+/// - When `T: IsOpt` fails (`SyncP<u8>`), the inherent `impl<T: IsOpt> SyncP<T> { const YES: u16 }`
+///   is dropped and the in-scope trait `NoOpt::YES: u8` is picked (not E0277).
+/// - When `T: IsOpt` holds (`SyncP<u16>`), the inherent `SyncP::YES: u16` wins over `NoOpt::YES: u8`.
+/// - When no trait is in scope (`OnlyInh<u8>::YES`), the dropped inherent impl yields E0599 naming
+///   the unsatisfied bound.
+#[test]
+fn inherent_assoc_const_whose_impl_clause_fails_yields_to_in_scope_trait() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let (p0, u8_, u16_) = (fx.param(0), fx.u8(), fx.u16());
+    let is_opt = fx.tr("IsOpt", 1, Vec::new(), &[]);
+    fx.imp("impl IsOpt for u16", 0, u16_, Some((is_opt, &[])), &[], Vec::new());
+
+    let sp = fx.strukt("SyncP", 1, &[]);
+    let sp_t = fx.adt(sp, &[p0]);
+    let t_is_opt = fx.bound(is_opt, &[p0]);
+    let sp_inh = fx.imp("impl<T: IsOpt> SyncP<T>", 1, sp_t, None, &[], Vec::from([t_is_opt]));
+    fx.impl_const(sp_inh, "YES", u16_);
+
+    let no_opt = fx.tr("NoOpt", 1, Vec::new(), &[]);
+    fx.trait_const(no_opt, "YES", u8_);
+    fx.use_trait(no_opt);
+    let sp_tr = fx.imp("impl<T> NoOpt for SyncP<T>", 1, sp_t, Some((no_opt, &[])), &[], Vec::new());
+    fx.impl_const(sp_tr, "YES", u8_);
+
+    let only = fx.strukt("OnlyInh", 1, &[]);
+    let only_t = fx.adt(only, &[p0]);
+    let only_inh = fx.imp("impl<T: IsOpt> OnlyInh<T>", 1, only_t, None, &[], Vec::from([t_is_opt]));
+    fx.impl_const(only_inh, "YES", u16_);
+
+    let sp_u8 = fx.adt(sp, &[u8_]);
+    let sp_u16 = fx.adt(sp, &[u16_]);
+    let only_u8 = fx.adt(only, &[u8_]);
+
+    let f_trait = fx.func("f_trait", 0, &[], u8_, Vec::new());
+    let f_trait_wrong_ret = fx.func("f_trait_wrong_ret", 0, &[], u16_, Vec::new());
+    let f_inh = fx.func("f_inh", 0, &[], u16_, Vec::new());
+    let f_only = fx.func("f_only", 0, &[], u16_, Vec::new());
+    fx.finish();
+
+    let run = |owner: ItemKey, adt_key: ItemKey, arg_u16: bool| -> Vec<&'static str> {
+        let mut b = Bb::new();
+        let arg = b.ty(crate::portable::PNode::Uint(if arg_u16 { crate::ids::UintTy::U16 } else { crate::ids::UintTy::U8 }));
+        let args = b.t.intern_list(&[arg]).expect("intern_list");
+        let self_ty = b.ty(crate::portable::PNode::Adt(adt_key, args));
+        let e = b.qpath(self_ty, &["YES"]);
+        let root = b.block(&[], Some(e));
+        check_body(&fx, &b, owner, root, Plant::None, InferPlant::None).diags.iter().map(|d| d.code.code()).collect()
+    };
+
+    assert!(run(f_trait, sp, false).is_empty(), "SyncP<u8>::YES should pick NoOpt::YES: u8");
+    assert_eq!(run(f_trait_wrong_ret, sp, false), ["E0308"], "twin: NoOpt::YES has type u8, not u16");
+    assert!(run(f_inh, sp, true).is_empty(), "CONTROL: SyncP<u16>::YES should pick inherent YES: u16");
+    assert_eq!(run(f_only, only, false), ["E0599"], "no trait in scope: unmet inherent impl yields E0599");
+}

@@ -485,3 +485,39 @@ fn an_or_pattern_fragment_is_one_pattern() {
     assert_eq!(child_nodes(&single, SyntaxKind::TUPLE_PAT), ["REF_PAT & A", "IDENT_PAT A"]);
     std::println!("extent: `&$p` of `A | B` is `&(A | B)`");
 }
+
+/// Chained tuple field indices (`x.0.0`, `x.3.2.is_some()`, `x.0. bar`) lex the `0.0`/`3.2`
+/// after `.` as a single `FLOAT_NUMBER` token and emit `Step::FloatSplit { ends_in_dot }`, which
+/// closes 1 (`ends_in_dot`) or 2 (`!ends_in_dot`) open `FIELD_EXPR` nodes in `parser::Output`.
+/// Both `Words::extent`/`Words::list` and builtin `assert!` must accept them cleanly.
+#[test]
+fn chained_tuple_field_indices_parse_in_extent_and_assert() {
+    for src in ["x.0.0", "x.3.2.is_some()", "x.0.0 == 1", "x.0. bar", "carried.iter().any(|b| b == &beside.0.0)"] {
+        let stream = tokens(src);
+        let words = Words::new(&stream, alloc());
+        let got = words.extent(Prefix::Expr, 0, alloc()).unwrap_or_else(|e| panic!("extent refused `{src}`: {e:?}"));
+        assert_eq!(got, stream.len(), "extent did not consume all of `{src}`");
+    }
+
+    let list_stream = tokens(r#"literal.3.2.is_some(), "missing""#);
+    let words = Words::new(&list_stream, alloc());
+    let list = words.list(Prefix::Expr, 0..list_stream.len(), alloc()).expect("list accepts chained tuple index");
+    let pieces: std::vec::Vec<_> = list.iter().map(|r| text(&list_stream, r.clone())).collect();
+    assert_eq!(pieces, ["literal . 3.2 . is_some ( )", "missing"]);
+
+    // End-to-end builtin `assert!` expansion with chained tuple field indices.
+    let assert_def = crate::MacroDefinition::builtin_fn(crate::BuiltinFn::Assert, def_at(1), alloc());
+    for args in [
+        r#"x.0.0 == 1, "msg""#,
+        r#"literal.3.2.is_some(), "msg""#,
+        r#"carried.iter().any(|bytes| bytes == &beside.0.0), "msg""#,
+    ] {
+        match call(&assert_def, &tokens(args)) {
+            Ok(crate::Expanded::Expansion(expansion)) => {
+                assert!(expansion.diagnostics.is_empty(), "assert!({args}) diagnostics: {:?}", expansion.diagnostics);
+            }
+            Ok(crate::Expanded::NeedsExpanded(nested)) => panic!("assert!({args}) unexpectedly needed {} nested calls", nested.len()),
+            Err(error) => panic!("assert!({args}) failed to expand: {error:?}"),
+        }
+    }
+}
