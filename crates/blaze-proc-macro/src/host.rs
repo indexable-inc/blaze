@@ -849,7 +849,11 @@ fn imports<W: HostWidth>(l: &mut Linker<Host>) -> wasmtime::Result<()> {
         })
     })?;
     refused_wasi::<W>(l)?;
-    refused_build_script::<W>(l)
+    refused_build_script::<W>(l)?;
+    if W::WASI_MODULE == WASI_64 {
+        refused_seed(l)?;
+    }
+    Ok(())
 }
 
 /// The WASI module a 32-bit proc macro imports from (`wasm32-wasip1`).
@@ -955,6 +959,87 @@ fn refused_build_script<W: HostWidth>(l: &mut Linker<Host>) -> wasmtime::Result<
     l.func_wrap(bs, "reply", |mut c: Caller<'_, Host>, _: W::Ptr| -> wasmtime::Result<()> {
         with(&mut c, |_, _| Err(Stop("proc macros may not spawn subprocesses".to_owned())))
     })?;
+    Ok(())
+}
+
+/// The `blaze_seed` filesystem-mutation calls a `wasm64-blaze-wasip1` proc macro may import
+/// through `library/wasi_rt` (e.g. `napi-derive` linking `remove_dir`), none of which the
+/// read-only proc-macro sandbox permits (rule 9): each is defined so the module loads, and a
+/// call answers `EPERM` without touching the host filesystem.
+pub(crate) const REFUSED_SEED: &[&str] = &[
+    "create_dir",
+    "fd_set_times",
+    "hard_link",
+    "pwrite",
+    "remove_dir",
+    "rename",
+    "set_len",
+    "set_times",
+    "symlink",
+    "sync",
+    "unlink",
+];
+
+/// The `blaze_seed` calls the proc-macro sandbox permits in kind but does not serve (`pread`:
+/// the sandbox's reads are `fd_read`, matching `fd_pread` in [`UNSERVED_WASI`]). A call answers
+/// `ENOTSUP`.
+pub(crate) const UNSERVED_SEED: &[&str] = &["pread"];
+
+/// The non-filesystem `blaze_seed` calls the proc-macro host serves safely inside the sandbox
+/// (`abi_version` answers [`blaze_wasi::seed::VERSION`]; `decommit` zeroes the guest's linear
+/// memory range).
+pub(crate) const SERVED_SEED: &[&str] = &["abi_version", "decommit"];
+
+/// Defines `blaze_seed` imports ([`SERVED_SEED`], [`REFUSED_SEED`], [`UNSERVED_SEED`]) with
+/// their 64-bit ABI signatures ([`blaze_wasi::seed`]) for `wasm64-blaze-wasip1` proc macros
+/// whose `library/wasi_rt` links filesystem helpers (e.g. `napi-derive`).
+///
+/// The proc-macro sandbox is strictly read-only (rule 9): every filesystem mutation answers
+/// `EPERM` without touching the host, `pread` answers `ENOTSUP` (matching `fd_pread`),
+/// `abi_version` answers [`blaze_wasi::seed::VERSION`], and `decommit` zeroes the guest's
+/// linear-memory range (trapping on out-of-bounds). Seed-only fiber calls (`fiber_*`) stay
+/// undefined so modules requiring them fail at instantiation.
+fn refused_seed(l: &mut Linker<Host>) -> wasmtime::Result<()> {
+    let seed = blaze_wasi::seed::MODULE;
+    let perm = i32::from(blaze_wasi::Errno::PERM.0);
+    let notsup = i32::from(blaze_wasi::Errno::NOTSUP.0);
+    // () -> i32
+    l.func_wrap(seed, "abi_version", || -> u32 { blaze_wasi::seed::VERSION })?;
+    // (ptr, len) -> ()
+    l.func_wrap(seed, "decommit", |mut c: Caller<'_, Host>, ptr: u64, len: u64| {
+        with(&mut c, |mem, _| {
+            let size = mem.len();
+            let range = ptr
+                .checked_add(len)
+                .and_then(|end| Some(usize::try_from(ptr).ok()?..usize::try_from(end).ok()?))
+                .and_then(|range| mem.get_mut(range));
+            let Some(slice) = range else {
+                return Err(Stop::from(blaze_wasi::Fault::OutsideMemory { ptr, len, size }));
+            };
+            slice.fill(0);
+            Ok(())
+        })
+    })?;
+    // (path, len) -> i32
+    for name in ["create_dir", "remove_dir", "unlink"] {
+        l.func_wrap(seed, name, move |_: u64, _: u64| -> i32 { perm })?;
+    }
+    // (from, from_len, to, to_len) -> i32
+    for name in ["rename", "hard_link", "symlink"] {
+        l.func_wrap(seed, name, move |_: u64, _: u64, _: u64, _: u64| -> i32 { perm })?;
+    }
+    // (path, len, follow, atime, mtime) -> i32
+    l.func_wrap(seed, "set_times", move |_: u64, _: u64, _: u32, _: u64, _: u64| -> i32 { perm })?;
+    // (fd, atime, mtime) -> i32
+    l.func_wrap(seed, "fd_set_times", move |_: u32, _: u64, _: u64| -> i32 { perm })?;
+    // (fd, len) -> i32
+    l.func_wrap(seed, "set_len", move |_: u32, _: u64| -> i32 { perm })?;
+    // (fd, data_only) -> i32
+    l.func_wrap(seed, "sync", move |_: u32, _: u32| -> i32 { perm })?;
+    // (fd, buf, len, offset, out) -> i32
+    for (name, errno) in [("pread", notsup), ("pwrite", perm)] {
+        l.func_wrap(seed, name, move |_: u32, _: u64, _: u64, _: u64, _: u64| -> i32 { errno })?;
+    }
     Ok(())
 }
 

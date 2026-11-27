@@ -821,6 +821,307 @@ fn a_module_importing_build_script_process_loads_and_refuses_spawn() {
     assert!(spawned.as_ref().is_err_and(|e| e.contains("spawn subprocesses")), "{spawned:?}");
 }
 
+/// Every non-fiber `blaze_seed` function in [`blaze_wasi::seed::FUNCTIONS`] is defined once for
+/// 64-bit proc macros (served, refused or unserved in `host.rs`), while seed-only fiber calls
+/// remain intentionally undefined.
+#[test]
+fn the_proc_macro_host_covers_all_of_blaze_seed_except_fibers() {
+    const SEED_FIBERS: [&str; 4] = ["fiber_drop", "fiber_new", "fiber_resume", "fiber_suspend"];
+    let mut covered: Vec<&str> = crate::host::SERVED_SEED
+        .iter()
+        .chain(crate::host::REFUSED_SEED)
+        .chain(crate::host::UNSERVED_SEED)
+        .chain(SEED_FIBERS.iter())
+        .copied()
+        .collect();
+    covered.sort_unstable();
+    let mut all: Vec<&str> = blaze_wasi::seed::FUNCTIONS.to_vec();
+    all.sort_unstable();
+    assert_eq!(covered, all);
+}
+
+/// A minimal `memory64` (`wasm64-blaze-wasip1`) proc-macro module with `blaze_proc_macro_64::output`
+/// (func 0) followed by `extra` imports `(module, field, type_index)` starting at func 1.
+///
+/// Types:
+/// - 0: `(i64, i64) -> ()` (`output`, `decommit`)
+/// - 1: `(i64, i32, i64, i64) -> i32` (`blaze_proc_macro_expand`)
+/// - 2: `() -> ()` (`_initialize`, `fiber_suspend`)
+/// - 3: `(i64) -> i64` (`blaze_proc_macro_alloc`)
+/// - 4: `() -> i32` (`abi_version`)
+/// - 5: `(i64, i64) -> i32` (`create_dir`, `remove_dir`, `unlink`)
+/// - 6: `(i64, i64, i64, i64) -> i32` (`rename`, `hard_link`, `symlink`)
+/// - 7: `(i64, i64, i32, i64, i64) -> i32` (`set_times`)
+/// - 8: `(i32, i64, i64) -> i32` (`fd_set_times`)
+/// - 9: `(i32, i64) -> i32` (`set_len`)
+/// - 10: `(i32, i32) -> i32` (`sync`)
+/// - 11: `(i32, i64, i64, i64, i64) -> i32` (`pread`, `pwrite`)
+fn wasm64_importing(body: &[u8], extra: &[(&str, &str, u8)]) -> blaze_own::AVec<'static, u8> {
+    const I32: u8 = 0x7f;
+    const I64: u8 = 0x7e;
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = blaze_own::AVec::new_in(alloc);
+    out.extend_from_slice(b"\0asm\x01\0\0\0");
+    let types: [(&[u8], &[u8]); 12] = [
+        (&[I64, I64], &[]),
+        (&[I64, I32, I64, I64], &[I32]),
+        (&[], &[]),
+        (&[I64], &[I64]),
+        (&[], &[I32]),
+        (&[I64, I64], &[I32]),
+        (&[I64, I64, I64, I64], &[I32]),
+        (&[I64, I64, I32, I64, I64], &[I32]),
+        (&[I32, I64, I64], &[I32]),
+        (&[I32, I64], &[I32]),
+        (&[I32, I32], &[I32]),
+        (&[I32, I64, I64, I64, I64], &[I32]),
+    ];
+    let mut s = blaze_own::AVec::new_in(alloc);
+    s.push(types.len() as u8);
+    for (params, results) in types {
+        s.push(0x60);
+        s.push(params.len() as u8);
+        s.extend_from_slice(params);
+        s.push(results.len() as u8);
+        s.extend_from_slice(results);
+    }
+    section(1, &s, &mut out);
+    let base = [("blaze_proc_macro_64", "output", 0u8)];
+    s.clear();
+    s.push((base.len() + extra.len()) as u8);
+    for (module, field, ty) in base.into_iter().chain(extra.iter().copied()) {
+        name(module, &mut s);
+        name(field, &mut s);
+        s.extend_from_slice(&[0x00, ty]);
+    }
+    section(2, &s, &mut out);
+    let own = (base.len() + extra.len()) as u8;
+    // `_initialize` (type 2), `blaze_proc_macro_alloc` (type 3), `blaze_proc_macro_expand` (type 1)
+    section(3, &[3, 2, 3, 1], &mut out);
+    // memory64: flags = 0x04, min = 1 page (64 KiB)
+    section(5, &[1, 0x04, 1], &mut out);
+    // Global 0: `decls` (immutable i64 = 0)
+    section(6, &[1, I64, 0, 0x42, 0, op::END], &mut out);
+    s.clear();
+    s.push(5);
+    for (field, kind, index) in [
+        ("memory", 2u8, 0u8),
+        ("decls", 3, 0),
+        ("_initialize", 0, own),
+        ("blaze_proc_macro_alloc", 0, own + 1),
+        ("blaze_proc_macro_expand", 0, own + 2),
+    ] {
+        name(field, &mut s);
+        s.extend_from_slice(&[kind, index]);
+    }
+    section(7, &s, &mut out);
+    let mut expand = blaze_own::AVec::new_in(alloc);
+    expand.extend_from_slice(body);
+    expand.extend(op::i64(16));
+    expand.extend(op::i64(2));
+    expand.extend(op::call(0)); // output(16, 2)
+    expand.extend(op::i32(0));
+    expand.push(op::END);
+    let mut alloc_fn = op::i64(1024);
+    alloc_fn.push(op::END);
+    let mut init_fn = blaze_own::AVec::new_in(alloc);
+    init_fn.push(op::END);
+    s.clear();
+    s.push(3);
+    for code in [init_fn.as_slice(), alloc_fn.as_slice(), expand.as_slice()] {
+        let mut f = blaze_own::AVec::new_in(alloc);
+        f.push(0);
+        f.extend_from_slice(code);
+        op::uleb(f.len() as u64, &mut s);
+        s.extend_from_slice(&f);
+    }
+    section(10, &s, &mut out);
+    // Data segments: empty stream at 16, paths at 64/96/160, non-zero scratch at 128.
+    let data: [(i64, &[u8]); 5] = [
+        (16, b"\x00\x01"),
+        (64, b"/package/keep-dir"),
+        (96, b"/package/keep-file"),
+        (128, b"DEADBEEF"),
+        (160, b"/package/new-dir"),
+    ];
+    s.clear();
+    s.push(data.len() as u8);
+    for (at, bytes) in data {
+        s.push(0);
+        s.extend(op::i64(at));
+        s.push(op::END);
+        op::uleb(bytes.len() as u64, &mut s);
+        s.extend_from_slice(bytes);
+    }
+    section(11, &s, &mut out);
+    out
+}
+
+/// Reduced from `napi-derive 3.6.13` (`wasm64-blaze-wasip1`, `unknown import:
+/// blaze_seed::remove_dir`): a 64-bit proc macro linking `library/wasi_rt` `blaze_seed` helpers
+/// loads and expands; every filesystem mutation returns `EPERM` without touching the host disk,
+/// `pread` returns `ENOTSUP`, `abi_version` returns [`blaze_wasi::seed::VERSION`], `decommit`
+/// zeroes guest memory (and traps out of bounds), and seed-only fibers remain unlinked.
+#[test]
+fn a_wasm64_module_importing_blaze_seed_loads_and_refuses_mutations() {
+    let runtime = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
+    let seed = blaze_wasi::seed::MODULE;
+    let extra = [
+        (seed, "abi_version", 4),   // func 1
+        (seed, "decommit", 0),      // func 2
+        (seed, "create_dir", 5),    // func 3
+        (seed, "remove_dir", 5),    // func 4
+        (seed, "unlink", 5),        // func 5
+        (seed, "rename", 6),        // func 6
+        (seed, "hard_link", 6),     // func 7
+        (seed, "symlink", 6),       // func 8
+        (seed, "set_times", 7),     // func 9
+        (seed, "fd_set_times", 8),  // func 10
+        (seed, "set_len", 9),       // func 11
+        (seed, "sync", 10),         // func 12
+        (seed, "pread", 11),        // func 13
+        (seed, "pwrite", 11),       // func 14
+    ];
+    let run_in = |name: &str, body: &[u8], imports: &[(&str, &str, u8)], pkg_dir: &Path| -> Result<(), String> {
+        let module = module_in(&folder(name), wasm64_importing(body, imports), 1);
+        let loaded = runtime.load(&module).map_err(|e| format!("load: {e}"))?;
+        let alloc = blaze_own::testing::heap().alloc();
+        let input = lex("struct A;", EDITION, alloc).expect("the input lexes");
+        let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok(CALL_FILE_SHOWN) };
+        runtime
+            .expand(&loaded, &module.macros[0], &call, EDITION, package(pkg_dir, &[]), Limits::STANDARD, alloc)
+            .map(drop)
+            .map_err(|e| format!("call: {e}"))
+    };
+    let assert_i32 = |body: &mut Vec<u8>, expected: i64| {
+        body.extend(op::i32(expected));
+        body.push(op::NE);
+        body.extend(op::IF);
+        body.push(op::UNREACHABLE);
+        body.push(op::END);
+    };
+
+    // 1. Linked, never called (the napi-derive instantiation failure).
+    assert_eq!(run_in("seed-linked", &[], &extra, &folder("seed-linked-pkg")), Ok(()));
+
+    // 2. Call every `blaze_seed` import and verify exact return values + `decommit` zeroing +
+    //    negative control on real files/directories in the package directory.
+    let pkg_dir = folder("seed-called-pkg");
+    let keep_dir = pkg_dir.join("keep-dir");
+    let keep_file = pkg_dir.join("keep-file");
+    let new_dir = pkg_dir.join("new-dir");
+    std::fs::create_dir(&keep_dir).expect("temp dir");
+    std::fs::write(&keep_file, b"untouched").expect("temp file");
+
+    let perm = i64::from(blaze_wasi::Errno::PERM.0);
+    let notsup = i64::from(blaze_wasi::Errno::NOTSUP.0);
+    let version = i64::from(blaze_wasi::seed::VERSION);
+    let mut body = Vec::new();
+    // abi_version() == VERSION
+    body.extend(op::call(1));
+    assert_i32(&mut body, version);
+    // Verify [128..136] is non-zero before decommit, then zero after decommit(128, 8).
+    body.extend(op::i64(128));
+    body.extend([0x29, 0x00, 0x00]); // i64.load align=0 offset=0
+    body.push(0x50); // i64.eqz
+    body.extend(op::IF);
+    body.push(op::UNREACHABLE);
+    body.push(op::END);
+    body.extend(op::i64(128));
+    body.extend(op::i64(8));
+    body.extend(op::call(2)); // decommit(128, 8)
+    body.extend(op::i64(128));
+    body.extend([0x29, 0x00, 0x00]); // i64.load align=0 offset=0
+    body.extend(op::i64(0));
+    body.push(0x52); // i64.ne
+    body.extend(op::IF);
+    body.push(op::UNREACHABLE);
+    body.push(op::END);
+    // create_dir("/package/new-dir") -> EPERM
+    body.extend(op::i64(160));
+    body.extend(op::i64(16));
+    body.extend(op::call(3));
+    assert_i32(&mut body, perm);
+    // remove_dir("/package/keep-dir") -> EPERM
+    body.extend(op::i64(64));
+    body.extend(op::i64(17));
+    body.extend(op::call(4));
+    assert_i32(&mut body, perm);
+    // unlink("/package/keep-file") -> EPERM
+    body.extend(op::i64(96));
+    body.extend(op::i64(18));
+    body.extend(op::call(5));
+    assert_i32(&mut body, perm);
+    // rename / hard_link / symlink -> EPERM
+    for idx in [6, 7, 8] {
+        body.extend(op::i64(96));
+        body.extend(op::i64(18));
+        body.extend(op::i64(160));
+        body.extend(op::i64(16));
+        body.extend(op::call(idx));
+        assert_i32(&mut body, perm);
+    }
+    // set_times -> EPERM
+    body.extend(op::i64(96));
+    body.extend(op::i64(18));
+    body.extend(op::i32(1));
+    body.extend(op::i64(0));
+    body.extend(op::i64(0));
+    body.extend(op::call(9));
+    assert_i32(&mut body, perm);
+    // fd_set_times -> EPERM
+    body.extend(op::i32(3));
+    body.extend(op::i64(0));
+    body.extend(op::i64(0));
+    body.extend(op::call(10));
+    assert_i32(&mut body, perm);
+    // set_len -> EPERM
+    body.extend(op::i32(3));
+    body.extend(op::i64(0));
+    body.extend(op::call(11));
+    assert_i32(&mut body, perm);
+    // sync -> EPERM
+    body.extend(op::i32(3));
+    body.extend(op::i32(0));
+    body.extend(op::call(12));
+    assert_i32(&mut body, perm);
+    // pread -> ENOTSUP, pwrite -> EPERM
+    for (idx, expected) in [(13, notsup), (14, perm)] {
+        body.extend(op::i32(3));
+        body.extend(op::i64(256));
+        body.extend(op::i64(8));
+        body.extend(op::i64(0));
+        body.extend(op::i64(512));
+        body.extend(op::call(idx));
+        assert_i32(&mut body, expected);
+    }
+    assert_eq!(run_in("seed-called", &body, &extra, &pkg_dir), Ok(()));
+    assert!(keep_dir.is_dir(), "remove_dir must never delete host directories");
+    assert_eq!(std::fs::read(&keep_file).expect("file still present"), b"untouched", "unlink must never delete host files");
+    assert!(!new_dir.exists(), "create_dir must never create host directories");
+
+    // 3. Twin (rule 23): expecting success (0) from `remove_dir` must trap.
+    let mut expect_ok = Vec::new();
+    expect_ok.extend(op::i64(64));
+    expect_ok.extend(op::i64(17));
+    expect_ok.extend(op::call(4));
+    assert_i32(&mut expect_ok, 0);
+    let twin = run_in("seed-twin", &expect_ok, &extra, &pkg_dir);
+    assert!(twin.as_ref().is_err_and(|e| e.starts_with("call: ")), "expecting 0 from remove_dir must trap: {twin:?}");
+
+    // 4. `decommit` out-of-bounds traps with OutsideMemory.
+    let mut oob = Vec::new();
+    oob.extend(op::i64(0x10000));
+    oob.extend(op::i64(16));
+    oob.extend(op::call(2));
+    let oob_res = run_in("seed-decommit-oob", &oob, &extra, &pkg_dir);
+    assert!(oob_res.as_ref().is_err_and(|e| e.contains("outside its memory")), "{oob_res:?}");
+
+    // 5. Control (rule 23): seed-only fibers remain unlinked and fail at load naming the import.
+    let fiber = run_in("seed-fiber-unknown", &[], &[(seed, "fiber_suspend", 2)], &pkg_dir);
+    assert!(fiber.as_ref().is_err_and(|e| e.starts_with("load: ") && e.contains("fiber_suspend")), "{fiber:?}");
+}
+
 /// A module that traps (`unreachable`) is a typed failure naming the crate and the macro, and,
 /// through the hook, a finding naming the call's base key.
 #[test]
