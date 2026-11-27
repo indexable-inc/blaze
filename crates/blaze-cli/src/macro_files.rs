@@ -201,6 +201,21 @@ pub(crate) fn files_hex(id: &ContentId) -> String {
 /// very bytes those ids are of; an absent folder row and an absent digest row when no folder is
 /// there. Walked with a work list of folders, by the rules `package_files` walks by.
 pub(crate) fn read_row(cx: &Cx, root: &Dir<ReadWrite>, stamps: &impl Stamps, dir: &str, rows: &mut Rows<'_>, frame: &Frame) -> Result<(), CliError> {
+    read_row_with_flags(cx, root, stamps, dir, 0, rows, frame)
+}
+
+/// Like [`read_row`], tagging every emitted `MacroFolder`, `MacroFile`, and `MacroFiles` row
+/// with `extra_flags` (e.g. [`crate::sweep::POST_GRAPH_MACRO`] for post-graph registry/git
+/// proc-macro path closures kept out of `units_source` and `layout_moved`).
+pub(crate) fn read_row_with_flags(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    stamps: &impl Stamps,
+    dir: &str,
+    extra_flags: u8,
+    rows: &mut Rows<'_>,
+    frame: &Frame,
+) -> Result<(), CliError> {
     let cx = cx.span("macro files: read a member proc-macro crate's files whole, each with its stamp");
     let mut files: std::vec::Vec<(String, std::vec::Vec<u8, Global>), Global> = std::vec::Vec::new_in(Global);
     let mut folders: std::vec::Vec<String, Global> = std::vec::Vec::new_in(Global);
@@ -215,14 +230,14 @@ pub(crate) fn read_row(cx: &Cx, root: &Dir<ReadWrite>, stamps: &impl Stamps, dir
         };
         let Some(listed) = listed else {
             if rel.is_empty() {
-                rows.push(LeafKind::MacroFolder, ABSENT, dir, None, ContentId([0; 32]));
-                rows.push(LeafKind::MacroFiles, ABSENT, dir, None, ContentId([0; 32]));
+                rows.push(LeafKind::MacroFolder, ABSENT | extra_flags, dir, None, ContentId([0; 32]));
+                rows.push(LeafKind::MacroFiles, ABSENT | extra_flags, dir, None, ContentId([0; 32]));
                 return Ok(());
             }
             return Err(CliError::MacroFiles(MacroFilesError::Gone { at }));
         };
         let (flags, id) = listing_id(Some(listed.entries()));
-        rows.push(LeafKind::MacroFolder, flags, &at, stamp.flatten(), id);
+        rows.push(LeafKind::MacroFolder, flags | extra_flags, &at, stamp.flatten(), id);
         for (name, is_dir) in listed.entries() {
             let entry = if rel.is_empty() { String::from(name) } else { std::format!("{rel}/{name}") };
             if is_dir {
@@ -233,7 +248,7 @@ pub(crate) fn read_row(cx: &Cx, root: &Dir<ReadWrite>, stamps: &impl Stamps, dir
             let Some((stamp, id)) = look(&cx, root, stamps, Plant::None, &path, None, &mut bytes)? else {
                 return Err(CliError::MacroFiles(MacroFilesError::Kind { at: path }));
             };
-            rows.push(LeafKind::MacroFile, 0, &path, stamp, id);
+            rows.push(LeafKind::MacroFile, extra_flags, &path, stamp, id);
             let mut held = std::vec::Vec::new_in(Global);
             held.extend_from_slice(bytes.as_slice());
             files.push((entry, held));
@@ -243,7 +258,7 @@ pub(crate) fn read_row(cx: &Cx, root: &Dir<ReadWrite>, stamps: &impl Stamps, dir
     let Some(digest) = digest_bytes(&hex) else {
         return Err(CliError::MacroFiles(MacroFilesError::Digest { dir: String::from(dir) }));
     };
-    rows.push(LeafKind::MacroFiles, 0, dir, None, ContentId(digest));
+    rows.push(LeafKind::MacroFiles, extra_flags, dir, None, ContentId(digest));
     Ok(())
 }
 
@@ -253,13 +268,20 @@ pub(crate) fn member_hex(rows: &Rows<'_>, dir: &str) -> Option<String> {
     rows.of(LeafKind::MacroFiles).find(|leaf| !leaf.absent() && rows.path(leaf) == dir).map(|leaf| files_hex(&leaf.id))
 }
 
-const MACRO_FILES_DIGEST_DOMAIN: &str = "blaze-cli macro files digest 1";
+const MACRO_FILES_DIGEST_DOMAIN: &str = "blaze-cli macro files digest 2";
 
 /// Copy a proven-unchanged `dir`'s `MacroFiles`, `MacroFile`, and `MacroFolder` rows from
-/// `from` (the sweep's standing `followed.now`) into `to` with zero filesystem I/O (rules 74 &
-/// 77). Returns `false` when `from` holds no present `MacroFiles` row for `dir`.
-pub(crate) fn copy_standing_rows(from: &Rows<'_>, dir: &str, to: &mut Rows<'_>, frame: &Frame) -> bool {
-    if !from.of(LeafKind::MacroFiles).any(|leaf| !leaf.absent() && from.path(leaf) == dir) {
+/// `followed` into `to` (tagged with [`crate::sweep::POST_GRAPH_MACRO`]) with zero filesystem
+/// I/O (rules 74 & 77). Returns `false` when `followed` holds no present, unchanged `MacroFiles`
+/// row for `dir` (so edited post-graph dirs are re-read fresh even under `Stood` graph read-back).
+pub(crate) fn copy_standing_rows(followed: &crate::sweep::Followed<'_>, dir: &str, to: &mut Rows<'_>, frame: &Frame) -> bool {
+    let from = &followed.now;
+    let stands = from
+        .rows
+        .iter()
+        .enumerate()
+        .any(|(i, leaf)| leaf.kind == LeafKind::MacroFiles && !leaf.absent() && !followed.changed(i) && from.path(leaf) == dir);
+    if !stands {
         return false;
     }
     let mut existing: blaze_own::BTreeSet<(LeafKind, &str), &Frame> = blaze_own::BTreeSet::new_in(frame);
@@ -277,7 +299,7 @@ pub(crate) fn copy_standing_rows(from: &Rows<'_>, dir: &str, to: &mut Rows<'_>, 
             _ => continue,
         }
         if existing.insert((leaf.kind, path)) {
-            pending.push((leaf.kind, leaf.flags, path, leaf.stamp, leaf.id));
+            pending.push((leaf.kind, leaf.flags | crate::sweep::POST_GRAPH_MACRO, path, leaf.stamp, leaf.id));
         }
     }
     for (kind, flags, path, stamp, id) in pending.iter().copied() {
@@ -286,13 +308,10 @@ pub(crate) fn copy_standing_rows(from: &Rows<'_>, dir: &str, to: &mut Rows<'_>, 
     true
 }
 
-/// Deterministic digest of all present `LeafKind::MacroFiles` rows in `rows`, sorted by path
-/// and deduplicated (rule 25): mixed into `Kind::MacroModule` task sources so editing a
-/// `[patch.*]` path dependency reached by a registry/git proc-macro invalidates the
-/// `MacroModule` task without polluting `units_source` with unrelated runtime patches (rules 21
-/// and 60).
-pub(crate) fn rows_digest(rows: &Rows<'_>, frame: &Frame) -> ContentId {
-    let mut entries: Vec<(&str, ContentId), &Frame> = Vec::new_in(frame);
+/// All present `LeafKind::MacroFiles` rows in `rows`, sorted and deduplicated by path, for
+/// O(log N) per-closure digests ([`closure_digest`]).
+pub(crate) fn present_macro_files<'r, 'f>(rows: &'r Rows<'_>, frame: &'f Frame) -> Vec<(&'r str, ContentId), &'f Frame> {
+    let mut entries: Vec<(&'r str, ContentId), &'f Frame> = Vec::new_in(frame);
     for leaf in rows.of(LeafKind::MacroFiles) {
         if !leaf.absent() {
             entries.push((rows.path(leaf), leaf.id));
@@ -300,9 +319,25 @@ pub(crate) fn rows_digest(rows: &Rows<'_>, frame: &Frame) -> ContentId {
     }
     entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
     entries.dedup_by(|a, b| a.0 == b.0);
+    entries
+}
+
+/// The closure files digest of a proc-macro crate with no checkout path dependencies.
+pub(crate) fn empty_closure_digest() -> ContentId {
+    blaze_ids::Hasher::new(MACRO_FILES_DIGEST_DOMAIN).finish()
+}
+
+/// Deterministic digest of the `LeafKind::MacroFiles` rows for `dirs` (sorted, deduplicated),
+/// scoped to a single proc-macro crate's `Cargo.lock` closure so editing a patched path
+/// dependency only invalidates proc-macros whose closure reaches it (rules 21, 25, 60).
+pub(crate) fn closure_digest(present: &[(&str, ContentId)], dirs: &[&str]) -> ContentId {
     let mut h = blaze_ids::Hasher::new(MACRO_FILES_DIGEST_DOMAIN);
-    for (path, id) in entries.iter() {
-        h.part(path.as_bytes()).update(&id.0);
+    for &dir in dirs.iter() {
+        if let Ok(at) = present.binary_search_by(|(path, _)| (*path).cmp(dir))
+            && let Some((_, id)) = present.get(at)
+        {
+            h.part(dir.as_bytes()).update(&id.0);
+        }
     }
     h.finish()
 }

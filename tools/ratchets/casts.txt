@@ -34,7 +34,7 @@ blaze-cast	40
 blaze-cc	17
 blaze-cert	14
 blaze-check	108
-blaze-cli	620
+blaze-cli	618
 blaze-cli-spec	9
 blaze-code	139
 blaze-columns	2

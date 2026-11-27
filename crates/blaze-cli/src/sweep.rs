@@ -496,7 +496,13 @@ pub const BOTH: u8 = 8;
 /// the checkout root to this path was verified not to be a symlink, so the journal's own reach
 /// (`Index::reaches`) suffices instead of re-reading every script file on unrelated edits.
 pub const DIRECT_PATH: u8 = 16;
-const FLAGS: u8 = MODULE | AT_MOD_RS | ABSENT | BOTH | DIRECT_PATH;
+/// Set on post-graph `MacroFiles` / `MacroFile` / `MacroFolder` rows emitted for `[patch.*]`
+/// path closures reached by registry/git proc-macro crates (units.rs `emit_proc_macro_lock_files`).
+/// Those rows are excluded from `units_source` and do not set `layout_moved`, so editing them
+/// preserves `Stood` graph read-back while still appearing in `Followed::changed` so the
+/// affected `MacroModule` task updates on the phase path.
+pub const POST_GRAPH_MACRO: u8 = 32;
+const FLAGS: u8 = MODULE | AT_MOD_RS | ABSENT | BOTH | DIRECT_PATH | POST_GRAPH_MACRO;
 
 /// One row: what was read (or probed) at a path, and how it was.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -512,6 +518,12 @@ pub struct Leaf {
 impl Leaf {
     pub fn absent(&self) -> bool {
         self.flags & ABSENT != 0
+    }
+
+    /// Whether this row is a post-graph `MacroFiles` / `MacroFile` / `MacroFolder` row excluded
+    /// from `units_source` and `layout_moved`.
+    pub fn post_graph_macro(&self) -> bool {
+        self.flags & POST_GRAPH_MACRO != 0
     }
 
     /// What a reader of the row sees: the flags that say where it was found, and the id.
@@ -587,8 +599,9 @@ impl<'f> Rows<'f> {
 /// What the layout read: equal sources, equal layouts.
 pub fn units_source<'r>(rows: impl Iterator<Item = (&'r str, &'r Leaf)>, frame: &Frame) -> ContentId {
     let mut sorted: Vec<(&str, &Leaf), &Frame> = Vec::new_in(frame);
-    // A build script's read is a cell its script reads, never the layout's source.
-    sorted.extend(rows.filter(|(_, leaf)| leaf.kind != LeafKind::Slot && !leaf.kind.by_script()));
+    // A build script's read is a cell its script reads, and a post-graph macro closure row is
+    // tracked per `MacroModule` task: neither enters the layout's source.
+    sorted.extend(rows.filter(|(_, leaf)| leaf.kind != LeafKind::Slot && !leaf.kind.by_script() && !leaf.post_graph_macro()));
     sorted.sort_unstable_by(|a, b| (a.1.kind, a.0).cmp(&(b.1.kind, b.0)));
     let mut h = blaze_ids::Hasher::new(UNITS_SOURCE_DOMAIN);
     for (path, leaf) in sorted.iter() {
@@ -1345,6 +1358,7 @@ impl<S: Stamps> Follow<S> {
                 LeafKind::Slot => slot_now(&cx, root, &self.stamps, self.plant, path, old.flags & MODULE != 0, Some(&old), &mut bytes, frame)?,
                 LeafKind::Manifest if old.absent() && self.plant == Plant::AbsentForgotten => (ABSENT, None, old.id),
                 LeafKind::Manifest | LeafKind::MacroFile => {
+                    let post_graph = old.flags & POST_GRAPH_MACRO;
                     let reuse = old.stamp.filter(|_| !old.absent()).map(|stamp| (stamp, old.id));
                     // Emptied first: after the look, bytes are there only when it read them.
                     bytes.truncate(0);
@@ -1353,9 +1367,9 @@ impl<S: Stamps> Follow<S> {
                             if old.kind == LeafKind::Manifest && !bytes.as_slice().is_empty() {
                                 now.lock_read(path, bytes.as_slice(), frame);
                             }
-                            (0, stamp, id)
+                            (post_graph, stamp, id)
                         }
-                        None => (ABSENT, None, ContentId([0; 32])),
+                        None => (ABSENT | post_graph, None, ContentId([0; 32])),
                     }
                 }
                 LeafKind::Listing if old.absent() && self.plant == Plant::AbsentForgotten => (ABSENT, None, old.id),
@@ -1377,9 +1391,11 @@ impl<S: Stamps> Follow<S> {
                 LeafKind::MacroFolder => {
                     // A crate's own folder is the one its `MacroFiles` row names: those rows
                     // come first in the table's (kind, path) order, so all are in `crates` here.
+                    let post_graph = old.flags & POST_GRAPH_MACRO;
                     let own = crates.iter().any(|&at| last.path(at) == path);
                     let place = if own { blaze_build_script::served::InPackage::Root } else { blaze_build_script::served::InPackage::Beneath };
-                    crate::macro_files::folder_now(&cx, root, &self.stamps, self.plant, path, place, Some(&old), frame)?
+                    let (flags, stamp, id) = crate::macro_files::folder_now(&cx, root, &self.stamps, self.plant, path, place, Some(&old), frame)?;
+                    (flags | post_graph, stamp, id)
                 }
                 LeafKind::ScriptFile if fact_file => (0, None, fact_files.read(path, erased.handle())?),
                 LeafKind::ScriptFile | LeafKind::ScriptListing | LeafKind::ScriptStat | LeafKind::ScriptGit => {
@@ -1423,20 +1439,25 @@ impl<S: Stamps> Follow<S> {
             };
             now.push(old.kind, flags, path, stamp, id);
             was.push(old_state);
-            if old.kind != LeafKind::Slot && !old.kind.by_script() && now.rows[i].state() != old_state {
+            if old.kind != LeafKind::Slot && !old.kind.by_script() && !old.post_graph_macro() && now.rows[i].state() != old_state {
                 layout_moved = true;
             }
         }
         // A member macro crate's digest stands, no file of it read, while every row of its files
         // and folders does; else the layout reads the crate whole once (macro_files.rs
         // `read_row`: the digest and the files' ids from one read), and the row reads as moved
-        // (zeros) until then.
+        // (zeros) until then. Post-graph macro closure rows (`POST_GRAPH_MACRO`) are excluded
+        // from `units_source` and therefore do not set `layout_moved` so `Stood` graph read-back
+        // still succeeds and only the affected `MacroModule` task updates.
         for &i in crates.iter() {
             let stands = crate::macro_files::proven(&now, &was, now.path(&now.rows[i]));
             if !stands {
-                now.rows[i].flags = 0;
+                let post_graph = now.rows[i].flags & POST_GRAPH_MACRO;
+                now.rows[i].flags = post_graph;
                 now.rows[i].id = ContentId([0; 32]);
-                layout_moved = true;
+                if post_graph == 0 {
+                    layout_moved = true;
+                }
             }
         }
         Ok((Followed { now, was, layout_moved, looks: looked.counts }, statted))
