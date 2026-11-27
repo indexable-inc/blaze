@@ -1339,6 +1339,7 @@ fn format_vec_alu<W: fmt::Write>(
             out.write_str(", ")?;
             write_vec_reg(func, rn, "2d", out)
         }
+        VecAluOp::Addp => format_vec_bin(func, "addp", dst, rn, rm, arr, out),
         VecAluOp::FaddpScalar => {
             let double = elem_size == 3;
             out.write_str("faddp ")?;
@@ -1368,6 +1369,14 @@ fn format_vec_alu<W: fmt::Write>(
             out.write_str(", ")?;
             write_opt_vec_reg(func, rm, "16b", out)?;
             write!(out, ", #{imm4}")
+        }
+        VecAluOp::Tbl1 => {
+            out.write_str("tbl ")?;
+            write_vec_reg(func, dst, "16b", out)?;
+            out.write_str(", {")?;
+            write_vec_reg(func, rn, "16b", out)?;
+            out.write_str("}, ")?;
+            write_opt_vec_reg(func, rm, "16b", out)
         }
     }
 }

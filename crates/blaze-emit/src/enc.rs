@@ -1516,6 +1516,11 @@ pub(crate) const fn addp_d(rd: Reg, rn: Reg) -> u32 {
     0x5ef1_b800 | (rn << 5) | rd
 }
 
+/// `addp vd.T, vn.T, vm.T` (C7.2 ADDP vector: pairwise integer sum, `Q=1`, `size = 0:16B, 1:8H, 2:4S, 3:2D`).
+pub(crate) const fn addp_v(size: u32, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x4e20_bc00 | (size << 22) | (rm << 16) | (rn << 5) | rd
+}
+
 /// `faddp sd/dd, vn.2s/2d` (C7.2 FADDP scalar pairwise FP sum).
 pub(crate) const fn faddp_scalar(double: bool, rd: Reg, rn: Reg) -> u32 {
     0x7e30_d800 | (bit(double) << 22) | (rn << 5) | rd
