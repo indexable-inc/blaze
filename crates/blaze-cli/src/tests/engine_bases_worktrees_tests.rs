@@ -319,3 +319,285 @@ fn stale_older_tools_answer_in_worktree_falls_back_to_current_binary_base_and_co
     let control = run_case(BasePlant::NoStaleFallback);
     assert!(control.entered(blaze_engine::Stage::Bodies) > 0, "control must re-enter bodies under older-tools own answer:\n{}", control.profile);
 }
+
+/// Regression test for Bug 2 (`CrateScope` `MissingEntry { table: WorldCrates }` after starting
+/// from `tool-base` and hitting a layout/toolchain cell update):
+/// 1. `keep_toolchain_base` must populate `by_file` / `root.files` for every non-inline toolchain
+///    row so `Edit.files` retires any stale toolchain `CrateScope` not in today's `Names` world.
+/// 2. A post-fix `tool-base` carrying an extra `CrateScope` row reading a cell defined by `core`
+///    cleanly retires that row via `Edit.files` when repo B runs with a moved `Names` tool (so
+///    `core` re-runs and updates its cells), never waking it into `MissingEntry { WorldCrates }`.
+/// 3. A pre-fix legacy `tool-base` with empty `root.files` (`PagesPlant::FilesDropped`) is
+///    rejected by `open_toolchain_base` and automatically rewritten with populated `root.files` on
+///    the next check.
+#[test]
+fn toolchain_base_populates_by_file_and_retires_stale_cratescopes_on_layout_change() {
+    use blaze_drive::{Kind, Name};
+    use blaze_engine::{Cause, CellId, Phase, Row, Stage};
+    use crate::store::Store as _;
+
+    BASE_PLANT.set(BasePlant::None);
+    let io = Io::simulated(SimWorld::new(59, Limits::USUAL));
+    let shelf = lang_shelf(&io);
+    repository_a(&io, A1);
+    repository_b(&io, B);
+
+    let check_with = |checkout: Checkout| {
+        let opts = || {
+            let mut opts = engine_check_tests::opts(&io, 2, false);
+            opts.place.checkout = checkout.dir;
+            opts.toolchain = shelf;
+            opts
+        };
+        check_in::<fix::Atomic>(&io, checkout, &opts, View::Person, None)
+    };
+
+    // 1. Cold check of A1 populates `tool-base`. Verify EVERY non-inline row in `tool-base` is
+    //    owned by its `row.file` in both `decoded.answer.by_file` and `root.files`.
+    let a1 = check_with(A1);
+    assert_eq!(a1.errors, 0, "A1 cold check clean:\n{}", a1.profile);
+
+    let ghost_scope = Name::new(Kind::CrateScope, blaze_ids::ContentId::of("bug2 ghost cratescope", b"stale-edition-crate"));
+    let mut core_cell: Option<(CellId, blaze_ids::ContentId)> = None;
+    let orig_decoded_rows: usize;
+
+    {
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+        let frame = Frame::with_reserve(16 << 20, bstd::mem::Tag::Other).expect("frame");
+        let alloc = blaze_own::Erased::new(&frame);
+        let opts = engine_check_tests::opts(&io, 2, false);
+        let fs = io.need_fs().expect("files");
+        let root = fs.open_dir(&cx, &Path::new(A1.dir).expect("a path")).expect("open");
+        let err = io.need_err().expect("err");
+        let clock = io.need_clock().expect("clock");
+        let host = io.need_host().expect("host");
+        let mut rng = io.need_rng().expect("rng");
+        let opened = crate::store::open_for_command(&cx, &fs, &host, &mut rng, opts.place.home, None, &root, A1.dir, &clock, &err, opts.heap).expect("open store");
+        let mut store = crate::store::CommandStore::new(&cx, &opened.lent, false, opened.open_ns, None, clock.clone(), &err, alloc.handle()).expect("store");
+        let ptr = crate::engine_answer::load_toolchain_base(&cx, &mut store, shelf, &opts.tools, &frame)
+            .expect("load tool-base")
+            .expect("tool-base exists")
+            .expect("tool-base readable");
+        let dir = crate::engine_answer::open_root(&cx, &mut store, ptr.root, opts.heap.shared())
+            .expect("open root")
+            .expect("valid root");
+        assert!(!dir.files.is_empty(), "tool-base root.files must be populated so stale rows can be retired");
+
+        let mut decoded = blaze_engine::pages::decode(
+            ptr.root,
+            |k| match store.get(&cx, k) {
+                Ok(Some(held)) => Some(Ok(blaze_engine::pages::Sealed::by_store(k, held.bytes, held.proof))),
+                _ => None,
+            },
+            opts.heap.shared(),
+        )
+        .expect("decode tool-base");
+        orig_decoded_rows = decoded.answer.rows.len();
+        assert!(orig_decoded_rows > 0, "tool-base holds toolchain rows");
+        for (&name, row) in decoded.answer.rows.iter() {
+            if !row.inline {
+                assert!(
+                    decoded.answer.by_file.get(&row.file).is_some_and(|members| members.binary_search(&name).is_ok()),
+                    "tool-base row {name:?} must be listed under its file {:?} in by_file",
+                    row.file
+                );
+                assert!(
+                    dir.files.contains_key(&row.file),
+                    "tool-base root.files must contain {:?} for row {name:?}",
+                    row.file
+                );
+            }
+            if name.kind == Kind::CrateScope && core_cell.is_none() {
+                if let Some(&(cell, digest)) = row.defines.first() {
+                    core_cell = Some((CellId { of: name, cell }, digest));
+                }
+            }
+        }
+        let (cell_id, _cell_digest) = core_cell.expect("at least one toolchain CrateScope defines a cell");
+
+        // 2. Mutate `cell_id.of`'s stored key & cell digest in `tool-base` so repo B MUST re-enter
+        //    `cell_id.of` in `Stage::Names` and fire `Engine::move_cell(cell_id)` -> `readers_of`,
+        //    and inject a stale extra toolchain `CrateScope` (`ghost_scope`) reading `cell_id` AND
+        //    properly listed in `by_file[ghost_scope] = [ghost_scope]`.
+        let stale_digest = blaze_ids::ContentId([0xDD; 32]);
+        if let Some(definer) = decoded.answer.rows.get_mut(&cell_id.of) {
+            definer.key = blaze_drive::Key(blaze_ids::ContentId([0xCC; 32]));
+            if let Some(slot) = definer.defines.iter_mut().find(|(c, _)| *c == cell_id.cell) {
+                slot.1 = stale_digest;
+            }
+        }
+        if let Some(&(_, serial)) = decoded.answer.cells.get(&cell_id) {
+            decoded.answer.cells.insert(cell_id, (stale_digest, serial));
+        }
+        let ghost_payload = blaze_drive::key::content_key(b"ghost-cratescope-payload");
+        store.put(&cx, ghost_payload, b"ghost-cratescope-payload").expect("put ghost payload");
+        let ghost_src = blaze_ids::ContentId::of("ghost src", b"v1");
+        let mut reads = blaze_own::Vec::new_in(opts.heap.shared());
+        reads.push((cell_id, stale_digest));
+        let mut by_cell = blaze_own::Vec::new_in(opts.heap.shared());
+        by_cell.push(0);
+        decoded.answer.rows.insert(ghost_scope, Row {
+            key: opts.tools.key(ghost_scope, &ghost_src),
+            phase: Phase::new(Stage::Names, 1),
+            file: ghost_scope,
+            source: ghost_src,
+            out: ghost_payload.0,
+            serial: decoded.answer.serial,
+            defines: blaze_own::Vec::new_in(opts.heap.shared()),
+            reads,
+            by_cell,
+            findings: 0,
+            inline: false,
+            failed: false,
+        });
+        decoded.answer.by_file.entry(ghost_scope).or_insert_with(|| blaze_own::Vec::new_in(opts.heap.shared())).push(ghost_scope);
+        decoded.answer.readers = blaze_engine::engine::Readers::from_rows(&decoded.answer.rows, opts.heap.shared());
+        decoded.records.insert(ghost_scope, ghost_payload);
+        decoded.causes.insert(ghost_scope, (decoded.answer.serial, Cause::New));
+
+        // Rewrite `tool-base` with `ghost_scope` present and properly owned in `root.files`.
+        let encoded = blaze_engine::pages::encode(&decoded, None, opts.heap.shared());
+        for (k, b) in encoded.puts.iter() {
+            store.put(&cx, *k, b).expect("put updated tool-base page");
+        }
+        let mut page_idx = blaze_own::Vec::new_in(opts.heap.shared());
+        for (page, page_rows) in encoded.page_records() {
+            let mut keys = blaze_own::Vec::new_in(opts.heap.shared());
+            keys.push(blaze_cas::Key(page.0));
+            for &(_, rec) in page_rows {
+                keys.push(blaze_cas::Key(rec.0));
+            }
+            keys.sort_unstable();
+            keys.dedup();
+            let beside = opened.lent.index_beside(blaze_cas::Key(page.0), &keys).expect("index beside");
+            page_idx.push(beside);
+        }
+        page_idx.sort_unstable();
+        let (empty_lines_key, empty_lines_bytes) = crate::engine_lines::Lines::new_in(opts.heap.shared()).record();
+        store.put(&cx, empty_lines_key, &empty_lines_bytes).expect("put empty lines");
+        let empty_rows = crate::sweep::Rows::new_in(&frame);
+        let leaves = crate::sweep::Leaves::bytes_in(&empty_rows, &frame).expect("leaves");
+        let mut pointer = blaze_own::Vec::new_in(&frame);
+        pointer.extend_from_slice(crate::engine_answer::POINTER_MAGIC);
+        pointer.extend_from_slice(&encoded.root.0.0);
+        pointer.extend_from_slice(&empty_lines_key.0.0);
+        pointer.extend_from_slice(&encoded.files.to_le_bytes());
+        pointer.push(1); // names=true, bodies_whole=false, replayable=false
+        pointer.extend_from_slice(&encoded.findings.to_le_bytes());
+        pointer.extend_from_slice(&encoded.owed.to_le_bytes());
+        pointer.extend_from_slice(&crate::engine_answer::tools_digest(&opts.tools).0);
+        pointer.push(1); // HEADERS_ABSENT
+        pointer.extend_from_slice(&decoded.answer.serial.0.to_le_bytes());
+        pointer.extend_from_slice(&[0u8; 32 * blaze_engine::pages::HeaderPages::COUNT]);
+        crate::journal_sweep::Stored::encode_units(core::iter::empty(), None, &mut pointer);
+        let sealed = crate::seal::seal(&pointer, &leaves, &frame).expect("seal");
+        let ptr_key = blaze_drive::Key(blaze_ids::ContentId::of("blaze-cli engine-check pointer", &sealed));
+        store.put(&cx, ptr_key, &sealed).expect("put ptr");
+        let mut direct = blaze_own::Vec::new_in(opts.heap.shared());
+        direct.push(blaze_cas::Key(encoded.root.0));
+        direct.extend(encoded.tree_keys().iter().map(|k| blaze_cas::Key(k.0)));
+        direct.push(blaze_cas::Key(empty_lines_key.0));
+        let ans_idx = opened.lent.index(&direct).expect("answer index");
+        let tc_root = crate::engine_answer::toolchain_base_root(shelf, &opts.tools, &frame);
+        let reach_name = bstd::mem::format_in!(&frame, "{}.{}", tc_root.as_str(), crate::engine_answer::REACH_ROOT);
+        let answer_name = bstd::mem::format_in!(&frame, "{}.{}", tc_root.as_str(), crate::engine_answer::ANSWER_ROOT);
+        let life = crate::store::roots::TOOLCHAIN_LIFE_NS;
+        opened.lent.root_through(reach_name.as_str(), &page_idx, life).expect("pin reach");
+        opened.lent.root_through(answer_name.as_str(), &[ans_idx], life).expect("pin answer");
+        opened.lent.root_for(tc_root.as_str(), &[blaze_cas::Key(ptr_key.0)], life).expect("pin tc_root");
+        opened.lent.commit().expect("commit updated tool-base");
+    }
+
+    // Repo B starts from that `tool-base`, re-enters `cell_id.of` (moving `cell_id`), AND
+    // `Edit.files` retires `ghost_scope` cleanly — Stage::Names MUST NOT wake `ghost_scope` into
+    // `MissingEntry { table: WorldCrates }`!
+    let b = check_with(B);
+    assert!(b.engine().from_last, "B starts from post-fix tool-base:\n{}", b.profile);
+    assert!(b.entered(Stage::Names) >= 3, "B re-entered the mutated toolchain crate + its own 2 units:\n{}", b.profile);
+    assert_eq!(b.errors, 0, "B cleanly retired ghost_scope without MissingEntry:\n{}", b.profile);
+
+    // 3. Now simulate a pre-fix legacy `tool-base` with empty `root.files` (`PagesPlant::FilesDropped`):
+    //    `open_toolchain_base` must reject it (`Ok(None)`) rather than leaking unowned ghost rows!
+    {
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+        let frame = Frame::with_reserve(16 << 20, bstd::mem::Tag::Other).expect("frame");
+        let alloc = blaze_own::Erased::new(&frame);
+        let opts = engine_check_tests::opts(&io, 2, false);
+        let fs = io.need_fs().expect("files");
+        let root = fs.open_dir(&cx, &Path::new(A1.dir).expect("a path")).expect("open");
+        let err = io.need_err().expect("err");
+        let clock = io.need_clock().expect("clock");
+        let host = io.need_host().expect("host");
+        let mut rng = io.need_rng().expect("rng");
+        let opened = crate::store::open_for_command(&cx, &fs, &host, &mut rng, opts.place.home, None, &root, A1.dir, &clock, &err, opts.heap).expect("open store");
+        let mut store = crate::store::CommandStore::new(&cx, &opened.lent, false, opened.open_ns, None, clock.clone(), &err, alloc.handle()).expect("store");
+        let ptr = crate::engine_answer::load_toolchain_base(&cx, &mut store, shelf, &opts.tools, &frame)
+            .expect("load tool-base")
+            .expect("tool-base exists")
+            .expect("tool-base readable");
+        let decoded = blaze_engine::pages::decode(
+            ptr.root,
+            |k| match store.get(&cx, k) {
+                Ok(Some(held)) => Some(Ok(blaze_engine::pages::Sealed::by_store(k, held.bytes, held.proof))),
+                _ => None,
+            },
+            opts.heap.shared(),
+        )
+        .expect("decode");
+        // Encode with `PagesPlant::FilesDropped` to produce a pre-fix `tool-base` with empty `root.files`.
+        let encoded = blaze_engine::pages::encode_planted(&decoded, None, blaze_engine::pages::PagesPlant::FilesDropped, opts.heap.shared());
+        for (k, b) in encoded.puts.iter() {
+            store.put(&cx, *k, b).expect("put legacy page");
+        }
+        let mut page_idx = blaze_own::Vec::new_in(opts.heap.shared());
+        for (page, page_rows) in encoded.page_records() {
+            let mut keys = blaze_own::Vec::new_in(opts.heap.shared());
+            keys.push(blaze_cas::Key(page.0));
+            for &(_, rec) in page_rows {
+                keys.push(blaze_cas::Key(rec.0));
+            }
+            keys.sort_unstable();
+            keys.dedup();
+            page_idx.push(opened.lent.index_beside(blaze_cas::Key(page.0), &keys).expect("beside"));
+        }
+        page_idx.sort_unstable();
+        let (empty_lines_key, empty_lines_bytes) = crate::engine_lines::Lines::new_in(opts.heap.shared()).record();
+        store.put(&cx, empty_lines_key, &empty_lines_bytes).expect("put lines");
+        let empty_rows = crate::sweep::Rows::new_in(&frame);
+        let leaves = crate::sweep::Leaves::bytes_in(&empty_rows, &frame).expect("leaves");
+        let mut pointer = blaze_own::Vec::new_in(&frame);
+        pointer.extend_from_slice(crate::engine_answer::POINTER_MAGIC);
+        pointer.extend_from_slice(&encoded.root.0.0);
+        pointer.extend_from_slice(&empty_lines_key.0.0);
+        pointer.extend_from_slice(&encoded.files.to_le_bytes());
+        pointer.push(1);
+        pointer.extend_from_slice(&encoded.findings.to_le_bytes());
+        pointer.extend_from_slice(&encoded.owed.to_le_bytes());
+        pointer.extend_from_slice(&crate::engine_answer::tools_digest(&opts.tools).0);
+        pointer.push(1);
+        pointer.extend_from_slice(&decoded.answer.serial.0.to_le_bytes());
+        pointer.extend_from_slice(&[0u8; 32 * blaze_engine::pages::HeaderPages::COUNT]);
+        crate::journal_sweep::Stored::encode_units(core::iter::empty(), None, &mut pointer);
+        let sealed = crate::seal::seal(&pointer, &leaves, &frame).expect("seal");
+        let ptr_key = blaze_drive::Key(blaze_ids::ContentId::of("blaze-cli engine-check pointer", &sealed));
+        store.put(&cx, ptr_key, &sealed).expect("put ptr");
+        let mut direct = blaze_own::Vec::new_in(opts.heap.shared());
+        direct.push(blaze_cas::Key(encoded.root.0));
+        direct.extend(encoded.tree_keys().iter().map(|k| blaze_cas::Key(k.0)));
+        direct.push(blaze_cas::Key(empty_lines_key.0));
+        let ans_idx = opened.lent.index(&direct).expect("answer index");
+        let tc_root = crate::engine_answer::toolchain_base_root(shelf, &opts.tools, &frame);
+        let reach_name = bstd::mem::format_in!(&frame, "{}.{}", tc_root.as_str(), crate::engine_answer::REACH_ROOT);
+        let answer_name = bstd::mem::format_in!(&frame, "{}.{}", tc_root.as_str(), crate::engine_answer::ANSWER_ROOT);
+        let life = crate::store::roots::TOOLCHAIN_LIFE_NS;
+        opened.lent.root_through(reach_name.as_str(), &page_idx, life).expect("pin reach");
+        opened.lent.root_through(answer_name.as_str(), &[ans_idx], life).expect("pin answer");
+        opened.lent.root_for(tc_root.as_str(), &[blaze_cas::Key(ptr_key.0)], life).expect("pin tc_root");
+        opened.lent.commit().expect("commit legacy tool-base");
+
+        // `open_toolchain_base` must reject the legacy empty-files `tool-base`!
+        let opened_tc = crate::engine_answer::open_toolchain_base(&cx, &mut store, &opened.lent, shelf, &opts.tools, opts.heap.shared(), &frame)
+            .expect("open_toolchain_base");
+        assert!(opened_tc.is_none(), "pre-fix tool-base with empty root.files must be rejected");
+    }
+}

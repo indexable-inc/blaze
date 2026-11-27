@@ -1121,6 +1121,14 @@ where
 {
     let answer = &kept.answer;
     let files_kept = plant != PagesPlant::FilesDropped;
+    debug_assert!(
+        !files_kept
+            || answer.rows.iter().all(|(name, row)| {
+                row.inline
+                    || answer.by_file.get(&row.file).is_some_and(|members| members.binary_search(name).is_ok())
+            }),
+        "every non-inline row in Answer.rows must be listed under its `row.file` in Answer.by_file (otherwise Edit.files cannot retire stale rows)"
+    );
     let has_row = |name: &Name| answer.rows.contains_key(name);
     let bits = match forced_bits {
         Some(bits) => bits.clamp(1, blaze_drive::answers::MOST_BITS),

@@ -2679,19 +2679,18 @@ pub fn allocate_mfunc<'a>(
         }
     }
 
-    // Build per-block `use` and `def` bitsets for `VReg`s and `u64` masks for `PReg`s.
-    let words_per_block = n_vregs.div_ceil(64);
-    let total_words = n_blocks.saturating_mul(words_per_block);
-    let mut v_use: Vec<u64, Alloc<'a>> = Vec::with_capacity_in(total_words, alloc);
-    let mut v_def: Vec<u64, Alloc<'a>> = Vec::with_capacity_in(total_words, alloc);
-    let mut v_live_in: Vec<u64, Alloc<'a>> = Vec::with_capacity_in(total_words, alloc);
-    let mut v_live_out: Vec<u64, Alloc<'a>> = Vec::with_capacity_in(total_words, alloc);
-    for _ in 0..total_words {
-        v_use.push(0);
-        v_def.push(0);
-        v_live_in.push(0);
-        v_live_out.push(0);
+    // Prune liveness to upward-exposed (cross-block) `VReg`s and compute per-block `PReg` use/def
+    // masks in one pass. A `VReg` never upward-exposed in any block is strictly block-local and
+    // can never appear in `live_in` or `live_out` of any block (cutting dense liveness bitsets by
+    // 100x-1000x on mega-functions).
+    let mut def_stamp: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(n_vregs, alloc);
+    let mut vreg_to_global: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(n_vregs, alloc);
+    for _ in 0..n_vregs {
+        def_stamp.push(0);
+        vreg_to_global.push(NONE_U32);
     }
+    let mut global_to_vreg: Vec<u32, Alloc<'a>> = Vec::new_in(alloc);
+    let mut upward_uses: Vec<(u32, u32), Alloc<'a>> = Vec::new_in(alloc);
 
     let mut p_use: Vec<u64, Alloc<'a>> = Vec::with_capacity_in(n_blocks, alloc);
     let mut p_def: Vec<u64, Alloc<'a>> = Vec::with_capacity_in(n_blocks, alloc);
@@ -2704,9 +2703,10 @@ pub fn allocate_mfunc<'a>(
         p_live_out.push(0);
     }
 
-    for &blk in func.block_order.iter() {
+    for (ord_idx, &blk) in func.block_order.iter().enumerate() {
         let b = to_idx(blk.0);
-        let base = b * words_per_block;
+        let b_u32 = blk.0;
+        let stamp = u32_of(ord_idx.saturating_add(1)).ok_or(MRaError::FunctionTooLarge)?;
         let (ls, le) = slice_at(&block_lin_range, b, (0, 0));
         let mut pu_acc: u64 = 0;
         let mut pd_acc: u64 = 0;
@@ -2718,10 +2718,22 @@ pub fn allocate_mfunc<'a>(
             };
             let fl = slice_at(&func.flags, orig, MInstFlags::NONE);
             visit_op_uses(op, &func.copy_pairs, |r| {
-                if let MReg::V(v) = r
-                    && !bitset_test(&v_def, base, v.0)
-                {
-                    bitset_set(&mut v_use, base, v.0);
+                if let MReg::V(v) = r {
+                    let vi = to_idx(v.0);
+                    if vi < n_vregs && slice_at(&def_stamp, vi, 0) != stamp {
+                        let g = match slice_at(&vreg_to_global, vi, NONE_U32) {
+                            NONE_U32 => {
+                                let ng = u32_of(global_to_vreg.len()).unwrap_or(NONE_U32);
+                                slice_set(&mut vreg_to_global, vi, ng);
+                                global_to_vreg.push(v.0);
+                                ng
+                            }
+                            existing => existing,
+                        };
+                        if g != NONE_U32 {
+                            upward_uses.push((b_u32, g));
+                        }
+                    }
                 }
             });
             let (op_pu, mut op_pd) = explicit_phys_masks(op, &func.copy_pairs);
@@ -2734,7 +2746,7 @@ pub fn allocate_mfunc<'a>(
             pd_acc |= op_pd;
             visit_op_defs(op, &func.copy_pairs, |r| {
                 if let MReg::V(v) = r {
-                    bitset_set(&mut v_def, base, v.0);
+                    slice_set(&mut def_stamp, to_idx(v.0), stamp);
                 }
             });
         }
@@ -2742,52 +2754,119 @@ pub fn allocate_mfunc<'a>(
         slice_set(&mut p_def, b, pd_acc);
     }
 
-    // Bounded backward liveness fixed point (`<= 32` iterations, reverse `block_order`).
-    let mut live_converged = false;
-    for _ in 0..MAX_DATAFLOW_ITERS {
-        let mut changed = false;
-        for &blk in func.block_order.iter().rev() {
+    let n_global_vregs = global_to_vreg.len();
+    let words_per_block = n_global_vregs.div_ceil(64);
+    let total_words = n_blocks.saturating_mul(words_per_block);
+    let mut v_use: Vec<u64, Alloc<'a>> = Vec::with_capacity_in(total_words, alloc);
+    let mut v_def: Vec<u64, Alloc<'a>> = Vec::with_capacity_in(total_words, alloc);
+    let mut v_live_in: Vec<u64, Alloc<'a>> = Vec::with_capacity_in(total_words, alloc);
+    let mut v_live_out: Vec<u64, Alloc<'a>> = Vec::with_capacity_in(total_words, alloc);
+    for _ in 0..total_words {
+        v_use.push(0);
+        v_def.push(0);
+        v_live_in.push(0);
+        v_live_out.push(0);
+    }
+    if words_per_block > 0 {
+        for &(b_u32, g) in upward_uses.iter() {
+            bitset_set(&mut v_use, to_idx(b_u32) * words_per_block, g);
+        }
+        for &blk in func.block_order.iter() {
             let b = to_idx(blk.0);
             let base = b * words_per_block;
-            let succs = func.block_succs(blk);
-
-            // Physical register liveness (`u64`).
-            let mut new_po: u64 = 0;
-            for &succ in succs {
-                new_po |= slice_at(&p_live_in, to_idx(succ.0), 0);
+            let (ls, le) = slice_at(&block_lin_range, b, (0, 0));
+            for p in to_idx(ls)..to_idx(le) {
+                let orig = to_idx(slice_at(&lin_to_orig, p, 0));
+                let Some(op) = func.ops.get(orig) else {
+                    continue;
+                };
+                visit_op_defs(op, &func.copy_pairs, |r| {
+                    if let MReg::V(v) = r {
+                        let g = slice_at(&vreg_to_global, to_idx(v.0), NONE_U32);
+                        if g != NONE_U32 {
+                            bitset_set(&mut v_def, base, g);
+                        }
+                    }
+                });
             }
-            let new_pi = slice_at(&p_use, b, 0) | (new_po & !slice_at(&p_def, b, 0));
-            if new_po != slice_at(&p_live_out, b, 0) || new_pi != slice_at(&p_live_in, b, 0) {
-                slice_set(&mut p_live_out, b, new_po);
-                slice_set(&mut p_live_in, b, new_pi);
-                changed = true;
-            }
-
-            // Virtual register liveness (`u64` words).
-            for w in 0..words_per_block {
-                let mut new_out: u64 = 0;
-                for &succ in succs {
-                    let s_base = to_idx(succ.0) * words_per_block;
-                    new_out |= slice_at(&v_live_in, s_base + w, 0);
-                }
-                let idx = base + w;
-                let new_in = slice_at(&v_use, idx, 0) | (new_out & !slice_at(&v_def, idx, 0));
-                if new_out != slice_at(&v_live_out, idx, 0)
-                    || new_in != slice_at(&v_live_in, idx, 0)
-                {
-                    slice_set(&mut v_live_out, idx, new_out);
-                    slice_set(&mut v_live_in, idx, new_in);
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            live_converged = true;
-            break;
         }
     }
-    if !live_converged {
-        return Err(MRaError::LivenessDidNotConverge);
+
+    // Bounded worklist backward liveness fixed point (seeded in reverse `block_order` via stack
+    // so acyclic switch trees process each block once instead of `MAX_DATAFLOW_ITERS` times).
+    let mut worklist: Vec<MBlock, Alloc<'a>> = Vec::with_capacity_in(func.block_order.len(), alloc);
+    let mut in_worklist: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(n_blocks, alloc);
+    for _ in 0..n_blocks {
+        in_worklist.push(false);
+    }
+    for &blk in func.block_order.iter() {
+        let b = to_idx(blk.0);
+        if b < n_blocks && !slice_at(&in_worklist, b, true) {
+            slice_set(&mut in_worklist, b, true);
+            worklist.push(blk);
+        }
+    }
+    let max_worklist_steps = func
+        .block_order
+        .len()
+        .saturating_mul(MAX_DATAFLOW_ITERS)
+        .saturating_add(1);
+    let mut steps = 0usize;
+    while let Some(blk) = worklist.pop() {
+        if steps >= max_worklist_steps {
+            return Err(MRaError::LivenessDidNotConverge);
+        }
+        steps += 1;
+        let b = to_idx(blk.0);
+        slice_set(&mut in_worklist, b, false);
+        let base = b * words_per_block;
+        let succs = func.block_succs(blk);
+        let mut live_in_changed = false;
+
+        // Physical register liveness (`u64`).
+        let mut new_po: u64 = 0;
+        for &succ in succs {
+            new_po |= slice_at(&p_live_in, to_idx(succ.0), 0);
+        }
+        let new_pi = slice_at(&p_use, b, 0) | (new_po & !slice_at(&p_def, b, 0));
+        if new_po != slice_at(&p_live_out, b, 0) {
+            slice_set(&mut p_live_out, b, new_po);
+        }
+        if new_pi != slice_at(&p_live_in, b, 0) {
+            slice_set(&mut p_live_in, b, new_pi);
+            live_in_changed = true;
+        }
+
+        // Virtual register liveness (`u64` words over upward-exposed global `VReg`s only).
+        for w in 0..words_per_block {
+            let mut new_out: u64 = 0;
+            for &succ in succs {
+                let s_base = to_idx(succ.0) * words_per_block;
+                new_out |= slice_at(&v_live_in, s_base + w, 0);
+            }
+            let idx = base + w;
+            let new_in = slice_at(&v_use, idx, 0) | (new_out & !slice_at(&v_def, idx, 0));
+            if new_out != slice_at(&v_live_out, idx, 0) {
+                slice_set(&mut v_live_out, idx, new_out);
+            }
+            if new_in != slice_at(&v_live_in, idx, 0) {
+                slice_set(&mut v_live_in, idx, new_in);
+                live_in_changed = true;
+            }
+        }
+
+        if live_in_changed {
+            for &pred in func.block_preds(blk) {
+                let pb = to_idx(pred.0);
+                if pb < n_blocks
+                    && slice_at(&block_ord_pos, pb, NONE_U32) != NONE_U32
+                    && !slice_at(&in_worklist, pb, true)
+                {
+                    slice_set(&mut in_worklist, pb, true);
+                    worklist.push(pred);
+                }
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -2841,8 +2920,11 @@ pub fn allocate_mfunc<'a>(
             while bits != 0 {
                 let tz = bits.trailing_zeros();
                 bits &= bits - 1;
-                let v_idx = (w << 6) + to_idx(tz);
-                if let Some(head) = vreg_range_heads.get_mut(v_idx) {
+                let g_idx = (w << 6) + to_idx(tz);
+                let v_u32 = slice_at(&global_to_vreg, g_idx, NONE_U32);
+                if v_u32 != NONE_U32
+                    && let Some(head) = vreg_range_heads.get_mut(to_idx(v_u32))
+                {
                     range_list_add(head, &mut vreg_range_nodes, blk_start_pt, blk_end_pt);
                 }
             }
@@ -3115,13 +3197,16 @@ pub fn allocate_mfunc<'a>(
             if def_w >= HOT_BLOCK_WEIGHT_MIN {
                 continue;
             }
-            let v_u32 = u32_of(vi).unwrap_or(0);
+            let g_u32 = slice_at(&vreg_to_global, vi, NONE_U32);
+            if g_u32 == NONE_U32 {
+                continue;
+            }
             let mut crosses_hot_block = false;
             for &blk in func.block_order.iter() {
                 if block_raw_weight(opts.block_weights, blk) >= HOT_BLOCK_WEIGHT_MIN {
                     let b_base = to_idx(blk.0) * words_per_block;
-                    if bitset_test(&v_live_in, b_base, v_u32)
-                        || bitset_test(&v_live_out, b_base, v_u32)
+                    if bitset_test(&v_live_in, b_base, g_u32)
+                        || bitset_test(&v_live_out, b_base, g_u32)
                     {
                         crosses_hot_block = true;
                         break;

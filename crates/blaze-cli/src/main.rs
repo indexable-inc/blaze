@@ -425,6 +425,8 @@ struct Flags<'a> {
     select: run_package::Select<'a>,
     /// `--open`: opt-in to opening the Explore web page in the browser on `blaze run` (default: off).
     open: blaze_run::viewer::OpenExplore,
+    /// `-q` / `--quiet`: suppress `blaze run`'s persistent status lines and live TUI on stderr.
+    quiet: bool,
     /// `-o <path>` / `--output <path>`: where `blaze build` writes the standalone executable.
     output: Option<&'a str>,
     /// `--target <triple>`: target backend for `blaze build` (`native` or `wasm64`).
@@ -459,6 +461,7 @@ impl<'a> Flags<'a> {
             status_every: None,
             select: run_package::Select::NONE,
             open: blaze_run::viewer::OpenExplore::No,
+            quiet: false,
             output: None,
             target: None,
             names_oracle: engine_names::NamesOracle::Off,
@@ -584,6 +587,9 @@ pub(crate) fn parse_flags_in<'a>(args: &'a Args, frame: &Frame, mut package: imp
     }
     if parsed.has("open") {
         flags.open = blaze_run::viewer::OpenExplore::Open;
+    }
+    if parsed.has("quiet") {
+        flags.quiet = true;
     }
     if parsed.has("names-oracle") {
         flags.names_oracle = engine_names::NamesOracle::On;
