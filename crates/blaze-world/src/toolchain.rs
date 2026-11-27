@@ -44,10 +44,12 @@ const STD_SCRIPT_CFG: &[(&str, &[&str])] = &[
     ("aarch64-apple-darwin", &["backtrace_in_libstd"]),
     // build.rs:80 `println!("cargo:rustc-cfg=backtrace_in_libstd");`
     ("aarch64-unknown-linux-gnu", &["backtrace_in_libstd"]),
+    // build.rs:80 `println!("cargo:rustc-cfg=backtrace_in_libstd");`
+    ("x86_64-unknown-linux-gnu", &["backtrace_in_libstd"]),
 ];
 
 /// std's build-script cfg for `triple` ([`STD_SCRIPT_CFG`]); a target with no row is refused.
-fn std_script_cfg<'w>(triple: &'w str) -> Result<&'static [&'static str], WorldError<'w>> {
+pub(crate) fn std_script_cfg<'w>(triple: &'w str) -> Result<&'static [&'static str], WorldError<'w>> {
     STD_SCRIPT_CFG.iter().find(|(t, _)| *t == triple).map(|(_, atoms)| *atoms).ok_or(WorldError::NoStdScriptCfg { triple })
 }
 
