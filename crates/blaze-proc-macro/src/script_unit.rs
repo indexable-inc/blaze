@@ -566,12 +566,12 @@ pub fn records_named(store: &Path, name: &str, version: &str) -> Result<Vec<(Pat
 /// (scripts proc_macro_modules build_scripts.rs `library`), the same digest of the same file.
 const SHIM: &[u8] = include_bytes!("../guest/script_process.rs");
 
-/// Current wasm64 build-script module identity header (`blaze build-script module wasm64 6`):
+/// Current wasm64 build-script module identity header (`blaze build-script module wasm64 7`):
 /// target-bearing so on-demand `wasm64-blaze-wasip1` self-compiled modules never collide with
-/// `wasm32-wasip1` bootstrap records (`blaze build-script module wasm32 5`) or stale pre-v6
-/// modules. v6 resolves `[target.'cfg(...)'.dependencies]` against `wasm64-blaze-wasip1` and
-/// includes WASI-side unified dependency features + lock closure in `deps_digest`.
-pub const WASM_MODULE_HEADER: &str = "blaze build-script module wasm64 6";
+/// `wasm32-wasip1` bootstrap records (`blaze build-script module wasm32 5`) or stale pre-v7
+/// modules. v7 invalidates pre-fix wasm64 modules compiled before `blaze-build` `ScopeEnd` /
+/// `TempScopeEnd` adjusted-repr settling (fat pointers truncated from 16B to 8B before drops).
+pub const WASM_MODULE_HEADER: &str = "blaze build-script module wasm64 7";
 
 /// Current native host build-script module identity header (`blaze build-script module 3`): kept
 /// at v3 so existing Tier-2 native host records remain usable without re-bootstrapping while
@@ -1167,6 +1167,7 @@ mod tests {
             ("stale-v4", "blaze build-script module 4"),
             ("stale-v5", "blaze build-script module 5"),
             ("stale-wasm32-v5", "blaze build-script module wasm32 5"),
+            ("stale-wasm64-v6", "blaze build-script module wasm64 6"),
         ] {
             let stale_dir = store.join(format!("build-script/modules/{dir_name}"));
             std::fs::create_dir_all(&stale_dir).expect("create stale dir");
@@ -1179,15 +1180,15 @@ mod tests {
         let miss = super::module_of_files_and_deps(&store, "demo", "0.1.0", &[], None, None).expect("lookup stale");
         assert_eq!(miss, None, "stale/wasm32 modules must not match WASM_MODULE_HEADER ({})", super::WASM_MODULE_HEADER);
 
-        // Current wasm64 v6 module placed alongside stale/wasm32 modules matches uniquely (never Ambiguous).
-        let fresh_dir = store.join("build-script/modules/fresh-wasm64-v6");
+        // Current wasm64 v7 module placed alongside stale/wasm32 modules matches uniquely (never Ambiguous).
+        let fresh_dir = store.join("build-script/modules/fresh-wasm64-v7");
         std::fs::create_dir_all(&fresh_dir).expect("create fresh dir");
         std::fs::write(
             fresh_dir.join("identity"),
             format!("{}\nname demo\nversion 0.1.0\nfeatures \n{shim}\nbuilder blaze-wasm64\n", super::WASM_MODULE_HEADER),
         )
         .expect("write fresh identity");
-        let hit = super::module_of_files_and_deps(&store, "demo", "0.1.0", &[], None, None).expect("lookup v6");
+        let hit = super::module_of_files_and_deps(&store, "demo", "0.1.0", &[], None, None).expect("lookup v7");
         assert_eq!(hit, Some(fresh_dir));
 
         let _ = std::fs::remove_dir_all(&store);

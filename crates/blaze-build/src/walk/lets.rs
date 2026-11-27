@@ -73,9 +73,9 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let temps = self.if_let_open(e, cond, links.len())?;
         self.work.push(Task::IfThen { expr: e, else_, else_block, join, res });
         if temps {
-            self.work.push(Task::TempScopeEnd(cond));
+            self.work.push(Task::TempScopeEnd { anchor: cond, value: then });
         }
-        self.work.push(Task::ScopeEnd(then));
+        self.work.push(Task::ScopeEnd { expr: then, adjusted: true });
         self.work.push(Task::Eval(then));
         self.push_links(&links, else_block)
     }
@@ -131,9 +131,9 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let links = self.links_of(g)?;
         let temps = self.if_let_open(g, g, links.len())?;
         if temps {
-            self.work.push(Task::TempScopeEnd(g));
+            self.work.push(Task::TempScopeEnd { anchor: g, value: body });
         }
-        self.work.push(Task::ScopeEnd(body));
+        self.work.push(Task::ScopeEnd { expr: body, adjusted: true });
         self.work.push(Task::Eval(body));
         self.work.push(Task::ArmMoves { from });
         self.push_links(&links, fail)

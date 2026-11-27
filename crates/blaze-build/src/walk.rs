@@ -402,13 +402,17 @@ enum Task {
     /// Discard the value on top, of expression `e`: dropped when its type needs drop (the end
     /// of an expression statement, `let _ = <value>`).
     DropValue(ExprId),
-    /// The end of block `e`'s drop scope: its bindings dropped under its value.
-    ScopeEnd(ExprId),
+    /// The end of a drop scope: its bindings dropped under its value. `adjusted` is true when
+    /// `expr` has already been evaluated through `Task::Eval` (including its adjustments: a match
+    /// arm's body, an `if let` consequent, a `let`-guard body), and false when `expr` is the
+    /// enclosing block or single-arm match whose own `Task::Adjust` runs after this task.
+    ScopeEnd { expr: ExprId, adjusted: bool },
     /// The end of a statement: its borrowed temporaries dropped (walk/temps.rs).
     TempEnd,
-    /// The end of temporary scope `e` (an `if` condition, a lazy operand, an arm's body...):
-    /// its temporaries dropped under its value (walk/temps.rs `temp_close`).
-    TempScopeEnd(ExprId),
+    /// The end of temporary scope `anchor` (an `if` condition, a lazy operand, an arm's body, an
+    /// `if let` condition's region...): its temporaries dropped under the adjusted value of
+    /// `value` on top of the value stack (walk/temps.rs `temp_close`).
+    TempScopeEnd { anchor: ExprId, value: ExprId },
     PushNone,
     /// Bind the value on top to the pattern; the expression it is of, for an aggregate built
     /// in a temporary of its own, which becomes the binding's home.
@@ -4220,11 +4224,11 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 }
                 self.end_temp_val(v);
             }
-            Task::ScopeEnd(e) => {
+            Task::ScopeEnd { expr, adjusted } => {
                 let v = self.pop()?;
                 let depth = self.scope_marks.len();
                 let mark = self.scope_marks.pop().ok_or(malformed("a block's drop scope out of order"))? as usize;
-                let repr = self.expr_repr(e)?;
+                let repr = if adjusted { self.adjusted_repr(expr)? } else { self.expr_repr(expr)? };
                 let v = self.settle_scope(v, repr, mark, depth)?;
                 // Last declared first, each with its unwind ladder (walk/unwind_ladder.rs); each
                 // binding's own drop reads only its own `owned`, so they are cleared after.
@@ -4239,7 +4243,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 self.push_val(v, None);
             }
             Task::TempEnd => self.temp_end()?,
-            Task::TempScopeEnd(e) => self.temp_close(e)?,
+            Task::TempScopeEnd { anchor, value } => self.temp_close(anchor, value)?,
             Task::PushNone => self.push_val(V::None, None),
             // The same answer `stmt` had: `v` is the initializer as a scrutinee, owned with its
             // parts (walk/matches/irrefutable.rs `let_owns_parts`); the bindings own themselves.
@@ -6597,7 +6601,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 }
                 // The block's drop scope: its bindings are dropped after its value is made.
                 self.scope_marks.push(self.scope_pats.len() as u32);
-                self.work.push(Task::ScopeEnd(e));
+                self.work.push(Task::ScopeEnd { expr: e, adjusted: false });
                 match tail {
                     Some(t) => self.work.push(Task::Eval(t)),
                     None => self.work.push(Task::PushNone),
@@ -8089,7 +8093,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             self.end_temp_slot(slot);
         }
         self.work.push(Task::ArmEnd { m });
-        self.work.push(Task::ScopeEnd(arm.body));
+        self.work.push(Task::ScopeEnd { expr: arm.body, adjusted: true });
         // An `if let` guard (walk/lets.rs `let_guard`): its links, each failure to `next`.
         if let Some(g) = arm.guard
             && self.cond_has_let(g)?

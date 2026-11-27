@@ -48,7 +48,10 @@ const SUBJECT_DOMAIN: &str = "blaze-cli macro crate 1";
 // (`part_source_with_files`) so patched path deps reached by registry/git proc-macros
 // invalidate only affected `MacroModule` tasks without polluting `units_source` with unrelated
 // runtime patches.
-const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 6";
+// "7": proc-macro module identity bumped to form 9 (`blaze proc-macro module wasm64 9`) after
+// `blaze-build` `ScopeEnd`/`TempScopeEnd` adjusted-repr fix, invalidating cached `MacroModule`
+// task records that pointed at pre-v9 wasm64 proc-macro modules.
+const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 7";
 const OUT_DOMAIN: &str = "blaze-cli macro module out 1";
 /// The rule a refusal of this task names.
 const RULE: &str = "macros.rs";

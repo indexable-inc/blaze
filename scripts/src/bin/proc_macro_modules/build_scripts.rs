@@ -457,7 +457,7 @@ impl Plan<'_> {
         features.dedup();
         // Distinct target-bearing header for `wasm32-wasip1` bootstrap records so they never
         // collide with on-demand `wasm64-blaze-wasip1` self-compiled modules
-        // (`blaze build-script module wasm64 6` in `crates/blaze-proc-macro/src/script_unit.rs`).
+        // (`blaze build-script module wasm64 7` in `crates/blaze-proc-macro/src/script_unit.rs`).
         let (header, runner) = match native {
             None => ("blaze build-script module wasm32 5", format!("shim {shim_digest}\npatches {rt_digest}\n")),
             Some(native) => ("blaze build-script module 3", native.identity()?),

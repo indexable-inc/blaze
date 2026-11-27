@@ -209,7 +209,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let mark = u32::try_from(self.scope_pats.len()).map_err(|_| malformed("drop scope depth past u32::MAX"))?;
         self.scope_marks.push(mark);
         self.own(arm.pat, true)?;
-        self.work.push(Task::ScopeEnd(e));
+        self.work.push(Task::ScopeEnd { expr: e, adjusted: false });
         self.work.push(Task::Eval(arm.body));
         Ok(true)
     }
@@ -385,7 +385,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             self.end_temp_slot(slot);
         }
         self.work.push(Task::ArmEnd { m });
-        self.work.push(Task::ScopeEnd(arm.body));
+        self.work.push(Task::ScopeEnd { expr: arm.body, adjusted: true });
         // An `if let` guard (walk/lets.rs `let_guard`): its links, each failure to
         // `let_guard_fail` (either the next expansion of an or-pattern or `next` arm).
         if let Some(g) = arm.guard
