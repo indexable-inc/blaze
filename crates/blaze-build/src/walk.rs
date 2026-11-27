@@ -2557,6 +2557,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     }
 
     /// Calls the drop glue of ground type `g` on the value at `at`: `drop_in_place::<g>`.
+    /// Drop glue (`Kind::DropGlue`) always takes the plain one-pointer ABI `(ptr) -> ()`
+    /// with no hidden `Location` parameter.
     fn drop_at(&mut self, g: PTy, at: (Value, i32)) -> Result<(), BuildError> {
         let item = self.adts.lang_fn(DROP_FN).ok_or(BuildError::NoLangFn { expr: None, name: DROP_FN })?;
         let args = self.ground.intern_list(&[g]).map_err(|_| malformed("the ground table is full"))?;
@@ -2564,14 +2566,32 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         self.call_ptr(Instance { item, args }, p)
     }
 
-    /// A drop call of `instance`, a fn of one pointer parameter and no result, with `p`: plain,
-    /// or an `invoke` when an unwind ladder says so (walk/unwind_ladder.rs `drop_call`).
+    /// A drop-glue call of `instance` (`drop_in_place::<T>`), always one pointer parameter and
+    /// no result, with `p`: plain, or an `invoke` when an unwind ladder says so
+    /// (walk/unwind_ladder.rs `drop_call`).
     fn call_ptr(&mut self, instance: Instance, p: Value) -> Result<(), BuildError> {
-        // A tracked `Drop::drop` has no call expression to be the place: refused by name.
-        let (sig, values) = self.lang_call_sig(None, instance, &[Param::of(Ty::PTR)], &[p])?;
         let place = self.ref_place(instance);
         let reference = self.b.reference(RefKind::Func, place);
-        self.drop_call(Callee::Direct(reference), sig, &values)
+        let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
+        self.drop_call(Callee::Direct(reference), sig, &[p])
+    }
+
+    /// Calls a type's `Drop::drop` impl (`instance`) on `p`, appending the hidden
+    /// `&'static Location<'static>` parameter last when `instance` is `#[track_caller]`.
+    fn call_drop_impl(&mut self, instance: Instance, p: Value) -> Result<(), BuildError> {
+        let loc = self.drop_caller_arg(instance)?;
+        let place = self.ref_place(instance);
+        let reference = self.b.reference(RefKind::Func, place);
+        match loc {
+            Some(loc) => {
+                let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+                self.drop_call(Callee::Direct(reference), sig, &[p, loc])
+            }
+            None => {
+                let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
+                self.drop_call(Callee::Direct(reference), sig, &[p])
+            }
+        }
     }
 
     /// Binding `p`, just bound (`init`) or declared without a value, joins the innermost drop

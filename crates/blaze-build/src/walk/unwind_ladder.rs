@@ -161,7 +161,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         match step {
             DropStep::Held(h) => self.drop_held(h, kill),
             DropStep::Field { g, at } => self.drop_at(g, at),
-            DropStep::Impl { instance, p } => self.call_ptr(instance, p),
+            DropStep::Impl { instance, p } => self.call_drop_impl(instance, p),
             DropStep::Parts { l, p } => self.drop_parts(l as usize, p),
             DropStep::BoxContents { list, p } => self.drop_box_contents(list, p),
             DropStep::DynGlue { data, vt } => self.dyn_glue(data, vt),
