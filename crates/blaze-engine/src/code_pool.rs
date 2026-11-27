@@ -291,6 +291,22 @@ impl<'a> CodePool<'a> {
         self.index.get(&Probe { key, seed: self.opts.hash_seed }).copied()
     }
 
+    /// Removes a settled `Ready` entry from the lookup index so the relay can evict its cached
+    /// bytes under `most_bytes` pressure. Returns `false` if not `Ready` or still pending on a
+    /// live child.
+    fn evict_ready(&mut self, key: CodeKey) -> bool {
+        let Some(id) = self.find(key) else { return false };
+        if !matches!(self.rows[id].state, State::Ready { .. }) {
+            return false;
+        }
+        if self.children.iter().any(|c| c.live && c.pending.iter().any(|&(row, _)| row == id)) {
+            return false;
+        }
+        self.index.remove(&Probe { key, seed: self.opts.hash_seed });
+        self.rows[id].state = State::Dormant(None);
+        true
+    }
+
     fn claim(&mut self, key: CodeKey, out: &mut SVec<'_, Action>) -> RowId {
         let id = self.rows.len();
         let a = self.opts.alloc;
