@@ -88,6 +88,29 @@ pub(crate) fn part_source(graph_source: ContentId, subject: ContentId) -> Conten
     ContentId::of(SOURCE_DOMAIN, &source)
 }
 
+/// The lookup's part source when the build script's `wasm64-blaze-wasip1` closure executes
+/// dependency build scripts: mixes `probes_hex` into `part_source` so derived-fact pin or live
+/// C-probe answerer changes invalidate the `MacroModule` task itself (rules 21 and 60).
+pub(crate) fn part_source_with_dep_probes(
+    graph_source: ContentId,
+    subject: ContentId,
+    probes_hex: &str,
+) -> ContentId {
+    let mut buf = [0u8; 128];
+    if let Some(dst) = buf.get_mut(..32) {
+        dst.copy_from_slice(&graph_source.0);
+    }
+    if let Some(dst) = buf.get_mut(32..64) {
+        dst.copy_from_slice(&subject.0);
+    }
+    let bytes = probes_hex.as_bytes();
+    let take = bytes.len().min(64);
+    if let (Some(dst), Some(src)) = (buf.get_mut(64..64 + take), bytes.get(..take)) {
+        dst.copy_from_slice(src);
+    }
+    ContentId::of(SOURCE_DOMAIN, &buf)
+}
+
 /// A module lookup a crate's script reads: its subject, the world index of the crate reading
 /// it, and the script unit's package, version, features, and digests (from the graph, held to the
 /// end of the command with the names world). Made in names.rs `world`.

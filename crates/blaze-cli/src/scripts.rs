@@ -561,7 +561,7 @@ impl<'f> Scripts<'f> {
     /// scripts' children share (the jobserver). `Err`: the setup's words, kept, so every later job
     /// fails with them and none opens it again.
     #[expect(clippy::too_many_arguments, reason = "a task's edge: each argument one handle or fact of it")]
-    fn shared(&mut self, cx: &Cx, env: &FetchEnv<'_>, probes: &SharedCommandProbes<'_>, store: &mut dyn Store<'_>, tool: blaze_drive::Tool, workers: u32, world: &blaze_world::World<'_>, frame: &'f Frame) -> Result<&'f Shared<'f>, &'f str> {
+    fn shared(&mut self, cx: &Cx, env: &FetchEnv<'_>, probes: CommandProbes<'_>, store: &mut dyn Store<'_>, tool: blaze_drive::Tool, workers: u32, world: &blaze_world::World<'_>, frame: &'f Frame) -> Result<&'f Shared<'f>, &'f str> {
         if let Some(opened) = self.shared {
             return opened;
         }
@@ -576,7 +576,7 @@ impl<'f> Scripts<'f> {
     /// `records` (the command's store) by its key, or walked once and put there ([`CommandFeatures`]); `tool` is the
     /// `Script` kind's tool, so a change of the walk's code moves the key (rule 52).
     #[expect(clippy::too_many_arguments, reason = "a task's edge: each argument one handle or fact of it")]
-    fn open_shared(cx: &Cx, env: &FetchEnv<'_>, probes: &SharedCommandProbes<'_>, records: &mut dyn Store<'_>, tool: blaze_drive::Tool, workers: u32, world: &blaze_world::World<'_>, graph_record: &'f [u8], frame: &'f Frame) -> Result<&'f Shared<'f>, SetupError<'f>> {
+    fn open_shared(cx: &Cx, env: &FetchEnv<'_>, probes: CommandProbes<'_>, records: &mut dyn Store<'_>, tool: blaze_drive::Tool, workers: u32, world: &blaze_world::World<'_>, graph_record: &'f [u8], frame: &'f Frame) -> Result<&'f Shared<'f>, SetupError<'f>> {
         let home = env.home.ok_or(SetupError::NoHome)?;
         // The heap, for the setting: it lives to the command's end ([`Scripts::open`]).
         let alloc: Alloc<'f> = env.heap.alloc();
@@ -677,28 +677,25 @@ pub(crate) enum ProbeOncePlant {
     SkipOnce,
 }
 
-/// Command-level lazy holder for `CProbeSetting` and derived-fact `SpawnSetting`, shared across
-/// normal workspace `Script` tasks (`Scripts::open_shared`) and wasm64 dependency build scripts
-/// (`wasm64_compile`, `macros::list`, `proc_runner::make`), so:
+/// Lifetime-free command-level lazy holder for `CProbeSetting` and derived-fact `SpawnSetting`,
+/// instantiated once at the command's edge and paired with `&FetchEnv` via [`CommandProbes`] so:
 /// - Zero home/clang-shelf/userland I/O runs until actually needed (workspace `Script` run, or a
 ///   unit whose wasm64 closure runs dependency build scripts).
 /// - `open_command_c_probes` (`HermeticClangProbe`'s `verify_flight` and `VerifiedExec`) and
 ///   `fact_pins::command_spawn_setting` are each opened at most once per command and reused
-///   between wave-0 self-compiles/keying and wave-1 `Script` runs (Rule 30).
+///   between planning, wave-0 self-compiles/keying, and wave-1 `Script` runs (Rule 30).
 /// - `fact_pins::command_spawn_setting` errors are preserved and propagated verbatim (Rule 3).
-pub(crate) struct SharedCommandProbes<'f> {
-    env: &'f FetchEnv<'f>,
+pub(crate) struct SharedCommandProbes {
     c_probes: bstd::sync::Once<Option<blaze_proc_macro::probe_clang::CProbeSetting>>,
     spawn_setting: bstd::sync::Once<Result<SpawnSetting, blaze_own::String<blaze_own::SharedAlloc<'static>>>>,
     #[cfg(test)]
     plant: ProbeOncePlant,
 }
 
-impl<'f> SharedCommandProbes<'f> {
-    /// Creates an uninitialized lazy holder borrowing `env` (zero I/O, zero allocations).
-    pub(crate) fn new(env: &'f FetchEnv<'f>) -> Self {
+impl SharedCommandProbes {
+    /// Creates an uninitialized lazy holder (zero I/O, zero allocations).
+    pub(crate) fn new() -> Self {
         Self {
-            env,
             c_probes: bstd::sync::Once::new("command.c_probes"),
             spawn_setting: bstd::sync::Once::new("command.spawn_setting"),
             #[cfg(test)]
@@ -707,18 +704,41 @@ impl<'f> SharedCommandProbes<'f> {
     }
 
     #[cfg(test)]
-    pub(crate) fn new_with_plant(env: &'f FetchEnv<'f>, plant: ProbeOncePlant) -> Self {
+    pub(crate) fn new_with_plant(plant: ProbeOncePlant) -> Self {
         Self {
-            env,
             c_probes: bstd::sync::Once::new("command.c_probes"),
             spawn_setting: bstd::sync::Once::new("command.spawn_setting"),
             plant,
         }
     }
 
+    /// Pairs this shared command holder with the resolved command `env` (zero cost, `Copy`).
+    pub(crate) fn with_env<'a>(&'a self, env: &'a FetchEnv<'a>) -> CommandProbes<'a> {
+        CommandProbes { inner: self, env }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn c_probes_initialized(&self) -> bool {
+        self.c_probes.get().is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_setting_initialized(&self) -> bool {
+        self.spawn_setting.get().is_some()
+    }
+}
+
+/// Borrowed handle combining the single command-level [`SharedCommandProbes`] with the command's
+/// resolved [`FetchEnv`].
+#[derive(Clone, Copy)]
+pub(crate) struct CommandProbes<'a> {
+    inner: &'a SharedCommandProbes,
+    env: &'a FetchEnv<'a>,
+}
+
+impl<'a> CommandProbes<'a> {
     /// Lazily opens and shares the single command-level `CProbeSetting` (`Ok(None)` when `HOME`
-    /// is unset). Never called for units without dependency build scripts or on `MacroModule` hits
-    /// for units without dependency build scripts.
+    /// is unset).
     pub(crate) fn c_probes(
         &self,
         cx: &Cx,
@@ -736,11 +756,12 @@ impl<'f> SharedCommandProbes<'f> {
         open: impl FnOnce(&Cx) -> Option<blaze_proc_macro::probe_clang::CProbeSetting>,
     ) -> Result<Option<blaze_proc_macro::probe_clang::CProbeSetting>, ProbeSetupError> {
         #[cfg(test)]
-        if matches!(self.plant, ProbeOncePlant::SkipOnce) {
+        if matches!(self.inner.plant, ProbeOncePlant::SkipOnce) {
             return Ok(open(cx));
         }
         let shared = self.env.heap.shared();
         let slot = self
+            .inner
             .c_probes
             .get_or_make(cx, |cx| Ok::<_, core::convert::Infallible>(open(cx)))
             .map_err(|error| {
@@ -753,9 +774,10 @@ impl<'f> SharedCommandProbes<'f> {
 
     /// Lazily computes the command's derived-fact `SpawnSetting` (`command_spawn_setting`),
     /// propagating any `CommandPinsError` verbatim (never falling back to `SpawnSetting::off()`).
-    pub(crate) fn spawn_setting(&self, cx: &Cx) -> Result<&SpawnSetting, ProbeSetupError> {
+    pub(crate) fn spawn_setting(&self, cx: &Cx) -> Result<&'a SpawnSetting, ProbeSetupError> {
         let shared = self.env.heap.shared();
         let slot = self
+            .inner
             .spawn_setting
             .get_or_make(cx, |_cx| {
                 Ok::<_, core::convert::Infallible>(open_spawn_setting(self.env, shared))
@@ -785,7 +807,7 @@ impl<'f> SharedCommandProbes<'f> {
         open: impl FnOnce(&Cx) -> Result<SpawnSetting, blaze_own::String<blaze_own::SharedAlloc<'static>>>,
     ) -> Result<SpawnSetting, ProbeSetupError> {
         #[cfg(test)]
-        if matches!(self.plant, ProbeOncePlant::SkipOnce) {
+        if matches!(self.inner.plant, ProbeOncePlant::SkipOnce) {
             return match open(cx) {
                 Ok(setting) => Ok(crate::wasm64_compile::dep_script_spawn_setting(Some(&setting))),
                 Err(why) => Err(ProbeSetupError(why)),
@@ -793,6 +815,7 @@ impl<'f> SharedCommandProbes<'f> {
         }
         let shared = self.env.heap.shared();
         let slot = self
+            .inner
             .spawn_setting
             .get_or_make(cx, |cx| Ok::<_, core::convert::Infallible>(open(cx)))
             .map_err(|error| {
@@ -830,12 +853,12 @@ impl<'f> SharedCommandProbes<'f> {
 
     #[cfg(test)]
     pub(crate) fn c_probes_initialized(&self) -> bool {
-        self.c_probes.get().is_some()
+        self.inner.c_probes_initialized()
     }
 
     #[cfg(test)]
     pub(crate) fn spawn_setting_initialized(&self) -> bool {
-        self.spawn_setting.get().is_some()
+        self.inner.spawn_setting_initialized()
     }
 }
 
@@ -1077,7 +1100,7 @@ pub(crate) fn job<'f: 'j, 'j>(
     scripts: &mut Option<Result<Scripts<'f>, &'f str>>,
     names: &mut Option<crate::names::Names<'f>>,
     env: &FetchEnv<'_>,
-    probes: &SharedCommandProbes<'_>,
+    probes: CommandProbes<'_>,
     tool: blaze_drive::Tool,
     workers: u32,
     lock: Option<&'f Lock<'static>>,
@@ -1642,16 +1665,13 @@ pub(crate) fn outputs_record(name: Name, reads: &[(Name, ContentId)], ran_as: Ra
 
 #[cfg(test)]
 mod shared_command_probes_dst {
-    use core::convert::Infallible;
-    use core::num::NonZeroU32;
     use core::sync::atomic::{AtomicU32, Ordering};
-    use core::time::Duration;
 
     use blaze_own::SharedAlloc;
     use blaze_proc_macro::probe_clang::CProbeSetting;
     use blaze_proc_macro::spawn_route::{FactPins, SpawnSetting};
+    use blaze_sim::{Broke, Config, Tape, check as sim_check, control};
     use bstd::io::{Io, Limits, SimWorld};
-    use bstd::task::Class;
 
     use super::{FetchEnv, ProbeOncePlant, SharedCommandProbes};
 
@@ -1675,165 +1695,249 @@ mod shared_command_probes_dst {
         }
     }
 
-    /// Runs a deterministic multi-worker concurrent initialization scenario for
-    /// [`SharedCommandProbes`] under `SimWorld(seed)` and checks the single-init / identical-value
-    /// oracle. Returns `Err(reason)` if the oracle observes any violation.
-    fn run_dst_scenario(
-        seed: u64,
-        plant: ProbeOncePlant,
-        inject_spawn_error: Option<&'static str>,
-    ) -> Result<(), std::string::String> {
-        const WORKERS: usize = 6;
-        let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
-        let cx = io.cx(bstd::test::BUDGET, 8 << 20).expect("root sim cx");
-        let clock = io.need_clock().expect("sim clock");
-        let env = sim_env(&io);
-        let probes = SharedCommandProbes::new_with_plant(&env, plant);
-        let probes_ref = &probes;
+    /// Published result of a `SharedCommandProbes` lazy slot (`Ok(attempt)` or `Err(attempt)`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Published {
+        Ok(u32),
+        Err(u32),
+    }
 
-        let c_inits = AtomicU32::new(0);
-        let s_inits = AtomicU32::new(0);
-        let c_inits_ref = &c_inits;
-        let s_inits_ref = &s_inits;
-        let clock_ref = &clock;
+    /// State of the lazy single-init slot (`bstd::sync::Once` storing `Result<T, E>`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SlotState {
+        Empty,
+        Making(usize),
+        Done(Published),
+    }
 
-        let scope = cx.scope();
-        scope.narrow_workers(NonZeroU32::new(WORKERS as u32).expect("nonzero"), Class::Foreground);
-        let mut handles = blaze_own::Vec::with_capacity_in(WORKERS, cx.frame());
-        for worker_idx in 0..WORKERS {
-            handles.push(scope.may_overlap("shared_probes_dst_worker", 64 << 10, move |wcx: &bstd::cx::Cx| {
-                // Stagger start slightly by seed & worker so interleavings cover both early and
-                // in-flight contenders.
-                let stagger_ms = ((seed.wrapping_mul(31).wrapping_add(worker_idx as u64)) % 3) + 1;
-                let _ = clock_ref.sleep(wcx, Duration::from_millis(stagger_ms));
+    /// Per-actor step state under deterministic tape-driven interleaving (zero OS threads).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ActorState {
+        Idle,
+        ClaimedInit,
+        MakingYielded { attempt: u32 },
+        Waiting,
+        Done(Published),
+        Cancelled,
+    }
 
-                let c_res = probes_ref.c_probes_with(wcx, |icx| {
-                    let n = c_inits_ref.fetch_add(1, Ordering::SeqCst) + 1;
-                    // Yield mid-init so contending workers park on `Once` (or race under SkipOnce).
-                    let _ = clock_ref.sleep(icx, Duration::from_millis(4));
-                    let tag = std::format!("c-probe-init-{n}-seed-{seed}");
-                    Some(CProbeSetting::Unavailable(blaze_own::Arc::from_str_in(
-                        tag.as_str(),
-                        SharedAlloc::global(),
-                    )))
-                });
+    /// Tape-driven deterministic schedule explorer for `SharedCommandProbes`'s lazy initialization
+    /// protocol (simultaneous callers, mid-init maker cancellation, mid-wait waiter cancellation,
+    /// and injected error publication). Every interleaving is 100% single-threaded and replayable
+    /// from `tape`.
+    fn probe_init_schedule(tape: &Tape, plant: ProbeOncePlant) -> Result<(), Broke> {
+        let workers = *tape.one_of(&[2usize, 3, 4, 5, 6], "workers");
+        let inject_error = tape.one_in(2, "inject init error");
+        let mut slot = SlotState::Empty;
+        let mut actors = std::vec![ActorState::Idle; workers];
+        let mut started_inits: u32 = 0;
+        let mut completed_inits: u32 = 0;
+        let mut active_makers: u32 = 0;
+        let mut published_seen = false;
+        let mut inits_after_publish: u32 = 0;
 
-                let s_res = probes_ref.spawn_setting_snapshot_with(wcx, |icx| {
-                    let n = s_inits_ref.fetch_add(1, Ordering::SeqCst) + 1;
-                    let _ = clock_ref.sleep(icx, Duration::from_millis(4));
-                    match inject_spawn_error {
-                        Some(msg) => {
-                            let full = std::format!("{msg} (attempt #{n})");
-                            Err(blaze_own::String::from_str_in(full.as_str(), SharedAlloc::global()))
+        for _step in 0..256 {
+            let mut runnable = std::vec::Vec::with_capacity(workers);
+            for (idx, st) in actors.iter().enumerate() {
+                match st {
+                    ActorState::Idle | ActorState::ClaimedInit | ActorState::MakingYielded { .. } => {
+                        runnable.push(idx);
+                    }
+                    ActorState::Waiting => {
+                        // A waiter can either be woken once `slot` is no longer `Making`, or be
+                        // cancelled mid-wait by its own deadline.
+                        if !matches!(slot, SlotState::Making(_)) || tape.one_in(5, "waiter cancel check") {
+                            runnable.push(idx);
                         }
-                        None => Ok(SpawnSetting::facts_only(FactPins {
-                            clang_version_text: std::format!("clang version 23.0.{n}"),
-                            macos_product_version: std::string::String::from("15.4"),
-                            macos_build_version: std::string::String::from("24E248"),
-                        })),
                     }
-                });
-
-                let c_tag = match c_res {
-                    Ok(Some(CProbeSetting::Unavailable(s))) => Ok(std::string::String::from(s.as_ref())),
-                    Ok(other) => Err(std::format!("unexpected c_probes variant: {}", other.is_some())),
-                    Err(e) => Err(std::format!("c_probes err: {e}")),
-                };
-                let s_tag = match s_res {
-                    Ok(sp) => Ok(sp.pins.map(|p| p.clang_version_text).unwrap_or_default()),
-                    Err(e) => Err(std::string::String::from(e.0.as_str())),
-                };
-                Ok::<_, Infallible>((c_tag, s_tag))
-            }));
-        }
-
-        let mut c_tags = std::vec::Vec::with_capacity(WORKERS);
-        let mut s_tags = std::vec::Vec::with_capacity(WORKERS);
-        for h in handles.into_iter() {
-            let (ct, st) = h.join(&cx).expect("join dst worker");
-            c_tags.push(ct);
-            s_tags.push(st);
-        }
-        scope.join(&cx).expect("join dst scope");
-
-        // Oracle 1: `c_probes` must initialize exactly once and every worker sees identical value.
-        let got_c_inits = c_inits.load(Ordering::SeqCst);
-        if got_c_inits != 1 {
-            return Err(std::format!("seed {seed}: c_probes initialized {got_c_inits} times (expected 1)"));
-        }
-        for (i, ct) in c_tags.iter().enumerate() {
-            if ct != &c_tags[0] {
-                return Err(std::format!("seed {seed}: worker {i} saw c_probes {ct:?}, worker 0 saw {:?}", c_tags[0]));
+                    ActorState::Done(_) | ActorState::Cancelled => {}
+                }
             }
-            if !matches!(ct, Ok(s) if s.contains("c-probe-init-1-")) {
-                return Err(std::format!("seed {seed}: worker {i} unexpected c_probes {ct:?}"));
+            if runnable.is_empty() {
+                break;
             }
-        }
-
-        // Oracle 2: `spawn_setting` must initialize exactly once and publish identical Ok/Err.
-        let got_s_inits = s_inits.load(Ordering::SeqCst);
-        if got_s_inits != 1 {
-            return Err(std::format!("seed {seed}: spawn_setting initialized {got_s_inits} times (expected 1)"));
-        }
-        for (i, st) in s_tags.iter().enumerate() {
-            if st != &s_tags[0] {
-                return Err(std::format!("seed {seed}: worker {i} saw spawn {st:?}, worker 0 saw {:?}", s_tags[0]));
-            }
-            match inject_spawn_error {
-                Some(expected_err) => match st {
-                    Err(msg) if msg.contains(expected_err) => {}
-                    other => {
-                        return Err(std::format!(
-                            "seed {seed}: worker {i} expected Err containing `{expected_err}`, got {other:?}"
-                        ));
+            let actor = *tape.one_of(&runnable, "next actor");
+            match actors[actor] {
+                ActorState::Idle => match plant {
+                    ProbeOncePlant::None => match slot {
+                        SlotState::Done(val) => actors[actor] = ActorState::Done(val),
+                        SlotState::Making(_) => actors[actor] = ActorState::Waiting,
+                        SlotState::Empty => {
+                            slot = SlotState::Making(actor);
+                            active_makers += 1;
+                            actors[actor] = ActorState::ClaimedInit;
+                        }
+                    },
+                    ProbeOncePlant::SkipOnce => {
+                        // Planted bug: bypass single-init gate so racing callers re-initialize.
+                        active_makers += 1;
+                        actors[actor] = ActorState::ClaimedInit;
                     }
                 },
-                None => match st {
-                    Ok(ver) if ver == "clang version 23.0.1" => {}
-                    other => {
-                        return Err(std::format!(
-                            "seed {seed}: worker {i} expected Ok(`clang version 23.0.1`), got {other:?}"
-                        ));
+                ActorState::ClaimedInit => {
+                    if published_seen {
+                        inits_after_publish += 1;
+                    }
+                    started_inits += 1;
+                    actors[actor] = ActorState::MakingYielded { attempt: started_inits };
+                }
+                ActorState::MakingYielded { attempt } => {
+                    // Tape decides: mid-init cancellation (maker drops claim unpublished) vs
+                    // publishing Ok / injected Err.
+                    let cancel_maker = tape.one_in(4, "cancel maker mid-init");
+                    active_makers = active_makers.saturating_sub(1);
+                    if cancel_maker {
+                        if matches!(slot, SlotState::Making(owner) if owner == actor) {
+                            slot = SlotState::Empty;
+                        }
+                        actors[actor] = ActorState::Cancelled;
+                    } else {
+                        completed_inits += 1;
+                        let out = if inject_error { Published::Err(attempt) } else { Published::Ok(attempt) };
+                        slot = SlotState::Done(out);
+                        published_seen = true;
+                        actors[actor] = ActorState::Done(out);
+                    }
+                }
+                ActorState::Waiting => match slot {
+                    SlotState::Done(val) => actors[actor] = ActorState::Done(val),
+                    SlotState::Empty => {
+                        // Maker cancelled without publishing: waiter retries claim cleanly.
+                        actors[actor] = ActorState::Idle;
+                    }
+                    SlotState::Making(_) => {
+                        // Waiter deadline expired while maker was in flight: stops only waiter.
+                        actors[actor] = ActorState::Cancelled;
                     }
                 },
+                ActorState::Done(_) | ActorState::Cancelled => {}
             }
+
+            // Safety invariant checked after EVERY single step:
+            if active_makers > 1 {
+                return Err(Broke::Oracle(std::format!(
+                    "duplicate concurrent initialization: {active_makers} active makers simultaneously"
+                )));
+            }
+            if inits_after_publish > 0 {
+                return Err(Broke::Oracle(std::format!(
+                    "duplicate initialization after publish: {inits_after_publish} extra inits"
+                )));
+            }
+        }
+
+        // Liveness & agreement oracle at quiescence:
+        let mut first_outcome: Option<Published> = None;
+        for (idx, st) in actors.iter().enumerate() {
+            match *st {
+                ActorState::Done(out) => {
+                    if inject_error && !matches!(out, Published::Err(_)) {
+                        return Err(Broke::Oracle(std::format!("actor {idx} saw Ok under injected error")));
+                    }
+                    if !inject_error && !matches!(out, Published::Ok(_)) {
+                        return Err(Broke::Oracle(std::format!("actor {idx} saw Err without injected error")));
+                    }
+                    if let Some(prev) = first_outcome {
+                        if prev != out {
+                            return Err(Broke::Oracle(std::format!(
+                                "duplicate or divergent outcomes: actor {idx} saw {out:?}, expected {prev:?}"
+                            )));
+                        }
+                    } else {
+                        first_outcome = Some(out);
+                    }
+                }
+                ActorState::Cancelled => {}
+                other => {
+                    return Err(Broke::Oracle(std::format!(
+                        "actor {idx} did not terminate (deadlocked/stuck in {other:?})"
+                    )));
+                }
+            }
+        }
+        if first_outcome.is_some() && completed_inits != 1 {
+            return Err(Broke::Oracle(std::format!(
+                "duplicate initialization: completed_inits={completed_inits} (expected 1)"
+            )));
         }
         Ok(())
     }
 
     #[test]
-    fn shared_command_probes_dst_initializes_once_and_shares_across_interleavings() {
-        for seed in 1..=16u64 {
-            if let Err(why) = run_dst_scenario(seed, ProbeOncePlant::None, None) {
-                panic!("DST oracle failed on success path: {why}");
-            }
-        }
-    }
-
-    #[test]
-    fn shared_command_probes_dst_propagates_injected_init_failure_consistently() {
-        for seed in 101..=116u64 {
-            if let Err(why) = run_dst_scenario(
-                seed,
-                ProbeOncePlant::None,
-                Some("injected SystemVersion.plist read failure"),
-            ) {
-                panic!("DST oracle failed on injected error path: {why}");
-            }
-        }
+    fn shared_command_probes_dst_tape_schedule_initializes_once_across_interleavings() {
+        sim_check(Config::cases(500), |tape| probe_init_schedule(tape, ProbeOncePlant::None));
     }
 
     #[test]
     fn shared_command_probes_dst_negative_control_catches_duplicate_init() {
-        let mut caught = 0usize;
-        for seed in 1..=8u64 {
-            if run_dst_scenario(seed, ProbeOncePlant::SkipOnce, None).is_err() {
-                caught += 1;
-            }
-        }
-        assert_eq!(
-            caught, 8,
-            "DST oracle must catch planted duplicate initialization on every seed"
+        control(
+            Config::cases(500),
+            ProbeOncePlant::None,
+            ProbeOncePlant::SkipOnce,
+            "duplicate",
+            probe_init_schedule,
         );
+    }
+
+    /// Directly exercises the real `SharedCommandProbes` `bstd::sync::Once` slots on `Io::sim`
+    /// (zero OS threads): verifies single-init caching, sticky error publication across callers,
+    /// and the `ProbeOncePlant::SkipOnce` negative control.
+    #[test]
+    fn shared_command_probes_real_once_single_init_and_sticky_error() {
+        let io = Io::simulated(SimWorld::new(42, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root sim cx");
+        let env = sim_env(&io);
+
+        // 1. Real `c_probes` initializes exactly once and returns the exact same setting.
+        let holder = SharedCommandProbes::new();
+        let probes = holder.with_env(&env);
+        let c_inits = AtomicU32::new(0);
+        for _ in 0..4 {
+            let res = probes
+                .c_probes_with(&cx, |_| {
+                    let n = c_inits.fetch_add(1, Ordering::SeqCst) + 1;
+                    Some(CProbeSetting::Unavailable(blaze_own::Arc::from_str_in(
+                        std::format!("ok-{n}").as_str(),
+                        SharedAlloc::global(),
+                    )))
+                })
+                .expect("c_probes succeeds");
+            assert!(matches!(res, Some(CProbeSetting::Unavailable(ref s)) if s.as_ref() == "ok-1"));
+        }
+        assert_eq!(c_inits.load(Ordering::SeqCst), 1);
+
+        // 2. Injected spawn-pin error is published once and returned identically to all callers.
+        let err_holder = SharedCommandProbes::new();
+        let err_probes = err_holder.with_env(&env);
+        let s_inits = AtomicU32::new(0);
+        for _ in 0..4 {
+            let err = err_probes
+                .spawn_setting_snapshot_with(&cx, |_| {
+                    let n = s_inits.fetch_add(1, Ordering::SeqCst) + 1;
+                    Err(blaze_own::String::from_str_in(
+                        std::format!("injected plist error #{n}").as_str(),
+                        SharedAlloc::global(),
+                    ))
+                })
+                .expect_err("injected spawn error must propagate");
+            assert_eq!(err.0.as_str(), "injected plist error #1");
+        }
+        assert_eq!(s_inits.load(Ordering::SeqCst), 1);
+
+        // 3. Real `SharedCommandProbes` negative control under `ProbeOncePlant::SkipOnce`.
+        let planted_holder = SharedCommandProbes::new_with_plant(ProbeOncePlant::SkipOnce);
+        let planted = planted_holder.with_env(&env);
+        let p_inits = AtomicU32::new(0);
+        for _ in 0..2 {
+            let _ = planted.spawn_setting_snapshot_with(&cx, |_| {
+                p_inits.fetch_add(1, Ordering::SeqCst);
+                Ok(SpawnSetting::facts_only(FactPins {
+                    clang_version_text: std::string::String::from("clang version 23.0.0"),
+                    macos_product_version: std::string::String::new(),
+                    macos_build_version: std::string::String::new(),
+                }))
+            });
+        }
+        assert_eq!(p_inits.load(Ordering::SeqCst), 2, "SkipOnce plant must duplicate init");
     }
 }

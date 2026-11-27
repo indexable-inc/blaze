@@ -284,7 +284,7 @@ pub(crate) struct Handles<'h, 'f> {
     pub(crate) members: Option<&'h [crate::graph::CheckoutDir]>,
     pub(crate) env: &'h FetchEnv<'h>,
     pub(crate) producers: blaze_ids::producer::Producers,
-    pub(crate) probes: &'h crate::scripts::SharedCommandProbes<'h>,
+    pub(crate) probes: crate::scripts::CommandProbes<'h>,
     pub(crate) side: Option<&'h crate::proc_runner::MacroSide<'h, 'h, 'h>>,
     pub(crate) outlined: &'h [Outlined<'h>],
     pub(crate) workers: core::num::NonZeroU32,

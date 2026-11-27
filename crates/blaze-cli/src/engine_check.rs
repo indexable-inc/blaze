@@ -1647,6 +1647,7 @@ fn preserve_standing_sibling_names<'a, 'f, 's, 'r>(
     last_lines: Option<&crate::engine_lines::Last<'_, '_>>,
     tools: &blaze_engine::Tools,
     env: &FetchEnv<'_>,
+    script_module_probe_tags: &[(blaze_ids::ContentId, crate::wasm64_compile::Hex64)],
     alloc: SharedAlloc<'a>,
     heap_alloc: blaze_own::Alloc<'static>,
 ) -> Result<Option<ScopedUnits>, CliError> {
@@ -1722,7 +1723,10 @@ fn preserve_standing_sibling_names<'a, 'f, 's, 'r>(
     }
     for subject in world.script_module_subjects() {
         let name = crate::script_modules::name(subject);
-        module_sources.insert(name, crate::script_modules::part_source(graph_pub.source, subject));
+        module_sources.insert(
+            name,
+            crate::engine_scripts::script_module_task_source(graph_pub.source, subject, script_module_probe_tags),
+        );
     }
     let mut given_answers: SMap<'_, Name, blaze_ids::ContentId> = SMap::new_in(alloc);
     let mut changed_slots: SSet<'_, Name> = SSet::new_in(alloc);
@@ -4145,6 +4149,7 @@ fn checking<'f, 's: 'f>(
         scoped: Option<ScopedUnits>,
     }
 
+    let command_probes = crate::scripts::SharedCommandProbes::new();
     let mut ready_preflight = None;
     if matches!(chosen, crate::engine_ready_edit::Chosen::Wake { .. }) && !crate::engine_units::ready_lays_out() {
         let attempt = own_frame(|| -> Result<Result<blaze_own::Box<CheckedSetup<'_, '_>, blaze_own::Alloc<'static>>, crate::engine_ready_edit::ReadyRefused>, CliError> {
@@ -4370,11 +4375,26 @@ fn checking<'f, 's: 'f>(
                 planned.push(Planned { name: one.name, phase: Phase::new(Stage::Units, one.wave), source: one.source, file: one.name });
             }
             if let Some(stage) = &names {
-                if stage.names.as_ref().is_some_and(|world| world.script_keys().next().is_some())
-                    && let Some(lazy) = lazy_sdk
+                if stage.names.as_ref().is_some_and(|world| {
+                    use blaze_world::crate_list::CrateGraph as _;
+                    world.script_keys().next().is_some()
+                        || (0..world.list().len()).any(|at| world.list().proc_macro(at))
+                }) && let Some(lazy) = lazy_sdk
                 {
                     env.sdk = lazy.resolve_in_home(cx, home_dir, phases);
                 }
+                let script_module_probe_tags = match (stage.names.as_ref(), discovered.get_mut(Name::unit_graph())) {
+                    (Some(world), Some(graph_pub)) => crate::engine_scripts::plan_dep_probe_tags(
+                        cx,
+                        world,
+                        &mut store,
+                        graph_pub,
+                        tools,
+                        command_probes.with_env(&env),
+                        frame,
+                    )?,
+                    _ => Vec::new_in(frame),
+                };
                 let _cx = cx.span(STAGES_PLAN_SPAN);
                 let preserved_names = match (scoped.as_ref(), stored.as_ref()) {
                     (Some(strict), Some(last_stored)) => preserve_standing_sibling_names(
@@ -4388,13 +4408,14 @@ fn checking<'f, 's: 'f>(
                         last_lines.as_ref(),
                         &tools,
                         &env,
+                        script_module_probe_tags.as_slice(),
                         alloc,
                         heap.alloc(),
                     )?,
                     _ => None,
                 };
                 let names_scoped = preserved_names.as_ref().or(scoped.as_ref());
-                planned.extend(scripts.plan(stage, &discovered, tools, &env, names_scoped, alloc, frame)?);
+                planned.extend(scripts.plan(stage, &discovered, tools, &env, names_scoped, script_module_probe_tags.as_slice(), alloc, frame)?);
                 let no_reads = Rows::new_in(frame);
                 planned.extend(scripts.plan_reads(followed_kept.as_ref().map_or(&no_reads, |followed: &sweep::Followed<'_>| &followed.now), alloc));
                 planned.extend(stage.plan(names_scoped, alloc, frame)?);
@@ -4726,11 +4747,10 @@ fn checking<'f, 's: 'f>(
         buffers.push(Buffer::new_in(alloc));
     }
     let members = crate::names::member_dirs(laid_now);
-    let command_probes = crate::scripts::SharedCommandProbes::new(&env);
     let side = laid_now.and_then(|laid| laid.lock.as_ref()).map(|lockfile| crate::proc_runner::MacroSide {
         lock: lockfile,
         place: crate::macros::Place { home: env.home, checkout: env.checkout, members, rows: &rows },
-        probes: &command_probes,
+        probes: command_probes.with_env(&env),
         // PHASE-MEM-DEBT(Names): the proc macros' expansions on the process heap
         // (proc_runner.rs `MacroSide::heap`, `&'static Heap`): made in a Names phase, read by
         // the Scripts and Names phases after; the record is what should cross.
@@ -4742,7 +4762,7 @@ fn checking<'f, 's: 'f>(
         members,
         env: &env,
         producers,
-        probes: &command_probes,
+        probes: command_probes.with_env(&env),
         side: side.as_ref(),
         outlined: &outlined,
         workers,

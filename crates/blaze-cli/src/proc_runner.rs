@@ -44,7 +44,7 @@ pub(crate) struct MacroSide<'s, 'p, 'r> {
     pub place: crate::macros::Place<'p, 'r>,
     /// Shared lazy command-level probe/pin handle so proc-macro module lookup matches
     /// `macros::list` and `wasm64_compile` when a proc-macro has dependency build scripts.
-    pub probes: &'s crate::scripts::SharedCommandProbes<'s>,
+    pub probes: crate::scripts::CommandProbes<'s>,
     /// The process's heap, handed from `main` (`FetchEnv::heap`): the runtime's.
     pub heap: &'static blaze_own::Heap,
 }
