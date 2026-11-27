@@ -25,6 +25,7 @@
 //! minimum; that each `dyld_chained_starts_in_segment` may sit 8-aligned.
 
 use blaze_code::record::Symbol;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::Hasher;
 use blaze_own::{AString, AVec, Alloc, Vec};
 
@@ -35,6 +36,7 @@ use crate::error::ExportError;
 use crate::layout::{FixTo, Laid, Plan};
 use crate::native_dylib::DYLIB_VERSION;
 use crate::native_merge::{self, Merged, NATIVE_DATA, NATIVE_TEXT, Sect};
+use crate::par::{ExportLinkTimes, ExportRunner, SequentialExportRunner};
 use crate::plant::{self, Plant};
 use crate::sign;
 
@@ -505,9 +507,15 @@ fn section(name: &'static str, seg: &'static str, addr: u64, size: u64, offset: 
     Section { name, seg, addr: BASE + addr, size, offset, align, flags, reserved1: 0 }
 }
 
-/// Byte length of `name` after stripping embedded NUL bytes (for Mach-O `strtab`).
-fn sanitized_len(name: &str) -> usize {
-    name.as_bytes().iter().filter(|&&b| b != 0).count()
+/// Returns `(sanitized_len, has_nul)` in one pass over `name`'s bytes (for Mach-O `strtab`).
+#[inline]
+fn sanitized_info(name: &str) -> (usize, bool) {
+    let bytes = name.as_bytes();
+    if !bytes.contains(&0) {
+        (bytes.len(), false)
+    } else {
+        (bytes.iter().filter(|&&b| b != 0).count(), true)
+    }
 }
 
 /// Writes `laid` as a Mach-O executable into `out` (its contents replaced): the file, whole,
@@ -533,6 +541,27 @@ pub fn write_native<'a>(
     out: &mut AVec<'a, u8>,
     alloc: Alloc<'a>,
 ) -> Result<[u8; 16], ExportError> {
+    let mut times = ExportLinkTimes::default();
+    write_native_par(laid, eh, native, symbol_names, identifier, seed, out, alloc, &SequentialExportRunner, &mut times)
+}
+
+/// Parallel [`write_native`]: O(1) symbol name index, single exact reservation of `link` and `out`,
+/// parallel `__text` copy, and parallel 4 KiB ad-hoc SHA-256 page signing (bit-for-bit identical
+/// to [`write_native`], Rule 25).
+#[allow(clippy::too_many_arguments)]
+pub fn write_native_par<'a, R: ExportRunner>(
+    laid: &Laid<'_, '_>,
+    eh: &EhSections<'_>,
+    native: Option<&Merged<'_, '_>>,
+    symbol_names: &[(Symbol, &str)],
+    identifier: &str,
+    seed: &[u8; 32],
+    out: &mut AVec<'a, u8>,
+    alloc: Alloc<'a>,
+    runner: &R,
+    times: &mut ExportLinkTimes,
+) -> Result<[u8; 16], ExportError> {
+    let t_write = runner.now_ns();
     let has_const = !laid.konst.is_empty();
     let has_data = !laid.data.is_empty() || laid.zero_len > 0;
     // `__TEXT` holds the code and, after it, the unwind tables (eh_out.rs).
@@ -630,39 +659,54 @@ pub fn write_native<'a>(
     bytes::pad(&mut link, 8);
     let starts_len = link.len() as u64 - starts_at;
     let symtab_at = u64::try_from(link.len()).map_err(|_| ExportError::TooLarge { what: "the Mach-O symbol table offset", len: u64::MAX })?;
-    // Build a deterministic sorted index of `symbol_names` (O(N log N), zero recursion) and
-    // resolve each placed function in placement order (`laid.placed`). Empty or NUL-only names
-    // are skipped; embedded NUL bytes are stripped when advancing `strx` and writing `strtab`.
-    let mut local_syms: AVec<'_, (&str, u64)> = Vec::new_in(alloc);
+    // Build a deterministic O(1) index of `symbol_names` (keeping the lexicographically smallest
+    // name on duplicate `Symbol`, matching `sort_unstable + dedup_by_key` byte-for-byte — Rule 25)
+    // and resolve each placed function in placement order (`laid.placed`).
+    let mut local_syms: AVec<'_, (&str, usize, bool, u64)> = Vec::new_in(alloc);
+    let mut strtab_est = 2usize;
     if !symbol_names.is_empty() {
-        let mut name_index: AVec<'_, (Symbol, &str)> = Vec::with_capacity_in(symbol_names.len(), alloc);
+        let mut name_map: Map<Symbol, (&str, usize, bool), FixedState, Alloc<'a>> =
+            Map::new(MapOpts { hasher: FixedState, alloc, capacity: Some(symbol_names.len()) });
         for &(sym, name) in symbol_names {
-            if sanitized_len(name) > 0 {
-                name_index.push((sym, name));
+            let (slen, has_nul) = sanitized_info(name);
+            if slen == 0 {
+                continue;
+            }
+            match name_map.get_mut(&sym) {
+                Some(existing) => {
+                    if name < existing.0 {
+                        *existing = (name, slen, has_nul);
+                    }
+                }
+                None => {
+                    name_map.insert(sym, (name, slen, has_nul));
+                }
             }
         }
-        name_index.sort_unstable();
-        name_index.dedup_by_key(|entry| entry.0);
-        local_syms.reserve(laid.placed.len().min(name_index.len()));
+        local_syms.reserve(laid.placed.len().min(name_map.len()));
         for p in laid.placed.iter() {
-            if let Ok(idx) = name_index.binary_search_by_key(&p.symbol, |&(sym, _)| sym)
-                && let Some(&(_, name)) = name_index.get(idx)
-            {
-                local_syms.push((name, BASE + p.at));
+            if let Some(&(name, slen, has_nul)) = name_map.get(&p.symbol) {
+                local_syms.push((name, slen, has_nul, BASE + p.at));
+                strtab_est = strtab_est.saturating_add(slen + 2);
             }
         }
     }
     let n_local = local_syms.len();
     let n = laid.imports.len();
+    for import in laid.imports.iter() {
+        strtab_est = strtab_est.saturating_add(import.name.len() + 2);
+    }
+    let link_tail_est = (n_local + n).saturating_mul(16) + n.saturating_mul(4) + strtab_est + 32;
+    link.reserve(link_tail_est);
     let mut strx = 2u32;
-    for &(name, value) in local_syms.iter() {
+    for &(_name, slen, _has_nul, value) in local_syms.iter() {
         // `nlist_64`: n_strx, n_type (`N_SECT`), n_sect (`1` = `__TEXT,__text`), n_desc, n_value.
         bytes::u32(&mut link, strx);
         bytes::u8(&mut link, N_SECT);
         bytes::u8(&mut link, 1);
         bytes::u16(&mut link, 0);
         bytes::u64(&mut link, value);
-        let step = sanitized_len(name)
+        let step = slen
             .checked_add(2)
             .and_then(|v| u32::try_from(v).ok())
             .ok_or(ExportError::TooLarge { what: "the Mach-O string table", len: u64::from(strx) })?;
@@ -697,9 +741,9 @@ pub fn write_native<'a>(
     }
     let strtab_at = u64::try_from(link.len()).map_err(|_| ExportError::TooLarge { what: "the Mach-O string table offset", len: u64::MAX })?;
     link.extend_from_slice(b" \0");
-    for &(name, _) in local_syms.iter() {
+    for &(name, _slen, has_nul, _) in local_syms.iter() {
         link.push(b'_');
-        if !name.as_bytes().contains(&0) {
+        if !has_nul {
             link.extend_from_slice(name.as_bytes());
         } else {
             for &b in name.as_bytes() {
@@ -807,6 +851,9 @@ pub fn write_native<'a>(
     };
     tail(&t, libraries, |command| cmds.push(command));
     out.clear();
+    let final_file_len = usize::try_from(code_limit.saturating_add(sig_len))
+        .map_err(|_| ExportError::TooLarge { what: "the Mach-O output size", len: code_limit.saturating_add(sig_len) })?;
+    out.reserve_exact(final_file_len);
     let header = Header { filetype: MH_EXECUTE, flags: MH_FLAGS | native.map_or(0, |m| m.header_flags()) };
     let uuid_at = match cmds.write(out, header, laid.text_at) {
         Ok(written) => written.uuid_at,
@@ -816,6 +863,7 @@ pub fn write_native<'a>(
 
     // The regions at their offsets, the fixups' slots in them.
     out.resize(laid.text_at as usize, 0);
+    // Direct single-pass copy into pre-reserved capacity avoids an extra full-size zero-fill pass.
     out.extend_from_slice(&laid.text);
     out.resize(eh.eh_frame_at as usize, 0);
     out.extend_from_slice(&eh.eh_frame);
@@ -853,8 +901,10 @@ pub fn write_native<'a>(
         bytes::set64(out, file_of(at) as usize, value);
     }
     out.extend_from_slice(&link);
+    times.write_ns = runner.now_ns().saturating_sub(t_write);
 
     // The identity of the content, then the signature over every byte before it.
+    let t_uuid = runner.now_ns();
     let mut hasher = Hasher::new(UUID_DOMAIN);
     hasher.update(seed);
     hasher.update(&out[..]);
@@ -862,11 +912,15 @@ pub fn write_native<'a>(
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(&digest[..16]);
     out[uuid_at..uuid_at + 16].copy_from_slice(&uuid);
-    sign::sign(out, identifier, text_size, true);
+    times.uuid_ns = runner.now_ns().saturating_sub(t_uuid);
+
+    let t_sign = runner.now_ns();
+    sign::sign_par(out, identifier, text_size, true, runner);
     if late {
         let (at, value) = slots[slots.len() - 1];
         bytes::set64(out, file_of(at) as usize, value);
     }
+    times.sign_ns = runner.now_ns().saturating_sub(t_sign);
     Ok(uuid)
 }
 

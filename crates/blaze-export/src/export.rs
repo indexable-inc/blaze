@@ -12,8 +12,9 @@ use blaze_own::{AVec, Alloc, Vec};
 use crate::eh_out::{Outside, eh_room_with, eh_sections_with};
 use crate::error::ExportError;
 use crate::input::{Entry, Panic, Platform, ProgramIn, Tier};
-use crate::layout::{Member, TlsPlan, lay_out_with_tls};
+use crate::layout::{Member, TlsPlan, lay_out_with_tls_par};
 use crate::native_merge::{self, MergeError};
+use crate::par::{ExportLinkTimes, ExportRunner, SequentialExportRunner};
 use crate::start::{main_of, start};
 use crate::{elf, macho};
 
@@ -102,6 +103,21 @@ fn panics(program: &ProgramIn<'_>, functions: u32) -> Panics {
 
 /// Exports `program` for `platform`: the file's bytes replace `out`'s contents.
 pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a, u8>, alloc: Alloc<'a>) -> Result<Exported, ExportError> {
+    export_par(program, platform, out, alloc, &SequentialExportRunner).map(|(exported, _)| exported)
+}
+
+/// Parallel [`export`] using `runner` for fold hashing, text copy + ARM64 site relocation
+/// patching, segment writes, and Mach-O ad-hoc SHA-256 page signing, returning both [`Exported`]
+/// and fine-grained sub-phase durations ([`ExportLinkTimes`]). Output bytes are bit-for-bit
+/// identical to [`export`] regardless of worker count (Rule 25).
+pub fn export_par<'a, R: ExportRunner>(
+    program: &ProgramIn<'_>,
+    platform: Platform,
+    out: &mut AVec<'a, u8>,
+    alloc: Alloc<'a>,
+    runner: &R,
+) -> Result<(Exported, ExportLinkTimes), ExportError> {
+    let mut times = ExportLinkTimes::default();
     if platform == Platform::Wasm64 {
         return Err(ExportError::Wasm64RequiresWasmProgram);
     }
@@ -156,8 +172,10 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
         Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),
     };
     let tls_plan = program.tls.map(|t| TlsPlan { descriptor: t.descriptor, mod_init_fn: start.tls_init, initial_root });
+    let t_eh_room = runner.now_ns();
     let room = eh_room_with(&members, program.personality, platform, program.natives, alloc)?;
-    let laid = lay_out_with_tls(&members, program.data, start.entry, program.profile, plan, room, tls_plan, alloc)?;
+    times.eh_room_ns = runner.now_ns().saturating_sub(t_eh_room);
+    let laid = lay_out_with_tls_par(&members, program.data, start.entry, program.profile, plan, room, tls_plan, alloc, runner, &mut times)?;
     let seed = program.profile.map_or([0u8; 32], |p| p.digest);
     let (eh, identity, bound) = match platform {
         Platform::MacosArm64 => {
@@ -169,8 +187,10 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
                 (Some(image), Some(m)) => Some(Outside { image, shift: m.shift }),
                 _ => None,
             };
+            let t_eh = runner.now_ns();
             let eh = eh_sections_with(&laid, &members, program.personality, platform, outside.as_ref(), alloc)?;
-            let identity = macho::write_native(&laid, &eh, merged.as_ref(), program.symbol_names, program.name, &seed, out, alloc)?;
+            times.eh_sections_ns = runner.now_ns().saturating_sub(t_eh);
+            let identity = macho::write_native_par(&laid, &eh, merged.as_ref(), program.symbol_names, program.name, &seed, out, alloc, runner, &mut times)?;
             let bound = merged.as_ref().map_or(laid.imports.len(), |m| m.bound(laid.imports.len()));
             (eh, identity, bound)
         }
@@ -183,8 +203,10 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
                 (Some(image), Some(m)) => Some(Outside { image, shift: m.shift }),
                 _ => None,
             };
+            let t_eh = runner.now_ns();
             let eh = eh_sections_with(&laid, &members, program.personality, platform, outside.as_ref(), alloc)?;
-            let identity = elf::write_native(&laid, &eh, merged.as_ref(), &seed, out, alloc)?;
+            times.eh_sections_ns = runner.now_ns().saturating_sub(t_eh);
+            let identity = elf::write_native_par(&laid, &eh, merged.as_ref(), &seed, out, alloc, runner, &mut times)?;
             let bound = merged.as_ref().map_or(laid.imports.len(), |m| m.bound(laid.imports.len()));
             (eh, identity, bound)
         }
@@ -205,17 +227,20 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
             }
         }
     }
-    Ok(Exported {
-        platform,
-        functions,
-        folded,
-        fast,
-        optimized,
-        made,
-        imports: bound as u32,
-        len: out.len() as u64,
-        identity,
-        profile: program.profile.map(|p| p.digest),
-        panics,
-    })
+    Ok((
+        Exported {
+            platform,
+            functions,
+            folded,
+            fast,
+            optimized,
+            made,
+            imports: bound as u32,
+            len: out.len() as u64,
+            identity,
+            profile: program.profile.map(|p| p.digest),
+            panics,
+        },
+        times,
+    ))
 }

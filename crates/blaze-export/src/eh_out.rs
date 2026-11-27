@@ -259,6 +259,149 @@ fn cie(f: &mut AVec<'_, u8>, personality: Option<u64>, patches: &mut AVec<'_, (u
     finish(f, start)
 }
 
+/// Computes the exact byte end of [`tables`] without allocating or writing `eh_frame`,
+/// `except_tab`, `patches`, `unwind_info`, or `eh_frame_hdr` (eliminating double EH table
+/// construction on every export while preserving byte-exact [`eh_room`] bounds).
+fn measure_tables(
+    covered: &[Covered<'_>],
+    personality_at: Option<u64>,
+    at: u64,
+    platform: Platform,
+    outside: Option<&Outside<'_, '_>>,
+    alloc: Alloc<'_>,
+) -> Result<u64, ExportError> {
+    let mut scratch_lsda: AVec<'_, u8> = Vec::new_in(alloc);
+    let mut given: AVec<'_, Given> = Vec::with_capacity_in(covered.len(), alloc);
+    let mut except_len = 0u64;
+    let mut landing = 0u32;
+    for c in covered {
+        let lsda = match c.unwind.frame().is_some() && c.unwind.lands() {
+            false => None,
+            true => {
+                if personality_at.is_none() {
+                    return Err(ExportError::NoPersonality { symbol: c.symbol });
+                }
+                except_len = up(except_len, 4);
+                let offset = except_len;
+                scratch_lsda.clear();
+                eh::lsda_table(&c.unwind, &mut scratch_lsda).map_err(|error| ExportError::Lsda { symbol: c.symbol, error })?;
+                except_len += scratch_lsda.len() as u64;
+                landing += 1;
+                Some(offset)
+            }
+        };
+        given.push(Given { fde: None, lsda });
+    }
+
+    let mut scratch_cie: AVec<'_, u8> = Vec::with_capacity_in(64, alloc);
+    let mut scratch_patches: AVec<'_, (usize, PatchTo)> = Vec::new_in(alloc);
+    let mut eh_frame_len = 0u64;
+    let plain_cie = match platform {
+        Platform::MacosArm64 => None,
+        Platform::LinuxArm64 | Platform::Wasm64 => {
+            scratch_cie.clear();
+            scratch_patches.clear();
+            cie(&mut scratch_cie, None, &mut scratch_patches)?;
+            let off = eh_frame_len;
+            eh_frame_len += scratch_cie.len() as u64;
+            Some(off)
+        }
+    };
+    let landing_cie = match (landing, personality_at) {
+        (0, _) | (_, None) => plain_cie,
+        (_, Some(routine)) => {
+            scratch_cie.clear();
+            scratch_patches.clear();
+            cie(&mut scratch_cie, Some(routine), &mut scratch_patches)?;
+            let off = eh_frame_len;
+            eh_frame_len += scratch_cie.len() as u64;
+            Some(off)
+        }
+    };
+
+    let mut scratch_prog: AVec<'_, u8> = Vec::with_capacity_in(64, alloc);
+    let mut functions = 0u32;
+    for (k, c) in covered.iter().enumerate() {
+        let Some(frame) = c.unwind.frame() else {
+            continue;
+        };
+        functions += 1;
+        if platform == Platform::MacosArm64 && given[k].lsda.is_none() {
+            continue;
+        }
+        let Some(cie_at) = (match given[k].lsda {
+            Some(_) => landing_cie,
+            None => plain_cie,
+        }) else {
+            continue;
+        };
+        let start = eh_frame_len;
+        let _ = u32_of((start + 4) - cie_at, "an FDE's CIE pointer")?;
+        scratch_prog.clear();
+        eh::frame_program(frame, &mut scratch_prog);
+        let aug_len: u64 = if given[k].lsda.is_some() { 1 + 4 } else { 1 };
+        let raw_len = 4 + 4 + 4 + 4 + aug_len + scratch_prog.len() as u64;
+        let fde_len = up(raw_len, 8);
+        let _ = u32_of(fde_len - 4, "an eh_frame entry's length")?;
+        given[k].fde = Some(u32_of(start, "an FDE's offset in eh_frame")?);
+        eh_frame_len += fde_len;
+    }
+    let native_at = usize::try_from(eh_frame_len).map_err(|_| ExportError::TooLarge { what: "native eh_frame offset", len: eh_frame_len })?;
+    if let Some(o) = outside {
+        let (_, bytes) = o.eh_frame()?;
+        eh_frame_len += bytes.len() as u64;
+        functions += o.image.frames.len() as u32;
+    }
+    eh_frame_len += 4;
+
+    let eh_frame_at = at;
+    let except_tab_at = up(eh_frame_at + eh_frame_len, TABLE_ALIGN);
+    let index_at = up(except_tab_at + except_len, TABLE_ALIGN);
+
+    let index_len: u64 = match platform {
+        Platform::MacosArm64 => {
+            let native_rows = outside.map_or(0, |o| o.image.unwind.len());
+            let mut rows: AVec<'_, Row> = Vec::with_capacity_in(covered.len() + native_rows, alloc);
+            for (k, c) in covered.iter().enumerate() {
+                let end = match covered.get(k + 1) {
+                    Some(next) => next.at,
+                    None => c.at + u64::from(c.unwind.code_len()),
+                };
+                let length = u32_of(end - c.at, "a function's length in __unwind_info")?;
+                rows.push(Row { start: c.at, length, encoding: encoding(c, given[k])?, personality: None, lsda: None });
+            }
+            if let Some(o) = outside {
+                let moved = u32_of(native_at as u64, "the native FDEs' offset in eh_frame")?;
+                for r in o.image.unwind.iter() {
+                    let mut enc = r.encoding;
+                    if enc & MODE_MASK == COMPACT_DWARF {
+                        let fde = (enc & DWARF_OFFSET) + moved;
+                        if fde & !DWARF_OFFSET != 0 {
+                            return Err(ExportError::TooLarge { what: "an FDE's offset in __unwind_info's DWARF mode (24 bits)", len: u64::from(fde) });
+                        }
+                        enc = (enc & !DWARF_OFFSET) | fde;
+                    }
+                    rows.push(Row {
+                        start: r.start + o.shift,
+                        length: r.length,
+                        encoding: enc,
+                        personality: r.personality.map(|cell| cell + o.shift),
+                        lsda: r.lsda.map(|lsda| lsda + o.shift),
+                    });
+                }
+            }
+            native_unwind::unwind_info_len(&rows).map_err(|error| ExportError::NativeUnwind { error })? as u64
+        }
+        Platform::LinuxArm64 => 12 + 8 * u64::from(functions),
+        Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),
+    };
+
+    let end = (eh_frame_at + eh_frame_len)
+        .max(except_tab_at + except_len)
+        .max(index_at + index_len);
+    Ok(end)
+}
+
 /// The tables for `covered` (sorted by address), the personality routine at `personality_at`,
 /// the first table at `at` ([`TABLES_ALIGN`]-aligned).
 fn tables<'a>(
@@ -561,8 +704,8 @@ pub fn eh_room_with<'a>(functions: &[Member<'_>], personality: Option<Symbol>, p
         Platform::LinuxArm64 => crate::elf::PAGE,
     };
     let standin = natives.map(|image| Outside { image, shift: up(base, page) + page });
-    let measured = tables(&covered, personality_at, base, platform, standin.as_ref(), alloc)?;
-    Ok(measured.end() - base + ROOM_SLACK)
+    let measured_end = measure_tables(&covered, personality_at, base, platform, standin.as_ref(), alloc)?;
+    Ok(measured_end - base + ROOM_SLACK)
 }
 
 /// The tables written for `laid` at their place after the code, refused unless they end within
@@ -611,20 +754,35 @@ pub fn eh_sections_with<'a>(
             }
         }
     };
-    let mut by_symbol: AVec<'_, u32> = Vec::with_capacity_in(functions.len(), alloc);
-    for i in 0..functions.len() as u32 {
-        by_symbol.push(i);
-    }
-    by_symbol.sort_unstable_by(|&a, &b| functions[a as usize].symbol.cmp(&functions[b as usize].symbol));
     let mut covered: AVec<'_, Covered<'_>> = Vec::with_capacity_in(laid.placed.len(), alloc);
-    for p in laid.placed.iter() {
-        if p.folded {
-            continue;
+    if laid.placed_member.len() == laid.placed.len() {
+        for (p, &member_idx) in laid.placed.iter().zip(laid.placed_member.iter()) {
+            if p.folded {
+                continue;
+            }
+            let Some(func) = functions.get(member_idx as usize) else {
+                return Err(ExportError::EhNoRecord { symbol: p.symbol });
+            };
+            let unwind = unwind::read(func.record).map_err(|error| ExportError::UnwindRows { symbol: p.symbol, error })?;
+            covered.push(Covered { symbol: p.symbol, at: p.at, unwind });
         }
-        let unwind = read_rows(functions, &by_symbol, p.symbol)?;
-        covered.push(Covered { symbol: p.symbol, at: p.at, unwind });
+    } else {
+        let mut by_symbol: AVec<'_, u32> = Vec::with_capacity_in(functions.len(), alloc);
+        for i in 0..functions.len() as u32 {
+            by_symbol.push(i);
+        }
+        by_symbol.sort_unstable_by(|&a, &b| functions[a as usize].symbol.cmp(&functions[b as usize].symbol));
+        for p in laid.placed.iter() {
+            if p.folded {
+                continue;
+            }
+            let unwind = read_rows(functions, &by_symbol, p.symbol)?;
+            covered.push(Covered { symbol: p.symbol, at: p.at, unwind });
+        }
     }
-    covered.sort_unstable_by_key(|c| c.at);
+    if !covered.is_sorted_by_key(|c| c.at) {
+        covered.sort_unstable_by_key(|c| c.at);
+    }
     let at = up(laid.text_end(), TABLES_ALIGN);
     within_room(laid, tables(&covered, personality_at, at, platform, outside, alloc)?)
 }
@@ -642,8 +800,8 @@ pub fn eh_room_rows<'a>(functions: &[(Symbol, Unwind<'_>)], personality: Option<
     }
     let base = up(at, TABLES_ALIGN);
     let personality_at = personality.map(|_| 0);
-    let measured = tables(&covered, personality_at, base, platform, None, alloc)?;
-    Ok(measured.end() - base + ROOM_SLACK)
+    let measured_end = measure_tables(&covered, personality_at, base, platform, None, alloc)?;
+    Ok(measured_end - base + ROOM_SLACK)
 }
 
 /// [`eh_sections`] over rows already made one `Unwind` each (`(symbol, rows)`, each symbol once,

@@ -33,7 +33,7 @@ use blaze_code::record::{RecordError, Symbol};
 use blaze_emit::{RecordEmitError, RoutinePlaces};
 use blaze_lir::legalize::{LegalizeError, SoftFloat};
 use blaze_lower::head;
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, Vec};
 use blaze_typeck::{ItemKey, List, PortableTys};
 
 use super::heads::CrateCfg;
@@ -297,6 +297,15 @@ pub struct BoundRef<'a> {
 impl<'a> BoundRef<'a> {
     /// Appends one callee per found routine to `funcs` and returns the emitter's routine table.
     pub fn bind(self, funcs: &mut AVec<'_, Callee<'_>>) -> Result<Routines<'a>, CodeRecordError> {
+        self.bind_in(funcs)
+    }
+
+    /// Appends one callee per found routine to `funcs` (any explicit allocator) and returns the
+    /// emitter's routine table.
+    pub fn bind_in<A: core::alloc::Allocator>(
+        self,
+        funcs: &mut Vec<Callee<'_>, A>,
+    ) -> Result<Routines<'a>, CodeRecordError> {
         let mut places = RoutinePlaces::NONE;
         for r in SoftFloat::ALL {
             let Some(symbol) = self.symbols.get(r as usize).copied().flatten() else { continue };
@@ -353,6 +362,34 @@ impl<'r> Routines<'r> {
                 CodeRecordError::Routine(BuiltinsRefused { routine: r, why: bound.found.found(r) })
             }
             (error, _) => CodeRecordError::Emit(error),
+        }
+    }
+
+    /// Feeds every bound soft-float routine's place, `ItemKey`, and name into `hasher` so
+    /// content-addressed LTO emit caches invalidate whenever routine bindings change (Rule 21).
+    pub fn hash_into(&self, hasher: &mut blaze_ids::Hasher) {
+        for r in SoftFloat::ALL {
+            match self.places.place(r) {
+                Some(place) => {
+                    hasher.update(&[1]);
+                    hasher.update(&place.to_le_bytes());
+                }
+                None => {
+                    hasher.update(&[0]);
+                }
+            }
+            match self.bound.and_then(|b| b.declared(r)) {
+                Some(decl) => {
+                    hasher.update(&[1]);
+                    hasher.update(&decl.tabled.0.to_le_bytes());
+                    let len = u32::try_from(decl.name.len()).unwrap_or(u32::MAX);
+                    hasher.update(&len.to_le_bytes());
+                    hasher.update(decl.name);
+                }
+                None => {
+                    hasher.update(&[0]);
+                }
+            }
         }
     }
 }

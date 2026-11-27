@@ -214,9 +214,10 @@ impl<A: Allocator> ModuleBodies<'_, A> {
             let Some(body_imports) = self.imports.get(idx) else {
                 break;
             };
-            let Some(imp) = body_imports.iter().find(|r| r.caller_ref == reference) else {
+            let Ok(pos) = body_imports.binary_search_by_key(&reference, |r| r.caller_ref) else {
                 break;
             };
+            let imp = body_imports[pos];
             from = imp.source_body;
             reference = imp.source_ref;
         }
@@ -620,11 +621,11 @@ impl<A: Allocator> SccLocalBodies<'_, '_, A> {
             let found = if let Some(lpos) = self.local_pos(idx)
                 && let Some(Some(imps)) = self.local_imports.get(lpos)
             {
-                imps.iter().find(|r| r.caller_ref == reference).copied()
+                imps.binary_search_by_key(&reference, |r| r.caller_ref).ok().map(|p| imps[p])
             } else {
                 self.base_imports
                     .get(idx)
-                    .and_then(|imps| imps.iter().find(|r| r.caller_ref == reference).copied())
+                    .and_then(|imps| imps.binary_search_by_key(&reference, |r| r.caller_ref).ok().map(|p| imps[p]))
             };
             let Some(imp) = found else {
                 break;
@@ -712,9 +713,10 @@ impl<A: Allocator> ParModuleBodies<'_, A> {
             let Some(body_imports) = self.imports.get(idx) else {
                 break;
             };
-            let Some(imp) = body_imports.iter().find(|r| r.caller_ref == reference) else {
+            let Ok(pos) = body_imports.binary_search_by_key(&reference, |r| r.caller_ref) else {
                 break;
             };
+            let imp = body_imports[pos];
             from = imp.source_body;
             reference = imp.source_ref;
         }

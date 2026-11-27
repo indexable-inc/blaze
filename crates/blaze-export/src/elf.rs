@@ -28,6 +28,7 @@ use crate::eh_out::EhSections;
 use crate::error::ExportError;
 use crate::layout::{FixTo, Laid, Plan};
 use crate::native_merge::{ElfRelaKind, MergeError, MergedElf};
+use crate::par::{ExportLinkTimes, ExportRunner, SequentialExportRunner};
 
 pub const PAGE: u64 = 0x1_0000;
 
@@ -204,6 +205,25 @@ pub fn write_native<'a>(
     out: &mut AVec<'a, u8>,
     alloc: Alloc<'a>,
 ) -> Result<[u8; 16], ExportError> {
+    let mut times = ExportLinkTimes::default();
+    write_native_par(laid, eh, native, seed, out, alloc, &SequentialExportRunner, &mut times)
+}
+
+/// Parallel [`write_native`]: pre-allocates `out` to exact final length, copies `__text` in
+/// parallel via `runner`, and records sub-phase durations into `times` (bit-for-bit identical to
+/// [`write_native`], Rule 25).
+#[allow(clippy::too_many_arguments)]
+pub fn write_native_par<'a, R: ExportRunner>(
+    laid: &Laid<'_, '_>,
+    eh: &EhSections<'_>,
+    native: Option<&MergedElf<'_, '_>>,
+    seed: &[u8; 32],
+    out: &mut AVec<'a, u8>,
+    alloc: Alloc<'a>,
+    runner: &R,
+    times: &mut ExportLinkTimes,
+) -> Result<[u8; 16], ExportError> {
+    let t_write = runner.now_ns();
     // Program imports defined by the native image — plus ELF linker-synthesized symbols such as
     // `__dso_handle` (the image's ELF header at vaddr 0, matching crtbegin.o / lld's
     // `ElfSym::__dso_handle`) — become `R_AARCH64_RELATIVE` and leave `.dynsym`.
@@ -520,7 +540,10 @@ pub fn write_native<'a>(
     out.extend_from_slice(&[0u8; 16]);
 
     // The loads' bytes at their offsets.
+    let final_len = usize_of(meta_off + meta_len, "ELF final length")?;
+    out.reserve_exact(final_len.saturating_sub(out.len()));
     out.resize(usize_of(laid.text_at, "text_at")?, 0);
+    // Direct single-pass copy into pre-reserved capacity avoids an extra full-size zero-fill pass.
     out.extend_from_slice(&laid.text);
     out.resize(usize_of(eh.eh_frame_at, "eh_frame_at")?, 0);
     out.extend_from_slice(&eh.eh_frame);
@@ -564,7 +587,9 @@ pub fn write_native<'a>(
     }
     out.resize(usize_of(meta_off, "meta_off")?, 0);
     out.extend_from_slice(&meta);
+    times.write_ns = runner.now_ns().saturating_sub(t_write);
 
+    let t_uuid = runner.now_ns();
     let mut hasher = Hasher::new(ID_DOMAIN);
     hasher.update(seed);
     hasher.update(&out[..]);
@@ -572,5 +597,6 @@ pub fn write_native<'a>(
     let mut id = [0u8; 16];
     id.copy_from_slice(&digest[..16]);
     out[id_at..id_at + 16].copy_from_slice(&id);
+    times.uuid_ns = runner.now_ns().saturating_sub(t_uuid);
     Ok(id)
 }

@@ -42,6 +42,7 @@ pub mod native_dylib;
 pub mod native_so;
 pub mod native_merge;
 pub mod optimized;
+pub mod par;
 mod plant;
 pub mod sign;
 pub mod start;
@@ -49,7 +50,8 @@ pub mod start;
 pub mod wasm64;
 
 pub use error::ExportError;
-pub use export::{Exported, Panics, export};
+pub use export::{Exported, Panics, export, export_par};
+pub use par::{ExportLinkTimes, ExportRunner, SequentialExportRunner};
 pub use input::{CExport, Data, DataPlace, DataWord, Entry, Function, Panic, Platform, Profile, ProgramIn, Tier, TlsRuntime};
 pub use lir_wasm64::{
     LirWasm64Error, LirWasm64Func, LirWasm64Global, LirWasm64GlobalValue, LirWasm64Import,

@@ -30,11 +30,13 @@
 use blaze_code::a64::{ADD64, ADRP, BLR, LDR64, NOP, add_lo12, adrp, bl, expect, ldr_lo12, up, write32};
 use blaze_code::record::{CodeView, NO_TARGET, OWN_CODE, OWN_RELRO, SiteKind, Space, Symbol, Target, Word};
 use blaze_code::tls::{CAP as TLS_CAP, DESC_VARS, ROW_BYTES as TLS_ROW_BYTES, ROW_INIT, descriptor as tls_descriptor, var_row as tls_var_row};
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::Hasher;
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::error::ExportError;
 use crate::input::{Data, DataPlace, Profile, Tier};
+use crate::par::{ExportLinkTimes, ExportRunner, SequentialExportRunner};
 
 const FOLD_DOMAIN: &str = "blaze-export fold 1";
 
@@ -133,6 +135,9 @@ pub struct Laid<'a, 'r> {
     pub entry: u64,
     /// In placement order.
     pub placed: AVec<'a, Placed>,
+    /// Index into `members` corresponding 1:1 with `placed`, so `eh_sections_with` reads unwind
+    /// rows in O(1) without re-sorting `by_symbol`.
+    pub(crate) placed_member: AVec<'a, u32>,
     /// The bytes kept after the code for the unwind tables: what eh_out.rs `eh_room` measured
     /// (the layout's `tail`). `eh_sections` refuses tables past it in every build.
     pub tables_room: u64,
@@ -393,7 +398,48 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
     // The const region: the writer's head, the GOT, optional `__mod_init_func`, TLS index words,
     // TLS `VarRow` table, relro parts, read-only data and TLS templates.
     let const_at = up(text_end + tail, page);
-    let mut konst: AVec<'a, u8> = Vec::new_in(alloc);
+    // Pre-compute exact `konst` and `data` byte sizes so neither vector reallocates on large binaries.
+    let mut est_konst = up(const_at + plan.const_head, 8) - const_at + 8 * imports_len as u64;
+    if tls_plan.and_then(|t| t.mod_init_fn).is_some() {
+        est_konst += 8;
+    }
+    let est_post_tables = est_konst;
+    if !tls_targets.is_empty() {
+        est_konst = up(const_at + est_konst, 16) - const_at;
+    }
+    est_konst += tls_count.saturating_mul(8) + tls_targets.len().saturating_mul(TLS_ROW_BYTES) as u64;
+    for (pos, &i) in order.iter().enumerate() {
+        if rep[pos] as usize != pos {
+            continue;
+        }
+        let rlen = members[i as usize].relro().len() as u64;
+        if rlen > 0 {
+            est_konst = up(const_at + est_konst, 16) - const_at + rlen;
+        }
+    }
+    let mut est_data = 0u64;
+    for &d in by_target.iter() {
+        let Some(datum) = data.get(usize::try_from(d).unwrap_or(usize::MAX)) else {
+            continue;
+        };
+        let in_const = match datum.target.space {
+            Space::Tls => !matches!(datum.place, DataPlace::Zeroed { .. }) && !datum.bytes.is_empty(),
+            Space::Static | Space::Vtable => datum.place == DataPlace::ReadOnly,
+            Space::Func | Space::Outside | Space::WeakOutside => false,
+        };
+        if in_const {
+            if est_konst == est_post_tables {
+                est_konst = up(const_at + est_konst, 16) - const_at;
+            }
+            est_konst = up(const_at + est_konst, u64::from(datum.align)) - const_at + datum.bytes.len() as u64;
+        } else if datum.target.space != Space::Tls && datum.place == DataPlace::Writable {
+            est_data = up(est_data, u64::from(datum.align)) + datum.bytes.len() as u64;
+        }
+    }
+    if tls_plan.is_some() {
+        est_data = up(est_data, 8) + 64;
+    }
+    let mut konst: AVec<'a, u8> = Vec::with_capacity_in(usize::try_from(est_konst).unwrap_or(0), alloc);
     konst.resize(plan.const_head as usize, 0);
     pad_to(&mut konst, const_at, 8);
     let got_at = const_at + konst.len() as u64;
@@ -476,7 +522,7 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
     }
     // The data region: writable data, optional TLS `Desc`, then zeroed data with no file bytes.
     let data_at = up(const_at + konst.len() as u64, page);
-    let mut bytes: AVec<'a, u8> = Vec::new_in(alloc);
+    let mut bytes: AVec<'a, u8> = Vec::with_capacity_in(usize::try_from(est_data).unwrap_or(0), alloc);
     for &d in by_target.iter() {
         let Some(datum) = data.get(usize::try_from(d).unwrap_or(usize::MAX)) else {
             continue;
@@ -534,6 +580,193 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
     })
 }
 
+const EMPTY_SLOT: u32 = u32::MAX;
+
+#[derive(Clone, Copy)]
+struct SymSlot {
+    symbol: Symbol,
+    idx: u32,
+}
+
+#[derive(Clone, Copy)]
+struct TargetSlot {
+    target: Target,
+    idx: u32,
+}
+
+#[inline]
+fn hash_symbol_bytes(b: &[u8; 32]) -> usize {
+    let w0 = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+    let w1 = u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
+    let w2 = u64::from_le_bytes([b[16], b[17], b[18], b[19], b[20], b[21], b[22], b[23]]);
+    let w3 = u64::from_le_bytes([b[24], b[25], b[26], b[27], b[28], b[29], b[30], b[31]]);
+    let mut h = w0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ w1.rotate_left(17) ^ w2.rotate_left(33) ^ w3.rotate_left(49);
+    h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (h ^ (h >> 31)) as usize
+}
+
+#[inline]
+fn hash_target(t: Target) -> usize {
+    hash_symbol_bytes(&t.symbol.0).wrapping_add((t.space as usize).wrapping_mul(0x517C_C1B7))
+}
+
+fn table_cap(len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        len.saturating_mul(2).next_power_of_two().max(8)
+    }
+}
+
+/// O(1) symbol, datum, and import lookup tables stored in caller-allocated flat power-of-2 slices
+/// whose borrowed [`FastIndicesView`] is `Copy + Sync` for parallel `ExportRunner` workers
+/// (zero `unsafe`, 100% deterministic — Rule 25).
+pub(crate) struct FastIndices<'a> {
+    sym_to_member: AVec<'a, SymSlot>,
+    target_to_data: AVec<'a, TargetSlot>,
+    import_to_idx: AVec<'a, SymSlot>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FastIndicesView<'a> {
+    sym_to_member: &'a [SymSlot],
+    target_to_data: &'a [TargetSlot],
+    import_to_idx: &'a [SymSlot],
+}
+
+impl<'a> FastIndices<'a> {
+    fn build<M: LayoutMember>(
+        members: &[M],
+        data: &[Data<'_>],
+        imports: &[Import<'_>],
+        alloc: Alloc<'a>,
+    ) -> Self {
+        let sym_cap = table_cap(members.len());
+        let mut sym_to_member = Vec::from_elem_in(SymSlot { symbol: Symbol([0; 32]), idx: EMPTY_SLOT }, sym_cap, alloc);
+        if sym_cap > 0 {
+            let mask = sym_cap - 1;
+            for (i, m) in members.iter().enumerate() {
+                let sym = m.symbol();
+                let mut pos = hash_symbol_bytes(&sym.0) & mask;
+                while sym_to_member[pos].idx != EMPTY_SLOT {
+                    pos = (pos + 1) & mask;
+                }
+                sym_to_member[pos] = SymSlot { symbol: sym, idx: i as u32 };
+            }
+        }
+
+        let data_cap = table_cap(data.len());
+        let mut target_to_data = Vec::from_elem_in(
+            TargetSlot { target: Target { space: Space::Func, symbol: Symbol([0; 32]) }, idx: EMPTY_SLOT },
+            data_cap,
+            alloc,
+        );
+        if data_cap > 0 {
+            let mask = data_cap - 1;
+            for (d, datum) in data.iter().enumerate() {
+                let mut pos = hash_target(datum.target) & mask;
+                while target_to_data[pos].idx != EMPTY_SLOT {
+                    pos = (pos + 1) & mask;
+                }
+                target_to_data[pos] = TargetSlot { target: datum.target, idx: d as u32 };
+            }
+        }
+
+        let imp_cap = table_cap(imports.len());
+        let mut import_to_idx = Vec::from_elem_in(SymSlot { symbol: Symbol([0; 32]), idx: EMPTY_SLOT }, imp_cap, alloc);
+        if imp_cap > 0 {
+            let mask = imp_cap - 1;
+            for (k, imp) in imports.iter().enumerate() {
+                let mut pos = hash_symbol_bytes(&imp.symbol.0) & mask;
+                while import_to_idx[pos].idx != EMPTY_SLOT {
+                    pos = (pos + 1) & mask;
+                }
+                import_to_idx[pos] = SymSlot { symbol: imp.symbol, idx: k as u32 };
+            }
+        }
+
+        Self { sym_to_member, target_to_data, import_to_idx }
+    }
+
+    #[inline]
+    fn view(&self) -> FastIndicesView<'_> {
+        FastIndicesView {
+            sym_to_member: self.sym_to_member.as_slice(),
+            target_to_data: self.target_to_data.as_slice(),
+            import_to_idx: self.import_to_idx.as_slice(),
+        }
+    }
+}
+
+impl FastIndicesView<'_> {
+    #[inline]
+    fn lookup_sym(table: &[SymSlot], symbol: Symbol) -> Option<usize> {
+        if table.is_empty() {
+            return None;
+        }
+        let mask = table.len() - 1;
+        let mut pos = hash_symbol_bytes(&symbol.0) & mask;
+        loop {
+            let slot = table[pos];
+            if slot.idx == EMPTY_SLOT {
+                return None;
+            }
+            if slot.symbol == symbol {
+                return Some(slot.idx as usize);
+            }
+            pos = (pos + 1) & mask;
+        }
+    }
+
+    #[inline]
+    fn lookup_target(table: &[TargetSlot], target: Target) -> Option<usize> {
+        if table.is_empty() {
+            return None;
+        }
+        let mask = table.len() - 1;
+        let mut pos = hash_target(target) & mask;
+        loop {
+            let slot = table[pos];
+            if slot.idx == EMPTY_SLOT {
+                return None;
+            }
+            if slot.target == target {
+                return Some(slot.idx as usize);
+            }
+            pos = (pos + 1) & mask;
+        }
+    }
+
+    #[inline]
+    fn import_of(self, symbol: Symbol) -> Option<usize> {
+        Self::lookup_sym(self.import_to_idx, symbol)
+    }
+
+    #[inline]
+    fn target_home(
+        self,
+        home: &[u64],
+        data_home: &[u64],
+        tls_desc: Option<(Symbol, u64)>,
+        t: Target,
+    ) -> Option<u64> {
+        match t.space {
+            Space::Func => Self::lookup_sym(self.sym_to_member, t.symbol).map(|i| home[i]),
+            Space::Static | Space::Vtable => {
+                if t.space == Space::Static
+                    && let Some((sym, at)) = tls_desc
+                    && t.symbol == sym
+                {
+                    return Some(at);
+                }
+                Self::lookup_target(self.target_to_data, t).map(|d| data_home[d])
+            }
+            Space::Tls | Space::Outside | Space::WeakOutside => None,
+        }
+    }
+}
+
 impl<'a> ConstAndData<'a> {
     /// Emits every placed record's word fixups, every datum's word fixups, and the TLS descriptor,
     /// `VarRow` `init` and `__mod_init_func` fixups into `fixups`, sorts them by offset, and
@@ -542,7 +775,46 @@ impl<'a> ConstAndData<'a> {
     pub(crate) fn finish<'r, M: LayoutMember>(
         self,
         members: &[M],
-        by_symbol: &[u32],
+        _by_symbol: &[u32],
+        order: &[u32],
+        rep: &[u32],
+        home: &[u64],
+        data: &[Data<'r>],
+        by_target: &[u32],
+        entry_member: usize,
+        plan: Plan,
+        tail: u64,
+        text: AVec<'a, u8>,
+        imports: AVec<'a, Import<'r>>,
+        fixups: AVec<'a, Fixup>,
+        placed: AVec<'a, Placed>,
+    ) -> Result<Laid<'a, 'r>, ExportError> {
+        let alloc = *text.allocator();
+        let indices = FastIndices::build(members, data, &imports, alloc);
+        self.finish_with_indices(
+            members,
+            &indices,
+            order,
+            rep,
+            home,
+            data,
+            by_target,
+            entry_member,
+            plan,
+            tail,
+            text,
+            imports,
+            fixups,
+            placed,
+            alloc,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finish_with_indices<'r, M: LayoutMember>(
+        self,
+        members: &[M],
+        indices: &FastIndices<'_>,
         order: &[u32],
         rep: &[u32],
         home: &[u64],
@@ -555,6 +827,7 @@ impl<'a> ConstAndData<'a> {
         imports: AVec<'a, Import<'r>>,
         mut fixups: AVec<'a, Fixup>,
         placed: AVec<'a, Placed>,
+        alloc: Alloc<'a>,
     ) -> Result<Laid<'a, 'r>, ExportError> {
         let Self {
             const_at,
@@ -574,12 +847,24 @@ impl<'a> ConstAndData<'a> {
             zero_end,
             end,
         } = self;
-        let import_of = |symbol: Symbol| imports.binary_search_by(|it| it.symbol.cmp(&symbol)).ok();
-        let home_of = |t: Target| target_home(members, by_symbol, home, data, by_target, &data_home, tls_desc, t);
+        let indices_view = indices.view();
+        let import_of = |symbol: Symbol| indices_view.import_of(symbol);
+        let home_of = |t: Target| indices_view.target_home(home, &data_home, tls_desc, t);
         let tls_index_of = |symbol: Symbol| -> Option<u32> {
             let idx = tls_targets.binary_search_by_key(&symbol, |&(s, _)| s).ok()?;
             u32::try_from(idx).ok()
         };
+        // Pre-reserve exact upper bound of word fixups to eliminate doubling reallocations.
+        let mut est_fixups = fixups.len() + tls_targets.len() + 2;
+        for (pos, &i) in order.iter().enumerate() {
+            if rep[pos] as usize == pos {
+                est_fixups += members[i as usize].words();
+            }
+        }
+        for &d in by_target.iter() {
+            est_fixups += data[d as usize].words.len();
+        }
+        fixups.reserve(est_fixups.saturating_sub(fixups.len()));
         // Emit `__mod_init_func` rebase (macOS TLS startup initializer).
         if let (Some(at), Some(init_sym)) = (mod_init_at, tls_plan.and_then(|t| t.mod_init_fn))
             && let Some(target) = home_of(Target { space: Space::Func, symbol: init_sym })
@@ -684,6 +969,8 @@ impl<'a> ConstAndData<'a> {
         let entry_at = home[entry_member];
         let tls_count = u32::try_from(tls_targets.len()).unwrap_or(u32::MAX);
         let has_tls = tls_desc.is_some();
+        let mut placed_member: AVec<'a, u32> = Vec::with_capacity_in(order.len(), alloc);
+        placed_member.extend_from_slice(order);
         drop(relro_at);
         drop(data_home);
         drop(tls_targets);
@@ -703,6 +990,7 @@ impl<'a> ConstAndData<'a> {
             fixups,
             entry: entry_at,
             placed,
+            placed_member,
             tables_room: tail,
             mod_init_at,
             has_tls,
@@ -805,29 +1093,20 @@ fn align_up_u64(offset: u64, align: u64) -> u64 {
     if rem == 0 { offset } else { offset.saturating_add(a - rem) }
 }
 
-/// Finds `symbol`'s canonical index in `0..by_symbol.len()` (invariant under permutations of
-/// `members`, Rule 25).
-fn find_sym_id<M: LayoutMember>(members: &[M], by_symbol: &[u32], symbol: Symbol) -> Option<usize> {
-    by_symbol
-        .binary_search_by(|&raw| {
-            members
-                .get(to_idx(raw))
-                .map_or(core::cmp::Ordering::Greater, |m| m.symbol().cmp(&symbol))
-        })
-        .ok()
-}
-
 /// Returns `true` when `m` contains a trap (`traps() > 0` or an AArch64 `brk` instruction) and has
 /// no normal return (`ret`/`retaa`/`retab`) or tail-call branch (`b`/`br`), identifying noreturn
 /// panic/trap stubs that belong in the cold tail.
+///
+/// Scans backwards from the end of `code` and short-circuits immediately on the first return or
+/// tail-call instruction: >99% of normal functions end with `ret` in their last 1-2 words, cutting
+/// instruction scanning traffic by >100x on large binaries.
 fn is_trap_stub<M: LayoutMember>(m: &M) -> bool {
     let code = m.code();
     if code.len() < 4 || code.len() % 4 != 0 {
         return false;
     }
     let mut has_brk = m.traps() > 0;
-    let mut has_return_or_tail = false;
-    for chunk in code.chunks_exact(4) {
+    for chunk in code.chunks_exact(4).rev() {
         let Ok(bytes) = <[u8; 4]>::try_from(chunk) else {
             continue;
         };
@@ -841,14 +1120,14 @@ fn is_trap_stub<M: LayoutMember>(m: &M) -> bool {
             || (inst & 0xFC00_0000) == 0x1400_0000
             || (inst & 0xFFFF_FC1F) == 0xD61F_0000
         {
-            has_return_or_tail = true;
+            return false;
         }
         // `brk #imm16` (`0xD420_0000` mask `0xFFE0_001F`).
-        if (inst & 0xFFE0_001F) == 0xD420_0000 {
+        if !has_brk && (inst & 0xFFE0_001F) == 0xD420_0000 {
             has_brk = true;
         }
     }
-    has_brk && !has_return_or_tail
+    has_brk
 }
 
 #[derive(Clone, Copy)]
@@ -858,8 +1137,12 @@ struct RawCallEdge {
     first_site: u32,
 }
 
-struct BoltChain<'a> {
-    nodes: AVec<'a, usize>,
+const CHAIN_END: u32 = u32::MAX;
+
+#[derive(Clone, Copy)]
+struct BoltChain {
+    head: u32,
+    tail: u32,
     total_bytes: u64,
     total_weight: u64,
     min_rank: u32,
@@ -909,7 +1192,8 @@ fn pack_tier_ext_tsp<'a>(
 
     let n = fn_bytes.len();
     let mut slot_of: AVec<'_, usize> = Vec::from_elem_in(usize::MAX, n, alloc);
-    let mut chains: AVec<'_, BoltChain<'a>> = Vec::with_capacity_in(t_len, alloc);
+    let mut chains: AVec<'_, BoltChain> = Vec::with_capacity_in(t_len, alloc);
+    let mut next_node: AVec<'_, u32> = Vec::from_elem_in(CHAIN_END, t_len, alloc);
     let mut chain_of: AVec<'_, usize> = Vec::with_capacity_in(t_len, alloc);
     let mut offset_in_chain: AVec<'_, u64> = Vec::from_elem_in(0, t_len, alloc);
 
@@ -918,9 +1202,8 @@ fn pack_tier_ext_tsp<'a>(
         let bytes = at_u64(fn_bytes, sym_id).max(CODE_ALIGN_BYTES);
         let weight = at_u64(node_weight, sym_id).max(1);
         let rank = at_u32(node_rank, sym_id);
-        let mut nodes: AVec<'a, usize> = Vec::with_capacity_in(1, alloc);
-        nodes.push(slot);
-        chains.push(BoltChain { nodes, total_bytes: bytes, total_weight: weight, min_rank: rank, alive: true });
+        let slot_u32 = to_u32(slot);
+        chains.push(BoltChain { head: slot_u32, tail: slot_u32, total_bytes: bytes, total_weight: weight, min_rank: rank, alive: true });
         chain_of.push(slot);
     }
 
@@ -1008,21 +1291,24 @@ fn pack_tier_ext_tsp<'a>(
         let off_v = at_u64(&offset_in_chain, e.v_slot);
         let (dst_c, src_c) = if off_v == 0 { (ca, cb) } else { (cb, ca) };
 
-        let (src_nodes, src_bytes, src_weight, src_min_rank) = if let Some(sc) = chains.get_mut(src_c) {
+        let (src_head, src_tail, src_bytes, src_weight, src_min_rank) = if let Some(sc) = chains.get_mut(src_c) {
             sc.alive = false;
-            let moved = core::mem::replace(&mut sc.nodes, Vec::new_in(alloc));
-            (moved, sc.total_bytes, sc.total_weight, sc.min_rank)
+            (sc.head, sc.tail, sc.total_bytes, sc.total_weight, sc.min_rank)
         } else {
             continue;
         };
         if let Some(dc) = chains.get_mut(dst_c) {
             let base_off = dc.total_bytes;
-            for &node_slot in src_nodes.iter() {
+            let mut cur = src_head;
+            while cur != CHAIN_END {
+                let node_slot = to_idx(cur);
                 set_at(&mut chain_of, node_slot, dst_c);
                 let prev_off = at_u64(&offset_in_chain, node_slot);
                 set_at(&mut offset_in_chain, node_slot, base_off.saturating_add(prev_off));
-                dc.nodes.push(node_slot);
+                cur = at_u32(&next_node, node_slot);
             }
+            set_at(&mut next_node, to_idx(dc.tail), src_head);
+            dc.tail = src_tail;
             dc.total_bytes = dc.total_bytes.saturating_add(src_bytes);
             dc.total_weight = dc.total_weight.saturating_add(src_weight);
             dc.min_rank = dc.min_rank.min(src_min_rank);
@@ -1035,7 +1321,7 @@ fn pack_tier_ext_tsp<'a>(
     // then ascending first node's canonical symbol id (Rule 25).
     let mut alive_chains: AVec<'_, usize> = Vec::with_capacity_in(t_len, alloc);
     for (ci, ch) in chains.iter().enumerate() {
-        if ch.alive && !ch.nodes.is_empty() {
+        if ch.alive && ch.head != CHAIN_END {
             alive_chains.push(ci);
         }
     }
@@ -1049,8 +1335,8 @@ fn pack_tier_ext_tsp<'a>(
             .then_with(|| cb.total_weight.cmp(&ca.total_weight))
             .then_with(|| ca.min_rank.cmp(&cb.min_rank))
             .then_with(|| {
-                let fa = ca.nodes.first().copied().and_then(|s| tier_nodes.get(s).copied()).unwrap_or(usize::MAX);
-                let fb = cb.nodes.first().copied().and_then(|s| tier_nodes.get(s).copied()).unwrap_or(usize::MAX);
+                let fa = tier_nodes.get(to_idx(ca.head)).copied().unwrap_or(usize::MAX);
+                let fb = tier_nodes.get(to_idx(cb.head)).copied().unwrap_or(usize::MAX);
                 fa.cmp(&fb)
             })
     });
@@ -1059,10 +1345,13 @@ fn pack_tier_ext_tsp<'a>(
         let Some(ch) = chains.get(ci) else {
             continue;
         };
-        for &slot in ch.nodes.iter() {
+        let mut cur = ch.head;
+        while cur != CHAIN_END {
+            let slot = to_idx(cur);
             if let Some(&sym_id) = tier_nodes.get(slot) {
                 out.push(sym_id);
             }
+            cur = at_u32(&next_node, slot);
         }
     }
 }
@@ -1088,9 +1377,19 @@ pub(crate) fn bolt_order_members<'a, M: LayoutMember>(
         return Vec::new_in(alloc);
     }
     let page_cap = page.clamp(MIN_CLUSTER_PAGE_BYTES, APPLE_PAGE_BYTES);
+    // O(1) lookup from `Symbol` to canonical symbol index `0..n` (matching `by_symbol` exactly,
+    // invariant under input `members` permutations — Rule 25).
+    let mut sym_to_id: Map<Symbol, u32, FixedState, Alloc<'a>> =
+        Map::new(MapOpts { hasher: FixedState, alloc, capacity: Some(n) });
+    for (sym_id, &raw) in by_symbol.iter().enumerate() {
+        if let Some(m) = members.get(to_idx(raw)) {
+            sym_to_id.insert(m.symbol(), to_u32(sym_id));
+        }
+    }
+    let find_id = |symbol: Symbol| -> Option<usize> { sym_to_id.get(&symbol).map(|&id| to_idx(id)) };
     let entry_sym_id = members
         .get(entry)
-        .and_then(|m| find_sym_id(members, by_symbol, m.symbol()))
+        .and_then(|m| find_id(m.symbol()))
         .unwrap_or(0);
 
     // 1. Build per-function canonical metadata and flat CSR direct call graph in `0..n` symbol
@@ -1120,7 +1419,7 @@ pub(crate) fn bolt_order_members<'a, M: LayoutMember>(
         let edge_start = call_edges.len();
         let mut site_ord = 0u32;
         m.for_each_direct_call(|target_sym| {
-            if let Some(to_id) = find_sym_id(members, by_symbol, target_sym)
+            if let Some(to_id) = find_id(target_sym)
                 && to_id != sym_id
             {
                 call_edges.push(RawCallEdge { to: to_u32(to_id), mult: 1, first_site: site_ord });
@@ -1172,7 +1471,7 @@ pub(crate) fn bolt_order_members<'a, M: LayoutMember>(
     let mut hot_rank: AVec<'_, u32> = Vec::from_elem_in(u32::MAX, n, alloc);
     let mut profile_hot_nodes: AVec<'_, usize> = Vec::with_capacity_in(hot.len().min(n), alloc);
     for (rank, &sym) in hot.iter().enumerate() {
-        if let Some(sym_id) = find_sym_id(members, by_symbol, sym)
+        if let Some(sym_id) = find_id(sym)
             && at_u32(&hot_rank, sym_id) == u32::MAX
         {
             set_at(&mut hot_rank, sym_id, to_u32(rank));
@@ -1214,7 +1513,7 @@ pub(crate) fn bolt_order_members<'a, M: LayoutMember>(
             && let Some(m) = members.get(to_idx(at_u32(by_symbol, u)))
         {
             m.for_each_code_func_load(|target_sym| {
-                if let Some(v) = find_sym_id(members, by_symbol, target_sym)
+                if let Some(v) = find_id(target_sym)
                     && !at_bool(&trap_stub, v)
                 {
                     enqueue_direct(v, &mut direct_reach, &mut bfs_queue);
@@ -1231,7 +1530,7 @@ pub(crate) fn bolt_order_members<'a, M: LayoutMember>(
         for &u in bfs_queue.iter() {
             if let Some(m) = members.get(to_idx(at_u32(by_symbol, u))) {
                 m.for_each_code_func_load(|target_sym| {
-                    if let Some(v) = find_sym_id(members, by_symbol, target_sym)
+                    if let Some(v) = find_id(target_sym)
                         && !at_bool(&direct_reach, v)
                         && !at_bool(&trap_stub, v)
                         && !at_bool(&code_load_reach, v)
@@ -1291,7 +1590,7 @@ pub(crate) fn bolt_order_members<'a, M: LayoutMember>(
             {
                 let mut loaded: AVec<'_, usize> = Vec::new_in(alloc);
                 m.for_each_code_func_load(|target_sym| {
-                    if let Some(v) = find_sym_id(members, by_symbol, target_sym)
+                    if let Some(v) = find_id(target_sym)
                         && at_u32(&dfs_pre, v) == u32::MAX
                     {
                         loaded.push(v);
@@ -1417,14 +1716,14 @@ pub(crate) fn bolt_order_members<'a, M: LayoutMember>(
             }
             if let Some(m) = members.get(to_idx(at_u32(by_symbol, u))) {
                 m.for_each_code_func_load(|target_sym| {
-                    if let Some(v) = find_sym_id(members, by_symbol, target_sym)
+                    if let Some(v) = find_id(target_sym)
                         && !at_bool(&emitted, v)
                     {
                         cold_roots.push(v);
                     }
                 });
                 m.for_each_relro_func_ref(|target_sym| {
-                    if let Some(v) = find_sym_id(members, by_symbol, target_sym)
+                    if let Some(v) = find_id(target_sym)
                         && !at_bool(&emitted, v)
                     {
                         cold_roots.push(v);
@@ -1454,14 +1753,14 @@ pub(crate) fn bolt_order_members<'a, M: LayoutMember>(
                 scratch_refs.clear();
                 if let Some(m) = members.get(to_idx(at_u32(by_symbol, u))) {
                     m.for_each_relro_func_ref(|target_sym| {
-                        if let Some(v) = find_sym_id(members, by_symbol, target_sym)
+                        if let Some(v) = find_id(target_sym)
                             && !at_bool(&emitted, v)
                         {
                             scratch_refs.push(v);
                         }
                     });
                     m.for_each_code_func_load(|target_sym| {
-                        if let Some(v) = find_sym_id(members, by_symbol, target_sym)
+                        if let Some(v) = find_id(target_sym)
                             && !at_bool(&emitted, v)
                         {
                             scratch_refs.push(v);
@@ -1524,6 +1823,28 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
     tls_plan: Option<TlsPlan>,
     alloc: Alloc<'a>,
 ) -> Result<Laid<'a, 'r>, ExportError> {
+    let mut times = ExportLinkTimes::default();
+    lay_out_with_tls_par(members, data, entry, profile, plan, tail, tls_plan, alloc, &SequentialExportRunner, &mut times)
+}
+
+/// Parallel [`lay_out_with_tls`]: hashes equal-record fold digests in parallel, pre-sizes `text`,
+/// `konst`, `data`, and `fixups` to exact final bounds, fuses text copying with ARM64 site
+/// relocation patching across disjoint function-aligned partitions via `runner`, and uses O(1)
+/// symbol/data/import hash maps (100% bit-for-bit identical to [`lay_out_with_tls`], Rule 25).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lay_out_with_tls_par<'a, 'r, R: ExportRunner>(
+    members: &[Member<'r>],
+    data: &[Data<'r>],
+    entry: Symbol,
+    profile: Option<Profile<'_>>,
+    plan: Plan,
+    tail: u64,
+    tls_plan: Option<TlsPlan>,
+    alloc: Alloc<'a>,
+    runner: &R,
+    times: &mut ExportLinkTimes,
+) -> Result<Laid<'a, 'r>, ExportError> {
+    let t_order = runner.now_ns();
     let n = members.len();
     let page = plan.page;
     let mut by_symbol: AVec<'_, u32> = Vec::with_capacity_in(n, alloc);
@@ -1544,13 +1865,20 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
         return Err(ExportError::NoEntry { symbol: entry });
     };
     let order = bolt_order_members(members, &by_symbol, entry_member, profile, page, alloc);
+    times.order_ns = runner.now_ns().saturating_sub(t_order);
 
-    // Folding: each position's representative is the first position with equal bytes.
-    let mut digests: AVec<'_, ([u8; 32], u32)> = Vec::with_capacity_in(n, alloc);
-    for (pos, &i) in order.iter().enumerate() {
-        let bytes = members[i as usize].record.bytes();
-        digests.push((Hasher::new(FOLD_DOMAIN).update(bytes).finish().0, pos as u32));
-    }
+    // Folding: each position's representative is the first position with equal bytes (parallel BLAKE3).
+    let t_fold = runner.now_ns();
+    let mut digests: AVec<'_, ([u8; 32], u32)> = Vec::from_elem_in(([0u8; 32], 0u32), n, alloc);
+    let order_slice = order.as_slice();
+    runner.for_each_chunk_mut(digests.as_mut_slice(), 256, |start, chunk| {
+        for (k, slot) in chunk.iter_mut().enumerate() {
+            let pos = start + k;
+            let i = order_slice[pos] as usize;
+            let bytes = members[i].record.bytes();
+            *slot = (Hasher::new(FOLD_DOMAIN).update(bytes).finish().0, pos as u32);
+        }
+    });
     digests.sort_unstable();
     let mut rep: AVec<'_, u32> = Vec::from_elem_in(0, n, alloc);
     let mut run = 0usize;
@@ -1564,36 +1892,40 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
         rep[pos as usize] = if equal { first } else { pos };
     }
     drop(digests);
+    times.fold_ns = runner.now_ns().saturating_sub(t_fold);
 
-    // The code, in order; `home[member]` is its function's image offset.
+    // Pre-compute exact function homes (`home[member]`), `placed`, and exact `total_text_len`
+    // without touching code bytes yet, so `text` allocates once and copying + site relocation
+    // fuse in one parallel L1-hot pass.
+    let t_reloc = runner.now_ns();
     let mut home: AVec<'_, u64> = Vec::from_elem_in(0, n, alloc);
-    let mut text: AVec<'a, u8> = Vec::new_in(alloc);
     let mut placed: AVec<'a, Placed> = Vec::with_capacity_in(n, alloc);
+    let mut unique_placed: AVec<'_, (u32, usize)> = Vec::with_capacity_in(n, alloc);
+    let mut text_cursor = 0u64;
     for (pos, &i) in order.iter().enumerate() {
         let m = &members[i as usize];
         let r = rep[pos] as usize;
         let folded = r != pos;
+        let code_len = m.record.code().len() as u64;
         if folded {
             home[i as usize] = home[order[r] as usize];
         } else {
-            pad_to(&mut text, plan.text_at, 16);
-            home[i as usize] = plan.text_at + text.len() as u64;
-            text.extend_from_slice(m.record.code());
+            let aligned = up(plan.text_at + text_cursor, 16) - plan.text_at;
+            home[i as usize] = plan.text_at + aligned;
+            unique_placed.push((i, aligned as usize));
+            text_cursor = aligned + code_len;
         }
-        let len = m.record.code().len() as u64;
-        placed.push(Placed { symbol: m.symbol, at: home[i as usize], len, tier: m.tier, folded });
+        placed.push(Placed { symbol: m.symbol, at: home[i as usize], len: code_len, tier: m.tier, folded });
     }
-    let text_end = plan.text_at + text.len() as u64;
+    let total_text_len = usize::try_from(text_cursor).map_err(|_| ExportError::TooLarge { what: "the code region", len: text_cursor })?;
+    let text_end = plan.text_at + text_cursor;
 
     // Every target a placed record actually references in its sites or relro words: C names
     // gathered, thread-locals checked for runtime. Unreferenced targets kept by `CodeRecord::seal`
     // are ignored (matching `optimized.rs`), so dead strong entries cannot override a used weak
     // reference to the same symbol.
     let mut imports: AVec<'a, Import<'r>> = Vec::new_in(alloc);
-    for (pos, &i) in order.iter().enumerate() {
-        if rep[pos] as usize != pos {
-            continue;
-        }
+    for &(i, _) in unique_placed.iter() {
         let m = &members[i as usize];
         let site_targets = (0..m.record.sites())
             .map(|s| m.record.site(s))
@@ -1643,93 +1975,176 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
         }
     }
     dedup_imports(&mut imports);
-    let import_of = |symbol: Symbol| imports.binary_search_by(|it| it.symbol.cmp(&symbol)).ok();
 
     let regions = lay_out_const_and_data(members, &order, &rep, data, &by_target, imports.len(), tls_plan, text_end, plan, tail, alloc)?;
-    let home_of = |t: Target| target_home(members, &by_symbol, &home, data, &by_target, &regions.data_home, regions.tls_desc, t);
+    let indices = FastIndices::build(members, data, &imports, alloc);
 
-    // Complete every placed record's sites.
-    for (pos, &i) in order.iter().enumerate() {
-        if rep[pos] as usize != pos {
-            continue;
-        }
-        let m = &members[i as usize];
-        let symbol = m.symbol;
-        let at_home = home[i as usize];
-        for s in 0..m.record.sites() {
-            let site = m.record.site(s);
-            let pc = at_home + u64::from(site.at);
-            let x = pc - plan.text_at;
-            if site.kind == SiteKind::Relro {
-                let to = regions.relro_at[i as usize] + u64::from(site.addend);
-                let first = expect(&text, x, ADRP, symbol, "adrp")?;
-                let second = expect(&text, x + 4, ADD64, symbol, "add")?;
-                write32(&mut text, x, adrp(first, pc, to, symbol)?);
-                write32(&mut text, x + 4, add_lo12(second, to));
-                continue;
-            }
-            let t = m.record.target(site.target as usize);
-            let first = expect(&text, x, ADRP, symbol, "adrp")?;
-            let second = expect(&text, x + 4, LDR64, symbol, "ldr")?;
-            if site.kind == SiteKind::Call {
-                expect(&text, x + 8, BLR, symbol, "blr")?;
-            }
-            match t.space {
-                Space::Tls => {
-                    if site.kind == SiteKind::Call {
-                        return Err(ExportError::CallOfData { from: symbol, at: site.at });
-                    }
-                    let Some(index) = regions.tls_index_of(t.symbol) else {
-                        return Err(ExportError::OutOfReach { from: symbol, target: t });
-                    };
-                    let word = regions.tls_indices_at + 8 * u64::from(index);
-                    write32(&mut text, x, adrp(first, pc, word, symbol)?);
-                    write32(&mut text, x + 4, ldr_lo12(second, word));
+    // Single exact allocation for `text`, then fused parallel copy + ARM64 relocation patching
+    // over disjoint function-aligned byte partitions (Rule 25: identical bytes & error selection).
+    let mut text: AVec<'a, u8> = Vec::from_elem_in(0u8, total_text_len, alloc);
+    let unique_slice = unique_placed.as_slice();
+    let home_slice = home.as_slice();
+    let relro_slice = regions.relro_at.as_slice();
+    let data_home_slice = regions.data_home.as_slice();
+    let tls_targets_slice = regions.tls_targets.as_slice();
+    let tls_indices_at = regions.tls_indices_at;
+    let tls_desc = regions.tls_desc;
+    let got_at = regions.got_at;
+    let indices_view = indices.view();
+
+    // Partition `unique_placed` into balanced byte-range slices (~2 MiB each, at most 128 parts).
+    const TARGET_PART_BYTES: usize = 2 << 20;
+    const MIN_PAR_TEXT_BYTES: usize = 256 << 10;
+    const MAX_TEXT_PARTS: usize = 128;
+    let mut splits: AVec<'_, usize> = Vec::new_in(alloc);
+    let mut part_fn_ranges: AVec<'_, (usize, usize)> = Vec::new_in(alloc);
+    splits.push(0);
+    if !unique_slice.is_empty() {
+        if total_text_len < MIN_PAR_TEXT_BYTES || unique_slice.len() < 64 {
+            part_fn_ranges.push((0, unique_slice.len()));
+            splits.push(total_text_len);
+        } else {
+            let target_bytes = (total_text_len / MAX_TEXT_PARTS).max(TARGET_PART_BYTES);
+            let mut fn_start = 0usize;
+            let mut part_start_byte = 0usize;
+            for (u_idx, &(member_idx, rel_off)) in unique_slice.iter().enumerate() {
+                if u_idx > fn_start && rel_off.saturating_sub(part_start_byte) >= target_bytes {
+                    part_fn_ranges.push((fn_start, u_idx));
+                    splits.push(rel_off);
+                    fn_start = u_idx;
+                    part_start_byte = rel_off;
                 }
-                Space::Outside | Space::WeakOutside => {
-                    let Some(index) = import_of(t.symbol) else {
-                        unreachable!("every outside target of a placed record was gathered above");
-                    };
-                    let word = regions.got_at + 8 * index as u64;
-                    write32(&mut text, x, adrp(first, pc, word, symbol)?);
-                    write32(&mut text, x + 4, ldr_lo12(second, word));
-                }
-                Space::Func | Space::Static | Space::Vtable => {
-                    let Some(to) = home_of(t) else {
-                        return Err(ExportError::OutOfReach { from: symbol, target: t });
-                    };
-                    match site.kind {
-                        SiteKind::Call if t.space != Space::Func => {
-                            return Err(ExportError::CallOfData { from: symbol, at: site.at });
-                        }
-                        SiteKind::Call => {
-                            if let Ok(branch) = bl(pc + 8, to, symbol) {
-                                write32(&mut text, x, NOP);
-                                write32(&mut text, x + 4, NOP);
-                                write32(&mut text, x + 8, branch);
-                            } else {
-                                // Target is past ARM64 `bl`'s ±128 MiB reach: materialize `to` via
-                                // `adrp + add` (±4 GiB reach) into the existing `blr` at `x + 8`.
-                                write32(&mut text, x, adrp(first, pc, to, symbol)?);
-                                write32(&mut text, x + 4, add_lo12(second, to));
-                            }
-                        }
-                        _ => {
-                            write32(&mut text, x, adrp(first, pc, to, symbol)?);
-                            write32(&mut text, x + 4, add_lo12(second, to));
-                        }
-                    }
-                }
+                let _ = member_idx;
             }
+            part_fn_ranges.push((fn_start, unique_slice.len()));
+            splits.push(total_text_len);
         }
     }
 
+    let num_parts = part_fn_ranges.len();
+    let mut part_results: AVec<'_, Option<Result<(), ExportError>>> = Vec::with_capacity_in(num_parts, alloc);
+    for _ in 0..num_parts {
+        part_results.push(None);
+    }
+    let splits_slice = splits.as_slice();
+    let ranges_slice = part_fn_ranges.as_slice();
+
+    runner.map_splits_mut(text.as_mut_slice(), splits_slice, part_results.as_mut_slice(), |part_idx, slice| {
+        let base_rel = splits_slice[part_idx];
+        let (fn_start, fn_end) = ranges_slice[part_idx];
+        for &(i, rel_off) in &unique_slice[fn_start..fn_end] {
+            let m = &members[i as usize];
+            let symbol = m.symbol;
+            let at_home = home_slice[i as usize];
+            let code = m.record.code();
+            let local_start = rel_off - base_rel;
+            slice[local_start..local_start + code.len()].copy_from_slice(code);
+
+            for s in 0..m.record.sites() {
+                let site = m.record.site(s);
+                let pc = at_home + u64::from(site.at);
+                let x = (local_start as u64) + u64::from(site.at);
+                if site.kind == SiteKind::Relro {
+                    let to = relro_slice[i as usize] + u64::from(site.addend);
+                    let first = expect(slice, x, ADRP, symbol, "adrp")?;
+                    let second = expect(slice, x + 4, ADD64, symbol, "add")?;
+                    write32(slice, x, adrp(first, pc, to, symbol)?);
+                    write32(slice, x + 4, add_lo12(second, to));
+                    continue;
+                }
+                let t = m.record.target(site.target as usize);
+                let first = expect(slice, x, ADRP, symbol, "adrp")?;
+                let second = expect(slice, x + 4, LDR64, symbol, "ldr")?;
+                if site.kind == SiteKind::Call {
+                    expect(slice, x + 8, BLR, symbol, "blr")?;
+                }
+                match t.space {
+                    Space::Tls => {
+                        if site.kind == SiteKind::Call {
+                            return Err(ExportError::CallOfData { from: symbol, at: site.at });
+                        }
+                        let Some(index) = tls_targets_slice
+                            .binary_search_by_key(&t.symbol, |&(s, _)| s)
+                            .ok()
+                            .and_then(|idx| u32::try_from(idx).ok())
+                        else {
+                            return Err(ExportError::OutOfReach { from: symbol, target: t });
+                        };
+                        let word = tls_indices_at + 8 * u64::from(index);
+                        write32(slice, x, adrp(first, pc, word, symbol)?);
+                        write32(slice, x + 4, ldr_lo12(second, word));
+                    }
+                    Space::Outside | Space::WeakOutside => {
+                        let Some(index) = indices_view.import_of(t.symbol) else {
+                            unreachable!("every outside target of a placed record was gathered above");
+                        };
+                        let word = got_at + 8 * index as u64;
+                        write32(slice, x, adrp(first, pc, word, symbol)?);
+                        write32(slice, x + 4, ldr_lo12(second, word));
+                    }
+                    Space::Func | Space::Static | Space::Vtable => {
+                        let Some(to) = indices_view.target_home(home_slice, data_home_slice, tls_desc, t) else {
+                            return Err(ExportError::OutOfReach { from: symbol, target: t });
+                        };
+                        match site.kind {
+                            SiteKind::Call if t.space != Space::Func => {
+                                return Err(ExportError::CallOfData { from: symbol, at: site.at });
+                            }
+                            SiteKind::Call => {
+                                if let Ok(branch) = bl(pc + 8, to, symbol) {
+                                    write32(slice, x, NOP);
+                                    write32(slice, x + 4, NOP);
+                                    write32(slice, x + 8, branch);
+                                } else {
+                                    // Target is past ARM64 `bl`'s ±128 MiB reach: materialize `to` via
+                                    // `adrp + add` (±4 GiB reach) into the existing `blr` at `x + 8`.
+                                    write32(slice, x, adrp(first, pc, to, symbol)?);
+                                    write32(slice, x + 4, add_lo12(second, to));
+                                }
+                            }
+                            _ => {
+                                write32(slice, x, adrp(first, pc, to, symbol)?);
+                                write32(slice, x + 4, add_lo12(second, to));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    });
+    for res in part_results {
+        if let Some(err_or_ok) = res {
+            err_or_ok?;
+        }
+    }
+    times.reloc_ns = runner.now_ns().saturating_sub(t_reloc);
+
     // Every word the loader fixes: the GOT's, the relro parts', the data's.
-    let mut fixups: AVec<'a, Fixup> = Vec::new_in(alloc);
+    let t_fixups = runner.now_ns();
+    let mut fixups: AVec<'a, Fixup> = Vec::with_capacity_in(imports.len(), alloc);
     for k in 0..imports.len() {
         fixups.push(Fixup { at: regions.got_at + 8 * k as u64, to: FixTo::Bind { import: k as u32 } });
     }
-    regions.finish(members, &by_symbol, &order, &rep, &home, data, &by_target, entry_member, plan, tail, text, imports, fixups, placed)
+    let laid = regions.finish_with_indices(
+        members,
+        &indices,
+        &order,
+        &rep,
+        &home,
+        data,
+        &by_target,
+        entry_member,
+        plan,
+        tail,
+        text,
+        imports,
+        fixups,
+        placed,
+        alloc,
+    )?;
+    times.fixups_ns = runner.now_ns().saturating_sub(t_fixups);
+    Ok(laid)
 }
 
 #[cfg(test)]

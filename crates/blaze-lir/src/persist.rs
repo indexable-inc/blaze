@@ -115,6 +115,17 @@ pub fn to_bytes(view: &View<'_>) -> Vec<u8> {
     out.finish(root)
 }
 
+/// `view` encoded into an explicit caller allocator (`blaze_own::Vec<u8, A>`).
+pub fn to_bytes_in<A: core::alloc::Allocator>(view: &View<'_>, alloc: A) -> blaze_own::Vec<u8, A> {
+    let mut out = Writer::new(blaze_format::WriterOpts {
+        schema: SCHEMA,
+        alloc: blaze_format::Own(alloc),
+        capacity: None,
+    });
+    let root = write(view, &mut out);
+    out.finish(root)
+}
+
 /// The function in `buffer`, read in place: its schema, its records' bounds, then every tag,
 /// length and index of its columns.
 pub fn read(buffer: &[u8]) -> Result<View<'_>, ReadError> {
@@ -122,6 +133,20 @@ pub fn read(buffer: &[u8]) -> Result<View<'_>, ReadError> {
     let view = read_columns(root, buffer).map_err(ReadError::Format)?;
     verify::structure(view).map_err(ReadError::Structure)?;
     Ok(view)
+}
+
+/// Decodes a persisted function from `buffer` into `alloc`, reading in place when `buffer` is
+/// already 16-byte aligned (`blaze_format::ALIGN`) and copying into an aligned scratch buffer
+/// otherwise.
+pub fn read_to_func_in<A: core::alloc::Allocator + Copy>(
+    buffer: &[u8],
+    alloc: A,
+) -> Result<Func<A>, ReadError> {
+    if (buffer.as_ptr() as usize).is_multiple_of(blaze_format::ALIGN) {
+        return Ok(read(buffer)?.to_func_in(alloc));
+    }
+    let aligned = blaze_format::AlignedIn::copy_from(buffer, alloc);
+    Ok(read(&aligned)?.to_func_in(alloc))
 }
 
 /// A function on the global heap, as the store keeps one: its record is [`to_bytes`] of it.

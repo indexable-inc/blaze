@@ -24,10 +24,15 @@ use core::fmt;
 
 use blaze_code::datum::{DatumView, OWN_DATUM, Place as DatumPlace};
 use blaze_code::record::{CodeRecord, CodeView, NO_TARGET, PositionPart, Site, SiteKind, Space, Symbol as CodeSymbol, Target};
-use blaze_export::{Data, DataPlace, DataWord, Entry, ExportError, Exported, Function, Panic, Platform, Profile, ProgramIn, Tier, TlsRuntime};
-use blaze_ladder::body_ids::{self, RowKind, Scratch, Stepped, Walk};
+use blaze_export::{
+    Data, DataPlace, DataWord, Entry, ExportError, ExportLinkTimes, ExportRunner, Exported, Function, Panic, Platform,
+    Profile, ProgramIn, SequentialExportRunner, Tier, TlsRuntime,
+};
+use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
+use blaze_ladder::body_ids::{self, BodyIds as _, RowKind, Scratch, Stepped, Walk};
 use blaze_ladder::code_records::{CodeKey, entry_of, statics};
 use blaze_ladder::front2::program::lazy::{SharedLazyFront, SharedLazyFrontHandle, SharedLazyFrontStats};
+use blaze_ladder::run::make_one::export_lto::{ExportLtoCache, ExportLtoMachine, ExportLtoTimes, built_lir_cache_key};
 use blaze_ladder::run::make_one::{MOST_WALKED, Maker, RecordsProgram, Typing, TypingCounts};
 use blaze_ladder::run::special::{EntryForm, Roots, Special, make_special, run_roots};
 use blaze_ladder::run::RunError;
@@ -193,7 +198,7 @@ fn persist_worker_typed_batch<'a, D: blaze_core::Driver>(
 /// `blaze_export::export()`) and again before `blaze_export::export()` if LTO/TLS emitted extra
 /// entries, so a linker/LTO/output failure never discards compiled `CodeRecord`s or `Typed`
 /// batches, and unlent store arena chunks are freed before linking.
-#[expect(clippy::too_many_arguments, reason = "export root checkpoint joins code store and dep/toolchain typed keys")]
+#[expect(clippy::too_many_arguments, reason = "export root checkpoint joins code store, dep/toolchain typed keys, and local LTO cache keys")]
 fn checkpoint_export_roots<D: blaze_core::Driver>(
     lent: &blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
     today: &crate::start_list::Today,
@@ -202,6 +207,7 @@ fn checkpoint_export_roots<D: blaze_core::Driver>(
     typed: &crate::engine_body_record::StoreTyped<'_>,
     dep_typed_program: &[blaze_cas::Key],
     dep_typed_toolchain: &[blaze_cas::Key],
+    extra_program_roots: &[blaze_cas::Key],
     frame: &Frame,
     heap: &'static blaze_own::Heap,
 ) -> Result<(), CliError> {
@@ -224,6 +230,7 @@ fn checkpoint_export_roots<D: blaze_core::Driver>(
     let mut toolchain_made = codes.toolchain_made();
     walked.extend_from_slice(typed.kept_program());
     walked.extend_from_slice(dep_typed_program);
+    walked.extend_from_slice(extra_program_roots);
     toolchain_made.extend_from_slice(typed.kept_toolchain());
     toolchain_made.extend_from_slice(dep_typed_toolchain);
     let kept_roots = keep_export_roots(lent, today, toolchain, &walked, &toolchain_made);
@@ -388,50 +395,73 @@ fn crate_of_item(list: &blaze_world::crate_list::CrateList<'_>, item: ItemKey, a
     owned_str(crate_name_of_item(list, item), alloc)
 }
 
-/// Formats a deterministic, human-readable Rust symbol name for one reached function instance
-/// into `bump` (for Mach-O local `N_SECT` symbols so `nm`, `lldb`, `sample`, `xctrace`, and
-/// `otool`/`llvm-objdump` show Rust function names instead of raw addresses).
-fn format_symbol_name<'a, 'n>(
+fn build_crate_name_map<'a, 'c>(
+    list: &'c blaze_world::crate_list::CrateList<'_>,
+    alloc: Alloc<'a>,
+) -> Map<[u8; 8], &'c str, FixedState, Alloc<'a>> {
+    let n = blaze_world::crate_list::CrateGraph::len(list);
+    let mut map: Map<[u8; 8], &'c str, FixedState, Alloc<'a>> =
+        Map::new(MapOpts { hasher: FixedState, alloc, capacity: Some(n) });
+    for at in 0..n {
+        map.entry(list.key(at).prefix())
+            .or_insert_with(|| blaze_world::crate_list::CrateGraph::name(list, at));
+    }
+    map
+}
+
+/// Fast, zero-leak deterministic Rust symbol name formatter for one reached function instance
+/// into `bump` (for Mach-O local `N_SECT` symbols). Uses an O(1) `crate_names` map, caches
+/// `ItemKey -> path` across monomorphizations in `item_paths`, and resets `sym_frame` per row
+/// instead of leaking `PortableTys` tables into `Maker`'s allocator.
+#[expect(clippy::too_many_arguments, reason = "fast cached symbol formatting helper over maker, records, caches, scratch frame, and output bump")]
+fn format_symbol_name_fast<'a, 'n, G, T>(
     symbol: CodeSymbol,
     tabled: ItemKey,
-    shown: Option<blaze_ladder::run::make_one::InstanceShown>,
+    instance_name: &[u8],
+    maker: &Maker<'n, G, T>,
     records: &'n blaze_ladder::front2::source::Records<'n>,
-    list: &blaze_world::crate_list::CrateList<'_>,
+    crate_names: &Map<[u8; 8], &str, FixedState, Alloc<'_>>,
+    item_paths: &mut Map<ItemKey, Option<&'a str>, FixedState, Alloc<'_>>,
+    lib_paths: &mut Map<ItemKey, Option<&'a str>, FixedState, Alloc<'_>>,
     buf: &mut AString<'_>,
+    sym_frame: &mut Frame,
     bump: Bump<'a>,
-) -> &'a str {
+) -> &'a str
+where
+    G: blaze_ladder::body_ids::Grant,
+    T: Typing<RecordsProgram<'n>>,
+{
     use core::fmt::Write as _;
     use blaze_ladder::front2::source::NamesSource as _;
 
-    buf.clear();
-    if let Some(shown) = shown
-        && let Some(path) = shown.item.path()
-    {
-        buf.push_str(path);
-        if let Some(args) = shown.args.as_deref()
-            && !args.is_empty()
-        {
-            if let Some(inner) = args.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-                buf.push('<');
-                buf.push_str(inner);
-                buf.push('>');
-            } else {
-                buf.push_str(args);
-            }
-        }
-        return bump.alloc_str(buf.as_str());
+    sym_frame.reset();
+    let sym_erased = Erased::new(sym_frame);
+    if let Some(formatted) = maker.format_instance_symbol(
+        tabled,
+        instance_name,
+        item_paths,
+        buf,
+        sym_erased.handle(),
+        bump,
+    ) {
+        return formatted;
     }
-    if let Some(lib) = records.key_beginning(tabled.0.to_be_bytes()) {
+    let lib_path = *lib_paths.entry(tabled).or_insert_with(|| {
+        let lib = records.key_beginning(tabled.0.to_be_bytes())?;
         let item = blaze_ladder::front2::item_shown::ItemShown::of_lib(records, lib);
-        if let Some(path) = item.path() {
-            return bump.alloc_str(path);
-        }
+        item.path().map(|p| &*bump.alloc_str(p))
+    });
+    if let Some(path) = lib_path {
+        return path;
     }
-    let krate = crate_name_of_item(list, tabled);
+    let b = tabled.0.to_be_bytes();
+    let prefix = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
+    let krate = crate_names.get(&prefix).copied().unwrap_or("<unknown>");
     let short = u64::from_be_bytes([
         symbol.0[0], symbol.0[1], symbol.0[2], symbol.0[3],
         symbol.0[4], symbol.0[5], symbol.0[6], symbol.0[7],
     ]);
+    buf.clear();
     let _ = write!(buf, "{krate}::fn_{short:016x}");
     bump.alloc_str(buf.as_str())
 }
@@ -588,6 +618,10 @@ struct ExportPhaseTimes {
     walk_ns: u64,
     lto_ns: u64,
     link_ns: u64,
+    lto_times: ExportLtoTimes,
+    assemble_ns: u64,
+    link_times: ExportLinkTimes,
+    io_ns: u64,
 }
 
 /// Borrowed comparison key shared by [`FnCompileStat`] and [`blaze_ladder::run::make_one::MakeSizes`]
@@ -1044,11 +1078,12 @@ fn materialize_positionless<'a>(
     })
 }
 
-/// Decodes `datum_bytes` and appends it to `data` if `target` has not been seen yet.
-#[expect(clippy::too_many_arguments, reason = "datum deduplication helper over caller-owned vectors and allocators")]
+/// Decodes `datum_bytes` and appends it to `data` if `target` has not been seen yet (O(1) set
+/// deduplication, fixing the quadratic `binary_search` + `insert_shift` bottleneck).
+#[expect(clippy::too_many_arguments, reason = "datum deduplication helper over caller-owned vectors, hash set, and allocators")]
 fn push_datum<'a>(
     data: &mut AVec<'a, Data<'a>>,
-    seen_data: &mut AVec<'a, Target>,
+    seen_data: &mut Set<Target, FixedState, Alloc<'a>>,
     tls_count: &mut usize,
     target: Target,
     datum_bytes: &'a [u8],
@@ -1056,11 +1091,10 @@ fn push_datum<'a>(
     bump: Bump<'a>,
     heap: &'static blaze_own::Heap,
 ) -> Result<(), CliError> {
-    if let Err(pos) = seen_data.binary_search(&target) {
+    if seen_data.insert(target) {
         let view = DatumView::read(datum_bytes)
             .map_err(|why| box_err(ExportCliError::Decode { symbol: target.symbol.0, what: "datum record", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;
         let datum = datum_to_export(target, &view, bump, heap).map_err(|e| box_err(e, heap))?;
-        seen_data.insert_shift(pos, target);
         data.push(datum);
         if target.space == Space::Tls {
             *tls_count += 1;
@@ -1091,7 +1125,7 @@ const EXPORT_LTO_WORKER_FRAME: usize = 2 << 30;
 const EXPORT_LTO_WORKER_KEEP: usize = 4 << 20;
 const EXPORT_LTO_WORKER_TRIM: usize = 32 << 20;
 /// Minimum batch count to fan out export LTO work across worker threads.
-const EXPORT_LTO_PAR_MIN: usize = 4;
+const EXPORT_LTO_PAR_MIN: usize = 2;
 
 /// Chooses the dynamic work-stealing batch size for `count` items across `worker_count` workers.
 #[inline]
@@ -1256,6 +1290,283 @@ impl blaze_ladder::run::make_one::export_lto::ExportLtoRunner for CliLtoRunner<'
         }
         let scope_failed = scope.join(self.cx).is_err();
         collect_lto_worker_parts(count, parts, scope_failed, out_alloc)
+    }
+}
+
+/// `Cx::scope`-backed parallel executor and monotonic timer for `blaze_export::export_par`:
+/// fans out BLAKE3 fold hashing, fused text copy + ARM64 relocation patching, Mach-O/ELF
+/// `__text` segment copying, and 4 KiB page SHA-256 ad-hoc code signing across all workers
+/// with zero `unsafe` and bit-for-bit deterministic output (Rule 25).
+struct CliExportRunner<'c> {
+    cx: &'c Cx,
+    workers: core::num::NonZeroU32,
+    shared: SharedAlloc<'static>,
+    phases: &'c Phases,
+    began: bstd::clock::Instant,
+}
+
+impl ExportRunner for CliExportRunner<'_> {
+    fn for_each_chunk_mut<T: Send, F>(&self, out: &mut [T], min_chunk: usize, f: F)
+    where
+        F: Fn(usize, &mut [T]) + Sync,
+    {
+        let min_chunk = min_chunk.max(1);
+        let active = usize::try_from(self.workers.get().min(self.cx.workers())).unwrap_or(1);
+        if active <= 1 || out.len() <= min_chunk {
+            if !out.is_empty() {
+                f(0, out);
+            }
+            return;
+        }
+        let max_chunks = (out.len() / min_chunk).max(1);
+        let num_chunks = active.min(max_chunks);
+        if num_chunks <= 1 {
+            f(0, out);
+            return;
+        }
+        let chunk_len = out.len().div_ceil(num_chunks);
+        let f_ref = &f;
+        let scope = self.cx.scope();
+        scope.narrow_workers(self.workers, bstd::task::Class::Foreground);
+        let mut handles = Vec::with_capacity_in(num_chunks, self.shared);
+        let mut rest = out;
+        let mut start = 0usize;
+        while !rest.is_empty() {
+            let take = chunk_len.min(rest.len());
+            let (head, tail) = rest.split_at_mut(take);
+            let chunk_start = start;
+            handles.push(scope.may_overlap(
+                "export: link chunk worker",
+                1 << 20,
+                move |_worker_cx: &Cx| -> Result<(), core::convert::Infallible> {
+                    f_ref(chunk_start, head);
+                    Ok(())
+                },
+            ));
+            start = start.saturating_add(take);
+            rest = tail;
+        }
+        for handle in handles {
+            let _ = handle.join(self.cx);
+        }
+        let _ = scope.join(self.cx);
+    }
+
+    fn map_splits_mut<T: Send, R: Send, F>(
+        &self,
+        buf: &mut [T],
+        splits: &[usize],
+        results: &mut [Option<R>],
+        f: F,
+    ) where
+        F: Fn(usize, &mut [T]) -> R + Sync,
+    {
+        let num_parts = splits.len().saturating_sub(1);
+        let active = usize::try_from(self.workers.get().min(self.cx.workers())).unwrap_or(1);
+        if active <= 1 || num_parts <= 1 {
+            SequentialExportRunner.map_splits_mut(buf, splits, results, f);
+            return;
+        }
+        let num_workers = active.min(num_parts);
+        let parts_per_worker = num_parts.div_ceil(num_workers);
+        let f_ref = &f;
+        let scope = self.cx.scope();
+        scope.narrow_workers(self.workers, bstd::task::Class::Foreground);
+        let mut handles = Vec::with_capacity_in(num_workers, self.shared);
+        let mut rest_buf = buf;
+        let mut rest_res = results;
+        let mut w_start = 0usize;
+        while w_start < num_parts {
+            let w_end = w_start.saturating_add(parts_per_worker).min(num_parts);
+            let byte_start = splits.get(w_start).copied().unwrap_or(0);
+            let byte_end = splits.get(w_end).copied().unwrap_or(byte_start);
+            let byte_len = byte_end.saturating_sub(byte_start);
+            let res_len = w_end.saturating_sub(w_start);
+            let (buf_head, buf_tail) = rest_buf.split_at_mut(byte_len);
+            let (res_head, res_tail) = rest_res.split_at_mut(res_len);
+            let part_splits = &splits[w_start..=w_end];
+            let base_part = w_start;
+            handles.push(scope.may_overlap(
+                "export: link reloc worker",
+                1 << 20,
+                move |_worker_cx: &Cx| -> Result<(), core::convert::Infallible> {
+                    let mut cur_buf = buf_head;
+                    let mut prev = part_splits.first().copied().unwrap_or(0);
+                    for (local_i, &end) in part_splits.iter().skip(1).enumerate() {
+                        let len = end.saturating_sub(prev);
+                        let (part_slice, tail) = cur_buf.split_at_mut(len);
+                        let val = f_ref(base_part + local_i, part_slice);
+                        if let Some(slot) = res_head.get_mut(local_i) {
+                            *slot = Some(val);
+                        }
+                        cur_buf = tail;
+                        prev = end;
+                    }
+                    Ok(())
+                },
+            ));
+            rest_buf = buf_tail;
+            rest_res = res_tail;
+            w_start = w_end;
+        }
+        for handle in handles {
+            let _ = handle.join(self.cx);
+        }
+        let _ = scope.join(self.cx);
+    }
+
+    fn now_ns(&self) -> u64 {
+        self.phases.since(self.began)
+    }
+}
+
+/// Content-addressed local LTO cache over the command's plain store (`Namespace::LOCAL`,
+/// `ReservedTag::Code`), keeping pre-LTO [`BuiltLir`] and post-LTO emitted host-ISA bodies
+/// across incremental `blaze build` invocations and tracking every read/written key so
+/// `checkpoint_export_roots` roots them against GC (Rule 21, Rule 51).
+struct HomeLtoCache<'m, 'w, 'o, 'i, 'p, 'f, D: blaze_core::Driver> {
+    lent: &'m blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
+    walk: &'w Walk<'w>,
+    outcomes: &'o [RowOutcome<'o>],
+    ids: &'i crate::run_ids::RunIds<'i>,
+    producer_digest: [u8; 32],
+    phases: &'p Phases,
+    began: bstd::clock::Instant,
+    frame: &'f Frame,
+    heap: &'static blaze_own::Heap,
+    touched: core::cell::RefCell<std::vec::Vec<blaze_cas::Key, crate::store::plain_place::StoreAlloc>>,
+    io_error: core::cell::RefCell<Option<AString<'static>>>,
+}
+
+impl<'m, 'w, 'o, 'i, 'p, 'f, D: blaze_core::Driver> HomeLtoCache<'m, 'w, 'o, 'i, 'p, 'f, D> {
+    #[expect(clippy::too_many_arguments, reason = "local LTO cache borrows store, walk, outcomes, ids, producer digest, clock, and allocators")]
+    fn new(
+        lent: &'m blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
+        walk: &'w Walk<'w>,
+        outcomes: &'o [RowOutcome<'o>],
+        ids: &'i crate::run_ids::RunIds<'i>,
+        producer_digest: [u8; 32],
+        phases: &'p Phases,
+        began: bstd::clock::Instant,
+        frame: &'f Frame,
+        heap: &'static blaze_own::Heap,
+    ) -> Self {
+        Self {
+            lent,
+            walk,
+            outcomes,
+            ids,
+            producer_digest,
+            phases,
+            began,
+            frame,
+            heap,
+            touched: core::cell::RefCell::new(std::vec::Vec::new_in(*lent.alloc())),
+            io_error: core::cell::RefCell::new(None),
+        }
+    }
+
+    fn take_error(&self) -> Option<AString<'static>> {
+        self.io_error.borrow_mut().take()
+    }
+
+    fn into_touched_keys(self) -> std::vec::Vec<blaze_cas::Key, crate::store::plain_place::StoreAlloc> {
+        self.touched.into_inner()
+    }
+}
+
+impl<D: blaze_core::Driver> ExportLtoCache for HomeLtoCache<'_, '_, '_, '_, '_, '_, D> {
+    fn lir_key(&self, row: usize, machine: ExportLtoMachine) -> Option<[u8; 32]> {
+        let RowOutcome::Keyed(content_key) = *self.outcomes.get(row)? else {
+            return None;
+        };
+        let tabled = self.walk.tabled(row);
+        let body = self.ids.body_check(tabled)?;
+        if body.reads.is_empty() {
+            return None;
+        }
+        Some(built_lir_cache_key(
+            self.producer_digest,
+            machine,
+            self.walk.symbol(row),
+            content_key.0.0,
+            body.key.0,
+            body.reads,
+        ))
+    }
+
+    fn producer_digest(&self) -> Option<[u8; 32]> {
+        Some(self.producer_digest)
+    }
+
+    fn get(&self, key: [u8; 32], alloc: SharedAlloc<'static>) -> Option<Vec<u8, SharedAlloc<'static>>> {
+        if self.io_error.borrow().is_some() {
+            return None;
+        }
+        let cas_key = blaze_cas::Key(blaze_ids::ContentId(key));
+        match self.lent.get(&cas_key) {
+            Ok(Some(rec)) => {
+                if !blaze_keyed::kind::ReservedTag::Code.is(rec.tag) {
+                    *self.io_error.borrow_mut() = Some(owned_fmt(
+                        format_args!("local LTO cache key {} has unexpected tag {:?}", Hex(&key), rec.tag),
+                        self.frame,
+                        self.heap.alloc(),
+                    ));
+                    return None;
+                }
+                self.touched.borrow_mut().push(cas_key);
+                let mut out: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(rec.bytes.len(), alloc);
+                out.extend_from_slice(rec.bytes);
+                Some(out)
+            }
+            Ok(None) => None,
+            Err(why) => {
+                *self.io_error.borrow_mut() = Some(owned_fmt(
+                    format_args!("reading local LTO cache key {}: {why}", Hex(&key)),
+                    self.frame,
+                    self.heap.alloc(),
+                ));
+                None
+            }
+        }
+    }
+
+    fn put(&self, key: [u8; 32], bytes: &[u8]) {
+        if self.io_error.borrow().is_some() {
+            return;
+        }
+        let cas_key = blaze_cas::Key(blaze_ids::ContentId(key));
+        if self.lent.uncommitted_bytes() > crate::store::plain_place::COMMIT_BYTES
+            && let Err(why) = self.lent.commit()
+        {
+            *self.io_error.borrow_mut() = Some(owned_fmt(
+                format_args!("committing local LTO cache arena: {why}"),
+                self.frame,
+                self.heap.alloc(),
+            ));
+            return;
+        }
+        match self.lent.put(
+            &cas_key,
+            blaze_cas::plain::Namespace::LOCAL,
+            blaze_keyed::kind::ReservedTag::Code.tag(),
+            bytes,
+        ) {
+            Ok(_) => {
+                self.touched.borrow_mut().push(cas_key);
+            }
+            Err(why) => {
+                *self.io_error.borrow_mut() = Some(owned_fmt(
+                    format_args!("writing local LTO cache key {}: {why}", Hex(&key)),
+                    self.frame,
+                    self.heap.alloc(),
+                ));
+            }
+        }
+    }
+
+    fn now_ns(&self) -> u64 {
+        self.phases.since(self.began)
     }
 }
 
@@ -2886,6 +3197,7 @@ fn export_program<'f>(
         &maker.typing().kept,
         dep_typed_program.as_slice(),
         dep_typed_toolchain.as_slice(),
+        &[],
         frame,
         heap,
     )?;
@@ -2931,6 +3243,7 @@ fn export_program<'f>(
                 &maker.typing().kept,
                 dep_typed_program.as_slice(),
                 dep_typed_toolchain.as_slice(),
+                &[],
                 frame,
                 heap,
             )?;
@@ -2963,15 +3276,15 @@ fn export_program<'f>(
             lto_bodies: 0,
             lto_inlined: 0,
             lto_hot: 0,
-            phase_times: ExportPhaseTimes { front_ns, walk_ns, lto_ns: 0, link_ns },
+            phase_times: ExportPhaseTimes { front_ns, walk_ns, lto_ns: 0, link_ns, ..ExportPhaseTimes::default() },
             shared_front_stats: shared_front.stats(),
             top_stats,
         });
     }
 
     // Whole-program demand-driven cross-function LIR inlining + host-ISA SOTA emission over
-    // workspace functions and their non-cold reachable callees (kept ephemeral in `export_bump`,
-    // never written into portable `HomeCodeStore`).
+    // workspace functions and their non-cold reachable callees (cached in `Namespace::LOCAL`
+    // under host+producer+input-complete keys, never written into portable `HomeCodeStore`).
     let lto_began = phases.now();
     let mut lto_seeds: AVec<'_, usize> = Vec::new_in(alloc);
     for (row, outcome) in outcomes.iter().enumerate() {
@@ -2985,9 +3298,30 @@ fn export_program<'f>(
     let mut lto_opts = blaze_ladder::run::make_one::export_lto::ExportLtoOpts::for_export(isa);
     lto_opts.pgo_bytes = persisted_pgo.as_deref();
     let lto_runner = CliLtoRunner { cx, workers: standing.workers };
+    let lto_producer_digest = blaze_ladder::code_records::code_key(
+        &blaze_ladder::code_records::KeyParts {
+            symbol: CodeSymbol([0u8; 32]),
+            body: blaze_ids::ContentId([0u8; 32]),
+            ground: blaze_ids::ContentId([0u8; 32]),
+        },
+        &builder,
+    )
+    .0
+    .0;
+    let lto_cache = HomeLtoCache::new(
+        lent,
+        &walk,
+        outcomes.as_slice(),
+        &ids,
+        lto_producer_digest,
+        phases,
+        lto_began,
+        frame,
+        heap,
+    );
     let lto_out = {
         let _lto_span = cx.span("export: workspace LTO");
-        blaze_ladder::run::make_one::export_lto::optimize_export_workspace_par(
+        blaze_ladder::run::make_one::export_lto::optimize_export_workspace_par_cached(
             &walk,
             lto_seeds.as_slice(),
             |row| walk.kind(row) == RowKind::Instance && !matches!(outcomes.get(row), Some(RowOutcome::UnbuiltStub(_))),
@@ -2997,6 +3331,7 @@ fn export_program<'f>(
             heap.shared(),
             alloc,
             &lto_runner,
+            &lto_cache,
         )
         .map_err(|why| {
             box_err(
@@ -3005,6 +3340,11 @@ fn export_program<'f>(
             )
         })?
     };
+    if let Some(cache_err) = lto_cache.take_error() {
+        return Err(box_err(ExportCliError::Lto { shown: cache_err }, heap));
+    }
+    let lto_touched_keys = lto_cache.into_touched_keys();
+    let lto_times = lto_out.times;
     let lto_bodies = lto_out.bodies.len();
     let lto_inlined = lto_out.total_inlined;
     let lto_hot_symbols = lto_out.hot_symbols;
@@ -3085,39 +3425,36 @@ fn export_program<'f>(
     }
 
     // Detect whether any walked row or code record touches Rust thread-locals.
+    // Fast path: check `RowKind::ThreadLocal` across walked rows first (0 store reads!).
     let tls_getter_sym = blaze_ladder::symbols::tls_getter_symbol();
     let tls_desc_sym = blaze_ladder::symbols::tls_desc_symbol();
     let tls_ender_sym = blaze_ladder::tls_index::tls_ender_symbol();
-    let mut has_tls = false;
-    for (row, outcome) in outcomes.iter().enumerate() {
-        match walk.kind(row) {
-            RowKind::ThreadLocal => {
+    let mut has_tls = (0..outcomes.len()).any(|row| walk.kind(row) == RowKind::ThreadLocal);
+    if !has_tls {
+        for (row, outcome) in outcomes.iter().enumerate() {
+            if walk.kind(row) != RowKind::Instance {
+                continue;
+            }
+            let symbol = walk.symbol(row);
+            let rec_bytes = match outcome {
+                RowOutcome::Keyed(key) => {
+                    let entry_bytes = entry_of(&codes, *key)
+                        .map_err(|why| box_err(ExportCliError::Store { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?
+                        .ok_or_else(|| box_err(ExportCliError::MissingEntry { symbol: symbol.0 }, heap))?;
+                    statics::entry_record(entry_bytes)
+                        .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "code entry", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?
+                }
+                RowOutcome::Unkeyed(bytes) => statics::entry_record(bytes.as_slice())
+                    .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "code entry", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?,
+                RowOutcome::Lto { record, .. } => record.as_slice(),
+                RowOutcome::UnbuiltStub(bytes) => bytes.as_slice(),
+            };
+            let view = CodeView::read(rec_bytes)
+                .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "code record", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;
+            if code_touches_tls(&view, tls_getter_sym, tls_desc_sym) {
                 has_tls = true;
                 break;
             }
-            RowKind::Instance => {
-                let symbol = walk.symbol(row);
-                let rec_bytes = match outcome {
-                    RowOutcome::Keyed(key) => {
-                        let entry_bytes = entry_of(&codes, *key)
-                            .map_err(|why| box_err(ExportCliError::Store { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?
-                            .ok_or_else(|| box_err(ExportCliError::MissingEntry { symbol: symbol.0 }, heap))?;
-                        statics::entry_record(entry_bytes)
-                            .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "code entry", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?
-                    }
-                    RowOutcome::Unkeyed(bytes) => statics::entry_record(bytes.as_slice())
-                        .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "code entry", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?,
-                    RowOutcome::Lto { record, .. } => record.as_slice(),
-                    RowOutcome::UnbuiltStub(bytes) => bytes.as_slice(),
-                };
-                let view = CodeView::read(rec_bytes)
-                    .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "code record", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;
-                if code_touches_tls(&view, tls_getter_sym, tls_desc_sym) {
-                    has_tls = true;
-                    break;
-                }
-            }
-            RowKind::Static => {}
         }
     }
 
@@ -3140,9 +3477,10 @@ fn export_program<'f>(
         None
     };
 
-    // Commit and root any extra LTO-discovered or TLS special records BEFORE `ProgramIn` borrows
-    // `&codes` and BEFORE `blaze_export::export()` runs, so a linker error never discards them.
-    if lent.needs_commit() || tls_keys.is_some() {
+    // Commit and root any extra LTO-discovered, local LTO cache, or TLS special records BEFORE
+    // `ProgramIn` borrows `&codes` and BEFORE `blaze_export::export_par()` runs, so a linker error
+    // never discards them.
+    if lent.needs_commit() || tls_keys.is_some() || !lto_touched_keys.is_empty() {
         checkpoint_export_roots(
             lent,
             &today,
@@ -3151,25 +3489,47 @@ fn export_program<'f>(
             &maker.typing().kept,
             dep_typed_program.as_slice(),
             dep_typed_toolchain.as_slice(),
+            lto_touched_keys.as_slice(),
             frame,
             heap,
         )?;
     }
 
-    // Assemble `ProgramIn` functions and data (zero-copy for cached positionless records).
+    // Assemble `ProgramIn` functions and data (zero-copy for cached positionless records, O(1)
+    // datum deduplication, and zero-leak cached symbol formatting).
+    let assemble_began = phases.now();
     let mut functions: AVec<'_, Function<'_>> = Vec::with_capacity_in(outcomes.len() + 2, alloc);
     let mut symbol_names: AVec<'_, (CodeSymbol, &'_ str)> = Vec::with_capacity_in(outcomes.len() + 2, alloc);
     let mut sym_name_buf: AString<'_> = String::new_in(alloc);
+    let crate_names = build_crate_name_map(list, alloc);
+    let mut item_paths: Map<ItemKey, Option<&'_ str>, FixedState, Alloc<'_>> =
+        Map::new(MapOpts { hasher: FixedState, alloc, capacity: Some(outcomes.len() / 4) });
+    let mut lib_paths: Map<ItemKey, Option<&'_ str>, FixedState, Alloc<'_>> =
+        Map::new(MapOpts { hasher: FixedState, alloc, capacity: Some(outcomes.len() / 8) });
+    let mut sym_frame = Frame::with_reserve(16 << 20, bstd::mem::Tag::Other)
+        .map_err(|_| box_err(ExportCliError::Frame, heap))?;
     let mut data: AVec<'_, Data<'_>> = Vec::new_in(alloc);
-    let mut seen_data: AVec<'_, Target> = Vec::new_in(alloc);
+    let mut seen_data: Set<Target, FixedState, Alloc<'_>> =
+        Set::new(SetOpts { hasher: FixedState, alloc, capacity: Some(outcomes.len() / 4) });
     let mut tls_count = 0usize;
 
     for (row, outcome) in outcomes.iter().enumerate() {
         let symbol = walk.symbol(row);
         if walk.kind(row) == RowKind::Instance {
             let tabled = walk.tabled(row);
-            let shown = maker.instance_shown(tabled, walk.name(row));
-            let sym_name = format_symbol_name(symbol, tabled, shown, names.records, list, &mut sym_name_buf, export_bump);
+            let sym_name = format_symbol_name_fast(
+                symbol,
+                tabled,
+                walk.name(row),
+                &maker,
+                names.records,
+                &crate_names,
+                &mut item_paths,
+                &mut lib_paths,
+                &mut sym_name_buf,
+                &mut sym_frame,
+                export_bump,
+            );
             symbol_names.push((symbol, sym_name));
         }
         if let RowOutcome::Lto { record, vtable_data } = outcome {
@@ -3344,8 +3704,20 @@ fn export_program<'f>(
         symbol_names: symbol_names.as_slice(),
     };
 
+    let assemble_ns = phases.since(assemble_began);
+    let export_runner = CliExportRunner {
+        cx,
+        workers: standing.workers,
+        shared: heap.shared(),
+        phases,
+        began: link_began,
+    };
     let mut exe_bytes: AVec<'_, u8> = Vec::new_in(heap.alloc());
-    let exported = blaze_export::export(&program_in, platform, &mut exe_bytes, heap.alloc()).map_err(|error| box_err(ExportCliError::Export(error), heap))?;
+    let (exported, link_times) = {
+        let _link_span = cx.span("export: blaze_export::export_par");
+        blaze_export::export_par(&program_in, platform, &mut exe_bytes, heap.alloc(), &export_runner)
+            .map_err(|error| box_err(ExportCliError::Export(error), heap))?
+    };
 
     // Release immutable borrows of `codes` and ensure any remaining store mutations are committed
     // and rooted (Rule 3: refuse instead of silently dropping).
@@ -3362,13 +3734,16 @@ fn export_program<'f>(
             &maker.typing().kept,
             dep_typed_program.as_slice(),
             dep_typed_toolchain.as_slice(),
+            lto_touched_keys.as_slice(),
             frame,
             heap,
         )?;
     }
     drop(codes);
 
+    let io_began = phases.now();
     write_executable(cx, fs, output_path, exe_bytes.as_slice(), heap)?;
+    let io_ns = phases.since(io_began);
     let link_ns = phases.since(link_began);
     Ok(ExportSummary {
         output: output_path,
@@ -3382,7 +3757,16 @@ fn export_program<'f>(
         lto_bodies,
         lto_inlined,
         lto_hot,
-        phase_times: ExportPhaseTimes { front_ns, walk_ns, lto_ns, link_ns },
+        phase_times: ExportPhaseTimes {
+            front_ns,
+            walk_ns,
+            lto_ns,
+            link_ns,
+            lto_times,
+            assemble_ns,
+            link_times,
+            io_ns,
+        },
         shared_front_stats: shared_front.stats(),
         top_stats,
     })
@@ -3614,6 +3998,41 @@ fn format_build_phases_line(
     }
 }
 
+/// Formats fine-grained LTO sub-phase wall times and cache hit counters for `--stats`.
+fn format_lto_phases_line(out: &mut impl fmt::Write, t: ExportLtoTimes) {
+    let bfs_ms = t.bfs_ns / 1_000_000;
+    let pgo_ms = t.pgo_ns / 1_000_000;
+    let inline_ms = t.inline_ns / 1_000_000;
+    let prep_ms = t.prep_ns / 1_000_000;
+    let emit_ms = t.emit_ns / 1_000_000;
+    let lir_total = t.lir_hits.saturating_add(t.lir_misses);
+    let emit_total = t.emit_hits.saturating_add(t.emit_misses);
+    let _ = write!(
+        out,
+        "lto phases: bfs={bfs_ms}ms pgo={pgo_ms}ms inline={inline_ms}ms prep={prep_ms}ms emit={emit_ms}ms (lir_hit={}/{lir_total} emit_hit={}/{emit_total})",
+        t.lir_hits, t.emit_hits
+    );
+}
+
+/// Formats fine-grained link/Mach-O/ELF export sub-phase wall times for `--stats`.
+fn format_link_phases_line(out: &mut impl fmt::Write, assemble_ns: u64, t: ExportLinkTimes, io_ns: u64) {
+    let assemble_ms = assemble_ns / 1_000_000;
+    let eh_room_ms = t.eh_room_ns / 1_000_000;
+    let order_ms = t.order_ns / 1_000_000;
+    let fold_ms = t.fold_ns / 1_000_000;
+    let reloc_ms = t.reloc_ns / 1_000_000;
+    let fixups_ms = t.fixups_ns / 1_000_000;
+    let eh_ms = t.eh_sections_ns / 1_000_000;
+    let write_ms = t.write_ns / 1_000_000;
+    let uuid_ms = t.uuid_ns / 1_000_000;
+    let sign_ms = t.sign_ns / 1_000_000;
+    let io_ms = io_ns / 1_000_000;
+    let _ = write!(
+        out,
+        "link phases: assemble={assemble_ms}ms eh_room={eh_room_ms}ms order={order_ms}ms fold={fold_ms}ms reloc={reloc_ms}ms fixups={fixups_ms}ms eh={eh_ms}ms write={write_ms}ms uuid={uuid_ms}ms sign={sign_ms}ms io={io_ms}ms"
+    );
+}
+
 /// Formats the top-10 slowest and top-10 largest compiled function tables for `--stats`.
 fn format_top_fn_tables(out: &mut impl fmt::Write, top: &CompileTopStats) {
     if !top.slowest.is_empty() {
@@ -3738,6 +4157,17 @@ fn print_summary(
         let mut phase_line = String::new_in(erased.handle());
         format_build_phases_line(&mut phase_line, summary.phase_times, wall_ns, peak_rss_bytes);
         err.line(cx, format_args!("{}", phase_line.as_str()))?;
+        let mut lto_line = String::new_in(erased.handle());
+        format_lto_phases_line(&mut lto_line, summary.phase_times.lto_times);
+        err.line(cx, format_args!("{}", lto_line.as_str()))?;
+        let mut link_line = String::new_in(erased.handle());
+        format_link_phases_line(
+            &mut link_line,
+            summary.phase_times.assemble_ns,
+            summary.phase_times.link_times,
+            summary.phase_times.io_ns,
+        );
+        err.line(cx, format_args!("{}", link_line.as_str()))?;
         let sf = summary.shared_front_stats;
         if sf.head_hits
             + sf.head_misses
@@ -4650,6 +5080,7 @@ mod tests {
                 walk_ns: 318_000_000,
                 lto_ns: 85_000_000,
                 link_ns: 19_000_000,
+                ..ExportPhaseTimes::default()
             },
             466_000_000,
             Some(184 * 1024 * 1024 + 205 * 1024),
@@ -4662,7 +5093,13 @@ mod tests {
         let mut no_rss = String::new_in(erased.handle());
         format_build_phases_line(
             &mut no_rss,
-            ExportPhaseTimes { front_ns: 1_000_000, walk_ns: 2_000_000, lto_ns: 3_000_000, link_ns: 4_000_000 },
+            ExportPhaseTimes {
+                front_ns: 1_000_000,
+                walk_ns: 2_000_000,
+                lto_ns: 3_000_000,
+                link_ns: 4_000_000,
+                ..ExportPhaseTimes::default()
+            },
             10_000_000,
             None,
         );
@@ -4988,5 +5425,164 @@ mod tests {
         assert_eq!(ctrl_prog, 0, "Rule 23 control: skipping pre-export checkpoint discards uncommitted program CodeRecords on linker failure");
         assert_eq!(ctrl_tool, 0, "Rule 23 control: skipping pre-export checkpoint discards uncommitted toolchain CodeRecords on linker failure");
         assert_eq!(ctrl_typed, 0, "Rule 23 control: skipping pre-export checkpoint discards uncommitted dep Typed records on linker failure");
+    }
+
+    #[test]
+    fn format_lto_and_link_phases_lines_render_expected_fields() {
+        let frame = Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let mut lto_line = String::new_in(erased.handle());
+        format_lto_phases_line(
+            &mut lto_line,
+            ExportLtoTimes {
+                bfs_ns: 12_000_000,
+                pgo_ns: 3_000_000,
+                inline_ns: 45_000_000,
+                prep_ns: 7_000_000,
+                emit_ns: 19_000_000,
+                lir_hits: 999,
+                lir_misses: 1,
+                emit_hits: 998,
+                emit_misses: 2,
+            },
+        );
+        assert_eq!(
+            lto_line.as_str(),
+            "lto phases: bfs=12ms pgo=3ms inline=45ms prep=7ms emit=19ms (lir_hit=999/1000 emit_hit=998/1000)"
+        );
+
+        let mut link_line = String::new_in(erased.handle());
+        format_link_phases_line(
+            &mut link_line,
+            11_000_000,
+            ExportLinkTimes {
+                eh_room_ns: 1_000_000,
+                order_ns: 2_000_000,
+                fold_ns: 3_000_000,
+                reloc_ns: 4_000_000,
+                fixups_ns: 5_000_000,
+                eh_sections_ns: 6_000_000,
+                write_ns: 7_000_000,
+                uuid_ns: 8_000_000,
+                sign_ns: 9_000_000,
+            },
+            10_000_000,
+        );
+        assert_eq!(
+            link_line.as_str(),
+            "link phases: assemble=11ms eh_room=1ms order=2ms fold=3ms reloc=4ms fixups=5ms eh=6ms write=7ms uuid=8ms sign=9ms io=10ms"
+        );
+    }
+
+    #[test]
+    fn cli_export_runner_parallel_matches_sequential_macho_and_elf() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let shared = heap.shared();
+
+        // Build 64 synthetic ARM64 functions with calls + outside import to exercise parallel
+        // folding, relocs, __text write, and Mach-O page signing through `CliExportRunner`.
+        let stp: u32 = 0xA9BF_7BFD;
+        let mov_fp: u32 = 0x9100_03FD;
+        let ldp: u32 = 0xA8C1_7BFD;
+        let ret: u32 = 0xD65F_03C0;
+        let adrp_x16: u32 = 0x9000_0010;
+        let ldr_x16: u32 = 0xF940_0210;
+        let blr_x16: u32 = 0xD63F_0200;
+        let nop: u32 = 0xD503_201F;
+
+        let num_fns = 64usize;
+        let syms: std::vec::Vec<CodeSymbol> = (0..num_fns)
+            .map(|i| {
+                if i == 0 {
+                    CodeSymbol::of_name("main")
+                } else {
+                    CodeSymbol::of_name(&std::format!("cli_par_fn_{i}"))
+                }
+            })
+            .collect();
+        let mut encoded: std::vec::Vec<AVec<'static, u8>> = std::vec::Vec::with_capacity(num_fns);
+        for i in 0..num_fns {
+            let mut r = CodeRecord::new_in(alloc);
+            r.code.extend_from_slice(&stp.to_le_bytes());
+            r.code.extend_from_slice(&mov_fp.to_le_bytes());
+            let call_at = u32::try_from(r.code.len()).unwrap();
+            let t = r.target(Target { space: Space::Func, symbol: syms[(i + 1) % num_fns] });
+            r.code.extend_from_slice(&adrp_x16.to_le_bytes());
+            r.code.extend_from_slice(&ldr_x16.to_le_bytes());
+            r.code.extend_from_slice(&blr_x16.to_le_bytes());
+            r.sites.push(Site { at: call_at, kind: SiteKind::Call, target: t, addend: 0 });
+            if i == 0 {
+                let exit_at = u32::try_from(r.code.len()).unwrap();
+                let te = r.outside("exit");
+                r.code.extend_from_slice(&adrp_x16.to_le_bytes());
+                r.code.extend_from_slice(&ldr_x16.to_le_bytes());
+                r.code.extend_from_slice(&blr_x16.to_le_bytes());
+                r.sites.push(Site { at: exit_at, kind: SiteKind::Call, target: te, addend: 0 });
+            }
+            for _ in 0..1024 {
+                r.code.extend_from_slice(&nop.to_le_bytes());
+            }
+            r.code.extend_from_slice(&ldp.to_le_bytes());
+            r.code.extend_from_slice(&ret.to_le_bytes());
+            let mut buf = Vec::new_in(alloc);
+            r.seal().expect("seal").encode(&mut buf);
+            encoded.push(buf);
+        }
+        let funcs: std::vec::Vec<Function<'_>> = syms
+            .iter()
+            .zip(encoded.iter())
+            .map(|(&symbol, bytes)| Function {
+                symbol,
+                record: CodeView::read(bytes.as_slice()).expect("view"),
+                tier: Tier::Fast,
+            })
+            .collect();
+        let prog = ProgramIn {
+            name: "cli_export_runner_test",
+            functions: &funcs,
+            data: &[],
+            entry: Entry::CMain { main: syms[0] },
+            panic: Panic::Abort,
+            personality: None,
+            tls: None,
+            profile: None,
+            natives: None,
+            exports: &[],
+            symbol_names: &[],
+        };
+
+        use bstd::io::{Io, Limits, SimWorld};
+        let io = Io::simulated(SimWorld::new(202, Limits::USUAL));
+        let workers_4 = core::num::NonZeroU32::new(4).expect("4 workers");
+        let phases = Phases::new(io.clock().expect("sim clock"));
+        let began = phases.now();
+        io.with_test_workers(workers_4, |cx| {
+            assert_eq!(cx.workers(), 4);
+            let runner_1 = CliExportRunner {
+                cx,
+                workers: core::num::NonZeroU32::new(1).expect("1 worker"),
+                shared,
+                phases: &phases,
+                began,
+            };
+            let runner_4 = CliExportRunner {
+                cx,
+                workers: workers_4,
+                shared,
+                phases: &phases,
+                began,
+            };
+            for platform in [Platform::MacosArm64, Platform::LinuxArm64] {
+                let mut out_1 = Vec::new_in(alloc);
+                let mut out_4 = Vec::new_in(alloc);
+                let (exp_1, _) = blaze_export::export_par(&prog, platform, &mut out_1, alloc, &runner_1)
+                    .expect("1-worker export_par");
+                let (exp_4, _) = blaze_export::export_par(&prog, platform, &mut out_4, alloc, &runner_4)
+                    .expect("4-worker export_par");
+                assert_eq!(exp_1, exp_4);
+                assert_eq!(out_1.as_slice(), out_4.as_slice(), "CliExportRunner must be byte-identical across worker counts");
+            }
+        });
     }
 }

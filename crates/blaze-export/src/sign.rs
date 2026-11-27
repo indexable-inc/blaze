@@ -12,6 +12,7 @@
 use blaze_own::AVec;
 
 use crate::bytes;
+use crate::par::{ExportRunner, SequentialExportRunner};
 
 pub const SUPER_BLOB: u32 = 0xFADE_0CC0;
 pub const CODE_DIRECTORY: u32 = 0xFADE_0C02;
@@ -44,6 +45,12 @@ pub fn len(identifier: &str, code_limit: u64) -> u64 {
 /// Appends the signature of `file` (every byte of it: `file.len()` is the code limit) to it.
 /// `text_len` is `__TEXT`'s file size (it starts at offset 0); `main` marks an executable.
 pub fn sign(file: &mut AVec<'_, u8>, identifier: &str, text_len: u64, main: bool) {
+    sign_par(file, identifier, text_len, main, &SequentialExportRunner);
+}
+
+/// Parallel [`sign`]: hashes every 4 KiB code page in `file[..limit]` across `runner` directly
+/// into the pre-allocated `CS_CodeDirectory` hash slots (bit-for-bit identical to [`sign`], Rule 25).
+pub fn sign_par<R: ExportRunner>(file: &mut AVec<'_, u8>, identifier: &str, text_len: u64, main: bool, runner: &R) {
     let limit = file.len();
     let pages = limit.div_ceil(PAGE);
     let hashes_at = DIRECTORY_HEADER + identifier.len() + 1;
@@ -51,6 +58,7 @@ pub fn sign(file: &mut AVec<'_, u8>, identifier: &str, text_len: u64, main: bool
     let total = len(identifier, limit as u64) as usize;
     let start = file.len();
 
+    file.reserve(total);
     bytes::be32(file, SUPER_BLOB);
     bytes::be32(file, (BLOB_HEADER + directory_len) as u32);
     bytes::be32(file, 1);
@@ -78,11 +86,23 @@ pub fn sign(file: &mut AVec<'_, u8>, identifier: &str, text_len: u64, main: bool
     bytes::be64(file, if main { EXECSEG_MAIN_BINARY } else { 0 }); // execSegFlags
     file.extend_from_slice(identifier.as_bytes());
     file.push(0);
-    for page in 0..pages {
-        let from = page * PAGE;
-        let to = (from + PAGE).min(limit);
-        let digest = blaze_sha256::digest(&file[from..to]);
-        file.extend_from_slice(&digest);
-    }
+
+    let hash_start = file.len();
     file.resize(start + total, 0);
+    if pages > 0 {
+        let (before_hashes, sig_tail) = file.split_at_mut(hash_start);
+        let payload = &before_hashes[..limit];
+        let hash_bytes = pages * HASH;
+        if let Some(dst) = sig_tail.get_mut(..hash_bytes) {
+            let (hash_slots, _) = dst.as_chunks_mut::<HASH>();
+            runner.for_each_chunk_mut(hash_slots, 64, |first_page, chunk| {
+                for (k, slot) in chunk.iter_mut().enumerate() {
+                    let page = first_page + k;
+                    let from = page * PAGE;
+                    let to = (from + PAGE).min(limit);
+                    *slot = blaze_sha256::digest(&payload[from..to]);
+                }
+            });
+        }
+    }
 }
