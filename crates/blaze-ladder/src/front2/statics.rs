@@ -111,10 +111,10 @@ pub fn static_values<'c, 'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, bod
                 StaticHeadError::Want(e) => {
                     let _ = core::fmt::write(&mut msg, format_args!("{e}"));
                 }
-                StaticHeadError::Const(want, c, e) => {
+                StaticHeadError::Ensure(want, super::program::WantError::Const { key: c, error: e }) => {
                     let _ = core::fmt::write(&mut msg, format_args!("static head asked {want:?}: the constant {c:x} its head names: {e:?}"));
                 }
-                StaticHeadError::Head(want, e) => {
+                StaticHeadError::Ensure(want, super::program::WantError::Head(e)) => {
                     let shown = super::item_shown::head_error_shown(r.names, &e);
                     let _ = core::fmt::write(&mut msg, format_args!("static head asked {want:?}: {shown}"));
                 }
@@ -164,31 +164,18 @@ pub fn static_values<'c, 'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, bod
 
 enum StaticHeadError {
     Want(super::fill::FillError),
-    Const(super::heads::Want, blaze_id::ItemKey, super::consts::ConstFail),
-    Head(super::heads::Want, super::heads::HeadError),
+    Ensure(super::heads::Want, super::program::WantError),
 }
 
 /// Ensures static `k`'s head is filed in `r.store.fns` and `r.store.statics` (including for
 /// cold cached-`Typed` runs and transitive `DataTarget::Static` relocations pointing to foreign
-/// statics whose heads were never loaded by `check_body`).
+/// statics whose heads were never loaded by `check_body`), via the shared [`super::program::ensure_want`].
 fn ensure_static_head<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, k: ItemKey) -> Result<(), StaticHeadError> {
     if r.store.fns.contains_key(&k) && r.store.statics.contains_key(&k) {
         return Ok(());
     }
     let want = super::fill::want_of_key(r.names, &*r.keys, k).map_err(StaticHeadError::Want)?;
-    let mut lens = 0u32;
-    loop {
-        match r.store.ensure(r.names, &mut *r.keys, want) {
-            Ok(()) => return Ok(()),
-            Err(super::heads::HeadError::Item(_, super::types::Why::NeedConst(c, _))) if lens < super::program::MOST_ADT_LENS => {
-                lens += 1;
-                if let Err(e) = super::check::eval_len(r, c) {
-                    return Err(StaticHeadError::Const(want, c, e));
-                }
-            }
-            Err(e) => return Err(StaticHeadError::Head(want, e)),
-        }
-    }
+    super::program::ensure_want(r, want).map_err(|e| StaticHeadError::Ensure(want, e))
 }
 
 /// Static `k`'s record (copied out of the evaluator's arena) and its kind. The run's static

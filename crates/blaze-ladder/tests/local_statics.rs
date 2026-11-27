@@ -1092,3 +1092,131 @@ pub extern \"C-unwind\" fn main() -> i32 {
         Some(blaze_build::StaticItem { thread_local: false, mutable: false, extern_weak: false })
     );
 }
+
+/// Regression for cold cached-`Typed` lazy runs of bodies performing overloaded `Deref`,
+/// `DerefMut`, `Index`, and `IndexMut` calls (e.g. `std`'s `<impl CStringArray>::push` doing
+/// `self.ptrs.len()` via `Deref` and `self.ptrs[argc] = ...` via `IndexMut`): none of those
+/// implicit lang-trait methods appear in `checked.callees`, so `table_body_facts` must file
+/// their trait member heads upfront rather than failing with `BuildError::NoAbi`.
+#[test]
+fn cold_typed_record_overloaded_deref_and_index_have_abi_upfront() {
+    use blaze_ladder::run::make_one::{FromRecord, Twin};
+
+    let text = "#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = \"pointee_sized\"]
+trait PointeeSized {}
+
+#[lang = \"meta_sized\"]
+trait MetaSized: PointeeSized {}
+
+#[lang = \"sized\"]
+trait Sized: MetaSized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+#[lang = \"deref\"]
+trait Deref {
+    type Target: ?Sized;
+    fn deref(&self) -> &Self::Target;
+}
+
+#[lang = \"deref_mut\"]
+trait DerefMut: Deref {
+    fn deref_mut(&mut self) -> &mut Self::Target;
+}
+
+#[lang = \"index\"]
+trait Index<Idx: ?Sized> {
+    type Output: ?Sized;
+    fn index(&self, index: Idx) -> &Self::Output;
+}
+
+#[lang = \"index_mut\"]
+trait IndexMut<Idx: ?Sized>: Index<Idx> {
+    fn index_mut(&mut self, index: Idx) -> &mut Self::Output;
+}
+
+struct Inner {
+    first_val: i32,
+    second_val: i32,
+}
+
+impl Inner {
+    fn first(&self) -> i32 {
+        self.first_val
+    }
+    fn bump_second(&mut self) {
+        self.second_val = self.second_val + 1;
+    }
+}
+
+struct Arr {
+    inner: Inner,
+}
+
+impl Deref for Arr {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.inner
+    }
+}
+
+impl DerefMut for Arr {
+    fn deref_mut(&mut self) -> &mut Inner {
+        &mut self.inner
+    }
+}
+
+impl Index<usize> for Arr {
+    type Output = i32;
+    fn index(&self, index: usize) -> &i32 {
+        if index == 0 { &self.inner.first_val } else { &self.inner.second_val }
+    }
+}
+
+impl IndexMut<usize> for Arr {
+    fn index_mut(&mut self, index: usize) -> &mut i32 {
+        if index == 0 { &mut self.inner.first_val } else { &mut self.inner.second_val }
+    }
+}
+
+#[inline(never)]
+fn push_like(arr: &mut Arr) -> i32 {
+    let a = arr.first();
+    arr.bump_second();
+    arr[0] = a + 1;
+    arr[0] + arr[1]
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    let mut arr = Arr { inner: Inner { first_val: 1, second_val: 0 } };
+    push_like(&mut arr)
+}
+";
+
+    let f = fixture(text);
+    let b = builder();
+    let main_key = fn_named(&f, "main");
+    let names = reader(&f);
+    let checking = Maker::new(names, Some(main_key), &b, alloc());
+    let typing = FromRecord::rechecked(names, Some(main_key), alloc()).expect("rechecked double");
+    let reading = Maker::typed(names, Some(main_key), typing, &b, alloc());
+    let mut twin = Twin::new(checking, reading, alloc());
+    let mut store = MemoryStore::new_in(alloc());
+    let (_, counts) = walk_records(main_key, &EveryItem, &mut store, &b, &producer(), &mut twin, alloc())
+        .unwrap_or_else(|e| panic!("cold typed-record deref/index walk failed: {e}; log={:?}", logged(names.records)));
+    assert!(logged(names.records).is_empty(), "records log must be empty: {:?}", logged(names.records));
+    assert!(counts.made > 0, "expected makes in walk: {counts}");
+    assert_eq!(twin.compared, counts.make_calls(), "every entry must match byte-for-byte");
+    assert_eq!(
+        twin.reading.program().expect("reading program").counts().checked,
+        0,
+        "cold reading maker must not run check_body"
+    );
+    assert_eq!(run_whole(text), 3);
+}
