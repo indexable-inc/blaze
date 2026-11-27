@@ -2143,3 +2143,74 @@ fn publish_precomputed_emits_bytes_declare_data_publish_and_answers_later_needs_
     let (item, _) = split(&reply).expect("whole frame").expect("one reply");
     assert!(matches!(Down::decode(item).expect("valid"), (_, Down::Publish { record, .. }) if record == fn_rec));
 }
+
+/// Asserts (Rule 21, Rule 23, Rule 76): under a prior certificate (`Held::Other`),
+/// `ahead_of_closed` (1) ALWAYS fetches today's fresh `StartHead` from `lazy.head()` (never
+/// reuses the prior list's head), (2) places ONLY groups whose code content key is in
+/// `VerifiedClosedContents` while leaving workspace groups unresolved for on-demand resolution,
+/// and (3) planted-bug / invalidation control: when `VerifiedClosedContents` is empty (e.g.
+/// `closed_crates_digest` moved), places ZERO groups.
+#[test]
+fn ahead_of_closed_places_only_verified_closed_groups_with_fresh_head() {
+    let io = Io::simulated(SimWorld::new(5, Limits::USUAL));
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let frame = bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
+    let mut store = MemoryStore::new_in(alloc);
+    let mut folder = ToyFolder::default();
+    let (calls, starts) = (Cell::new(0), Cell::new(0));
+
+    // Run 1 under LISTED: resolve MAIN (workspace) and A (closed callee).
+    let mut first = Lazy::new(&cx, ToyFront { calls: &calls, starts: &starts, clean: true, root: MAIN }, &mut folder, &mut store, builder(), alloc);
+    let old_head = StartHead { line: EntryLine { form: blaze_ladder::run::special::EntryForm::Unit, symbol: CodeSymbol([0xee; 32]) }, personality: None };
+    let mut needs = Needs::new(alloc);
+    let mut out = std::vec::Vec::new();
+    needs.serve(&mut first, &need(Needed::Symbol(symbol_of(MAIN))), &mut out).expect("main served");
+    needs.serve(&mut first, &need(Needed::Symbol(symbol_of(A))), &mut out).expect("a served");
+    drop(first);
+
+    let rows: std::vec::Vec<Line> = first_lines(&needs);
+    assert_eq!(rows.len(), 2, "expected MAIN and A rows");
+    let Line::Code(main_row) = rows[0] else { panic!("expected code row for MAIN") };
+    let Line::Code(a_row) = rows[1] else { panic!("expected code row for A") };
+    let mut bytes: AVec<'_, u8> = Vec::new_in(alloc);
+    start_list::encode_lines(&LISTED, old_head, &rows, &mut bytes).expect("encoded list");
+
+    // Read under a DIFFERENT certificate -> Held::Other(symbols).
+    let other_cert = start_list::Certificate::for_tests([0x99; 32]);
+    let start_list::Held::Other(symbols) = start_list::read(bytes.as_slice(), alloc).expect("list reads").under(&other_cert) else {
+        panic!("different certificate must yield Held::Other");
+    };
+
+    // Control 1: with ONLY A's key in VerifiedClosedContents, A is placed, MAIN is NOT placed,
+    // and head is freshly built from today's roots (NOT old_head).
+    let closed = crate::test_cache::VerifiedClosedContents::for_tests(&[a_row.key.0.0], alloc);
+    starts.set(0);
+    calls.set(0);
+    let mut lazy = Lazy::new(&cx, ToyFront { calls: &calls, starts: &starts, clean: true, root: MAIN }, &mut folder, &mut store, builder(), alloc);
+    let mut needs2 = Needs::new(alloc);
+    let mut kept: AVec<'_, TodayGroup<'_>> = Vec::new_in(alloc);
+    let mut out2 = std::vec::Vec::new();
+    let head = ahead_of_closed(symbols, &closed, &mut lazy, &mut needs2, &mut kept, &mut out2).expect("ahead_of_closed");
+    assert_eq!(starts.get(), 1, "ahead_of_closed must build today's fresh StartHead from roots");
+    assert_ne!(head, old_head, "ahead_of_closed must never reuse the old certificate's StartHead");
+    assert_eq!(kept.len(), 1, "only closed group A should be placed");
+    assert_eq!(kept[0].code().symbol, a_row.symbol);
+    assert_ne!(kept[0].code().symbol, main_row.symbol);
+
+    // Asking for placed A answers without calling the resolver; asking for MAIN resolves normally.
+    out2.clear();
+    needs2.serve(&mut lazy, &need(Needed::Symbol(symbol_of(A))), &mut out2).expect("placed A served");
+    assert_eq!(calls.get(), 0, "placed closed group A must not recompile");
+
+    // Control 2 (invalidation): when VerifiedClosedContents is empty (closed_crates_digest moved),
+    // ZERO groups are placed from Held::Other.
+    let empty_closed = crate::test_cache::VerifiedClosedContents::empty(alloc);
+    let mut lazy3 = Lazy::new(&cx, ToyFront { calls: &calls, starts: &starts, clean: true, root: MAIN }, &mut folder, &mut store, builder(), alloc);
+    let mut needs3 = Needs::new(alloc);
+    let mut kept3: AVec<'_, TodayGroup<'_>> = Vec::new_in(alloc);
+    let mut out3 = std::vec::Vec::new();
+    let _ = ahead_of_closed(symbols, &empty_closed, &mut lazy3, &mut needs3, &mut kept3, &mut out3).expect("empty closed");
+    assert!(kept3.is_empty(), "empty VerifiedClosedContents must place zero groups");
+}

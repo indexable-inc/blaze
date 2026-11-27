@@ -1175,6 +1175,9 @@ fn run_program_with(
     phases.mark_cx(cx, "body_ids", frame);
     // The line's table half now: the table itself is handed to the parent below.
     let ids_line = ids.line(&asked, ids_ns);
+    let producer = standing.producers.get::<blaze_ids::producer::CodeBuilder>();
+    let builder = program::run_builder(cx, root, picked.edition, producer, heap, frame)?;
+    let closed_crates_digest = crate::test_cache::closed_crates_digest_of_list(&builder, list, &ids, &standing.tools, alloc);
     let mut made = Some(ids);
     // The start list (start_list.rs): under the answer's root, named by the program; its
     // tables are the root's body ids and the program's image, so both stay rooted beside it.
@@ -1192,7 +1195,6 @@ fn run_program_with(
     }
     // The units' record: the entry's crate list, as the effect's `units` key was.
     let units = (standing.names)(blaze_drive::Name::units()).ok_or(CliError::Start(StartError::NoUnits))?.at;
-    let producer = standing.producers.get::<blaze_ids::producer::CodeBuilder>();
     let lent = standing.lent;
     // What the run reads each body's checked columns from (engine_body_record.rs `TypedFrom`):
     // the check's typed records, found through the answer's records in the command's store,
@@ -1214,7 +1216,7 @@ fn run_program_with(
     if let Some(status_out) = status_out {
         status_out.set_launch(picked.package, picked.bin, launch.args);
     }
-    let ran = program::run(cx, root, launch, picked, units, native.send, producer, lent, today, overrides, &mut names, &mut ids, typed, &mut phases.code_records, watch, heap, frame);
+    let ran = program::run(cx, root, launch, picked, units, native.send, builder, closed_crates_digest, lent, today, overrides, &mut names, &mut ids, typed, &mut phases.code_records, watch, heap, frame);
     drop(names);
     read.add_by_need(scope_records.counts());
     end_procs(cx, &maker, standing.err, "run")?;

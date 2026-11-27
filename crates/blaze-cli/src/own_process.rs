@@ -213,7 +213,7 @@ pub(crate) struct OwnOverrides<'a> {
 /// (`BLAZE_LAUNCH_NATIVE`) and told as the first frame, before today's list and the
 /// personality (blaze-launch wire/run.rs `Down::Native`); `None` sends neither.
 #[expect(clippy::too_many_arguments, reason = "the own-process run's edge: each argument one input, handle or allocator of it")]
-pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
+pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::VerifiedRunMaker<'h>>>(
     cx: &Cx,
     launch: &Launch<'_>,
     package: &str,
@@ -223,6 +223,8 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
     lent: &crate::store::CommandLent,
     today: start_list::Today,
     overrides: OwnOverrides<'_>,
+    run_verified_id: blaze_ids::ContentId,
+    closed_crates_digest: [u8; 32],
     // The run's closing count, for the profile's `run` line on every run (phases.rs): set once
     // the program's loop ends, whether it ended well or not.
     counted: &mut Option<crate::run_parent::RunTally>,
@@ -268,19 +270,6 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
             None
         }
     };
-    let rows = match list {
-        Some(start_list::Held::Today(rows)) => {
-            listed = run_parent::ListHeld::Today;
-            Some(rows)
-        }
-        // Another certificate's symbols: each is resolved at its first call (compiled-behind,
-        // run.md piece 10, will resolve them ahead on idle workers).
-        Some(start_list::Held::Other(_)) => {
-            listed = run_parent::ListHeld::Other;
-            None
-        }
-        None => None,
-    };
     let mut needs = Needs::new(alloc);
     let mut ahead = std::vec::Vec::new_in(alloc);
     let mut placed = Vec::new_in(alloc);
@@ -289,7 +278,21 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
     if let Some(send) = native {
         needs.tell_native(send.library, send.words, &mut ahead).map_err(OwnError::Parent)?;
     }
-    let head = run_parent::ahead_of(rows, &mut lazy, &mut needs, &mut placed, &mut ahead).map_err(OwnError::Parent)?;
+    let head = match list {
+        Some(start_list::Held::Today(rows)) => {
+            listed = run_parent::ListHeld::Today;
+            run_parent::ahead_of(Some(rows), &mut lazy, &mut needs, &mut placed, &mut ahead).map_err(OwnError::Parent)?
+        }
+        // Another certificate's list: always derive today's fresh `StartHead` from `lazy.head()`,
+        // and pre-place ONLY groups whose code content key is proven closed under today's
+        // `closed_crates_digest` (zero workspace items in code, args, reads, declared, or positions).
+        Some(start_list::Held::Other(symbols)) => {
+            listed = run_parent::ListHeld::Other;
+            let closed = lazy.verified_closed_contents(alloc);
+            run_parent::ahead_of_closed(symbols, &closed, &mut lazy, &mut needs, &mut placed, &mut ahead).map_err(OwnError::Parent)?
+        }
+        None => run_parent::ahead_of(None, &mut lazy, &mut needs, &mut placed, &mut ahead).map_err(OwnError::Parent)?,
+    };
     let line = head.line;
     let entry = bstd::mem::format_in!(frame, "{line}");
     // 3. The launcher (either the built JIT executable itself, or `blaze-launcher` beside `blaze`).
@@ -463,12 +466,18 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
         crate::run_fault::report(fault, &mut lazy, record)
     });
     // The walk is over: what the code store served and made is final (the program root's half).
+    let verified = lazy.take_verified();
     drop(lazy);
     if let Err(why) = codes.ensure_persisted() {
         err.line(cx, format_args!("blaze run: refreshing persisted code entries before rooting failed: {why}")).map_err(OwnError::Out)?;
     }
     let mut walked = codes.reached();
     let toolchain_made = codes.toolchain_made();
+    if let Some(verified) = verified
+        && let Err(why) = verified.save_split(lent, run_verified_id, *today.certificate.bytes(), closed_crates_digest, alloc)
+    {
+        err.line(cx, format_args!("blaze run: verified cache was not kept: {why:?}")).map_err(OwnError::Out)?;
+    }
     let ran = ran.map_err(|error| match error {
         LoopError::Start(error) => OwnError::NotStarted {
             launcher: std::boxed::Box::from(launcher_path),

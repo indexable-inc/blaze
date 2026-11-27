@@ -1596,6 +1596,19 @@ fn object_missing(e: &RunError) -> Option<ItemKey> {
 /// Each distinct node is visited once (ground types are interned: one id per type), so the
 /// walk is linear in the arguments' distinct nodes; bounded (rule 18).
 fn held_owners<'a, P: FrontEnd>(program: &P, ground: blaze_typeck::PTys<'_>, args: blaze_typeck::List, tabled: ItemKey, alloc: Alloc<'a>) -> Result<Held<'a>, RunError> {
+    let malformed = |_| RunError::OneBody { key: tabled, why: "an instance's ground arguments refer past their table (make_one.rs `held_owners`)" };
+    let slice = ground.list(args).map_err(malformed)?;
+    held_owners_slice(program, ground, slice, Some(tabled), tabled, alloc)
+}
+
+fn held_owners_slice<'a, P: FrontEnd>(
+    program: &P,
+    ground: blaze_typeck::PTys<'_>,
+    roots: &[blaze_typeck::PTy],
+    skip: Option<ItemKey>,
+    tabled: ItemKey,
+    alloc: Alloc<'a>,
+) -> Result<Held<'a>, RunError> {
     /// The most distinct type nodes one instance's arguments are walked through (rule 18).
     const MOST_NODES: usize = 1 << 20;
     let malformed = |_| RunError::OneBody { key: tabled, why: "an instance's ground arguments refer past their table (make_one.rs `held_owners`)" };
@@ -1605,7 +1618,7 @@ fn held_owners<'a, P: FrontEnd>(program: &P, ground: blaze_typeck::PTys<'_>, arg
     let mut missing_opaques: AVec<'a, ItemKey> = blaze_own::Vec::new_in(alloc);
     let mut seen: AVec<'a, blaze_typeck::PTy> = blaze_own::Vec::new_in(alloc);
     let mut todo: AVec<'a, blaze_typeck::PTy> = blaze_own::Vec::new_in(alloc);
-    todo.extend_from_slice(ground.list(args).map_err(malformed)?);
+    todo.extend_from_slice(roots);
     while let Some(t) = todo.pop() {
         let Err(slot) = seen.binary_search(&t) else { continue };
         if seen.len() >= MOST_NODES {
@@ -1641,7 +1654,7 @@ fn held_owners<'a, P: FrontEnd>(program: &P, ground: blaze_typeck::PTys<'_>, arg
             _ => None,
         };
         if let Some(owner) = owner
-            && owner != tabled
+            && skip != Some(owner)
             && !owners.contains(&owner)
         {
             owners.push(owner);
@@ -2116,6 +2129,19 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
     core.work.needs.clear();
     for row in view.reads() {
         let (bytes, _) = row.map_err(|e| refused(&*program, CodeRecordError::Entry(e)))?;
+        // Prepare any body-local items (`LibKey::INNER` set) declared inside `tabled` (same crate
+        // prefix) before any head/static/const/read lookup, so macro-generated local fns (e.g.
+        // `const_eval_select!` -> `runtime`, `thread_local!`) are filed in O(1) from `tabled`'s
+        // body instead of scanning the crate (`ensure_local_index`) or returning `NotFound` ->
+        // false `Verdict::Stale`.
+        if let Some(q_name) = bytes.get(9..) {
+            let crate_prefix = tabled.0 >> 64;
+            let _ = crate::body_ids::each_item(q_name, |k| {
+                if crate::front2::program::lazy::typed::is_local(k) && (k.0 >> 64) == crate_prefix && k != tabled {
+                    program.prepare_local(k, &[tabled]);
+                }
+            });
+        }
         // A row of no kind: `verify_today` refuses it by name below.
         let Some(kind) = bytes.first().copied().and_then(ReadKind::of) else { continue };
         match kind {
@@ -2232,6 +2258,38 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
         }
         need_tys.sort_unstable();
         need_tys.dedup();
+        // Ensure any closure/coroutine/opaque owners, object tables, and fn heads referenced in
+        // `need_tys` (including closures owned by `tabled` itself, which has only had `head_row`
+        // called above, not `core.ensure`) so `referenced_coroutines` and `const_at::pull` find
+        // their closure capture layouts instead of returning a false `Verdict::Stale`.
+        if let Ok(Held { owners: need_owners, items: need_items, objects: need_objects, missing_opaques }) =
+            held_owners_slice(&*program, core.work.ground.view(), &need_tys, None, tabled, fn_alloc)
+        {
+            for &opaque in missing_opaques.iter() {
+                if matches!(program.opaque_head(opaque), Ok(true))
+                    && let Some(Ok(owner)) = program.opaque_definer(opaque)
+                {
+                    if core.ensure(program, typing, owner, checks, fn_alloc).is_err() {
+                        return Ok(Verdict::Stale { kind: ReadKind::Const, item: tabled });
+                    }
+                }
+            }
+            for &object in need_objects.iter() {
+                if program.object_table(object).is_err() {
+                    return Ok(Verdict::Stale { kind: ReadKind::Const, item: tabled });
+                }
+            }
+            for &item in need_items.iter() {
+                if program.head_row(item).is_err() {
+                    return Ok(Verdict::Stale { kind: ReadKind::Const, item: tabled });
+                }
+            }
+            for &owner in need_owners.iter() {
+                if core.ensure(program, typing, owner, checks, fn_alloc).is_err() {
+                    return Ok(Verdict::Stale { kind: ReadKind::Const, item: tabled });
+                }
+            }
+        }
         let mut rounds = 0u32;
         while !need_tys.is_empty() {
             let found = {

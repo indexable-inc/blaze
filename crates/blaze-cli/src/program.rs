@@ -62,16 +62,36 @@ pub struct Launch<'a> {
 ///
 /// `producer` is the code builder's identity from the command's producer table (D105): the
 /// record walk's code keys hold it.
+/// Domain separator for persisted `BZTV` verified-entry cache pointers on `blaze run`.
+const RUN_VERIFIED_DOMAIN: &str = "blaze run verified cache 1";
+
+/// Builds the `dev`-profile code [`blaze_ladder::code_records::Builder`] for `picked` on this host.
+pub(crate) fn run_builder(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    edition: &str,
+    producer: blaze_ids::producer::ProducerId<blaze_ids::producer::CodeBuilder>,
+    heap: &'static blaze_own::Heap,
+    frame: &Frame,
+) -> Result<blaze_ladder::code_records::Builder, CliError> {
+    let overflow = dev_overflow(cx, root, frame)?;
+    let panic = dev_panic(cx, root, frame)?;
+    let parent = move |why| CliError::OwnProcess(blaze_own::Box::new_in(crate::own_process::OwnError::Parent(why), heap.alloc()));
+    let isa = crate::run_parent::isa().map_err(parent)?;
+    crate::run_parent::builder_for(edition, overflow, panic, producer, isa).map_err(parent)
+}
+
 #[expect(unused_variables, reason = "`units` waits for the image path that loads the program from its records")]
 #[expect(clippy::too_many_arguments, reason = "the run's edge: each argument one handle or fact of it")]
 pub(crate) fn run<'h>(
     cx: &Cx,
-    root: &Dir<ReadWrite>,
+    _root: &Dir<ReadWrite>,
     launch: &Launch<'_>,
     picked: &crate::run_package::Program<'_>,
     units: blaze_drive::Key,
     native: Option<crate::engine_native::NativeSend<'_>>,
-    producer: blaze_ids::producer::ProducerId<blaze_ids::producer::CodeBuilder>,
+    builder: blaze_ladder::code_records::Builder,
+    closed_crates_digest: [u8; 32],
     // The command's one store: a Rust program's code entries are found and kept there (own_process.rs).
     lent: &crate::store::CommandLent,
     // The request's certificate and the start list's name (start_list.rs): own_process.rs reads
@@ -96,15 +116,17 @@ pub(crate) fn run<'h>(
     frame: &Frame,
 ) -> Result<u8, CliError> {
     let cx = cx.span("blaze run: the program");
-    let (package, edition) = (picked.package, picked.edition);
-    // What the records are made for: the edition, the `dev` profile's overflow checks and
-    // panic strategy, the code builder (D105), this machine.
-    let overflow = dev_overflow(&cx, root, frame)?;
-    let panic = dev_panic(&cx, root, frame)?;
-    // The parent's failures boxed in the process heap: the error outlives this frame to `main`.
-    let parent = move |why| CliError::OwnProcess(blaze_own::Box::new_in(crate::own_process::OwnError::Parent(why), heap.alloc()));
-    let isa = crate::run_parent::isa().map_err(parent)?;
-    let builder = crate::run_parent::builder_for(edition, overflow, panic, producer, isa).map_err(parent)?;
+    let package = picked.package;
+    let run_verified_id = blaze_ids::ContentId::of(RUN_VERIFIED_DOMAIN, &today.name.id().0);
+    let mut verified = crate::test_cache::VerifiedCache::new(heap.alloc());
+    if let Err(why) = verified.load_split(lent, run_verified_id, *today.certificate.bytes(), closed_crates_digest) {
+        return Err(CliError::OwnProcess(blaze_own::Box::new_in(
+            crate::own_process::OwnError::Parent(crate::run_parent::ParentError::BodyIds {
+                shown: std::boxed::Box::from(bstd::mem::format_in!(frame, "verified cache could not be read: {why:?}").as_str()),
+            }),
+            heap.alloc(),
+        )));
+    }
     // EVERY program runs in its own process under the lazy parent (own_process.rs, D103, D124;
     // run.md "Every program runs in the child"), and nothing of it is built here: its start
     // (the roots: bstd's hosted entry, a C `main`, the shim of a Rust program with std, or
@@ -117,8 +139,9 @@ pub(crate) fn run<'h>(
     let exports = native.map_or(&[][..], |send| send.items);
     // The make watch's clock starts here, at the command's edge (rule 75).
     let make_watch = crate::run_parent::command_make_watch();
-    let front = crate::run_parent::CommandFront::new(names, ids, typed, builder, heap.alloc(), roots.handle(), watch, exports, make_watch);
-    crate::own_process::run_own(&cx, launch, package, builder, front, native, lent, today, overrides, counted, frame).map_err(move |error| CliError::OwnProcess(blaze_own::Box::new_in(error, heap.alloc())))
+    let front = crate::run_parent::CommandFront::new(names, ids, typed, builder, heap.alloc(), roots.handle(), watch, exports, make_watch, Some(verified));
+    crate::own_process::run_own(&cx, launch, package, builder, front, native, lent, today, overrides, run_verified_id, closed_crates_digest, counted, frame)
+        .map_err(move |error| CliError::OwnProcess(blaze_own::Box::new_in(error, heap.alloc())))
 }
 
 /// The exit status of `blaze run` and `blaze test` for every failure before the program starts
