@@ -420,7 +420,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         loop {
             let names = self.front.names;
             match self.store.ensure(names, &mut self.front.keys, want) {
-                Err(crate::front2::heads::HeadError::Item(_, crate::front2::heads::Why::NeedConst(c, _))) if lens < MOST_ADT_LENS => {
+                Err(crate::front2::heads::HeadError::Item(_, crate::front2::types::Why::NeedConst(c, _))) if lens < MOST_ADT_LENS => {
                     lens += 1;
                     let cacheable = self.store.maps.const_proofs.is_none()
                         && !self.store.maps.qpaths.borrow().is_leaf(c)
