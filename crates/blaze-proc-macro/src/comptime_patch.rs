@@ -2529,7 +2529,7 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
                     }
                     let _ = writeln!(
                         source_arms,
-                        "        match ::core::option::Option::as_ref({acc}) {{ ::core::option::Option::Some(__e) => ::core::option::Option::Some(__e as &(dyn ::core::error::Error + 'static)), ::core::option::Option::None => ::core::option::Option::None }}"
+                        "        match ({acc}).as_ref() {{ ::core::option::Option::Some(__e) => ::core::option::Option::Some(__e as &(dyn ::core::error::Error + 'static)), ::core::option::Option::None => ::core::option::Option::None }}"
                     );
                 } else {
                     let _ = writeln!(
@@ -2623,7 +2623,7 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
                         }
                         let _ = writeln!(
                             source_arms,
-                            "            {pat} => match ::core::option::Option::as_ref(__f{idx}) {{ ::core::option::Option::Some(__e) => ::core::option::Option::Some(__e as &(dyn ::core::error::Error + 'static)), ::core::option::Option::None => ::core::option::Option::None }},"
+                            "            {pat} => match __f{idx}.as_ref() {{ ::core::option::Option::Some(__e) => ::core::option::Option::Some(__e as &(dyn ::core::error::Error + 'static)), ::core::option::Option::None => ::core::option::Option::None }},"
                         );
                     } else {
                         let _ = writeln!(
@@ -3512,9 +3512,9 @@ mod tests {
         let exp = expand_code("thiserror-impl", ProcKind::Derive, "Error", resolve_err)
             .expect("struct explicit #[source] Option<E> expands");
         assert!(
-            exp.contains("match ::core::option::Option::as_ref(&self.source)")
+            exp.contains("match (&self.source).as_ref()")
                 && exp.contains("::core::option::Option::Some(__e) =>::core::option::Option::Some(__e as &(dyn ::core::error::Error + 'static))"),
-            "must unwrap Option<E> via Option::as_ref instead of casting &Option<E>:\n{exp}"
+            "must unwrap Option<E> via .as_ref() instead of casting &Option<E>:\n{exp}"
         );
         assert!(
             !exp.contains("&self.source as &(dyn"),
@@ -3533,7 +3533,7 @@ mod tests {
         let exp_imp = expand_code("thiserror_impl", ProcKind::Derive, "Error", implicit_err)
             .expect("struct implicit source: Option<E> expands");
         assert!(
-            exp_imp.contains("match ::core::option::Option::as_ref(&self.source)"),
+            exp_imp.contains("match (&self.source).as_ref()"),
             "implicit source: Option<E> must unwrap Option:\n{exp_imp}"
         );
 
@@ -3546,7 +3546,7 @@ mod tests {
         let exp_tup = expand_code("thiserror_impl", ProcKind::Derive, "Error", tuple_err)
             .expect("tuple struct #[source] Option<E> expands");
         assert!(
-            exp_tup.contains("match ::core::option::Option::as_ref(&self.0)"),
+            exp_tup.contains("match (&self.0).as_ref()"),
             "tuple struct #[source] Option<E> must unwrap &self.0:\n{exp_tup}"
         );
 
@@ -3576,9 +3576,9 @@ mod tests {
         let exp_enum = expand_code("thiserror_impl", ProcKind::Derive, "Error", enum_opt)
             .expect("enum Option<E> source variants expand");
         assert!(
-            exp_enum.contains("match ::core::option::Option::as_ref(__f1)")
-                && exp_enum.contains("match ::core::option::Option::as_ref(__f0)"),
-            "enum variants must unwrap Option<E> via Option::as_ref(__fN):\n{exp_enum}"
+            exp_enum.contains("match __f1.as_ref()")
+                && exp_enum.contains("match __f0.as_ref()"),
+            "enum variants must unwrap Option<E> via __fN.as_ref():\n{exp_enum}"
         );
         assert!(
             !exp_enum.contains("__f0 as &(dyn") && !exp_enum.contains("__f1 as &(dyn"),
@@ -3598,7 +3598,7 @@ mod tests {
         let exp_prec = expand_code("thiserror_impl", ProcKind::Derive, "Error", prec_err)
             .expect("explicit #[source] before field named source expands");
         assert!(
-            exp_prec.contains("match ::core::option::Option::as_ref(&self.cause)")
+            exp_prec.contains("match (&self.cause).as_ref()")
                 && !exp_prec.contains("&self.source"),
             "explicit #[source] must beat later implicit `source` field:\n{exp_prec}"
         );
@@ -3642,8 +3642,8 @@ mod tests {
         assert!(
             exp_const_opt.contains("::core::convert::From <Option <3>> for ConstOptErr")
                 && exp_const_opt.contains("::core::option::Option::Some(&self.source as &(dyn ::core::error::Error + 'static))")
-                && !exp_const_opt.contains("Option::as_ref"),
-            "Option<3> must not be unwrapped as core::option::Option:\n{exp_const_opt}"
+                && !exp_const_opt.contains(".as_ref()"),
+            "Option<3> must not be unwrapped as Option:\n{exp_const_opt}"
         );
 
         // 6c. Reference-valued sources (`&'static E` and `Option<&'static E>`, `#[source]` & `#[from]`)
@@ -3659,20 +3659,20 @@ mod tests {
         let exp_opt_ref = expand_code("thiserror_impl", ProcKind::Derive, "Error", opt_ref_src)
             .expect("Option<&'static E> source expands directly");
         assert!(
-            exp_opt_ref.contains("match ::core::option::Option::as_ref(&self.source)"),
-            "Option<&'static E> source must unwrap via Option::as_ref:\n{exp_opt_ref}"
+            exp_opt_ref.contains("match (&self.source).as_ref()"),
+            "Option<&'static E> source must unwrap via .as_ref():\n{exp_opt_ref}"
         );
         let from_opt_ref = r#"#[derive(Debug)] #[error("from opt ref")] pub struct FromOptRef { #[from] source: Option<&'static std::io::Error> }"#;
         let exp_from_opt_ref = expand_code("thiserror_impl", ProcKind::Derive, "Error", from_opt_ref)
             .expect("#[from] Option<&'static E> expands directly");
         assert!(
             exp_from_opt_ref.contains("::core::convert::From <&'static std::io::Error> for FromOptRef")
-                && exp_from_opt_ref.contains("match ::core::option::Option::as_ref(&self.source)"),
+                && exp_from_opt_ref.contains("match (&self.source).as_ref()"),
             "#[from] Option<&'static E> must impl From<&'static E> and unwrap source():\n{exp_from_opt_ref}"
         );
 
         // 7. `#[from] Option<E>` expands directly (wrapping `Some(__source)` in `From<E>`
-        //    and unwrapping `Option::as_ref` in `Error::source`) for structs and enums.
+        //    and unwrapping via `.as_ref()` in `Error::source`) for structs and enums.
         let from_opt_named = r#"
             #[derive(Debug)]
             #[error("from named")]
@@ -3686,7 +3686,7 @@ mod tests {
         assert!(
             exp_from_named.contains("::core::convert::From <std::io::Error> for FromOptNamed")
                 && exp_from_named.contains("FromOptNamed {source: ::core::option::Option::Some(__source)}")
-                && exp_from_named.contains("match ::core::option::Option::as_ref(&self.source)"),
+                && exp_from_named.contains("match (&self.source).as_ref()"),
             "struct #[from] Option<E> must impl From<E> wrapping Some and unwrap source():\n{exp_from_named}"
         );
 
@@ -3700,7 +3700,7 @@ mod tests {
         assert!(
             exp_from_tuple.contains("::core::convert::From <std::io::Error> for FromOptTuple")
                 && exp_from_tuple.contains("FromOptTuple(::core::option::Option::Some(__source))")
-                && exp_from_tuple.contains("match ::core::option::Option::as_ref(&self.0)"),
+                && exp_from_tuple.contains("match (&self.0).as_ref()"),
             "tuple struct #[from] Option<E> must impl From<E> wrapping Some and unwrap source():\n{exp_from_tuple}"
         );
 
@@ -3720,7 +3720,7 @@ mod tests {
                 && exp_from_enum.contains("FromOptEnum::Io {source: ::core::option::Option::Some(__source)}")
                 && exp_from_enum.contains("::core::convert::From <std::fmt::Error> for FromOptEnum")
                 && exp_from_enum.contains("FromOptEnum::Fmt(::core::option::Option::Some(__source))")
-                && exp_from_enum.contains("match ::core::option::Option::as_ref(__f0)"),
+                && exp_from_enum.contains("match __f0.as_ref()"),
             "enum #[from] Option<E> must impl From<E> wrapping Some and unwrap source():\n{exp_from_enum}"
         );
 
@@ -3929,6 +3929,18 @@ mod tests {
             ProcKind::Derive,
             "Error",
             r#"#[derive(Debug)] #[error("const opt")] pub struct ConstOptErr { #[from] source: Option<3> }"#,
+        );
+        let custom_opt_struct_impl = expand_raw(
+            "thiserror_impl",
+            ProcKind::Derive,
+            "Error",
+            r#"#[derive(Debug)] #[error("custom opt")] pub struct CustomOptErr { #[source] source: Option<super::LeafErr> }"#,
+        );
+        let custom_opt_enum_impl = expand_raw(
+            "thiserror_impl",
+            ProcKind::Derive,
+            "Error",
+            r#"#[derive(Debug)] pub enum CustomOptEnum { #[error("custom opt")] Wrapped(#[source] Option<super::LeafErr>) }"#,
         );
 
         let strum_def = "pub enum Kind { FastPath, SlowFallback }";
@@ -4145,6 +4157,23 @@ mod const_opt_shadow {{
     }}
     {const_opt_mod_impl}
 }}
+mod custom_opt_shadow {{
+    #[derive(Debug)]
+    pub struct Option<T>(pub ::core::option::Option<T>);
+    impl<T> Option<T> {{
+        pub fn as_ref(&self) -> ::core::option::Option<&T> {{ self.0.as_ref() }}
+    }}
+    #[derive(Debug)]
+    pub struct CustomOptErr {{
+        pub source: Option<super::LeafErr>,
+    }}
+    {custom_opt_struct_impl}
+    #[derive(Debug)]
+    pub enum CustomOptEnum {{
+        Wrapped(Option<super::LeafErr>),
+    }}
+    {custom_opt_enum_impl}
+}}
 {strum_def}
 {strum_as_ref}
 {strum_into_str}
@@ -4244,6 +4273,17 @@ fn main() {{
 
     let co: const_opt_shadow::ConstOptErr = const_opt_shadow::Option::<3>.into();
     assert_eq!(std::error::Error::source(&co).map(|s| s.to_string()).as_deref(), Some("opt-3"));
+
+    let cust_some = custom_opt_shadow::CustomOptErr {{
+        source: custom_opt_shadow::Option(Some(LeafErr)),
+    }};
+    assert_eq!(std::error::Error::source(&cust_some).map(|s| s.to_string()).as_deref(), Some("leaf"));
+    let cust_none = custom_opt_shadow::CustomOptErr {{
+        source: custom_opt_shadow::Option(None),
+    }};
+    assert!(std::error::Error::source(&cust_none).is_none());
+    let cust_enum = custom_opt_shadow::CustomOptEnum::Wrapped(custom_opt_shadow::Option(Some(LeafErr)));
+    assert_eq!(std::error::Error::source(&cust_enum).map(|s| s.to_string()).as_deref(), Some("leaf"));
 
     let k = Kind::FastPath;
     assert_eq!(k.as_ref(), "fast-path");

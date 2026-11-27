@@ -321,7 +321,7 @@ pub struct ResolveError {
 }
 impl Error for ResolveError {
     fn source(&self) -> Opt<&(dyn Error + 'static)> {
-        match Opt::as_ref(&self.source) {
+        match (&self.source).as_ref() {
             Opt::Some(__e) => Opt::Some(__e as &(dyn Error + 'static)),
             Opt::None => Opt::None,
         }
@@ -338,12 +338,12 @@ impl Error for OptEnumErr {
         match self {
             OptEnumErr::Named { code: __f0, cause: __f1 } => {
                 let _ = __f0;
-                match Opt::as_ref(__f1) {
+                match __f1.as_ref() {
                     Opt::Some(__e) => Opt::Some(__e as &(dyn Error + 'static)),
                     Opt::None => Opt::None,
                 }
             }
-            OptEnumErr::Tuple(__f0) => match Opt::as_ref(__f0) {
+            OptEnumErr::Tuple(__f0) => match __f0.as_ref() {
                 Opt::Some(__e) => Opt::Some(__e as &(dyn Error + 'static)),
                 Opt::None => Opt::None,
             },
