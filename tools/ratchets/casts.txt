@@ -79,7 +79,7 @@ blaze-inproc	70
 blaze-int	6
 blaze-keyed	677
 blaze-kit	2
-blaze-ladder	1376
+blaze-ladder	1375
 blaze-launch	174
 blaze-launch-rt	455
 blaze-launcher	5
@@ -116,7 +116,7 @@ blaze-screen	13
 blaze-script	11
 blaze-sh	145
 blaze-sha256	1
-blaze-shell	503
+blaze-shell	508
 blaze-shell-config	1
 blaze-sim	50
 blaze-sniff	2

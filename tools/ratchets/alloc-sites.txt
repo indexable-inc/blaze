@@ -77,7 +77,7 @@ blaze-resolve	5	0	103	64
 blaze-scope	0	0	0	47
 blaze-screen	254	0	0	37
 blaze-script	0	0	6	117
-blaze-shell	0	0	7	239
+blaze-shell	0	0	7	241
 blaze-sim	0	0	39	33
 blaze-solve	0	0	0	16
 blaze-source	2	0	4	8
