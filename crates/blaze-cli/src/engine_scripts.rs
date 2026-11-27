@@ -1462,6 +1462,7 @@ impl<'f> ScriptsStage<'f> {
             };
             let module = made.script_module(name.subject).ok_or(EngineCheckError::MissingEntry { task: name, table: Table::WorldScriptModules, key: name })?;
             let wanted = crate::script_modules::Wanted {
+                script_unit: module.script_unit,
                 ran_as: module.ran_as, package: module.package, version: module.version,
                 features: queue.jobs.alloc_slice_copy(&module.features),
                 files: module.files.as_deref().map(|s| &*queue.jobs.alloc_str(s)),

@@ -618,14 +618,50 @@ fn map_wasm64_build_error(module_name: &str, mode: CompileMode, err: Wasm64Build
     }
 }
 
-/// Ensures the build-script unit `package version features` has a compiled `wasm64` module in
-/// `<store>/build-script/modules/` and returns its `wasm-sha256` hex digest.
+/// Resolves and validates the exact requested build-script `UnitId` in `graph` against the
+/// caller's `(package, version, features)` so resolver-2 target-side vs host-side build scripts
+/// (or same-name/version packages from distinct sources) with different WASI dependency closures
+/// never alias onto the first matching unit.
+fn select_build_script_unit(
+    graph: &UnitGraph<'_>,
+    script_id: UnitId,
+    package: &str,
+    version: &str,
+    want_sorted: &[&str],
+    frame: &Frame,
+) -> Result<UnitId, SelfCompileError> {
+    if let Some(u) = graph.units.get(script_id.index())
+        && u.kind == UnitKind::BuildScript
+        && u.name.as_str() == package
+        && u.version.as_str() == version
+        && sorted_features_match(u, want_sorted)
+    {
+        return Ok(script_id);
+    }
+    Err(SelfCompileError::Failed(
+        bstd::mem::format_in!(
+            frame,
+            "unit graph unit {} does not match BuildScript {package} {version} with features [{}]",
+            script_id.0,
+            want_sorted.join(",")
+        )
+        .as_str()
+        .into(),
+    ))
+}
+
+/// Ensures the build-script unit `script_id` (`package version features`, expected `deps_digest`)
+/// has a compiled `wasm64` module in `<store>/build-script/modules/` and returns its
+/// `wasm-sha256` hex digest.
+#[expect(clippy::too_many_arguments, reason = "build-script compile entry point taking store, inputs, exact UnitId, package identity, and expected deps digest")]
 pub(crate) fn compile_build_script(
     store: &Path,
     inputs: CompileInputs<'_>,
+    script_id: UnitId,
     package: &str,
     version: &str,
     features: &[&str],
+    expected_deps: Option<&str>,
 ) -> Result<std::string::String, SelfCompileError> {
     let Some(checkout) = inputs.checkout else {
         return Err(SelfCompileError::Failed(std::format!(
@@ -651,18 +687,7 @@ pub(crate) fn compile_build_script(
         .map_err(|e| SelfCompileError::Failed(std::format!("Cargo.lock parse failed: {e}")))?;
     let mut want_sorted: std::vec::Vec<&str> = features.to_vec();
     want_sorted.sort_unstable();
-    let Some(unit_idx) = decoded.graph.units.iter().position(|u| {
-        u.kind == UnitKind::BuildScript
-            && u.name.as_str() == package
-            && u.version.as_str() == version
-            && sorted_features_match(u, &want_sorted)
-    }) else {
-        return Err(SelfCompileError::Failed(std::format!(
-            "unit graph has no BuildScript unit for {package} {version} with features [{}]",
-            want_sorted.join(",")
-        )));
-    };
-    let script_id = UnitId(unit_idx as u32);
+    let script_id = select_build_script_unit(&decoded.graph, script_id, package, version, &want_sorted, &frame)?;
     ensure_build_script_unit(
         store,
         &decoded.graph,
@@ -672,6 +697,7 @@ pub(crate) fn compile_build_script(
         inputs.members,
         inputs.heap,
         script_id,
+        expected_deps,
         0,
     )
 }
@@ -693,7 +719,7 @@ fn path_pkg_files_digest(
 
 /// Recursively compiles `script_id` (and any build-script dependencies of its build-dependencies)
 /// into `<store>/build-script/modules/<key>` and returns its `wasm-sha256` digest.
-#[expect(clippy::too_many_arguments, reason = "recursive build-script compilation over store, graph, wasm_graph, lock, checkout, members, heap, unit, and depth")]
+#[expect(clippy::too_many_arguments, reason = "recursive build-script compilation over store, graph, wasm_graph, lock, checkout, members, heap, unit, expected_deps, and depth")]
 fn ensure_build_script_unit(
     store: &Path,
     graph: &UnitGraph<'_>,
@@ -703,6 +729,7 @@ fn ensure_build_script_unit(
     members: &[(LockId, &str, blaze_world::PathKind)],
     heap: &'static blaze_own::Heap,
     script_id: UnitId,
+    expected_deps: Option<&str>,
     depth: u8,
 ) -> Result<std::string::String, SelfCompileError> {
     if depth > 8 {
@@ -735,6 +762,20 @@ fn ensure_build_script_unit(
         let _ = write!(msg, "build-script deps digest of {}: {e}", unit.name.as_str());
         SelfCompileError::Failed(msg.as_str().into())
     })?;
+    if let Some(want_deps) = expected_deps
+        && deps_digest.as_deref() != Some(want_deps)
+    {
+        let mut msg = blaze_own::String::new_in(heap.alloc());
+        let _ = write!(
+            msg,
+            "build-script unit {} ({} {}) computed deps digest {:?} != requested {want_deps}",
+            script_id.0,
+            unit.name.as_str(),
+            unit.version.as_str(),
+            deps_digest.as_deref()
+        );
+        return Err(SelfCompileError::Failed(msg.as_str().into()));
+    }
 
     // Fast path: already compiled and cached on disk.
     if let Ok(Some(record_dir)) = script_unit::module_of_files_and_deps(
@@ -1102,7 +1143,7 @@ fn run_dep_build_script(
     depth: u8,
 ) -> Result<std::vec::Vec<u8>, SelfCompileError> {
     // Ensure the build script's own wasm64 module exists first (`graph` here is already `wasm_graph`).
-    let _ = ensure_build_script_unit(store, graph, Some(graph), lock, checkout, members, heap, bs_id, depth + 1)?;
+    let _ = ensure_build_script_unit(store, graph, Some(graph), lock, checkout, members, heap, bs_id, None, depth + 1)?;
     let frame = Frame::with_reserve(128 << 20, Tag::Other)
         .map_err(|_| SelfCompileError::Failed(std::string::String::from("failed to reserve dep build-script frame")))?;
     let erased = Erased::new(&frame);
@@ -3445,5 +3486,118 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn select_build_script_unit_and_wasm_root_distinguish_same_identity_target_and_host_scripts() {
+        let frame = Frame::with_reserve(16 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let a = erased.handle();
+
+        // Two BuildScript units for the same `(pkg, version, features)` (`demo 0.1.0 []`),
+        // one owned by a target-side Lib (`Side::Target`) and one owned by a host-side Lib
+        // (`Side::Host`), each having a distinct WASI-only build-dependency closure (`dep-a` vs
+        // `dep-b`). Selecting by exact `UnitId` + `HostFeatureSide` must keep them separate.
+        let lock_text = "\
+version = 4
+
+[[package]]
+name = \"demo\"
+version = \"0.1.0\"
+dependencies = [
+ \"dep-a\",
+ \"dep-b\",
+]
+
+[[package]]
+name = \"dep-a\"
+version = \"0.1.0\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+checksum = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"
+
+[[package]]
+name = \"dep-b\"
+version = \"0.1.0\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
+";
+        let lock = Lock::read(lock_text.as_bytes(), a).expect("parse lock");
+
+        let make_bs = |pkg: u32, deps: &[(&str, u32)]| -> Unit<'_> {
+            make_unit(pkg, "demo", "build_script_build", UnitKind::BuildScript, "2024", deps, a)
+        };
+        let make_lib = |pkg: u32, name: &str, for_host: bool, bs: Option<u32>| -> Unit<'_> {
+            let mut u = make_unit(pkg, name, name, UnitKind::Lib, "2024", &[], a);
+            u.for_host = for_host;
+            u.build_script = bs.map(UnitId);
+            u
+        };
+
+        // Host graph:
+        //   0: demo BuildScript (target side, owned by unit 1)
+        //   1: demo Lib (for_host = false, build_script = 0)
+        //   2: demo BuildScript (host side, owned by unit 3)
+        //   3: demo Lib (for_host = true, build_script = 2)
+        let host_graph = make_graph(
+            std::vec![
+                make_bs(0, &[]),
+                make_lib(0, "demo", false, Some(0)),
+                make_bs(0, &[]),
+                make_lib(0, "demo", true, Some(2)),
+            ],
+            a,
+        );
+
+        // Wasm graph (order intentionally flipped so host-side script comes first):
+        //   0: dep-b Lib (host-side)
+        //   1: demo BuildScript (host side, depends on dep-b = UnitId(0))
+        //   2: demo Lib (for_host = true, build_script = 1)
+        //   3: dep-a Lib (target-side)
+        //   4: demo BuildScript (target side, depends on dep-a = UnitId(3))
+        //   5: demo Lib (for_host = false, build_script = 4)
+        let mut wasm_dep_b = make_lib(2, "dep_b", true, None);
+        wasm_dep_b.name = blaze_own::String::from_str_in("dep-b", a);
+        let mut wasm_dep_a = make_lib(1, "dep_a", false, None);
+        wasm_dep_a.name = blaze_own::String::from_str_in("dep-a", a);
+        let wasm_graph = make_graph(
+            std::vec![
+                wasm_dep_b,
+                make_bs(0, &[("dep_b", 0)]),
+                make_lib(0, "demo", true, Some(1)),
+                wasm_dep_a,
+                make_bs(0, &[("dep_a", 3)]),
+                make_lib(0, "demo", false, Some(4)),
+            ],
+            a,
+        );
+
+        let target_bs = select_build_script_unit(&host_graph, UnitId(0), "demo", "0.1.0", &[], &frame)
+            .expect("target-side script selected by exact UnitId");
+        let host_bs = select_build_script_unit(&host_graph, UnitId(2), "demo", "0.1.0", &[], &frame)
+            .expect("host-side script selected by exact UnitId");
+        assert_eq!(target_bs, UnitId(0));
+        assert_eq!(host_bs, UnitId(2));
+
+        // Passing a non-BuildScript unit or mismatched package/features must fail loudly.
+        assert!(select_build_script_unit(&host_graph, UnitId(1), "demo", "0.1.0", &[], &frame).is_err());
+        assert!(select_build_script_unit(&host_graph, UnitId(0), "demo", "0.1.0", &["extra"], &frame).is_err());
+
+        let wasm_target_bs = locate_root_in_wasm_graph(&host_graph, &wasm_graph, target_bs, CompileMode::BuildScript, a)
+            .expect("locate target-side build script in wasm graph");
+        let wasm_host_bs = locate_root_in_wasm_graph(&host_graph, &wasm_graph, host_bs, CompileMode::BuildScript, a)
+            .expect("locate host-side build script in wasm graph");
+        assert_eq!(wasm_target_bs, UnitId(4));
+        assert_eq!(wasm_host_bs, UnitId(1));
+
+        let target_digest = script_unit::script_deps_digest(&host_graph, Some(&wasm_graph), &lock, target_bs, |_| None)
+            .expect("target script deps digest");
+        let host_digest = script_unit::script_deps_digest(&host_graph, Some(&wasm_graph), &lock, host_bs, |_| None)
+            .expect("host script deps digest");
+        assert!(target_digest.is_some());
+        assert!(host_digest.is_some());
+        assert_ne!(
+            target_digest, host_digest,
+            "same-(pkg, version, features) target-side and host-side build scripts with distinct WASI deps must have distinct digests"
+        );
     }
 }

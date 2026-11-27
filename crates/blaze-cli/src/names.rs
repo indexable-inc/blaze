@@ -1875,6 +1875,7 @@ fn make_world<'f>(
         script_modules.push(crate::script_modules::ScriptModule {
             subject,
             crate_at: at,
+            script_unit: script_id,
             ran_as,
             package: script.name.as_str(),
             version: script.version.as_str(),

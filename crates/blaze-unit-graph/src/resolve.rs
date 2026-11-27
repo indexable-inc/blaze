@@ -319,6 +319,11 @@ impl<'l, 'a> Resolution<'l, 'a> {
                 if !kind_ok {
                     return false;
                 }
+                if !self.decouple() {
+                    // Resolver 1: a target-specific dependency's features count on every target
+                    // during feature unification, while `units()` still emits only WASI-active edges.
+                    return true;
+                }
                 return self.holds.get(id.index()).and_then(|h| h.get(e)).is_some_and(|&(_, on_host)| on_host);
             }
         };

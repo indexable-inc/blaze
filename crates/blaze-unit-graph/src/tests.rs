@@ -1810,3 +1810,63 @@ fn host_units_preserves_target_and_host_build_script_feature_namespaces_distinct
         "target-side and host-side build scripts for `shared` must stay separate with zero feature bleed"
     );
 }
+
+/// Under resolver 1, target-specific dependency feature requests unify across all targets (even
+/// inactive ones): if `app` requests build-dep `shared` with `feat_a` under `cfg(target_os =
+/// "linux")` and `feat_b` under `cfg(target_os = "wasi")`, `Resolution::for_host_units` on WASI
+/// must keep the unified `["feat_a", "feat_b"]` while omitting inactive Linux-only edges from `deps`.
+#[test]
+fn host_units_resolver_v1_unifies_features_from_inactive_linux_and_active_wasi_build_deps() {
+    let wasi_desc = {
+        let mut cfg = Vec::new_in(a());
+        cfg.push(CfgAtom::pair("target_os", "wasi", a()));
+        TargetDesc::new("wasm64-blaze-wasip1", cfg, a())
+    };
+
+    let ps = vec![
+        // 0: app has normal dep `normal_only` (must NOT be walked) and two platform-specific build-deps.
+        pkg("app")
+            .member()
+            .build()
+            .dep(dep("normal_only"))
+            .dep(dep("shared").build().on("cfg(target_os = \"linux\")").no_default().features(&["feat_a"]))
+            .dep(dep("shared").build().on("cfg(target_os = \"wasi\")").no_default().features(&["feat_b"]))
+            .dep(dep("linux_only").build().on("cfg(target_os = \"linux\")")),
+        // 1: normal_only
+        pkg("normal_only"),
+        // 2: shared
+        pkg("shared").feature("feat_a", &[]).feature("feat_b", &[]),
+        // 3: linux_only (not active on WASI; must NOT appear in emitted WASI units)
+        pkg("linux_only"),
+    ];
+    let text = lock_text(&ps);
+    let lock = Lock::read(text.as_bytes(), a()).expect("lock");
+
+    let mut wasm_roots = Vec::new_in(a());
+    wasm_roots.push(HostUnitAsk {
+        package: LockId(0),
+        kind: HostUnitKind::BuildScript,
+        side: HostFeatureSide::Target,
+        features: Vec::new_in(a()),
+    });
+    let mut wasm_res = Resolution::for_host_units(&lock, &wasi_desc, wasm_roots, Resolver::V1, a());
+    wasm_res.member(LockId(0), ps[0].facts()).expect("app");
+    for i in 1..ps.len() {
+        wasm_res.package(LockId(i as u32), Some(ps[i].facts())).expect("pkg");
+    }
+    let wasm_graph = match wasm_res.pass().expect("wasm64 resolver 1 pass") {
+        Pass::Done(g) => g,
+        _ => panic!("expected Done"),
+    };
+
+    assert!(!wasm_graph.units.iter().any(|u| u.name.as_str() == "normal_only"), "BuildScript must not walk normal deps");
+    assert!(!wasm_graph.units.iter().any(|u| u.name.as_str() == "linux_only"), "inactive Linux-only dep must not emit a WASI unit");
+    let shared_unit = wasm_graph
+        .units
+        .iter()
+        .find(|u| u.name.as_str() == "shared" && u.kind == UnitKind::Lib)
+        .expect("shared lib unit");
+    let mut feats: std::vec::Vec<&str> = shared_unit.features.iter().map(|f| f.as_str()).collect();
+    feats.sort();
+    assert_eq!(feats, ["feat_a", "feat_b"], "resolver 1 must unify inactive Linux `feat_a` with active WASI `feat_b`");
+}
