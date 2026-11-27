@@ -1867,6 +1867,10 @@ pub struct MacroSrc<'t> {
     pub module: ItemKey,
     pub export: bool,
     pub local_inner: bool,
+    /// When an expansion of ANOTHER crate wrote this macro definition and every `$crate` in its
+    /// body names that crate (`token-mark-3`), that crate's key; `None` when every `$crate` names
+    /// the crate defining this macro (or the body has none).
+    pub dollar_crate: Option<CrateItemKey>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2165,6 +2169,8 @@ pub enum LowerNoteKind<'t> {
     /// A `#[lang = ..]` or `#[path = ..]` whose macro-call value does not read to a string
     /// (`include_str!`, `env!`, a macro only resolution can tell): no lang row, no path.
     AttrValueRefused(AttrValueRefusal<'t>),
+    /// A generated macro definition mixes `$crate` tokens from two different crates (token-mark-3).
+    MixedDollarCrate,
 }
 
 impl fmt::Display for LowerNoteKind<'_> {
@@ -2183,6 +2189,7 @@ impl fmt::Display for LowerNoteKind<'_> {
             LowerNoteKind::ItemNotRead => f.write_str("an item the outline could not read"),
             LowerNoteKind::UnhandledItem { syntax } => write!(f, "unhandled item form: {:?}", syntax_kind(*syntax)),
             LowerNoteKind::AttrValueRefused(refusal) => write!(f, "{refusal}"),
+            LowerNoteKind::MixedDollarCrate => f.write_str("macro definition mixes `$crate` from different crates"),
         }
     }
 }
@@ -2679,7 +2686,7 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
         };
         let key = self.key(self.owner, "proc_macro", name);
         self.declare(name, Namespace::Macros, key, DefKind::Macro(shape), WrittenVis::Pub);
-        let src = MacroSrc { name, body: MacroBody::Proc { kind: proc.kind, helpers: proc.helpers }, module: self.module, export: true, local_inner: false };
+        let src = MacroSrc { name, body: MacroBody::Proc { kind: proc.kind, helpers: proc.helpers }, module: self.module, export: true, local_inner: false, dollar_crate: None };
         self.out.macros.push((key, src));
     }
 
@@ -2985,12 +2992,25 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
                     self.note(LowerNoteKind::MacroRulesWithoutBody, at, name);
                     return false;
                 };
+                let dollar_crate = if attrs.builtin {
+                    None
+                } else if let Some(marks) = self.marks {
+                    match marks.dollar_crate_in(&[body], self.krate) {
+                        Ok(dc) => dc,
+                        Err(_) => {
+                            self.note(LowerNoteKind::MixedDollarCrate, at, name);
+                            return false;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let pos = self.next_pos();
                 let export = exported || attrs.macro_export;
                 let shapes = if attrs.builtin { MacroShapes::FN_LIKE } else { rules_shapes(body, self.edition, self.scratch) };
                 self.out.decls.macro_rules.push(MacroRulesDecl { name, def: key, pos, export, shapes });
                 let body = if attrs.builtin { MacroBody::BuiltinFn(attrs.builtin_name.unwrap_or(name)) } else { MacroBody::Rules(body) };
-                let src = MacroSrc { name, body, module: self.module, export, local_inner: attrs.local_inner };
+                let src = MacroSrc { name, body, module: self.module, export, local_inner: attrs.local_inner, dollar_crate };
                 self.out.macros.push((key, src));
             }
             ItemDetail::MacroDef => {
@@ -2999,14 +3019,14 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
                     self.note(LowerNoteKind::MacroWithoutBody, at, name);
                     return false;
                 };
-                let (shape, body) = if attrs.builtin {
+                let (shape, body, dollar_crate) = if attrs.builtin {
                     let which = attrs.builtin_name.unwrap_or(name);
                     if BuiltinDerive::ALL.into_iter().any(|it| it.name() == which) {
-                        (MacroShapes::DERIVE, MacroBody::BuiltinDerive { helpers: attrs.builtin_helpers })
+                        (MacroShapes::DERIVE, MacroBody::BuiltinDerive { helpers: attrs.builtin_helpers }, None)
                     } else if BuiltinAttr::ALL.into_iter().any(|it| it.name() == which) {
-                        (MacroShapes::ATTR, MacroBody::BuiltinOther(CallShape::Attr))
+                        (MacroShapes::ATTR, MacroBody::BuiltinOther(CallShape::Attr), None)
                     } else {
-                        (MacroShapes::FN_LIKE, MacroBody::BuiltinFn(which))
+                        (MacroShapes::FN_LIKE, MacroBody::BuiltinFn(which), None)
                     }
                 } else {
                     let params = item.name.map(|r| {
@@ -3015,15 +3035,27 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
                     });
                     let params = params.filter(|it| it.starts_with('(')).map(inside);
                     let body = inside(item.text(text, body_range));
+                    let dollar_crate = if let Some(marks) = self.marks {
+                        let slices = [params.unwrap_or(""), body];
+                        match marks.dollar_crate_in(&slices, self.krate) {
+                            Ok(dc) => dc,
+                            Err(_) => {
+                                self.note(LowerNoteKind::MixedDollarCrate, at, name);
+                                return false;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     // `macro m(..) {..}` is one function-like rule; `macro m {..}` has arms.
                     let shapes = match params {
                         Some(_) => MacroShapes::FN_LIKE,
                         None => rules_shapes(body, self.edition, self.scratch),
                     };
-                    (shapes, MacroBody::Macro2 { params, body })
+                    (shapes, MacroBody::Macro2 { params, body }, dollar_crate)
                 };
                 self.declare(name, Namespace::Macros, key, DefKind::Macro(shape), vis);
-                let src = MacroSrc { name, body, module: self.module, export: false, local_inner: false };
+                let src = MacroSrc { name, body, module: self.module, export: false, local_inner: false, dollar_crate };
                 self.out.macros.push((key, src));
             }
             ItemDetail::MacroCall { .. } => self.fn_like_call(idx, item, key, None),

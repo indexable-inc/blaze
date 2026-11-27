@@ -97,6 +97,7 @@ app::triple!(\"aarch64\");
 
 const BAD_APP: &str = "#![no_core]
 dep::emit_foreign_macro!();
+foreign_m!();
 ";
 
 const RUNNER: CrateItemKey = CrateItemKey(ContentId([8; 32]));
@@ -230,7 +231,7 @@ fn include_from_core_and_call_site_proc_macro_keep_caller_dollar_crate() {
 }
 
 #[test]
-fn semi_opaque_macro_emitting_macro_rules_with_dollar_crate_still_refuses_foreign_crate() {
+fn semi_opaque_macro_emitting_macro_rules_with_uniform_dollar_crate_preserves_foreign_crate() {
     static FILES: WorldSources = WorldSources(
         &[
             &[("/dep/src/lib.rs", DEP)],
@@ -245,12 +246,38 @@ fn semi_opaque_macro_emitting_macro_rules_with_dollar_crate_still_refuses_foreig
     let names = resolve_crates(&crates, Sysroot::default(), &FILES, &Serial, super::SyncFrame::leaked())
         .unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let dep_key = names.krate(0).key;
-    let saw_foreign_dep = names.notes(1).iter().any(|note| {
-        matches!(note, NamesNote::Expand { note: ExpandNote::ForeignDollarCrate { krate, .. }, .. } if *krate == dep_key)
-    });
     assert!(
-        saw_foreign_dep,
-        "control: a `SemiOpaque` macro from `dep` emitting `macro_rules! {{ ... $crate ... }}` must still produce ForeignDollarCrate(dep); notes: {:?}",
+        names.notes(1).is_empty(),
+        "token-mark-3: uniform foreign `$crate` in emitted `macro_rules!` must succeed cleanly; notes: {:?}",
         names.notes(1)
+    );
+    let foreign_m = names
+        .krate(1)
+        .tables
+        .macros
+        .values()
+        .find(|m| m.name == "foreign_m")
+        .expect("foreign_m macro lowered");
+    assert_eq!(
+        foreign_m.dollar_crate,
+        Some(dep_key),
+        "emitted `foreign_m` must preserve `dollar_crate = Some(dep)`"
+    );
+    let g = blaze_own::testing::heap().alloc();
+    let bad_ty = names
+        .item_at(names.root(1), Namespace::Types, Written { kind: PathKind::Plain, segments: &["Bad"] }, g)
+        .unwrap_or_else(|e| panic!("bad_app::Bad must resolve: {e:?}"));
+    assert_eq!(bad_ty.krate, 1);
+    let app_exp_roots: Vec<CrateItemKey> = names
+        .krate(1)
+        .expansions
+        .values()
+        .filter_map(|e| e.made.as_ref())
+        .filter_map(|made| crate::crate_roots::column_in(&made.origins).ok())
+        .flat_map(|col| (0..col.len()).filter_map(move |i| col.row(i).mark.map(|m| m.site.krate)))
+        .collect();
+    assert!(
+        app_exp_roots.contains(&dep_key),
+        "expanding `foreign_m!()` must attribute `$crate::DepType` to `dep`: {app_exp_roots:?}"
     );
 }

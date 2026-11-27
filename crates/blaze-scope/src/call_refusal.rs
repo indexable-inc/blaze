@@ -52,7 +52,7 @@ pub enum RefusalKind {
     Expander,
     /// The expansion does not read as items (a syntax error in what the macro wrote).
     NotItems,
-    /// The expansion writes a macro definition holding another crate's `$crate` (token-mark-3).
+    /// The expansion writes a macro definition mixing `$crate` tokens from different crates.
     ForeignDollarCrate,
     /// The expansion writes another crate's root and keeps no marks to tell it by.
     RootsLost,
@@ -126,7 +126,7 @@ impl RefusalKind {
             RefusalKind::Eager => "a call nested in an eager builtin's input was not expanded first",
             RefusalKind::Expander => "the expander refused it",
             RefusalKind::NotItems => "its expansion does not read as items",
-            RefusalKind::ForeignDollarCrate => "its expansion writes a macro definition holding another crate's `$crate` (token-mark-3)",
+            RefusalKind::ForeignDollarCrate => "its expansion writes a macro definition mixing `$crate` from different crates",
             RefusalKind::RootsLost => "its expansion writes another crate's root and keeps no marks to tell it by",
             RefusalKind::NestedInput => "its input is no range of the tokens of the expansion it is written in",
             RefusalKind::Unnoted => "the solve noted no reason (a bug of blaze-scope resolve.rs `expand_decls`)",
