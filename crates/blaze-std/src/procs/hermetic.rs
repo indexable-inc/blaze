@@ -43,6 +43,7 @@ use super::{Exit, Spawner};
 use crate::cx::Cx;
 
 mod execution;
+pub(crate) mod inode_record;
 mod machine;
 mod plan;
 mod report;
@@ -71,6 +72,7 @@ pub const CONFINEMENT_SOURCE: &[&[u8]] = &[
     include_bytes!("linked/run.rs"),
     include_bytes!("hermetic.rs"),
     include_bytes!("hermetic/execution.rs"),
+    include_bytes!("hermetic/inode_record.rs"),
     include_bytes!("hermetic/machine.rs"),
     include_bytes!("hermetic/native.rs"),
     include_bytes!("hermetic/plan.rs"),
@@ -146,7 +148,6 @@ struct RootReaderInner {
     root: Option<crate::fs::Dir<crate::fs::ReadOnly>>,
     stalled: core::sync::atomic::AtomicBool,
     holds_reaper_slot: bool,
-    closure_cache: landlock::ClosureDigestCache,
 }
 
 #[cfg(target_os = "linux")]
@@ -223,7 +224,6 @@ impl RootReader {
                 root: Some(root),
                 stalled: core::sync::atomic::AtomicBool::new(false),
                 holds_reaper_slot: true,
-                closure_cache: landlock::ClosureDigestCache::new(),
             },
             blaze_own::SharedAlloc::global(),
         );
@@ -234,11 +234,6 @@ impl RootReader {
     /// long-lived owners should rotate in a fresh reader and let this one retire to the reaper).
     pub fn is_stalled(&self) -> bool {
         self.inner.stalled.load(core::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Caller-owned bounded inode-validated ELF closure digest cache held on this reader.
-    pub fn closure_cache(&self) -> &landlock::ClosureDigestCache {
-        &self.inner.closure_cache
     }
 
     fn io_ref(&self) -> Result<&crate::io::Io, Fault> {
@@ -398,7 +393,7 @@ impl RootReader {
 }
 
 #[cfg(target_os = "linux")]
-fn fs_err_to_fault(call: &'static str, err: &crate::fs::FsError) -> Fault {
+pub(super) fn fs_err_to_fault(call: &'static str, err: &crate::fs::FsError) -> Fault {
     let code = match &err.kind {
         crate::fs::FsKind::Stopped(_) => 110,
         crate::fs::FsKind::NotFound => 2,
@@ -856,12 +851,16 @@ impl<T> StandbyReaperCore<T> {
     }
 }
 
+pub use inode_record::{
+    ELF_INODE_RECORD_SUBDIR, InodeRecord, InodeRecordIo, InodeRecordPlant, InodeStamp,
+    MAX_INODE_RECORD_BYTES, RecordRead, decode_record, encode_record, lookup_inode_record,
+    publish_inode_record,
+};
 #[cfg(target_os = "linux")]
 pub use landlock::{
-    ClosureDigestCache, HostLdCaps, InodeStamp, PreloadScanner, dl_dst_lib_token,
-    dl_dst_platform_token, expand_rpath_tokens, feed_nix_runtime_closure,
-    feed_nix_runtime_closure_with, parse_ld_so_cache_match, validate_rpath_entry,
-    x86_64_fhs_hwcap_subdirs,
+    HostLdCaps, PreloadScanner, dl_dst_lib_token, dl_dst_platform_token, expand_rpath_tokens,
+    feed_nix_runtime_closure, feed_nix_runtime_closure_with, parse_ld_so_cache_match,
+    validate_rpath_entry, x86_64_fhs_hwcap_subdirs,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use crate::rt::{AttemptSignal, LockBackend, LockPlant, LockRuntime, LockedIoHandshake, LockedIoPlant, NativeLockErr};

@@ -26,17 +26,20 @@
 //! filtered), the kernel's version (`uname`), the pid, and randomness (`getrandom`).
 
 use core::ffi::CStr;
-use core::sync::atomic::{AtomicU64, Ordering};
 
-use blaze_own::{Alloc, Arc as OwnArc, Box as OwnBox, Share as _, SharedAlloc, Vec as OwnVec, planted::NoPlant};
+use blaze_own::{Alloc, SharedAlloc, Vec as OwnVec, planted::NoPlant};
 use blaze_sys::{
     Fd,
     linux::{
         AccessFs, AccessNet, CWD, OpenFlags, OwnedFd, PathBeneath, RulesetAttr, SockFilter,
         confine::{self, ChildConfine, Filter, MOST_FILTER, Resource, Rlimit},
         landlock_abi, landlock_add_rule_path, landlock_create_ruleset, openat, pread, readlinkat,
-        task::fstat,
     },
+};
+
+use super::inode_record::{
+    DirInodeRecordIo, InodeRecord, InodeRecordIo, InodeRecordPlant, InodeStamp,
+    lookup_inode_record, publish_inode_record,
 };
 
 use super::{
@@ -203,13 +206,16 @@ pub fn feed_nix_runtime_closure(
     feed: &mut dyn FnMut(&[u8]),
 ) -> Result<bool, Fault> {
     let reader = super::RootReader::new(cx)?;
-    feed_nix_runtime_closure_with(&reader, cx, program_path, alloc, feed)
+    feed_nix_runtime_closure_with(&reader, None, cx, program_path, alloc, feed)
 }
 
-/// Same as [`feed_nix_runtime_closure`], reusing a caller-owned [`super::RootReader`] so
-/// cancelled/stalled reads never allocate or leak a fresh async driver per probe.
+/// Same as [`feed_nix_runtime_closure`], reusing a caller-owned [`super::RootReader`] (so
+/// cancelled/stalled reads never allocate or leak a fresh async driver per probe) and an optional
+/// caller-owned capability `record_dir` (`bstd::fs::Dir<ReadWrite>`) for immutable write-once
+/// on-disk ELF inode records read from the kernel page cache (Rule 51: zero process-memory cache).
 pub fn feed_nix_runtime_closure_with(
     reader: &super::RootReader,
+    record_dir: Option<&crate::fs::Dir<crate::fs::ReadWrite>>,
     cx: &Cx,
     program_path: &str,
     alloc: Alloc<'_>,
@@ -227,367 +233,12 @@ pub fn feed_nix_runtime_closure_with(
     let Ok(cstr) = CStr::from_bytes_until_nul(name.get(..=bytes.len()).unwrap_or(&[0])) else {
         return Err(Fault::Host { call: "nix runtime closure (invalid program path)", code: 22 });
     };
+    let dir_io = record_dir.map(|dir| DirInodeRecordIo::new(dir, cx));
+    let record_io: Option<&dyn InodeRecordIo> = dir_io.as_ref().map(|io| io as &dyn InodeRecordIo);
     let mut opt_feed = Some(feed);
     // `HermeticClangProbe` always launches the verified binary via anonymous sealed `memfd`
     // (`execveat(..., AT_EMPTY_PATH)`), so model the exact memfd `$ORIGIN` (`"/"`).
-    walk_nix_elf_closure(Some(reader), Some(cx), Some(alloc), None, cstr, None, true, None, false, &mut opt_feed)
-}
-
-/// Kernel inode metadata stamp of a live opened regular file descriptor (`fstat(fd)`):
-/// `(st_dev, st_ino, st_mode, st_size, st_mtime, st_ctime)`. Any write, truncation, attribute
-/// change, or atomic replacement changes at least one field and immediately misses
-/// [`ClosureDigestCache`] (Rule 21 + TOCTOU safe).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct InodeStamp {
-    pub dev: u64,
-    pub ino: u64,
-    pub mode: u32,
-    pub size: i64,
-    pub mtime_sec: i64,
-    pub mtime_nsec: i64,
-    pub ctime_sec: i64,
-    pub ctime_nsec: i64,
-}
-
-impl InodeStamp {
-    /// Classic racy-clean margin (seconds): files modified or created within the last 2 seconds
-    /// bypass the cache so same-size in-place writes within a coarse filesystem timestamp tick
-    /// can never collide with a cached digest. Immutable `/nix/store` and installed system
-    /// libraries always pass immediately.
-    pub const RACY_CLEAN_SECS: i64 = 2;
-
-    const S_IFMT: u32 = 0o170_000;
-    const S_IFREG: u32 = 0o100_000;
-
-    /// Stats the already-opened live descriptor `fd`. Returns `Ok(None)` for non-regular files.
-    pub fn from_fd(fd: Fd) -> Result<Option<Self>, Fault> {
-        let st = fstat(fd).map_err(|errno| Fault::Host { call: "fstat (nix runtime closure)", code: errno.raw() })?;
-        if (st.st_mode & Self::S_IFMT) != Self::S_IFREG || st.st_size < 0 {
-            return Ok(None);
-        }
-        Ok(Some(Self {
-            dev: st.st_dev,
-            ino: st.st_ino,
-            mode: st.st_mode,
-            size: st.st_size,
-            mtime_sec: st.st_mtime,
-            mtime_nsec: st.st_mtime_nsec,
-            ctime_sec: st.st_ctime,
-            ctime_nsec: st.st_ctime_nsec,
-        }))
-    }
-
-    /// Whether this stamp is safely outside the racy-clean window for wall-clock second `now_sec`.
-    pub const fn is_cacheable(&self, now_sec: i64) -> bool {
-        if now_sec < Self::RACY_CLEAN_SECS {
-            return false;
-        }
-        let cutoff = now_sec - Self::RACY_CLEAN_SECS;
-        self.size >= 0
-            && self.mtime_sec >= 0
-            && self.ctime_sec >= 0
-            && self.mtime_sec <= cutoff
-            && self.ctime_sec <= cutoff
-    }
-
-    fn bucket(&self) -> usize {
-        let mut h = self.ino ^ self.dev.rotate_left(17) ^ self.size.cast_unsigned().rotate_left(33);
-        h ^= h >> 30;
-        h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        h ^= h >> 27;
-        usize::try_from(h & 0xffff).unwrap_or(0)
-    }
-}
-
-/// Immutable parsed ELF64 header and raw unexpanded dynamic-section metadata for one inode.
-/// `$ORIGIN`/`$LIB`/`$PLATFORM` expansion always happens live from the resolved path on every
-/// walk, so hardlinks at distinct paths behave identically to an uncached walk.
-struct CachedElf64 {
-    e_machine: u16,
-    interp: OwnVec<u8, SharedAlloc<'static>>,
-    has_dyn: bool,
-    runpath: Option<OwnVec<u8, SharedAlloc<'static>>>,
-    rpath: Option<OwnVec<u8, SharedAlloc<'static>>>,
-    /// Flat NUL-separated raw `DT_NEEDED` SONAME bytes in ELF order.
-    needed_blob: OwnVec<u8, SharedAlloc<'static>>,
-}
-
-#[derive(Clone, Copy)]
-struct DigestSlot {
-    stamp: InodeStamp,
-    sha256: [u8; 32],
-    len: u64,
-    age: u64,
-}
-
-struct ElfSlot {
-    stamp: InodeStamp,
-    elf: OwnArc<CachedElf64, SharedAlloc<'static>>,
-    age: u64,
-}
-
-struct LdCacheSlot {
-    stamp: InodeStamp,
-    sha256: [u8; 32],
-    bytes: OwnArc<OwnVec<u8, SharedAlloc<'static>>, SharedAlloc<'static>>,
-}
-
-const DIGEST_SETS: usize = 64;
-const ELF_SETS: usize = 16;
-const CACHE_WAYS: usize = 4;
-
-struct ClosureDigestCacheInner {
-    digests: [[Option<DigestSlot>; CACHE_WAYS]; DIGEST_SETS],
-    elfs: [[Option<ElfSlot>; CACHE_WAYS]; ELF_SETS],
-    ld_cache: Option<LdCacheSlot>,
-    tick: u64,
-}
-
-/// Caller-owned, strictly bounded (256 digest entries + 64 ELF metadata entries + 1
-/// `/etc/ld.so.cache` entry), zero-global-state cache keyed by live `fstat(fd)` [`InodeStamp`]
-/// with a 2-second racy-clean guard.
-///
-/// The internal `bstd::sync::Lock` is NEVER held across any filesystem syscall or SHA-256 pass.
-pub struct ClosureDigestCache {
-    inner: crate::sync::Lock<OwnBox<ClosureDigestCacheInner, SharedAlloc<'static>>>,
-    digest_hits: AtomicU64,
-    digest_misses: AtomicU64,
-    elf_hits: AtomicU64,
-    elf_misses: AtomicU64,
-}
-
-impl ClosureDigestCache {
-    /// Creates an empty bounded cache with zero ambient/global state.
-    pub fn new() -> Self {
-        let state = ClosureDigestCacheInner {
-            digests: [[None; CACHE_WAYS]; DIGEST_SETS],
-            elfs: core::array::from_fn(|_| core::array::from_fn(|_| None)),
-            ld_cache: None,
-            tick: 0,
-        };
-        Self {
-            inner: crate::sync::Lock::new(
-                "bstd.hermetic.closure_cache",
-                OwnBox::new_in(state, SharedAlloc::global()),
-            ),
-            digest_hits: AtomicU64::new(0),
-            digest_misses: AtomicU64::new(0),
-            elf_hits: AtomicU64::new(0),
-            elf_misses: AtomicU64::new(0),
-        }
-    }
-
-    pub fn digest_hits(&self) -> u64 {
-        self.digest_hits.load(Ordering::Relaxed)
-    }
-
-    pub fn digest_misses(&self) -> u64 {
-        self.digest_misses.load(Ordering::Relaxed)
-    }
-
-    pub fn elf_hits(&self) -> u64 {
-        self.elf_hits.load(Ordering::Relaxed)
-    }
-
-    pub fn elf_misses(&self) -> u64 {
-        self.elf_misses.load(Ordering::Relaxed)
-    }
-
-    fn lock_state<'a>(
-        &'a self,
-        cx: Option<&Cx>,
-    ) -> Result<Option<crate::sync::LockGuard<'a, OwnBox<ClosureDigestCacheInner, SharedAlloc<'static>>>>, Fault> {
-        match cx {
-            Some(c) => self
-                .inner
-                .lock(c)
-                .map(Some)
-                .map_err(|_| Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 }),
-            None => Ok(self.inner.try_lock()),
-        }
-    }
-
-    /// Looks up a cached `(sha256, len)` for `stamp` at wall-clock second `now_sec`.
-    pub fn lookup_digest(&self, cx: Option<&Cx>, stamp: InodeStamp, now_sec: i64) -> Result<Option<([u8; 32], u64)>, Fault> {
-        if !stamp.is_cacheable(now_sec) {
-            self.digest_misses.fetch_add(1, Ordering::Relaxed);
-            return Ok(None);
-        }
-        let set_idx = stamp.bucket() & (DIGEST_SETS - 1);
-        if let Some(mut guard) = self.lock_state(cx)? {
-            guard.tick = guard.tick.wrapping_add(1);
-            let tick = guard.tick;
-            if let Some(set) = guard.digests.get_mut(set_idx) {
-                for slot in set.iter_mut() {
-                    if let Some(entry) = slot.as_mut()
-                        && entry.stamp == stamp
-                    {
-                        entry.age = tick;
-                        let out = (entry.sha256, entry.len);
-                        self.digest_hits.fetch_add(1, Ordering::Relaxed);
-                        return Ok(Some(out));
-                    }
-                }
-            }
-        }
-        self.digest_misses.fetch_add(1, Ordering::Relaxed);
-        Ok(None)
-    }
-
-    /// Inserts `(sha256, len)` for `stamp` if outside the racy-clean window, evicting the oldest
-    /// way in its 4-way set when full.
-    pub fn insert_digest(
-        &self,
-        cx: Option<&Cx>,
-        stamp: InodeStamp,
-        now_sec: i64,
-        sha256: [u8; 32],
-        len: u64,
-    ) -> Result<(), Fault> {
-        if !stamp.is_cacheable(now_sec) {
-            return Ok(());
-        }
-        let set_idx = stamp.bucket() & (DIGEST_SETS - 1);
-        if let Some(mut guard) = self.lock_state(cx)? {
-            guard.tick = guard.tick.wrapping_add(1);
-            let tick = guard.tick;
-            if let Some(set) = guard.digests.get_mut(set_idx) {
-                let mut victim = 0usize;
-                let mut oldest = u64::MAX;
-                for (i, slot) in set.iter().enumerate() {
-                    match slot {
-                        Some(entry) if entry.stamp == stamp => {
-                            victim = i;
-                            break;
-                        }
-                        None => {
-                            victim = i;
-                            break;
-                        }
-                        Some(entry) => {
-                            if entry.age < oldest {
-                                oldest = entry.age;
-                                victim = i;
-                            }
-                        }
-                    }
-                }
-                if let Some(dst) = set.get_mut(victim) {
-                    *dst = Some(DigestSlot { stamp, sha256, len, age: tick });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn lookup_elf(
-        &self,
-        cx: Option<&Cx>,
-        stamp: InodeStamp,
-        now_sec: i64,
-    ) -> Result<Option<OwnArc<CachedElf64, SharedAlloc<'static>>>, Fault> {
-        if !stamp.is_cacheable(now_sec) {
-            self.elf_misses.fetch_add(1, Ordering::Relaxed);
-            return Ok(None);
-        }
-        let set_idx = stamp.bucket() & (ELF_SETS - 1);
-        if let Some(mut guard) = self.lock_state(cx)? {
-            guard.tick = guard.tick.wrapping_add(1);
-            let tick = guard.tick;
-            if let Some(set) = guard.elfs.get_mut(set_idx) {
-                for slot in set.iter_mut() {
-                    if let Some(entry) = slot.as_mut()
-                        && entry.stamp == stamp
-                    {
-                        entry.age = tick;
-                        let out = entry.elf.share();
-                        self.elf_hits.fetch_add(1, Ordering::Relaxed);
-                        return Ok(Some(out));
-                    }
-                }
-            }
-        }
-        self.elf_misses.fetch_add(1, Ordering::Relaxed);
-        Ok(None)
-    }
-
-    fn insert_elf(
-        &self,
-        cx: Option<&Cx>,
-        stamp: InodeStamp,
-        now_sec: i64,
-        elf: &OwnArc<CachedElf64, SharedAlloc<'static>>,
-    ) -> Result<(), Fault> {
-        if !stamp.is_cacheable(now_sec) {
-            return Ok(());
-        }
-        let set_idx = stamp.bucket() & (ELF_SETS - 1);
-        if let Some(mut guard) = self.lock_state(cx)? {
-            guard.tick = guard.tick.wrapping_add(1);
-            let tick = guard.tick;
-            if let Some(set) = guard.elfs.get_mut(set_idx) {
-                let mut victim = 0usize;
-                let mut oldest = u64::MAX;
-                for (i, slot) in set.iter().enumerate() {
-                    match slot {
-                        Some(entry) if entry.stamp == stamp => {
-                            victim = i;
-                            break;
-                        }
-                        None => {
-                            victim = i;
-                            break;
-                        }
-                        Some(entry) => {
-                            if entry.age < oldest {
-                                oldest = entry.age;
-                                victim = i;
-                            }
-                        }
-                    }
-                }
-                if let Some(dst) = set.get_mut(victim) {
-                    *dst = Some(ElfSlot { stamp, elf: elf.share(), age: tick });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn lookup_ld_cache(
-        &self,
-        cx: Option<&Cx>,
-        stamp: InodeStamp,
-        now_sec: i64,
-    ) -> Result<Option<([u8; 32], OwnArc<OwnVec<u8, SharedAlloc<'static>>, SharedAlloc<'static>>)>, Fault> {
-        if !stamp.is_cacheable(now_sec) {
-            return Ok(None);
-        }
-        if let Some(guard) = self.lock_state(cx)?
-            && let Some(entry) = guard.ld_cache.as_ref()
-            && entry.stamp == stamp
-        {
-            return Ok(Some((entry.sha256, entry.bytes.share())));
-        }
-        Ok(None)
-    }
-
-    fn insert_ld_cache(
-        &self,
-        cx: Option<&Cx>,
-        stamp: InodeStamp,
-        now_sec: i64,
-        sha256: [u8; 32],
-        bytes: OwnArc<OwnVec<u8, SharedAlloc<'static>>, SharedAlloc<'static>>,
-    ) -> Result<(), Fault> {
-        if !stamp.is_cacheable(now_sec) {
-            return Ok(());
-        }
-        if let Some(mut guard) = self.lock_state(cx)? {
-            guard.ld_cache = Some(LdCacheSlot { stamp, sha256, bytes });
-        }
-        Ok(())
-    }
+    walk_nix_elf_closure(Some(reader), record_io, Some(cx), Some(alloc), None, cstr, None, true, None, false, &mut opt_feed)
 }
 
 fn now_sec_for_cx(cx: Option<&Cx>) -> i64 {
@@ -683,7 +334,7 @@ fn grant_nix_elf_closure(
 ) -> Result<(), Fault> {
     let mut no_feed: Option<&mut dyn FnMut(&[u8])> = None;
     let memfd_origin = verified_exec_fd.is_some();
-    let _ = walk_nix_elf_closure(None, None, alloc, Some(ruleset), program, verified_exec_fd, memfd_origin, Some(plan), has_helper_folder, &mut no_feed)?;
+    let _ = walk_nix_elf_closure(None, None, None, alloc, Some(ruleset), program, verified_exec_fd, memfd_origin, Some(plan), has_helper_folder, &mut no_feed)?;
     Ok(())
 }
 
@@ -718,6 +369,7 @@ pub fn validate_rpath_entry(
 #[expect(clippy::too_many_arguments, reason = "internal ELF closure walker shared between Landlock admission and strategy hashing")]
 fn walk_nix_elf_closure(
     reader: Option<&super::RootReader>,
+    record_io: Option<&dyn InodeRecordIo>,
     cx: Option<&Cx>,
     alloc: Option<Alloc<'_>>,
     ruleset: Option<Fd>,
@@ -752,7 +404,7 @@ fn walk_nix_elf_closure(
         (None, Some(owned)) => owned.fd(),
         (None, None) => return Ok(false),
     };
-    let Some(prog_elf) = load_elf64_summary(reader, cx, now_sec, prog_fd)? else {
+    let Some(prog_elf) = load_or_compute_elf_record(reader, record_io, cx, now_sec, prog_fd, false)? else {
         return Ok(false);
     };
     if prog_elf.interp.is_empty() {
@@ -847,38 +499,24 @@ fn walk_nix_elf_closure(
             add_nix_loader_rule(rs, NIX_LD_SO)?;
         }
     }
-    let mut ld_cache_arc: Option<OwnArc<OwnVec<u8, SharedAlloc<'static>>, SharedAlloc<'static>>> = None;
+    let mut ld_cache_raw: Option<OwnVec<u8, SharedAlloc<'static>>> = None;
     if let Some(f) = feed.as_deref_mut() {
-        feed_nix_file_by_path(reader, cx, now_sec, interp_cstr, f)?;
+        feed_nix_file_by_path(reader, record_io, cx, now_sec, interp_cstr, f)?;
         if is_nix_ld {
-            feed_nix_file_by_path(reader, cx, now_sec, NIX_LD_SO, f)?;
+            feed_nix_file_by_path(reader, record_io, cx, now_sec, NIX_LD_SO, f)?;
         }
         if !is_nix {
             match openat(CWD, blaze_sys::Path::new(c"/etc/ld.so.cache"), OpenFlags::CLOSE_ON_EXEC, 0) {
                 Ok(cache_fd) => {
                     if alloc.is_some() {
-                        let stamp = InodeStamp::from_fd(cache_fd.fd())?;
-                        let hit = match (reader, stamp) {
-                            (Some(r), Some(st)) => r.closure_cache().lookup_ld_cache(cx, st, now_sec)?,
-                            _ => None,
-                        };
-                        let (sha256, raw_arc) = match hit {
-                            Some(cached) => cached,
-                            None => {
-                                let raw = read_ld_cache_bounded(reader, cx, cache_fd.fd())?;
-                                let sha256 = blaze_sha256::digest(raw.as_slice());
-                                let arc = OwnArc::new_in(raw, SharedAlloc::global());
-                                if let (Some(r), Some(st)) = (reader, stamp) {
-                                    r.closure_cache().insert_ld_cache(cx, st, now_sec, sha256, arc.share())?;
-                                }
-                                (sha256, arc)
-                            }
-                        };
-                        let total_len = u64::try_from(raw_arc.len()).unwrap_or(u64::MAX);
+                        let raw = read_ld_cache_bounded(reader, cx, cache_fd.fd())?;
+                        let sha256 = blaze_sha256::digest(raw.as_slice());
+                        let total_len = u64::try_from(raw.len()).unwrap_or(u64::MAX);
                         feed_framed_digest(b"/etc/ld.so.cache", &sha256, total_len, f);
-                        ld_cache_arc = Some(raw_arc);
+                        ld_cache_raw = Some(raw);
                     } else {
-                        feed_nix_fd(reader, cx, now_sec, b"/etc/ld.so.cache", cache_fd.fd(), f)?;
+                        let (total_len, sha256) = stream_fd_sha256(reader, cx, cache_fd.fd())?;
+                        feed_framed_digest(b"/etc/ld.so.cache", &sha256, total_len, f);
                     }
                 }
                 Err(blaze_sys::Errno::NoEnt) => {}
@@ -890,8 +528,7 @@ fn walk_nix_elf_closure(
     } else if !is_nix && alloc.is_some() {
         match openat(CWD, blaze_sys::Path::new(c"/etc/ld.so.cache"), OpenFlags::CLOSE_ON_EXEC, 0) {
             Ok(cache_fd) => {
-                let raw = read_ld_cache_bounded(None, None, cache_fd.fd())?;
-                ld_cache_arc = Some(OwnArc::new_in(raw, SharedAlloc::global()));
+                ld_cache_raw = Some(read_ld_cache_bounded(None, None, cache_fd.fd())?);
             }
             Err(blaze_sys::Errno::NoEnt) => {}
             Err(errno) => {
@@ -966,18 +603,22 @@ fn walk_nix_elf_closure(
             None => break,
         };
         q_head += 1;
-        let elf = if cur_idx == 0 {
-            prog_elf.share()
+        let loaded_cur: Option<InodeRecord> = if cur_idx == 0 {
+            None
         } else {
             let Ok(cur_cstr) = CStr::from_bytes_until_nul(cur_path.get(..=cur_len).unwrap_or(&[0])) else {
                 return Err(Fault::Host { call: "landlock (NixOS ELF invalid queued path)", code: 22 });
             };
             let opened_cur = openat(CWD, blaze_sys::Path::new(cur_cstr), OpenFlags::CLOSE_ON_EXEC, 0)
                 .map_err(|errno| Fault::Host { call: "openat (nix ELF closure object)", code: errno.raw() })?;
-            let Some(summary) = load_elf64_summary(reader, cx, now_sec, opened_cur.fd())? else {
+            let Some(summary) = load_or_compute_elf_record(reader, record_io, cx, now_sec, opened_cur.fd(), false)? else {
                 continue;
             };
-            summary
+            Some(summary)
+        };
+        let elf: &InodeRecord = match loaded_cur.as_ref() {
+            Some(rec) => rec,
+            None => &prog_elf,
         };
         if !elf.has_dyn {
             continue;
@@ -1064,6 +705,7 @@ fn walk_nix_elf_closure(
                 }
                 if !try_grant_and_enqueue_lib(
                     reader,
+                    record_io,
                     cx,
                     now_sec,
                     ruleset,
@@ -1086,6 +728,7 @@ fn walk_nix_elf_closure(
             } else {
                 enqueue_nix_soname(
                     reader,
+                    record_io,
                     cx,
                     now_sec,
                     ruleset,
@@ -1095,7 +738,7 @@ fn walk_nix_elf_closure(
                     NIX_LD_DIR,
                     glibc_dir,
                     is_nix,
-                    ld_cache_arc.as_deref().map(OwnVec::as_slice),
+                    ld_cache_raw.as_ref().map(OwnVec::as_slice),
                     &host_ld_caps,
                     plan,
                     &mut queue,
@@ -1127,18 +770,20 @@ impl Elf64Meta {
     }
 }
 
-fn load_elf64_summary(
+fn load_or_compute_elf_record(
     reader: Option<&super::RootReader>,
+    record_io: Option<&dyn InodeRecordIo>,
     cx: Option<&Cx>,
     now_sec: i64,
     fd: Fd,
-) -> Result<Option<OwnArc<CachedElf64, SharedAlloc<'static>>>, Fault> {
-    let stamp = match reader {
+    need_digest: bool,
+) -> Result<Option<InodeRecord>, Fault> {
+    let stamp = match record_io {
         Some(_) => InodeStamp::from_fd(fd)?,
         None => None,
     };
-    if let (Some(r), Some(st)) = (reader, stamp)
-        && let Some(hit) = r.closure_cache().lookup_elf(cx, st, now_sec)?
+    if let (Some(io), Some(st)) = (record_io, stamp)
+        && let Some(hit) = lookup_inode_record(io, st, now_sec, need_digest, InodeRecordPlant::None)?
     {
         return Ok(Some(hit));
     }
@@ -1243,14 +888,35 @@ fn load_elf64_summary(
             }
         }
     }
-    let summary = OwnArc::new_in(
-        CachedElf64 { e_machine: meta.e_machine, interp, has_dyn, runpath, rpath, needed_blob },
-        shared,
-    );
-    if let (Some(r), Some(st)) = (reader, stamp) {
-        r.closure_cache().insert_elf(cx, st, now_sec, &summary)?;
+    let digest = if need_digest {
+        Some(stream_fd_sha256(reader, cx, fd)?)
+    } else {
+        None
+    };
+    let rec_stamp = stamp.unwrap_or(InodeStamp {
+        dev: 0,
+        ino: 0,
+        mode: 0,
+        size: 0,
+        mtime_sec: 0,
+        mtime_nsec: 0,
+        ctime_sec: 0,
+        ctime_nsec: 0,
+    });
+    let record = InodeRecord {
+        stamp: rec_stamp,
+        digest,
+        e_machine: meta.e_machine,
+        has_dyn,
+        interp,
+        runpath,
+        rpath,
+        needed_blob,
+    };
+    if let (Some(io), Some(_)) = (record_io, stamp) {
+        let _ = publish_inode_record(io, &record, now_sec, InodeRecordPlant::None)?;
     }
-    Ok(Some(summary))
+    Ok(Some(record))
 }
 
 fn parse_elf64_meta(
@@ -1925,6 +1591,7 @@ pub fn parse_ld_so_cache_match(
 #[expect(clippy::too_many_arguments, reason = "internal SONAME lookup shared between Landlock admission and strategy hashing")]
 fn enqueue_nix_soname<const N: usize>(
     reader: Option<&super::RootReader>,
+    record_io: Option<&dyn InodeRecordIo>,
     cx: Option<&Cx>,
     now_sec: i64,
     ruleset: Option<Fd>,
@@ -1943,16 +1610,16 @@ fn enqueue_nix_soname<const N: usize>(
 ) -> Result<(), Fault> {
     for (dir_buf, dir_len) in search_dirs {
         let dir = dir_buf.get(..*dir_len).unwrap_or(&[]);
-        if try_grant_and_enqueue_lib(reader, cx, now_sec, ruleset, dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
+        if try_grant_and_enqueue_lib(reader, record_io, cx, now_sec, ruleset, dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
             return Ok(());
         }
     }
     if is_nix {
-        if try_grant_and_enqueue_lib(reader, cx, now_sec, ruleset, nix_ld_dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
+        if try_grant_and_enqueue_lib(reader, record_io, cx, now_sec, ruleset, nix_ld_dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
             return Ok(());
         }
         if let Some(dir) = glibc_dir {
-            if try_grant_and_enqueue_lib(reader, cx, now_sec, ruleset, dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
+            if try_grant_and_enqueue_lib(reader, record_io, cx, now_sec, ruleset, dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
                 return Ok(());
             }
         }
@@ -1967,6 +1634,7 @@ fn enqueue_nix_soname<const N: usize>(
             let found = parse_ld_so_cache_match(cache_bytes, soname, host_caps, |resolved_path| {
                 try_grant_and_enqueue_lib(
                     reader,
+                    record_io,
                     cx,
                     now_sec,
                     ruleset,
@@ -2021,13 +1689,13 @@ fn enqueue_nix_soname<const N: usize>(
                         tail.copy_from_slice(sub);
                     }
                     if let Some(prefix) = joined.get(..jlen)
-                        && try_grant_and_enqueue_lib(reader, cx, now_sec, ruleset, prefix, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)?
+                        && try_grant_and_enqueue_lib(reader, record_io, cx, now_sec, ruleset, prefix, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)?
                     {
                         return Ok(());
                     }
                 }
             }
-            if try_grant_and_enqueue_lib(reader, cx, now_sec, ruleset, fhs_dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
+            if try_grant_and_enqueue_lib(reader, record_io, cx, now_sec, ruleset, fhs_dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
                 return Ok(());
             }
         }
@@ -2101,6 +1769,7 @@ fn fhs_hwcap_subdirs(host_caps: &HostLdCaps) -> &'static [&'static [u8]] {
 #[expect(clippy::too_many_arguments, reason = "internal library candidate admission shared between Landlock and strategy hashing")]
 fn try_grant_and_enqueue_lib<const N: usize>(
     reader: Option<&super::RootReader>,
+    record_io: Option<&dyn InodeRecordIo>,
     cx: Option<&Cx>,
     now_sec: i64,
     ruleset: Option<Fd>,
@@ -2137,17 +1806,17 @@ fn try_grant_and_enqueue_lib<const N: usize>(
     };
     // Verify ELF64 class, little-endian data, and target `e_machine` (`EM_AARCH64=183` /
     // `EM_X86_64=62`) on the opened fd so cross-arch libraries in shared FHS dirs are skipped
-    // just as glibc `ld.so` skips them. Reuses a live-fstat-verified cached ELF header when
-    // present so warm closure walks issue zero async reads.
-    let cached_machine = match reader {
-        Some(r) => match InodeStamp::from_fd(fd.fd())? {
-            Some(st) => r.closure_cache().lookup_elf(cx, st, now_sec)?.map(|elf| elf.e_machine),
+    // just as glibc `ld.so` skips them. Reuses an immutable on-disk inode record from the kernel
+    // page cache when present (Rule 51: zero process-memory cache).
+    let record_hit = match record_io {
+        Some(io) => match InodeStamp::from_fd(fd.fd())? {
+            Some(st) => lookup_inode_record(io, st, now_sec, feed.is_some(), InodeRecordPlant::None)?,
             None => None,
         },
         None => None,
     };
-    let e_machine = match cached_machine {
-        Some(m) => m,
+    let e_machine = match record_hit.as_ref() {
+        Some(rec) => rec.e_machine,
         None => {
             let mut ehdr_head = [0u8; 20];
             let head_n = read_nix_at(reader, cx, fd.fd(), &mut ehdr_head, 0, "pread (ELF e_machine check)")?;
@@ -2197,7 +1866,11 @@ fn try_grant_and_enqueue_lib<const N: usize>(
         .get(..*q_len)
         .is_some_and(|used| used.iter().any(|(b, l, _)| *l == res_slice.len() && b.get(..*l) == Some(res_slice)));
     if first_seen_path && let Some(f) = feed.as_deref_mut() {
-        feed_nix_fd(reader, cx, now_sec, res_slice, fd.fd(), f)?;
+        if let Some((total_len, sha256)) = record_hit.as_ref().and_then(|rec| rec.digest) {
+            feed_framed_digest(res_slice, &sha256, total_len, f);
+        } else {
+            feed_nix_elf_fd(reader, record_io, cx, now_sec, res_slice, fd.fd(), f)?;
+        }
     }
     enqueue_nix_canonical_slice(res_slice, child_chain, queue, q_len)?;
     Ok(true)
@@ -2205,6 +1878,7 @@ fn try_grant_and_enqueue_lib<const N: usize>(
 
 fn feed_nix_file_by_path(
     reader: Option<&super::RootReader>,
+    record_io: Option<&dyn InodeRecordIo>,
     cx: Option<&Cx>,
     now_sec: i64,
     path: &CStr,
@@ -2215,7 +1889,7 @@ fn feed_nix_file_by_path(
         .map_err(|errno| Fault::Host { call: "openat (nix runtime loader)", code: errno.raw() })?;
     let mut resolved = [0u8; 320];
     let res_len = readlink_fd_path(fd.fd(), &mut resolved)?;
-    feed_nix_fd(reader, cx, now_sec, resolved.get(..res_len).unwrap_or(&[]), fd.fd(), feed)
+    feed_nix_elf_fd(reader, record_io, cx, now_sec, resolved.get(..res_len).unwrap_or(&[]), fd.fd(), feed)
 }
 
 fn feed_framed_digest(
@@ -2276,57 +1950,55 @@ fn read_ld_cache_bounded(
     Ok(raw)
 }
 
-fn feed_nix_fd(
+fn stream_fd_sha256(
     reader: Option<&super::RootReader>,
+    cx: Option<&Cx>,
+    fd: Fd,
+) -> Result<(u64, [u8; 32]), Fault> {
+    let mut hasher = blaze_sha256::Sha256::new();
+    let total_len = if let (Some(r), Some(cx)) = (reader, cx) {
+        r.stream_fd(cx, fd, "bstd::fs read (nix runtime closure hash)", |chunk| {
+            hasher.update(chunk);
+        })?
+    } else {
+        let mut buf = [0u8; 64 << 10];
+        let mut offset = 0u64;
+        loop {
+            check_nix_cx(cx)?;
+            let n = pread(fd, &mut buf, offset)
+                .map_err(|errno| Fault::Host { call: "pread (nix runtime closure hash)", code: errno.raw() })?;
+            if n == 0 {
+                break;
+            }
+            if let Some(chunk) = buf.get(..n) {
+                hasher.update(chunk);
+            }
+            let step = u64::try_from(n)
+                .map_err(|_| Fault::Host { call: "pread (nix runtime closure overflow)", code: 75 })?;
+            offset = offset
+                .checked_add(step)
+                .ok_or(Fault::Host { call: "pread (nix runtime closure overflow)", code: 75 })?;
+        }
+        offset
+    };
+    Ok((total_len, hasher.finish()))
+}
+
+fn feed_nix_elf_fd(
+    reader: Option<&super::RootReader>,
+    record_io: Option<&dyn InodeRecordIo>,
     cx: Option<&Cx>,
     now_sec: i64,
     canonical_path: &[u8],
     fd: Fd,
     feed: &mut dyn FnMut(&[u8]),
 ) -> Result<(), Fault> {
-    let stamp = match reader {
-        Some(_) => InodeStamp::from_fd(fd)?,
-        None => None,
-    };
-    let cached = match (reader, stamp) {
-        (Some(r), Some(st)) => r.closure_cache().lookup_digest(cx, st, now_sec)?,
-        _ => None,
-    };
-    let (sha256, total_len) = match cached {
-        Some(hit) => hit,
-        None => {
-            let mut hasher = blaze_sha256::Sha256::new();
-            let total_len = if let (Some(r), Some(cx)) = (reader, cx) {
-                r.stream_fd(cx, fd, "bstd::fs read (nix runtime closure hash)", |chunk| {
-                    hasher.update(chunk);
-                })?
-            } else {
-                let mut buf = [0u8; 64 << 10];
-                let mut offset = 0u64;
-                loop {
-                    check_nix_cx(cx)?;
-                    let n = pread(fd, &mut buf, offset)
-                        .map_err(|errno| Fault::Host { call: "pread (nix runtime closure hash)", code: errno.raw() })?;
-                    if n == 0 {
-                        break;
-                    }
-                    if let Some(chunk) = buf.get(..n) {
-                        hasher.update(chunk);
-                    }
-                    let step = u64::try_from(n)
-                        .map_err(|_| Fault::Host { call: "pread (nix runtime closure overflow)", code: 75 })?;
-                    offset = offset
-                        .checked_add(step)
-                        .ok_or(Fault::Host { call: "pread (nix runtime closure overflow)", code: 75 })?;
-                }
-                offset
-            };
-            let sha256 = hasher.finish();
-            if let (Some(r), Some(st)) = (reader, stamp) {
-                r.closure_cache().insert_digest(cx, st, now_sec, sha256, total_len)?;
-            }
-            (sha256, total_len)
-        }
+    let (total_len, sha256) = match load_or_compute_elf_record(reader, record_io, cx, now_sec, fd, true)? {
+        Some(rec) => match rec.digest {
+            Some(pair) => pair,
+            None => stream_fd_sha256(reader, cx, fd)?,
+        },
+        None => stream_fd_sha256(reader, cx, fd)?,
     };
     feed_framed_digest(canonical_path, &sha256, total_len, feed);
     Ok(())
@@ -2552,58 +2224,5 @@ mod nix_closure_tests {
         let err = parse_ld_so_cache_match(b"not-an-ld-cache", b"libz.so.1", &HostLdCaps { at_hwcap: 0, x86_64_level: 1 }, |_| Ok(true))
             .expect_err("corrupt ld.so.cache must fail");
         assert!(matches!(err, Fault::Host { code: 22, .. }));
-    }
-
-    #[test]
-    fn closure_digest_cache_validates_stamp_racy_clean_and_bounded_eviction() {
-        use super::{ClosureDigestCache, InodeStamp};
-
-        let cache = ClosureDigestCache::new();
-        let base = InodeStamp {
-            dev: 1,
-            ino: 42,
-            mode: 0o100_644,
-            size: 1024,
-            mtime_sec: 1,
-            mtime_nsec: 0,
-            ctime_sec: 1_700_000_000,
-            ctime_nsec: 123,
-        };
-        let now_safe = 1_700_000_010;
-        let digest_a = [0xaa; 32];
-
-        // Cold miss -> insert -> warm hit.
-        assert_eq!(cache.lookup_digest(None, base, now_safe).expect("lookup"), None);
-        assert_eq!(cache.digest_misses(), 1);
-        cache.insert_digest(None, base, now_safe, digest_a, 1024).expect("insert");
-        assert_eq!(cache.lookup_digest(None, base, now_safe).expect("hit"), Some((digest_a, 1024)));
-        assert_eq!(cache.digest_hits(), 1);
-
-        // Racy-clean guard: files touched within <2 seconds of `now_sec` are NEVER cached or hit.
-        let fresh = InodeStamp { ctime_sec: now_safe - 1, ..base };
-        cache.insert_digest(None, fresh, now_safe, [0xbb; 32], 1024).expect("racy insert ignored");
-        assert_eq!(cache.lookup_digest(None, fresh, now_safe).expect("racy miss"), None);
-
-        // Any single inode metadata field mutation immediately misses the cache.
-        for mutated in [
-            InodeStamp { dev: base.dev + 1, ..base },
-            InodeStamp { ino: base.ino + 1, ..base },
-            InodeStamp { mode: 0o100_755, ..base },
-            InodeStamp { size: base.size + 1, ..base },
-            InodeStamp { mtime_sec: base.mtime_sec + 1, ..base },
-            InodeStamp { mtime_nsec: 1, ..base },
-            InodeStamp { ctime_sec: base.ctime_sec + 1, ..base },
-            InodeStamp { ctime_nsec: base.ctime_nsec + 1, ..base },
-        ] {
-            assert_eq!(cache.lookup_digest(None, mutated, now_safe).expect("mutated miss"), None);
-        }
-
-        // Bounded eviction: inserting 512 distinct stamps into a 256-entry cache never grows or panics.
-        for i in 0u64..512 {
-            let st = InodeStamp { ino: 1000 + i, ..base };
-            cache.insert_digest(None, st, now_safe, [u8::try_from(i & 0xff).unwrap_or(0); 32], i).expect("bounded insert");
-        }
-        let newest = InodeStamp { ino: 1511, ..base };
-        assert_eq!(cache.lookup_digest(None, newest, now_safe).expect("newest hit"), Some(([0xff; 32], 511)));
     }
 }
