@@ -393,3 +393,5 @@ crates/blaze-git/src/vfs.rs	BGOV_MAGIC	none
 crates/blaze-git/src/vfs.rs	BGOV_VERSION	none
 crates/blaze-git/src/worktree.rs	BGWT_MAGIC	none
 crates/blaze-git/src/worktree.rs	BGWT_VERSION	none
+crates/blaze-ladder/src/run/export_lto.rs	BUILT_LIR_CACHE_MAGIC	none
+crates/blaze-ladder/src/run/export_lto.rs	EMIT_BODY_CACHE_MAGIC	none
