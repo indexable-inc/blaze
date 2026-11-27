@@ -502,7 +502,10 @@ pub struct Editor {
     pub completions: Vec<CompletionItem>,
     pub completion_selected: usize,
     pub completion_scroll: usize,
-    completion_replace_start: usize,
+    pub completion_replace_start: usize,
+    /// When the user explicitly presses `Esc` to dismiss auto-opened completions on a token,
+    /// remember that token's start offset so we don't immediately re-open until they move on.
+    completions_suppressed_token_start: Option<usize>,
     /// Fish/Nushell-style dimmed inline ghost suffix shown directly after the cursor.
     pub ghost: Option<String>,
     /// Sans-IO Vim modal editing engine (`Normal`/`Insert`/`Visual`/`VisualLine`, undo/redo,
@@ -633,6 +636,7 @@ impl Editor {
             completion_selected: 0,
             completion_scroll: 0,
             completion_replace_start: 0,
+            completions_suppressed_token_start: None,
             ghost: None,
             vim: VimMachine::new(
                 VimOpts {
@@ -1266,6 +1270,7 @@ impl Editor {
                 self.completion_selected -= 1;
             }
             self.sync_completion_scroll();
+            self.sync_ghost_to_selected_completion();
             return;
         }
         self.clamp_cursor();
@@ -1289,6 +1294,7 @@ impl Editor {
         if !self.completions.is_empty() {
             self.completion_selected = (self.completion_selected + 1) % self.completions.len();
             self.sync_completion_scroll();
+            self.sync_ghost_to_selected_completion();
             return;
         }
         self.clamp_cursor();
@@ -1772,6 +1778,175 @@ impl Editor {
         self.completion_scroll = 0;
     }
 
+    /// Explicitly dismiss the completion popup (e.g. on `Esc`) and suppress zero-Tab auto-opening
+    /// until the user moves to a different token or presses `Tab`.
+    pub fn suppress_completions(&mut self) {
+        self.clamp_cursor();
+        let tok_start = token_start_offset(&self.text[..self.cursor]);
+        self.completions_suppressed_token_start = Some(tok_start);
+        self.dismiss_completions();
+    }
+
+    /// Keep the inline Fish ghost text 100% consistent with the currently highlighted row in the
+    /// completion popup whenever the cursor is at the end of a single-line buffer.
+    fn sync_ghost_to_selected_completion(&mut self) {
+        let at_eol = self.cursor == self.text.len() && !self.text.contains('\n');
+        if !at_eol || self.completions.is_empty() {
+            return;
+        }
+        let Some(sel) = self.completions.get(self.completion_selected) else {
+            return;
+        };
+        if sel.kind == CompletionKind::Hint {
+            return;
+        }
+        let start = clamp_char_boundary(&self.text, self.completion_replace_start).min(self.cursor);
+        let prefix = &self.text[start..self.cursor];
+        if sel.insert.len() > prefix.len()
+            && sel
+                .insert
+                .get(..prefix.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+        {
+            let suffix = &sel.insert[prefix.len()..];
+            // Preserve a richer full-command ghost (e.g. `git log --oneline -n 20`) when it
+            // already starts with the selected token followed by whitespace.
+            let keep_richer_ghost = self.ghost.as_deref().is_some_and(|g| {
+                g.starts_with(suffix)
+                    && g.as_bytes()
+                        .get(suffix.len())
+                        .is_none_or(|b| b.is_ascii_whitespace())
+            });
+            if !keep_richer_ghost {
+                self.ghost = Some(suffix.to_owned());
+            }
+        }
+    }
+
+    /// True when the active cursor context has structured candidates that should auto-open in the
+    /// unified completion popup as the user types (zero-Tab): CLI subcommands (`git `, `git s`,
+    /// `bgit worktree `, `blaze `, `cargo `, …), flags (`-`), pipes (`| `), table column args,
+    /// and remote search commands (`git clone `, `cargo add `, …).
+    fn should_auto_open_completions(
+        &self,
+        before: &str,
+        token_start: usize,
+        prefix: &str,
+    ) -> bool {
+        if self.vim_mode() != VimMode::Insert || self.text.contains('\n') {
+            return false;
+        }
+        let prev_non_ws = before[..token_start].trim_end();
+        if prefix.starts_with('-')
+            || prev_non_ws.ends_with('|')
+            || (before.ends_with(' ') && expects_column_arg(before))
+            || (before.ends_with(' ')
+                && blaze_cli_spec::remote::detect_remote_context(before, Alloc::global()).is_some())
+        {
+            return true;
+        }
+
+        let stage_start = before.rfind(['|', ';', '\n']).map_or(0, |p| p + 1);
+        let stage_raw = &before[stage_start..];
+        let stage_trimmed = stage_raw.trim_start();
+        if stage_trimmed.is_empty() {
+            return false;
+        }
+        let trailing_space = stage_raw.ends_with(char::is_whitespace);
+        let words: Vec<&str> = stage_trimmed.split_whitespace().collect();
+        if words.is_empty() || (words.len() == 1 && !trailing_space) {
+            return false;
+        }
+
+        let cmd_base = words[0].trim_start_matches('^').rsplit('/').next().unwrap_or(words[0]);
+        let done_words = if trailing_space {
+            &words[1..]
+        } else {
+            &words[1..words.len() - 1]
+        };
+        let has_done_sub = done_words.iter().any(|w| !w.starts_with('-'));
+
+        if cmd_base == "bgit" {
+            let active = resolve_bgit_spec(done_words);
+            if active.subcommands.is_empty() {
+                return false;
+            }
+            // Exact unique leaf subcommand (e.g. `bgit wt add`) -> let LiveHint::Signature show.
+            if !prefix.is_empty()
+                && let Some(exact) = active
+                    .subcommands
+                    .iter()
+                    .find(|s| !s.hidden && (s.name == prefix || s.aliases.contains(&prefix)))
+            {
+                let matching_count = active
+                    .subcommands
+                    .iter()
+                    .filter(|s| !s.hidden && fuzzy_match_score(s.name, prefix).is_some())
+                    .count();
+                if matching_count <= 1 && exact.spec.subcommands.is_empty() {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        if cmd_base == "git" {
+            if has_done_sub {
+                return false;
+            }
+            if !prefix.is_empty()
+                && GIT_SUBCOMMAND_SIGNATURES.iter().any(|m| m.name == prefix)
+                && GIT_SUBCOMMANDS
+                    .iter()
+                    .filter(|&&(name, _)| name.starts_with(prefix))
+                    .count()
+                    <= 1
+            {
+                return false;
+            }
+            return true;
+        }
+
+        if cmd_base == "blaze" {
+            if has_done_sub {
+                return false;
+            }
+            let app = &blaze_cli_spec::blaze_app::BLAZE_APP;
+            if !prefix.is_empty()
+                && blaze_cli_spec::app::find_command(app, prefix).is_some()
+                && app
+                    .commands
+                    .iter()
+                    .filter(|c| !c.hidden && c.name.starts_with(prefix))
+                    .count()
+                    <= 1
+            {
+                return false;
+            }
+            return true;
+        }
+
+        if !has_done_sub
+            && let Some(cli) = blaze_cli_spec::manual::manual_spec_in(cmd_base, None, Alloc::global())
+            && !cli.subcommands.is_empty()
+        {
+            if !prefix.is_empty()
+                && cli.subcommands.iter().any(|s| s.name.as_str() == prefix)
+                && cli
+                    .subcommands
+                    .iter()
+                    .filter(|s| s.name.as_str().starts_with(prefix))
+                    .count()
+                    <= 1
+            {
+                return false;
+            }
+            return true;
+        }
+
+        false
+    }
+
     fn sync_completion_scroll(&mut self) {
         if self.completion_selected < self.completion_scroll {
             self.completion_scroll = self.completion_selected;
@@ -1852,6 +2027,7 @@ impl Editor {
         self.ghost = None;
 
         if self.text.is_empty() || self.reverse_search.is_some() {
+            self.completions_suppressed_token_start = None;
             self.dismiss_completions();
             return;
         }
@@ -1873,18 +2049,29 @@ impl Editor {
             }
         }
 
-        if !open_popup {
-            return;
-        }
-
         let before = &self.text[..self.cursor];
         let token_start = token_start_offset(before);
         let prefix = before[token_start..].to_owned();
         let prev_non_ws = before[..token_start].trim_end();
 
+        // Moving to a new token clears any previous `Esc` suppression.
+        if self.completions_suppressed_token_start.is_some_and(|s| s != token_start) {
+            self.completions_suppressed_token_start = None;
+        }
+        let is_suppressed = self.completions_suppressed_token_start == Some(token_start);
+
+        let auto_open = !is_suppressed && self.should_auto_open_completions(before, token_start, &prefix);
+        if !open_popup && !auto_open {
+            if !self.completions.is_empty() {
+                self.dismiss_completions();
+            }
+            return;
+        }
+
         // Trigger live IntelliJ popup when typing a token (>= 1 char), `$`, `-`, `/`, after `| `,
-        // or right after a remote-search command (`git clone `, `cargo add `, `bun add `, etc.).
-        let should_show = !prefix.is_empty()
+        // after a remote-search command, or when auto-opened for structured CLI subcommands/flags.
+        let should_show = auto_open
+            || !prefix.is_empty()
             || prev_non_ws.ends_with('|')
             || (before.ends_with(' ') && expects_column_arg(before))
             || (before.ends_with(' ')
@@ -1895,30 +2082,25 @@ impl Editor {
             return;
         }
 
-        let prev_selected_label = self
-            .completions
-            .get(self.completion_selected)
-            .map(|c| c.label.clone());
+        let prev_selected_label = if open_popup && self.completion_selected > 0 {
+            self.completions
+                .get(self.completion_selected)
+                .map(|c| c.label.clone())
+        } else {
+            None
+        };
         let items = self.compute_completions(state, recent_cols, token_start, &prefix);
         // Hide popup if the only candidate is already typed verbatim.
         if items.len() == 1 && items[0].kind != CompletionKind::Hint && items[0].insert == prefix {
             self.dismiss_completions();
             return;
         }
-        if let Some(first) = items.first()
-            && first.kind != CompletionKind::Hint
-            && self.ghost.is_none()
-            && at_eol
-            && !prefix.is_empty()
-            && first.insert.len() > prefix.len()
-            && first.insert.starts_with(&prefix)
-        {
-            self.ghost = Some(first.insert[prefix.len()..].to_owned());
-        }
 
         if items.is_empty() {
             self.dismiss_completions();
         } else {
+            // Always highlight the #1 most likely completion (index 0) unless the user
+            // explicitly arrowed to a specific candidate while keeping the popup open.
             let new_sel = prev_selected_label
                 .as_deref()
                 .and_then(|lbl| items.iter().position(|it| it.label == lbl))
@@ -1927,6 +2109,7 @@ impl Editor {
             self.completions = items;
             self.completion_selected = new_sel;
             self.sync_completion_scroll();
+            self.sync_ghost_to_selected_completion();
         }
     }
 
@@ -1941,12 +2124,14 @@ impl Editor {
         state: &EngineState<'_>,
         recent_cols: &[String],
     ) {
+        self.completions_suppressed_token_start = None;
         if !self.completions.is_empty() {
             if self.completions.len() == 1 {
                 self.apply_selected_completion();
             } else {
                 self.completion_selected = (self.completion_selected + 1) % self.completions.len();
                 self.sync_completion_scroll();
+                self.sync_ghost_to_selected_completion();
             }
             return;
         }
@@ -2033,8 +2218,11 @@ impl Editor {
                     self.completions = narrowed;
                     self.completion_selected = 0;
                     self.completion_scroll = 0;
+                    self.sync_ghost_to_selected_completion();
                 }
             }
+        } else {
+            self.sync_ghost_to_selected_completion();
         }
     }
 
@@ -2194,7 +2382,71 @@ impl Editor {
                 .filter(|w| !w.starts_with('-'));
             let mut seen_flags: HashSet<String> = HashSet::new();
 
-            // 1. Native `blaze-sh` builtin flags (and `bgit` declarative `bstd::cli` flags/opts).
+            // 1. Native `blaze-sh` builtin flags, curated `git`/`blaze` flags, and `bgit` `bstd::cli` flags/opts.
+            if cmd_base == "git"
+                && let Some(sub) = subcmd
+                && let Some(meta) = GIT_SUBCOMMAND_SIGNATURES.iter().find(|m| m.name == sub)
+            {
+                for (idx, &(tok, _short, desc)) in meta.flags.iter().enumerate() {
+                    if let Some((score, idxs)) = fuzzy_match_score(tok, prefix)
+                        && seen_flags.insert(tok.to_owned())
+                    {
+                        let rank = (meta.flags.len().saturating_sub(idx)).min(16) as i32;
+                        scored.push((
+                            score + 65 + rank,
+                            CompletionItem {
+                                label: tok.to_owned(),
+                                insert: tok.to_owned(),
+                                detail: String::new(),
+                                doc: desc.to_owned(),
+                                kind: CompletionKind::Flag,
+                                icon: None,
+                                avatar_path: None,
+                                fs_meta: None,
+                                match_indices: idxs,
+                            },
+                        ));
+                    }
+                }
+            }
+            if cmd_base == "blaze" {
+                let app = &blaze_cli_spec::blaze_app::BLAZE_APP;
+                if let Some(sub) = subcmd
+                    && let Some(cmd) = blaze_cli_spec::app::find_command(app, sub)
+                {
+                    for fl in cmd.flags.iter().chain(app.common_flags.iter()) {
+                        if fl.hidden {
+                            continue;
+                        }
+                        let Some(tok) = fl
+                            .long
+                            .map(|l| format!("--{l}"))
+                            .or_else(|| fl.short.map(|c| format!("-{c}")))
+                        else {
+                            continue;
+                        };
+                        if let Some((score, idxs)) = fuzzy_match_score(&tok, prefix)
+                            && seen_flags.insert(tok.clone())
+                        {
+                            let detail = fl.short.map(|c| format!("-{c}")).unwrap_or_default();
+                            scored.push((
+                                score + 65,
+                                CompletionItem {
+                                    label: tok.clone(),
+                                    insert: tok,
+                                    detail,
+                                    doc: fl.about.to_owned(),
+                                    kind: CompletionKind::Flag,
+                                    icon: None,
+                                    avatar_path: None,
+                                    fs_meta: None,
+                                    match_indices: idxs,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
             if cmd_base == "bgit" {
                 let spec = resolve_bgit_spec(&stage_words[1..]);
                 for f in spec.flags {
@@ -2550,16 +2802,20 @@ impl Editor {
                 }
             } else if cmd_base == "git" {
                 if subcmd.is_none() {
-                    for &(sub, desc) in GIT_SUBCOMMANDS {
+                    for (idx, &(sub, desc)) in GIT_SUBCOMMANDS.iter().enumerate() {
                         if let Some((score, idxs)) = fuzzy_match_score(sub, prefix) {
+                            // Preserve curated frequency ordering (`status`, `diff`, `log`, `switch`, …)
+                            // on prefix ties so `status` always ranks above `stash` on `git s`/`git st`.
+                            let rank = (GIT_SUBCOMMANDS.len() - idx) as i32;
+                            let tie_boost = if prefix.is_empty() { rank } else { rank.min(18) };
                             scored.push((
-                                score + 65,
+                                score + 65 + tie_boost,
                                 CompletionItem {
                                     label: sub.to_owned(),
                                     insert: sub.to_owned(),
                                     detail: "git".to_owned(),
                                     doc: desc.to_owned(),
-                                    kind: CompletionKind::Builtin,
+                                    kind: CompletionKind::Subcommand,
                                     icon: None,
                                     avatar_path: None,
                                     fs_meta: None,
@@ -2599,13 +2855,15 @@ impl Editor {
             } else if cmd_base == "bgit" {
                 let active_spec = resolve_bgit_spec(&stage_words[1..]);
                 if !active_spec.subcommands.is_empty() {
-                    for sub in active_spec.subcommands {
+                    let total_subs = active_spec.subcommands.len();
+                    for (idx, sub) in active_spec.subcommands.iter().enumerate() {
                         if sub.hidden {
                             continue;
                         }
                         if let Some((score, idxs)) = fuzzy_match_score(sub.name, prefix) {
+                            let rank = (total_subs.saturating_sub(idx)).min(16) as i32;
                             scored.push((
-                                score + 70,
+                                score + 70 + rank,
                                 CompletionItem {
                                     label: sub.name.to_owned(),
                                     insert: sub.name.to_owned(),
@@ -2643,13 +2901,15 @@ impl Editor {
                     }
                 }
             } else if cmd_base == "blaze" && subcmd.is_none() {
-                for cmd in blaze_cli_spec::blaze_app::BLAZE_APP.commands {
+                let total_cmds = blaze_cli_spec::blaze_app::BLAZE_APP.commands.len();
+                for (idx, cmd) in blaze_cli_spec::blaze_app::BLAZE_APP.commands.iter().enumerate() {
                     if cmd.hidden {
                         continue;
                     }
                     if let Some((score, idxs)) = fuzzy_match_score(cmd.name, prefix) {
+                        let rank = (total_cmds.saturating_sub(idx)).min(16) as i32;
                         scored.push((
-                            score + 65,
+                            score + 65 + rank,
                             CompletionItem {
                                 label: cmd.name.to_owned(),
                                 insert: cmd.name.to_owned(),
@@ -2976,6 +3236,43 @@ impl Editor {
                     }
                 }
                 collect_path_completions(state.cwd.as_ref(), prefix, matches!(cmd_base, "cd" | "z"), &mut scored);
+            }
+        }
+
+        // Boost candidates by recent command history frequency for the same command prefix,
+        // AND ensure any item matching our Fish ghost prediction ranks #1 so ghost text and
+        // the highlighted popup row NEVER disagree!
+        let before_tok = &self.text[..token_start.min(self.cursor)];
+        let ghost_predicted_tok: Option<String> = self.ghost.as_deref().and_then(|g| {
+            let mut full = String::with_capacity(prefix.len() + g.len());
+            full.push_str(prefix);
+            full.push_str(g);
+            full.split_whitespace().next().map(str::to_owned)
+        });
+        let mut hist_boosts: HashMap<String, i32> = HashMap::new();
+        if !before_tok.is_empty() && !self.history.is_empty() {
+            let total_hist = self.history.len();
+            let start_idx = total_hist.saturating_sub(256);
+            for (offset, cmd) in self.history[start_idx..].iter().enumerate() {
+                if let Some(rest) = cmd.strip_prefix(before_tok)
+                    && let Some(tok) = rest.split_whitespace().next()
+                    && !tok.is_empty()
+                {
+                    let recency = 1 + (offset as i32 * 4) / (total_hist - start_idx).max(1) as i32;
+                    let entry = hist_boosts.entry(tok.to_owned()).or_insert(0);
+                    *entry = (*entry + recency).min(45);
+                }
+            }
+        }
+        for (score, item) in &mut scored {
+            if let Some(&hb) = hist_boosts.get(&item.insert) {
+                *score += hb;
+            }
+            if let Some(gt) = ghost_predicted_tok.as_deref()
+                && item.kind != CompletionKind::Hint
+                && item.insert == gt
+            {
+                *score += 120;
             }
         }
 
@@ -3434,19 +3731,10 @@ const GIT_SUBCOMMANDS: &[(&str, &str)] = &[
     ("worktree", "Manage multiple working trees"),
 ];
 
-/// One clickable subcommand or flag preview item inside [`LiveHint::Candidates`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LiveHintItem {
-    pub label: String,
-    pub insert: String,
-    pub doc: String,
-    pub is_flag: bool,
-    pub match_indices: Vec<usize>,
-}
-
-/// Zero-Tab, non-modal live inline hint rendered directly below the active prompt line as the
-/// user types (IDE signature-help for recognized subcommands + calm inline subcommand/flag preview
-/// with descriptions — never hijacks `Enter`, `↑`/`↓`, or `→` Fish ghost text).
+/// Zero-Tab, non-modal IDE signature strip rendered directly below the active prompt line when
+/// no completion candidate popup is open (e.g. `git add <pathspec>...` with clickable flag chips).
+/// Subcommand & flag candidate lists are unified into [`Editor::completions`] so there is only
+/// ONE popup with selection highlight, live ghost sync, and instant `Tab` completion.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LiveHint {
     /// Recognized command / subcommand signature + 1-line description + key clickable flag chips.
@@ -3459,15 +3747,6 @@ pub enum LiveHint {
         about: String,
         /// Up to 4 compact clickable flag chips `(flag_token, short_desc)`.
         flags: Vec<(String, String)>,
-    },
-    /// Matching subcommands or flags with 1-line descriptions as you type (no Tab required).
-    Candidates {
-        /// Byte offset in `editor.text` replaced when a row is clicked.
-        replace_start: usize,
-        /// Up to 5 matching preview items.
-        items: Vec<LiveHintItem>,
-        /// Total matches across the full command table (`total_matches > items.len()` shows `+N more`).
-        total_matches: usize,
     },
 }
 
@@ -3758,10 +4037,10 @@ impl Editor {
 
         // 1. `bgit` — driven directly from `bgit::cli_spec()` (supports nested `worktree add/list/sync/...`!).
         if cmd_base == "bgit" {
-            let active = resolve_bgit_spec(done_words);
             if typing_flag {
-                return build_bgit_flag_candidates(active, cur_prefix, replace_start);
+                return None;
             }
+            let active = resolve_bgit_spec(done_words);
             if !active.subcommands.is_empty() {
                 if !cur_prefix.is_empty()
                     && let Some(exact) = active
@@ -3778,19 +4057,19 @@ impl Editor {
                         return Some(build_bgit_signature(exact.spec, done_words, replace_start));
                     }
                 }
-                return build_bgit_sub_candidates(active, cur_prefix, replace_start);
+                return None;
             }
             return Some(build_bgit_signature(active, done_words, replace_start));
         }
 
-        // 2. `git` — curated rich subcommand & flag signatures + `GIT_SUBCOMMANDS`.
+        // 2. `git` — curated rich subcommand signatures.
         if cmd_base == "git" {
+            if typing_flag {
+                return None;
+            }
             let sub = done_words.iter().copied().find(|w| !w.starts_with('-'));
             if let Some(sub_name) = sub {
                 if let Some(meta) = GIT_SUBCOMMAND_SIGNATURES.iter().find(|m| m.name == sub_name) {
-                    if typing_flag {
-                        return build_static_flag_candidates(meta.flags, cur_prefix, replace_start);
-                    }
                     return Some(LiveHint::Signature {
                         anchor_byte: replace_start,
                         signature: meta.usage.to_owned(),
@@ -3803,10 +4082,6 @@ impl Editor {
                             .collect(),
                     });
                 }
-                return None;
-            }
-            // At subcommand position (`git `, `git a`, `git add`, `git st`).
-            if typing_flag {
                 return None;
             }
             if !cur_prefix.is_empty()
@@ -3830,19 +4105,19 @@ impl Editor {
                     });
                 }
             }
-            return build_pair_sub_candidates(GIT_SUBCOMMANDS, cur_prefix, replace_start);
+            return None;
         }
 
         // 3. `blaze` — driven directly from `blaze_cli_spec::blaze_app::BLAZE_APP`.
         if cmd_base == "blaze" {
+            if typing_flag {
+                return None;
+            }
             let app = &blaze_cli_spec::blaze_app::BLAZE_APP;
             let sub = done_words.iter().copied().find(|w| !w.starts_with('-'));
             if let Some(sub_name) = sub
                 && let Some(cmd) = blaze_cli_spec::app::find_command(app, sub_name)
             {
-                if typing_flag {
-                    return build_blaze_flag_candidates(cmd, app.common_flags, cur_prefix, replace_start);
-                }
                 let sig = if cmd.usage_args.is_empty() {
                     format!("blaze {}", cmd.name)
                 } else {
@@ -3868,82 +4143,47 @@ impl Editor {
                     flags,
                 });
             }
-            if !typing_flag {
-                if !cur_prefix.is_empty()
-                    && let Some(cmd) = blaze_cli_spec::app::find_command(app, cur_prefix)
-                {
-                    let n_match = app
-                        .commands
-                        .iter()
-                        .filter(|c| !c.hidden && c.name.starts_with(cur_prefix))
-                        .count();
-                    if n_match <= 1 {
-                        let sig = if cmd.usage_args.is_empty() {
-                            format!("blaze {}", cmd.name)
-                        } else {
-                            format!("blaze {} {}", cmd.name, cmd.usage_args)
-                        };
-                        return Some(LiveHint::Signature {
-                            anchor_byte: replace_start,
-                            signature: sig,
-                            about: cmd.about.to_owned(),
-                            flags: cmd
-                                .flags
-                                .iter()
-                                .filter(|f| !f.hidden)
-                                .take(4)
-                                .filter_map(|f| {
-                                    let tok = f
-                                        .long
-                                        .map(|l| format!("--{l}"))
-                                        .or_else(|| f.short.map(|c| format!("-{c}")))?;
-                                    Some((tok, compact_flag_label(f.about)))
-                                })
-                                .collect(),
-                        });
-                    }
+            if !cur_prefix.is_empty()
+                && let Some(cmd) = blaze_cli_spec::app::find_command(app, cur_prefix)
+            {
+                let n_match = app
+                    .commands
+                    .iter()
+                    .filter(|c| !c.hidden && c.name.starts_with(cur_prefix))
+                    .count();
+                if n_match <= 1 {
+                    let sig = if cmd.usage_args.is_empty() {
+                        format!("blaze {}", cmd.name)
+                    } else {
+                        format!("blaze {} {}", cmd.name, cmd.usage_args)
+                    };
+                    return Some(LiveHint::Signature {
+                        anchor_byte: replace_start,
+                        signature: sig,
+                        about: cmd.about.to_owned(),
+                        flags: cmd
+                            .flags
+                            .iter()
+                            .filter(|f| !f.hidden)
+                            .take(4)
+                            .filter_map(|f| {
+                                let tok = f
+                                    .long
+                                    .map(|l| format!("--{l}"))
+                                    .or_else(|| f.short.map(|c| format!("-{c}")))?;
+                                Some((tok, compact_flag_label(f.about)))
+                            })
+                            .collect(),
+                    });
                 }
-                let mut scored: Vec<(i32, LiveHintItem)> = Vec::new();
-                for cmd in app.commands {
-                    if cmd.hidden {
-                        continue;
-                    }
-                    if let Some((score, idxs)) = fuzzy_match_score(cmd.name, cur_prefix) {
-                        scored.push((
-                            score,
-                            LiveHintItem {
-                                label: cmd.name.to_owned(),
-                                insert: cmd.name.to_owned(),
-                                doc: cmd.about.to_owned(),
-                                is_flag: false,
-                                match_indices: idxs,
-                            },
-                        ));
-                    }
-                }
-                return finalize_live_candidates(scored, replace_start);
             }
+            return None;
         }
 
         // 4. Native `blaze-sh` builtins (`ls`, `where`, `sort-by`, `select`, `ps`, `rg`, …).
         if let Some(spec) = find_spec(cmd_base) {
             if typing_flag {
-                let mut scored: Vec<(i32, LiveHintItem)> = Vec::new();
-                for &flag in spec.flags {
-                    if let Some((score, idxs)) = fuzzy_match_score(flag, cur_prefix) {
-                        scored.push((
-                            score,
-                            LiveHintItem {
-                                label: flag.to_owned(),
-                                insert: flag.to_owned(),
-                                doc: spec.summary.to_owned(),
-                                is_flag: true,
-                                match_indices: idxs,
-                            },
-                        ));
-                    }
-                }
-                return finalize_live_candidates(scored, replace_start);
+                return None;
             }
             return Some(LiveHint::Signature {
                 anchor_byte: replace_start,
@@ -3959,38 +4199,15 @@ impl Editor {
         }
 
         // 5. Any curated CLI in `blaze-cli-spec::manual` (`cargo`, `claude`, `rg`, `fd`, `curl`, `ssh`, `vim`, …).
+        if typing_flag {
+            return None;
+        }
         let alloc = Alloc::global();
         let sub = done_words.iter().copied().find(|w| !w.starts_with('-'));
         if let Some(cli) = sub
             .and_then(|s| blaze_cli_spec::manual::manual_spec_in(cmd_base, Some(s), alloc))
             .or_else(|| blaze_cli_spec::manual::manual_spec_in(cmd_base, None, alloc))
         {
-            if typing_flag {
-                let mut scored: Vec<(i32, LiveHintItem)> = Vec::new();
-                for fl in cli.flags.iter() {
-                    let primary = fl.primary();
-                    if primary.is_empty() {
-                        continue;
-                    }
-                    if let Some((score, idxs)) = fuzzy_match_score(primary, cur_prefix) {
-                        let label = match &fl.value_hint {
-                            Some(vh) => format!("{primary} {}", vh.as_str()),
-                            None => primary.to_owned(),
-                        };
-                        scored.push((
-                            score,
-                            LiveHintItem {
-                                label,
-                                insert: primary.to_owned(),
-                                doc: fl.description.as_str().to_owned(),
-                                is_flag: true,
-                                match_indices: idxs,
-                            },
-                        ));
-                    }
-                }
-                return finalize_live_candidates(scored, replace_start);
-            }
             if let Some(sub_name) = sub {
                 if let Some(sc) = cli.subcommands.iter().find(|s| s.name.as_str() == sub_name) {
                     return Some(LiveHint::Signature {
@@ -4008,40 +4225,23 @@ impl Editor {
                 }
                 return None;
             }
-            if !cli.subcommands.is_empty() {
-                if !cur_prefix.is_empty()
-                    && let Some(sc) = cli.subcommands.iter().find(|s| s.name.as_str() == cur_prefix)
-                {
-                    let n_match = cli
-                        .subcommands
-                        .iter()
-                        .filter(|s| s.name.as_str().starts_with(cur_prefix))
-                        .count();
-                    if n_match <= 1 {
-                        return Some(LiveHint::Signature {
-                            anchor_byte: replace_start,
-                            signature: format!("{cmd_base} {}", sc.name.as_str()),
-                            about: sc.description.as_str().to_owned(),
-                            flags: Vec::new(),
-                        });
-                    }
+            if !cli.subcommands.is_empty()
+                && !cur_prefix.is_empty()
+                && let Some(sc) = cli.subcommands.iter().find(|s| s.name.as_str() == cur_prefix)
+            {
+                let n_match = cli
+                    .subcommands
+                    .iter()
+                    .filter(|s| s.name.as_str().starts_with(cur_prefix))
+                    .count();
+                if n_match <= 1 {
+                    return Some(LiveHint::Signature {
+                        anchor_byte: replace_start,
+                        signature: format!("{cmd_base} {}", sc.name.as_str()),
+                        about: sc.description.as_str().to_owned(),
+                        flags: Vec::new(),
+                    });
                 }
-                let mut scored: Vec<(i32, LiveHintItem)> = Vec::new();
-                for sc in cli.subcommands.iter() {
-                    if let Some((score, idxs)) = fuzzy_match_score(sc.name.as_str(), cur_prefix) {
-                        scored.push((
-                            score,
-                            LiveHintItem {
-                                label: sc.name.as_str().to_owned(),
-                                insert: sc.name.as_str().to_owned(),
-                                doc: sc.description.as_str().to_owned(),
-                                is_flag: false,
-                                match_indices: idxs,
-                            },
-                        ));
-                    }
-                }
-                return finalize_live_candidates(scored, replace_start);
             }
         }
 
@@ -4052,146 +4252,6 @@ impl Editor {
 fn compact_flag_label(desc: &str) -> String {
     let words: Vec<&str> = desc.split_whitespace().take(3).collect();
     words.join(" ")
-}
-
-fn finalize_live_candidates(
-    mut scored: Vec<(i32, LiveHintItem)>,
-    replace_start: usize,
-) -> Option<LiveHint> {
-    if scored.is_empty() {
-        return None;
-    }
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.label.cmp(&b.1.label)));
-    let total_matches = scored.len();
-    let items: Vec<LiveHintItem> = scored.into_iter().take(5).map(|(_, it)| it).collect();
-    Some(LiveHint::Candidates { replace_start, items, total_matches })
-}
-
-fn build_pair_sub_candidates(
-    entries: &[(&str, &str)],
-    prefix: &str,
-    replace_start: usize,
-) -> Option<LiveHint> {
-    let mut scored: Vec<(i32, LiveHintItem)> = Vec::new();
-    for (idx, &(name, desc)) in entries.iter().enumerate() {
-        if let Some((score, idxs)) = fuzzy_match_score(name, prefix) {
-            // Preserve curated frequency ordering (`status`, `diff`, `commit`, …) on close prefix ties.
-            let rank = (entries.len() - idx) as i32;
-            let tie_boost = if prefix.is_empty() { rank } else { rank.min(16) };
-            scored.push((
-                score + tie_boost,
-                LiveHintItem {
-                    label: name.to_owned(),
-                    insert: name.to_owned(),
-                    doc: desc.to_owned(),
-                    is_flag: false,
-                    match_indices: idxs,
-                },
-            ));
-        }
-    }
-    finalize_live_candidates(scored, replace_start)
-}
-
-fn build_static_flag_candidates(
-    flags: &[(&str, &str, &str)],
-    prefix: &str,
-    replace_start: usize,
-) -> Option<LiveHint> {
-    let mut scored: Vec<(i32, LiveHintItem)> = Vec::new();
-    for &(tok, _short, desc) in flags {
-        if let Some((score, idxs)) = fuzzy_match_score(tok, prefix) {
-            scored.push((
-                score,
-                LiveHintItem {
-                    label: tok.to_owned(),
-                    insert: tok.to_owned(),
-                    doc: desc.to_owned(),
-                    is_flag: true,
-                    match_indices: idxs,
-                },
-            ));
-        }
-    }
-    finalize_live_candidates(scored, replace_start)
-}
-
-fn build_bgit_sub_candidates(
-    spec: &bgit::CliCommandSpec<'static>,
-    prefix: &str,
-    replace_start: usize,
-) -> Option<LiveHint> {
-    let mut scored: Vec<(i32, LiveHintItem)> = Vec::new();
-    let total = spec.subcommands.len();
-    for (idx, sub) in spec.subcommands.iter().enumerate() {
-        if sub.hidden {
-            continue;
-        }
-        if let Some((score, idxs)) = fuzzy_match_score(sub.name, prefix) {
-            let tie_boost = if prefix.is_empty() { (total - idx) as i32 } else { 0 };
-            scored.push((
-                score + tie_boost,
-                LiveHintItem {
-                    label: sub.name.to_owned(),
-                    insert: sub.name.to_owned(),
-                    doc: sub.about.to_owned(),
-                    is_flag: false,
-                    match_indices: idxs,
-                },
-            ));
-        }
-    }
-    finalize_live_candidates(scored, replace_start)
-}
-
-fn build_bgit_flag_candidates(
-    spec: &bgit::CliCommandSpec<'static>,
-    prefix: &str,
-    replace_start: usize,
-) -> Option<LiveHint> {
-    let mut scored: Vec<(i32, LiveHintItem)> = Vec::new();
-    for f in spec.flags {
-        if f.hidden {
-            continue;
-        }
-        let tok = format!("--{}", f.long);
-        if let Some((score, idxs)) = fuzzy_match_score(&tok, prefix) {
-            let label = match f.short {
-                Some(s) => format!("-{s}, {tok}"),
-                None => tok.clone(),
-            };
-            scored.push((
-                score,
-                LiveHintItem {
-                    label,
-                    insert: tok,
-                    doc: f.help.to_owned(),
-                    is_flag: true,
-                    match_indices: idxs,
-                },
-            ));
-        }
-    }
-    for o in spec.opts {
-        if o.hidden {
-            continue;
-        }
-        let tok = format!("--{}", o.long);
-        if let Some((score, idxs)) = fuzzy_match_score(&tok, prefix) {
-            let label = format!("{tok} <{}>", o.value_name);
-            scored.push((
-                score,
-                LiveHintItem {
-                    label,
-                    insert: tok,
-                    doc: o.help.to_owned(),
-                    is_flag: true,
-                    match_indices: idxs,
-                },
-            ));
-        }
-    }
-    finalize_live_candidates(scored, replace_start)
 }
 
 fn build_bgit_signature(
@@ -4237,40 +4297,6 @@ fn build_bgit_signature(
         flags.push((format!("--{}", o.long), o.value_name.to_lowercase()));
     }
     LiveHint::Signature { anchor_byte, signature: sig, about: spec.about.to_owned(), flags }
-}
-
-fn build_blaze_flag_candidates(
-    cmd: &blaze_cli_spec::app::CommandSpec,
-    common: &[blaze_cli_spec::app::ArgSpec],
-    prefix: &str,
-    replace_start: usize,
-) -> Option<LiveHint> {
-    let mut scored: Vec<(i32, LiveHintItem)> = Vec::new();
-    for fl in cmd.flags.iter().chain(common.iter()) {
-        if fl.hidden {
-            continue;
-        }
-        let Some(tok) = fl
-            .long
-            .map(|l| format!("--{l}"))
-            .or_else(|| fl.short.map(|c| format!("-{c}")))
-        else {
-            continue;
-        };
-        if let Some((score, idxs)) = fuzzy_match_score(&tok, prefix) {
-            scored.push((
-                score,
-                LiveHintItem {
-                    label: tok.clone(),
-                    insert: tok,
-                    doc: fl.about.to_owned(),
-                    is_flag: true,
-                    match_indices: idxs,
-                },
-            ));
-        }
-    }
-    finalize_live_candidates(scored, replace_start)
 }
 
 /// Load SSH hosts via our sans-IO `blaze-ssh` parser (`~/.ssh/config` + `Include`s + `known_hosts`).
@@ -4833,77 +4859,85 @@ mod tests {
     }
 
     #[test]
-    fn zero_tab_live_inline_hints_cover_git_bgit_blaze_and_manual_clis() {
+    fn unified_zero_tab_completions_select_most_likely_and_sync_ghost() {
+        let state = EngineState::new("/tmp", &[], blaze_own::Alloc::global());
         let mut ed = Editor::new();
 
-        // 1. `git ` -> live subcommand preview with descriptions (no Tab pressed!).
+        // 1. `git ` -> unified completion popup auto-opens (zero Tab!) with `status` selected #1.
         ed.set_text_initial("git ".to_owned());
-        match ed.live_inline_hint().expect("git subcommand preview") {
-            LiveHint::Candidates { items, total_matches, .. } => {
-                assert!(total_matches >= 10);
-                assert_eq!(items[0].label, "status");
-                assert!(items[0].doc.contains("working tree"));
-            }
-            other => panic!("expected Candidates for `git `, got {other:?}"),
-        }
+        ed.refresh_assist(&state, &[], false);
+        assert!(ed.completions.len() >= 10);
+        assert_eq!(ed.completion_selected, 0);
+        assert_eq!(ed.completions[0].label, "status");
+        assert!(ed.completions[0].doc.contains("working tree"));
 
-        // 2. `git st` -> narrowed to `status` + `stash`.
+        // 2. `git s` -> `status` is #1 (matching ghost `tatus`) and pressing Tab completes `git status `!
+        ed.set_text_initial("git s".to_owned());
+        ed.refresh_assist(&state, &[], false);
+        assert_eq!(ed.completions[0].label, "status");
+        assert_eq!(ed.ghost.as_deref(), Some("tatus"));
+
+        // 3. `git st` -> `status` STILL beats `stash` (no ghost/popup mismatch!) and Tab accepts it!
         ed.set_text_initial("git st".to_owned());
-        match ed.live_inline_hint().expect("git st preview") {
-            LiveHint::Candidates { items, .. } => {
-                assert!(items.iter().any(|i| i.label == "status"));
-                assert!(items.iter().any(|i| i.label == "stash"));
-            }
-            other => panic!("expected Candidates for `git st`, got {other:?}"),
-        }
+        ed.refresh_assist(&state, &[], false);
+        assert_eq!(ed.completions[0].label, "status");
+        assert_eq!(ed.ghost.as_deref(), Some("atus"));
+        assert!(ed.completions.iter().any(|i| i.label == "stash"));
 
-        // 3. `git add` -> exact unique subcommand shows calm 1-line Signature + flags!
+        // Arrowing down to `stash` live-syncs the inline ghost text to `ash`!
+        ed.move_down();
+        assert_eq!(ed.completions[ed.completion_selected].label, "stash");
+        assert_eq!(ed.ghost.as_deref(), Some("ash"));
+        // Arrowing back up restores `status` + ghost `atus`, and Tab applies `git status `!
+        ed.move_up();
+        assert_eq!(ed.completions[ed.completion_selected].label, "status");
+        assert!(ed.apply_selected_completion());
+        assert_eq!(ed.text, "git status ");
+
+        // 4. `git add` -> exact unique subcommand dismisses candidate popup and shows 1-line Signature + flags!
         ed.set_text_initial("git add".to_owned());
+        ed.refresh_assist(&state, &[], false);
+        assert!(ed.completions.is_empty());
         match ed.live_inline_hint().expect("git add signature") {
             LiveHint::Signature { signature, about, flags, .. } => {
                 assert!(signature.starts_with("git add"));
                 assert!(about.contains("Stage"));
                 assert!(flags.iter().any(|(f, _)| f == "-A"));
             }
-            other => panic!("expected Signature for `git add`, got {other:?}"),
         }
 
-        // 4. `git add -` -> matching flag candidates with descriptions.
+        // 5. `git add -` -> unified popup auto-opens with curated flag candidates + descriptions.
         ed.set_text_initial("git add -".to_owned());
-        match ed.live_inline_hint().expect("git add flags") {
-            LiveHint::Candidates { items, .. } => {
-                assert!(items.iter().all(|i| i.is_flag));
-                assert!(items.iter().any(|i| i.label == "-A"));
-            }
-            other => panic!("expected flag Candidates for `git add -`, got {other:?}"),
-        }
+        ed.refresh_assist(&state, &[], false);
+        assert!(!ed.completions.is_empty());
+        assert!(ed.completions.iter().all(|i| i.kind == CompletionKind::Flag));
+        assert!(ed.completions.iter().any(|i| i.label == "-A"));
 
-        // 5. `bgit worktree ` -> nested subcommands straight from `bgit::cli_spec()`!
+        // 6. `bgit worktree ` -> nested subcommands straight from `bgit::cli_spec()`!
         ed.set_text_initial("bgit worktree ".to_owned());
-        match ed.live_inline_hint().expect("bgit worktree subcommands") {
-            LiveHint::Candidates { items, .. } => {
-                assert!(items.iter().any(|i| i.label == "add"));
-                assert!(items.iter().any(|i| i.label == "sync"));
-            }
-            other => panic!("expected Candidates for `bgit worktree `, got {other:?}"),
-        }
+        ed.refresh_assist(&state, &[], false);
+        assert!(ed.completions.iter().any(|i| i.label == "add"));
+        assert!(ed.completions.iter().any(|i| i.label == "sync"));
 
-        // 6. `bgit wt add ` -> exact nested signature with positionals & flags!
+        // 7. `bgit wt add ` -> exact nested signature with positionals & flags!
         ed.set_text_initial("bgit wt add ".to_owned());
+        ed.refresh_assist(&state, &[], false);
+        assert!(ed.completions.is_empty());
         match ed.live_inline_hint().expect("bgit wt add signature") {
             LiveHint::Signature { signature, about, flags, .. } => {
                 assert!(signature.contains("add"));
                 assert!(about.contains("worktree"));
                 assert!(flags.iter().any(|(f, _)| f == "--vfs"));
             }
-            other => panic!("expected Signature for `bgit wt add `, got {other:?}"),
         }
 
-        // 7. Clicking a live hint replaces the partial token cleanly.
-        ed.set_text_initial("git st".to_owned());
-        if let Some(LiveHint::Candidates { replace_start, items, .. }) = ed.live_inline_hint() {
-            ed.apply_live_hint(replace_start, &items[0].insert);
-            assert_eq!(ed.text, "git status ");
-        }
+        // 8. Esc suppresses auto-popup on the current token until moving on.
+        ed.set_text_initial("git s".to_owned());
+        ed.refresh_assist(&state, &[], false);
+        assert!(!ed.completions.is_empty());
+        ed.suppress_completions();
+        assert!(ed.completions.is_empty());
+        ed.refresh_assist(&state, &[], false);
+        assert!(ed.completions.is_empty(), "Esc suppression must keep popup closed on same token");
     }
 }

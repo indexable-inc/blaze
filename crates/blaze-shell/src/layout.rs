@@ -7146,150 +7146,6 @@ fn layout_live_hint_strip(
                 scene.overlay_mono_small(tx0 + 5.0, ty, tab_lbl, theme::INK_4, false, false, 0);
             }
         }
-        LiveHint::Candidates { replace_start, items, total_matches } => {
-            if items.is_empty() {
-                return;
-            }
-            let row_h = m.ch + 6.0;
-            let rem = total_matches.saturating_sub(items.len());
-            let footer_h = if rem > 0 { m.ch + 6.0 } else { 0.0 };
-            let card_h = 8.0 + items.len() as f32 * row_h + footer_h;
-
-            let max_label_w = items
-                .iter()
-                .map(|it| m.measure(&it.label, TextFace::MonoSmall))
-                .fold(0.0f32, f32::max)
-                .clamp(68.0, 210.0);
-            let max_doc_w = items
-                .iter()
-                .map(|it| m.measure(&it.doc, TextFace::UiSmall))
-                .fold(0.0f32, f32::max)
-                .min(340.0);
-            let card_w = (12.0 + max_label_w + 16.0 + max_doc_w + 14.0).clamp(260.0, max_avail_w.min(580.0));
-
-            // Anchor horizontally to the start of the active token being typed.
-            let prefix_before = &editor.text[..(*replace_start).min(editor.text.len())];
-            let anchor_col = prefix_before
-                .rsplit('\n')
-                .next()
-                .map(|line| line.chars().count())
-                .unwrap_or(0);
-            let desired_x = scene.composer_text_origin[0] + (anchor_col as f32 * m.cw) - 10.0;
-            let px0 = desired_x.clamp(x0, (x1 - card_w).max(x0));
-            let px1 = px0 + card_w;
-
-            let below_y0 = prompt_y1 + 5.0;
-            let py0 = if below_y0 + card_h <= vh - 10.0 {
-                below_y0.max(TOP_BAR_H + 8.0)
-            } else {
-                (prompt_y0 - 6.0 - card_h).max(TOP_BAR_H + 8.0)
-            };
-            let py1 = py0 + card_h;
-
-            scene.overlay_shadow(px0, py0 + 3.0, px1, py1 + 3.0, 7.0, 14.0, theme::SHADOW_SOFT, 0);
-            scene.overlay_round_rect(px0, py0, px1, py1, 7.0, glass_bg, 1.0, theme::LINE, 0);
-
-            let label_x = px0 + 11.0;
-            let doc_x = label_x + max_label_w + 14.0;
-            let doc_budget_w = (px1 - doc_x - 10.0).max(40.0);
-            let mono_small_cw = m.cw * 0.84;
-            let mut ry = py0 + 4.0;
-
-            for item in items {
-                let row_rect = HitRect::new(px0 + 4.0, ry, px1 - 4.0, ry + row_h);
-                let hovered = mouse_pos.is_some_and(|p| row_rect.contains(p[0], p[1]));
-                if hovered {
-                    scene.overlay_round_rect(
-                        row_rect.x0,
-                        row_rect.y0,
-                        row_rect.x1,
-                        row_rect.y1,
-                        4.5,
-                        theme::COMPLETION_SEL_BG,
-                        0.0,
-                        [0.0; 4],
-                        0,
-                    );
-                }
-
-                let ty = ry + (row_h - m.ch) * 0.5;
-                let base_col = if item.is_flag {
-                    theme::CMD_BUILTIN
-                } else {
-                    theme::rgb(0x56, 0xb6, 0xc2)
-                };
-
-                // Draw `MonoSmall` candidate label with gentle highlight on matched character indices.
-                let max_lbl_chars = (max_label_w / mono_small_cw).floor().max(8.0) as usize;
-                let lbl_txt = truncate_chars(&item.label, max_lbl_chars);
-                if item.match_indices.is_empty() {
-                    scene.overlay_mono_small(
-                        label_x,
-                        ty,
-                        lbl_txt,
-                        if hovered { theme::INK_1 } else { base_col },
-                        hovered,
-                        false,
-                        0,
-                    );
-                } else {
-                    let mut lx = label_x;
-                    for (ci, ch) in lbl_txt.chars().enumerate() {
-                        let matched = item.match_indices.contains(&ci);
-                        let col = if matched {
-                            theme::INK_1
-                        } else if hovered {
-                            theme::INK_2
-                        } else {
-                            base_col
-                        };
-                        let mut buf = [0u8; 4];
-                        let s = ch.encode_utf8(&mut buf);
-                        scene.overlay_mono_small(lx, ty, s, col, matched, false, 0);
-                        lx += mono_small_cw;
-                    }
-                }
-
-                // Draw calm SF Pro 1-line description.
-                if !item.doc.is_empty() && doc_x + 30.0 < px1 {
-                    let max_doc_chars = (doc_budget_w / (m.cw * 0.62)).floor().max(8.0) as usize;
-                    let doc_txt = truncate_chars(&item.doc, max_doc_chars);
-                    scene.overlay_ui_small(
-                        doc_x,
-                        ty,
-                        doc_txt,
-                        if hovered { theme::INK_2 } else { theme::INK_3 },
-                        false,
-                        false,
-                        0,
-                    );
-                }
-
-                scene.push_hit(
-                    row_rect,
-                    HitAction::InsertLiveHint {
-                        replace_start: *replace_start,
-                        insert: item.insert.clone(),
-                    },
-                );
-                ry += row_h;
-            }
-
-            if rem > 0 {
-                let fy0 = py1 - footer_h;
-                scene.overlay_line(px0 + 8.0, fy0, px1 - 8.0, fy0, 1.0, theme::LINE, 0);
-                let footer_txt = format!("+{rem} more · Tab to browse");
-                scene.overlay_ui_small(
-                    px0 + 11.0,
-                    fy0 + (footer_h - m.ch) * 0.5,
-                    footer_txt,
-                    theme::INK_4,
-                    false,
-                    false,
-                    0,
-                );
-            }
-        }
     }
 }
 
@@ -7423,16 +7279,42 @@ fn layout_completion_popup(
     }
     const COMP_SIZE_BAR_W: f32 = 44.0;
     const COMP_AGE_COL_W: f32 = 28.0;
+    let inline_doc_mode = !any_size_bar && !any_age;
     let detail_col_w = if any_size_bar {
         max_detail_w.clamp(58.0, 96.0)
+    } else if inline_doc_mode {
+        0.0
     } else {
         max_detail_w.min(180.0)
     };
-    let popup_w = (x1 - x0).min(if any_size_bar { 640.0 } else { 560.0 });
+    let icon_s = m.icon_md();
+    let max_inline_label_w = if inline_doc_mode {
+        (0..show)
+            .map(|offset| editor.completions[win_start + offset].label.chars().count() as f32 * m.cw)
+            .fold(0.0f32, f32::max)
+            .clamp(76.0, 210.0)
+    } else {
+        0.0
+    };
+    let popup_w = if inline_doc_mode {
+        let max_doc_w = (0..show)
+            .map(|offset| m.measure(&editor.completions[win_start + offset].doc, TextFace::UiSmall))
+            .fold(0.0f32, f32::max)
+            .min(340.0);
+        (13.0 + icon_s + 9.0 + max_inline_label_w + 18.0 + max_doc_w + 18.0 + sb_pad)
+            .clamp(340.0, (x1 - x0).min(640.0))
+    } else {
+        (x1 - x0).min(if any_size_bar { 640.0 } else { 560.0 })
+    };
 
-    // Anchor horizontally near the active cursor token (clamped inside `[x0, x1 - popup_w]`).
-    let (_, ccol) = editor.cursor_line_col();
-    let desired_x = scene.composer_text_origin[0] + (ccol as f32 * m.cw) - 36.0;
+    // Anchor horizontally to the start of the active token being completed (rock-steady while typing).
+    let tok_start = editor.completion_replace_start.min(editor.text.len());
+    let anchor_col = editor.text[..tok_start]
+        .rsplit('\n')
+        .next()
+        .map(|line| line.chars().count())
+        .unwrap_or(0);
+    let desired_x = scene.composer_text_origin[0] + (anchor_col as f32 * m.cw) - (13.0 + icon_s + 9.0);
     let px0 = desired_x.clamp(x0, (x1 - popup_w).max(x0));
     let px1 = px0 + popup_w;
 
@@ -7458,7 +7340,6 @@ fn layout_completion_popup(
         0,
     );
 
-    let icon_s = m.icon_md();
     let list_y0 = py0 + 5.0;
     let mut ry = list_y0;
     for offset in 0..show {
@@ -7607,82 +7488,125 @@ fn layout_completion_popup(
         }
 
         // Fixed right-hand tabular columns (all vertically centered on the exact row centerline):
-        //   [label ...]   [age (heat-colored)]   [==== size bar]   [right-aligned size/detail]
+        // - In filesystem mode (`any_size_bar || any_age`): `[label] [age] [==== size bar] [size/detail]`
+        // - In unified subcommand/flag mode (`inline_doc_mode`): `[label] [inline 1-line description]`
         let vis = &row_vis[offset];
         let ty_small = ry + (row_h - m.line_h(TextFace::UiSmall)) * 0.5;
         let right_edge = px1 - 14.0 - sb_pad;
-        let detail_w = m.measure(&vis.detail_txt, TextFace::UiSmall);
-        let detail_x = right_edge - detail_w;
-        scene.overlay_ui_small(
-            detail_x,
-            ty_small,
-            &vis.detail_txt,
-            if is_sel { theme::INK_2 } else { theme::INK_4 },
-            false,
-            false,
-            0,
-        );
-
-        let mut col_left = right_edge - detail_col_w - 10.0;
-        if any_size_bar {
-            let bar_x0 = col_left - COMP_SIZE_BAR_W;
-            col_left = bar_x0 - 12.0;
-            if let Some(b) = vis.bytes
-                && b > 0
-                && max_bytes > 0
-            {
-                let frac = blaze_dust::bar_fraction(b, max_bytes);
-                let by0 = ry + row_h * 0.5 - 2.0;
-                let by1 = by0 + 4.0;
-                scene.overlay_round_rect(
-                    bar_x0,
-                    by0,
-                    bar_x0 + COMP_SIZE_BAR_W,
-                    by1,
-                    2.0,
-                    theme::BG_TRACK,
-                    0.0,
-                    [0.0; 4],
-                    0,
-                );
-                let fill_w = (COMP_SIZE_BAR_W * frac).max(3.0);
-                let fill_col = if !vis.bytes_done {
-                    theme::rgba(0xe5, 0xb5, 0x67, 0.50)
-                } else {
-                    match blaze_dust::size_tier(b) {
-                        blaze_dust::SizeTier::Bytes => theme::rgba(0x88, 0x90, 0x9e, 0.55),
-                        blaze_dust::SizeTier::KiB => theme::rgb(0x58, 0x9d, 0xf6),
-                        blaze_dust::SizeTier::MiB => theme::rgb(0xe5, 0xb5, 0x67),
-                        blaze_dust::SizeTier::GiB => theme::rgb(0xe8, 0x6a, 0x45),
-                    }
-                };
-                scene.overlay_round_rect(
-                    bar_x0,
-                    by0,
-                    bar_x0 + fill_w,
-                    by1,
-                    2.0,
-                    fill_col,
-                    0.0,
-                    [0.0; 4],
+        let label_x = ix + icon_s + 9.0;
+        let mut col_left;
+        if inline_doc_mode {
+            let doc_x = label_x + max_inline_label_w + 14.0;
+            let show_detail_tag = !vis.detail_txt.is_empty()
+                && !matches!(
+                    vis.detail_txt.as_str(),
+                    "git" | "bgit" | "blaze" | "flag" | "builtin" | "cmd" | "subcommand" | "custom"
+                )
+                && item.doc != vis.detail_txt;
+            let mut doc_right = right_edge;
+            if show_detail_tag {
+                let dw = m.measure(&vis.detail_txt, TextFace::UiSmall);
+                if doc_right - dw > doc_x + 48.0 {
+                    scene.overlay_ui_small(
+                        doc_right - dw,
+                        ty_small,
+                        &vis.detail_txt,
+                        if is_sel { theme::INK_2 } else { theme::INK_4 },
+                        false,
+                        false,
+                        0,
+                    );
+                    doc_right -= dw + 10.0;
+                }
+            }
+            if !item.doc.is_empty() && doc_x + 36.0 < doc_right {
+                let avg_cw = m.measure("n", TextFace::UiSmall).max(4.5);
+                let max_doc_ch = ((doc_right - doc_x) / avg_cw).floor().max(8.0) as usize;
+                let doc_txt = truncate_chars(&item.doc, max_doc_ch);
+                scene.overlay_ui_small(
+                    doc_x,
+                    ty_small,
+                    doc_txt,
+                    if is_sel { theme::INK_2 } else { theme::INK_3 },
+                    false,
+                    false,
                     0,
                 );
             }
-        }
+            col_left = doc_x - 10.0;
+        } else {
+            let detail_w = m.measure(&vis.detail_txt, TextFace::UiSmall);
+            let detail_x = right_edge - detail_w;
+            scene.overlay_ui_small(
+                detail_x,
+                ty_small,
+                &vis.detail_txt,
+                if is_sel { theme::INK_2 } else { theme::INK_4 },
+                false,
+                false,
+                0,
+            );
 
-        if any_age {
-            if let Some(age_s) = vis.age_txt.as_deref()
-                && let Some((heat_col, _)) = vis.heat
-            {
-                let aw = m.measure(age_s, TextFace::UiSmall);
-                scene.overlay_ui_small(col_left - aw, ty_small, age_s, heat_col, false, false, 0);
+            col_left = right_edge - detail_col_w - 10.0;
+            if any_size_bar {
+                let bar_x0 = col_left - COMP_SIZE_BAR_W;
+                col_left = bar_x0 - 12.0;
+                if let Some(b) = vis.bytes
+                    && b > 0
+                    && max_bytes > 0
+                {
+                    let frac = blaze_dust::bar_fraction(b, max_bytes);
+                    let by0 = ry + row_h * 0.5 - 2.0;
+                    let by1 = by0 + 4.0;
+                    scene.overlay_round_rect(
+                        bar_x0,
+                        by0,
+                        bar_x0 + COMP_SIZE_BAR_W,
+                        by1,
+                        2.0,
+                        theme::BG_TRACK,
+                        0.0,
+                        [0.0; 4],
+                        0,
+                    );
+                    let fill_w = (COMP_SIZE_BAR_W * frac).max(3.0);
+                    let fill_col = if !vis.bytes_done {
+                        theme::rgba(0xe5, 0xb5, 0x67, 0.50)
+                    } else {
+                        match blaze_dust::size_tier(b) {
+                            blaze_dust::SizeTier::Bytes => theme::rgba(0x88, 0x90, 0x9e, 0.55),
+                            blaze_dust::SizeTier::KiB => theme::rgb(0x58, 0x9d, 0xf6),
+                            blaze_dust::SizeTier::MiB => theme::rgb(0xe5, 0xb5, 0x67),
+                            blaze_dust::SizeTier::GiB => theme::rgb(0xe8, 0x6a, 0x45),
+                        }
+                    };
+                    scene.overlay_round_rect(
+                        bar_x0,
+                        by0,
+                        bar_x0 + fill_w,
+                        by1,
+                        2.0,
+                        fill_col,
+                        0.0,
+                        [0.0; 4],
+                        0,
+                    );
+                }
             }
-            col_left -= COMP_AGE_COL_W + 10.0;
+
+            if any_age {
+                if let Some(age_s) = vis.age_txt.as_deref()
+                    && let Some((heat_col, _)) = vis.heat
+                {
+                    let aw = m.measure(age_s, TextFace::UiSmall);
+                    scene.overlay_ui_small(col_left - aw, ty_small, age_s, heat_col, false, false, 0);
+                }
+                col_left -= COMP_AGE_COL_W + 10.0;
+            }
         }
 
         // Label with IntelliJ-style vivid blue matched-character highlighting (`#589DF6`)
         // blended with `ls`-matching recency heat warmth when recently modified.
-        let label_x = ix + icon_s + 9.0;
         let max_label_ch = ((col_left - label_x) / m.cw).floor().max(6.0) as usize;
         let label_txt = truncate_chars(&item.label, max_label_ch);
         let mut base_col = match item.kind {
@@ -7754,23 +7678,29 @@ fn layout_completion_popup(
         draw_overlay_scrollbar(scene, px1 - 8.0, list_y0 + 2.0, ry - 2.0, win_start, max_scroll, show, total);
     }
 
-    // Bottom Quick-Doc strip in SF Pro + scroll count indicator.
+    // Bottom status / Quick-Doc strip in SF Pro + scroll count indicator.
     let div_y = py1 - doc_h;
     scene.overlay_line(px0 + 1.0, div_y, px1 - 1.0, div_y, 1.0, theme::LINE, 0);
-    let doc_ty = div_y + (doc_h - m.ch) * 0.5;
+    let doc_ty = div_y + (doc_h - m.line_h(TextFace::UiSmall)) * 0.5;
     let hint = if has_sb {
-        format!("{}/{}  ·  ↑↓ scroll  tab", editor.completion_selected + 1, total)
+        format!("{}/{}  ·  tab complete  ·  ↑↓  ·  esc", editor.completion_selected + 1, total)
     } else {
-        "↑↓  tab  esc".to_owned()
+        "tab complete  ·  ↑↓  ·  esc".to_owned()
     };
     let hint_w = m.measure(&hint, TextFace::UiSmall);
     scene.overlay_ui_small(px1 - 12.0 - hint_w, doc_ty, &hint, theme::INK_4, false, false, 0);
 
-    if let Some(sel) = editor.completions.get(editor.completion_selected) {
-        let avg_cw = m.measure("n", TextFace::UiSmall).max(4.5);
-        let max_doc = ((px1 - 24.0 - hint_w - (px0 + 13.0)) / avg_cw).floor().max(8.0) as usize;
-        let doc_txt = truncate_chars(&sel.doc, max_doc);
-        scene.overlay_ui_small(px0 + 13.0, doc_ty, doc_txt, theme::INK_3, false, false, 0);
+    if !inline_doc_mode {
+        if let Some(sel) = editor.completions.get(editor.completion_selected) {
+            let avg_cw = m.measure("n", TextFace::UiSmall).max(4.5);
+            let max_doc = ((px1 - 24.0 - hint_w - (px0 + 13.0)) / avg_cw).floor().max(8.0) as usize;
+            let doc_txt = truncate_chars(&sel.doc, max_doc);
+            scene.overlay_ui_small(px0 + 13.0, doc_ty, doc_txt, theme::INK_3, false, false, 0);
+        }
+    } else if has_sb {
+        let rem = total.saturating_sub(show);
+        let more_txt = format!("+{rem} more");
+        scene.overlay_ui_small(px0 + 13.0, doc_ty, more_txt, theme::INK_4, false, false, 0);
     }
 }
 
