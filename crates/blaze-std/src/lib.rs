@@ -689,7 +689,7 @@ pub mod cbor {
     pub use blaze_cbor::*;
 }
 
-/// Strict TOML 1.0 parser, writer, and lossless format-preserving editor (`blaze-toml`).
+/// Strict TOML 1.1 parser, writer, and lossless format-preserving editor (`blaze-toml`).
 pub mod toml {
     pub use blaze_toml::*;
 }

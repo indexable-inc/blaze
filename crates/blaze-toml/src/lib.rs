@@ -1,4 +1,4 @@
-//! TOML 1.0 as one format, in place of `toml` and `toml_edit`.
+//! TOML 1.1 as one format, in place of `toml` and `toml_edit`.
 //!
 //! - [`Document::parse_in`]: text to a [`Document`] whose nodes keep every key's and value's
 //!   byte range (manifests need them: errors on the right line, and edits that keep the rest);
@@ -10,7 +10,9 @@
 //! - [`Edit`]: set a key, put a value into an array, or remove a key or a table, keeping every
 //!   other byte of the text.
 //!
-//! The reader is the whole of TOML 1.0: tables, arrays of tables and inline tables, dotted
+//! The reader is the whole of TOML 1.1, which Cargo reads (over 1.0: an inline table on several
+//! lines with comments and a trailing comma, `\e` and `\xHH`, a time without seconds; the
+//! writer keeps to what 1.0 reads too): tables, arrays of tables and inline tables, dotted
 //! keys, the four string forms, integers in every radix, floats with `inf` and `nan`, booleans,
 //! and the four datetime forms, checked for real days and times. Which later lines may add to
 //! a table follows TOML's rules ([`Origin`]); a breach names both places. Every bound on

@@ -305,7 +305,7 @@ pub const CRATE_CATALOG: &[CrateMapping] = &[
         target: "blaze_toml",
         extra_blaze_crate: Some("blaze-toml"),
         bstd_feature: BstdFeature::Core,
-        summary: "Strict zero-dep TOML 1.0 parser and lossless editor (`blaze-toml`).",
+        summary: "Strict zero-dep TOML 1.1 parser and lossless editor (`blaze-toml`).",
         path_rewrites: &[
             ("toml::Table", "blaze_toml::Document"),
             ("toml::Value", "blaze_data::Value"),

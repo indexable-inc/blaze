@@ -201,7 +201,7 @@ The plan is to do both.
 serde-untagged in blaze-manifest, resolve, audit, fmt, new, source and the scripts). Cargo
 compatibility needs:
 
-- a full TOML 1.0 reader;
+- a full TOML 1.1 reader (what Cargo reads);
 - an editor that keeps formatting, for `blaze new` and `--fix` edits to manifests;
 - semver versions and requirements, with cargo's exact matching rules, prerelease included;
 - the schema of Cargo.toml.

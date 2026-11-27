@@ -1,4 +1,4 @@
-//! The reader: TOML 1.0 text to a [`Document`], line by line, one pass, no backtracking.
+//! The reader: TOML 1.1 text to a [`Document`], line by line, one pass, no backtracking.
 
 use core::alloc::Allocator;
 
@@ -31,8 +31,8 @@ enum Began {
     Opened(u32),
 }
 
-/// Where the cursor stands in the innermost open array or inline table: at its start (or,
-/// in an array, after a comma), or after an element or entry.
+/// Where the cursor stands in the innermost open array or inline table: at its start (or
+/// after a comma), or after an element or entry.
 #[derive(Clone, Copy)]
 enum Within {
     Start,
@@ -56,7 +56,7 @@ impl Key {
 }
 
 impl<'t, A: Allocator + Clone> Document<'t, A> {
-    /// `text` read as TOML 1.0, within `limits`, the document's columns in `alloc`.
+    /// `text` read as TOML 1.1, within `limits`, the document's columns in `alloc`.
     pub fn parse_in(text: &'t str, limits: Limits, alloc: A) -> Result<Document<'t, A>, Error> {
         Document::parse_in_planted(text, limits, alloc, NoPlant)
     }
@@ -204,8 +204,8 @@ impl<'t, A: Allocator, P: Planted<TomlPlant>> Parser<'t, '_, A, P> {
         Err(self.unexpected(self.at, Expected::EndOfLine))
     }
 
-    /// Blanks, comments and newlines, as an array allows between its parts.
-    fn array_blanks(&mut self) -> Result<(), Error> {
+    /// Blanks, comments and newlines, as an array or an inline table allows between its parts.
+    fn blanks(&mut self) -> Result<(), Error> {
         loop {
             self.spaces();
             self.comment()?;
@@ -449,41 +449,25 @@ impl<'t, A: Allocator, P: Planted<TomlPlant>> Parser<'t, '_, A, P> {
         let mut at = Within::Start;
         loop {
             let array = self.doc.nodes.kinds()[widen(open)] == Kind::Array;
-            let close = match (array, at) {
-                (true, Within::Start) => {
-                    self.array_blanks()?;
-                    self.peek() == Some(b']')
-                }
-                (true, Within::After) => {
-                    self.array_blanks()?;
-                    match self.peek() {
-                        // A comma, then an element or (a trailing comma) the close.
-                        Some(b',') => {
-                            self.at += 1;
-                            at = Within::Start;
-                            continue;
-                        }
-                        Some(b']') => true,
-                        _ => return Err(self.unexpected(self.at, Expected::CommaOrEndArray)),
+            let (closer, expected) = match array {
+                true => (b']', Expected::CommaOrEndArray),
+                false => (b'}', Expected::CommaOrEndInline),
+            };
+            // One layout for both: TOML 1.1 gave an inline table the newlines, comments and
+            // trailing comma an array has, and Cargo reads 1.1.
+            self.blanks()?;
+            let close = match at {
+                Within::Start => self.peek() == Some(closer),
+                Within::After => match self.peek() {
+                    // A comma, then an element or entry or (a trailing comma) the close.
+                    Some(b',') => {
+                        self.at += 1;
+                        at = Within::Start;
+                        continue;
                     }
-                }
-                (false, Within::Start) => {
-                    self.spaces();
-                    self.peek() == Some(b'}')
-                }
-                (false, Within::After) => {
-                    self.spaces();
-                    match self.peek() {
-                        // A comma, then an entry: TOML 1.0 has no trailing comma here.
-                        Some(b',') => {
-                            self.at += 1;
-                            self.spaces();
-                            false
-                        }
-                        Some(b'}') => true,
-                        _ => return Err(self.unexpected(self.at, Expected::CommaOrEndInline)),
-                    }
-                }
+                    Some(b) if b == closer => true,
+                    _ => return Err(self.unexpected(self.at, expected)),
+                },
             };
             if close {
                 self.at += 1;
@@ -659,6 +643,9 @@ impl<'t, A: Allocator, P: Planted<TomlPlant>> Parser<'t, '_, A, P> {
             Some(b'n') => '\n',
             Some(b'f') => '\u{c}',
             Some(b'r') => '\r',
+            // TOML 1.1's two: escape, and a scalar of two hex digits.
+            Some(b'e') => '\u{1b}',
+            Some(b'x') => return self.unicode(2),
             Some(b'"') => '"',
             Some(b'\\') => '\\',
             Some(b'u') => return self.unicode(4),
@@ -816,19 +803,23 @@ impl<'t, A: Allocator, P: Planted<TomlPlant>> Parser<'t, '_, A, P> {
             let hour = narrow8(self.digits(2)?);
             self.expect(b':')?;
             let minute = narrow8(self.digits(2)?);
-            self.expect(b':')?;
-            let second = narrow8(self.digits(2)?);
+            let mut second = 0;
             let mut nanosecond = 0;
-            if self.peek() == Some(b'.') {
+            // TOML 1.1: the seconds, and the fraction only they take, may be left out.
+            if self.peek() == Some(b':') {
                 self.at += 1;
-                let digits = self.b[self.at..].iter().take_while(|b| b.is_ascii_digit()).count();
-                if digits == 0 {
-                    return Err(self.unexpected(self.at, Expected::Digit));
+                second = narrow8(self.digits(2)?);
+                if self.peek() == Some(b'.') {
+                    self.at += 1;
+                    let digits = self.b[self.at..].iter().take_while(|b| b.is_ascii_digit()).count();
+                    if digits == 0 {
+                        return Err(self.unexpected(self.at, Expected::Digit));
+                    }
+                    for (i, &d) in self.b[self.at..self.at + digits].iter().enumerate().take(9) {
+                        nanosecond += u32::from(d - b'0') * 10u32.pow(8 - narrow(i));
+                    }
+                    self.at += digits;
                 }
-                for (i, &d) in self.b[self.at..self.at + digits].iter().enumerate().take(9) {
-                    nanosecond += u32::from(d - b'0') * 10u32.pow(8 - narrow(i));
-                }
-                self.at += digits;
             }
             if hour > 23 || minute > 59 || second > 60 {
                 return Err(no_such(self));

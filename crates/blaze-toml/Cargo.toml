@@ -1,6 +1,6 @@
 [package]
 name = "blaze-toml"
-description = "TOML 1.0 as a format: a reader into a document that keeps every key's and value's byte range in columns (tables, arrays of tables, inline tables, dotted keys, every string form, integers in every radix, floats with inf and nan, typed dates and times), lowered to blaze-data's `Value` on demand; a writer of a `Value` as a document or an inline value; and an editor that sets a key or adds to an array keeping every other byte; typed errors with byte offset and line; bounded; `no_std`, no `alloc`"
+description = "TOML 1.1 as a format: a reader into a document that keeps every key's and value's byte range in columns (tables, arrays of tables, inline tables, dotted keys, every string form, integers in every radix, floats with inf and nan, typed dates and times), lowered to blaze-data's `Value` on demand; a writer of a `Value` as a document or an inline value; and an editor that sets a key or adds to an array keeping every other byte; typed errors with byte offset and line; bounded; `no_std`, no `alloc`"
 publish = false
 
 version.workspace = true
