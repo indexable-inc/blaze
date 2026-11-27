@@ -185,6 +185,8 @@ pub struct Relay<'a, J, E> {
     building: SVec<'a, Option<(CodeKey, bool)>>,
     jobs: VecDeque<(Worker, CodeKey, J), SharedAlloc<'a>>,
     entries: SMap<'a, CodeKey, Entry<'a, E>>,
+    /// FIFO order of keyed `bytes` entries in `entries`, for evicting idle entries under `most_bytes`.
+    kept_order: VecDeque<CodeKey, SharedAlloc<'a>>,
     held: usize,
     unkeyed: u64,
     actions: SVec<'a, Action>,
@@ -204,7 +206,7 @@ impl<'a, J, E> Relay<'a, J, E> {
         let mut building = SVec::with_capacity_in(opts.workers, a);
         building.resize(opts.workers, None);
         let mut relay = Relay {
-            opts, pool, askers, due: SSet::new_in(a), orders: SMap::new_in(a), building, jobs: VecDeque::new_in(a), entries: SMap::new_in(a), held: 0, unkeyed: 0,
+            opts, pool, askers, due: SSet::new_in(a), orders: SMap::new_in(a), building, jobs: VecDeque::new_in(a), entries: SMap::new_in(a), kept_order: VecDeque::new_in(a), held: 0, unkeyed: 0,
             actions: SVec::new_in(a),
             #[cfg(test)]
             plant: Plant::None,
@@ -278,10 +280,15 @@ impl<'a, J, E> Relay<'a, J, E> {
         // An unkeyed make whose one asker ended is answered to no one: nothing is kept.
         if !unkeyed || self.asked(key) {
             let len = bytes.len();
-            if self.held.saturating_add(len) > self.opts.most_bytes {
-                return Err(RelayError::Full { key, bytes: len, most: self.opts.most_bytes });
+            while self.held.saturating_add(len) > self.opts.most_bytes {
+                if !self.evict_one_kept() {
+                    return Err(RelayError::Full { key, bytes: len, most: self.opts.most_bytes });
+                }
             }
             self.held += len;
+            if !unkeyed {
+                self.kept_order.push_back(key);
+            }
             self.entries.insert(key, Entry {
                 bytes: Some(bytes), refusal: None, unkeyed,
                 #[cfg(test)]
@@ -382,6 +389,40 @@ impl<'a, J, E> Relay<'a, J, E> {
     /// Whether a live child's ask of `key` is open (an unkeyed key has one asker at most).
     fn asked(&self, key: CodeKey) -> bool {
         self.askers.iter().any(|asker| asker.end == End::Live && asker.asked.is_some_and(|asked| asked.key == key))
+    }
+
+    /// Whether any live child has an open ask or an untaken answer for `key`.
+    fn pinned(&self, key: CodeKey) -> bool {
+        self.askers.iter().any(|asker| {
+            asker.end == End::Live
+                && (asker.asked.is_some_and(|asked| asked.key == key)
+                    || matches!(asker.got, Some(Got::Made(k) | Got::Refused(k)) if k == key))
+        })
+    }
+
+    /// Evicts the oldest idle kept `bytes` entry so `self.held` stays within `self.opts.most_bytes`.
+    fn evict_one_kept(&mut self) -> bool {
+        let remaining = self.kept_order.len();
+        for _ in 0..remaining {
+            let Some(evict_key) = self.kept_order.pop_front() else {
+                return false;
+            };
+            let Some(entry) = self.entries.get(&evict_key) else {
+                continue;
+            };
+            if entry.unkeyed || entry.bytes.is_none() {
+                continue;
+            }
+            if self.pinned(evict_key) || !self.pool.evict_ready(evict_key) {
+                self.kept_order.push_back(evict_key);
+                continue;
+            }
+            if let Some(removed) = self.entries.remove(&evict_key) {
+                self.held -= removed.bytes.as_ref().map_or(0, |b| b.len());
+                return true;
+            }
+        }
+        false
     }
 
     fn expire(&mut self, now: Time) -> Result<(), RelayError> {
