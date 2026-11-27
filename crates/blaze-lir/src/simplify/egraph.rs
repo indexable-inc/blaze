@@ -5992,9 +5992,11 @@ pub fn sota_optimize_fixpoint<A: Allocator + Copy>(
         rounds_run += 1;
         let step = aegraph_optimize_inner(cur.view(), budget.hardware_fma, alloc)?;
         let (sr_func, sr_count) = materialize_strength_reduction(step.func.view(), alloc)?;
-        let (licm_func, hoisted_count) = hoist_loop_invariants(sr_func.view(), alloc)?;
-        let prop = super::propagate(licm_func.view(), alloc)?;
-        let cleaned = dead(prop.view(), alloc)?;
+        let (licm_func, hoisted_count) = if step.stats.loops.natural_loops > 0 {
+            hoist_loop_invariants(sr_func.view(), alloc)?
+        } else {
+            (sr_func, 0)
+        };
 
         total_stats.gvn_hits += step.stats.gvn_hits;
         total_stats.identities_folded += step.stats.identities_folded;
@@ -6004,12 +6006,21 @@ pub fn sota_optimize_fixpoint<A: Allocator + Copy>(
         total_stats.loops = step.stats.loops;
         total_stats.loops.licm_candidates = prev_hoisted + hoisted_count;
 
-        let changed = cleaned.ops.len() != cur.ops.len()
-            || step.stats.gvn_hits > 0
+        let mid_changed = step.stats.gvn_hits > 0
             || step.stats.identities_folded > 0
             || step.stats.constants_folded > 0
             || sr_count > 0
             || hoisted_count > 0;
+        // On round 2+, `propagate` + `dead` already ran at the end of the previous round; if
+        // aegraph, strength reduction, and LICM made zero changes, the fixed point is reached.
+        if rounds_run > 1 && !mid_changed && licm_func.ops.len() == cur.ops.len() {
+            break;
+        }
+
+        let prop = super::propagate(licm_func.view(), alloc)?;
+        let cleaned = dead(prop.view(), alloc)?;
+
+        let changed = mid_changed || cleaned.ops.len() != cur.ops.len();
         cur = cleaned;
         if !changed {
             break;

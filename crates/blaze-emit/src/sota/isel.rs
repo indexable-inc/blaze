@@ -3788,6 +3788,36 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
     preserve_all_cold: bool,
     alloc: Alloc<'a>,
 ) -> Result<(Emitted<'a>, CallClobbers), TierError> {
+    emit_sota_a64_with_abi_profile(
+        view,
+        names,
+        call_mode,
+        features,
+        is_macos,
+        call_clobbers,
+        scratch_order,
+        preserve_all_cold,
+        false,
+        alloc,
+    )
+}
+
+/// Zero-ABI & IPRA-enabled SOTA AArch64 emitter with explicit `fast_mode`: when `true`
+/// ([`super::EmitProfile::Fast`]), uses `O(V + E)` RPO block layout (skipping Ext-TSP) and
+/// `O(N log K)` linear-scan register allocation (skipping exact-CFG interference bitmatrices).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_sota_a64_with_abi_profile<'a>(
+    view: View<'_>,
+    names: &dyn Names,
+    call_mode: CallMode,
+    features: u64,
+    is_macos: bool,
+    call_clobbers: impl Fn(usize) -> CallClobbers,
+    scratch_order: Option<&ScratchOrder>,
+    preserve_all_cold: bool,
+    fast_mode: bool,
+    alloc: Alloc<'a>,
+) -> Result<(Emitted<'a>, CallClobbers), TierError> {
     let has_lse = features & blaze_tier::Machine::LSE != 0;
     let has_cssc = features & blaze_tier::Machine::CSSC != 0;
     let has_sha3 = features & blaze_tier::Machine::SHA3 != 0;
@@ -3822,7 +3852,11 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
     } else {
         detect_tail_calls(&view, call_mode == CallMode::DirectBl, os, alloc)
     };
-    let hot_layout = super::layout::compute_block_layout(&view, alloc);
+    let hot_layout = if fast_mode {
+        super::layout::compute_fast_block_layout(&view, alloc)
+    } else {
+        super::layout::compute_block_layout(&view, alloc)
+    };
     let block_order = hot_layout.order.as_slice();
     let block_loop_depth = hot_layout.loop_depth.as_slice();
     let block_is_loop_hdr = hot_layout.is_loop_hdr.as_slice();
@@ -8774,7 +8808,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
     }
 
     // 3. IPRA-aware Greedy Priority-Weighted Graph-Coloring Regalloc + True Constant Rematerialization!
-    let mut reg_alloc = regalloc::allocate_with_ipra_and_order(
+    let mut reg_alloc = regalloc::allocate_with_ipra_and_order_profile(
         &view,
         &regalloc_skip,
         &alias_of,
@@ -8783,7 +8817,8 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
         os,
         call_clobbers,
         scratch_order,
-        Some(&hot_layout),
+        if fast_mode { None } else { Some(&hot_layout) },
+        fast_mode,
         alloc,
     )
     .map_err(|_| TierError::Refused {
@@ -17312,9 +17347,12 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
     }
 
     // 4b. Emit deferred cold edge-move stubs at the tail of the function (out of hot I-cache lines),
-    //     deduplicating identical `(target_block, edge_args)` stubs across both pre-block and tail batches.
+    //     deduplicating identical `(target_block, edge_args)` stubs within a bounded scan window
+    //     (Rule 18: prevents O(S^2) scans on mega-functions with thousands of cold stubs).
+    const MAX_COLD_STUB_DEDUP_SCAN: usize = 64;
     for &stub in &cold_stubs {
-        if let Some(&(_, existing_w)) = emitted_cold_stubs
+        let dedup_start = emitted_cold_stubs.len().saturating_sub(MAX_COLD_STUB_DEDUP_SCAN);
+        if let Some(&(_, existing_w)) = emitted_cold_stubs[dedup_start..]
             .iter()
             .find(|&&(prev, _)| same_stub_edge(&prev, &stub))
             && let Ok(patched) = encode_branch_patch(stub.branch_kind, word_delta(existing_w, stub.branch_word_idx))
