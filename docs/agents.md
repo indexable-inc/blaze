@@ -1,6 +1,6 @@
 ---
 status: current
-summary: blaze for coding agents: `blaze agents install|status|remove` wires Claude Code and Codex to blaze (a hook after each edit that says the new errors and warnings, a hook before each shell command that steers cargo and rustc to blaze, and a block of instructions); `blaze agents hook` is that hook; `blaze diagnostics --since` is the request under it, for any agent; `blaze doctor` says whether all of it is installed and current.
+summary: "blaze for coding agents: `blaze agents install|status|remove` wires Claude Code and Codex to blaze (a hook after each edit that says the new errors and warnings, a hook before each shell command that steers cargo and rustc to blaze, and a block of instructions); `blaze agents hook` is that hook; `blaze diagnostics --since` is the request under it, for any agent; `blaze doctor` says whether all of it is installed and current."
 ---
 # blaze for coding agents
 

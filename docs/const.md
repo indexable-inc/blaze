@@ -1,6 +1,6 @@
 ---
 status: current
-summary: Const evaluation: blaze's own interpreter for constants and const fns, and what it covers.
+summary: "Const evaluation: blaze's own interpreter for constants and const fns, and what it covers."
 ---
 # Const
 

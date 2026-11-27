@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Performance history of the programs blaze builds (lane perf-history). Each profiled run is one row set in the profile history (the run with its exact tree, blaze, binary and host; per function self and total samples, by path and by code identity), and `blaze perf diff <run> [<base>]` gives per function the change in time with a noise bound and the cause class read from the identities (its code changed, built with other settings, a callee changed, or same code and callees). Built: the code map each link writes, the rows and their Parquet round trip, the identity join, the diff (text and JSON) and `blaze perf record|runs|diff`. Designed: the `--prof` switch that records on its own, call and instruction counts.
+summary: "Performance history of the programs blaze builds (lane perf-history). Each profiled run is one row set in the profile history (the run with its exact tree, blaze, binary and host; per function self and total samples, by path and by code identity), and `blaze perf diff <run> [<base>]` gives per function the change in time with a noise bound and the cause class read from the identities (its code changed, built with other settings, a callee changed, or same code and callees). Built: the code map each link writes, the rows and their Parquet round trip, the identity join, the diff (text and JSON) and `blaze perf record|runs|diff`. Designed: the `--prof` switch that records on its own, call and instruction counts."
 date: 2026-11-02
 ---
 # Performance history: compare runs and see what changed

@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Why a stage5 self-build's daemon reached 75.7 GiB against a 47 GiB limit on the Mac (freed memory pinned by long-lived blocks on the same heap, query storage that only grows, two measures of memory), and the fix: an owner per lifetime (frames reset per item, outputs as records in the store's own vmcache-style buffer pool), footprint as the one measure, telemetry first.
+summary: "Why a stage5 self-build's daemon reached 75.7 GiB against a 47 GiB limit on the Mac (freed memory pinned by long-lived blocks on the same heap, query storage that only grows, two measures of memory), and the fix: an owner per lifetime (frames reset per item, outputs as records in the store's own vmcache-style buffer pool), footprint as the one measure, telemetry first."
 date: 2026-11-09
 ---
 # Memory: what the stage5 self-build showed, and the fixes

@@ -1,7 +1,7 @@
 ---
 status: superseded
 superseded_by: end-state.md#d159-one-body-one-store-one-answer-form-code-made-ahead
-summary: (crates/blaze-vfs deleted 2026-11-20) blaze v2 vfs lane's design: the Merkle tree, heads and views, rebase, the journal with group commit, recovery and compaction, and the disk watcher as one input of transactions.
+summary: "(crates/blaze-vfs deleted 2026-11-20) blaze v2 vfs lane's design: the Merkle tree, heads and views, rebase, the journal with group commit, recovery and compaction, and the disk watcher as one input of transactions."
 date: 2026-10-29
 ---
 # blaze v2: the vfs lane's design

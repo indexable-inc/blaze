@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: `#[blaze::bits]`: Zig-style bit-packed structs with ordinary field syntax. Layout is the backing integer's; a field's width comes from its type; field places stay places through borrow checking and are lowered to integer ops by one MIR pass at the end of the runtime passes, so neither the interpreter nor the code generator sees a new projection.
+summary: "`#[blaze::bits]`: Zig-style bit-packed structs with ordinary field syntax. Layout is the backing integer's; a field's width comes from its type; field places stay places through borrow checking and are lowered to integer ops by one MIR pass at the end of the runtime passes, so neither the interpreter nor the code generator sees a new projection."
 date: 2026-11-02
 ---
 # Bit-packed structs (`#[blaze::bits]`)

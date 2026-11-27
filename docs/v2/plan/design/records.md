@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Records and named arguments (edition change 4, ledger row E5). Under `#![blaze::records]`, `{ a: T, b: U }` is a structural type (core's `Record` over the tuple of its fields sorted by name), `{ a: x, b }` its value and `{ a, b: p }` its pattern; a record parameter whose fields have defaults is how arguments are named and left out. What the edition page left open is decided here.
+summary: "Records and named arguments (edition change 4, ledger row E5). Under `#![blaze::records]`, `{ a: T, b: U }` is a structural type (core's `Record` over the tuple of its fields sorted by name), `{ a: x, b }` its value and `{ a, b: p }` its pattern; a record parameter whose fields have defaults is how arguments are named and left out. What the edition page left open is decided here."
 date: 2026-11-10
 ---
 # Records and named arguments

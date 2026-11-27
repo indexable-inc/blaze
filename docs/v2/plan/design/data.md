@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze v2: data-oriented layout and compression in every stage.
+summary: "blaze v2: data-oriented layout and compression in every stage."
 date: 2026-10-29
 ---
 # Data-oriented everywhere

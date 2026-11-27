@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze's lints at item grain (crates/blaze-lint): one pass over an item's own tokens, findings as records keyed by item hash, rule set and scope, levels and positions at print time, fixes applied by a pure function
+summary: "blaze's lints at item grain (crates/blaze-lint): one pass over an item's own tokens, findings as records keyed by item hash, rule set and scope, levels and positions at print time, fixes applied by a pure function"
 date: 2026-11-16
 ---
 # Lints at item grain

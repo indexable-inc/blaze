@@ -1,6 +1,6 @@
 ---
 status: current
-summary: How to build, test and change blaze: AI use, where new code goes, rules for code, working in parallel, landing.
+summary: "How to build, test and change blaze: AI use, where new code goes, rules for code, working in parallel, landing."
 ---
 # Contributing
 

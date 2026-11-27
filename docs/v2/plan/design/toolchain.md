@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: How blaze gives every crate its standard libraries with nothing in the manifest. The toolchain is records: one source pack per crate (core, alloc, std and what they are built from, bstd and the crates beneath it) in blaze-fetch's pack form, listed by one manifest record whose digest the binary is built with and the units record's key holds. An installed blaze finds them on a per-user read-only shelf, verified when opened; the implicit dependencies are one rule in blaze-unit-graph; a blaze-edition manifest that still names bstd gets a finding with its fix.
+summary: "How blaze gives every crate its standard libraries with nothing in the manifest. The toolchain is records: one source pack per crate (core, alloc, std and what they are built from, bstd and the crates beneath it) in blaze-fetch's pack form, listed by one manifest record whose digest the binary is built with and the units record's key holds. An installed blaze finds them on a per-user read-only shelf, verified when opened; the implicit dependencies are one rule in blaze-unit-graph; a blaze-edition manifest that still names bstd gets a finding with its fix."
 date: 2026-11-16
 ---
 # The toolchain as records

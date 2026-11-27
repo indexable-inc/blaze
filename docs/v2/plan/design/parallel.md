@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: How one command uses every core and holds little memory. The end state (architect, 2026-11-16) first: one work-stealing thread pool, item-grain tasks that never block (a missing record parks the task on a per-key claim and it is re-entered), no global interner, a frame per worker reset per item, records as the only thing that outlives a task, footprint as the one measure, a refused allocation as a typed failure of one job, determinism by sorting at record boundaries; then the gap against today's code and the pieces in build order. Below them, the 2026-11-15 audit of the older layer, kept as a record.
+summary: "How one command uses every core and holds little memory. The end state (architect, 2026-11-16) first: one work-stealing thread pool, item-grain tasks that never block (a missing record parks the task on a per-key claim and it is re-entered), no global interner, a frame per worker reset per item, records as the only thing that outlives a task, footprint as the one measure, a refused allocation as a typed failure of one job, determinism by sorting at record boundaries; then the gap against today's code and the pieces in build order. Below them, the 2026-11-15 audit of the older layer, kept as a record."
 date: 2026-11-17
 ---
 # Parallelism on 128 cores, and on a Mac

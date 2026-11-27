@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze v2 codegen lane's design: per-function units, instance keys, templates (the back-end memo up to callee renaming), code dedupe, folding by constants, settings and tiering, release summaries and imports.
+summary: "blaze v2 codegen lane's design: per-function units, instance keys, templates (the back-end memo up to callee renaming), code dedupe, folding by constants, settings and tiering, release summaries and imports."
 date: 2026-10-29
 ---
 # blaze v2: the codegen lane's design

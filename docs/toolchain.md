@@ -1,6 +1,6 @@
 ---
 status: current
-summary: blaze's own pinned nightly: what it is, how it is fetched and checked, and how its pin moves.
+summary: "blaze's own pinned nightly: what it is, how it is fetched and checked, and how its pin moves."
 ---
 # blaze's own toolchain
 

@@ -1,7 +1,7 @@
 ---
 status: superseded
 superseded_by: end-state.md#d159-one-body-one-store-one-answer-form-code-made-ahead
-summary: (the pack store, deleted from blaze-cas 2026-11-20; the store is the plain store, crates/blaze-cas/src/plain.rs) blaze v2: the store.
+summary: "(the pack store, deleted from blaze-cas 2026-11-20; the store is the plain store, crates/blaze-cas/src/plain.rs) blaze v2: the store."
 date: 2026-11-01
 ---
 # blaze v2: store

@@ -1,6 +1,6 @@
 ---
 status: current
-summary: Releases: the release pipeline was deleted on 2026-11-15; what is left is the R2 layout, the smoke corpus and installing a release.
+summary: "Releases: the release pipeline was deleted on 2026-11-15; what is left is the R2 layout, the smoke corpus and installing a release."
 ---
 # Releases
 

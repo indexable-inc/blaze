@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze v2: what rust-analyzer's front end got wrong for a compiler, and what v2 does instead: incremental name resolution, indexed impls, one token format, signature-only dependencies, mapped files, no IDE-only work.
+summary: "blaze v2: what rust-analyzer's front end got wrong for a compiler, and what v2 does instead: incremental name resolution, indexed impls, one token format, signature-only dependencies, mapped files, no IDE-only work."
 date: 2026-10-29
 ---
 # The front end: rust-analyzer's design, fixed

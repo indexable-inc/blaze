@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze v2's kernel: registered pure compute steps from MIR down, each value kept in the store under its identity, its step's code and flags, with the narrow reads it made and their hashes, verified on lookup; codegen's dev templates are its first entries.
+summary: "blaze v2's kernel: registered pure compute steps from MIR down, each value kept in the store under its identity, its step's code and flags, with the narrow reads it made and their hashes, verified on lookup; codegen's dev templates are its first entries."
 date: 2026-11-02
 ---
 # The kernel: verifying traces from MIR down

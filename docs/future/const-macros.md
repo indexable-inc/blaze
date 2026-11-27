@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Const macros: proc macros written inline as const fn over flat syntax trees, run by the const evaluator. Experimental.
+summary: "Const macros: proc macros written inline as const fn over flat syntax trees, run by the const evaluator. Experimental."
 date: 2026-11-12
 ---
 # Const macros: proc macros written inline as `const fn`

@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: lane may-suspend (2026-10-31): blaze rejects a value held across a call that may park a fiber when that value must not cross threads (`!Send`, or `#[must_not_suspend]`); may-suspend is inferred from the monomorphized call graph from corosensei's `Yielder::suspend`, written only as `#[blaze::may_suspend]` on a trait method or fn-pointer field. Crate `hir-ty-suspend`; replaces sched phase 2's hand audit.
+summary: "lane may-suspend (2026-10-31): blaze rejects a value held across a call that may park a fiber when that value must not cross threads (`!Send`, or `#[must_not_suspend]`); may-suspend is inferred from the monomorphized call graph from corosensei's `Yielder::suspend`, written only as `#[blaze::may_suspend]` on a trait method or fn-pointer field. Crate `hir-ty-suspend`; replaces sched phase 2's hand audit."
 date: 2026-10-31
 ---
 # may-suspend: values held across a fiber switch

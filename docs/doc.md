@@ -1,6 +1,6 @@
 ---
 status: record
-summary: blaze doc as blaze v1 did it (the engine's doc.rs, over a workspace loaded into rust-analyzer): HTML documentation written from the front end's HIR, with no rustdoc. v2 has no `blaze doc` yet.
+summary: "blaze doc as blaze v1 did it (the engine's doc.rs, over a workspace loaded into rust-analyzer): HTML documentation written from the front end's HIR, with no rustdoc. v2 has no `blaze doc` yet."
 date: 2026-10-30
 ---
 # `blaze doc`

@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze-malloc, blaze's general-purpose allocator for memory not in a frame and for bstd programs: a heap per thread with no atomics on its own blocks, 81 size classes in header-free spans of 2 MiB segments, remote frees by a lock-free queue per heap, large blocks as their own growable mappings, ended threads' heaps adopted. Built and measured; not yet anyone's global allocator.
+summary: "blaze-malloc, blaze's general-purpose allocator for memory not in a frame and for bstd programs: a heap per thread with no atomics on its own blocks, 81 size classes in header-free spans of 2 MiB segments, remote frees by a lock-free queue per heap, large blocks as their own growable mappings, ended threads' heaps adopted. Built and measured; not yet anyone's global allocator."
 date: 2026-11-16
 ---
 # blaze-malloc

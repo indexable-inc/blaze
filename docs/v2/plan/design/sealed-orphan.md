@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Relaxing the orphan rule soundly as an opt-in blaze extension: `#[blaze::sealed]` traits whose crate may write `impl<T: Sealed> ForeignTrait for T` (built, with its checks in `hir-ty-coherence`), and the ranked alternatives, including a whole-workspace coherence domain (designed, not built).
+summary: "Relaxing the orphan rule soundly as an opt-in blaze extension: `#[blaze::sealed]` traits whose crate may write `impl<T: Sealed> ForeignTrait for T` (built, with its checks in `hir-ty-coherence`), and the ranked alternatives, including a whole-workspace coherence domain (designed, not built)."
 date: 2026-11-02
 ---
 # Relaxing the orphan rule, soundly (`#[blaze::sealed]`)

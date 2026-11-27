@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze v2: how threads share data: reads never lock or write shared memory, values are immutable once published, task boundaries reclaim memory, no build lock.
+summary: "blaze v2: how threads share data: reads never lock or write shared memory, values are immutable once published, task boundaries reclaim memory, no build lock."
 date: 2026-10-29
 ---
 # Concurrency: no lock on the hot path

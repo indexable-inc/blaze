@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze v2 manages memory like a game engine: allocators by lifetime (frame, request, view, image), virtual-memory-reserved arenas with stable addresses, pools, generational handles, per-subsystem budgets, and zero general-purpose allocations in the warm loop.
+summary: "blaze v2 manages memory like a game engine: allocators by lifetime (frame, request, view, image), virtual-memory-reserved arenas with stable addresses, pools, generational handles, per-subsystem budgets, and zero general-purpose allocations in the warm loop."
 date: 2026-10-29
 ---
 # Memory, the way a game engine does it

@@ -1,6 +1,6 @@
 ---
 status: record
-summary: #[blaze::cache]: results of pure functions kept across runs, keyed by the code they reach. Its library crates were deleted on 2026-10-30.
+summary: "#[blaze::cache]: results of pure functions kept across runs, keyed by the code they reach. Its library crates were deleted on 2026-10-30."
 date: 2026-10-30
 ---
 # Cached functions

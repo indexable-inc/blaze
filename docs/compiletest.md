@@ -1,6 +1,6 @@
 ---
 status: current
-summary: rustc's own test suites under blaze: which suites matter and why, and what of a test is held; the runner was deleted on 2026-11-15.
+summary: "rustc's own test suites under blaze: which suites matter and why, and what of a test is held; the runner was deleted on 2026-11-15."
 ---
 # rustc's tests under blaze
 

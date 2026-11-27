@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: How the parked type checker (hir-ty and the hir-ty-* crates) is reconnected to the new item layer without touching its call sites: the names it asks base-db, hir-expand and hir-def for, counted; one task's database over the records; ids interned from item keys; a missing record as a typed stop that names its key; a resolver and narrow def-map accessors over per-module scopes.
+summary: "How the parked type checker (hir-ty and the hir-ty-* crates) is reconnected to the new item layer without touching its call sites: the names it asks base-db, hir-expand and hir-def for, counted; one task's database over the records; ids interned from item keys; a missing record as a typed stop that names its key; a resolver and narrow def-map accessors over per-module scopes."
 date: 2026-11-15
 ---
 # Reconnecting the type checker
