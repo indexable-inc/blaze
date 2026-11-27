@@ -392,6 +392,7 @@ impl<'s> ScriptQueue<'s> {
             lock: side.lock.text,
             checkout: Some(root),
             members: members.into_bump_slice(),
+            producers: handles.producers,
             heap: handles.env.heap,
         };
         self.compile_inputs = Some(built);

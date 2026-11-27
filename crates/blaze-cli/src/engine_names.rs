@@ -283,6 +283,7 @@ pub(crate) struct Handles<'h, 'f> {
     pub(crate) lock: Option<&'f blaze_manifest::lock::Lock<'static>>,
     pub(crate) members: Option<&'h [crate::graph::CheckoutDir]>,
     pub(crate) env: &'h FetchEnv<'h>,
+    pub(crate) producers: blaze_ids::producer::Producers,
     pub(crate) side: Option<&'h crate::proc_runner::MacroSide<'h, 'h, 'h>>,
     pub(crate) outlined: &'h [Outlined<'h>],
     pub(crate) workers: core::num::NonZeroU32,

@@ -278,15 +278,21 @@ pub(crate) fn run<'b>(
                         return Ok(Did::Done(made));
                     }
                     Err(why) => {
+                        let words = bstd::mem::format_in!(
+                            held,
+                            "{package} {version}: wasm64 proc-macro self-compilation failed (key {key}): {why}"
+                        );
+                        if why.is_hole() {
+                            return Ok(Did::Hole(
+                                refused("the wasm64 sysroot/module store could not be read"),
+                                held_str(words.as_str(), held),
+                            ));
+                        }
                         let what = if why.is_tier2() {
                             "proc-macro requires Tier-2 native/host features unsupported in wasm64"
                         } else {
                             "proc-macro wasm64 self-compilation failed"
                         };
-                        let words = bstd::mem::format_in!(
-                            held,
-                            "{package} {version}: wasm64 proc-macro self-compilation failed (key {key}): {why}"
-                        );
                         return Ok(Did::FailedSaying(
                             refused(what),
                             held_str(words.as_str(), held),

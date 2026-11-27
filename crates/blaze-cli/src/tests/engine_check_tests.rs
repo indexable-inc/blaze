@@ -29,6 +29,7 @@ pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'st
     let producers = blaze_ids::producer::Producers::for_tests(b"test");
     engine_check::Opts {
         tools: engine_store::tools(&home::tools(&producers, lints::Lints::NONE.rules)),
+        producers,
         workers: core::num::NonZeroU32::new(workers).expect("a worker"),
         toolchain: shelf(io),
         heap: blaze_own::testing::heap(),

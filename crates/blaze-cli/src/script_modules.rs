@@ -160,15 +160,21 @@ pub(crate) fn run<'b>(
                     return Ok(Did::Done(made));
                 }
                 Err(why) => {
+                    let words = bstd::mem::format_in!(
+                        held,
+                        "the build script of {package} {version}: wasm64 self-compilation failed: {why}"
+                    );
+                    if why.is_hole() {
+                        return Ok(Did::Hole(
+                            refused("the wasm64 sysroot/module store could not be read"),
+                            held_str(words.as_str(), held),
+                        ));
+                    }
                     let what = if why.is_tier2() {
                         "build-script requires Tier-2 native/host features unsupported in wasm64"
                     } else {
                         "build-script wasm64 self-compilation failed"
                     };
-                    let words = bstd::mem::format_in!(
-                        held,
-                        "the build script of {package} {version}: wasm64 self-compilation failed: {why}"
-                    );
                     return Ok(Did::FailedSaying(
                         refused(what),
                         held_str(words.as_str(), held),

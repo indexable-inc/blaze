@@ -74,7 +74,28 @@ const COMPILE_FRAME_RESERVE: usize = 2 << 30;
 /// Atomic counter for unique staging directory names during atomic module publication.
 static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Single-flight guard used ONLY when `<store>/wasm64-sysroot-v2/<tc_id>/` has missing sysroot
+/// Hash domain for the `<store>/wasm64-sysroot-v2/<dir>/` cache directory name (Rule 21, Rule 52):
+/// covers the pinned toolchain id and every producer row whose serialized record format or
+/// resolution semantics live inside that directory (`exports.bin`, `inner.bin`, `read.bin`,
+/// `names.bin`, `items.bin`, `expansions.bin`), so any compiler or record-format upgrade misses
+/// cleanly instead of reading stale bytes (`NotThisRecord`).
+const WASM64_SYSROOT_DIR_DOMAIN: &str = "blaze-cli wasm64 sysroot dir 1";
+
+/// Computes the content-addressed directory name under `<store>/wasm64-sysroot-v2/` covering
+/// `tc_id` and all producer rows that produce or decode sysroot records stored there.
+fn wasm64_sysroot_dir_name(tc_id: ToolchainId, producers: &Producers) -> std::string::String {
+    let mut h = blaze_ids::Hasher::new(WASM64_SYSROOT_DIR_DOMAIN);
+    h.part(&tc_id.0);
+    h.id(producers.get::<blaze_ids::producer::Names>().id());
+    h.id(producers.get::<blaze_ids::producer::Expander>().id());
+    h.id(producers.get::<blaze_ids::producer::Lowering>().id());
+    h.id(producers.get::<blaze_ids::producer::CodeBuilder>().id());
+    h.id(producers.get::<blaze_ids::producer::Whole>().id());
+    let key = h.finish();
+    std::format!("{tc_id}-{}", hex_bytes(&key.0))
+}
+
+/// Single-flight guard used ONLY when `<store>/wasm64-sysroot-v2/<dir>/` has missing sysroot
 /// crate records on a completely cold store, preventing N parallel build-script/proc-macro
 /// workers from simultaneously re-parsing `core`/`alloc`/`std` (~3.5x peak RSS reduction).
 static SYSROOT_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -93,6 +114,9 @@ pub(crate) struct CompileInputs<'a> {
     pub checkout: Option<&'a blaze_proc_macro::script_sandbox::RealRoot>,
     /// Workspace members and external path packages by lock id.
     pub members: &'a [(LockId, &'a str, blaze_world::PathKind)],
+    /// Running binary's producer identities (Rule 21, Rule 52): keys `<store>/wasm64-sysroot-v2/`
+    /// and the internal LIR/wasm64 builder.
+    pub producers: Producers,
     /// Process heap for `Maker` tables (reclaimed when `Maker` drops).
     pub heap: &'static blaze_own::Heap,
 }
@@ -555,9 +579,8 @@ fn tc_edition(written: &str) -> Result<Edition, std::string::String> {
     }
 }
 
-fn wasm64_builder(id: ToolchainId) -> Builder {
-    let producer: ProducerId<CodeBuilder> =
-        Producers::for_tests(b"blaze-cli wasm64 self-compile 1").get::<CodeBuilder>();
+fn wasm64_builder(id: ToolchainId, producers: &Producers) -> Builder {
+    let producer: ProducerId<CodeBuilder> = producers.get::<CodeBuilder>();
     Builder {
         isa: Isa { lse: true, os: Os::MacOs },
         tier: TierName::Reference,
@@ -590,6 +613,10 @@ pub(crate) enum SelfCompileError {
         symbol: std::string::String,
         detail: std::string::String,
     },
+    /// On-disk store or cached sysroot record read error (`NotThisRecord`, corrupt/truncated cache
+    /// file): outside the task's key and reads, so callers return `Did::Hole` and never persist it
+    /// as a cached `MacroModule` failure.
+    StoreError(std::string::String),
     /// Any non-Tier-2 compilation, resolution, linking, validation, or publication failure.
     Failed(std::string::String),
 }
@@ -597,6 +624,10 @@ pub(crate) enum SelfCompileError {
 impl SelfCompileError {
     pub(crate) fn is_tier2(&self) -> bool {
         matches!(self, SelfCompileError::Tier2Unsupported { .. })
+    }
+
+    pub(crate) fn is_hole(&self) -> bool {
+        matches!(self, SelfCompileError::StoreError(_))
     }
 }
 
@@ -616,7 +647,7 @@ impl core::fmt::Display for SelfCompileError {
                     )
                 }
             }
-            SelfCompileError::Failed(msg) => f.write_str(msg),
+            SelfCompileError::StoreError(msg) | SelfCompileError::Failed(msg) => f.write_str(msg),
         }
     }
 }
@@ -722,6 +753,7 @@ pub(crate) fn compile_build_script(
         &lock,
         checkout,
         inputs.members,
+        &inputs.producers,
         inputs.heap,
         script_id,
         expected_deps,
@@ -754,6 +786,7 @@ fn ensure_build_script_unit(
     lock: &Lock<'_>,
     checkout: &blaze_proc_macro::script_sandbox::RealRoot,
     members: &[(LockId, &str, blaze_world::PathKind)],
+    producers: &Producers,
     heap: &'static blaze_own::Heap,
     script_id: UnitId,
     expected_deps: Option<&str>,
@@ -824,6 +857,7 @@ fn ensure_build_script_unit(
         lock,
         checkout,
         members,
+        producers,
         heap,
         script_id,
         CompileMode::BuildScript,
@@ -867,6 +901,7 @@ fn ensure_proc_macro_unit(
     lock: &Lock<'_>,
     checkout: &blaze_proc_macro::script_sandbox::RealRoot,
     members: &[(LockId, &str, blaze_world::PathKind)],
+    producers: &Producers,
     heap: &'static blaze_own::Heap,
     pm_id: UnitId,
     depth: u8,
@@ -915,6 +950,7 @@ fn ensure_proc_macro_unit(
                 lock,
                 checkout,
                 members,
+                producers,
                 heap,
                 pm_id,
                 CompileMode::ProcMacro,
@@ -1005,6 +1041,7 @@ pub(crate) fn compile_proc_macro(
         &lock,
         checkout,
         inputs.members,
+        &inputs.producers,
         inputs.heap,
         pm_id,
         CompileMode::ProcMacro,
@@ -1165,6 +1202,7 @@ fn run_dep_build_script(
     lock: &Lock<'_>,
     checkout: &blaze_proc_macro::script_sandbox::RealRoot,
     members: &[(LockId, &str, blaze_world::PathKind)],
+    producers: &Producers,
     heap: &'static blaze_own::Heap,
     bs_id: UnitId,
     tc_cfg: &[(std::string::String, Option<std::string::String>)],
@@ -1173,7 +1211,7 @@ fn run_dep_build_script(
     depth: u8,
 ) -> Result<std::vec::Vec<u8>, SelfCompileError> {
     // Ensure the build script's own wasm64 module exists first (`graph` here is already `wasm_graph`).
-    let _ = ensure_build_script_unit(store, graph, Some(graph), lock, checkout, members, heap, bs_id, None, depth + 1)?;
+    let _ = ensure_build_script_unit(store, graph, Some(graph), lock, checkout, members, producers, heap, bs_id, None, depth + 1)?;
     let frame = Frame::with_reserve(128 << 20, Tag::Other)
         .map_err(|_| SelfCompileError::Failed(std::string::String::from("failed to reserve dep build-script frame")))?;
     let erased = Erased::new(&frame);
@@ -1642,6 +1680,7 @@ fn compile_unit_to_wasm64(
     lock: &Lock<'_>,
     checkout: &blaze_proc_macro::script_sandbox::RealRoot,
     members: &[(LockId, &str, blaze_world::PathKind)],
+    producers: &Producers,
     heap: &'static blaze_own::Heap,
     root_unit: UnitId,
     mode: CompileMode,
@@ -1749,6 +1788,7 @@ fn compile_unit_to_wasm64(
                 lock,
                 checkout,
                 members,
+                producers,
                 heap,
                 uid,
                 depth + 1,
@@ -1797,6 +1837,7 @@ fn compile_unit_to_wasm64(
         lock,
         checkout,
         members,
+        producers,
         heap,
         wasm_root_unit,
         unit_order.as_slice(),
@@ -1885,6 +1926,7 @@ fn compile_unit_in<'a>(
     lock: &'a Lock<'a>,
     checkout: &'a blaze_proc_macro::script_sandbox::RealRoot,
     members: &[(LockId, &str, blaze_world::PathKind)],
+    producers: &Producers,
     heap: &'static blaze_own::Heap,
     root_unit: UnitId,
     unit_order: &[UnitId],
@@ -2016,6 +2058,7 @@ fn compile_unit_in<'a>(
                 lock,
                 checkout,
                 members,
+                producers,
                 heap,
                 bs_id,
                 &tc_cfg_owned,
@@ -2294,8 +2337,9 @@ fn compile_unit_in<'a>(
 
     // 5. Resolve all crates together with `blaze-scope`, reusing persisted disk records for
     //    `wasm64-blaze-wasip1` sysroot crates (`krate >= tc_base`) under
-    //    `<store>/wasm64-sysroot-v2/<tc_id>/` (Rule 51: content-addressed records on disk, page
-    //    cache only, zero in-memory cross-command cache).
+    //    `<store>/wasm64-sysroot-v2/<tc_id>-<producers_hash>/` (Rule 21 & Rule 51: content-addressed
+    //    records on disk keyed by toolchain + producer/format identity, page cache only, zero
+    //    in-memory cross-command cache).
     let sources: &'a Wasm64Sources<'a, 'a> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
         Wasm64Sources {
             origins,
@@ -2310,7 +2354,7 @@ fn compile_unit_in<'a>(
     let par = CompilePar::new();
     let sysroot_dir = store
         .join("wasm64-sysroot-v2")
-        .join(bstd::mem::format_in!(frame, "{tc_id}").as_str());
+        .join(wasm64_sysroot_dir_name(tc_id, producers));
     let mut sysroot_kept = Wasm64SysrootKept::open(&sysroot_dir, tc_base, crates.as_slice(), bump);
     let sysroot_guard = if sysroot_kept.has_missing() {
         let guard = SYSROOT_INIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -2321,7 +2365,10 @@ fn compile_unit_in<'a>(
     };
     let ready = Ready::serial(core::time::Duration::from_secs(120));
     let (solved, _) = resolve_kept(crates.as_slice(), sysroot, sources, &par, &ready, &sysroot_kept, bump)
-        .map_err(|(at, e)| std::format!("blaze-scope resolve failed on `{}`: {e:?}", crates[at].name))?;
+        .map_err(|(at, e)| {
+            let name = crates.get(at).map_or("<unknown>", |c| c.name);
+            classify_scope_resolve_error(name, &e)
+        })?;
 
     // Extract proc-macro exports in exact `_DECLS` order (including macro-generated
     // `#[proc_macro*]` items such as `derive_more-impl`'s `create_derive!`) if in ProcMacro mode.
@@ -2408,7 +2455,10 @@ fn compile_unit_in<'a>(
             }
             Solved::Found { .. } => {
                 let cached = sysroot_kept.loaded_at(krate).ok_or_else(|| {
-                    std::format!("cached sysroot crate `{}` missing loaded records", crates[krate].name)
+                    let name = crates.get(krate).map_or("<unknown>", |c| c.name);
+                    SelfCompileError::StoreError(std::format!(
+                        "cached sysroot crate `{name}` missing loaded records"
+                    ))
                 })?;
                 kept.names.push(cached.names);
                 kept.items.push(cached.items);
@@ -2416,7 +2466,8 @@ fn compile_unit_in<'a>(
                 kept.files.push(blaze_own::BTreeMap::new_in(alloc));
                 let mut e_map = blaze_own::BTreeMap::new_in(alloc);
                 let mut o_map = blaze_own::BTreeMap::new_in(alloc);
-                decode_expansions_table(cached.expansions, &mut e_map, &mut o_map)?;
+                decode_expansions_table(cached.expansions, &mut e_map, &mut o_map)
+                    .map_err(SelfCompileError::StoreError)?;
                 kept.expansions.push(e_map);
                 kept.origins.push(o_map);
             }
@@ -2475,6 +2526,7 @@ fn compile_unit_in<'a>(
         lang_crates,
         body_sources,
         tc_id,
+        producers,
         mode,
         shim_idx,
         module_name,
@@ -2507,6 +2559,7 @@ fn emit_wasm64_from_records<'n>(
     lang_crates: &'n [usize],
     body_sources: &'n dyn BodySources,
     tc_id: ToolchainId,
+    producers: &Producers,
     mode: CompileMode,
     shim_idx: Option<usize>,
     module_name: &str,
@@ -2515,7 +2568,7 @@ fn emit_wasm64_from_records<'n>(
     heap_alloc: Alloc<'static>,
 ) -> Result<std::vec::Vec<u8>, SelfCompileError> {
     let nr = NamesRecords { records, frame: infer_frame, lang_crates, body_sources: Some(body_sources) };
-    let builder = wasm64_builder(tc_id);
+    let builder = wasm64_builder(tc_id, producers);
 
     // 7. Single-pass LIR -> Wasm64 compilation! Use `heap_alloc` for the growing worklist,
     //    `Vec<OwnedFunc>`, and emitted wasm buffer so reallocations free old backing storage
@@ -2775,9 +2828,10 @@ struct FreshSysrootCrate {
 }
 
 /// Persisted disk record store for resolved `wasm64-blaze-wasip1` sysroot crates
-/// (`<store>/wasm64-sysroot-v2/<tc_id>/<crate_key_hex>/`). Follows Rule 51: content-addressed
-/// records written once via atomic staging-dir rename, read in place via the kernel page cache,
-/// and verified by `resolve_kept`'s read-list check (`blaze_scope::asked::check`).
+/// (`<store>/wasm64-sysroot-v2/<tc_id>-<producers_hash>/<crate_key_hex>/`). Follows Rule 21 &
+/// Rule 51: content-addressed records written once via atomic staging-dir rename, read in place
+/// via the kernel page cache, and verified by `resolve_kept`'s read-list check
+/// (`blaze_scope::asked::check`).
 struct Wasm64SysrootKept<'a> {
     tc_base: usize,
     loaded: std::vec::Vec<Option<CachedSysrootCrate<'a>>>,
@@ -2870,12 +2924,37 @@ impl Kept for Wasm64SysrootKept<'_> {
     }
 }
 
-fn hex_content_id(id: ContentId) -> std::string::String {
+fn classify_scope_resolve_error(
+    krate: &str,
+    err: &blaze_scope::crate_scope::CrateScopeError<'_>,
+) -> SelfCompileError {
+    let msg = std::format!("blaze-scope resolve failed on `{krate}`: {err:?}");
+    if matches!(
+        err,
+        blaze_scope::crate_scope::CrateScopeError::OwnRecord {
+            error: blaze_scope::crate_scope::RecordRead::NotThisRecord,
+            ..
+        } | blaze_scope::crate_scope::CrateScopeError::ReadList {
+            error: blaze_scope::asked::ReadListError::NotThisRecord,
+            ..
+        }
+    ) {
+        SelfCompileError::StoreError(msg)
+    } else {
+        SelfCompileError::Failed(msg)
+    }
+}
+
+fn hex_bytes(bytes: &[u8; 32]) -> std::string::String {
     let mut s = std::string::String::with_capacity(64);
-    for b in id.0 {
+    for b in bytes {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+fn hex_content_id(id: ContentId) -> std::string::String {
+    hex_bytes(&id.0)
 }
 
 fn encode_expansions_table(
@@ -3513,6 +3592,7 @@ mod tests {
         )
         .expect("open checkout");
         let members = [(LockId(0), "", blaze_world::PathKind::Member)];
+        let producers = Producers::for_tests(b"wasm64-compile-test");
         let heap = blaze_own::testing::heap();
 
         let compiled = compile_unit_to_wasm64(
@@ -3522,6 +3602,7 @@ mod tests {
             &lock,
             &checkout,
             &members,
+            &producers,
             heap,
             UnitId(0),
             CompileMode::BuildScript,
@@ -3533,8 +3614,10 @@ mod tests {
         assert!(checked.memory64, "emitted module must use memory64");
 
         // Verify the persisted sysroot cache contains ONLY the minimal Rust sysroot closure
-        // (never bstd / sonic-rs).
-        let sysroot_dir = store_dir.join("wasm64-sysroot-v2").join(tc_id.to_string());
+        // (never bstd / sonic-rs) under its producer-keyed directory.
+        let sysroot_dir = store_dir
+            .join("wasm64-sysroot-v2")
+            .join(super::wasm64_sysroot_dir_name(tc_id, &producers));
         let cached_count = std::fs::read_dir(&sysroot_dir)
             .expect("read wasm64-sysroot-v2")
             .filter_map(Result::ok)
@@ -3546,6 +3629,63 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn wasm64_sysroot_dir_key_moves_on_each_producer_row_and_toolchain() {
+        use blaze_ids::producer::Row;
+
+        let tc_a = blaze_toolchain::PINNED;
+        let tc_b = blaze_toolchain::ToolchainId([0x5a; 32]);
+        let base = Producers::for_tests(b"sysroot-key-base");
+        let base_dir = super::wasm64_sysroot_dir_name(tc_a, &base);
+
+        // Deterministic for identical inputs.
+        assert_eq!(base_dir, super::wasm64_sysroot_dir_name(tc_a, &base));
+        assert!(base_dir.starts_with(&std::format!("{tc_a}-")));
+
+        // Changing the toolchain id moves the directory key.
+        assert_ne!(
+            base_dir,
+            super::wasm64_sysroot_dir_name(tc_b, &base),
+            "toolchain id must change wasm64-sysroot-v2 key"
+        );
+
+        // Moving each producer row whose record format or semantics live in `wasm64-sysroot-v2`
+        // (Names, Expander, Lowering, CodeBuilder, Whole) MUST produce a distinct directory key
+        // so format bumps miss cleanly instead of reading stale `NotThisRecord` bytes (Rule 21).
+        for row in [Row::Names, Row::Expander, Row::Lowering, Row::CodeBuilder, Row::Whole] {
+            let moved = base.planted_for_tests(row, b"sysroot-key-bumped");
+            let moved_dir = super::wasm64_sysroot_dir_name(tc_a, &moved);
+            assert_ne!(
+                base_dir, moved_dir,
+                "moving producer row {row:?} must change wasm64-sysroot-v2 key"
+            );
+        }
+    }
+
+    #[test]
+    fn wasm64_sysroot_not_this_record_is_hole_and_not_cached_failure() {
+        let own_rec_err = blaze_scope::crate_scope::CrateScopeError::OwnRecord {
+            krate: "core",
+            error: blaze_scope::crate_scope::RecordRead::NotThisRecord,
+        };
+        let mapped = super::classify_scope_resolve_error("core", &own_rec_err);
+        assert!(
+            mapped.is_hole(),
+            "OwnRecord::NotThisRecord must map to StoreError (Did::Hole, never cached failure), got {mapped:?}"
+        );
+        assert!(!mapped.is_tier2());
+
+        let read_list_err = blaze_scope::crate_scope::CrateScopeError::ReadList {
+            krate: "core",
+            error: blaze_scope::asked::ReadListError::NotThisRecord,
+        };
+        let mapped_rl = super::classify_scope_resolve_error("core", &read_list_err);
+        assert!(
+            mapped_rl.is_hole(),
+            "ReadList::NotThisRecord must map to StoreError (Did::Hole, never cached failure), got {mapped_rl:?}"
+        );
     }
 
     #[test]
