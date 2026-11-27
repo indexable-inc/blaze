@@ -19,7 +19,7 @@ use blaze_vt::terminal::{Mode as VtMode, Terminal};
 use crate::blocks::{Block, BlockBody, BlockId, BlockStore, BranchId, TABLE_FOLD_ROWS};
 use crate::editor::{
     COMPLETION_VISIBLE_ROWS, CommandPalette, CompletionKind, Editor, HISTORY_VISIBLE_ROWS,
-    PALETTE_VISIBLE_ROWS,
+    LiveHint, PALETTE_VISIBLE_ROWS,
 };
 use crate::icons::{Icon, draw_icon, icon_for_record_key};
 use crate::prompt::{GitFileStatus, PromptInfo};
@@ -393,6 +393,21 @@ fn build_scene_inner(input: &LayoutInput<'_>, draw_top_bar: bool) -> Scene {
         );
     } else if let Some(pop) = input.active_popover {
         layout_active_popover(&mut scene, pop, vw, vh, m, input.mouse_pos, input.now_ns);
+    } else if !input.pty_focused
+        && let Some(hint) = input.editor.live_inline_hint()
+    {
+        layout_live_hint_strip(
+            &mut scene,
+            &hint,
+            input.editor,
+            col_x0,
+            prompt_y0,
+            prompt_y1,
+            vh,
+            col_x1,
+            m,
+            input.mouse_pos,
+        );
     }
     if let Some(drag) = input.drag {
         layout_drag_overlay(&mut scene, drag, m);
@@ -1540,7 +1555,7 @@ fn layout_starship_line(
         && !badge.is_empty()
     {
         cx += 6.0;
-        let bw = m.measure(badge, TextFace::UiSmall) + 10.0;
+        let bw = m.measure(badge, TextFace::MonoSmall) + 10.0;
         let bh = m.ch - 2.0;
         let by = ty + 1.0;
         let bc = prompt.project_color.unwrap_or(theme::SERIES_BLUE);
@@ -1555,7 +1570,7 @@ fn layout_starship_line(
             [bc[0], bc[1], bc[2], 0.42],
             clip_id,
         );
-        scene.ui_small(cx + 5.0, ty + 1.0, badge, bc, true, false, clip_id);
+        scene.mono_small(cx + 5.0, ty + 1.0, badge, bc, true, false, clip_id);
         cx += bw;
     }
     if !prompt.cwd.is_empty() {
@@ -2779,7 +2794,7 @@ fn layout_file_grid(
                 let mut end_x = cx + drawn_icon_w + icon_gap + txt_w;
                 if let Some((tag, tag_col)) = badge {
                     let bx = end_x + (m.cw * 0.45).max(3.5);
-                    scene.ui_small(bx, ty + 1.0, tag, tag_col, true, false, clip_id);
+                    scene.mono_small(bx, ty + 1.0, tag, tag_col, true, false, clip_id);
                     end_x = bx + m.cw;
                 } else if tracked_dot {
                     let dx = end_x + (m.cw * 0.55).max(4.5);
@@ -3332,8 +3347,8 @@ fn layout_table(
 
     let row_h = m.ch + TABLE_ROW_PAD_Y * 2.0;
 
-    // Clickable sortable column headers in crisp Apple SF Pro (`UiSmall`) + hairline underneath.
-    scene.ui_small(x0, y0, "#", theme::INK_4, false, false, clip_id);
+    // Clickable sortable column headers in crisp compact monospace (`MonoSmall`) + hairline underneath.
+    scene.mono_small(x0, y0, "#", theme::INK_4, false, false, clip_id);
     let mut cx = x0 + idx_w;
     for c in 0..ncols {
         if !col_visible[c] {
@@ -3357,20 +3372,20 @@ fn layout_table(
             let ls = m.icon_sm();
             draw_icon(scene, Icon::Lock, cx + 2.0, y0 + (m.ch - ls) * 0.5, ls, hdr_col, clip_id);
             if !suffix.is_empty() {
-                scene.ui_small(cx + ls + 4.0, y0, suffix.trim(), hdr_col, true, false, clip_id);
+                scene.mono_small(cx + ls + 4.0, y0, suffix.trim(), hdr_col, true, false, clip_id);
             }
         } else {
-            let avg_cw = m.measure("n", TextFace::UiSmall).max(4.5);
+            let avg_cw = m.measure("n", TextFace::MonoSmall).max(4.5);
             let max_ch = (content_w / avg_cw).floor().max(2.0) as usize;
             let hdr_base = truncate_chars(col_raw, max_ch.saturating_sub(suffix.chars().count()).max(1));
             let hdr = format!("{hdr_base}{suffix}");
-            let hdr_w = m.measure(&hdr, TextFace::UiSmall);
+            let hdr_w = m.measure(&hdr, TextFace::MonoSmall);
             let tx = if col_right_align[c] {
                 cx + content_w - hdr_w
             } else {
                 cx
             };
-            scene.ui_small(tx, y0, hdr, hdr_col, active_sort.is_some(), false, clip_id);
+            scene.mono_small(tx, y0, hdr, hdr_col, active_sort.is_some(), false, clip_id);
         }
         if depth <= 1 {
             let resize_x = cx + cw - col_gap * 0.5;
@@ -3409,7 +3424,7 @@ fn layout_table(
     }
 
     if show_ls_commit_col {
-        scene.ui_small(cx, y0, "commit", theme::INK_3, false, false, clip_id);
+        scene.mono_small(cx, y0, "commit", theme::INK_3, false, false, clip_id);
         let resize_x = cx + ls_commit_col_w - col_gap * 0.5;
         scene.line(resize_x, y0 + 2.0, resize_x, y0 + m.ch - 1.0, 1.0, theme::LINE_FAINT, clip_id);
         scene.push_hit_clipped(
@@ -3438,7 +3453,7 @@ fn layout_table(
         } else {
             format!("+{n_hid} cols")
         };
-        let pw = m.measure(&pill_lbl, TextFace::UiSmall) + 12.0;
+        let pw = m.measure(&pill_lbl, TextFace::MonoSmall) + 12.0;
         let px0 = (x1 - pw).max(cx - 8.0);
         let py0 = y0 - 1.0;
         let py1 = y0 + m.ch + 1.0;
@@ -3453,7 +3468,7 @@ fn layout_table(
             theme::LINE_FAINT,
             clip_id,
         );
-        scene.ui_small(
+        scene.mono_small(
             px0 + 6.0,
             y0,
             pill_lbl,
@@ -3855,7 +3870,7 @@ fn layout_table(
                                 );
                                 if let Some((tag, tag_col)) = badge {
                                     let gx = (bx0 + chip_w + 6.0).min(rx + content_w - m.cw);
-                                    scene.ui_small(gx, ty + 1.0, tag, tag_col, true, false, clip_id);
+                                    scene.mono_small(gx, ty + 1.0, tag, tag_col, true, false, clip_id);
                                 } else if tracked_dot {
                                     let gx = rx + drawn_icon_pad + txt_w + (m.cw * 0.55).max(4.5);
                                     scene.over_circle(
@@ -4068,7 +4083,7 @@ fn layout_table(
                                         let max_ch = ((content_w - 14.0) / m.cw).floor().max(2.0) as usize;
                                         let txt = truncate_chars(&raw, max_ch);
                                         let col = if is_ok { theme::INK_2 } else { theme::INK_3 };
-                                        scene.ui_small(rx + 13.0, ty, txt, col, false, false, clip_id);
+                                        scene.mono_small(rx + 13.0, ty, txt, col, false, false, clip_id);
                                     }
                                 }
                             }
@@ -4760,7 +4775,7 @@ fn layout_command_output(
         format!("exit {}", out.exit_code)
     };
     let pill_lbl = streams_lbl;
-    let pill_w = m.measure(&pill_lbl, TextFace::UiSmall) + 16.0;
+    let pill_w = m.measure(&pill_lbl, TextFace::MonoSmall) + 16.0;
     let bx0 = (x0 + width - pill_w).max(x0 + 80.0);
     let (pill_bg, pill_border, pill_fg) = if out.exit_code != 0 {
         (
@@ -4795,7 +4810,7 @@ fn layout_command_output(
             pill_border,
             clip_id,
         );
-        scene.ui_small(px0 + 8.0, pill_y, &pill_lbl, pill_fg, out.exit_code != 0, false, clip_id);
+        scene.mono_small(px0 + 8.0, pill_y, &pill_lbl, pill_fg, out.exit_code != 0, false, clip_id);
         scene.push_hover_clipped(
             HitRect::new(px0, pill_y - 2.0, px1, pill_y + m.ch + 1.0),
             clip_id,
@@ -5773,7 +5788,7 @@ fn layout_error_panel(
     draw_icon(scene, Icon::Error, px, cur_y + (m.ch - icon_s) * 0.5, icon_s, theme::DANGER, clip_id);
     let kind_x = px + icon_s + 7.0;
     let kind_lbl = err.kind.as_str();
-    let kind_bw = m.measure(kind_lbl, TextFace::UiSmall) + 12.0;
+    let kind_bw = m.measure(kind_lbl, TextFace::MonoSmall) + 12.0;
     let kind_bh = m.ch - 1.0;
     scene.round_rect(
         kind_x,
@@ -5786,7 +5801,7 @@ fn layout_error_panel(
         theme::rgba(0xe0, 0x6c, 0x75, 0.45),
         clip_id,
     );
-    scene.ui_small(kind_x + 6.0, cur_y + 0.5, kind_lbl, theme::DANGER, true, false, clip_id);
+    scene.mono_small(kind_x + 6.0, cur_y + 0.5, kind_lbl, theme::DANGER, true, false, clip_id);
 
     let inner_w = (x1 - 12.0 - px).max(100.0);
     let msg_indent = (kind_x - px) + kind_bw + 8.0;
@@ -5827,7 +5842,7 @@ fn layout_error_panel(
     }
 
     if let Some(help) = &err.help {
-        let help_bw = m.measure("help", TextFace::UiSmall) + 10.0;
+        let help_bw = m.measure("help", TextFace::MonoSmall) + 10.0;
         let help_bh = m.ch - 2.0;
         scene.round_rect(
             px,
@@ -5840,7 +5855,7 @@ fn layout_error_panel(
             theme::rgba(0x4c, 0xc3, 0x8a, 0.36),
             clip_id,
         );
-        scene.ui_small(px + 5.0, cur_y + 1.0, "help", theme::OK, true, false, clip_id);
+        scene.mono_small(px + 5.0, cur_y + 1.0, "help", theme::OK, true, false, clip_id);
         let help_h = crate::diag_view::layout_inline_markdown(
             scene,
             help.as_str(),
@@ -6864,6 +6879,327 @@ fn layout_ghostty_cursor_trail(
                 [0.0; 4],
                 clip_id,
             );
+        }
+    }
+}
+
+/// Non-modal, zero-Tab live inline hint strip rendered directly beneath the active prompt line
+/// as the user types:
+/// - `LiveHint::Signature`: 1-line IDE signature (`MonoSmall`) + calm description (SF Pro `UiSmall`)
+///   + clickable flag chips + quiet `Tab` cue.
+/// - `LiveHint::Candidates`: 1–5 row calm preview card of matching subcommands/flags + descriptions
+///   (clickable, never hijacking `Enter`, `↑`/`↓`, or `→` Fish ghost text).
+#[allow(clippy::too_many_arguments)]
+fn layout_live_hint_strip(
+    scene: &mut Scene,
+    hint: &LiveHint,
+    editor: &Editor,
+    x0: f32,
+    prompt_y0: f32,
+    prompt_y1: f32,
+    vh: f32,
+    x1: f32,
+    m: CellMetrics,
+    mouse_pos: Option<[f32; 2]>,
+) {
+    let max_avail_w = (x1 - x0).max(160.0);
+    let glass_bg = theme::rgba(0x16, 0x16, 0x1a, 0.94);
+
+    match hint {
+        LiveHint::Signature { anchor_byte: _, signature, about, flags } => {
+            let card_h = m.ch + 10.0;
+            let pad_x = 10.0;
+            let sig_w = m.measure(signature, TextFace::MonoSmall);
+            let tab_lbl = "Tab";
+            let tab_w = m.measure(tab_lbl, TextFace::MonoSmall) + 10.0;
+            let sep_w = m.measure(" · ", TextFace::UiSmall);
+            let about_full_w = if about.is_empty() { 0.0 } else { m.measure(about, TextFace::UiSmall) };
+
+            // Measure compact clickable flag chips so the bar hugs its content cleanly.
+            let mut chips_total_w = 0.0f32;
+            let mut chip_specs: Vec<(&str, &str, f32)> = Vec::with_capacity(flags.len().min(4));
+            for (flag, short_doc) in flags.iter().take(4) {
+                let fw = m.measure(flag, TextFace::MonoSmall);
+                let dw = if short_doc.is_empty() {
+                    0.0
+                } else {
+                    4.0 + m.measure(short_doc, TextFace::UiSmall)
+                };
+                let w = fw + dw + 10.0;
+                chip_specs.push((flag.as_str(), short_doc.as_str(), w));
+                chips_total_w += w + 5.0;
+            }
+            if !chip_specs.is_empty() {
+                chips_total_w += 6.0;
+            }
+
+            let desired_w = (pad_x * 2.0
+                + sig_w
+                + if about.is_empty() { 0.0 } else { sep_w + about_full_w }
+                + chips_total_w
+                + 8.0
+                + tab_w)
+                .clamp(220.0, max_avail_w);
+            let px0 = scene.composer_text_origin[0].clamp(x0, (x1 - desired_w).max(x0));
+            let px1 = (px0 + desired_w).min(x1);
+            let below_y0 = prompt_y1 + 5.0;
+            let py0 = if below_y0 + card_h <= vh - 10.0 {
+                below_y0.max(TOP_BAR_H + 8.0)
+            } else {
+                (prompt_y0 - 6.0 - card_h).max(TOP_BAR_H + 8.0)
+            };
+            let py1 = py0 + card_h;
+
+            scene.overlay_shadow(px0, py0 + 3.0, px1, py1 + 3.0, 6.0, 12.0, theme::SHADOW_SOFT, 0);
+            scene.overlay_round_rect(px0, py0, px1, py1, 6.0, glass_bg, 1.0, theme::LINE, 0);
+
+            let ty = py0 + (card_h - m.ch) * 0.5;
+            let mut cx = px0 + pad_x;
+
+            // Right-reserved `Tab` badge (only when there's comfortable room).
+            let show_tab = px1 - px0 >= 280.0;
+            let right_limit = if show_tab { px1 - pad_x - tab_w - 6.0 } else { px1 - pad_x };
+
+            // 1. Monospace usage signature.
+            let max_sig_chars = (((right_limit - cx).max(40.0)) / (m.cw * 0.84)).floor() as usize;
+            let sig_txt = truncate_chars(signature, max_sig_chars.max(8));
+            let sig_draw_w = m.measure(&sig_txt, TextFace::MonoSmall);
+            scene.overlay_mono_small(cx, ty, sig_txt, theme::INK_1, true, false, 0);
+            cx += sig_draw_w;
+
+            // 2. Calm SF Pro 1-line description (reserve room for at least 1 flag chip if present).
+            let min_chip_reserve = chip_specs.first().map(|c| c.2 + 12.0).unwrap_or(0.0);
+            if !about.is_empty() && cx + sep_w + 48.0 < right_limit - min_chip_reserve {
+                scene.overlay_ui_small(cx, ty, " · ", theme::INK_4, false, false, 0);
+                cx += sep_w;
+                let about_budget = (right_limit - min_chip_reserve - cx).max(40.0);
+                let max_about_chars = (about_budget / (m.cw * 0.62)).floor() as usize;
+                let about_txt = truncate_chars(about, max_about_chars.max(10));
+                let about_draw_w = m.measure(&about_txt, TextFace::UiSmall);
+                scene.overlay_ui_small(cx, ty, about_txt, theme::INK_2, false, false, 0);
+                cx += about_draw_w;
+            }
+
+            // 3. Clickable compact flag chips (`MonoSmall` flag + optional short `UiSmall` gloss).
+            if !chip_specs.is_empty() {
+                cx += 10.0;
+                let chip_y0 = py0 + 3.0;
+                let chip_y1 = py1 - 3.0;
+                for (flag, short_doc, full_chip_w) in chip_specs {
+                    let flag_only_w = m.measure(flag, TextFace::MonoSmall) + 10.0;
+                    let (chip_w, show_short) = if cx + full_chip_w <= right_limit {
+                        (full_chip_w, !short_doc.is_empty())
+                    } else if cx + flag_only_w <= right_limit {
+                        (flag_only_w, false)
+                    } else {
+                        break;
+                    };
+                    let rect = HitRect::new(cx, chip_y0, cx + chip_w, chip_y1);
+                    let hovered = mouse_pos.is_some_and(|p| rect.contains(p[0], p[1]));
+                    scene.overlay_round_rect(
+                        rect.x0,
+                        rect.y0,
+                        rect.x1,
+                        rect.y1,
+                        4.0,
+                        if hovered { theme::COMPLETION_SEL_BG } else { theme::BG_CHIP },
+                        1.0,
+                        if hovered { theme::LINE_STRONG } else { theme::LINE },
+                        0,
+                    );
+                    let fx = cx + 5.0;
+                    scene.overlay_mono_small(
+                        fx,
+                        ty,
+                        flag,
+                        if hovered { theme::INK_1 } else { theme::CMD_BUILTIN },
+                        false,
+                        false,
+                        0,
+                    );
+                    if show_short {
+                        let fw = m.measure(flag, TextFace::MonoSmall);
+                        scene.overlay_ui_small(
+                            fx + fw + 4.0,
+                            ty,
+                            short_doc,
+                            theme::INK_3,
+                            false,
+                            false,
+                            0,
+                        );
+                    }
+                    scene.push_hit(
+                        rect,
+                        HitAction::InsertLiveHint {
+                            replace_start: editor.cursor,
+                            insert: flag.to_owned(),
+                        },
+                    );
+                    cx += chip_w + 5.0;
+                }
+            }
+
+            // 4. Quiet right-aligned `Tab` hint pill.
+            if show_tab {
+                let tx0 = px1 - pad_x - tab_w;
+                scene.overlay_round_rect(
+                    tx0,
+                    py0 + 4.0,
+                    px1 - pad_x,
+                    py1 - 4.0,
+                    3.5,
+                    theme::rgba(0xff, 0xff, 0xff, 0.04),
+                    1.0,
+                    theme::LINE,
+                    0,
+                );
+                scene.overlay_mono_small(tx0 + 5.0, ty, tab_lbl, theme::INK_4, false, false, 0);
+            }
+        }
+        LiveHint::Candidates { replace_start, items, total_matches } => {
+            if items.is_empty() {
+                return;
+            }
+            let row_h = m.ch + 6.0;
+            let rem = total_matches.saturating_sub(items.len());
+            let footer_h = if rem > 0 { m.ch + 6.0 } else { 0.0 };
+            let card_h = 8.0 + items.len() as f32 * row_h + footer_h;
+
+            let max_label_w = items
+                .iter()
+                .map(|it| m.measure(&it.label, TextFace::MonoSmall))
+                .fold(0.0f32, f32::max)
+                .clamp(68.0, 210.0);
+            let max_doc_w = items
+                .iter()
+                .map(|it| m.measure(&it.doc, TextFace::UiSmall))
+                .fold(0.0f32, f32::max)
+                .min(340.0);
+            let card_w = (12.0 + max_label_w + 16.0 + max_doc_w + 14.0).clamp(260.0, max_avail_w.min(580.0));
+
+            // Anchor horizontally to the start of the active token being typed.
+            let prefix_before = &editor.text[..(*replace_start).min(editor.text.len())];
+            let anchor_col = prefix_before
+                .rsplit('\n')
+                .next()
+                .map(|line| line.chars().count())
+                .unwrap_or(0);
+            let desired_x = scene.composer_text_origin[0] + (anchor_col as f32 * m.cw) - 10.0;
+            let px0 = desired_x.clamp(x0, (x1 - card_w).max(x0));
+            let px1 = px0 + card_w;
+
+            let below_y0 = prompt_y1 + 5.0;
+            let py0 = if below_y0 + card_h <= vh - 10.0 {
+                below_y0.max(TOP_BAR_H + 8.0)
+            } else {
+                (prompt_y0 - 6.0 - card_h).max(TOP_BAR_H + 8.0)
+            };
+            let py1 = py0 + card_h;
+
+            scene.overlay_shadow(px0, py0 + 3.0, px1, py1 + 3.0, 7.0, 14.0, theme::SHADOW_SOFT, 0);
+            scene.overlay_round_rect(px0, py0, px1, py1, 7.0, glass_bg, 1.0, theme::LINE, 0);
+
+            let label_x = px0 + 11.0;
+            let doc_x = label_x + max_label_w + 14.0;
+            let doc_budget_w = (px1 - doc_x - 10.0).max(40.0);
+            let mono_small_cw = m.cw * 0.84;
+            let mut ry = py0 + 4.0;
+
+            for item in items {
+                let row_rect = HitRect::new(px0 + 4.0, ry, px1 - 4.0, ry + row_h);
+                let hovered = mouse_pos.is_some_and(|p| row_rect.contains(p[0], p[1]));
+                if hovered {
+                    scene.overlay_round_rect(
+                        row_rect.x0,
+                        row_rect.y0,
+                        row_rect.x1,
+                        row_rect.y1,
+                        4.5,
+                        theme::COMPLETION_SEL_BG,
+                        0.0,
+                        [0.0; 4],
+                        0,
+                    );
+                }
+
+                let ty = ry + (row_h - m.ch) * 0.5;
+                let base_col = if item.is_flag {
+                    theme::CMD_BUILTIN
+                } else {
+                    theme::rgb(0x56, 0xb6, 0xc2)
+                };
+
+                // Draw `MonoSmall` candidate label with gentle highlight on matched character indices.
+                let max_lbl_chars = (max_label_w / mono_small_cw).floor().max(8.0) as usize;
+                let lbl_txt = truncate_chars(&item.label, max_lbl_chars);
+                if item.match_indices.is_empty() {
+                    scene.overlay_mono_small(
+                        label_x,
+                        ty,
+                        lbl_txt,
+                        if hovered { theme::INK_1 } else { base_col },
+                        hovered,
+                        false,
+                        0,
+                    );
+                } else {
+                    let mut lx = label_x;
+                    for (ci, ch) in lbl_txt.chars().enumerate() {
+                        let matched = item.match_indices.contains(&ci);
+                        let col = if matched {
+                            theme::INK_1
+                        } else if hovered {
+                            theme::INK_2
+                        } else {
+                            base_col
+                        };
+                        let mut buf = [0u8; 4];
+                        let s = ch.encode_utf8(&mut buf);
+                        scene.overlay_mono_small(lx, ty, s, col, matched, false, 0);
+                        lx += mono_small_cw;
+                    }
+                }
+
+                // Draw calm SF Pro 1-line description.
+                if !item.doc.is_empty() && doc_x + 30.0 < px1 {
+                    let max_doc_chars = (doc_budget_w / (m.cw * 0.62)).floor().max(8.0) as usize;
+                    let doc_txt = truncate_chars(&item.doc, max_doc_chars);
+                    scene.overlay_ui_small(
+                        doc_x,
+                        ty,
+                        doc_txt,
+                        if hovered { theme::INK_2 } else { theme::INK_3 },
+                        false,
+                        false,
+                        0,
+                    );
+                }
+
+                scene.push_hit(
+                    row_rect,
+                    HitAction::InsertLiveHint {
+                        replace_start: *replace_start,
+                        insert: item.insert.clone(),
+                    },
+                );
+                ry += row_h;
+            }
+
+            if rem > 0 {
+                let fy0 = py1 - footer_h;
+                scene.overlay_line(px0 + 8.0, fy0, px1 - 8.0, fy0, 1.0, theme::LINE, 0);
+                let footer_txt = format!("+{rem} more · Tab to browse");
+                scene.overlay_ui_small(
+                    px0 + 11.0,
+                    fy0 + (footer_h - m.ch) * 0.5,
+                    footer_txt,
+                    theme::INK_4,
+                    false,
+                    false,
+                    0,
+                );
+            }
         }
     }
 }

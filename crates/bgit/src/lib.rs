@@ -44,6 +44,15 @@ use crate::{
     },
 };
 
+/// Exposes `bgit`'s declarative `bstd::cli` command tree so embedders like `blaze-shell`
+/// derive completions, live inline signatures, and help previews from one source of truth.
+pub use bstd::cli::CommandSpec as CliCommandSpec;
+
+/// Returns the root declarative CLI specification for `bgit`.
+pub const fn cli_spec() -> &'static CliCommandSpec<'static> {
+    &cli::BGIT_CLI
+}
+
 /// Captured result of running `bgit` (or a `git` command routed to `libbgit`) in-process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecOutput {
