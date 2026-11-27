@@ -61,14 +61,15 @@ mod tool_attrs {
         assert!(TOOLS.windows(2).all(|w| w[0] < w[1]), "TOOLS sorted, no name twice");
         assert!(TOOLS.contains(&BLAZE), "blaze is a registered tool");
         assert!(KNOWN.windows(2).all(|w| w[0].name < w[1].name), "KNOWN sorted, no name twice");
-        // `args` (rule 83) and `cost` (complexity contracts) are the ones checked by a stage.
+        // `args` (rule 83), `capability` (sans-IO firewall), and `cost` (complexity contracts) are checked by a stage.
         assert!(
             KNOWN.iter().all(|k| {
                 k.state == State::Unchecked
                     || (k.name == "args" && k.state == State::Checked(crate::tool_attrs::Stage::Syntax))
+                    || (k.name == "capability" && k.state == State::Checked(crate::tool_attrs::Stage::Ownership))
                     || (k.name == "cost" && k.state == State::Checked(crate::tool_attrs::Stage::Proofs))
             }),
-            "no stage checks a blaze attribute in this build yet but `args` and `cost`"
+            "no stage checks a blaze attribute in this build yet but `args`, `capability`, and `cost`"
         );
     }
 

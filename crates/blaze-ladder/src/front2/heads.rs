@@ -900,6 +900,15 @@ pub struct AdtRow {
     /// which the body check's `args-inline` reads (blaze-typeck rules/args_inline.rs); the head
     /// record keeps it, so an ADT of any crate is known.
     pub args: bool,
+    /// Marked `#[blaze::capability]` (`docs/v2/plan/design/drop-with.md`, section 6): a
+    /// host/runtime capability that cannot be stored as a field (directly or transitively) inside
+    /// any type defined in a `#![blaze::sans_io]` crate or module. Answered as
+    /// [`tc::TypeAttrs::CAPABILITY`].
+    pub capability: bool,
+    /// Defined inside a `#![blaze::sans_io]` crate or module (or marked `#[blaze::sans_io]`):
+    /// checked by `blaze::capability_in_sans_io` (`blaze-typeck` `rules/capability.rs`). Answered
+    /// as [`tc::TypeAttrs::SANS_IO`].
+    pub sans_io: bool,
 }
 
 /// Reads one `#[rustc_layout_scalar_valid_range_start(n)]` or `..._end(n)` (its path `path` as
@@ -935,6 +944,215 @@ pub(crate) fn valid_range_of(path: &str, args: &str, kind: tc::AdtKind, out: &mu
 /// Whether an attribute's path, as written, is `blaze::args` (spaces around `::` allowed).
 fn is_args_attr(path: &str) -> bool {
     path.split_once("::").is_some_and(|(tool, rest)| tool.trim() == "blaze" && rest.trim() == "args")
+}
+
+/// Whether an attribute's path, as written, is `blaze::capability` (spaces around `::` allowed).
+fn is_capability_attr(path: &str) -> bool {
+    path.split_once("::").is_some_and(|(tool, rest)| tool.trim() == "blaze" && rest.trim() == "capability")
+}
+
+/// Whether an attribute's path, as written, is `blaze::sans_io` (spaces around `::` allowed).
+fn is_sans_io_attr(path: &str) -> bool {
+    path.split_once("::").is_some_and(|(tool, rest)| tool.trim() == "blaze" && rest.trim() == "sans_io")
+}
+
+/// Skips leading whitespace, `//` line comments, and nested `/* ... */` block comments.
+fn skip_ws_and_comments(mut s: &str) -> &str {
+    loop {
+        let trimmed = s.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("//") {
+            match rest.find('\n') {
+                Some(nl) => s = &rest[nl + 1..],
+                None => return "",
+            }
+            continue;
+        }
+        if let Some(mut rest) = trimmed.strip_prefix("/*") {
+            let mut depth = 1usize;
+            while depth > 0 {
+                let open = rest.find("/*");
+                let close = rest.find("*/");
+                match (open, close) {
+                    (_, None) => return "",
+                    (Some(o), Some(c)) if o < c => {
+                        depth += 1;
+                        rest = &rest[o + 2..];
+                    }
+                    (_, Some(c)) => {
+                        depth -= 1;
+                        rest = &rest[c + 2..];
+                    }
+                }
+            }
+            s = rest;
+            continue;
+        }
+        return trimmed;
+    }
+}
+
+/// Scans past a balanced `[` ... `]` attribute body (starting just after `[`), returning
+/// `(inner_text, rest_after_close_bracket)`.
+fn scan_attr_bracket(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 1usize;
+    let mut in_str = false;
+    let mut escape = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&s[..i], &s[i + 1..]));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Returns `true` iff `text`'s leading inner attributes (`#![...]`) include `#![blaze::sans_io]`.
+fn has_leading_inner_sans_io(mut text: &str) -> bool {
+    for _ in 0..256 {
+        text = skip_ws_and_comments(text);
+        let Some(after_hash) = text.strip_prefix('#') else { return false };
+        let after_hash = skip_ws_and_comments(after_hash);
+        let Some(after_bang) = after_hash.strip_prefix('!') else { return false };
+        let after_bang = skip_ws_and_comments(after_bang);
+        let Some(after_open) = after_bang.strip_prefix('[') else { return false };
+        let Some((inner, rest)) = scan_attr_bracket(after_open) else { return false };
+        if is_sans_io_attr(inner.trim()) {
+            return true;
+        }
+        text = rest;
+    }
+    false
+}
+
+/// Scans `text[..target_offset]` with a tiny stack of enclosing `{` offsets (skipping comments,
+/// strings, and char literals) and returns `true` iff any enclosing `{ ... }` block starts with
+/// `#![blaze::sans_io]` (e.g. `mod core_mod { #![blaze::sans_io] ... }`).
+fn enclosing_block_has_sans_io(text: &str, target_offset: usize) -> bool {
+    let limit = target_offset.min(text.len());
+    let bytes = text.as_bytes();
+    let mut stack = [0usize; 64];
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < limit {
+        let b = bytes[i];
+        // Line comment `// ...`
+        if b == b'/' && i + 1 < limit && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < limit && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Nested block comment `/* ... */`
+        if b == b'/' && i + 1 < limit && bytes[i + 1] == b'*' {
+            i += 2;
+            let mut cdepth = 1usize;
+            while i < limit && cdepth > 0 {
+                if bytes[i] == b'/' && i + 1 < limit && bytes[i + 1] == b'*' {
+                    cdepth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && i + 1 < limit && bytes[i + 1] == b'/' {
+                    cdepth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // String literal `"..."`
+        if b == b'"' {
+            i += 1;
+            while i < limit {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                } else if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // Char literal `'x'` / `'\''` (distinguished from lifetime `'a` by closing `'`).
+        if b == b'\'' {
+            if i + 2 < limit && bytes[i + 1] == b'\\' {
+                if i + 3 < limit && bytes[i + 3] == b'\'' {
+                    i += 4;
+                    continue;
+                }
+            } else if i + 2 < limit && bytes[i + 2] == b'\'' {
+                i += 3;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'{' {
+            if depth < stack.len() {
+                stack[depth] = i;
+            }
+            depth += 1;
+        } else if b == b'}' && depth > 0 {
+            depth -= 1;
+        }
+        i += 1;
+    }
+    let kept = depth.min(stack.len());
+    for &brace in &stack[..kept] {
+        if let Some(after) = text.get(brace + 1..)
+            && has_leading_inner_sans_io(after)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns `true` iff `key` is defined inside a `#![blaze::sans_io]` crate, module file, or
+/// inline `mod { #![blaze::sans_io] ... }` block.
+fn is_in_sans_io_scope<'n, S: NamesSource<'n>>(names: S, key: LibKey, module: LibKey) -> bool {
+    let Some(krate) = names.crate_of(key).or_else(|| names.crate_of(module)) else {
+        return false;
+    };
+    // 1. Crate root file (`file 0`) carries `#![blaze::sans_io]`.
+    if let Some(root_text) = names.file_text(krate, 0)
+        && has_leading_inner_sans_io(root_text)
+    {
+        return true;
+    }
+    // 2. Item's own file carries `#![blaze::sans_io]` or an enclosing inline `mod { #![blaze::sans_io] ... }`.
+    if let Some((blaze_scope::resolve::At::File(file), start)) = names.item_start(key)
+        && let Some(text) = names.file_text(krate, file)
+    {
+        if (file != 0 && has_leading_inner_sans_io(text)) || enclosing_block_has_sans_io(text, start as usize) {
+            return true;
+        }
+    }
+    false
 }
 
 /// An enum's discriminant type (the Reference, "Enumerations", "Discriminants": "Under the
@@ -5715,6 +5933,8 @@ impl<'n> Store<'n> {
         let mut repr = blaze_build::layout::ReprAttrs::RUST;
         let mut valid = blaze_build::layout::ValidRange::default();
         let mut args = false;
+        let mut capability = false;
+        let mut sans_io = false;
         let coherence = self.adt_declarations.get(&ck).ok_or(Why::Need(key))?.marks;
         let attrs = v.list(head::ATTRS);
         for (i, &n) in v.rows(attrs)?.iter().enumerate() {
@@ -5735,14 +5955,17 @@ impl<'n> Store<'n> {
                 valid_range_of(path, v.text_at(a.args)?, kind, &mut valid).map_err(|what| Why::Unsupported(what, r))?;
             }
             args |= is_args_attr(path);
+            capability |= is_capability_attr(path);
+            sans_io |= is_sans_io_attr(path);
         }
+        sans_io |= is_in_sans_io_scope(names, key, module);
         let discrs = discriminants(&b, &mut self.tys, &env, v, repr, &written)?;
         self.register_record_defaults(names, keys, key, &env, marks, v)?;
         let (lifetimes, field_region_at, field_region_list) = super::borrows::freeze_field_regions(names, keys, self, ck, v, kind, &fields, self.tys.alloc())?;
         let field_regions = super::borrows::FieldRegions::new(field_region_at, field_region_list, self.tys.alloc());
         let auto_copy = is_auto_copy_pub_view(names, key, module, kind, v)?;
         self.auto_copy_pub.insert(ck, auto_copy);
-        self.adts.insert(ck, AdtRow { kind, generics, variants, fields, field_vis, repr, valid, discrs, args, marks: coherence, lifetimes, field_regions });
+        self.adts.insert(ck, AdtRow { kind, generics, variants, fields, field_vis, repr, valid, discrs, args, capability, sans_io, marks: coherence, lifetimes, field_regions });
         self.adt_life_from_view(names, keys, key, module, v);
         Ok(())
     }

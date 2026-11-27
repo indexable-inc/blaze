@@ -27,8 +27,10 @@ use blaze_lir::{
     inline::{InlinePolicy, SiteWeights},
     lto::{ModuleBody, OptimizedBody, lto_optimize_module, tarjan_sccs},
     superopt::SuperoptOpts,
-    verify,
+    verify_in,
 };
+#[cfg(test)]
+use blaze_lir::verify;
 use blaze_own::{Alloc, Vec};
 use blaze_tier::{
     Arch, CallClobbers, Emitted, Machine, Named, Names, Outside, Reg, RegSet, RoutinePlaces, Tier,
@@ -551,7 +553,7 @@ pub fn compile_module_a64<'a, 'f, F: Tier>(
                 inst: None,
                 what: "missing module function",
             })?;
-            let verified = verify(opt_func.view()).map_err(|_| TierError::Refused {
+            let verified = verify_in(opt_func.view(), alloc).map_err(|_| TierError::Refused {
                 tier: TierName::Sota,
                 inst: None,
                 what: "post-LTO optimized LIR failed verify",

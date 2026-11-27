@@ -74,7 +74,7 @@ use blaze_lir::{
     unroll::{rotate_loops, unroll_scalar_loops},
     unswitch::unswitch_loops,
     vectorize::{auto_vectorize_loops_with_width, vectorize_iv_div_loops},
-    verify,
+    verify_in,
 };
 use blaze_own::Alloc;
 use blaze_tier::{Arch, CallClobbers, Emitted, Machine, Names, RelocKind, Tier, TierError, TierName};
@@ -275,7 +275,7 @@ fn run_sroa_thread_cleanup<'a>(
     if let Ok(Some(rpo)) = reorder_blocks_rpo(v, alloc) {
         cur = Some(rpo.func);
     }
-    cur.filter(|f| verify(f.view()).is_ok())
+    cur.filter(|f| verify_in(f.view(), alloc).is_ok())
 }
 
 /// Shared Stage 1a–1g loop, vectorization, dispatch tail-duplication, superoptimization,
@@ -707,7 +707,7 @@ impl<F: Tier> Tier for Sota<F> {
                 self.superopt,
                 alloc,
             )?;
-            verify(opt_owned.view()).map_err(|_| TierError::Refused {
+            verify_in(opt_owned.view(), alloc).map_err(|_| TierError::Refused {
                 tier: Self::NAME,
                 inst: None,
                 what: "SOTA optimized LIR failed verify",
@@ -1180,7 +1180,7 @@ pub fn emit_sota_record_for_machine_with_abi<'a>(
     let sota_opt = run_midend
         .then(|| sota_optimize_fixpoint(mid_in, RegBudget::AARCH64, max_rounds, |_| 1, alloc).ok())
         .flatten();
-    let chosen_opt = sota_opt.as_ref().and_then(|res| verify(res.func.view()).ok());
+    let chosen_opt = sota_opt.as_ref().and_then(|res| verify_in(res.func.view(), alloc).ok());
     let has_fast_abi_req = opts.internal_fast
         || !collect_misel_fast_calls(func.view(), opts.internal_fast_callees, alloc).is_empty();
 
@@ -1195,7 +1195,7 @@ pub fn emit_sota_record_for_machine_with_abi<'a>(
                 alloc,
             )
         });
-        let full_v = match late_func.as_ref().map(|f| verify(f.view())) {
+        let full_v = match late_func.as_ref().map(|f| verify_in(f.view(), alloc)) {
             Some(Ok(v)) => v,
             _ => opt_v,
         };
@@ -1218,7 +1218,7 @@ pub fn emit_sota_record_for_machine_with_abi<'a>(
                 superopt,
                 alloc,
             ));
-            if let Some(nv) = late_no_vec.as_ref().and_then(|f| verify(f.view()).ok())
+            if let Some(nv) = late_no_vec.as_ref().and_then(|f| verify_in(f.view(), alloc).ok())
                 && {
                     let nv_fast = collect_misel_fast_calls(nv.view(), opts.internal_fast_callees, alloc);
                     misel_subset_ok(nv.view(), names, opts, nv_fast.as_slice())

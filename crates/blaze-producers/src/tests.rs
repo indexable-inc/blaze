@@ -427,3 +427,100 @@ fn a_missing_lock_row_refuses_its_row_alone() {
     }
     std::println!("producers: a missing lock row, an unnamed path crate and a required unlocked dependency each refused the names row alone");
 }
+
+fn drive_single<'a>(files: &[(&str, &str)], row: Row, alloc: Alloc<'a>) -> Result<crate::SingleDigest<'a>, Refused<'a>> {
+    let mut walk = Walk::for_row(row, alloc)?;
+    loop {
+        match walk.next()? {
+            Step::Done => break,
+            Step::Read(path) => {
+                let found = files.iter().find(|(p, _)| *p == path).map(|(_, text)| text.as_bytes());
+                walk.read(found)?;
+            }
+            Step::List(dir) => {
+                let mut entries: Vec<Entry<'_>, Alloc<'_>> = Vec::new_in(alloc);
+                let mut owned: Vec<(usize, usize, usize, bool), Alloc<'_>> = Vec::new_in(alloc);
+                for (at, (path, _)) in files.iter().enumerate() {
+                    let Some(rest) = path.strip_prefix(dir).and_then(|r| r.strip_prefix('/')) else { continue };
+                    let start = path.len() - rest.len();
+                    let (len, is_dir) = match rest.find('/') {
+                        Some(end) => (end, true),
+                        None => (rest.len(), false),
+                    };
+                    if !owned.iter().any(|&(a, s, l, _)| files[a].0[s..s + l] == path[start..start + len]) {
+                        owned.push((at, start, len, is_dir));
+                    }
+                }
+                for &(at, start, len, is_dir) in owned.iter() {
+                    entries.push(Entry { name: &files[at].0[start..start + len], is_dir });
+                }
+                walk.listed(if entries.is_empty() { None } else { Some(&entries[..]) })?;
+            }
+        }
+    }
+    walk.finish_row(row)
+}
+
+#[test]
+fn producer_exclude_and_for_row_scope_code_builder_precisely() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let ladder_with_export = "[package]\nname = \"blaze-ladder\"\n\n[package.metadata.blaze]\nproducer = [\"body-checker\", \"code-builder\"]\n\n[package.metadata.blaze.producer-exclude]\ncode-builder = [\"blaze-export\"]\n\n[dependencies]\nblaze-export = { path = \"../blaze-export\" }\n\n[target.'cfg(unix)'.dependencies]\nblaze-typeck = { path = \"../blaze-typeck\" }\n";
+    let base_tree = tree(
+        &[
+            ("crates/blaze-ladder/Cargo.toml", ladder_with_export),
+            ("crates/blaze-export/Cargo.toml", "[package]\nname = \"blaze-export\"\n"),
+            ("crates/blaze-export/src/lib.rs", "pub fn export() {}\n"),
+        ],
+        alloc,
+    );
+    let base = run(&base_tree, false, alloc).expect("workspace with producer-exclude walks");
+    let single = drive_single(&base_tree, Row::CodeBuilder, alloc).expect("single-row walk succeeds");
+    assert_eq!(
+        single.digest.source(),
+        base.rows.iter().find(|(r, _)| *r == Row::CodeBuilder).and_then(|(_, d)| d.source()),
+        "Walk::for_row matches full Walk digest for CodeBuilder"
+    );
+    assert!(
+        !single.watch.iter().any(|w| w.as_str() == "crates/blaze-export/src"),
+        "excluded crate's src is not watched for CodeBuilder: {:?}",
+        single.watch
+    );
+
+    // Editing blaze-export moves body-checker (which did NOT exclude it) but NOT code-builder!
+    let edit_export = tree(
+        &[
+            ("crates/blaze-ladder/Cargo.toml", ladder_with_export),
+            ("crates/blaze-export/Cargo.toml", "[package]\nname = \"blaze-export\"\n"),
+            ("crates/blaze-export/src/lib.rs", "pub fn export() { 42; }\n"),
+        ],
+        alloc,
+    );
+    let after_export = run(&edit_export, false, alloc).expect("after export edit");
+    assert_eq!(&moved(&base, &after_export, alloc)[..], &["body-checker"]);
+    let single_after_export = drive_single(&edit_export, Row::CodeBuilder, alloc).expect("single after export edit");
+    assert_eq!(single_after_export.digest.source(), single.digest.source());
+
+    // Editing a codegen dependency (blaze-typeck) DOES move code-builder!
+    let edit_codegen = tree(
+        &[
+            ("crates/blaze-ladder/Cargo.toml", ladder_with_export),
+            ("crates/blaze-export/Cargo.toml", "[package]\nname = \"blaze-export\"\n"),
+            ("crates/blaze-export/src/lib.rs", "pub fn export() {}\n"),
+            ("crates/blaze-typeck/src/lib.rs", "pub fn check() { 99; }\n"),
+        ],
+        alloc,
+    );
+    let single_after_codegen = drive_single(&edit_codegen, Row::CodeBuilder, alloc).expect("single after codegen edit");
+    assert_ne!(single_after_codegen.digest.source(), single.digest.source());
+
+    // Excluding a nonexistent dependency key is refused by name (Rule 3, Rule 21).
+    let bad_exclude = ladder_with_export.replace("[\"blaze-export\"]", "[\"typo-crate\"]");
+    let bad_tree = tree(&[("crates/blaze-ladder/Cargo.toml", bad_exclude.as_str())], alloc);
+    match run(&bad_tree, false, alloc) {
+        Err(Refused::UnknownExclude { path, dep }) => {
+            assert_eq!(path.as_str(), "crates/blaze-ladder/Cargo.toml");
+            assert_eq!(dep.as_str(), "typo-crate");
+        }
+        other => panic!("expected UnknownExclude, got {:?}", other.map(|_| ())),
+    }
+}
