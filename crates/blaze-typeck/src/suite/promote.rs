@@ -589,3 +589,102 @@ fn nested_shared_ref_to_const_is_promoted() {
         assert!(c.promoted.is_empty(), "`&[(3, &local)]` must NOT be promoted: {:?}", c.promoted);
     }
 }
+
+/// Constant promotion for shared index bases (`&[3u8][0]`) and non-capturing closures (`&|x| x`):
+/// - `&[3u8][0]` promotes the `Expr::Index` base; `&mut [3u8][0]` and `&[local][0]` do NOT.
+/// - `&|x: u8| x` (0 captures) promotes the `Expr::Ref`; `&|| local` (captures `local`) does NOT.
+#[test]
+fn shared_index_base_and_non_capturing_closure_are_promoted() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Default::default(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let copy = fx.tr("Copy", 1, Default::default(), &[]);
+    fx.lang(LangItem::Copy, copy);
+    let freeze = fx.tr("Freeze", 1, Default::default(), &[]);
+    fx.auto(freeze);
+    fx.lang(LangItem::Freeze, freeze);
+    let u8_ = fx.u8();
+    let usize_ = fx.usize();
+    let r_u8 = fx.r(Mutbl::Not, u8_);
+    let rm_u8 = fx.r(Mutbl::Mut, u8_);
+    let unit = fx.unit();
+    let f_idx_ok = fx.func("f_idx_ok", 0, &[usize_], r_u8, Default::default());
+    let f_idx_mut = fx.func("f_idx_mut", 0, &[usize_], rm_u8, Default::default());
+    let f_idx_local = fx.func("f_idx_local", 0, &[u8_, usize_], r_u8, Default::default());
+    let f_cl_ok = fx.func("f_cl_ok", 0, &[], unit, Default::default());
+    let f_cl_cap = fx.func("f_cl_cap", 0, &[u8_], unit, Default::default());
+    fx.finish();
+
+    // Positive 1: `&[3u8][i]` promotes the `Expr::Index` (even with runtime index `i`).
+    {
+        let mut bb = Bb::new();
+        let pi = bb.param("i");
+        let three = bb.int(None);
+        let arr = bb.array(&[three]);
+        let li = bb.local(pi);
+        let idx = bb.e(crate::body::Expr::Index { base: arr, index: li });
+        let r = bb.borrow(Mutbl::Not, idx);
+        let root = bb.block(&[], Some(r));
+        let c = check_body(&fx, &bb, f_idx_ok, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert_eq!(&c.promoted[..], &[idx][..], "`&[3u8][i]` must promote the index base: {:?}", c.promoted);
+    }
+
+    // Negative 1: `&mut [3u8][i]` must NOT promote.
+    {
+        let mut bb = Bb::new();
+        let pi = bb.param("i");
+        let three = bb.int(None);
+        let arr = bb.array(&[three]);
+        let li = bb.local(pi);
+        let idx = bb.e(crate::body::Expr::Index { base: arr, index: li });
+        let r = bb.borrow(Mutbl::Mut, idx);
+        let root = bb.block(&[], Some(r));
+        let c = check_body(&fx, &bb, f_idx_mut, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert!(c.promoted.is_empty(), "`&mut [3u8][i]` must NOT be promoted: {:?}", c.promoted);
+    }
+
+    // Negative 2: `&[local][i]` must NOT promote.
+    {
+        let mut bb = Bb::new();
+        let pl = bb.param("local");
+        let pi = bb.param("i");
+        let ll = bb.local(pl);
+        let arr = bb.array(&[ll]);
+        let li = bb.local(pi);
+        let idx = bb.e(crate::body::Expr::Index { base: arr, index: li });
+        let r = bb.borrow(Mutbl::Not, idx);
+        let root = bb.block(&[], Some(r));
+        let c = check_body(&fx, &bb, f_idx_local, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert!(c.promoted.is_empty(), "`&[local][i]` must NOT be promoted: {:?}", c.promoted);
+    }
+
+    // Positive 2: `&|| 1u8` (non-capturing closure) promotes the borrow.
+    {
+        let mut bb = Bb::new();
+        let one = bb.int(None);
+        let cl = bb.closure(&[], one);
+        let r = bb.borrow(Mutbl::Not, cl);
+        let st = bb.semi(r);
+        let root = bb.block(&[st], None);
+        let c = check_body(&fx, &bb, f_cl_ok, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert_eq!(&c.promoted[..], &[r][..], "`&|| 1u8` must be promoted: {:?}", c.promoted);
+    }
+
+    // Negative 3: `&|| local` (capturing closure) must NOT promote.
+    {
+        let mut bb = Bb::new();
+        let pl = bb.param("local");
+        let ll = bb.local(pl);
+        let cl = bb.closure(&[], ll);
+        let r = bb.borrow(Mutbl::Not, cl);
+        let st = bb.semi(r);
+        let root = bb.block(&[st], None);
+        let c = check_body(&fx, &bb, f_cl_cap, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert!(c.promoted.is_empty(), "`&|| local` must NOT be promoted: {:?}", c.promoted);
+    }
+}

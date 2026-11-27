@@ -227,7 +227,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         // A shared autoref promoted to `'static` (`Checked::promoted`): the constant's address,
         // never a frame temporary; any coercions after it (e.g. `Unsize`) run from `lo + 1`.
         if hi > lo
-            && !matches!(self.expr(e)?, Expr::Ref { .. })
+            && !matches!(self.expr(e)?, Expr::Ref { .. } | Expr::Index { .. })
             && let Some((AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. }, to)) = self.adjust(lo)
             && self.is_promoted(e)
         {
@@ -645,7 +645,15 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         let builtin = matches!(self.node(bt, At::Expr(base))?, PNode::Array(..) | PNode::Slice(_))
             && matches!(self.node(it, At::Expr(index))?, PNode::Uint(UintTy::Usize));
         if builtin {
-            let bp = self.place(base)?;
+            let bp = if !self.ck.index_is_mut(e) && self.is_promoted(e) {
+                let ref_ty = self.find_ty(PNode::Ref(Mutbl::Not, bt), at)?;
+                let c = self.b.new_const(ConstDecl { kind: ConstKind::Promoted(e.0), ty: ref_ty });
+                let rt = self.scratch(e, ref_ty);
+                self.b.assign(rt, Value::Use(Operand::Const(c)), span);
+                self.b.project(rt, Proj::Deref)
+            } else {
+                self.place(base)?
+            };
             let iv = self.operand(index)?;
             let (il, ip) = self.temp_local(index, it, Role::Value)?;
             self.b.assign(ip, Value::Use(iv), span);
@@ -684,7 +692,18 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             None
         };
         let ref_ty = self.find_ty(PNode::Ref(mutbl, bt), at)?;
-        let base_op = if let Some(arr_ty) = array_to_slice {
+        let base_op = if mutbl == Mutbl::Not && self.is_promoted(e) {
+            if let Some(arr_ty) = array_to_slice {
+                let thin_ty = self.find_ty(PNode::Ref(Mutbl::Not, arr_ty), at)?;
+                let c = self.b.new_const(ConstDecl { kind: ConstKind::Promoted(e.0), ty: thin_ty });
+                let wide_t = self.temp(base, ref_ty, Role::Value)?;
+                self.b.assign(wide_t, Value::Cast { kind: CastKind::Unsize, operand: Operand::Const(c), ty: ref_ty }, span);
+                Operand::Copy(wide_t)
+            } else {
+                let c = self.b.new_const(ConstDecl { kind: ConstKind::Promoted(e.0), ty: ref_ty });
+                Operand::Const(c)
+            }
+        } else if let Some(arr_ty) = array_to_slice {
             let v = self.val_prefix(base, blo, bhi - 1)?;
             let ap = self.to_place(v, base)?;
             let thin_ty = self.find_ty(PNode::Ref(mutbl, arr_ty), at)?;

@@ -1844,7 +1844,13 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             _ => (None, None),
         };
         if let (Some(self_shape), Some(tc_shape)) = (self_shape, tc_shape) {
-            g.owner_trait_impls.push(blaze_flow_lower::OwnerTraitImpl { imp: container, trait_: tr, generics: ih.generics, self_shape });
+            g.owner_trait_impls.push(blaze_flow_lower::OwnerTraitImpl {
+                imp: container,
+                trait_: tr,
+                generics: ih.generics,
+                self_shape,
+                is_enclosing: true,
+            });
             traits.push(tr.0);
             selected.push((container.0, None));
             // Also record unique impls of `tr`'s `Self`-supertraits for `SelfTy` (e.g.
@@ -1884,7 +1890,13 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                         && container_head(r, lib, false)
                         && let Some(sup_ih) = r.store.impls.get(&imp)
                     {
-                        g.owner_trait_impls.push(blaze_flow_lower::OwnerTraitImpl { imp, trait_: sup, generics: sup_ih.generics, self_shape });
+                        g.owner_trait_impls.push(blaze_flow_lower::OwnerTraitImpl {
+                            imp,
+                            trait_: sup,
+                            generics: sup_ih.generics,
+                            self_shape,
+                            is_enclosing: false,
+                        });
                         traits.push(sup.0);
                         selected.push((imp.0, None));
                     }

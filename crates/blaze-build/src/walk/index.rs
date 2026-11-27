@@ -79,6 +79,9 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         if self.index_builtin(e)? {
             self.work.push(Task::IndexPlace(e));
             self.work.push(Task::Eval(index));
+            if !self.checked.index_is_mut(e) && self.is_promoted(e) {
+                return self.promoted_place(e);
+            }
             return self.push_index_base(base);
         }
         // A `&mut` autoref of the index's own place (a `&mut self` method on `w[i]`).
@@ -93,6 +96,9 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         self.work.push(Task::DerefPlace);
         self.work.push(Task::IndexCall(e));
         self.work.push(Task::Eval(index));
+        if !self.checked.index_is_mut(e) && self.is_promoted(e) {
+            return self.promoted_ref(e);
+        }
         self.work.push(Task::Ref);
         if self.array_as_slice(base)? {
             // The steps up to the array: its place, borrowed thin; `index_call` widens it.

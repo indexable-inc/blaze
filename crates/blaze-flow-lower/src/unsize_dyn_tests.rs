@@ -730,6 +730,85 @@ fn lay_written_param_reads_alias_closure_param_regions() {
     );
 }
 
+/// Regression for `crates/blaze-std/src/pointer.rs:1434` (`let map1 = |k: &str, v: Value<_>| { ... }`):
+/// when a written closure parameter type contains a `_` hole (`Value<_>` inferred to `Value<Alloc<'a>>`),
+/// `closure_param_regions` records `WrittenRegion::Inferred` at the `_` path. `lay_written_param`
+/// must lay every lifetime under that `_` hole as `SigSlot::Owner` (existential in the enclosing fn),
+/// never `SigSlot::Late` (universal per call).
+#[test]
+fn lay_written_param_treats_inferred_hole_as_owner_region() {
+    let mut fx = Fx::new();
+    let alloc_k = fx.strukt("Alloc", 0, &[]);
+    let alloc_ty = fx.adt(alloc_k, &[]);
+    let val_k = fx.strukt("Value", 1, &[]);
+    let val_alloc = fx.adt(val_k, &[alloc_ty]);
+    let unit = fx.unit();
+    let use_val = fx.func("use_val", 0, &[val_alloc], unit, vec![]);
+    let f = fx.func("f", 0, &[], unit, vec![]);
+    fx.finish();
+
+    let mut decls = Decls::new();
+    decls.adt(alloc_k, 1);
+    decls.adt(val_k, 0);
+    decls.func(use_val, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[val_alloc], output: unit, slots: &[P0] });
+    decls.func(f, FnHead { lifetimes: 1, late: &[], outlives: &[], inputs: &[], output: unit, slots: &[] });
+
+    let run_case = |with_inferred: bool| {
+        let mut b = Bb::new();
+        let pv = b.bind("v");
+        let lv = b.local(pv);
+        let uv = b.path(&["use_val"]);
+        let call = b.call(uv, &[lv]);
+        let cl = b.closure(&[pv], call);
+        let pwork = b.bind("work");
+        let st = b.let_(pwork, None, cl);
+        let root = b.block(&[st], None);
+        let mut view = b.view(f, root);
+        let mut ck = region_fixture::checked(&fx, &view);
+        let alloc_body = ck.types.intern(PNode::Adt(alloc_k, List::EMPTY)).expect("intern");
+        let val_args = ck.types.intern_list(&[alloc_body]).expect("intern");
+        let val_body = ck.types.intern(PNode::Adt(val_k, val_args)).expect("intern");
+        let unit_body = ck.types.intern(PNode::Tuple(List::EMPTY)).expect("intern");
+        let sig_list = ck.types.intern_list(&[val_body, unit_body]).expect("intern");
+        let sig_ty = ck.types.intern(PNode::FnPtr(sig_list, blaze_typeck::FnPtrHeader::RUST)).expect("intern");
+        let row = ck.closures.column::<0>().iter().position(|&c| c == cl).expect("closure row");
+        ck.closures.column_mut::<2>()[row] = sig_ty;
+        ck.closures.column_mut::<4>()[row] = blaze_typeck::SigFrom::Written;
+        ck.local_ty[pv.ix()] = val_body;
+        ck.expr_ty[lv.ix()] = val_body;
+        let step0 = ClosureParamRegion::push_step(ClosureParamRegion::ROOT, 0).expect("step0");
+        let written = [ClosureParamRegion { closure: cl, param: 0, path: step0, own: 0, kind: WrittenRegion::Inferred }];
+        if with_inferred {
+            view.closure_param_regions = &written;
+        }
+        let mut base = UnsizeFacts::new();
+        base.adts.push((alloc_k, 1, true));
+        base.adts.push((val_k, 0, false));
+        let regions = decls.lay(fx.t.view(), &mut ck.types);
+        let with = region_fixture::WithRegions { base: &base, regions: &regions };
+        let cf = lower_closure_external(&view, &ck, cl, &with, region_fixture::alloc()).expect("lower_closure_external");
+        let rep = blaze_flow::check(&cf.lowered.flow, region_fixture::alloc()).expect("check");
+        (cf, rep)
+    };
+
+    // POSITIVE: `|v: Value<_>|` with `WrittenRegion::Inferred` at child 0 -> `SigOwner(0)`!
+    let (cf_ok, rep_ok) = run_case(true);
+    assert!(
+        cf_ok.externals.iter().any(|&(_, w)| matches!(w, External::SigOwner(0))),
+        "POSITIVE: inferred `_` hole in `Value<_>` must lower to `External::SigOwner(0)`: {:?}",
+        cf_ok.externals
+    );
+    assert!(rep_ok.borrows.is_empty(), "POSITIVE: expected clean check, got {:?}", rep_ok.borrows);
+
+    // NEGATIVE: without `WrittenRegion::Inferred` (e.g. `|v: Value<Alloc<'_>>|`) -> `External::Late`!
+    let (cf_late, _) = run_case(false);
+    assert!(
+        !cf_late.externals.iter().any(|&(_, w)| matches!(w, External::SigOwner(_))),
+        "NEGATIVE: elided lifetime without `Inferred` must stay `External::Late`: {:?}",
+        cf_late.externals
+    );
+}
+
 /// `lower_closure_as_fn_once` (`crates/blaze-cli/src/store/take.rs:826` shape):
 /// `bufs_chunk: &'w mut S` captured `ByValue` by a `move` closure that `blaze-typeck` inferred as
 /// `ClosureKind::FnMut`:

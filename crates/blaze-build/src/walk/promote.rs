@@ -59,6 +59,18 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         Ok(())
     }
 
+    /// Promoted base place of a shared index expression (`&[..][i]`): pushes `V::Place(at, 0)`
+    /// pointing at the constant row instead of evaluating the base into a frame temporary.
+    pub(super) fn promoted_place(&mut self, e: ExprId) -> Result<(), BuildError> {
+        let adts = self.adts;
+        let owner = self.body.owner;
+        let record = adts.promoted_value(owner, e, self.args).ok_or(BuildError::NoPromotedValue { expr: e, owner })?;
+        record.check().map_err(|_| malformed("a promoted borrow's record that breaks the data form"))?;
+        let at = self.data_rows(e, record)?;
+        self.push_val(V::Place(at, 0), None);
+        Ok(())
+    }
+
     /// Each allocation of `record` as a data row of the function, its relocations resolved;
     /// returns the root's address: the one home of a promoted borrow's rows and of a constant
     /// path's or a const block's (walk.rs `const_record_value`). A fn target is a `Func`

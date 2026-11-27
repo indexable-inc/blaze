@@ -4961,7 +4961,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             // were already pushed above as `Task::Adjust(e, 1)`. An `Expr::Ref` listed in
             // `Checked::promoted` promotes its own `&operand`, not a further autoref of it.
             (0, true)
-                if !matches!(self.expr(e)?, Expr::Ref { .. })
+                if !matches!(self.expr(e)?, Expr::Ref { .. } | Expr::Index { .. })
                     && matches!(kinds[0], AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. })
                     && self.is_promoted(e) =>
             {

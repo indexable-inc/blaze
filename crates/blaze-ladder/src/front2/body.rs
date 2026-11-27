@@ -912,6 +912,15 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
                         cursor = next_cursor;
                     }
                 }
+                blaze_typeck::PNode::Infer => {
+                    out(blaze_typeck::ClosureParamRegion {
+                        closure,
+                        param,
+                        path,
+                        own: 0,
+                        kind: blaze_typeck::WrittenRegion::Inferred,
+                    });
+                }
                 blaze_typeck::PNode::Bool
                 | blaze_typeck::PNode::Char
                 | blaze_typeck::PNode::Int(_)
@@ -922,7 +931,6 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
                 | blaze_typeck::PNode::Param(_)
                 | blaze_typeck::PNode::ConstValue { .. }
                 | blaze_typeck::PNode::ConstParam(_)
-                | blaze_typeck::PNode::Infer
                 | blaze_typeck::PNode::Error => {}
                 _ => return false,
             }
@@ -2818,5 +2826,93 @@ pub fn make_from() {
                 (0, p_names, 0, WrittenRegion::Elided(1)),
             ]
         );
+    }
+
+    /// `|k: &str, v: Value<_>|` (`crates/blaze-std/src/pointer.rs:1434` shape): a `_` type hole
+    /// inside a written closure parameter annotation records `WrittenRegion::Inferred` at the
+    /// hole's structural path so `blaze-flow-lower` lays its inferred lifetimes as owner regions.
+    #[test]
+    fn front2_closure_param_regions_records_inferred_hole() {
+        let src = r#"
+pub struct Alloc<'a>(&'a u8);
+pub struct Value<A>(A);
+pub fn f<'a>(a: Alloc<'a>) {
+    let _g = |k: &str, v: Value<_>| { let _ = (k, v, a); };
+}
+"#;
+        let heap = blaze_own::testing::heap();
+        let got = lower_regions(src, "f", heap.alloc());
+        let step = |p: u64, c: u32| ClosureParamRegion::push_step(p, c).expect("step");
+        let root = ClosureParamRegion::ROOT;
+        assert_eq!(&got[..], &[(1, step(root, 0), 0, WrittenRegion::Inferred)]);
+    }
+
+    /// `AliasPaths::expand` (`crates/blaze-ids/src/bits/tests.rs`, `blaze-lint-defs/src/set.rs`,
+    /// `target-features/src/lib.rs` shape): `type BitArray<const W: usize, I = usize> = Bits<[u64; W], I>;`
+    /// with both unsuffixed literal (`BitArray::<4>::all_below`) and named const (`BitArray::<WORDS, u16>::EMPTY`)
+    /// must stamp `usize` onto `PNode::ConstValue { ty: Infer, bits }` before substituting into
+    /// `Bits<[u64; W], I>`, preventing `Malformed(ConstValueType)` in `blaze-typeck`.
+    #[test]
+    fn front2_alias_path_const_arg_stamps_declared_type() {
+        let src = r#"
+#![no_core]
+pub struct Bits<S, I = usize>(S, I);
+impl<const W: usize, I> Bits<[u64; W], I> {
+    pub const EMPTY: Self = Bits([0; W], loop {});
+    pub fn all_below(_n: usize) -> Self { loop {} }
+}
+pub type BitArray<const W: usize, I = usize> = Bits<[u64; W], I>;
+pub fn use_bit_array() {
+    let _a = BitArray::<4>::all_below(3);
+    let _b = BitArray::<2, u16>::EMPTY;
+}
+"#;
+        let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let heap = blaze_own::testing::heap();
+        let store_alloc = heap.alloc();
+        let input = CrateInput {
+            name: "alias_const_arg_test",
+            key: CrateItemKey(ContentId::of("alias_path_const_arg_test", b"alias_const_arg")),
+            root: "/fnptr/src/lib.rs",
+            shown_from: "/fnptr/",
+            edition: Edition::E2024,
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2024), proc_macro: false, entry: false },
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let names = resolve_crates(&[input], Sysroot::default(), &OneFile(src), &Serial, bump).expect("resolve");
+        let front_frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("front frame");
+        let files = [SourceFile { path: "src/lib.rs", text: src }];
+        let mut front = Front2::new(&names, &front_frame, &files, store_alloc).expect("front2");
+        let prepared = Prepares::new_in(bump);
+        let mut store = Store::new(front.index.lang("sized"), front.frame, store_alloc);
+        let (fn_key, _, _) = names
+            .items(0)
+            .find(|(k, _, _)| names.item_text(*k).and_then(|t| t.name) == Some("use_bit_array"))
+            .expect("use_bit_array");
+        let body = lower_fn(&names, &prepared, &mut front.keys, &mut store, fn_key).expect("lower_fn");
+        let tys = body.tys.view(&store.tys).expect("tys");
+        let mut saw_expanded_array = false;
+        for &arg in body.typeck.type_lists.iter() {
+            if let Ok(blaze_typeck::PNode::Array(_, len)) = tys.node(arg) {
+                saw_expanded_array = true;
+                match tys.node(len) {
+                    Ok(blaze_typeck::PNode::ConstValue { ty, .. }) => {
+                        assert_eq!(
+                            tys.node(ty),
+                            Ok(blaze_typeck::PNode::Uint(blaze_typeck::UintTy::Usize)),
+                            "expanded alias array length must carry declared `usize` type, got {:?}",
+                            tys.node(ty)
+                        );
+                    }
+                    other => panic!("expected ConstValue array length in expanded BitArray, got {other:?}"),
+                }
+            }
+        }
+        assert!(saw_expanded_array, "expected expanded `[u64; W]` in lowered BitArray path args");
     }
 }

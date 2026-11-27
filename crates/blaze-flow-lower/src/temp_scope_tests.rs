@@ -907,3 +907,52 @@ fn branch_operand_temporaries_drop_before_outgoing_edges() {
         }
     }
 }
+
+/// `let (ref x,) = mk1() else { return; }; look(x);` (`crates/blaze-preview/src/lib.rs:417`
+/// `let Ok(DataValue::Map(ref map)) = read_in(..) else { continue; };` shape): an extending
+/// pattern (`ref`) on a `let ... else` statement extends the initializer temporary to the
+/// enclosing block, just as `let (ref x,) = mk1();` does.
+#[test]
+fn let_else_extending_ref_pattern_keeps_initializer_temporary_alive() {
+    let it = items();
+    for edition in [Edition::E2021, Edition::E2024] {
+        // Positive: `let (ref x,) = mk1() else { return; }; look(x);` -> clean.
+        let mut b = Bb::new();
+        let rx = b.bind_ref("x", Mutbl::Not);
+        let pat = b.tuple_pat(&[rx]);
+        let mk1 = b.path(&["mk1"]);
+        let init = b.call(mk1, &[]);
+        let ret = b.ret(None);
+        let else_blk = b.block(&[], Some(ret));
+        let st1 = b.let_else(pat, None, init, else_blk);
+        let look = b.path(&["look"]);
+        let lx = b.local(rx);
+        let call = b.call(look, &[lx]);
+        let st2 = b.semi(call);
+        let root = b.block(&[st1, st2], None);
+        let got = run(&it, &b, root, edition);
+        assert!(!found(&got), "`let (ref x,) = mk1() else {{ return; }}; look(x);` ({edition:?}) must be clean: {got:?}");
+
+        // Negative control: `let r = { let (ref x,) = mk1() else { return; }; x }; look(r);`
+        // MUST STILL FAIL (the extended temporary ends at the inner block, not past it).
+        let mut b = Bb::new();
+        let rx = b.bind_ref("x", Mutbl::Not);
+        let pat = b.tuple_pat(&[rx]);
+        let mk1 = b.path(&["mk1"]);
+        let init = b.call(mk1, &[]);
+        let ret = b.ret(None);
+        let else_blk = b.block(&[], Some(ret));
+        let st1 = b.let_else(pat, None, init, else_blk);
+        let lx = b.local(rx);
+        let inner = b.block(&[st1], Some(lx));
+        let pr = b.bind("r");
+        let st_let = b.let_(pr, None, inner);
+        let look = b.path(&["look"]);
+        let lr = b.local(pr);
+        let call = b.call(look, &[lr]);
+        let st_use = b.semi(call);
+        let root = b.block(&[st_let, st_use], None);
+        let got = run(&it, &b, root, edition);
+        assert!(found(&got), "NEGATIVE CONTROL: `let ... else` ref escaping inner block must fail ({edition:?}): {got:?}");
+    }
+}
