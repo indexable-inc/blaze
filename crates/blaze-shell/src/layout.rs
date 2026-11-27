@@ -1839,12 +1839,8 @@ fn layout_starship_line(
 
     let cap_x1 = (cx + pad_x).min(x0 + max_w);
     scene.rects[cap_idx].rect[2] = cap_x1;
-
-    // Quiet elapsed time outside the capsule when the previous command took >= 1s.
-    if prompt.last_duration_ms >= 1000 && cap_x1 + 70.0 < x0 + max_w {
-        let took = format!("took {}", format_duration_ms(prompt.last_duration_ms));
-        scene.text(cap_x1 + 10.0, ty, &took, meta_col, false, false, clip_id);
-    }
+    // The previous command's time is not repeated here: the composer's right edge shows it
+    // (with the exit code when it failed).
 
     cap_h
 }

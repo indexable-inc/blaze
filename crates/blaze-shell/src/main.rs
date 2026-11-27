@@ -1001,6 +1001,9 @@ mod macos_app {
         fn refresh_editor_assist(&mut self, open_popup: bool) {
             let st = self.store.active_state().fork();
             let cols = self.recent_table_columns();
+            if let Ok(home) = std::env::var("HOME") {
+                self.editor.auto_popup = blaze_shell::config::load_cached(&home).auto_popup;
+            }
             self.editor.refresh_assist(&st, &cols, open_popup);
         }
 
