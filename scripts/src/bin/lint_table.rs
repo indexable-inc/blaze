@@ -56,7 +56,7 @@ impl Input for Args {
 }
 
 fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    PathBuf::from(".")
 }
 
 fn read(path: &Path) -> String {
