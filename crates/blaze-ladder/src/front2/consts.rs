@@ -488,12 +488,24 @@ pub(super) fn written_name<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> Opt
     names.name_of(lib)
 }
 
+/// Whether `container` is a trait: already filed in `store.trait_defs`, or a library trait whose
+/// `Want::Members` has not been loaded yet (e.g. a cold cached-`Typed` run reading `T::CONST`
+/// before any body check touched the trait).
+fn is_trait_container<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'_>, container: ItemKey) -> bool {
+    store.trait_defs.contains_key(&container)
+        || keys.library_in(names, container).is_some_and(|lib| names.kind_of_item(lib) == Some(blaze_surface::ItemKind::Trait))
+}
+
 impl<'n, S: NamesSource<'n>> ConstsWorld<'_, 'n, S> {
     /// `item` as an associated constant DECLARED by a trait (`Specifier::BITS`): the trait and
     /// the constant's name; `None` for any other item (an impl's constant, a free one).
     fn trait_const(&self, item: ItemKey) -> Option<(ItemKey, tc::Name)> {
         match self.keys.origin(item)? {
-            super::keys::Origin::Member { container, kind: super::keys::MemberKind::Const, name } if self.store.trait_defs.contains_key(container) => Some((*container, tc::Name::of(name))),
+            super::keys::Origin::Member { container, kind: super::keys::MemberKind::Const, name }
+                if is_trait_container(self.names, self.keys, self.store, *container) =>
+            {
+                Some((*container, tc::Name::of(name)))
+            }
             _ => None,
         }
     }
@@ -917,7 +929,11 @@ impl<'n> Consts<'n> {
     /// ([`ConstsWorld::trait_const`], over the records as they are now).
     fn trait_of_const<S: NamesSource<'n>>(&self, r: &Records<'_, 'n, S>, item: ItemKey) -> Option<ItemKey> {
         match r.keys.origin(item)? {
-            super::keys::Origin::Member { container, kind: super::keys::MemberKind::Const, .. } if r.store.trait_defs.contains_key(container) => Some(*container),
+            super::keys::Origin::Member { container, kind: super::keys::MemberKind::Const, .. }
+                if is_trait_container(r.names, r.keys, r.store, *container) =>
+            {
+                Some(*container)
+            }
             _ => None,
         }
     }
@@ -1156,10 +1172,7 @@ impl<'n> Consts<'n> {
             }
             // A trait's constant has `Self` among its parameters: a need for it with no
             // arguments has no impl to select ([`ConstFail::TraitConstNoSelf`]).
-            let of_a_trait = matches!(
-                r.keys.origin(n.item),
-                Some(super::keys::Origin::Member { container, kind: super::keys::MemberKind::Const, .. }) if r.store.trait_defs.contains_key(container)
-            );
+            let of_a_trait = self.trait_of_const(&*r, n.item).is_some();
             if of_a_trait && ground.view().list(n.args).map_or(true, |l| l.is_empty()) {
                 out = Err(ConstFail::TraitConstNoSelf { item, constant: n.item });
                 break;

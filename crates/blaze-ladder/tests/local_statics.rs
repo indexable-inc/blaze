@@ -1220,3 +1220,239 @@ pub extern \"C-unwind\" fn main() -> i32 {
     );
     assert_eq!(run_whole(text), 3);
 }
+
+/// Regression for cold cached-`Typed` lazy runs of trait-impl methods (`Adts::track_caller`):
+/// when a trait-impl method is loaded from a cached `Typed` record (so `check_body` never ran),
+/// `Want::MemberFn` -> `Want::Impl` populates `store.impls[container]` with `imp.trait_ = Some(t)`,
+/// so `LazyProgram::row` must also ensure `Want::Members(t)` so `seam_rules::track_caller` can
+/// look up the trait's declared method both when the trait method is NOT `#[track_caller]`
+/// (Case A, e.g. `<impl SpecFromIterNested for Vec>::from_iter`) and when it IS `#[track_caller]`
+/// on the trait declaration only (Case B, inherited without repeating the attribute on the impl).
+#[test]
+fn cold_typed_record_trait_impl_method_track_caller_and_inheritance() {
+    use blaze_ladder::run::make_one::{FromRecord, Twin};
+
+    let text = "#![feature(no_core, lang_items, intrinsics, rustc_attrs)]
+#![no_core]
+#![no_main]
+#![allow(internal_features)]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for u32 {}
+
+#[lang = \"panic_location\"]
+struct Location<'a> {
+    file: &'a str,
+    line: u32,
+    col: u32,
+}
+
+#[rustc_intrinsic]
+const fn caller_location() -> &'static Location<'static>;
+
+#[track_caller]
+#[inline(never)]
+fn here() -> u32 {
+    caller_location().line
+}
+
+struct Boxed;
+
+trait PlainTrait {
+    fn call_plain(&self) -> u32;
+}
+
+impl PlainTrait for Boxed {
+    #[inline(never)]
+    fn call_plain(&self) -> u32 {
+        here() // PLAIN_CALL_LINE
+    }
+}
+
+trait TrackedTrait {
+    #[track_caller]
+    fn call_tracked(&self) -> u32;
+}
+
+impl TrackedTrait for Boxed {
+    #[inline(never)]
+    fn call_tracked(&self) -> u32 {
+        here() // TRACKED_INNER_LINE
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    let b = Boxed;
+    let a = <Boxed as PlainTrait>::call_plain(&b);
+    let c = <Boxed as TrackedTrait>::call_tracked(&b); // TRACKED_OUTER_LINE
+    if a == 39 && c == 59 { 3 } else { 1 }
+}
+";
+
+    let plain_line = text.lines().position(|l| l.contains("PLAIN_CALL_LINE")).expect("plain line") + 1;
+    let tracked_outer_line = text.lines().position(|l| l.contains("TRACKED_OUTER_LINE")).expect("tracked line") + 1;
+    assert_eq!(plain_line, 39, "update fixture line numbers if lines shift");
+    assert_eq!(tracked_outer_line, 59, "update fixture line numbers if lines shift");
+
+    let f = fixture(text);
+    let b = builder();
+    let main_key = fn_named(&f, "main");
+    let names = reader(&f);
+    let checking = Maker::new(names, Some(main_key), &b, alloc());
+    let typing = FromRecord::rechecked(names, Some(main_key), alloc()).expect("rechecked double");
+    let reading = Maker::typed(names, Some(main_key), typing, &b, alloc());
+    let mut twin = Twin::new(checking, reading, alloc());
+    let mut store = MemoryStore::new_in(alloc());
+    let (walk, counts) = walk_records(main_key, &EveryItem, &mut store, &b, &producer(), &mut twin, alloc())
+        .unwrap_or_else(|e| panic!("cold typed-record trait impl track_caller walk failed: {e}; log={:?}", logged(names.records)));
+    assert!(logged(names.records).is_empty(), "records log must be empty: {:?}", logged(names.records));
+    assert!(counts.made > 0, "expected makes in walk: {counts}");
+    assert_eq!(twin.compared, counts.make_calls(), "every entry must match byte-for-byte");
+    assert_eq!(
+        twin.reading.program().expect("reading program").counts().checked,
+        0,
+        "cold reading maker must not run check_body"
+    );
+
+    // 2. Truly cold trait-impl method entry (matching a warm CodeRecords hit on `main` and a cold
+    // miss on the trait-impl methods, like `<impl SpecFromIterNested for Vec>::from_iter`): seed a
+    // fresh `MemoryStore` with ONLY `main`'s code entry so the fresh `Maker::typed` never touches
+    // `PlainTrait` or `TrackedTrait` while building `main`, and must build `call_plain` and
+    // `call_tracked` directly from cached `Typed` records.
+    let main_row = (0..walk.len()).find(|&r| walk.tabled(r) == main_key).expect("main row");
+    let main_code_key = walk.key(main_row).expect("main code key");
+    struct OnlyEntry<'a> {
+        seed: &'a MemoryStore<'a>,
+        keep: blaze_ladder::code_records::CodeKey,
+        extra: MemoryStore<'a>,
+    }
+    impl blaze_ladder::code_records::CodeStore for OnlyEntry<'_> {
+        fn get(&self, key: blaze_ladder::code_records::CodeKey) -> Result<Option<&[u8]>, blaze_ladder::code_records::StoreError> {
+            if key == self.keep {
+                return self.seed.get(key);
+            }
+            self.extra.get(key)
+        }
+        fn put(&mut self, class: blaze_ladder::code_records::CodeClass, key: blaze_ladder::code_records::CodeKey, bytes: &[u8]) -> Result<(), blaze_ladder::code_records::StoreError> {
+            self.extra.put(class, key, bytes)
+        }
+        fn pointed(&self, key: blaze_ladder::code_records::CodeKey) -> Result<Option<blaze_ladder::code_records::CodeKey>, blaze_ladder::code_records::StoreError> {
+            if let Some(target) = self.seed.pointed(key)?
+                && target == self.keep
+            {
+                return Ok(Some(target));
+            }
+            self.extra.pointed(key)
+        }
+        fn point(&mut self, class: blaze_ladder::code_records::CodeClass, key: blaze_ladder::code_records::CodeKey, content: blaze_ladder::code_records::CodeKey) -> Result<(), blaze_ladder::code_records::StoreError> {
+            self.extra.point(class, key, content)
+        }
+    }
+    let mut main_only_store = OnlyEntry { seed: &store, keep: main_code_key, extra: MemoryStore::new_in(alloc()) };
+    let names2 = reader(&f);
+    let checking2 = Maker::new(names2, Some(main_key), &b, alloc());
+    let typing2 = FromRecord::rechecked(names2, Some(main_key), alloc()).expect("rechecked double 2");
+    let reading2 = Maker::typed(names2, Some(main_key), typing2, &b, alloc());
+    let mut twin2 = Twin::new(checking2, reading2, alloc());
+    let (_, counts2) = walk_records(main_key, &EveryItem, &mut main_only_store, &b, &producer(), &mut twin2, alloc())
+        .unwrap_or_else(|e| panic!("warm-main cold-impl track_caller walk failed: {e}; log={:?}", logged(names2.records)));
+    assert!(logged(names2.records).is_empty(), "records log must be empty: {:?}", logged(names2.records));
+    assert!(counts2.found >= 1, "expected cached hit on main: {counts2}");
+    assert!(counts2.made >= 2, "expected cold makes for call_plain and call_tracked: {counts2}");
+    assert_eq!(twin2.compared, counts2.make_calls(), "every cold impl entry must match byte-for-byte");
+    assert_eq!(
+        twin2.reading.program().expect("reading2 program").counts().checked,
+        0,
+        "cold reading maker 2 must not run check_body"
+    );
+    assert_eq!(run_whole(text), 3);
+}
+
+/// Regression for cold cached-`Typed` lazy runs of generic fns reading a trait's associated
+/// constant (`T::INFINITY`, e.g. `core::num::imp::traits::Float::INFINITY` in `parse_inf_nan`):
+/// on a cold cached-`Typed` run `store.trait_defs` does not hold the trait yet when `const_at`
+/// evaluates the associated const, so `consts.rs` must recognize trait containers via `NamesSource`
+/// too and select the impl's associated constant (both for required associated constants with no
+/// default body and for defaulted associated constants overridden by an impl).
+#[test]
+fn cold_typed_record_trait_associated_const_required_and_overridden() {
+    use blaze_ladder::run::make_one::{FromRecord, Twin};
+
+    let text = "#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+trait MyFloat {
+    const INFINITY: i32;
+}
+
+trait WithDefault {
+    const VAL: i32 = 1;
+}
+
+struct MarkerA;
+struct MarkerB;
+
+impl MyFloat for MarkerA {
+    const INFINITY: i32 = 1;
+}
+
+impl WithDefault for MarkerA {
+    const VAL: i32 = 2;
+}
+
+impl WithDefault for MarkerB {}
+
+#[inline(never)]
+fn read_req<T: MyFloat>() -> i32 {
+    T::INFINITY
+}
+
+#[inline(never)]
+fn read_def<T: WithDefault>() -> i32 {
+    T::VAL
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    if read_def::<MarkerB>() == 1 {
+        read_req::<MarkerA>() + read_def::<MarkerA>()
+    } else {
+        0
+    }
+}
+";
+
+    let f = fixture(text);
+    let b = builder();
+    let main_key = fn_named(&f, "main");
+    let names = reader(&f);
+    let checking = Maker::new(names, Some(main_key), &b, alloc());
+    let typing = FromRecord::rechecked(names, Some(main_key), alloc()).expect("rechecked double");
+    let reading = Maker::typed(names, Some(main_key), typing, &b, alloc());
+    let mut twin = Twin::new(checking, reading, alloc());
+    let mut store = MemoryStore::new_in(alloc());
+    let (_, counts) = walk_records(main_key, &EveryItem, &mut store, &b, &producer(), &mut twin, alloc())
+        .unwrap_or_else(|e| panic!("cold typed-record trait assoc const walk failed: {e}; log={:?}", logged(names.records)));
+    assert!(logged(names.records).is_empty(), "records log must be empty: {:?}", logged(names.records));
+    assert!(counts.made > 0, "expected makes in walk: {counts}");
+    assert_eq!(twin.compared, counts.make_calls(), "every entry must match byte-for-byte");
+    assert_eq!(
+        twin.reading.program().expect("reading program").counts().checked,
+        0,
+        "cold reading maker must not run check_body"
+    );
+    assert_eq!(run_whole(text), 3);
+}
