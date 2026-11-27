@@ -7369,18 +7369,43 @@ fn layout_completion_popup(
     } else {
         0.0
     };
+    let sel_preview = editor
+        .completions
+        .get(editor.completion_selected)
+        .and_then(|c| c.preview.as_ref());
+    let total_avail_w = (x1 - x0).max(200.0);
+    let show_preview_pane = sel_preview.is_some() && total_avail_w >= 580.0;
+    let max_left_w = if show_preview_pane {
+        (total_avail_w - 290.0).clamp(270.0, 440.0)
+    } else {
+        total_avail_w.min(640.0)
+    };
+
     let popup_w = if inline_doc_mode {
         let max_doc_w = (0..show)
             .map(|offset| m.measure(&editor.completions[win_start + offset].doc, TextFace::UiSmall))
             .fold(0.0f32, f32::max)
-            .min(340.0);
+            .min(if show_preview_pane { 220.0 } else { 340.0 });
         (13.0 + icon_s + 9.0 + max_inline_label_w + 18.0 + max_doc_w + 18.0 + sb_pad)
-            .clamp(340.0, (x1 - x0).min(640.0))
+            .clamp(270.0_f32.min(max_left_w), max_left_w)
     } else {
-        (x1 - x0).min(if any_size_bar { 640.0 } else { 560.0 })
+        (x1 - x0).min(if any_size_bar { 640.0 } else { 560.0 }).min(max_left_w)
     };
 
-    // Anchor horizontally to the start of the active token being completed (rock-steady while typing).
+    let preview_gap = 8.0f32;
+    let preview_w = if show_preview_pane {
+        (total_avail_w - popup_w - preview_gap).clamp(260.0, 380.0)
+    } else {
+        0.0
+    };
+    let group_w = if show_preview_pane {
+        popup_w + preview_gap + preview_w
+    } else {
+        popup_w
+    };
+
+    // Anchor horizontally to the start of the active token being completed (rock-steady while typing),
+    // shifting gently left if needed so the right-hand preview card stays fully visible inside the window.
     let tok_start = editor.completion_replace_start.min(editor.text.len());
     let anchor_col = editor.text[..tok_start]
         .rsplit('\n')
@@ -7388,7 +7413,7 @@ fn layout_completion_popup(
         .map(|line| line.chars().count())
         .unwrap_or(0);
     let desired_x = scene.composer_text_origin[0] + (anchor_col as f32 * m.cw) - (13.0 + icon_s + 9.0);
-    let px0 = desired_x.clamp(x0, (x1 - popup_w).max(x0));
+    let px0 = desired_x.clamp(x0, (x1 - group_w).max(x0));
     let px1 = px0 + popup_w;
 
     // Prefer opening directly BELOW the inline prompt line; flip ABOVE if near window bottom.
@@ -7788,6 +7813,217 @@ fn layout_completion_popup(
         let rem = total.saturating_sub(show);
         let more_txt = format!("+{rem} more");
         scene.overlay_ui_small(px0 + 13.0, doc_ty, more_txt, theme::INK_4, false, false, 0);
+    }
+
+    // Docked right-hand Live Result Preview card showing what selecting the highlighted
+    // completion will actually produce (table slice, record fields, list values, or `[]` flatten).
+    if show_preview_pane
+        && let Some(preview) = sel_preview
+    {
+        let pv_x0 = px1 + preview_gap;
+        let pv_x1 = (pv_x0 + preview_w).min(x1);
+        layout_completion_preview_card(scene, preview, pv_x0, py0, pv_x1, popup_h, vh, m);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn layout_completion_preview_card(
+    scene: &mut Scene,
+    preview: &crate::editor::CompletionPreview,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    min_h: f32,
+    vh: f32,
+    m: CellMetrics,
+) {
+    let w = x1 - x0;
+    if w < 160.0 {
+        return;
+    }
+    let header_h = m.ch + 14.0;
+    let row_h = m.ch + 5.0;
+    let table_hdr_h = if preview.table_headers.is_empty() {
+        0.0
+    } else {
+        m.ch + 6.0
+    };
+    let footer_h = if preview.footer.is_empty() {
+        0.0
+    } else {
+        m.ch + 10.0
+    };
+    let body_rows = preview.rows.len().max(1);
+    let content_h = header_h + 6.0 + table_hdr_h + body_rows as f32 * row_h + 6.0 + footer_h;
+    let max_h = (vh - y0 - 12.0).max(min_h.min(220.0));
+    let card_h = content_h.clamp(min_h.min(content_h.max(120.0)), max_h);
+    let y1 = y0 + card_h;
+
+    scene.overlay_shadow(x0, y0 + 4.0, x1, y1 + 4.0, 8.0, 18.0, theme::SHADOW_SOFT, 0);
+    scene.overlay_round_rect(
+        x0,
+        y0,
+        x1,
+        y1,
+        8.0,
+        theme::BG_POPUP,
+        1.0,
+        theme::LINE_STRONG,
+        0,
+    );
+
+    // Header: semantic type badge pill + compact metadata (`200 items · 195 unique`).
+    let pad_x = 12.0f32;
+    let (pill_bg, pill_border, pill_fg) = if preview.type_tag.starts_with("table") {
+        (
+            theme::rgba(0x5c, 0xb8, 0xff, 0.16),
+            theme::rgba(0x5c, 0xb8, 0xff, 0.45),
+            theme::CMD_BUILTIN,
+        )
+    } else if preview.type_tag.starts_with("record") {
+        (
+            theme::rgba(0x56, 0xb6, 0xc2, 0.16),
+            theme::rgba(0x56, 0xb6, 0xc2, 0.45),
+            theme::rgb(0x56, 0xb6, 0xc2),
+        )
+    } else if preview.type_tag.starts_with("list") {
+        (
+            theme::rgba(0xc6, 0x78, 0xdd, 0.16),
+            theme::rgba(0xc6, 0x78, 0xdd, 0.45),
+            theme::CMD_ABBREV,
+        )
+    } else if preview.type_tag == "string" {
+        (
+            theme::rgba(0x6a, 0xab, 0x73, 0.16),
+            theme::rgba(0x6a, 0xab, 0x73, 0.45),
+            theme::rgb(0x7c, 0xc9, 0x8b),
+        )
+    } else {
+        (
+            theme::rgba(0xe5, 0xc0, 0x7b, 0.16),
+            theme::rgba(0xe5, 0xc0, 0x7b, 0.45),
+            theme::CMD_EXTERNAL,
+        )
+    };
+
+    let tag_w = m.measure_styled(&preview.type_tag, TextFace::UiSmall, true);
+    let pill_w = (tag_w + 12.0).min(w - pad_x * 2.0);
+    let pill_h = m.ch + 2.0;
+    let pill_x0 = x0 + pad_x;
+    let pill_y0 = y0 + (header_h - pill_h) * 0.5;
+    scene.overlay_round_rect(
+        pill_x0,
+        pill_y0,
+        pill_x0 + pill_w,
+        pill_y0 + pill_h,
+        4.0,
+        pill_bg,
+        1.0,
+        pill_border,
+        0,
+    );
+    let hdr_ty = y0 + (header_h - m.ch) * 0.5;
+    scene.overlay_ui_small(pill_x0 + 6.0, hdr_ty, &preview.type_tag, pill_fg, true, false, 0);
+
+    if !preview.meta.is_empty() {
+        let meta_x = pill_x0 + pill_w + 8.0;
+        let avail = (x1 - pad_x - meta_x).max(0.0);
+        if avail > 28.0 {
+            let avg_cw = m.measure("n", TextFace::UiSmall).max(4.5);
+            let max_ch = (avail / avg_cw).floor().max(6.0) as usize;
+            let meta_txt = truncate_chars(&preview.meta, max_ch);
+            scene.overlay_ui_small(meta_x, hdr_ty, meta_txt, theme::INK_3, false, false, 0);
+        }
+    }
+
+    let hdr_div_y = y0 + header_h;
+    scene.overlay_line(x0 + 1.0, hdr_div_y, x1 - 1.0, hdr_div_y, 1.0, theme::LINE, 0);
+
+    let mut ry = hdr_div_y + 5.0;
+    let body_bottom = if footer_h > 0.0 { y1 - footer_h - 4.0 } else { y1 - 6.0 };
+
+    if !preview.table_headers.is_empty() {
+        // Mini-table preview (`Cargo.lock.package`, etc.)
+        let ncols = preview.table_headers.len();
+        let inner_w = (w - pad_x * 2.0).max(80.0);
+        let col_w = inner_w / ncols as f32;
+        let max_col_ch = ((col_w - 8.0) / m.cw).floor().max(4.0) as usize;
+        let th_ty = ry + (table_hdr_h - m.ch) * 0.5;
+        for (ci, hdr) in preview.table_headers.iter().enumerate() {
+            let cx = x0 + pad_x + ci as f32 * col_w;
+            let txt = truncate_chars(hdr, max_col_ch);
+            scene.overlay_ui_small(cx, th_ty, txt, theme::INK_4, true, false, 0);
+        }
+        ry += table_hdr_h;
+        scene.overlay_line(x0 + pad_x, ry - 2.0, x1 - pad_x, ry - 2.0, 1.0, theme::LINE, 0);
+
+        for row in &preview.rows {
+            if ry + row_h > body_bottom + 2.0 {
+                break;
+            }
+            let ty = ry + (row_h - m.ch) * 0.5;
+            for (ci, cell) in row.cells.iter().take(ncols).enumerate() {
+                let cx = x0 + pad_x + ci as f32 * col_w;
+                let txt = truncate_chars(cell, max_col_ch);
+                let col = if cell == "—" { theme::INK_4 } else { theme::INK_2 };
+                scene.overlay_text_run(cx, ty, txt, col, false, false, 0);
+            }
+            ry += row_h;
+        }
+    } else if preview.rows.is_empty() {
+        let ty = ry + (row_h - m.ch) * 0.5;
+        scene.overlay_ui_small(x0 + pad_x, ty, "(empty)", theme::INK_4, false, false, 0);
+    } else {
+        // Record / List / Scalar preview with crisp aligned key/index gutter.
+        let max_key_chars = preview
+            .rows
+            .iter()
+            .map(|r| r.key.chars().count())
+            .max()
+            .unwrap_or(0);
+        let key_col_w = if max_key_chars == 0 {
+            0.0
+        } else {
+            ((max_key_chars.min(14) as f32) * m.cw + 12.0).min(w * 0.40)
+        };
+        let val_x = x0 + pad_x + key_col_w;
+        let val_max_ch = ((x1 - pad_x - val_x) / m.cw).floor().max(8.0) as usize;
+        let key_max_ch = if key_col_w > 0.0 {
+            ((key_col_w - 10.0) / m.cw).floor().max(2.0) as usize
+        } else {
+            0
+        };
+
+        for row in &preview.rows {
+            if ry + row_h > body_bottom + 2.0 {
+                break;
+            }
+            let ty = ry + (row_h - m.ch) * 0.5;
+            if key_col_w > 0.0 && !row.key.is_empty() {
+                let ktxt = truncate_chars(&row.key, key_max_ch);
+                scene.overlay_text_run(x0 + pad_x, ty, ktxt, theme::INK_4, false, false, 0);
+            }
+            if let Some(cell) = row.cells.first() {
+                let vtxt = truncate_chars(cell, val_max_ch);
+                let vcol = if row.is_null || cell == "—" {
+                    theme::INK_4
+                } else {
+                    theme::INK_1
+                };
+                scene.overlay_text_run(val_x, ty, vtxt, vcol, false, false, 0);
+            }
+            ry += row_h;
+        }
+    }
+
+    if footer_h > 0.0 {
+        let fdiv_y = y1 - footer_h;
+        scene.overlay_line(x0 + 1.0, fdiv_y, x1 - 1.0, fdiv_y, 1.0, theme::LINE, 0);
+        let fty = fdiv_y + (footer_h - m.ch) * 0.5;
+        let avg_cw = m.measure("n", TextFace::UiSmall).max(4.5);
+        let max_fch = ((w - pad_x * 2.0) / avg_cw).floor().max(10.0) as usize;
+        let ftxt = truncate_chars(&preview.footer, max_fch);
+        scene.overlay_ui_small(x0 + pad_x, fty, ftxt, theme::INK_4, false, false, 0);
     }
 }
 

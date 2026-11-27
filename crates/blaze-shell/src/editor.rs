@@ -308,6 +308,33 @@ pub struct CompletionFsMeta {
     pub is_direct_child: bool,
 }
 
+/// One row inside the right-hand live completion preview pane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewRow {
+    /// Left key/index gutter (e.g. `"0"`, `"name"`, `"version"`, or empty for mini-table rows).
+    pub key: String,
+    /// Value cells (1 cell for record/list/scalar rows; 1..=3 cells for mini-table rows).
+    pub cells: Vec<String>,
+    /// True when the value is `null`/`nothing` (rendered dimmed as `—`).
+    pub is_null: bool,
+}
+
+/// Live result preview docked directly to the right of the completion popup so the user sees
+/// what selecting the highlighted completion will actually produce.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionPreview {
+    /// Semantic type pill (`"list<string>"`, `"table[200]"`, `"record{5}"`, `"string"`, `"int"`).
+    pub type_tag: String,
+    /// Compact summary beside the type pill (`"200 items · 195 unique · 100% fill"`, `"5 cols × 200 rows"`).
+    pub meta: String,
+    /// Optional mini-table column headers (non-empty when previewing a `Table`).
+    pub table_headers: Vec<String>,
+    /// Up to 8 sample rows of the live value.
+    pub rows: Vec<PreviewRow>,
+    /// Optional footer hint (`"+ 192 more"`, `"+ 192 more · Tab → [] flattens"`).
+    pub footer: String,
+}
+
 /// One candidate shown in the IntelliJ-style floating completion popup.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletionItem {
@@ -326,6 +353,8 @@ pub struct CompletionItem {
     pub fs_meta: Option<CompletionFsMeta>,
     /// Character indices inside `label` matching the typed query (highlighted IntelliJ-style).
     pub match_indices: Vec<usize>,
+    /// Optional live value preview rendered in a side card to the right of the popup.
+    pub preview: Option<CompletionPreview>,
 }
 
 /// Scope filter for the Atuin-class `Ctrl+R` command history palette.
@@ -2564,6 +2593,7 @@ impl Editor {
                                     avatar_path: None,
                                     fs_meta: None,
                                     match_indices: idxs,
+                                    preview: None,
                                 },
                             ));
                         }
@@ -2574,6 +2604,7 @@ impl Editor {
                                 *i += 1;
                             }
                             let ty = slot.value.type_name().to_owned();
+                            let preview = Some(build_value_preview(&slot.value, None));
                             scored.push((
                                 score + 10,
                                 CompletionItem {
@@ -2586,6 +2617,7 @@ impl Editor {
                                     avatar_path: None,
                                     fs_meta: None,
                                     match_indices: idxs,
+                                    preview,
                                 },
                             ));
                         }
@@ -2626,6 +2658,7 @@ impl Editor {
                                 avatar_path: None,
                                 fs_meta: None,
                                 match_indices: idxs,
+                                    preview: None,
                             },
                         ));
                     }
@@ -2663,6 +2696,7 @@ impl Editor {
                                     avatar_path: None,
                                     fs_meta: None,
                                     match_indices: idxs,
+                                    preview: None,
                                 },
                             ));
                         }
@@ -2691,6 +2725,7 @@ impl Editor {
                                 avatar_path: None,
                                 fs_meta: None,
                                 match_indices: idxs,
+                                    preview: None,
                             },
                         ));
                     }
@@ -2715,6 +2750,7 @@ impl Editor {
                                 avatar_path: None,
                                 fs_meta: None,
                                 match_indices: idxs,
+                                    preview: None,
                             },
                         ));
                     }
@@ -2742,6 +2778,7 @@ impl Editor {
                                     avatar_path: None,
                                     fs_meta: None,
                                     match_indices: idxs,
+                                    preview: None,
                                 },
                             ));
                         }
@@ -2765,6 +2802,7 @@ impl Editor {
                                 avatar_path: None,
                                 fs_meta: None,
                                 match_indices: idxs,
+                                    preview: None,
                             },
                         ));
                     }
@@ -2796,6 +2834,7 @@ impl Editor {
                                 avatar_path: None,
                                 fs_meta: None,
                                 match_indices: idxs,
+                                    preview: None,
                             },
                         ));
                     }
@@ -2856,6 +2895,7 @@ impl Editor {
                                 avatar_path: None,
                                 fs_meta: None,
                                 match_indices: idxs,
+                                    preview: None,
                             },
                         ));
                     }
@@ -2888,6 +2928,7 @@ impl Editor {
                                 avatar_path: None,
                                 fs_meta: None,
                                 match_indices: idxs,
+                                    preview: None,
                             },
                         ));
                     }
@@ -2906,6 +2947,7 @@ impl Editor {
                 // `blaze.lock`, `data.json`, `items.csv`) — exact-case matches like `Car` ->
                 // `Cargo.lock` / `Cargo.toml` jump straight to the top!
                 if !after_pipe && !prefix.is_empty() {
+                    let mut previewed_files = 0usize;
                     for f in cached_cwd_data_files(state.cwd.as_ref()) {
                         if let Some((score, idxs)) = fuzzy_match_score(&f.name, prefix) {
                             let sz = crate::view::format_value_cell(&blaze_sh::Value::Size(Bytes(
@@ -2915,6 +2957,19 @@ impl Editor {
                                 format!("data · {sz}")
                             } else {
                                 format!("{} · {sz}", f.sniff_label)
+                            };
+                            let preview = if previewed_files < 8 {
+                                previewed_files += 1;
+                                let abs = resolve_preview_path(
+                                    state.cwd.as_ref(),
+                                    &f.name,
+                                    state.get_env("HOME"),
+                                );
+                                load_cached_open_preview(&abs).map(|parsed| {
+                                    build_value_preview(&parsed, Some("Tab → drill into fields"))
+                                })
+                            } else {
+                                None
                             };
                             scored.push((
                                 score + 65,
@@ -2928,6 +2983,7 @@ impl Editor {
                                     avatar_path: None,
                                     fs_meta: None,
                                     match_indices: idxs,
+                                    preview,
                                 },
                             ));
                         }
@@ -2949,6 +3005,7 @@ impl Editor {
                                     avatar_path: None,
                                     fs_meta: None,
                                     match_indices: idxs,
+                                    preview: None,
                                 },
                             ));
                         }
@@ -2968,6 +3025,7 @@ impl Editor {
                                 avatar_path: None,
                                 fs_meta: None,
                                 match_indices: idxs,
+                                    preview: None,
                             },
                         ));
                     }
@@ -2986,6 +3044,7 @@ impl Editor {
                                 avatar_path: None,
                                 fs_meta: None,
                                 match_indices: idxs,
+                                    preview: None,
                             },
                         ));
                     }
@@ -3004,6 +3063,7 @@ impl Editor {
                                 avatar_path: None,
                                 fs_meta: None,
                                 match_indices: idxs,
+                                    preview: None,
                             },
                         ));
                     }
@@ -3037,6 +3097,7 @@ impl Editor {
                                     avatar_path: None,
                                     fs_meta: None,
                                     match_indices: idxs,
+                                    preview: None,
                                 },
                             ));
                         }
@@ -3088,6 +3149,7 @@ impl Editor {
                                 avatar_path: None,
                                 fs_meta: None,
                                 match_indices: idxs,
+                                    preview: None,
                             },
                         ));
                     }
@@ -3115,6 +3177,7 @@ impl Editor {
                                     avatar_path: None,
                                     fs_meta: None,
                                     match_indices: idxs,
+                                    preview: None,
                                 },
                             ));
                         }
@@ -3139,6 +3202,7 @@ impl Editor {
                                     avatar_path: None,
                                     fs_meta: None,
                                     match_indices: idxs,
+                                    preview: None,
                                 },
                             ));
                         }
@@ -3169,6 +3233,7 @@ impl Editor {
                                     avatar_path: None,
                                     fs_meta: None,
                                     match_indices: idxs,
+                                    preview: None,
                                 },
                             ));
                         }
@@ -3190,6 +3255,7 @@ impl Editor {
                                     avatar_path: None,
                                     fs_meta: None,
                                     match_indices: idxs,
+                                    preview: None,
                                 },
                             ));
                         }
@@ -3215,6 +3281,7 @@ impl Editor {
                                 avatar_path: None,
                                 fs_meta: None,
                                 match_indices: idxs,
+                                    preview: None,
                             },
                         ));
                     }
@@ -3253,6 +3320,7 @@ impl Editor {
                                     avatar_path: None,
                                     fs_meta: None,
                                     match_indices: idxs,
+                                    preview: None,
                                 },
                             ));
                         }
@@ -3281,6 +3349,7 @@ impl Editor {
                                     avatar_path: None,
                                     fs_meta: None,
                                     match_indices: idxs,
+                                    preview: None,
                                 },
                             ));
                         }
@@ -3307,6 +3376,7 @@ impl Editor {
                                 avatar_path: None,
                                 fs_meta: None,
                                 match_indices: idxs,
+                                    preview: None,
                             },
                         ));
                     }
@@ -3349,6 +3419,7 @@ impl Editor {
                                 avatar_path: None,
                                 fs_meta: None,
                                 match_indices: Vec::new(),
+                                preview: None,
                             },
                         ));
                     }
@@ -3365,6 +3436,7 @@ impl Editor {
                                 avatar_path: None,
                                 fs_meta: None,
                                 match_indices: Vec::new(),
+                                preview: None,
                             },
                         ));
                     }
@@ -3382,6 +3454,7 @@ impl Editor {
                                     avatar_path: None,
                                     fs_meta: None,
                                     match_indices: Vec::new(),
+                                preview: None,
                                 },
                             ));
                         } else {
@@ -3415,6 +3488,7 @@ impl Editor {
                                         avatar_path: sug.avatar_path,
                                         fs_meta: None,
                                         match_indices,
+                                        preview: None,
                                     },
                                 ));
                             }
@@ -3531,6 +3605,7 @@ impl Editor {
                                 avatar_path: None,
                                 fs_meta,
                                 match_indices,
+                                preview: None,
                             },
                         ));
                     }
@@ -4887,6 +4962,7 @@ fn collect_path_completions(
                     is_direct_child: true,
                 }),
                 match_indices: idxs,
+                                    preview: None,
             },
         ));
     }
@@ -4957,6 +5033,7 @@ fn collect_path_completions(
                     avatar_path: None,
                     fs_meta: None,
                     match_indices: idxs,
+                                    preview: None,
                 },
             ));
         }
@@ -5441,6 +5518,7 @@ fn collect_piped_command_schema_dot_completions(
                     avatar_path: None,
                     fs_meta: None,
                     match_indices: idxs,
+                                    preview: None,
                 },
             ));
         }
@@ -5564,7 +5642,8 @@ fn collect_value_path_completions(
                       key: &str,
                       detail: String,
                       doc: String,
-                      is_container: bool| {
+                      is_container: bool,
+                      preview: Option<CompletionPreview>| {
         if let Some((score, mut idxs)) = fuzzy_match_score(key, leaf_prefix) {
             let mut insert = String::with_capacity(built_prefix.len() + key.len() + 2);
             insert.push_str(&built_prefix);
@@ -5593,13 +5672,15 @@ fn collect_value_path_completions(
                     avatar_path: None,
                     fs_meta: None,
                     match_indices: idxs,
+                    preview,
                 },
             ));
         }
     };
 
     // If `leaf_prefix` already exactly names a field/column whose value is a nested/nullable
-    // list (e.g. `Cargo.lock.package.dependencies`), immediately offer `[]` (flatten + drop nulls)!
+    // list (e.g. `Cargo.lock.package.dependencies`), immediately offer `[]` (flatten + drop nulls)
+    // WITH a live preview of the flattened, null-free elements!
     if !leaf_prefix.is_empty() {
         let exact_col_val: Option<Value<'_>> = match &cur {
             Value::Record(r) => r.get(leaf_prefix).map(Share::share),
@@ -5620,6 +5701,32 @@ fn collect_value_path_completions(
                 flat_insert.push('.');
                 flat_insert.push_str(leaf_prefix);
                 flat_insert.push_str("[]");
+
+                let alloc = Alloc::global();
+                let mut flat_list = blaze_sh::PVec::new(alloc);
+                for it in items.iter() {
+                    if flat_list.len() >= 256 {
+                        break;
+                    }
+                    match it {
+                        Value::Nothing => {}
+                        Value::List(inner) => {
+                            for sub in inner.iter() {
+                                if flat_list.len() >= 256 {
+                                    break;
+                                }
+                                if !matches!(sub, Value::Nothing) {
+                                    flat_list.push(clone_value_global(sub));
+                                }
+                            }
+                        }
+                        other => flat_list.push(clone_value_global(other)),
+                    }
+                }
+                let flat_preview = build_value_preview(
+                    &Value::List(flat_list),
+                    Some("flattened & nulls dropped · try `| uniq`"),
+                );
                 scored.push((
                     500,
                     CompletionItem {
@@ -5632,6 +5739,7 @@ fn collect_value_path_completions(
                         avatar_path: None,
                         fs_meta: None,
                         match_indices: Vec::new(),
+                        preview: Some(flat_preview),
                     },
                 ));
                 return;
@@ -5645,32 +5753,46 @@ fn collect_value_path_completions(
             for (idx, (k, v)) in r.iter().enumerate() {
                 let (detail, doc, is_cont) = preview_val(v);
                 let rank = (total.saturating_sub(idx)).min(24) as i32;
-                push_field(scored, rank, k, detail, doc, is_cont);
+                let pv = Some(build_value_preview(v, None));
+                push_field(scored, rank, k, detail, doc, is_cont, pv);
             }
         }
         Value::Table(t) => {
             let ncols = t.ncols();
             for ci in 0..ncols {
                 let cname = t.columns.get(ci).unwrap().as_ref();
-                let sample = t
-                    .cell(0, ci)
-                    .map(|v| {
-                        let (_, doc, _) = preview_val(v);
-                        doc
-                    })
+                let col_list = t.cols.get(ci).map(|c| Value::List(c.share()));
+                let first_non_null = (0..t.nrows().min(64)).find_map(|ri| {
+                    t.cell(ri, ci).filter(|v| !matches!(v, Value::Nothing))
+                });
+                let sample = first_non_null
+                    .map(|v| format_preview_scalar(v, 44))
                     .unwrap_or_default();
-                let doc = if sample.is_empty() {
-                    format!("column · {} rows", t.nrows())
+                let (col_type, col_preview) = if let Some(ref lv) = col_list {
+                    let pv = build_value_preview(lv, None);
+                    let short_ty = pv.type_tag.clone();
+                    (short_ty, Some(pv))
                 } else {
-                    format!("column ({} rows) · e.g. {sample}", t.nrows())
+                    ("col".to_owned(), None)
+                };
+                let doc = if sample.is_empty() {
+                    format!("{} rows (all null)", t.nrows())
+                } else {
+                    format!("e.g. {sample}")
                 };
                 let rank = (ncols.saturating_sub(ci)).min(24) as i32 + 4;
-                push_field(scored, rank, cname, "col".to_owned(), doc, false);
+                push_field(scored, rank, cname, col_type, doc, false, col_preview);
             }
             for ri in 0..t.nrows().min(4) {
                 let idx_s = ri.to_string();
-                let doc = format!("row {ri} of {}", t.nrows());
-                push_field(scored, 0, &idx_s, "row".to_owned(), doc, true);
+                let row_rec = t.row_record(ri);
+                let doc = row_rec
+                    .as_ref()
+                    .and_then(|rec| rec.iter().next())
+                    .map(|(k, v)| format!("{k}: {}", format_preview_scalar(v, 36)))
+                    .unwrap_or_else(|| format!("row {ri} of {}", t.nrows()));
+                let pv = row_rec.map(|rec| build_value_preview(&Value::Record(rec), None));
+                push_field(scored, 0, &idx_s, "row".to_owned(), doc, true, pv);
             }
         }
         Value::List(items) => {
@@ -5680,32 +5802,339 @@ fn collect_value_path_completions(
                 for (idx, (k, v)) in first_rec.iter().enumerate() {
                     let (detail, doc, _) = preview_val(v);
                     let rank = (total.saturating_sub(idx)).min(24) as i32 + 6;
-                    push_field(scored, rank, k, detail, doc, false);
+                    let pv = Some(build_value_preview(v, None));
+                    push_field(scored, rank, k, detail, doc, false, pv);
                 }
             }
             for i in 0..items.len().min(6) {
                 if let Some(v) = items.get(i) {
                     let (detail, doc, is_cont) = preview_val(v);
                     let idx_s = i.to_string();
-                    push_field(scored, 0, &idx_s, detail, doc, is_cont);
+                    let pv = Some(build_value_preview(v, None));
+                    push_field(scored, 0, &idx_s, detail, doc, is_cont, pv);
                 }
             }
         }
         Value::Output(o) => {
-            for (idx, (name, detail, doc)) in [
-                ("stdout", "string", format!("{} bytes stdout", o.stdout_len())),
-                ("stderr", "string", format!("{} bytes stderr", o.stderr_len())),
-                ("exit_code", "int", format!("= {}", o.exit_code)),
-                ("duration", "duration", "command runtime".to_owned()),
-                ("events", "table", "time-interleaved stream chunks".to_owned()),
+            let stdout_val = o.stdout_value(Alloc::global());
+            let stderr_val = o.stderr_value(Alloc::global());
+            let exit_val = Value::Int(i64::from(o.exit_code));
+            let dur_val = Value::Duration(o.duration);
+            let ev_val = Value::Table(o.events_table(Alloc::global()));
+            for (idx, (name, detail, doc, val)) in [
+                ("stdout", "string", format!("{} bytes stdout", o.stdout_len()), stdout_val),
+                ("stderr", "string", format!("{} bytes stderr", o.stderr_len()), stderr_val),
+                ("exit_code", "int", format!("= {}", o.exit_code), exit_val),
+                ("duration", "duration", "command runtime".to_owned(), dur_val),
+                ("events", "table", "time-interleaved stream chunks".to_owned(), ev_val),
             ]
             .into_iter()
             .enumerate()
             {
-                push_field(scored, (10 - idx as i32).max(0), name, detail.to_owned(), doc, false);
+                let pv = Some(build_value_preview(&val, None));
+                push_field(scored, (10 - idx as i32).max(0), name, detail.to_owned(), doc, false, pv);
             }
         }
         _ => {}
+    }
+}
+
+fn format_preview_scalar(v: &Value<'_>, max_chars: usize) -> String {
+    match v {
+        Value::Nothing => "—".to_owned(),
+        Value::List(items) => {
+            let mut out = String::from("[");
+            for (i, it) in items.iter().take(4).enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&format_preview_scalar(it, 20));
+                if out.chars().count() >= max_chars.saturating_sub(4) {
+                    if i + 1 < items.len() {
+                        out.push_str(", …");
+                    }
+                    break;
+                }
+            }
+            if items.len() > 4 && !out.ends_with('…') {
+                out.push_str(&format!(", +{}", items.len() - 4));
+            }
+            out.push(']');
+            truncate_preview_str(&out, max_chars)
+        }
+        Value::Record(r) => {
+            let mut out = String::from("{");
+            for (i, (k, val)) in r.iter().take(3).enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(k);
+                out.push_str(": ");
+                out.push_str(&format_preview_scalar(val, 16));
+            }
+            if r.len() > 3 {
+                out.push_str(&format!(", +{}", r.len() - 3));
+            }
+            out.push('}');
+            truncate_preview_str(&out, max_chars)
+        }
+        Value::Table(t) => format!("table[{} × {}]", t.nrows(), t.ncols()),
+        other => {
+            let mut s = blaze_own::AString::new_in(Alloc::global());
+            let _ = other.format_cell(&mut s);
+            let single_line = s.as_str().replace('\n', " ↵ ");
+            truncate_preview_str(&single_line, max_chars)
+        }
+    }
+}
+
+fn truncate_preview_str(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_owned();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let cut = s.char_indices().nth(keep).map(|(i, _)| i).unwrap_or(s.len());
+    let mut out = s[..cut].to_owned();
+    out.push('…');
+    out
+}
+
+/// Build a fast, bounded (`<= 8` rows) live result preview for the right-hand completion pane.
+fn build_value_preview(val: &Value<'_>, footer_hint: Option<&str>) -> CompletionPreview {
+    const MAX_PREVIEW_ROWS: usize = 8;
+    match val {
+        Value::Table(t) => {
+            let show_cols = t.ncols().min(3);
+            let table_headers: Vec<String> = (0..show_cols)
+                .map(|ci| t.columns.get(ci).unwrap().as_ref().to_owned())
+                .collect();
+            let show_rows = t.nrows().min(MAX_PREVIEW_ROWS - 1);
+            let mut rows = Vec::with_capacity(show_rows);
+            for ri in 0..show_rows {
+                let mut cells = Vec::with_capacity(show_cols);
+                for ci in 0..show_cols {
+                    let cell = t
+                        .cell(ri, ci)
+                        .map(|v| format_preview_scalar(v, 22))
+                        .unwrap_or_else(|| "—".to_owned());
+                    cells.push(cell);
+                }
+                rows.push(PreviewRow {
+                    key: ri.to_string(),
+                    cells,
+                    is_null: false,
+                });
+            }
+            let extra_rows = t.nrows().saturating_sub(show_rows);
+            let extra_cols = t.ncols().saturating_sub(show_cols);
+            let mut footer = String::new();
+            if extra_rows > 0 {
+                footer.push_str(&format!("+{extra_rows} rows"));
+            }
+            if extra_cols > 0 {
+                if !footer.is_empty() {
+                    footer.push_str(" · ");
+                }
+                footer.push_str(&format!("+{extra_cols} cols"));
+            }
+            if let Some(hint) = footer_hint {
+                if !footer.is_empty() {
+                    footer.push_str(" · ");
+                }
+                footer.push_str(hint);
+            }
+            CompletionPreview {
+                type_tag: format!("table[{}]", t.nrows()),
+                meta: format!("{} rows × {} cols", t.nrows(), t.ncols()),
+                table_headers,
+                rows,
+                footer,
+            }
+        }
+        Value::Record(r) => {
+            let mut rows = Vec::with_capacity(r.len().min(MAX_PREVIEW_ROWS));
+            for (k, v) in r.iter().take(MAX_PREVIEW_ROWS) {
+                let is_null = matches!(v, Value::Nothing);
+                rows.push(PreviewRow {
+                    key: k.to_owned(),
+                    cells: vec![format_preview_scalar(v, 36)],
+                    is_null,
+                });
+            }
+            let extra = r.len().saturating_sub(rows.len());
+            let mut footer = if extra > 0 {
+                format!("+{extra} more fields")
+            } else {
+                String::new()
+            };
+            if let Some(hint) = footer_hint {
+                if !footer.is_empty() {
+                    footer.push_str(" · ");
+                }
+                footer.push_str(hint);
+            }
+            CompletionPreview {
+                type_tag: format!("record{{{}}}", r.len()),
+                meta: format!("{} fields", r.len()),
+                table_headers: Vec::new(),
+                rows,
+                footer,
+            }
+        }
+        Value::List(items) => {
+            let total = items.len();
+            let scan_n = total.min(256);
+            let mut non_null = 0usize;
+            let mut has_nested_list = false;
+            let mut elem_ty: Option<&'static str> = None;
+            let mut mixed_ty = false;
+            let mut uniq: HashSet<String> = HashSet::new();
+            for it in items.iter().take(scan_n) {
+                if matches!(it, Value::Nothing) {
+                    continue;
+                }
+                non_null += 1;
+                if matches!(it, Value::List(_)) {
+                    has_nested_list = true;
+                }
+                let ty = it.type_name();
+                match elem_ty {
+                    None => elem_ty = Some(ty),
+                    Some(prev) if prev != ty => mixed_ty = true,
+                    _ => {}
+                }
+                if uniq.len() <= 200 {
+                    uniq.insert(format_preview_scalar(it, 32));
+                }
+            }
+            let has_nulls = non_null < scan_n;
+            let inner_ty = if mixed_ty {
+                "any"
+            } else {
+                elem_ty.unwrap_or("null")
+            };
+            let type_tag = if has_nested_list {
+                if has_nulls {
+                    "list<list?>".to_owned()
+                } else {
+                    "list<list>".to_owned()
+                }
+            } else if has_nulls && inner_ty != "null" {
+                format!("list<{inner_ty}?>")
+            } else {
+                format!("list<{inner_ty}>")
+            };
+            let fill_pct = if scan_n > 0 { (non_null * 100) / scan_n } else { 100 };
+            let meta = if has_nulls {
+                format!("{total} items · {fill_pct}% fill")
+            } else if uniq.len() <= 200 && total > 1 {
+                format!("{total} items · {} unique", uniq.len())
+            } else {
+                format!("{total} items")
+            };
+
+            let mut rows = Vec::with_capacity(total.min(MAX_PREVIEW_ROWS));
+            let mut shown_non_null = 0usize;
+            for (idx, it) in items.iter().enumerate() {
+                if rows.len() >= MAX_PREVIEW_ROWS {
+                    break;
+                }
+                let is_null = matches!(it, Value::Nothing);
+                // If early rows are mostly null, show up to 2 nulls then jump to real samples
+                // so the preview is always informative instead of 8 blank `—` lines!
+                if is_null && shown_non_null == 0 && rows.len() >= 2 && non_null > 0 {
+                    continue;
+                }
+                if !is_null {
+                    shown_non_null += 1;
+                }
+                rows.push(PreviewRow {
+                    key: idx.to_string(),
+                    cells: vec![format_preview_scalar(it, 40)],
+                    is_null,
+                });
+            }
+            let extra = total.saturating_sub(rows.len());
+            let mut footer = if extra > 0 {
+                format!("+{extra} more")
+            } else {
+                String::new()
+            };
+            let auto_hint = if footer_hint.is_none() && (has_nested_list || has_nulls) {
+                Some("[] flattens & drops nulls")
+            } else {
+                footer_hint
+            };
+            if let Some(hint) = auto_hint {
+                if !footer.is_empty() {
+                    footer.push_str(" · ");
+                }
+                footer.push_str(hint);
+            }
+            CompletionPreview {
+                type_tag,
+                meta,
+                table_headers: Vec::new(),
+                rows,
+                footer,
+            }
+        }
+        Value::Output(o) => {
+            let mut rows = vec![
+                PreviewRow {
+                    key: "exit".to_owned(),
+                    cells: vec![o.exit_code.to_string()],
+                    is_null: false,
+                },
+                PreviewRow {
+                    key: "stdout".to_owned(),
+                    cells: vec![format!("{} B", o.stdout_len())],
+                    is_null: false,
+                },
+            ];
+            let s = o.stdout_value(Alloc::global());
+            if let Some(txt) = s.as_str() {
+                for (i, line) in txt.lines().take(5).enumerate() {
+                    rows.push(PreviewRow {
+                        key: format!("L{}", i + 1),
+                        cells: vec![truncate_preview_str(line, 38)],
+                        is_null: false,
+                    });
+                }
+            }
+            CompletionPreview {
+                type_tag: "output".to_owned(),
+                meta: format!("exit {} · {} B", o.exit_code, o.stdout_len()),
+                table_headers: Vec::new(),
+                rows,
+                footer: footer_hint.unwrap_or("").to_owned(),
+            }
+        }
+        other => {
+            let is_null = matches!(other, Value::Nothing);
+            let txt = format_preview_scalar(other, 140);
+            let mut rows = Vec::new();
+            let mut rem = txt.as_str();
+            for _ in 0..4 {
+                if rem.is_empty() {
+                    break;
+                }
+                let cut = rem.char_indices().nth(38).map(|(i, _)| i).unwrap_or(rem.len());
+                rows.push(PreviewRow {
+                    key: String::new(),
+                    cells: vec![rem[..cut].to_owned()],
+                    is_null,
+                });
+                rem = &rem[cut..];
+            }
+            CompletionPreview {
+                type_tag: other.type_name().to_owned(),
+                meta: String::new(),
+                table_headers: Vec::new(),
+                rows,
+                footer: footer_hint.unwrap_or("").to_owned(),
+            }
+        }
     }
 }
 
@@ -6107,6 +6536,10 @@ mod tests {
             ed.completions.iter().map(|c| (&c.label, &c.insert)).collect::<Vec<_>>()
         );
         let pkg_idx = ed.completions.iter().position(|c| c.label == ".package").unwrap();
+        let pkg_pv = ed.completions[pkg_idx].preview.as_ref().expect(".package must carry live table preview");
+        assert!(pkg_pv.type_tag.starts_with("table["), "got {}", pkg_pv.type_tag);
+        assert!(!pkg_pv.table_headers.is_empty());
+        assert!(!pkg_pv.rows.is_empty());
         assert!(ed.apply_completion(pkg_idx));
         assert_eq!(ed.text, "Cargo.lock.package.");
 
@@ -6114,17 +6547,22 @@ mod tests {
         ed.insert_typed(".");
         assert_eq!(ed.text, "Cargo.lock.package.");
 
-        // Next refresh immediately shows `name`, `version`, `dependencies`!
+        // Next refresh immediately shows `name`, `version`, `dependencies` with live previews!
         ed.refresh_assist(&state, &[], false);
         assert!(ed.completions.iter().any(|c| c.label == "dependencies"));
-
-        // Selecting `dependencies` and refreshing immediately offers `[]` flatten+drop-nulls!
         let dep_idx = ed.completions.iter().position(|c| c.label == "dependencies").unwrap();
+        let dep_pv = ed.completions[dep_idx].preview.as_ref().expect("dependencies must carry list preview");
+        assert!(dep_pv.type_tag.starts_with("list<"), "got {}", dep_pv.type_tag);
+        assert!(ed.completions[dep_idx].doc.contains("cfg-if"), "expected non-null sample, got {}", ed.completions[dep_idx].doc);
+
+        // Selecting `dependencies` and refreshing immediately offers `[]` flatten+drop-nulls with flattened preview!
         assert!(ed.apply_completion(dep_idx));
         assert_eq!(ed.text, "Cargo.lock.package.dependencies");
         ed.refresh_assist(&state, &[], false);
         assert_eq!(ed.completions[0].label, "[]");
         assert_eq!(ed.completions[0].insert, "Cargo.lock.package.dependencies[]");
+        let flat_pv = ed.completions[0].preview.as_ref().expect("[] must carry flattened list preview");
+        assert_eq!(flat_pv.rows[0].cells[0], "cfg-if");
         assert!(ed.apply_selected_completion());
         assert_eq!(ed.text, "Cargo.lock.package.dependencies[]");
 
