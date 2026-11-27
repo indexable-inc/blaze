@@ -492,9 +492,13 @@ struct Work {
     clock: Option<blaze_core::wait::Monotonic>,
     /// The instance being made: its builds' and emits' times, and its last build's sizes.
     times: MakeTimes,
-    /// The last make's report, when it was large or slow, for the maker to hand on
+    /// The last make's sizes and timing (populated whenever `clock` is `Some`), for profiling
+    /// summaries (`Maker::take_last_make`) and large/slow threshold reporting
     /// ([`MakeWatch::report`]).
-    reported: Option<MakeSizes>,
+    last_make: Option<MakeSizes>,
+    /// Whether `last_make` crossed the large/slow reporting threshold (`MAKE_REPORT_BYTES` or
+    /// `MAKE_REPORT_TIME`) and has not yet been reported via [`MakerState::take_report`].
+    last_make_reportable: bool,
     /// The questions the build being made asked ([`Asking`]): cleared as each build starts,
     /// so a build made again after a retry keeps only its own answers (a lazy front's default
     /// `repr` before a head was made is never kept), then sealed into the entry's read list
@@ -725,7 +729,8 @@ impl MakerState {
             routines: core::cell::OnceCell::new(),
             clock: None,
             times: MakeTimes::default(),
-            reported: None,
+            last_make: None,
+            last_make_reportable: false,
             reads: ReadLog::new(ReadPlant::None),
             answers: Answers::new_in(alloc),
             query_cache: core::cell::RefCell::new(QueryCache::new_in(alloc)),
@@ -752,7 +757,30 @@ impl MakerState {
 
     /// The last make's report, when it was large or slow ([`MakeSizes`]); taken once.
     pub fn take_report(&mut self) -> Option<MakeSizes> {
-        self.work.reported.take()
+        if self.work.last_make_reportable {
+            self.work.last_make_reportable = false;
+            self.work.last_make.take()
+        } else {
+            None
+        }
+    }
+
+    /// Borrows the last make's [`MakeSizes`] once if it crossed the large/slow threshold, leaving
+    /// `last_make` intact for [`MakerState::take_last_make`].
+    fn report_if_large_or_slow(&mut self) -> Option<&MakeSizes> {
+        if self.work.last_make_reportable {
+            self.work.last_make_reportable = false;
+            self.work.last_make.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// Takes the last compiled function's [`MakeSizes`] (populated whenever `clock` is set),
+    /// regardless of whether it crossed the large/slow reporting threshold.
+    pub fn take_last_make(&mut self) -> Option<MakeSizes> {
+        self.work.last_make_reportable = false;
+        self.work.last_make.take()
     }
 
     /// Fn `key` checked, once a run: its index, `None` when the front end has no body for it.
@@ -961,25 +989,27 @@ pub fn make_instance<P: FrontEnd, T: Typing<P>>(
     use blaze_core::wait::Clock as _;
     let made_from = state.work.clock.map(|c| c.now());
     state.work.times = MakeTimes::default();
-    state.work.reported = None;
+    state.work.last_make = None;
+    state.work.last_make_reportable = false;
     make_instance_timed(program, typing, state, checks, tabled, name, entry)?;
     finish_make_timing(state, made_from);
     Ok(())
 }
 
-/// Records the make's [`MakeSizes`] report when it was large or slow (rule 16): its times split,
-/// with checks and constant pulls (`lower`) being what builds and emits leave of the whole.
+/// Records the make's [`MakeSizes`] (rule 16): its times split, with checks and constant pulls
+/// (`lower`) being what builds and emits leave of the whole, and marks whether it crossed the
+/// large/slow threshold.
 fn finish_make_timing(state: &mut MakerState, made_from: Option<core::time::Duration>) {
     use blaze_core::wait::Clock as _;
     if let (Some(c), Some(from)) = (state.work.clock, made_from) {
         let took = c.now().saturating_sub(from);
         let times = core::mem::take(&mut state.work.times);
-        if let Some(last) = times.last
-            && last.reported(took)
-        {
+        if let Some(last) = times.last {
+            let reportable = last.reported(took);
             let MadeSizes { function, blocks, insts, copy_insts, slots, frame_estimate, entry_bytes, code } = last;
             let lower = took.saturating_sub(times.build).saturating_sub(times.emit);
-            state.work.reported = Some(MakeSizes { function, blocks, insts, copy_insts, slots, frame_estimate, entry_bytes, code, lower, build: times.build, emit: times.emit });
+            state.work.last_make = Some(MakeSizes { function, blocks, insts, copy_insts, slots, frame_estimate, entry_bytes, code, lower, build: times.build, emit: times.emit });
+            state.work.last_make_reportable = reportable;
         }
     }
 }
@@ -3228,6 +3258,12 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         Some(RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled, first, kept: errors.len(), dropped: log.dropped() })))
     }
 
+    /// Takes the last compiled function's [`MakeSizes`] (populated whenever `watch` is `Some`),
+    /// for profiling summaries without changing threshold reporting.
+    pub fn take_last_make(&mut self) -> Option<MakeSizes> {
+        self.made.as_mut().and_then(|(_, state)| state.take_last_make())
+    }
+
     /// The program made on the first call, then the one instance.
     fn make_over(&mut self, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
         self.construct(tabled)?;
@@ -3235,8 +3271,8 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
             return Err(RunError::OneBody { key: tabled, why: "the maker's program was not made (make_one.rs `Maker::make`)" });
         };
         make_instance(program, &mut self.typing, state, &mut self.checks, tabled, name, entry)?;
-        if let (Some(watch), Some(sizes)) = (self.watch, state.take_report()) {
-            (watch.report)(&sizes);
+        if let (Some(watch), Some(sizes)) = (self.watch, state.report_if_large_or_slow()) {
+            (watch.report)(sizes);
         }
         Ok(())
     }
@@ -3288,13 +3324,14 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         use blaze_core::wait::Clock as _;
         let made_from = state.work.clock.map(|c| c.now());
         state.work.times = MakeTimes::default();
-        state.work.reported = None;
+        state.work.last_make = None;
+        state.work.last_make_reportable = false;
         let mut out: Option<BuiltLir<A>> = None;
         let mut sink = BuildSink::Lir { alloc, out: &mut out, declared };
         run_instance_loop(program, &mut self.typing, state, &mut self.checks, tabled, name, &mut sink)?;
         finish_make_timing(state, made_from);
-        if let (Some(watch), Some(sizes)) = (self.watch, state.take_report()) {
-            (watch.report)(&sizes);
+        if let (Some(watch), Some(sizes)) = (self.watch, state.report_if_large_or_slow()) {
+            (watch.report)(sizes);
         }
         out.ok_or(RunError::OneBody { key: tabled, why: "the LIR build completed without producing a body (make_one.rs `Maker::build_lir`)" })
     }
@@ -3328,6 +3365,8 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         let Some((program, state)) = self.made.as_mut() else {
             return Err(RunError::OneBody { key: item, why: "the maker's program was not made (make_one.rs `Maker::make_static`)" });
         };
+        state.work.last_make = None;
+        state.work.last_make_reportable = false;
         let kind = program.make_static_value(item).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
         let alloc = state.work.alloc;
         let mut vtable_keys: AVec<'_, blaze_build::vtable::VtableKey> = blaze_own::Vec::new_in(alloc);

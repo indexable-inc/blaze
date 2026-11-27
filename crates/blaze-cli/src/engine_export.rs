@@ -480,7 +480,7 @@ pub(crate) fn command(
                 Some(picked) => picked,
                 None => run_package::pick(cx, root, select, frame)?,
             };
-            let summary = export_program(cx, standing, &picked, fs, output_flag, target, phases, watch)?;
+            let summary = export_program(cx, standing, &picked, fs, output_flag, target, started_ns, stats, phases, watch)?;
             write_start_profile(cx, root, phases, frame)?;
             let wall_ns = phases.since(started_ns);
             print_summary(cx, &summary, wall_ns, stats, out, err, frame)?;
@@ -488,6 +488,209 @@ pub(crate) fn command(
         })
     });
     lined.map_err(CliError::RunLine)?
+}
+
+/// Maximum number of entries retained in each per-worker and merged top-N compile profile table
+/// (Rule 18: strictly bounded memory).
+const TOP_FN_LIMIT: usize = 10;
+
+/// Wall-clock phase durations (in nanoseconds) recorded across one `blaze build` / `blaze export`.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct ExportPhaseTimes {
+    front_ns: u64,
+    walk_ns: u64,
+    lto_ns: u64,
+    link_ns: u64,
+}
+
+/// Borrowed comparison key shared by [`FnCompileStat`] and [`blaze_ladder::run::make_one::MakeSizes`]
+/// so fast-path rejection before allocation and bounded insertion use one ordering (Rule 30).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FnCompileKey<'a> {
+    name: &'a str,
+    lower_ns: u64,
+    build_ns: u64,
+    emit_ns: u64,
+    insts: u64,
+    blocks: u64,
+    frame_estimate: u64,
+    entry_bytes: u64,
+}
+
+impl<'a> FnCompileKey<'a> {
+    fn of_sizes(sizes: &'a blaze_ladder::run::make_one::MakeSizes) -> Self {
+        Self {
+            name: &sizes.function.path,
+            lower_ns: u64::try_from(sizes.lower.as_nanos()).unwrap_or(u64::MAX),
+            build_ns: u64::try_from(sizes.build.as_nanos()).unwrap_or(u64::MAX),
+            emit_ns: u64::try_from(sizes.emit.as_nanos()).unwrap_or(u64::MAX),
+            insts: sizes.insts,
+            blocks: sizes.blocks,
+            frame_estimate: sizes.frame_estimate,
+            entry_bytes: sizes.entry_bytes,
+        }
+    }
+
+    #[inline]
+    const fn total_ns(&self) -> u64 {
+        self.lower_ns.saturating_add(self.build_ns).saturating_add(self.emit_ns)
+    }
+}
+
+/// Deterministic top-N ordering for slowest compiled functions: total compile time descending,
+/// breaking ties deterministically by function name ascending then size/phase fields (Rule 25).
+fn cmp_slowest_key(a: &FnCompileKey<'_>, b: &FnCompileKey<'_>) -> core::cmp::Ordering {
+    b.total_ns()
+        .cmp(&a.total_ns())
+        .then_with(|| a.name.cmp(b.name))
+        .then_with(|| b.insts.cmp(&a.insts))
+        .then_with(|| b.frame_estimate.cmp(&a.frame_estimate))
+        .then_with(|| b.blocks.cmp(&a.blocks))
+        .then_with(|| b.entry_bytes.cmp(&a.entry_bytes))
+        .then_with(|| b.lower_ns.cmp(&a.lower_ns))
+        .then_with(|| b.build_ns.cmp(&a.build_ns))
+        .then_with(|| b.emit_ns.cmp(&a.emit_ns))
+}
+
+/// Deterministic top-N ordering for largest compiled functions: LIR `insts` descending, then
+/// `frame_estimate` descending, breaking ties deterministically by function name ascending then
+/// remaining fields (Rule 25).
+fn cmp_largest_key(a: &FnCompileKey<'_>, b: &FnCompileKey<'_>) -> core::cmp::Ordering {
+    b.insts
+        .cmp(&a.insts)
+        .then_with(|| b.frame_estimate.cmp(&a.frame_estimate))
+        .then_with(|| a.name.cmp(b.name))
+        .then_with(|| b.blocks.cmp(&a.blocks))
+        .then_with(|| b.entry_bytes.cmp(&a.entry_bytes))
+        .then_with(|| b.total_ns().cmp(&a.total_ns()))
+        .then_with(|| b.lower_ns.cmp(&a.lower_ns))
+        .then_with(|| b.build_ns.cmp(&a.build_ns))
+        .then_with(|| b.emit_ns.cmp(&a.emit_ns))
+}
+
+/// One compiled function's bounded profiling sample held in a worker or coordinator top-10 table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FnCompileStat {
+    name: String<SharedAlloc<'static>>,
+    lower_ns: u64,
+    build_ns: u64,
+    emit_ns: u64,
+    insts: u64,
+    blocks: u64,
+    frame_estimate: u64,
+    entry_bytes: u64,
+}
+
+impl FnCompileStat {
+    fn from_key(key: FnCompileKey<'_>, alloc: SharedAlloc<'static>) -> Self {
+        let mut name = String::with_capacity_in(key.name.len(), alloc);
+        name.push_str(key.name);
+        Self {
+            name,
+            lower_ns: key.lower_ns,
+            build_ns: key.build_ns,
+            emit_ns: key.emit_ns,
+            insts: key.insts,
+            blocks: key.blocks,
+            frame_estimate: key.frame_estimate,
+            entry_bytes: key.entry_bytes,
+        }
+    }
+
+    fn key(&self) -> FnCompileKey<'_> {
+        FnCompileKey {
+            name: self.name.as_str(),
+            lower_ns: self.lower_ns,
+            build_ns: self.build_ns,
+            emit_ns: self.emit_ns,
+            insts: self.insts,
+            blocks: self.blocks,
+            frame_estimate: self.frame_estimate,
+            entry_bytes: self.entry_bytes,
+        }
+    }
+}
+
+fn would_accept_key(
+    list: &[FnCompileStat],
+    key: &FnCompileKey<'_>,
+    cmp: fn(&FnCompileKey<'_>, &FnCompileKey<'_>) -> core::cmp::Ordering,
+) -> bool {
+    if list.len() < TOP_FN_LIMIT {
+        return true;
+    }
+    list.last().is_some_and(|last| cmp(key, &last.key()) == core::cmp::Ordering::Less)
+}
+
+fn insert_bounded(
+    list: &mut Vec<FnCompileStat, SharedAlloc<'static>>,
+    entry: FnCompileStat,
+    cmp: fn(&FnCompileKey<'_>, &FnCompileKey<'_>) -> core::cmp::Ordering,
+) {
+    let key = entry.key();
+    if !would_accept_key(list.as_slice(), &key, cmp) {
+        return;
+    }
+    let pos = list.binary_search_by(|existing| cmp(&existing.key(), &key)).unwrap_or_else(|i| i);
+    if pos >= TOP_FN_LIMIT {
+        return;
+    }
+    if list.len() == TOP_FN_LIMIT {
+        list.pop();
+    }
+    list.insert_shift(pos, entry);
+}
+
+/// Lock-free per-worker (and post-join merged coordinator) bounded top-10 slowest and largest
+/// compiled function tables collected when `--stats` is active.
+#[derive(Debug)]
+struct CompileTopStats {
+    slowest: Vec<FnCompileStat, SharedAlloc<'static>>,
+    largest: Vec<FnCompileStat, SharedAlloc<'static>>,
+    alloc: SharedAlloc<'static>,
+}
+
+impl CompileTopStats {
+    fn new_in(alloc: SharedAlloc<'static>) -> Self {
+        Self {
+            slowest: Vec::with_capacity_in(TOP_FN_LIMIT, alloc),
+            largest: Vec::with_capacity_in(TOP_FN_LIMIT, alloc),
+            alloc,
+        }
+    }
+
+    fn record_sizes(&mut self, sizes: &blaze_ladder::run::make_one::MakeSizes) {
+        self.record_key(FnCompileKey::of_sizes(sizes));
+    }
+
+    fn record_key(&mut self, key: FnCompileKey<'_>) {
+        let enter_slow = would_accept_key(self.slowest.as_slice(), &key, cmp_slowest_key);
+        let enter_large = would_accept_key(self.largest.as_slice(), &key, cmp_largest_key);
+        if !enter_slow && !enter_large {
+            return;
+        }
+        let stat = FnCompileStat::from_key(key, self.alloc);
+        match (enter_slow, enter_large) {
+            (true, true) => {
+                let dup = stat.clone();
+                insert_bounded(&mut self.slowest, stat, cmp_slowest_key);
+                insert_bounded(&mut self.largest, dup, cmp_largest_key);
+            }
+            (true, false) => insert_bounded(&mut self.slowest, stat, cmp_slowest_key),
+            (false, true) => insert_bounded(&mut self.largest, stat, cmp_largest_key),
+            (false, false) => {}
+        }
+    }
+
+    /// Deterministically merges another worker's bounded top-10 tables into `self`.
+    fn merge(&mut self, other: CompileTopStats) {
+        for entry in other.slowest {
+            insert_bounded(&mut self.slowest, entry, cmp_slowest_key);
+        }
+        for entry in other.largest {
+            insert_bounded(&mut self.largest, entry, cmp_largest_key);
+        }
+    }
 }
 
 /// Summary metrics collected during one `blaze export`.
@@ -503,6 +706,8 @@ struct ExportSummary<'f> {
     lto_bodies: usize,
     lto_inlined: usize,
     lto_hot: usize,
+    phase_times: ExportPhaseTimes,
+    top_stats: Option<CompileTopStats>,
 }
 
 /// How one walked row's entry bytes are held until assembly.
@@ -1041,6 +1246,7 @@ fn run_export_worker_epoch<'f>(
     worker_frame: &'f Frame,
     carry: &mut Option<ExportJob>,
     reset_at: &mut usize,
+    mut worker_top: Option<&mut CompileTopStats>,
     heap: &'static blaze_own::Heap,
 ) -> ExportEpochEnd {
     let shared = heap.shared();
@@ -1101,6 +1307,11 @@ fn run_export_worker_epoch<'f>(
                     let used = worker_frame.used();
                     *reset_at = used.saturating_add(EXPORT_WORKER_FRAME_HEADROOM).min(EXPORT_WORKER_FRAME_HARD_RESET_AT);
                 }
+                if let Some(top) = worker_top.as_deref_mut()
+                    && let Some(sizes) = maker.take_last_make()
+                {
+                    top.record_sizes(&sizes);
+                }
                 let mut out = Vec::with_capacity_in(scratch.len(), shared);
                 out.extend_from_slice(scratch.as_slice());
                 Ok(out)
@@ -1149,10 +1360,12 @@ fn run_export_code_worker(
     done: &bstd::sync::chan::OwnedChan<ExportDone, SharedAlloc<'static>>,
     procs_asked: &bstd::sync::chan::OwnedChan<usize, SharedAlloc<'static>>,
     procs_answer: &bstd::sync::chan::OwnedChan<ExportProcsAnswer, SharedAlloc<'static>>,
+    collect_stats: bool,
     heap: &'static blaze_own::Heap,
-) {
+) -> Option<CompileTopStats> {
+    let mut worker_top = collect_stats.then(|| CompileTopStats::new_in(heap.shared()));
     let Ok(mut worker_frame) = Frame::new(bstd::mem::Tag::Other) else {
-        return;
+        return worker_top;
     };
     let mut carry: Option<ExportJob> = None;
     let mut reset_at = EXPORT_WORKER_FRAME_HEADROOM;
@@ -1177,9 +1390,10 @@ fn run_export_code_worker(
             &worker_frame,
             &mut carry,
             &mut reset_at,
+            worker_top.as_mut(),
             heap,
         ) {
-            ExportEpochEnd::Done => return,
+            ExportEpochEnd::Done => return worker_top,
             ExportEpochEnd::Reset(next) => carry = next,
         }
     }
@@ -1215,6 +1429,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
     cached: &mut usize,
     unkeyed: &mut usize,
     stubs: &mut usize,
+    mut top_stats: Option<&mut CompileTopStats>,
     frame: &'f Frame,
     alloc: Alloc<'a>,
     heap: &'static blaze_own::Heap,
@@ -1222,6 +1437,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
     use bstd::sync::chan::owned;
     use core::num::NonZeroUsize;
 
+    let collect_stats = top_stats.is_some();
     let shared = heap.shared();
     let start_row = *next_row;
     let inbox_cap = NonZeroUsize::new(EXPORT_PER_WORKER_IN_FLIGHT * 2).expect("non-zero inbox cap");
@@ -1246,7 +1462,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
         let asked_ref = &procs_asked;
         let answer_ref = &procs_answers[worker_id];
         match scope.must_overlap("blaze build: a code worker", EXPORT_WORKER_SCRATCH, move |wcx: &Cx| {
-            run_export_code_worker(
+            let worker_top = run_export_code_worker(
                 worker_id,
                 wcx,
                 clock,
@@ -1260,9 +1476,10 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                 done_ref,
                 asked_ref,
                 answer_ref,
+                collect_stats,
                 heap,
             );
-            Ok::<(), core::convert::Infallible>(())
+            Ok::<Option<CompileTopStats>, core::convert::Infallible>(worker_top)
         }) {
             Ok(task) => tasks.push(task),
             Err(_) => break,
@@ -1319,10 +1536,20 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                         }
                         Stepped::Made(key) => {
                             *compiled += 1;
+                            if let Some(top) = top_stats.as_deref_mut()
+                                && let Some(sizes) = maker.take_last_make()
+                            {
+                                top.record_sizes(&sizes);
+                            }
                             outcomes.push(RowOutcome::Keyed(key));
                         }
                         Stepped::Unkeyed(_) => {
                             *unkeyed += 1;
+                            if let Some(top) = top_stats.as_deref_mut()
+                                && let Some(sizes) = maker.take_last_make()
+                            {
+                                top.record_sizes(&sizes);
+                            }
                             let mut copied: AVec<'_, u8> = Vec::with_capacity_in(scratch.made().len(), alloc);
                             copied.extend_from_slice(scratch.made());
                             outcomes.push(RowOutcome::Unkeyed(copied));
@@ -1481,10 +1708,20 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
                         }
                         Stepped::Made(key) => {
                             *compiled += 1;
+                            if let Some(top) = top_stats.as_deref_mut()
+                                && let Some(sizes) = maker.take_last_make()
+                            {
+                                top.record_sizes(&sizes);
+                            }
                             par_outcomes[rel] = Some(RowOutcome::Keyed(key));
                         }
                         Stepped::Unkeyed(_) => {
                             *unkeyed += 1;
+                            if let Some(top) = top_stats.as_deref_mut()
+                                && let Some(sizes) = maker.take_last_make()
+                            {
+                                top.record_sizes(&sizes);
+                            }
                             let mut copied: AVec<'_, u8> = Vec::with_capacity_in(scratch.made().len(), alloc);
                             copied.extend_from_slice(scratch.made());
                             par_outcomes[rel] = Some(RowOutcome::Unkeyed(copied));
@@ -1650,7 +1887,11 @@ fn walk_remaining_parallel<'a, 'f, 'p, D: blaze_core::Driver>(
     while done_ch.try_recv().is_ok() {}
     let ending = cx.until(bstd::Deadline::after(clock.now().since_start(), EXPORT_END_WAIT));
     for task in tasks {
-        let _ = task.join(&ending);
+        if let Ok(Some(worker_top)) = task.join(&ending)
+            && let Some(dst) = top_stats.as_deref_mut()
+        {
+            dst.merge(worker_top);
+        }
     }
     let _ = scope.join(&ending);
     run_res
@@ -1665,6 +1906,8 @@ fn export_program<'f>(
     fs: &Fs,
     output_flag: Option<&str>,
     target: BuildTarget,
+    started_at: bstd::clock::Instant,
+    stats: bool,
     phases: &mut Phases,
     watch: &dyn blaze_screen::Watch,
 ) -> Result<ExportSummary<'f>, CliError> {
@@ -1814,6 +2057,9 @@ fn export_program<'f>(
         .unwrap_or(0)
         .min(MAX_EXPORT_WORKERS);
 
+    let mut top_stats = stats.then(|| CompileTopStats::new_in(heap.shared()));
+    let front_ns = phases.since(started_at);
+    let walk_began = phases.now();
     let mut next_row = 0usize;
     {
         let _walk_span = cx.span("export: walk reachable functions");
@@ -1847,6 +2093,7 @@ fn export_program<'f>(
                     &mut cached,
                     &mut unkeyed,
                     &mut stubs,
+                    top_stats.as_mut(),
                     frame,
                     alloc,
                     heap,
@@ -1872,10 +2119,20 @@ fn export_program<'f>(
                     }
                     Stepped::Made(key) => {
                         compiled += 1;
+                        if let Some(top) = top_stats.as_mut()
+                            && let Some(sizes) = maker.take_last_make()
+                        {
+                            top.record_sizes(&sizes);
+                        }
                         outcomes.push(RowOutcome::Keyed(key));
                     }
                     Stepped::Unkeyed(_) => {
                         unkeyed += 1;
+                        if let Some(top) = top_stats.as_mut()
+                            && let Some(sizes) = maker.take_last_make()
+                        {
+                            top.record_sizes(&sizes);
+                        }
                         let mut copied: AVec<'_, u8> = Vec::with_capacity_in(scratch.made().len(), alloc);
                         copied.extend_from_slice(scratch.made());
                         outcomes.push(RowOutcome::Unkeyed(copied));
@@ -1896,8 +2153,10 @@ fn export_program<'f>(
             }
         }
     }
+    let walk_ns = phases.since(walk_began);
 
     if target == BuildTarget::Wasm64 {
+        let link_began = phases.now();
         let mut wasm_bytes: AVec<'_, u8> = Vec::new_in(alloc);
         let wasm_opts = blaze_ladder::run::make_one::wasm64::Wasm64BuildOpts {
             module_name: picked.bin,
@@ -1940,6 +2199,7 @@ fn export_program<'f>(
             heap,
         )?;
         write_output_file(cx, fs, output_path, wasm_bytes.as_slice(), false, heap)?;
+        let link_ns = phases.since(link_began);
         let exported = Exported {
             platform: Platform::Wasm64,
             functions: u32::try_from(built.func_count).unwrap_or(u32::MAX),
@@ -1965,12 +2225,15 @@ fn export_program<'f>(
             lto_bodies: 0,
             lto_inlined: 0,
             lto_hot: 0,
+            phase_times: ExportPhaseTimes { front_ns, walk_ns, lto_ns: 0, link_ns },
+            top_stats,
         });
     }
 
     // Whole-program demand-driven cross-function LIR inlining + host-ISA SOTA emission over
     // workspace functions and their non-cold reachable callees (kept ephemeral in `export_bump`,
     // never written into portable `HomeCodeStore`).
+    let lto_began = phases.now();
     let mut lto_seeds: AVec<'_, usize> = Vec::new_in(alloc);
     for (row, outcome) in outcomes.iter().enumerate() {
         if walk.kind(row) == RowKind::Instance
@@ -2044,10 +2307,20 @@ fn export_program<'f>(
                 }
                 Stepped::Made(key) => {
                     compiled += 1;
+                    if let Some(top) = top_stats.as_mut()
+                        && let Some(sizes) = maker.take_last_make()
+                    {
+                        top.record_sizes(&sizes);
+                    }
                     outcomes.push(RowOutcome::Keyed(key));
                 }
                 Stepped::Unkeyed(_) => {
                     unkeyed += 1;
+                    if let Some(top) = top_stats.as_mut()
+                        && let Some(sizes) = maker.take_last_make()
+                    {
+                        top.record_sizes(&sizes);
+                    }
                     let mut copied: AVec<'_, u8> = Vec::with_capacity_in(scratch.made().len(), alloc);
                     copied.extend_from_slice(scratch.made());
                     outcomes.push(RowOutcome::Unkeyed(copied));
@@ -2062,6 +2335,8 @@ fn export_program<'f>(
         }
     }
     end_procs(cx, &maker_procs, standing.err, "build")?;
+    let lto_ns = phases.since(lto_began);
+    let link_began = phases.now();
 
     let ids_line = crate::run_ids::IdsLine { read: asked.bodies(), folded: asked.reads(), ..ids_line };
     phases.run_names = Some(run_names::NamesRead::of(read.counts(), &seen).with_ids(ids_line));
@@ -2335,6 +2610,7 @@ fn export_program<'f>(
     )?;
 
     write_executable(cx, fs, output_path, exe_bytes.as_slice(), heap)?;
+    let link_ns = phases.since(link_began);
     Ok(ExportSummary {
         output: output_path,
         exported,
@@ -2347,6 +2623,8 @@ fn export_program<'f>(
         lto_bodies,
         lto_inlined,
         lto_hot,
+        phase_times: ExportPhaseTimes { front_ns, walk_ns, lto_ns, link_ns },
+        top_stats,
     })
 }
 
@@ -2500,6 +2778,132 @@ fn chmod_executable(output_path: &str, heap: &'static blaze_own::Heap) -> Result
     Ok(())
 }
 
+struct StackBuf {
+    buf: [u8; 64],
+    len: usize,
+}
+
+impl StackBuf {
+    fn new() -> Self {
+        Self { buf: [0u8; 64], len: 0 }
+    }
+
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl fmt::Write for StackBuf {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let bytes = s.as_bytes();
+        let take = bytes.len().min(self.buf.len().saturating_sub(self.len));
+        if let Some(dst) = self.buf.get_mut(self.len..self.len + take)
+            && let Some(src) = bytes.get(..take)
+        {
+            dst.copy_from_slice(src);
+            self.len += take;
+        }
+        Ok(())
+    }
+}
+
+fn write_ms1(out: &mut impl fmt::Write, ns: u64) -> fmt::Result {
+    let tenths = ns.saturating_add(50_000) / 100_000;
+    write!(out, "{}.{}", tenths / 10, tenths % 10)
+}
+
+fn write_kb1(out: &mut impl fmt::Write, bytes: u64) -> fmt::Result {
+    let tenths = bytes.saturating_mul(10).saturating_add(512) / 1024;
+    write!(out, "{}.{}", tenths / 10, tenths % 10)
+}
+
+fn format_time_col(lower_ns: u64, build_ns: u64, emit_ns: u64) -> StackBuf {
+    use core::fmt::Write as _;
+    let total = lower_ns.saturating_add(build_ns).saturating_add(emit_ns);
+    let mut buf = StackBuf::new();
+    let _ = write_ms1(&mut buf, total);
+    let _ = buf.write_str("ms (");
+    let _ = write_ms1(&mut buf, lower_ns);
+    let _ = buf.write_str("/");
+    let _ = write_ms1(&mut buf, build_ns);
+    let _ = buf.write_str("/");
+    let _ = write_ms1(&mut buf, emit_ns);
+    let _ = buf.write_str(")");
+    buf
+}
+
+/// Formats the per-phase wall-clock summary line (and optional peak RSS / footprint in MiB).
+fn format_build_phases_line(
+    out: &mut impl fmt::Write,
+    phase_times: ExportPhaseTimes,
+    total_ns: u64,
+    peak_rss_bytes: Option<u64>,
+) {
+    let front_ms = phase_times.front_ns / 1_000_000;
+    let walk_ms = phase_times.walk_ns / 1_000_000;
+    let lto_ms = phase_times.lto_ns / 1_000_000;
+    let link_ms = phase_times.link_ns / 1_000_000;
+    let total_ms = total_ns / 1_000_000;
+    let _ = write!(
+        out,
+        "build phases: front={front_ms}ms walk={walk_ms}ms lto={lto_ms}ms link={link_ms}ms total={total_ms}ms"
+    );
+    if let Some(bytes) = peak_rss_bytes {
+        let mb_tenths = bytes.saturating_mul(10).saturating_add(512 * 1024) / (1024 * 1024);
+        let _ = write!(out, " peak_rss_mb={}.{}", mb_tenths / 10, mb_tenths % 10);
+    }
+}
+
+/// Formats the top-10 slowest and top-10 largest compiled function tables for `--stats`.
+fn format_top_fn_tables(out: &mut impl fmt::Write, top: &CompileTopStats) {
+    if !top.slowest.is_empty() {
+        let _ = writeln!(out, "build top-{TOP_FN_LIMIT} slowest compiled fns:");
+        let _ = writeln!(
+            out,
+            "  {:>2}  {:<30}  {:>8}  {:>6}  {:>12}  {}",
+            "#", "total_ms (lower/build/emit)", "insts", "blocks", "frame_est_kb", "fn"
+        );
+        for (idx, entry) in top.slowest.iter().enumerate() {
+            let time_buf = format_time_col(entry.lower_ns, entry.build_ns, entry.emit_ns);
+            let mut kb_buf = StackBuf::new();
+            let _ = write_kb1(&mut kb_buf, entry.frame_estimate);
+            let _ = writeln!(
+                out,
+                "  {:>2}  {:<30}  {:>8}  {:>6}  {:>12}  {}",
+                idx + 1,
+                time_buf.as_str(),
+                entry.insts,
+                entry.blocks,
+                kb_buf.as_str(),
+                entry.name.as_str()
+            );
+        }
+    }
+    if !top.largest.is_empty() {
+        let _ = writeln!(out, "build top-{TOP_FN_LIMIT} largest compiled fns (by LIR insts / frame_estimate):");
+        let _ = writeln!(
+            out,
+            "  {:>2}  {:>8}  {:>6}  {:>12}  {:<30}  {}",
+            "#", "insts", "blocks", "frame_est_kb", "total_ms (lower/build/emit)", "fn"
+        );
+        for (idx, entry) in top.largest.iter().enumerate() {
+            let time_buf = format_time_col(entry.lower_ns, entry.build_ns, entry.emit_ns);
+            let mut kb_buf = StackBuf::new();
+            let _ = write_kb1(&mut kb_buf, entry.frame_estimate);
+            let _ = writeln!(
+                out,
+                "  {:>2}  {:>8}  {:>6}  {:>12}  {:<30}  {}",
+                idx + 1,
+                entry.insts,
+                entry.blocks,
+                kb_buf.as_str(),
+                time_buf.as_str(),
+                entry.name.as_str()
+            );
+        }
+    }
+}
+
 /// Prints the concise one-line summary to `out`, and detailed metrics to `err` when `--stats` is set.
 fn print_summary(
     cx: &Cx,
@@ -2567,6 +2971,20 @@ fn print_summary(
                 wall_ms
             ),
         )?;
+        let peak_rss_bytes = (!cx.is_simulated())
+            .then(blaze_core::own_footprint)
+            .flatten()
+            .map(|(_, most)| most);
+        let mut phase_line = String::new_in(erased.handle());
+        format_build_phases_line(&mut phase_line, summary.phase_times, wall_ns, peak_rss_bytes);
+        err.line(cx, format_args!("{}", phase_line.as_str()))?;
+        if let Some(top) = summary.top_stats.as_ref() {
+            let mut tables = String::new_in(erased.handle());
+            format_top_fn_tables(&mut tables, top);
+            for line in tables.as_str().lines() {
+                err.line(cx, format_args!("{line}"))?;
+            }
+        }
     }
     Ok(())
 }
@@ -3258,5 +3676,216 @@ mod tests {
                 verify(p.func.view()).expect("verified post-LTO IR");
             }
         });
+    }
+
+    #[test]
+    fn top_slow_and_large_bounds_eviction_and_tie_breaking() {
+        let shared = blaze_own::testing::heap().shared();
+        let mut top = CompileTopStats::new_in(shared);
+
+        // Insert 25 functions with distinct compile times and LIR sizes.
+        for i in 0..25u64 {
+            let name = std::format!("crate_a::fn_{i:02}");
+            top.record_key(FnCompileKey {
+                name: name.as_str(),
+                lower_ns: i * 1_000_000,
+                build_ns: i * 2_000_000,
+                emit_ns: i * 500_000,
+                insts: (24 - i) * 100,
+                blocks: (24 - i) * 5,
+                frame_estimate: (24 - i) * 1024,
+                entry_bytes: 512,
+            });
+        }
+        assert_eq!(top.slowest.len(), TOP_FN_LIMIT);
+        assert_eq!(top.largest.len(), TOP_FN_LIMIT);
+        // Slowest: fn_24 down to fn_15.
+        for (rank, entry) in top.slowest.iter().enumerate() {
+            let want = 24 - u64::try_from(rank).expect("rank");
+            assert_eq!(entry.name.as_str(), std::format!("crate_a::fn_{want:02}"));
+            assert_eq!(entry.key().total_ns(), want * 3_500_000);
+        }
+        // Largest: fn_00 down to fn_09.
+        for (rank, entry) in top.largest.iter().enumerate() {
+            let want = u64::try_from(rank).expect("rank");
+            assert_eq!(entry.name.as_str(), std::format!("crate_a::fn_{want:02}"));
+            assert_eq!(entry.insts, (24 - want) * 100);
+        }
+
+        // Tie-breaking (Rule 25): 12 functions with identical total_ns and insts, inserted in
+        // reverse alphabetical order; top-10 must keep the lexicographically first 10 names.
+        let mut tied = CompileTopStats::new_in(shared);
+        for c in (b'a'..=b'l').rev() {
+            let name = std::format!("tied::fn_{}", c as char);
+            tied.record_key(FnCompileKey {
+                name: name.as_str(),
+                lower_ns: 1_000_000,
+                build_ns: 2_000_000,
+                emit_ns: 3_000_000,
+                insts: 500,
+                blocks: 10,
+                frame_estimate: 8192,
+                entry_bytes: 1024,
+            });
+        }
+        assert_eq!(tied.slowest.len(), TOP_FN_LIMIT);
+        assert_eq!(tied.largest.len(), TOP_FN_LIMIT);
+        for (rank, c) in (b'a'..=b'j').enumerate() {
+            let want = std::format!("tied::fn_{}", c as char);
+            assert_eq!(tied.slowest[rank].name.as_str(), want);
+            assert_eq!(tied.largest[rank].name.as_str(), want);
+        }
+
+        // Secondary size tie-breaker: equal `insts`, higher `frame_estimate` ranks first.
+        let mut frame_tie = CompileTopStats::new_in(shared);
+        frame_tie.record_key(FnCompileKey {
+            name: "a::small_frame",
+            lower_ns: 10,
+            build_ns: 10,
+            emit_ns: 10,
+            insts: 100,
+            blocks: 4,
+            frame_estimate: 2048,
+            entry_bytes: 256,
+        });
+        frame_tie.record_key(FnCompileKey {
+            name: "z::huge_frame",
+            lower_ns: 10,
+            build_ns: 10,
+            emit_ns: 10,
+            insts: 100,
+            blocks: 4,
+            frame_estimate: 65536,
+            entry_bytes: 256,
+        });
+        assert_eq!(frame_tie.largest[0].name.as_str(), "z::huge_frame");
+        assert_eq!(frame_tie.largest[1].name.as_str(), "a::small_frame");
+    }
+
+    #[test]
+    fn top_slow_parallel_worker_merge_matches_sequential_for_all_schedules() {
+        let shared = blaze_own::testing::heap().shared();
+        blaze_sim::check(blaze_sim::Config::cases(80), |tape| {
+            let worker_count = usize::try_from(tape.int_in(1..=8u64, "workers")).expect("workers");
+            let fn_count = usize::try_from(tape.int_in(0..=64u64, "fns")).expect("fns");
+
+            let mut seq = CompileTopStats::new_in(shared);
+            let mut workers: Vec<CompileTopStats, SharedAlloc<'static>> = Vec::with_capacity_in(worker_count, shared);
+            for _ in 0..worker_count {
+                workers.push(CompileTopStats::new_in(shared));
+            }
+
+            for i in 0..fn_count {
+                let w = usize::try_from(tape.int_in(0..=u64::try_from(worker_count - 1).expect("w"), "owner")).expect("owner");
+                // Deliberately small value domains to force frequent ties across workers.
+                let lower_ns = tape.int_in(0..=6u64, "lower") * 1_000_000;
+                let build_ns = tape.int_in(0..=6u64, "build") * 1_000_000;
+                let emit_ns = tape.int_in(0..=6u64, "emit") * 1_000_000;
+                let insts = tape.int_in(1..=20u64, "insts") * 50;
+                let blocks = tape.int_in(1..=10u64, "blocks");
+                let frame_estimate = tape.int_in(1..=10u64, "frame") * 1024;
+                let name = std::format!("mod_{}::fn_{i:02}", i % 5);
+                let key = FnCompileKey {
+                    name: name.as_str(),
+                    lower_ns,
+                    build_ns,
+                    emit_ns,
+                    insts,
+                    blocks,
+                    frame_estimate,
+                    entry_bytes: 512,
+                };
+                seq.record_key(key);
+                workers[w].record_key(key);
+            }
+
+            // Shuffle worker join order.
+            let mut order: Vec<usize, SharedAlloc<'static>> = Vec::with_capacity_in(worker_count, shared);
+            for w in 0..worker_count {
+                order.push(w);
+            }
+            for i in (1..order.len()).rev() {
+                let j = usize::try_from(tape.int_in(0..=u64::try_from(i).expect("i"), "shuffle")).expect("j");
+                order.swap(i, j);
+            }
+
+            let mut opt_workers: Vec<Option<CompileTopStats>, SharedAlloc<'static>> = Vec::with_capacity_in(worker_count, shared);
+            for w in workers {
+                assert!(w.slowest.len() <= TOP_FN_LIMIT);
+                assert!(w.largest.len() <= TOP_FN_LIMIT);
+                opt_workers.push(Some(w));
+            }
+            let mut merged = CompileTopStats::new_in(shared);
+            for w in order {
+                if let Some(part) = opt_workers[w].take() {
+                    merged.merge(part);
+                }
+            }
+
+            assert_eq!(merged.slowest, seq.slowest, "merged top-10 slowest must match sequential oracle");
+            assert_eq!(merged.largest, seq.largest, "merged top-10 largest must match sequential oracle");
+        });
+    }
+
+    #[test]
+    fn top_slow_format_phases_and_tables_renders_expected_columns() {
+        let frame = Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let shared = blaze_own::testing::heap().shared();
+
+        let mut phase_line = String::new_in(erased.handle());
+        format_build_phases_line(
+            &mut phase_line,
+            ExportPhaseTimes {
+                front_ns: 42_000_000,
+                walk_ns: 318_000_000,
+                lto_ns: 85_000_000,
+                link_ns: 19_000_000,
+            },
+            466_000_000,
+            Some(184 * 1024 * 1024 + 205 * 1024),
+        );
+        assert_eq!(
+            phase_line.as_str(),
+            "build phases: front=42ms walk=318ms lto=85ms link=19ms total=466ms peak_rss_mb=184.2"
+        );
+
+        let mut no_rss = String::new_in(erased.handle());
+        format_build_phases_line(
+            &mut no_rss,
+            ExportPhaseTimes { front_ns: 1_000_000, walk_ns: 2_000_000, lto_ns: 3_000_000, link_ns: 4_000_000 },
+            10_000_000,
+            None,
+        );
+        assert_eq!(
+            no_rss.as_str(),
+            "build phases: front=1ms walk=2ms lto=3ms link=4ms total=10ms"
+        );
+
+        let mut top = CompileTopStats::new_in(shared);
+        let mut empty_tables = String::new_in(erased.handle());
+        format_top_fn_tables(&mut empty_tables, &top);
+        assert!(empty_tables.as_str().is_empty());
+
+        top.record_key(FnCompileKey {
+            name: "my_crate::big_parser::parse_expr",
+            lower_ns: 10_100_000,
+            build_ns: 25_400_000,
+            emit_ns: 6_800_000,
+            insts: 12_450,
+            blocks: 312,
+            frame_estimate: 145_920, // 142.5 KB
+            entry_bytes: 40_960,
+        });
+        let mut tables = String::new_in(erased.handle());
+        format_top_fn_tables(&mut tables, &top);
+        let rendered = tables.as_str();
+        assert!(rendered.contains("build top-10 slowest compiled fns:"), "{rendered}");
+        assert!(rendered.contains("build top-10 largest compiled fns (by LIR insts / frame_estimate):"), "{rendered}");
+        assert!(rendered.contains("42.3ms (10.1/25.4/6.8)"), "{rendered}");
+        assert!(rendered.contains("12450"), "{rendered}");
+        assert!(rendered.contains("312"), "{rendered}");
+        assert!(rendered.contains("142.5"), "{rendered}");
+        assert!(rendered.contains("my_crate::big_parser::parse_expr"), "{rendered}");
     }
 }
