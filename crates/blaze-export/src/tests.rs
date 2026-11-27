@@ -708,11 +708,17 @@ fn rust_tls_refusals_are_named() {
     let p = ProgramIn { functions: &fs_plain_ender, data: &collide_data, tls: rt, ..p };
     assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::TwoData { target: desc_target }));
 
-    // 8. Self-relative DataWord (`target: None`) in Space::Tls -> DataTlsTarget.
-    let self_words = [DataWord { at: 0, target: None, addend: 0 }];
-    let self_tls_data = [Data { target: tls_a, bytes: &val, align: 8, words: &self_words, outside: &[], place: DataPlace::ReadOnly }];
+    // 8. `OWN_DATUM` (`target: None`) in Space::Tls (an immutable `'static` sub-allocation
+    //    appended inside the read-only TLS template by `make_template_entry`) rebases cleanly
+    //    into `__DATA_CONST` so every thread's copy shares the immutable pointee.
+    let self_words = [DataWord { at: 0, target: None, addend: 8 }];
+    let mut tls_with_tail = [0u8; 16];
+    tls_with_tail[8..10].copy_from_slice(b"hi");
+    let self_tls_data = [Data { target: tls_a, bytes: &tls_with_tail, align: 8, words: &self_words, outside: &[], place: DataPlace::ReadOnly }];
     let p = ProgramIn { functions: &fs_both, data: &self_tls_data, tls: rt, ..p };
-    assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::DataTlsTarget { from: tls_a, target: tls_a }));
+    let exported = export(&p, Platform::MacosArm64, &mut out, alloc).expect("TLS template OWN_DATUM tail rebase");
+    assert_eq!(exported.imports, 1, "pthread_key_create");
+    check::macho(&out).expect("Mach-O valid with TLS OWN_DATUM tail rebase");
 
     // 9. Space::Outside import referenced only by a Space::Tls template is gathered and bound.
     let ext_sym = sym("puts");

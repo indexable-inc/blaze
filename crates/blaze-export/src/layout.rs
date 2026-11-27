@@ -648,7 +648,9 @@ impl<'a> ConstAndData<'a> {
             for w in datum.words {
                 let at = base + u64::from(w.at);
                 let to = match w.target {
-                    None if datum.target.space == Space::Tls => return Err(ExportError::DataTlsTarget { from: datum.target, target: datum.target }),
+                    // `OWN_DATUM` (`target: None`) inside a `Space::Tls` template points to an
+                    // immutable `'static` sub-allocation packed in the read-only template tail
+                    // (`make_template_entry` already refuses self-pointers into the TLS slot).
                     None => rebase_target(datum.target.symbol, at, base as i64 + w.addend, end)?,
                     Some(t) => match (t.space, import_of(t.symbol)) {
                         (Space::Tls, _) => return Err(ExportError::DataTlsTarget { from: datum.target, target: t }),
