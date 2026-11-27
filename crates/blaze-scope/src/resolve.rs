@@ -1109,6 +1109,11 @@ impl<'a> Names<'a> {
         crate::names::traits_in_scope::<&'a str, _>(self, module, alloc)
     }
 
+    /// [`crate::names::traits_exported`] over these names (without `module`'s implicit prelude).
+    pub fn traits_exported<'b>(&self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError> {
+        crate::names::traits_exported::<&'a str, _>(self, module, alloc)
+    }
+
     /// A trait's or an impl's members on under its crate's cfg, in declaration order; `None`
     /// when `owner` is no trait or impl held.
     pub fn members(&self, owner: ItemKey) -> Option<&[Member<'a>]> {

@@ -288,3 +288,68 @@ fn items_inside_bodies_through_front2() {
     let why: Vec<String> = report.iter().filter(|l| !l.contains(": clean")).map(|l| l.chars().take(300).collect()).collect();
     assert!(failed.is_empty(), "bodies that did not check as they must: {failed:?}\n{}", why.join("\n"));
 }
+
+/// An Edition 2018 body glob-importing a module from a later-edition crate (here `core`,
+/// Edition 2024, just as an Edition 2018 proc-macro expanding Edition 2021 `quote!` writes
+/// `use $crate::__private::ext::*;`): imports the target module's exported traits (`core::ops::Not`)
+/// without failing with `GLOB_LATER_EDITION` and without leaking the target crate's implicit
+/// prelude (`core::convert::TryInto`, absent from the 2018 prelude).
+#[test]
+fn block_glob_from_later_edition_crate_imports_exported_traits_only() {
+    const SRC_2018: &str = r#"
+#![no_std]
+pub fn uses_exported_trait(x: u32) -> u32 {
+    use core::ops::*;
+    x.not()
+}
+pub fn does_not_leak_later_prelude(x: u32) -> Result<u16, core::num::TryFromIntError> {
+    use core::ops::*;
+    x.try_into()
+}
+"#;
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let files = [("/locs2018/src/lib.rs".to_string(), SRC_2018.to_string())];
+    let edition = edition::PackageEdition::of_manifest("2018").expect("2018 edition");
+    let user = UserCrate { name: "locs2018", dir: "/locs2018/", root: "/locs2018/src/lib.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let sources = [SourceFile { path: "src/lib.rs", text: SRC_2018 }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+    let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
+    let mut buckets = None;
+    let find = |name: &str| {
+        names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &[name] }, Alloc::global())
+            .ok()
+            .and_then(|f| f.whole(1))
+            .map(|d| d.key)
+            .unwrap_or_else(|| panic!("`{name}` in locs2018"))
+    };
+
+    // 1. Exported trait (`core::ops::Not`) resolves cleanly across edition boundary.
+    let ok_key = find("uses_exported_trait");
+    store.ensure(&names, &mut front.keys, Want::Fn(ok_key)).expect("head");
+    let ok_body = lower_fn(&names, prepared, &mut front.keys, &mut store, ok_key).expect("lower");
+    let ok_view = ok_body.lowered.view();
+    let ok_spell = Spelling::of(&ok_view).expect("spelling");
+    let ok_scope = ok_body.scope(&ok_spell);
+    let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: None };
+    check_body(&mut records, &ok_body, &ok_scope).expect("block glob from later edition must check clean");
+
+    // 2. Later-edition prelude trait (`TryInto`) must NOT be leaked by `use core::ops::*;`.
+    let no_leak_key = find("does_not_leak_later_prelude");
+    store.ensure(&names, &mut front.keys, Want::Fn(no_leak_key)).expect("head");
+    let no_leak_body = lower_fn(&names, prepared, &mut front.keys, &mut store, no_leak_key).expect("lower");
+    let no_leak_view = no_leak_body.lowered.view();
+    let no_leak_spell = Spelling::of(&no_leak_view).expect("spelling");
+    let no_leak_scope = no_leak_body.scope(&no_leak_spell);
+    let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: None };
+    match check_body(&mut records, &no_leak_body, &no_leak_scope) {
+        Err(CheckFail::Diags { diags, .. }) if format!("{diags:?}").contains("(NoMethod,") => {}
+        other => panic!("expected NoMethod (prelude must not leak across glob), got {other:?}"),
+    }
+}
