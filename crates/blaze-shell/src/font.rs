@@ -121,10 +121,9 @@ impl GlyphAtlas {
         Some((self.next_x, self.next_y))
     }
 
-    /// Take the space [`GlyphAtlas::reserve`] returned for `slot` and queue its texels for upload.
-    fn commit(&mut self, slot: Slot, texels: Vec<u8>) {
+    /// Take the space [`GlyphAtlas::reserve`] returned for `slot`; its texels go on `pending`.
+    fn take(&mut self, slot: Slot) {
         self.next_x += slot.w + 1;
-        self.pending.push((slot, texels));
     }
 }
 
@@ -397,7 +396,8 @@ impl Fonts {
 
         let (x, y) = atlas.reserve(w, h)?;
         let slot = Slot { x, y, w, h, advance: w as f32, x_off: 0.0 };
-        atlas.commit(slot, buf);
+        atlas.take(slot);
+        atlas.pending.push((slot, buf));
         Some(slot)
     }
 
@@ -411,7 +411,7 @@ impl Fonts {
         s
     }
 
-    /// Append GPU [`GlyphInst`] quads for the visible [`TextRun`]s drawn in font set `set`,
+    /// Hand `emit` the GPU [`GlyphInst`] quads of the visible [`TextRun`]s drawn in font set `set`,
     /// culling offscreen runs outside `[0, viewport_h]` so tall rendered documents scroll at
     /// locked 120fps.
     fn rasterize_runs(
@@ -421,7 +421,7 @@ impl Fonts {
         set: FontSetId,
         scale: f64,
         viewport_h: f32,
-        glyphs: &mut Vec<GlyphInst>,
+        emit: &mut impl FnMut(GlyphInst),
     ) {
         let inv_atlas = 1.0 / ATLAS as f32;
         let inv_scale = 1.0 / (scale as f32).max(1.0);
@@ -489,7 +489,7 @@ impl Fonts {
                                 let gw = s.w as f32 * inv_scale;
                                 let gh = s.h as f32 * inv_scale;
                                 let draw_x = x + s.x_off * inv_scale;
-                                glyphs.push(GlyphInst {
+                                emit(GlyphInst {
                                     rect: [draw_x, y, draw_x + gw, y + gh],
                                     uv: [
                                         s.x as f32 * inv_atlas,
@@ -517,7 +517,7 @@ impl Fonts {
                         let gw = s.w as f32 * inv_scale;
                         let gh = s.h as f32 * inv_scale;
                         let draw_x = x + s.x_off * inv_scale;
-                        glyphs.push(GlyphInst {
+                        emit(GlyphInst {
                             rect: [draw_x, y, draw_x + gw, y + gh],
                             uv: [
                                 s.x as f32 * inv_atlas,
@@ -550,7 +550,7 @@ impl Fonts {
                     let gw = s.w as f32 * inv_scale;
                     let gh = s.h as f32 * inv_scale;
                     let draw_x = x + s.x_off * inv_scale;
-                    glyphs.push(GlyphInst {
+                    emit(GlyphInst {
                         rect: [draw_x, y, draw_x + gw, y + gh],
                         uv: [
                             s.x as f32 * inv_atlas,
@@ -654,7 +654,8 @@ impl Fonts {
             return None;
         }
         let slot = Slot { x, y, w, h, advance, x_off: -(pad_l as f32) };
-        atlas.commit(slot, buf);
+        atlas.take(slot);
+        atlas.pending.push((slot, buf));
         Some(slot)
     }
 }
@@ -717,15 +718,17 @@ impl FontBook {
                 FontSetId(idx as u8),
                 self.scale,
                 viewport_h,
-                &mut glyphs,
+                &mut |glyph| glyphs.push(glyph),
             );
         }
         glyphs
     }
 
-    /// Texels rasterized since the last call, to upload to the glyph texture.
-    pub fn drain_pending(&mut self) -> std::vec::Drain<'_, (Slot, Vec<u8>)> {
-        self.atlas.pending.drain(..)
+    /// Hand `upload` the texels rasterized since the last call, for the glyph texture.
+    pub fn drain_pending_into(&mut self, mut upload: impl FnMut(Slot, &[u8])) {
+        for (slot, texels) in self.atlas.pending.drain(..) {
+            upload(slot, &texels);
+        }
     }
 }
 

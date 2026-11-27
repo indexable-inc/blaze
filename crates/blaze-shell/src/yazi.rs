@@ -444,8 +444,13 @@ pub fn load_change_preview(
         line_no: None,
         spans: vec![PreviewSpan { text, color, bold: false, italic: false }],
     };
-    let diff = match crate::prompt::read_git_file_diff(path) {
-        Ok(diff) => diff,
+    let Some(mut git_diff) = crate::prompt::git_file_diff_command(path) else {
+        return load_hover_preview(path, name, icon, max_lines);
+    };
+    let diff = match git_diff.output() {
+        // A failing status is git saying there is nothing to diff against (no repository, no
+        // `HEAD` yet); its output is then empty and the entry previews as content below.
+        Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
         Err(e) => {
             return HoverKind::FilePreview {
                 full_path: path.to_string_lossy().into_owned(),

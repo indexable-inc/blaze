@@ -722,9 +722,9 @@ fn read_git_diff_numstat(
 /// `tree_rel` (a path below `work_tree`) as it is typed from `cwd`, the way `git status` prints
 /// it: `src/a.rs` below `cwd`, `../b.rs` beside it. A `cwd` outside `work_tree` gets the absolute
 /// path.
-fn path_from_cwd(work_tree: &Path, cwd: &Path, tree_rel: &str) -> String {
+fn path_from_cwd(work_tree: &Path, cwd: &Path, tree_rel: &str) -> PathBuf {
     let Ok(cwd_rel) = cwd.strip_prefix(work_tree) else {
-        return work_tree.join(tree_rel).to_string_lossy().into_owned();
+        return work_tree.join(tree_rel);
     };
     let cwd_parts: Vec<&std::ffi::OsStr> = cwd_rel.iter().collect();
     let parts: Vec<&str> = tree_rel.split('/').collect();
@@ -740,32 +740,25 @@ fn path_from_cwd(work_tree: &Path, cwd: &Path, tree_rel: &str) -> String {
         // `tree_rel` is `cwd` itself (an untracked folder listed as `dir/`).
         out.push_str("./");
     }
-    out
+    PathBuf::from(out)
 }
 
-/// The unified diff of `path` against `HEAD` (staged and unstaged together, one line of context
-/// round each change so a hover shows more of the change), empty when the file
-/// is unchanged, untracked or outside a repository. One `git diff` child for one file.
-pub fn read_git_file_diff(path: &Path) -> std::io::Result<String> {
+/// `git diff` of one file against `HEAD` (staged and unstaged together, one line of context
+/// round each change so a hover shows more of the change), not yet run. Its output is empty when
+/// the file is unchanged or untracked, and it fails outside a repository or before a first commit.
+pub fn git_file_diff_command(path: &Path) -> Option<std::process::Command> {
     use std::process::{Command, Stdio};
 
-    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
-        return Ok(String::new());
-    };
-    let out = Command::new("git")
-        .arg("--literal-pathspecs")
+    let (dir, name) = (path.parent()?, path.file_name()?);
+    let mut cmd = Command::new("git");
+    cmd.arg("--literal-pathspecs")
         .arg("-C")
         .arg(dir)
         .args(["-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "-U1", "HEAD", "--"])
         .arg(name)
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()?;
-    // Not a repository, or no `HEAD` yet: git says so with a failing status and no diff.
-    if !out.status.success() {
-        return Ok(String::new());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        .stderr(Stdio::null());
+    Some(cmd)
 }
 
 /// Read local git branch names for `cwd` with zero subprocesses (for prompt popover & `git` tab completion).
@@ -1456,7 +1449,7 @@ pub fn try_native_git_command(src: &str, cwd: &str) -> Option<blaze_sh::Value<'s
                 let shown_path = path_from_cwd(&head.work_tree, Path::new(cwd), rel_path);
                 tbl.push_row_values(&[
                     blaze_sh::Value::string(status_label, alloc),
-                    blaze_sh::Value::string(&shown_path, alloc),
+                    blaze_sh::Value::string(&shown_path.to_string_lossy(), alloc),
                     size_val,
                     mod_val,
                 ]);
@@ -2070,14 +2063,15 @@ mod tests {
     fn status_paths_are_named_from_the_current_folder() {
         let tree = Path::new("/repo");
         let from = |cwd: &str, rel: &str| path_from_cwd(tree, Path::new(cwd), rel);
-        assert_eq!(from("/repo", "crates/shell/src/view.rs"), "crates/shell/src/view.rs");
-        assert_eq!(from("/repo/crates/shell", "crates/shell/src/view.rs"), "src/view.rs");
-        assert_eq!(from("/repo/crates/shell", "crates/sh/src/lib.rs"), "../sh/src/lib.rs");
-        assert_eq!(from("/repo/crates/shell", "README.md"), "../../README.md");
+        let shown = |cwd: &str, rel: &str| from(cwd, rel).to_string_lossy().into_owned();
+        assert_eq!(shown("/repo", "crates/shell/src/view.rs"), "crates/shell/src/view.rs");
+        assert_eq!(shown("/repo/crates/shell", "crates/shell/src/view.rs"), "src/view.rs");
+        assert_eq!(shown("/repo/crates/shell", "crates/sh/src/lib.rs"), "../sh/src/lib.rs");
+        assert_eq!(shown("/repo/crates/shell", "README.md"), "../../README.md");
         // A file named like the folder it sits beside is not that folder.
-        assert_eq!(from("/repo/crates", "crates"), "../crates");
-        assert_eq!(from("/repo/crates/new", "crates/new/"), "./");
-        assert_eq!(from("/elsewhere", "a.rs"), "/repo/a.rs");
+        assert_eq!(shown("/repo/crates", "crates"), "../crates");
+        assert_eq!(shown("/repo/crates/new", "crates/new/"), "./");
+        assert_eq!(shown("/elsewhere", "a.rs"), "/repo/a.rs");
     }
 
     fn make_temp_repo(tag: &str) -> PathBuf {

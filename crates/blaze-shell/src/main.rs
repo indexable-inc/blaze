@@ -2876,9 +2876,7 @@ mod macos_app {
                 let vh = size.height as f32;
                 let glyphs = fonts.rasterize_runs(&scene.text_runs, vh);
                 let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, vh);
-                for (slot, bytes) in fonts.drain_pending() {
-                    renderer.upload(slot, &bytes);
-                }
+                fonts.drain_pending_into(|slot, texels| renderer.upload(slot, texels));
                 let mut icons = icon_atlas.rasterize_quads(&scene.icon_quads);
                 icon_atlas.rasterize_emoji_quads_into(&scene.emoji_quads, &mut icons);
                 icon_atlas.rasterize_custom_symbol_quads_into(&scene.custom_symbols, &mut icons);
@@ -3176,9 +3174,7 @@ mod macos_app {
             let vh = size.height as f32;
             let glyphs = fonts.rasterize_runs(&scene.text_runs, vh);
             let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, vh);
-            for (slot, bytes) in fonts.drain_pending() {
-                renderer.upload(slot, &bytes);
-            }
+            fonts.drain_pending_into(|slot, texels| renderer.upload(slot, texels));
             let mut icons = icon_atlas.rasterize_quads(&scene.icon_quads);
             icon_atlas.rasterize_emoji_quads_into(&scene.emoji_quads, &mut icons);
             icon_atlas.rasterize_custom_symbol_quads_into(&scene.custom_symbols, &mut icons);
@@ -7134,9 +7130,7 @@ mod macos_app {
                 let vh = size.height as f32;
                 let glyphs = fonts.rasterize_runs(&scene.text_runs, vh);
                 let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, vh);
-                for (slot, bytes) in fonts.drain_pending() {
-                    renderer.upload(slot, &bytes);
-                }
+                fonts.drain_pending_into(|slot, texels| renderer.upload(slot, texels));
                 let mut icons = icon_atlas.rasterize_quads(&scene.icon_quads);
                 icon_atlas.rasterize_emoji_quads_into(&scene.emoji_quads, &mut icons);
                 icon_atlas.rasterize_custom_symbol_quads_into(&scene.custom_symbols, &mut icons);
