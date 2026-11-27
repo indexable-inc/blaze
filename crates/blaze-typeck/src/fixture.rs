@@ -1170,6 +1170,8 @@ pub struct Bb {
     /// As `expr_marks` and `expr_editions`, for patterns ([`Bb::pat_edition`]).
     pat_marks: Vec<(PatId, Edition)>,
     pat_editions: Vec<(PatId, Edition)>,
+    /// Loop cost marks (`#[blaze::cost(bounded | amortized | reset)]`), sorted by `ExprId`.
+    loop_marks: Vec<(ExprId, crate::body::LoopCost)>,
     pub t: PortableTys<'static>,
 }
 
@@ -1203,7 +1205,16 @@ impl Bb {
             expr_editions: Vec::new(),
             pat_marks: Vec::new(),
             pat_editions: Vec::new(),
+            loop_marks: Vec::new(),
             t: PortableTys::new_in(Alloc::global()),
+        }
+    }
+
+    /// Marks loop expression `e` with `cost` (`BodyView::loop_marks`, kept sorted by `ExprId`).
+    pub fn loop_mark(&mut self, e: ExprId, cost: crate::body::LoopCost) {
+        match self.loop_marks.binary_search_by_key(&e, |&(x, _)| x) {
+            Ok(i) => self.loop_marks[i].1 = cost,
+            Err(i) => self.loop_marks.insert(i, (e, cost)),
         }
     }
 
@@ -1534,6 +1545,27 @@ impl Bb {
         self.e(Expr::Block { stmts: List { start, len: stmts.len() as u32 }, tail, scope: ScopeId(0) })
     }
 
+    /// `loop { body; break; }` with optional [`crate::body::LoopCost`] mark (returns the `Expr::Loop` id).
+    pub fn loop_with_cost(&mut self, body: ExprId, cost: crate::body::LoopCost) -> ExprId {
+        let lp = self.e(Expr::Loop { body });
+        if cost != crate::body::LoopCost::Normal {
+            self.loop_mark(lp, cost);
+        }
+        lp
+    }
+
+    /// `break` targeting `target`.
+    pub fn break_(&mut self, target: ExprId) -> ExprId {
+        self.e(Expr::Break { value: None, target })
+    }
+
+    /// `const { stmts; tail }`.
+    pub fn e_const_block(&mut self, stmts: &[StmtId], tail: Option<ExprId>) -> ExprId {
+        let start = self.stmt_lists.len() as u32;
+        self.stmt_lists.extend_from_slice(stmts);
+        self.e(Expr::ConstBlock { stmts: List { start, len: stmts.len() as u32 }, tail, scope: ScopeId(0) })
+    }
+
     pub fn view(&self, owner: ItemKey, root: ExprId) -> BodyView<'_> {
         BodyView {
             owner,
@@ -1573,6 +1605,7 @@ impl Bb {
             pat_editions: &self.pat_editions,
             record_expr_schemas: &[],
             closure_param_regions: &[],
+            loop_marks: &self.loop_marks,
         }
     }
 

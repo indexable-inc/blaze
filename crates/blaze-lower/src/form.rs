@@ -13,7 +13,7 @@ pub use crate::columns::BodyRange;
 use crate::asm::AsmRule;
 use crate::columns::Lens;
 pub use blaze_typeck::{
-    BinOp, BindAnn, ExprId, FloatTy, IntSuffix, IntTy, List, Mutbl, PatId, PathIdx, ScopeId, StmtId, UintTy,
+    BinOp, BindAnn, ExprId, FloatTy, IntSuffix, IntTy, List, LoopCost, Mutbl, PatId, PathIdx, ScopeId, StmtId, UintTy,
     UnOp,
 };
 
@@ -819,7 +819,7 @@ pub enum Expr {
     Let { pat: PatId, init: ExprId },
     /// `arms` rows of [`Arm`].
     Match { scrutinee: ExprId, arms: List, source: MatchSource },
-    Loop { body: ExprId, source: LoopSource },
+    Loop { body: ExprId, source: LoopSource, cost: LoopCost },
     /// `target` the loop or labelled block it leaves; `None` where there is none (a
     /// diagnostic says so).
     Break { value: Option<ExprId>, target: Option<ExprId> },
@@ -949,7 +949,9 @@ impl Expr {
             E::Match { scrutinee, arms, source } => {
                 Node { a: scrutinee.0, b: arms.start, c: arms.len, ..n(8).with(match_code(source)) }
             }
-            E::Loop { body, source } => Node { a: body.0, ..n(9).with(loop_code(source)) },
+            E::Loop { body, source, cost } => {
+                Node { a: body.0, ..n(9).with(loop_code(source) | ((cost as u16) << 2)) }
+            }
             E::Break { value, target } => {
                 Node { a: opt(value.map(|e| e.0)), b: opt(target.map(|e| e.0)), ..n(10) }
             }
@@ -1036,15 +1038,28 @@ impl Expr {
                     _ => return Err(err),
                 },
             },
-            9 => E::Loop {
-                body: ExprId(n.a),
-                source: match n.flags {
-                    0 => LoopSource::Loop,
-                    1 => LoopSource::While,
-                    2 => LoopSource::ForLoop,
-                    _ => return Err(err),
-                },
-            },
+            9 => {
+                if n.flags & !0x1f != 0 {
+                    return Err(err);
+                }
+                E::Loop {
+                    body: ExprId(n.a),
+                    source: match n.flags & 3 {
+                        0 => LoopSource::Loop,
+                        1 => LoopSource::While,
+                        2 => LoopSource::ForLoop,
+                        _ => return Err(err),
+                    },
+                    cost: match (n.flags >> 2) & 7 {
+                        0 => LoopCost::Normal,
+                        1 => LoopCost::Bounded,
+                        2 => LoopCost::Amortized,
+                        3 => LoopCost::Reset,
+                        4 => LoopCost::Invalid,
+                        _ => return Err(err),
+                    },
+                }
+            }
             10 => E::Break { value: opt_expr(n.a), target: opt_expr(n.b) },
             11 => E::Continue { target: opt_expr(n.b) },
             12 => E::Return { value: opt_expr(n.a) },

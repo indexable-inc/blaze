@@ -697,7 +697,7 @@ fn for_leaves_on_none(v: &View<'_>) -> Result<(), String> {
         let Ok(Expr::Break { value: None, target: Some(t) }) = v.expr(none.body) else {
             return Err(format!("e{m}: the None arm does not leave its loop"));
         };
-        let Ok(Expr::Loop { body, source: LoopSource::ForLoop }) = v.expr(t) else {
+        let Ok(Expr::Loop { body, source: LoopSource::ForLoop, .. }) = v.expr(t) else {
             return Err(format!("e{m}: the None arm's break leaves e{}, no `for` loop", t.0));
         };
         let holds = match v.expr(body) {

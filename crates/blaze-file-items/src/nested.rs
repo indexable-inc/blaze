@@ -1124,9 +1124,9 @@ const INERT_ATTRS: [&str; 18] = [
 ];
 
 /// The tools whose attributes ([`INERT_ATTRS`]' rule, a path of two or more segments) only
-/// tune a tool's reading: the Reference, "Attributes", "Tool attributes" (`rustfmt::skip`,
-/// `clippy::..`), and "Diagnostic attributes" (`diagnostic::on_unimplemented`).
-const INERT_TOOLS: [&str; 3] = ["rustfmt", "clippy", "diagnostic"];
+/// tune a tool's reading: the Reference, "Attributes", "Tool attributes" (`blaze::..`,
+/// `rustfmt::skip`, `clippy::..`), and "Diagnostic attributes" (`diagnostic::on_unimplemented`).
+const INERT_TOOLS: [&str; 4] = ["blaze", "rustfmt", "clippy", "diagnostic"];
 
 /// Whether an attribute whose path's first segment is `first`, of `segments` segments, is
 /// inert ([`INERT_ATTRS`] for one segment, [`INERT_TOOLS`] for a tool's path).

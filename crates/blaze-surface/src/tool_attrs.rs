@@ -71,9 +71,10 @@ const fn known(name: &'static str, planned: Stage) -> KnownAttr {
 }
 
 /// Every `blaze::` attribute this build knows, sorted by name: the extensions ledger's section 3
-/// (2026-11-16), every one known and unchecked today but `args` (rule 83, 2026-11-17). A stage that starts to check one, or the
+/// (2026-11-16), every one known and unchecked today but `args` (rule 83, 2026-11-17) and `cost`
+/// (checked complexity contracts, 2026-11-27). A stage that starts to check one, or the
 /// verdict that removes one, changes its `state` here and nowhere else.
-pub const KNOWN: [KnownAttr; 52] = {
+pub const KNOWN: [KnownAttr; 53] = {
     use Stage::*;
     [
         known("answers_request", Effects),
@@ -90,6 +91,9 @@ pub const KNOWN: [KnownAttr; 52] = {
         known("checkfree", Proofs),
         known("consumes", Ownership),
         known("contract_test", Proofs),
+        // Opt-in checked complexity contract (`#[blaze::cost(...)]` on fns and loops): checked by
+        // the body check's `cost-contract` (blaze-typeck rules/cost.rs), read from `FnHead::cost`.
+        KnownAttr { name: "cost", state: State::Checked(Proofs), planned: Proofs },
         known("differentiable", Codegen),
         // `#![blaze::driver]`: the thin driver over a sans-IO core, which holds the handles and
         // does the IO the core asks for (D170 C5; blaze-lint `RootMarks`, `sans-io-core`).

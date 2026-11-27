@@ -1160,6 +1160,9 @@ pub struct FnHead<'n> {
     /// A C-variadic foreign fn (`...` last): `inputs` are the declared parameters only.
     pub c_variadic: bool,
     pub qualifiers: FnQualifiers,
+    /// Opt-in checked complexity contract (`#[blaze::cost(...)]`), persisted in `K_FN` and
+    /// exposed to `blaze-typeck` via `TypeAttrs::with_cost`.
+    pub cost: tc::CostContract,
     /// `#[rustc_legacy_const_generics(i, ..)]`'s positions, as written: the call argument at
     /// each is the next own const generic argument (blaze-typeck rules/legacy_const.rs). Empty
     /// for every other fn.
@@ -3603,6 +3606,7 @@ impl<'n> Store<'n> {
                 header: tc::FnPtrHeader::RUST,
                 c_variadic: false,
                 qualifiers: FnQualifiers::CONST.note_lifetimes(text),
+                cost: tc::CostContract::NONE,
                 legacy_const_generics: blaze_own::Vec::new_in(alloc),
                 inputs: blaze_own::Vec::new_in(alloc),
                 output: bool_ty,
@@ -3747,6 +3751,7 @@ impl<'n> Store<'n> {
                 header: tc::FnPtrHeader::RUST,
                 c_variadic: false,
                 qualifiers: FnQualifiers::CONST.note_lifetimes(decl),
+                cost: tc::CostContract::NONE,
                 legacy_const_generics: blaze_own::Vec::new_in(alloc),
                 inputs: blaze_own::Vec::new_in(alloc),
                 output: bool_ty,
@@ -5449,6 +5454,7 @@ impl<'n> Store<'n> {
                         let has_body = mv.head.get(head::FLAGS).copied().unwrap_or(0) & sig::HAS_BODY != 0;
                         let row = FnHead {
                             qualifiers: FnQualifiers::of(mv)?,
+                            cost: tc::CostContract::NONE,
                             lib: key, text: m.text, text_prefix: None, text_inline: false, container: Some(ck), parent: own + 1, own: 0, declared: 0, self_param: false,
                             header, c_variadic: false, legacy_const_generics: blaze_own::Vec::new_in(head_alloc), inputs: blaze_own::Vec::new_in(head_alloc), output, has_body,
                             module, params: exact_in(&ps, head_alloc), consts: exact_in(&cs, head_alloc), bounds: exact_in(&bounds, head_alloc), self_: env.self_, self_assoc: blaze_own::Vec::new_in(head_alloc),
@@ -5676,6 +5682,7 @@ impl<'n> Store<'n> {
                 lib: key,
                 text,
                 qualifiers: FnQualifiers::CONST.note_lifetimes(text),
+                cost: tc::CostContract::NONE,
                 text_prefix: None,
                 text_inline: true,
                 container: None,
@@ -6221,6 +6228,7 @@ impl<'n> Store<'n> {
             let has_body = cv.head.get(head::FLAGS).copied().unwrap_or(0) & sig::HAS_BODY != 0;
             let row = FnHead {
                 qualifiers: FnQualifiers::of(cv)?,
+                cost: tc::CostContract::NONE,
                 lib: key, text, text_prefix: None, text_inline: false, container: Some(ck), parent: generics, own: 0, declared: 0, self_param: false,
                 header, c_variadic: false, legacy_const_generics: blaze_own::Vec::new_in(head_alloc), inputs: blaze_own::Vec::new_in(head_alloc), output, has_body,
                 module: env.module, params: exact_in(env.params, head_alloc), consts: exact_in(env.consts, head_alloc), bounds: exact_in(bounds, head_alloc), self_: env.self_, self_assoc: exact_in(env.self_assoc, head_alloc),
@@ -6490,6 +6498,7 @@ impl<'n> Store<'n> {
                     lib,
                     text,
                     qualifiers: FnQualifiers::CONST.note_lifetimes(text),
+                    cost: tc::CostContract::NONE,
                     text_prefix: None,
                     text_inline: true,
                     container: None,
@@ -6977,6 +6986,8 @@ impl<'n> Store<'n> {
         // of the call arguments that are the fn's own const generic arguments.
         let mut legacy_const_generics = blaze_own::Vec::new_in(alloc);
         let mut qualifiers = FnQualifiers::of_flags(flags).note_lifetimes(text);
+        let mut cost = tc::CostContract::NONE;
+        let mut saw_cost = false;
         if container_const {
             qualifiers.0 |= FnQualifiers::CONST.0;
         }
@@ -6988,6 +6999,17 @@ impl<'n> Store<'n> {
             if path == "rustc_legacy_const_generics" {
                 let r = v.site(v.row_range(attrs.start + i as u32)?)?;
                 legacy_positions(v.text_at(a.args)?, r, &mut legacy_const_generics)?;
+            } else if super::fn_attrs::is_cost_attr(path) {
+                if saw_cost {
+                    cost = tc::CostContract::INVALID;
+                } else {
+                    saw_cost = true;
+                    cost = if a.meta == lf::AttrMeta::Tokens {
+                        super::fn_attrs::parse_fn_cost(v.text_at(a.args)?)
+                    } else {
+                        tc::CostContract::INVALID
+                    };
+                }
             }
         }
         // Only a bodyless free declaration can bind a std-internal name. Compare every
@@ -7128,6 +7150,7 @@ impl<'n> Store<'n> {
                 header,
                 c_variadic,
                 qualifiers,
+                cost,
                 legacy_const_generics,
                 inputs,
                 output,

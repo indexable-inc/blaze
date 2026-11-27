@@ -586,4 +586,7 @@ pub(super) const BLAZE: &[Lint] = &[
     // 3+ adjacent Vec/AVec declarations or struct fields, checked by blaze-lint's `parallel-vecs` rule.
     l("blaze::parallel_vecs", Allow, "detects 3+ adjacent `Vec`/`AVec` locals or struct fields where a single-allocation `blaze_own::Soa` / `blaze_own::soa!` should share one length, capacity and backing block")
         .externally_loaded(),
+    // Opt-in checked complexity cost contracts (`#[blaze::cost(...)]`), checked by blaze-typeck's `cost-contract` rule.
+    l("blaze::cost_contract", Deny, "detects a violation of an opt-in `#[blaze::cost(...)]` time, space, or synchronization contract (loop depth, callee complexity, direct recursion, lock in loop, or malformed cost attribute)")
+        .externally_loaded(),
 ];

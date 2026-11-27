@@ -380,7 +380,7 @@ fn expr(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, e: ExprId) -> fmt::
             };
             node(p, work, head, &[W::Expr(scrutinee), W::Rows(arms)])
         }
-        Expr::Loop { body, source } => {
+        Expr::Loop { body, source, .. } => {
             let head = match source {
                 LoopSource::Loop => "loop",
                 LoopSource::While => "loop/while",
