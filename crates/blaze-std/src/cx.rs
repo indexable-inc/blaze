@@ -95,17 +95,21 @@ impl Drop for SpanEnd {
 /// same thread (`Cx::span`, `Cx::until`) clones this via a local L1 `Rc::clone` instead of
 /// bouncing the shared `Arc<Cancel>` cache line across cores.
 #[derive(Clone)]
-struct LocalCancel(Rc<Arc<Cancel>>);
+struct LocalCancel(Rc<Canceller>);
 
 impl LocalCancel {
     fn new(cancel: Arc<Cancel>) -> LocalCancel {
+        Self::from_canceller(Canceller(cancel))
+    }
+
+    fn from_canceller(cancel: Canceller) -> LocalCancel {
         // alloc: once per task/scope thread, avoids atomic refcount churn on every span/until.
         LocalCancel(Rc::new(cancel))
     }
 
     #[inline]
     fn arc(&self) -> &Arc<Cancel> {
-        &self.0
+        &self.0.0
     }
 
     #[inline]
@@ -336,9 +340,106 @@ pub(crate) struct Seed {
 // `Send` fails here, naming it, rather than at a spawn far away.
 const _: () = {
     const fn crosses<T: Send>() {}
+    const fn shares<T: Send + Sync>() {}
     crosses::<Seed>();
     crosses::<Io>();
+    shares::<CxBound>();
 };
+
+/// A `Send + Sync` handle carrying a caller [`Cx`]'s cancellation lineage and deadline across
+/// shared boundaries so secondary [`Io`] operations obey the caller's exact cancellation and
+/// earlier deadline without thread-locals (rules 18, 75).
+pub struct CxBound {
+    deadline: Option<Deadline>,
+    cancel: Option<Canceller>,
+    span: &'static str,
+    world: Io,
+    plant: Plant,
+    class: Class,
+    path: SpanPath,
+}
+
+impl Clone for CxBound {
+    fn clone(&self) -> Self {
+        Self {
+            deadline: self.deadline,
+            cancel: self.cancel.as_ref().map(blaze_own::Share::share),
+            span: self.span,
+            world: blaze_own::Share::share(&self.world),
+            plant: self.plant,
+            class: self.class,
+            path: self.path,
+        }
+    }
+}
+
+impl blaze_own::Share for CxBound {}
+
+impl CxBound {
+    /// Returns [`Stopped::Cancelled`] if the caller's scope was cancelled, or
+    /// [`Stopped::Deadline`] if the caller's deadline has already passed on its clock.
+    pub fn check(&self) -> Result<(), Stopped> {
+        if self.plant != Plant::WaitIgnoresCancel
+            && self.cancel.as_ref().is_some_and(Canceller::is_set)
+        {
+            return Err(Stopped::Cancelled { span: self.span });
+        }
+        if self.plant != Plant::WaitIgnoresDeadline
+            && let Some(deadline) = self.deadline
+            && deadline.passed(self.world.now())
+        {
+            return Err(Stopped::Deadline { span: self.span, at: deadline.get() });
+        }
+        Ok(())
+    }
+
+    /// Computes remaining budget bounded by BOTH the caller's deadline and `cap`.
+    pub fn remaining(&self, cap: core::time::Duration) -> Result<core::time::Duration, Stopped> {
+        self.check()?;
+        let Some(deadline) = self.deadline else {
+            return Ok(cap);
+        };
+        if self.plant == Plant::WaitIgnoresDeadline {
+            return Ok(cap);
+        }
+        let now = self.world.now();
+        let rem = deadline.get().saturating_sub(now);
+        if rem.is_zero() {
+            return Err(Stopped::Deadline { span: self.span, at: deadline.get() });
+        }
+        Ok(rem.min(cap))
+    }
+
+    /// Derives a child [`Cx`] on `world` bounded by BOTH `max_budget` and this caller's
+    /// cancellation lineage and deadline.
+    pub fn child_on(
+        &self,
+        world: &Io,
+        max_budget: core::time::Duration,
+        scratch: usize,
+    ) -> Result<Cx, Stopped> {
+        let rem = self.remaining(max_budget)?;
+        let deadline = Deadline::after(world.now(), rem);
+        Ok(Cx {
+            deadline: Some(deadline),
+            cancel: self.cancel.as_ref().map(Canceller::to_local),
+            span: self.span,
+            plant: self.plant,
+            class: self.class,
+            placed: Placed::on(
+                0,
+                None,
+                Here::Outside,
+                Seat::Root(OnceCell::new()),
+                None,
+                scratch,
+                blaze_own::Share::share(world),
+            ),
+            path: self.path,
+            end: None,
+        })
+    }
+}
 
 impl Seed {
     /// The task's context on the thread that runs it, which is `here`: its frame shared from
@@ -365,7 +466,10 @@ impl Seed {
 }
 
 /// A scope's cancellation, held where a scope's state is shared with its tasks' threads.
+#[derive(Clone)]
 pub(crate) struct Canceller(Arc<Cancel>);
+
+impl blaze_own::Share for Canceller {}
 
 impl Canceller {
     /// Cancels the scope: as [`Cx::cancel`].
@@ -373,6 +477,18 @@ impl Canceller {
     #[blaze::nonblocking]
     pub(crate) fn cancel(&self) {
         self.0.set.store(true, Ordering::Release);
+    }
+
+    fn from_local(local: &LocalCancel) -> Self {
+        blaze_own::Share::share(&local.0)
+    }
+
+    fn to_local(&self) -> LocalCancel {
+        LocalCancel::from_canceller(blaze_own::Share::share(self))
+    }
+
+    fn is_set(&self) -> bool {
+        self.0.is_set()
     }
 }
 
@@ -467,6 +583,20 @@ impl Cx {
             deadline: Some(deadline),
             placed: Placed::on(0, None, Here::Outside, Seat::Root(OnceCell::new()), None, crate::mem::TASK_FRAME, world),
             ..self.child()
+        }
+    }
+
+    /// Captures a `Send + Sync` [`CxBound`] carrying this context's cancellation lineage and
+    /// deadline so secondary `Io` operations inherit both without thread-locals (rules 18, 75).
+    pub fn bound(&self) -> CxBound {
+        CxBound {
+            deadline: self.deadline,
+            cancel: self.cancel.as_ref().map(Canceller::from_local),
+            span: self.span,
+            world: blaze_own::Share::share(self.io()),
+            plant: self.plant,
+            class: self.class,
+            path: self.path,
         }
     }
 

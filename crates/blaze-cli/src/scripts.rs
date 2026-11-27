@@ -1706,7 +1706,7 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
         // answers until the engine's checker has answered the real probes' ladder
         // (handoff p1-probe-checker.txt).
         probes: None,
-        c_probes: Some(blaze_own::Share::share(&shared.c_probes)),
+        c_probes: Some(shared.c_probes.with_cx(cx)),
         c_mode: C_MODE,
         mode: MODE,
         native,
