@@ -116,3 +116,39 @@ fn main() {}
         assert!(outcome(n).contains("E0425"), "`{n}`: want E0425 for `e9`:\n{}", lines.join("\n"));
     }
 }
+
+#[test]
+fn format_template_nested_user_macro_rules_checks_clean() {
+    const TEXT: &str = r#"use std::fmt::Write;
+macro_rules! csi { ($($l:expr),*) => { concat!("\x1B[", $($l),*) }; }
+macro_rules! vouched_through { () => { "CASE" }; }
+macro_rules! row_select { () => { concat!("SELECT ", vouched_through!(), " AS v") }; }
+
+fn write_csi(f: &mut String, a: u32, b: u32) -> std::fmt::Result {
+    write!(f, csi!("{};{}H"), a, b)
+}
+fn fmt_chain() -> String {
+    format!(concat!(row_select!(), " {X}"), X = 1u32)
+}
+fn csi_with_local_struct() -> String {
+    format!(csi!("{}"), {
+        struct Local(u32);
+        Local(42).0
+    })
+}
+fn comma_in_literal_with_local_struct() -> String {
+    format!(concat!("a, b", "{}"), {
+        struct Local(u32);
+        Local(7).0
+    })
+}
+fn main() {}
+"#;
+    let got = check_fns(
+        TEXT,
+        &["write_csi", "fmt_chain", "csi_with_local_struct", "comma_in_literal_with_local_struct"],
+    );
+    for (n, o) in &got {
+        assert_eq!(o, "clean", "`{n}`: {got:?}");
+    }
+}

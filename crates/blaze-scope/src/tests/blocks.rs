@@ -829,3 +829,71 @@ fn block_and_macro_path_mods_resolve_against_path_dir() {
         "macro-written `mod __blaze_block_real {{ mod child; }}` must keep its own folder segment: {macro_user_mod_ok:?}"
     );
 }
+
+const FORMAT_ARGS_NESTED_RULES: &str = r#"#![no_core]
+#[rustc_builtin_macro]
+macro_rules! format_args { ($fmt:expr) => {{}}; ($fmt:expr, $($args:tt)*) => {{}}; }
+#[rustc_builtin_macro]
+macro_rules! format_args_nl { ($fmt:expr) => {{}}; ($fmt:expr, $($args:tt)*) => {{}}; }
+#[rustc_builtin_macro]
+macro_rules! concat { ($($e:expr),* $(,)?) => {{}}; }
+
+macro_rules! csi { ($($l:expr),*) => { concat!("\x1B[", $($l),*) }; }
+macro_rules! vouched_through { () => { "CASE" }; }
+macro_rules! row_select { () => { concat!("SELECT ", vouched_through!(), " AS v") }; }
+
+pub struct Target;
+pub trait Mark {}
+
+pub fn plain_csi(a: u32, b: u32) {
+    format_args!(csi!("{};{}H"), a, b);
+    format_args_nl!(csi!("{};{}H"), a, b);
+    format_args!(concat!(row_select!(), " tail"), X = a);
+}
+
+pub fn csi_with_local_item() {
+    format_args!(csi!("{}"), {
+        struct LocalFromCsi;
+        impl Mark for LocalFromCsi {}
+        1u32
+    });
+    format_args!(concat!(row_select!(), " tail"), {
+        struct LocalFromChain;
+        impl Mark for LocalFromChain {}
+        1u32
+    });
+    format_args!(concat!("a, b", "{}"), {
+        struct LocalAfterCommaInLiteral;
+        impl Mark for LocalAfterCommaInLiteral {}
+        1u32
+    });
+}
+"#;
+
+static FORMAT_ARGS_NESTED_RULES_TEXTS: Texts = Texts(&[&[("/user/lib.rs", FORMAT_ARGS_NESTED_RULES)]]);
+
+/// `format_args!` / `format_args_nl!` inside a block whose template invokes user `macro_rules!`
+/// (`csi!`, `concat!(row_select!(), ..)`): skipped when trailing arguments declare nothing, and
+/// expanded with opaque template handling when a trailing argument declares a block-local item,
+/// never failing with `EagerRefusal::NotBuiltin`.
+#[test]
+fn format_args_nested_user_macro_rules_in_block() {
+    let crates = [input("user", "/user/lib.rs", &[])];
+    let names = resolved(&crates, &FORMAT_ARGS_NESTED_RULES_TEXTS);
+    let eager_errors: Vec<std::string::String> = names
+        .notes(0)
+        .iter()
+        .filter(|n| matches!(n, crate::resolve::NamesNote::Expand { .. }))
+        .map(|n| std::format!("{n:?}"))
+        .collect();
+    assert!(
+        eager_errors.is_empty(),
+        "format_args! with nested macro_rules! in template must emit 0 expand notes/NotBuiltin refusals: {eager_errors:?}"
+    );
+    let by_csi = impl_ending(&names, 0, "MarkforLocalFromCsi");
+    let by_chain = impl_ending(&names, 0, "MarkforLocalFromChain");
+    let by_comma = impl_ending(&names, 0, "MarkforLocalAfterCommaInLiteral");
+    assert_eq!(named_in(&names, by_csi, &["LocalFromCsi"]), 0);
+    assert_eq!(named_in(&names, by_chain, &["LocalFromChain"]), 0);
+    assert_eq!(named_in(&names, by_comma, &["LocalAfterCommaInLiteral"]), 0);
+}
