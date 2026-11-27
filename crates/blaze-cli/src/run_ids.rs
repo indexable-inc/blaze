@@ -2152,6 +2152,31 @@ pub(crate) struct RunIds<'a> {
 }
 
 impl<'a> RunIds<'a> {
+    #[cfg(test)]
+    pub(crate) fn empty_for_tests() -> RunIds<'static> {
+        struct EmptySlots;
+        static EMPTY_SLOTS: EmptySlots = EmptySlots;
+        impl ProofSlotLookup for EmptySlots {
+            fn slot_for_check(&self, _check: Name) -> &Slot { unreachable!("empty_for_tests has no checks") }
+            fn slot_for_fact(&self, _bodies: &[u8], _fact: &[u8; 32]) -> Option<&Slot> { None }
+            fn checked_count(&self) -> usize { 0 }
+            fn all_materialized(&self) -> bool { true }
+        }
+        RunIds {
+            toolchain: blaze_toolchain::PINNED,
+            toolchain_read: Read { fact: [0; 32], digest: [0; 32] },
+            producers: ContentId([0; 32]),
+            crates: &[],
+            grains: &[],
+            bodies: &[],
+            verdicts: &[],
+            edges: &[],
+            today: &[],
+            slots: &EMPTY_SLOTS,
+            from: None,
+        }
+    }
+
     /// The body ids of a command: `toolchain` the cut it opened, `crates` the `UnitGraph`
     /// record's crate list, `tools` its kinds' tools (home.rs `tools`), `workspace` the bodies
     /// of the checkout and `edges` the tree they were found by ([`workspace_of`]'s), and `answer`
