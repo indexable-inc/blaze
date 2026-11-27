@@ -10,6 +10,10 @@
 <p align="center">Type <code>blaze</code> wherever you'd type <code>cargo</code>.<br>Blazingly fast Rust, literally.</p>
 
 <p align="center">
+  <a href="https://www.ycombinator.com"><img alt="Backed by Y Combinator (F26)" src="https://img.shields.io/badge/Backed%20by-Y%20Combinator%20F26-F26522?style=for-the-badge&logo=ycombinator&logoColor=white&labelColor=1a1a1a"></a>
+</p>
+
+<p align="center">
   <a href="#install">Install</a> ·
   <a href="#try-it">Try it</a> ·
   <a href="#how-it-works">How it works</a> ·
