@@ -86,3 +86,10 @@ Format for new entries:
 - **Kind**: `tooling`
 - **Friction / Bug**: 154 comments and `clippy.toml` reasons cited one design doc by path and section title, so merging that doc meant editing about 290 files; cited section titles and decision ids are not checked at all, so a comment can cite a heading that was cut.
 - **Request**: `docs check` also resolves a cited heading or `D<n>` id after a doc path in code comments, and code cites a decision id (stable) in preference to a doc section.
+
+### 2026-11-27 — `BLAZE_HOME` does not hold all of a run's state, so a second smoke on one machine fails
+
+- **Area**: `crates/blaze-cli` (`store::open_for_command` and callers reading `HOME`), `scripts/src/bin/smoke.rs`
+- **Kind**: `strictness/lint` + `tooling`
+- **Friction / Bug**: The smoke gives each project a fresh `BLAZE_HOME` but passes the machine's `HOME`; the release blaze wrote `~/.blaze/v2/{runs,journal,test}` during the run. A second smoke of the same hello-world code on the same Mac then printed `ran 0: 0 passed ... 1 reused from kept results` (cold step 0.5 s instead of 3 to 4 s) and the harness, which rightly demands one executed test, gave `verdict FAILED` for a tree whose only change was Markdown.
+- **Request**: One `Home` value names every place (D162): with `BLAZE_HOME` set nothing is read or written under `HOME`; the smoke asserts its `BLAZE_HOME` is the only directory the run touched.
