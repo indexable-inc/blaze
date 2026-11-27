@@ -111,7 +111,7 @@ static SYSROOT_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub(crate) struct Hex64([u8; 64]);
 
 impl Hex64 {
-    fn from_bytes(bytes: [u8; 32]) -> Self {
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
         let mut out = [0u8; 64];
         for (i, byte) in bytes.iter().enumerate() {
             let hi = byte >> 4;
@@ -124,6 +124,15 @@ impl Hex64 {
             }
         }
         Self(out)
+    }
+
+    pub(crate) fn from_hex_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        let mut out = [0u8; 64];
+        out.copy_from_slice(bytes);
+        Some(Self(out))
     }
 
     pub(crate) fn as_str(&self) -> &str {

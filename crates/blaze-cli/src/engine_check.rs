@@ -2229,6 +2229,68 @@ fn open_abs_dir(cx: &Cx, fs: &bstd::fs::Fs, abs: &str) -> Result<Dir<ReadWrite>,
     })
 }
 
+/// Seeds `probes` with the dependency-probe identity tag that produced a pinned JIT certificate
+/// (`cert`), checking the checkout pointer's `LeafKind::DepProbes` leaf first (when the pointer
+/// still names `cert`) and falling back to any `Kind::MacroModule` record's 64-byte probe payload
+/// stored inside `stood_root` (so pinned launches stay pinned to `cert`'s probe identity even after
+/// subsequent workspace edits advance the checkout pointer). Zero probe I/O on workspaces with no
+/// probe-dependent `MacroModule`s.
+#[expect(clippy::too_many_arguments, reason = "pinned certificate probe seeding over cx, store, stored, root, cert, checkout, scope, probes, and frame")]
+pub(crate) fn seed_pinned_dep_probes<D: blaze_core::Driver, S: crate::store::Sharing>(
+    cx: &Cx,
+    store: &mut crate::store::CommandStore<'_, '_, D, S>,
+    stored: &crate::engine_answer::Stored<'_>,
+    stood_root: &blaze_engine::pages::Root<'_>,
+    cert: blaze_ids::ContentId,
+    checkout: &str,
+    scope: CheckScope<'_>,
+    probes: &crate::scripts::SharedCommandProbes,
+    frame: &Frame,
+) -> Result<Option<crate::wasm64_compile::Hex64>, CliError> {
+    use crate::store::Store as _;
+    let scoped_root = crate::engine_answer::scoped_root_name(checkout, scope, frame);
+    let whole_root = crate::engine_answer::root_name(checkout, frame);
+    let roots: [&str; 2] = [scoped_root.as_str(), whole_root.as_str()];
+    for (idx, root_name) in roots.iter().enumerate() {
+        if idx == 1 && *root_name == scoped_root.as_str() {
+            continue;
+        }
+        if let Some(Ok(ptr)) = crate::engine_answer::load_pointer(cx, store, root_name)?
+            && ptr.root.0 == cert
+        {
+            for i in 0..ptr.leaves.len() {
+                let leaf = ptr.leaves.row(i);
+                if leaf.kind == sweep::LeafKind::DepProbes {
+                    let hex = crate::wasm64_compile::Hex64::from_bytes(leaf.id.0);
+                    probes.seed_checked_dep_probe_hex(cx, hex);
+                    return Ok(Some(hex));
+                }
+            }
+        }
+    }
+    for &name in stood_root.files.keys() {
+        if name.kind != Kind::MacroModule {
+            continue;
+        }
+        let Some(header) = stored.header(name).map_err(crate::engine_answer::page_error)? else {
+            continue;
+        };
+        if header.facts.failed {
+            continue;
+        }
+        if let Some(rec_key) = header.record
+            && let Some(held) = store.get(cx, rec_key)?
+            && let Ok(blaze_drive::record::Stored::Whole(view)) = blaze_drive::record::open(held.bytes)
+            && view.name == name
+            && let Some(hex) = crate::wasm64_compile::Hex64::from_hex_bytes(view.payload)
+        {
+            probes.seed_checked_dep_probe_hex(cx, hex);
+            return Ok(Some(hex));
+        }
+    }
+    Ok(None)
+}
+
 /// Opens a pinned engine answer `Standing` directly from `cert` (`standing.root`) in `store_home`
 /// for `blaze jit-exec` — ZERO workspace stat sweep, ZERO file hashing, and ZERO re-checking.
 /// Commits the store cleanly after `start` returns (including updated `start_list`, compiled
@@ -2369,6 +2431,17 @@ pub(crate) fn open_pinned_standing<R>(
         lazy_sdk.resolve_on_demand(cx, home_dir, wall_ns)
     };
     let command_probes = crate::scripts::SharedCommandProbes::new();
+    let _ = seed_pinned_dep_probes(
+        cx,
+        &mut store,
+        &stored,
+        &stood_root,
+        cert,
+        place.checkout,
+        scope,
+        &command_probes,
+        frame,
+    )?;
     let standing = Standing {
         root: cert,
         store: &mut store,

@@ -768,6 +768,15 @@ impl SharedCommandProbes {
         CommandProbes { inner: self, env, sdk: env.sdk, reuse_checked_dep_probes: false }
     }
 
+    /// Seeds the verified dependency-probe identity snapshot (used by pinned JIT launches in
+    /// `engine_check::open_pinned_standing` so start-time `RunProcs` with `.with_checked_snapshot()`
+    /// look up the exact `MacroModule` records that produced the pinned certificate).
+    pub(crate) fn seed_checked_dep_probe_hex(&self, cx: &Cx, hex: crate::wasm64_compile::Hex64) {
+        let _ = self
+            .checked_dep_probe_hex
+            .get_or_make(cx, |_cx| Ok::<_, core::convert::Infallible>(hex));
+    }
+
     #[cfg(test)]
     pub(crate) fn c_probes_initialized(&self) -> bool {
         self.c_probes.get().is_some()
@@ -2562,5 +2571,199 @@ mod shared_command_probes_dst {
         let pin_moved = pin_followed.layout_moved
             || pin_followed.now.rows.iter().zip(pin_followed.was.iter()).any(|(n, w)| n.state() != *w);
         assert!(pin_moved, "changed derived-fact pins must invalidate certificate hit");
+    }
+
+    #[test]
+    fn pinned_standing_seeds_checked_probe_snapshot_from_leaf_or_stored_record() {
+        use blaze_build_script::c_tasks_probe::{CanonicalProbe, ProbeAnswer, ProbeAnswerer};
+        use blaze_drive::{Kind, Name, Tool};
+        use blaze_engine::{Cause, Gen, Phase, Row, Stage, Tools, pages};
+        use blaze_ids::ContentId;
+        use blaze_proc_macro::probe_clang::{CProbeStore, CScriptProbes, MemCProbeStore};
+
+        struct MutableAnswerer(std::sync::Arc<core::sync::atomic::AtomicU8>);
+        impl ProbeAnswerer for MutableAnswerer {
+            fn id<'a>(&self, _alloc: blaze_own::Alloc<'a>) -> Result<ContentId, blaze_own::AString<'a>> {
+                Ok(ContentId([self.0.load(Ordering::SeqCst); 32]))
+            }
+            fn answer<'a, 'b>(
+                &self,
+                _probe: &CanonicalProbe<'_, '_>,
+                _input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+                alloc: blaze_own::Alloc<'a>,
+            ) -> Result<ProbeAnswer<'a>, blaze_own::AString<'a>> {
+                Err(blaze_own::AString::from_str_in("unused", alloc))
+            }
+        }
+
+        let io = Io::simulated(SimWorld::new(74, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root sim cx");
+        let fs = io.need_fs().expect("sim fs");
+        let clock = io.need_clock().expect("sim clock");
+        let err = io.need_err().expect("sim err");
+        let env = sim_env(&io);
+        let shared = SharedAlloc::global();
+        let home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.shared();
+        let frame = cx.frame();
+        let erased = blaze_own::Erased::new(frame);
+        let lent = home
+            .open_store(&blaze_cas::plain::Settings::default(), crate::store::Facts { boot: Some(1), nonce: 74 }, heap.alloc())
+            .expect("open store");
+        let mut store = crate::store::CommandStore::new(&cx, &lent, false, 0, None, clock, &err, erased.handle())
+            .expect("command store");
+        let tools = Tools([Tool(ContentId([0x44; 32])); blaze_drive::key::KINDS]);
+
+        let hex_a = crate::wasm64_compile::Hex64::from_bytes([0xa5; 32]);
+        assert_eq!(
+            crate::wasm64_compile::Hex64::from_bytes(hex_a.to_content_id().0),
+            hex_a,
+            "Hex64 <-> ContentId round-trip must be exact"
+        );
+
+        // Build a pinned `MacroModule` answer containing `hex_a` in its record payload.
+        let pm_subj = crate::macros::subject_of("sqlx-macros", "0.9.0");
+        let pm_name = Name::new(Kind::MacroModule, pm_subj);
+        let pm_src = ContentId([0x55; 32]);
+        let pm_rec_bytes = blaze_drive::record::write_plain(
+            pm_name,
+            pm_src,
+            ContentId([0x88; 32]),
+            &[],
+            hex_a.as_str().as_bytes(),
+            erased.handle(),
+        );
+        let pm_rec_key = blaze_drive::key::content_key(&pm_rec_bytes);
+        crate::store::Store::put(&mut store, &cx, pm_rec_key, &pm_rec_bytes).expect("put pm rec");
+
+        let mut kept = pages::Kept::new_in(alloc);
+        kept.answer.serial = Gen(1);
+        kept.answer.by_file.entry(pm_name).or_insert_with(|| blaze_own::Vec::new_in(alloc)).push(pm_name);
+        kept.answer.rows.insert(
+            pm_name,
+            Row {
+                key: tools.key(pm_name, &pm_src),
+                phase: Phase::new(Stage::Scripts, 0),
+                file: pm_name,
+                source: pm_src,
+                out: ContentId([0x88; 32]),
+                serial: Gen(1),
+                defines: blaze_own::Vec::new_in(alloc),
+                reads: blaze_own::Vec::new_in(alloc),
+                by_cell: blaze_own::Vec::new_in(alloc),
+                findings: 0,
+                inline: false,
+                failed: false,
+            },
+        );
+        kept.causes.insert(pm_name, (Gen(1), Cause::New));
+        kept.records.insert(pm_name, pm_rec_key);
+        let enc = pages::encode_at_bits(&kept, 4, alloc);
+        for (k, b) in enc.puts.iter() {
+            crate::store::Store::put(&mut store, &cx, *k, b).expect("put page");
+        }
+        let cert = enc.root.0;
+        let stood_root = crate::engine_answer::open_root(&cx, &mut store, enc.root, alloc)
+            .expect("open root io")
+            .expect("valid root");
+        let snap = store.snapshot_in(alloc).expect("snapshot");
+        let headers = pages::Headers::Absent { since: Gen(0) };
+        let stored = crate::engine_answer::Stored::new(&stood_root, &snap, &headers, pages::Check::Store, alloc);
+
+        // Live host answerer has ALREADY drifted to 0xbb before the pinned launch runs!
+        let drifted_state = std::sync::Arc::new(core::sync::atomic::AtomicU8::new(0xbb));
+        let make_drifted_ready = || {
+            let answerer: blaze_own::Arc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> =
+                blaze_own::Arc::new_in(MutableAnswerer(std::sync::Arc::clone(&drifted_state)), shared);
+            let records: blaze_own::Arc<dyn CProbeStore, SharedAlloc<'static>> =
+                blaze_own::Arc::new_in(MemCProbeStore::default(), shared);
+            CProbeSetting::Ready(CScriptProbes {
+                answerer,
+                #[cfg(target_os = "linux")]
+                hermetic: None,
+                records,
+                sdk_dir: blaze_own::Arc::from_str_in("", shared),
+                sdk_id: blaze_own::Arc::from_str_in("", shared),
+                sdk_digest: [0; 32],
+                clang_sha256: [0x99; 32],
+            })
+        };
+
+        // Case 1: Checkout pointer absent/moved -> `seed_pinned_dep_probes` recovers `hex_a`
+        // directly from the pinned `stood_root`'s `MacroModule` record payload.
+        let holder_rec = SharedCommandProbes::new();
+        let seeded_rec = crate::engine_check::seed_pinned_dep_probes(
+            &cx,
+            &mut store,
+            &stored,
+            &stood_root,
+            cert,
+            "/pinned-checkout",
+            crate::engine_check::CheckScope::Whole,
+            &holder_rec,
+            frame,
+        )
+        .expect("seed from record");
+        assert_eq!(seeded_rec, Some(hex_a));
+        let _ = holder_rec.with_env(&env).c_probes_with(&cx, |_| Some(make_drifted_ready()));
+        let got_rec = holder_rec
+            .with_env(&env)
+            .with_checked_snapshot()
+            .dep_probe_identity_hex(&cx)
+            .expect("pinned start snapshot from record");
+        assert_eq!(got_rec, hex_a, "pinned launch must return cert's probe tag even after live drift");
+
+        // Case 2: Pointer matching `cert` with `LeafKind::DepProbes` carrying `hex_b` seeds
+        // directly from the certificate's `DepProbes` leaf (O(leaves), zero MacroModule reads).
+        let hex_b = crate::wasm64_compile::Hex64::from_bytes([0xb6; 32]);
+        let mut ptr_rows = crate::sweep::Rows::new_in(frame);
+        crate::sweep::record_dep_probes(&mut ptr_rows, hex_b.to_content_id());
+        let root_name = crate::engine_answer::root_name("/pinned-checkout", frame);
+        let leaves = crate::sweep::Leaves::bytes_in(&ptr_rows, frame).expect("leaves");
+        let mut ptr_bytes: blaze_own::Vec<u8, &bstd::mem::Frame> = blaze_own::Vec::new_in(frame);
+        ptr_bytes.extend_from_slice(crate::engine_answer::POINTER_MAGIC);
+        ptr_bytes.extend_from_slice(&enc.root.0.0);
+        ptr_bytes.extend_from_slice(&[0x99u8; 32]);
+        ptr_bytes.extend_from_slice(&enc.files.to_le_bytes());
+        ptr_bytes.push(0x07u8);
+        ptr_bytes.extend_from_slice(&enc.findings.to_le_bytes());
+        ptr_bytes.extend_from_slice(&enc.owed.to_le_bytes());
+        ptr_bytes.extend_from_slice(&[0u8; 32]);
+        ptr_bytes.push(1u8);
+        ptr_bytes.extend_from_slice(&0u64.to_le_bytes());
+        ptr_bytes.extend_from_slice(&[0u8; 32 * pages::HeaderPages::COUNT]);
+        crate::journal_sweep::Stored::encode_units(core::iter::empty(), None, &mut ptr_bytes);
+        let sealed = crate::seal::seal(&ptr_bytes, &leaves, frame).expect("seal");
+        let ptr_key = blaze_drive::key::content_key(&sealed);
+        crate::store::Store::put(&mut store, &cx, ptr_key, &sealed).expect("put pointer");
+        store.pin(root_name.as_str(), &[ptr_key]).expect("pin pointer");
+        lent.commit().expect("commit pointer");
+        let loaded_ptr = crate::engine_answer::load_pointer(&cx, &mut store, root_name.as_str())
+            .expect("load pointer io")
+            .expect("pointer present")
+            .expect("pointer readable");
+        assert_eq!(loaded_ptr.root, enc.root);
+
+        let holder_leaf = SharedCommandProbes::new();
+        let seeded_leaf = crate::engine_check::seed_pinned_dep_probes(
+            &cx,
+            &mut store,
+            &stored,
+            &stood_root,
+            cert,
+            "/pinned-checkout",
+            crate::engine_check::CheckScope::Whole,
+            &holder_leaf,
+            frame,
+        )
+        .expect("seed from pointer leaf");
+        assert_eq!(seeded_leaf, Some(hex_b));
+        let got_leaf = holder_leaf
+            .with_env(&env)
+            .with_checked_snapshot()
+            .dep_probe_identity_hex(&cx)
+            .expect("pinned start snapshot from leaf");
+        assert_eq!(got_leaf, hex_b, "pinned launch must restore pointer DepProbes leaf tag");
     }
 }
