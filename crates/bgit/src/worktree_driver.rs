@@ -13,7 +13,7 @@ use std::{
     fs,
     io::{self, Write},
     os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink},
-    path::{Path, PathBuf},
+    path::Path,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -23,7 +23,6 @@ use blaze_git::{
     commit_graph::CommitGraph,
     merge::{MergeOpts, MergeStatus},
     objects::TreeIter,
-    pack_write::encode_loose_object,
     slab::SlabCompression,
     storage::{ObjectStore, RefStore, RefTarget, RefUpdate, Signature, encode_commit},
     worktree::{
@@ -37,7 +36,10 @@ use bstd::cli::Matches;
 
 use crate::{
     IoStreams, WorktreeInfo,
-    disk::{BgitDiskStore, infect_repo_on_disk, open_or_infect},
+    disk::{
+        BgitDiskStore, infect_repo_on_disk, mirror_overlay_objects_to_git, mirror_ref_to_git,
+        open_or_infect, resolve_common_git_dir,
+    },
     print_help, resolve_bgit_binary, resolve_path,
     vfs_driver::{cmd_unmount_path, spawn_background_mount},
 };
@@ -1078,87 +1080,6 @@ pub(crate) fn install_git_worktree_hooks(repo_root: &Path) -> io::Result<()> {
     fs::write(&tmp, content)?;
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
     fs::rename(tmp, &hook_path)
-}
-
-fn resolve_common_git_dir(repo_root: &Path) -> Option<PathBuf> {
-    let dot_git = repo_root.join(".git");
-    if dot_git.is_dir() {
-        return Some(dot_git);
-    }
-    if dot_git.is_file() {
-        let raw = fs::read(&dot_git).ok()?;
-        let target = blaze_git::refs::parse_gitdir_file(&raw).ok()?;
-        let gd = {
-            let p = Path::new(target);
-            if p.is_absolute() { p.to_path_buf() } else { repo_root.join(p) }
-        };
-        let common = gd.join("commondir");
-        if common.is_file() {
-            let c = fs::read_to_string(&common).ok()?;
-            let c = c.trim();
-            let p = Path::new(c);
-            return Some(if p.is_absolute() { p.to_path_buf() } else { gd.join(p) });
-        }
-        return Some(gd);
-    }
-    None
-}
-
-/// Mirror newly written overlay objects (merge commit + merged trees/blobs) into `.git/objects`
-/// as loose zlib objects so plain `git` commands immediately see `bgit` auto-merge commits.
-fn mirror_overlay_objects_to_git<'a>(
-    store: &BgitDiskStore<'a>,
-    repo_root: &Path,
-    alloc: Alloc<'a>,
-) {
-    let Some(git_dir) = resolve_common_git_dir(repo_root) else {
-        return;
-    };
-    let obj_root = git_dir.join("objects");
-    if !obj_root.is_dir() {
-        return;
-    }
-    let mut oids = OwnVec::new_in(alloc);
-    if store.overlay_oids(&mut oids).is_err() {
-        return;
-    }
-    let mut body = OwnVec::new_in(alloc);
-    let mut loose = OwnVec::new_in(alloc);
-    for oid in oids {
-        let hex = oid.hex();
-        let hex_str = core::str::from_utf8(&hex).expect("ascii hex");
-        let dir = obj_root.join(&hex_str[..2]);
-        let dst = dir.join(&hex_str[2..]);
-        if dst.is_file() {
-            continue;
-        }
-        let Ok(Some(kind)) = store.read_object(&oid, &mut body) else {
-            continue;
-        };
-        if encode_loose_object(kind, &body, alloc, &mut loose).is_err() {
-            continue;
-        }
-        let _ = fs::create_dir_all(&dir);
-        let tmp = dir.join(format!("tmp_bgit_{}", &hex_str[2..]));
-        if fs::write(&tmp, loose.as_slice()).is_ok() {
-            let _ = fs::rename(&tmp, &dst);
-        }
-    }
-}
-
-/// Mirror a branch ref update into `.git/<ref>` when `.git` exists so `git` and `bgit` stay in sync.
-fn mirror_ref_to_git(repo_root: &Path, full_ref: &str, oid: Oid) {
-    let Some(git_dir) = resolve_common_git_dir(repo_root) else {
-        return;
-    };
-    if !full_ref.starts_with("refs/") || full_ref.contains("..") {
-        return;
-    }
-    let ref_path = git_dir.join(full_ref);
-    if let Some(parent) = ref_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(&ref_path, format!("{oid}\n"));
 }
 
 /// If a sibling `.git` directory has refs modified more recently than `.bgit/refs.bgref`

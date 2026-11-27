@@ -510,8 +510,118 @@ impl<'a> BgitDiskStore<'a> {
         Ok(())
     }
 
-    /// Resolves a revision string: 40-hex OID, `"HEAD"`, full refname, or short branch/tag name.
+    /// Resolves a Git revision expression:
+    /// - 40-hex OID or unambiguous short hex prefix (`>= 4` hex chars)
+    /// - `"HEAD"` or `"@"`
+    /// - full refname, `refs/heads/<r>`, `refs/tags/<r>`, `refs/remotes/origin/<r>`, `refs/remotes/<r>`
+    /// - suffix chain: `~`, `~N`, `^`, `^N` (`^0` peels to commit, `^1`..`^N` selects Nth parent),
+    ///   `^{commit}`, `^{tree}`, `^{}` (peel annotated tags)
     pub(crate) fn resolve_rev(&self, rev: &str) -> Result<Option<Oid>, GitError> {
+        let rev = rev.trim();
+        if rev.is_empty() {
+            return Ok(None);
+        }
+        // Split base revision from trailing `~` / `^` suffix chain.
+        let split_at = rev.find(['~', '^']).unwrap_or(rev.len());
+        let (base_raw, suffix) = rev.split_at(split_at);
+        let base_str = if base_raw == "@" { "HEAD" } else { base_raw };
+        let Some(mut oid) = self.resolve_base_rev(base_str)? else {
+            return Ok(None);
+        };
+        if suffix.is_empty() {
+            return Ok(Some(oid));
+        }
+
+        let mut rest = suffix;
+        let mut buf = OwnVec::new_in(self.alloc);
+        while !rest.is_empty() {
+            if let Some(after) = rest.strip_prefix('~') {
+                let digits_len = after.bytes().take_while(|b| b.is_ascii_digit()).count();
+                let count: usize = if digits_len == 0 {
+                    1
+                } else {
+                    after[..digits_len].parse().unwrap_or(usize::MAX)
+                };
+                rest = &after[digits_len..];
+                if let Some(peeled) = blaze_git::storage::peel_tag(self, oid, 8, self.alloc)? {
+                    oid = peeled;
+                }
+                for _ in 0..count {
+                    if self.read_object(&oid, &mut buf)? != Some(ObjectKind::Commit) {
+                        return Ok(None);
+                    }
+                    let Ok(commit) = git_store::Commit::parse(&buf) else {
+                        return Ok(None);
+                    };
+                    let Some(parent) = commit.parents().next() else {
+                        return Ok(None);
+                    };
+                    oid = parent;
+                }
+            } else if let Some(after) = rest.strip_prefix("^{") {
+                let Some(end) = after.find('}') else {
+                    return Ok(None);
+                };
+                let target_kind = &after[..end];
+                rest = &after[end + 1..];
+                if let Some(peeled) = blaze_git::storage::peel_tag(self, oid, 8, self.alloc)? {
+                    oid = peeled;
+                }
+                match target_kind {
+                    "" | "commit" => {
+                        if self.read_object(&oid, &mut buf)? != Some(ObjectKind::Commit) {
+                            return Ok(None);
+                        }
+                    }
+                    "tree" => {
+                        match self.read_object(&oid, &mut buf)? {
+                            Some(ObjectKind::Tree) => {}
+                            Some(ObjectKind::Commit) => {
+                                let Ok(commit) = git_store::Commit::parse(&buf) else {
+                                    return Ok(None);
+                                };
+                                oid = commit.tree;
+                            }
+                            _ => return Ok(None),
+                        }
+                    }
+                    _ => return Ok(None),
+                }
+            } else if let Some(after) = rest.strip_prefix('^') {
+                let digits_len = after.bytes().take_while(|b| b.is_ascii_digit()).count();
+                let parent_idx: usize = if digits_len == 0 {
+                    1
+                } else {
+                    after[..digits_len].parse().unwrap_or(usize::MAX)
+                };
+                rest = &after[digits_len..];
+                if let Some(peeled) = blaze_git::storage::peel_tag(self, oid, 8, self.alloc)? {
+                    oid = peeled;
+                }
+                if parent_idx == 0 {
+                    if self.read_object(&oid, &mut buf)? != Some(ObjectKind::Commit) {
+                        return Ok(None);
+                    }
+                } else {
+                    if self.read_object(&oid, &mut buf)? != Some(ObjectKind::Commit) {
+                        return Ok(None);
+                    }
+                    let Ok(commit) = git_store::Commit::parse(&buf) else {
+                        return Ok(None);
+                    };
+                    let Some(parent) = commit.parents().nth(parent_idx - 1) else {
+                        return Ok(None);
+                    };
+                    oid = parent;
+                }
+            } else {
+                return Ok(None);
+            }
+        }
+        Ok(Some(oid))
+    }
+
+    fn resolve_base_rev(&self, rev: &str) -> Result<Option<Oid>, GitError> {
         if let Some(oid) = Oid::parse_hex(rev.as_bytes()) {
             return Ok(Some(oid));
         }
@@ -527,8 +637,184 @@ impl<'a> BgitDiskStore<'a> {
             return Ok(Some(oid));
         }
         let remote = format!("refs/remotes/origin/{rev}");
-        self.resolve_ref(&remote)
+        if let Some(oid) = self.resolve_ref(&remote)? {
+            return Ok(Some(oid));
+        }
+        let remote_full = format!("refs/remotes/{rev}");
+        if let Some(oid) = self.resolve_ref(&remote_full)? {
+            return Ok(Some(oid));
+        }
+        // Short hex OID prefix (`>= 4` ASCII hex chars, unambiguous match across store).
+        if rev.len() >= 4
+            && rev.len() < 40
+            && rev.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            let lower = rev.to_ascii_lowercase();
+            let mut all = OwnVec::new_in(self.alloc);
+            self.list_oids(&mut all)?;
+            let mut found: Option<Oid> = None;
+            for oid in all {
+                let hex = oid.hex();
+                let hex_str = core::str::from_utf8(&hex).expect("ascii hex");
+                if hex_str.starts_with(&lower) {
+                    if found.is_some() {
+                        // Ambiguous prefix.
+                        return Ok(None);
+                    }
+                    found = Some(oid);
+                }
+            }
+            return Ok(found);
+        }
+        Ok(None)
     }
+
+    /// Peels `rev` (including annotated tags) to a commit OID, returning `None` if not a commit.
+    pub(crate) fn resolve_commit(&self, rev: &str) -> Result<Option<Oid>, GitError> {
+        let Some(oid) = self.resolve_rev(rev)? else {
+            return Ok(None);
+        };
+        let oid = blaze_git::storage::peel_tag(self, oid, 8, self.alloc)?.unwrap_or(oid);
+        let mut buf = OwnVec::new_in(self.alloc);
+        if self.read_object(&oid, &mut buf)? == Some(ObjectKind::Commit) {
+            Ok(Some(oid))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Resolves the common `.git` directory for a normal repo or linked worktree, if `.git` exists.
+pub(crate) fn resolve_common_git_dir(repo_root: &Path) -> Option<PathBuf> {
+    let dot_git = repo_root.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    if dot_git.is_file() {
+        let raw = fs::read(&dot_git).ok()?;
+        let target = parse_gitdir_file(&raw).ok()?;
+        let gd = {
+            let p = Path::new(target);
+            if p.is_absolute() { p.to_path_buf() } else { repo_root.join(p) }
+        };
+        let common = gd.join("commondir");
+        if common.is_file() {
+            let c = fs::read_to_string(&common).ok()?;
+            let c = c.trim();
+            let p = Path::new(c);
+            return Some(if p.is_absolute() { p.to_path_buf() } else { gd.join(p) });
+        }
+        return Some(gd);
+    }
+    None
+}
+
+/// Mirror newly written overlay objects into `.git/objects` as loose zlib objects so plain `git`
+/// commands immediately see objects written by `bgit`.
+pub(crate) fn mirror_overlay_objects_to_git<'a>(
+    store: &BgitDiskStore<'a>,
+    repo_root: &Path,
+    alloc: Alloc<'a>,
+) {
+    let Some(git_dir) = resolve_common_git_dir(repo_root) else {
+        return;
+    };
+    let obj_root = git_dir.join("objects");
+    if !obj_root.is_dir() {
+        return;
+    }
+    let mut oids = OwnVec::new_in(alloc);
+    if store.overlay_oids(&mut oids).is_err() {
+        return;
+    }
+    let mut body = OwnVec::new_in(alloc);
+    let mut loose = OwnVec::new_in(alloc);
+    for oid in oids {
+        let hex = oid.hex();
+        let hex_str = core::str::from_utf8(&hex).expect("ascii hex");
+        let dir = obj_root.join(&hex_str[..2]);
+        let dst = dir.join(&hex_str[2..]);
+        if dst.is_file() {
+            continue;
+        }
+        let Ok(Some(kind)) = store.read_object(&oid, &mut body) else {
+            continue;
+        };
+        if blaze_git::pack_write::encode_loose_object(kind, &body, alloc, &mut loose).is_err() {
+            continue;
+        }
+        let _ = fs::create_dir_all(&dir);
+        let tmp = dir.join(format!("tmp_bgit_{}", &hex_str[2..]));
+        if fs::write(&tmp, loose.as_slice()).is_ok() {
+            let _ = fs::rename(&tmp, &dst);
+        }
+    }
+}
+
+/// Mirror a branch/tag ref update into `.git/<ref>` when `.git` exists so `git` and `bgit` stay in sync.
+pub(crate) fn mirror_ref_to_git(repo_root: &Path, full_ref: &str, oid: Oid) {
+    let Some(git_dir) = resolve_common_git_dir(repo_root) else {
+        return;
+    };
+    if !full_ref.starts_with("refs/") || full_ref.contains("..") {
+        return;
+    }
+    let ref_path = git_dir.join(full_ref);
+    if let Some(parent) = ref_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = write_file_atomic(&ref_path, format!("{oid}\n").as_bytes());
+}
+
+/// Remove a loose/packed ref in `.git` when deleted through `bgit` so `git` sees the deletion.
+pub(crate) fn delete_ref_in_git(repo_root: &Path, full_ref: &str) {
+    let Some(git_dir) = resolve_common_git_dir(repo_root) else {
+        return;
+    };
+    if !full_ref.starts_with("refs/") || full_ref.contains("..") {
+        return;
+    }
+    let ref_path = git_dir.join(full_ref);
+    let _ = fs::remove_file(&ref_path);
+    // Also strip from `.git/packed-refs` if present.
+    let packed = git_dir.join("packed-refs");
+    if let Ok(raw) = fs::read_to_string(&packed) {
+        let mut changed = false;
+        let mut out = String::with_capacity(raw.len());
+        let mut skip_peel = false;
+        for line in raw.lines() {
+            if skip_peel {
+                if line.starts_with('^') {
+                    continue;
+                }
+                skip_peel = false;
+            }
+            if let Some((_, name)) = line.split_once(' ')
+                && name == full_ref
+            {
+                changed = true;
+                skip_peel = true;
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        if changed {
+            let _ = write_file_atomic(&packed, out.as_bytes());
+        }
+    }
+}
+
+/// Mirror a `HEAD` update into `.git/HEAD` (worktree-local git dir) when `.git` exists.
+pub(crate) fn mirror_head_to_git(repo_root: &Path, target: &RefTarget<'_>) {
+    let Ok(git_dir) = locate_git_dir(repo_root) else {
+        return;
+    };
+    let line = match target {
+        RefTarget::Symbolic(sym) => format!("ref: {}\n", sym.as_str()),
+        RefTarget::Direct(oid) => format!("{oid}\n"),
+    };
+    let _ = write_file_atomic(&git_dir.join("HEAD"), line.as_bytes());
 }
 
 impl<'a> ObjectStore<'a> for BgitDiskStore<'a> {
