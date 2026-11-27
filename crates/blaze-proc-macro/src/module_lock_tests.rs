@@ -317,3 +317,63 @@ fn a_malformed_entry_is_refused_with_its_line_not_a_package_named_empty() {
     assert_eq!(old.len(), 2);
     assert_eq!((old[1].name, old[1].version), ("", "2.0.0"), "the twin: the old reader's package named \"\"");
 }
+
+/// A path proc-macro crate whose path dependency has a `dev-dependency` in `Cargo.lock`
+/// (`blaze-memo-macros -> blaze-hash -> [dev] blaze-alloc-count`): `closure_of_packages` over
+/// the compiled UnitGraph deps hashes only the compiled path dep and never touches the unpinned
+/// dev-dependency, while still refusing an unpinned compiled path dep.
+#[test]
+fn closure_of_packages_skips_uncompiled_dev_deps_and_pins_compiled_path_deps() {
+    let text = r#"version = 4
+
+[[package]]
+name = "pm"
+version = "0.0.0"
+dependencies = [
+ "shared",
+]
+
+[[package]]
+name = "shared"
+version = "0.0.0"
+dependencies = [
+ "dev-only",
+]
+
+[[package]]
+name = "dev-only"
+version = "0.0.0"
+"#;
+    let lock = Lock::read(text.as_bytes(), blaze_own::testing::heap().alloc()).expect("lock reads");
+    let locked = LockedPackages::of(&lock);
+    let pm = lock.named("pm").next().expect("pm");
+    let shared = lock.named("shared").next().expect("shared");
+    let dev_only = lock.named("dev-only").next().expect("dev-only");
+
+    // Control: walking Cargo.lock directly hits `dev-only` and refuses it as unpinned.
+    let via_lock = locked
+        .closure_with("pm", "0.0.0", |id| Ok::<Option<&str>, core::convert::Infallible>((id == shared).then_some("aaa")))
+        .unwrap();
+    assert_eq!(via_lock, Err(ClosureError::Unpinned { name: "dev-only".into(), version: "0.0.0".into() }));
+
+    // UnitGraph closure contains only `shared`, not `dev-only`: pins cleanly and changes when
+    // `shared`'s files digest changes.
+    let d1 = locked
+        .closure_of_packages(pm, [shared], |id| {
+            assert_ne!(id, dev_only, "uncompiled dev-dep must never be queried");
+            Ok::<Option<&str>, core::convert::Infallible>((id == shared).then_some("aaa"))
+        })
+        .unwrap()
+        .expect("compiled path dep pinned");
+    let d2 = locked
+        .closure_of_packages(pm, [shared], |id| Ok::<Option<&str>, core::convert::Infallible>((id == shared).then_some("bbb")))
+        .unwrap()
+        .expect("compiled path dep pinned");
+    assert_ne!(d1, d2, "changing a compiled path dep's digest must change the closure key");
+
+    // Negative: missing pin for an actual compiled path dep is still refused.
+    let missing = locked
+        .closure_of_packages(pm, [shared], |_| Ok::<Option<&str>, core::convert::Infallible>(None))
+        .unwrap();
+    assert_eq!(missing, Err(ClosureError::Unpinned { name: "shared".into(), version: "0.0.0".into() }));
+}

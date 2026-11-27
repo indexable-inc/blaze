@@ -121,7 +121,7 @@ impl<'l, 'a> LockedPackages<'l, 'a> {
         &self,
         name: &str,
         version: &str,
-        mut path_pin: impl FnMut(blaze_manifest::lock::LockId) -> Result<Option<D>, E>,
+        path_pin: impl FnMut(blaze_manifest::lock::LockId) -> Result<Option<D>, E>,
     ) -> Result<Result<String, ClosureError>, E> {
         let lock = self.lock;
         let Some(root) = lock
@@ -139,6 +139,27 @@ impl<'l, 'a> LockedPackages<'l, 'a> {
                     seen[dep.index()] = true;
                     stack.push(*dep);
                 }
+            }
+        }
+        let deps = seen.iter().enumerate().filter_map(|(at, &hit)| hit.then_some(blaze_manifest::lock::LockId(at as u32)));
+        self.closure_of_packages(root, deps, path_pin)
+    }
+
+    /// Like [`Self::closure_with`], but hashes only the explicitly supplied dependency packages
+    /// (`dep_packages`, excluding `root`) rather than walking `Cargo.lock`'s `dependencies` lists
+    /// (which include `dev-dependencies` and inactive optional/target dependencies of workspace
+    /// path packages).
+    pub fn closure_of_packages<D: AsRef<str>, E>(
+        &self,
+        root: blaze_manifest::lock::LockId,
+        dep_packages: impl IntoIterator<Item = blaze_manifest::lock::LockId>,
+        mut path_pin: impl FnMut(blaze_manifest::lock::LockId) -> Result<Option<D>, E>,
+    ) -> Result<Result<String, ClosureError>, E> {
+        let lock = self.lock;
+        let mut seen = vec![false; lock.packages.len()];
+        for dep in dep_packages {
+            if dep.index() < seen.len() {
+                seen[dep.index()] = true;
             }
         }
         let mut lines = Vec::new();

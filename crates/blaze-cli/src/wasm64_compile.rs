@@ -852,7 +852,7 @@ fn ensure_proc_macro_unit(
     let locked = blaze_proc_macro::module::LockedPackages::of(lock);
     let folders = blaze_world::procs::git_folders(store)
         .map_err(|e| std::format!("listing proc-macro store git folders: {e}"))?;
-    let identity = blaze_world::procs::identify(lock, &locked, &folders, unit, |pkg_id| {
+    let identity = blaze_world::procs::identify(lock, &locked, &folders, graph, unit, |pkg_id| {
         let Some((_, dir, _)) = members.iter().find(|(id, _, _)| *id == pkg_id) else {
             return Ok(None);
         };
