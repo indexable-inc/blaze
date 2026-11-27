@@ -1132,27 +1132,50 @@ fn map_internal_fast_tier_err(err: TierError) -> RecordEmitError {
 ///   reduction, auto-vectorization, GEMM/AMAC/SLP, unrolling, modulo scheduling, mach-egraph,
 ///   superopt, DAG scheduling, cold splitting) and emits directly through `misel` / `isel` in
 ///   fast mode (`O(V + E)` RPO layout, zero `mopt`/`msched`, single-pass bitmask `mra`).
-/// - Under [`EmitProfile::Sota`] (`opts.is_hot` below the mega-function bound): runs the full
-///   SOTA LIR mid-end + full `misel` / `isel` backend (`mopt`, `msched`, coalescing `mra`).
+/// Returns `true` iff `view` contains any scalar (`f16`/`f128`) or non-128-bit vector type
+/// that neither AArch64 `misel` nor `isel` lowers natively, so legalizing it BEFORE SOTA mid-end
+/// lets SROA + GVN + `misel` optimize the scalarized form instead of falling back to stack-spilling
+/// `Reference` codegen.
 ///
-/// Both profiles preserve 100% identical runtime semantics, AAPCS64 / `InternalFast` /
-/// `ColdPreserveAll` ABI, IPRA `CallClobbers`, unwind frames, import sites, and trap rows.
-pub fn emit_sota_record_for_machine_with_abi<'a>(
+/// Preserves native 128-bit NEON vector types (`<16 x i8>`, `<8 x i16>`, `<4 x i32>`, `<2 x i64>`,
+/// `<4 x f32>`, `<2 x f64>`) and their 128-bit lane masks (`<2|4|8|16 x i1>`) untouched so native
+/// NEON SIMD and auto-vectorization keep full hardware throughput.
+fn needs_pre_sota_legalize(view: &blaze_lir::View<'_>) -> bool {
+    let is_non_native = |bits: u16| -> bool {
+        let ty = blaze_lir::Ty(bits);
+        match ty.form() {
+            blaze_lir::ty::Form::Scalar => {
+                matches!(ty.elem(), blaze_lir::Scalar::F16 | blaze_lir::Scalar::F128)
+            }
+            blaze_lir::ty::Form::Vector => {
+                let is_native_128 = ty.bits(64) == 128
+                    && !matches!(
+                        ty.elem(),
+                        blaze_lir::Scalar::F16 | blaze_lir::Scalar::F128 | blaze_lir::Scalar::Ptr
+                    );
+                let is_native_mask =
+                    matches!(ty.elem(), blaze_lir::Scalar::I1) && matches!(ty.lanes(), 2 | 4 | 8 | 16);
+                !is_native_128 && !is_native_mask
+            }
+            blaze_lir::ty::Form::Compound | blaze_lir::ty::Form::Scalable => false,
+        }
+    };
+    view.tys.iter().any(|&b| is_non_native(b))
+        || view.compound_tys.iter().any(|&b| is_non_native(b))
+        || view.sig_params.iter().any(|p| is_non_native(p.ty))
+}
+
+/// Runs the AArch64 SOTA mid-end + `misel` / `isel` emission pipeline over `func`, returning
+/// `Ok(Some((record, insts, clobbers)))` on success or `Ok(None)` when neither `misel` nor `isel`
+/// supports `func` (and `InternalFast` is not required).
+fn try_emit_sota_a64_core<'a>(
     func: Verified<'_>,
     names: &dyn Names,
-    routines: &RoutinePlaces,
     opts: SotaRecordAbiOpts<'_>,
     traps: &[TrapSource],
     alloc: Alloc<'a>,
-) -> Result<(CodeRecord<'a>, u32, Called, CallClobbers), RecordEmitError> {
+) -> Result<Option<(CodeRecord<'a>, u32, CallClobbers)>, RecordEmitError> {
     let machine = opts.machine;
-    let isa = Isa {
-        lse: (machine.features & Machine::LSE) != 0,
-        os: match machine.os {
-            blaze_tier::Os::MacOs => crate::Os::MacOs,
-            blaze_tier::Os::Linux => crate::Os::Linux,
-        },
-    };
 
     // Mega-function mid-end bound (rule 18, matching `value_info::MAX_BLOCKS` and
     // `layout::EXACT_LOOP_MAX_BLOCKS`): above this size (e.g. generated `cranelift-isle` decision
@@ -1184,159 +1207,212 @@ pub fn emit_sota_record_for_machine_with_abi<'a>(
     let has_fast_abi_req = opts.internal_fast
         || !collect_misel_fast_calls(func.view(), opts.internal_fast_callees, alloc).is_empty();
 
-    if let Some(opt_v) = chosen_opt.or_else(|| (has_fast_abi_req || fast_mode).then_some(func)) {
-        let late_func = run_midend.then(|| {
-            run_sota_loop_and_late_passes(
-                opt_v.view(),
-                machine,
-                RegBudget::AARCH64,
-                true,
-                superopt,
-                alloc,
-            )
-        });
-        let full_v = match late_func.as_ref().map(|f| verify_in(f.view(), alloc)) {
-            Some(Ok(v)) => v,
-            _ => opt_v,
-        };
-        let is_macos = machine.os == blaze_tier::Os::MacOs;
-        let initial_fast_calls = collect_misel_fast_calls(full_v.view(), opts.internal_fast_callees, alloc);
-        let need_misel_retry = run_midend && (opts.internal_fast || !initial_fast_calls.is_empty());
-        let late_no_vec: Option<blaze_lir::Func<Alloc<'a>>>;
-        let emit_v: Verified<'_> = if need_misel_retry
-            && !misel_subset_ok(full_v.view(), names, opts, initial_fast_calls.as_slice())
-        {
-            // Late auto-vectorization / GEMM / SIMD passes introduced an op outside `misel`'s
-            // subset while `InternalFast` ABI is active: re-run late scalar passes with
-            // `auto_vectorize = false` so BCE, unswitch, if-conv, and superopt still apply,
-            // falling back to `opt_v` or original `func` if needed — never to C-ABI `isel`.
-            late_no_vec = Some(run_sota_loop_and_late_passes(
-                opt_v.view(),
-                machine,
-                RegBudget::AARCH64,
-                false,
-                superopt,
-                alloc,
-            ));
-            if let Some(nv) = late_no_vec.as_ref().and_then(|f| verify_in(f.view(), alloc).ok())
-                && {
-                    let nv_fast = collect_misel_fast_calls(nv.view(), opts.internal_fast_callees, alloc);
-                    misel_subset_ok(nv.view(), names, opts, nv_fast.as_slice())
-                }
-            {
-                nv
-            } else {
-                let opt_fast = collect_misel_fast_calls(opt_v.view(), opts.internal_fast_callees, alloc);
-                if misel_subset_ok(opt_v.view(), names, opts, opt_fast.as_slice()) {
-                    opt_v
-                } else {
-                    func
-                }
-            }
-        } else {
-            full_v
-        };
+    let Some(opt_v) = chosen_opt.or_else(|| (has_fast_abi_req || fast_mode).then_some(func)) else {
+        return Ok(None);
+    };
 
-        let full_view = emit_v.view();
-        let effective_preserve_all_cold =
-            opts.preserve_all_cold && !opts.internal_fast && is_safe_for_cold_preserve_all(full_view);
-        let ra_order = opts.scratch_order.map(ScratchOrder::to_regalloc);
-        let lookup_clobbers = |inst: usize| -> Option<CallClobbers> {
-            lookup_direct_callee_clobbers(full_view, inst, opts.callee_clobbers)
-        };
-        // Primary V3 AArch64 pure-SSA `MFunc` pipeline (`fast_mode` skips Ext-TSP, `mopt`,
-        // `msched`, and multi-pass coalescing; SOTA runs the full backend optimization stack).
-        let mut misel_call_clobs: blaze_own::Vec<(u32, CallClobbers), Alloc<'a>> =
-            blaze_own::Vec::new_in(alloc);
-        if !opts.callee_clobbers.is_empty() {
-            for inst in 0..full_view.len() {
-                if let Some(clob) = lookup_clobbers(inst)
-                    && let Ok(inst_u32) = u32::try_from(inst)
-                {
-                    misel_call_clobs.push((inst_u32, clob));
-                }
-            }
-        }
-        let misel_fast_calls = collect_misel_fast_calls(full_view, opts.internal_fast_callees, alloc);
-        let must_use_misel = opts.internal_fast || !misel_fast_calls.is_empty();
-        let misel_result = misel::emit_mfunc_ssa_a64(
-            emit_v,
-            names,
-            misel::MIseOpts {
-                machine,
-                call_mode: CallMode::GotSlot,
-                scratch_gpr_order: opts.scratch_order.map(|o| o.gpr),
-                preserve_all_cold: effective_preserve_all_cold,
-                call_clobbers: misel_call_clobs.as_slice(),
-                internal_fast: opts.internal_fast,
-                internal_fast_calls: misel_fast_calls.as_slice(),
-                fast_mode,
-            },
+    let late_func = run_midend.then(|| {
+        run_sota_loop_and_late_passes(
+            opt_v.view(),
+            machine,
+            RegBudget::AARCH64,
+            true,
+            superopt,
             alloc,
         )
-        .map(|(emitted, clobbers, _stats)| (emitted, clobbers));
-        let emit_result = match misel_result {
-            Ok(pair) => Ok(pair),
-            Err(err) if must_use_misel => return Err(map_internal_fast_tier_err(err)),
-            Err(_) => isel::emit_sota_a64_with_abi_profile(
-                full_view,
-                names,
-                CallMode::GotSlot,
-                machine.features,
-                is_macos,
-                |inst| lookup_clobbers(inst).unwrap_or(CallClobbers::C_ABI_ARM64),
-                ra_order.as_ref(),
-                effective_preserve_all_cold,
-                fast_mode,
-                alloc,
-            ),
-        };
-        if let Ok((emitted, mut clobbers)) = emit_result {
-            if let Some((rec, insts)) = emitted_to_code_record(emitted, traps, alloc) {
-                // Soundly union callee clobbers for tail-called `Op::Call`/`Op::CallIndirect` sites
-                // (which `regalloc` excludes from `call_positions` since they do not clobber locals).
-                // `effective_preserve_all_cold` disables TCO and saves/restores modified scratch regs.
-                if !effective_preserve_all_cold {
-                    for inst in 0..full_view.len() {
-                        match full_view.op(inst) {
-                            Op::Call | Op::Invoke | Op::TailCall => {
-                                let callee_clob = lookup_clobbers(inst).unwrap_or(CallClobbers::C_ABI_ARM64);
-                                clobbers.clobbered = clobbers.clobbered.union(callee_clob.clobbered);
-                            }
-                            Op::CallIndirect | Op::InvokeIndirect | Op::TailCallIndirect => {
-                                clobbers.clobbered = clobbers.clobbered.union(CallClobbers::C_ABI_ARM64.clobbered);
-                            }
-                            _ => {}
+    });
+    let full_v = match late_func.as_ref().map(|f| verify_in(f.view(), alloc)) {
+        Some(Ok(v)) => v,
+        _ => opt_v,
+    };
+    let is_macos = machine.os == blaze_tier::Os::MacOs;
+    let initial_fast_calls = collect_misel_fast_calls(full_v.view(), opts.internal_fast_callees, alloc);
+    let need_misel_retry = run_midend && (opts.internal_fast || !initial_fast_calls.is_empty());
+    let late_no_vec: Option<blaze_lir::Func<Alloc<'a>>>;
+    let emit_v: Verified<'_> = if need_misel_retry
+        && !misel_subset_ok(full_v.view(), names, opts, initial_fast_calls.as_slice())
+    {
+        // Late auto-vectorization / GEMM / SIMD passes introduced an op outside `misel`'s
+        // subset while `InternalFast` ABI is active: re-run late scalar passes with
+        // `auto_vectorize = false` so BCE, unswitch, if-conv, and superopt still apply,
+        // falling back to `opt_v` or original `func` if needed — never to C-ABI `isel`.
+        late_no_vec = Some(run_sota_loop_and_late_passes(
+            opt_v.view(),
+            machine,
+            RegBudget::AARCH64,
+            false,
+            superopt,
+            alloc,
+        ));
+        if let Some(nv) = late_no_vec.as_ref().and_then(|f| verify_in(f.view(), alloc).ok())
+            && {
+                let nv_fast = collect_misel_fast_calls(nv.view(), opts.internal_fast_callees, alloc);
+                misel_subset_ok(nv.view(), names, opts, nv_fast.as_slice())
+            }
+        {
+            nv
+        } else {
+            let opt_fast = collect_misel_fast_calls(opt_v.view(), opts.internal_fast_callees, alloc);
+            if misel_subset_ok(opt_v.view(), names, opts, opt_fast.as_slice()) {
+                opt_v
+            } else {
+                func
+            }
+        }
+    } else {
+        full_v
+    };
+
+    let full_view = emit_v.view();
+    let effective_preserve_all_cold =
+        opts.preserve_all_cold && !opts.internal_fast && is_safe_for_cold_preserve_all(full_view);
+    let ra_order = opts.scratch_order.map(ScratchOrder::to_regalloc);
+    let lookup_clobbers = |inst: usize| -> Option<CallClobbers> {
+        lookup_direct_callee_clobbers(full_view, inst, opts.callee_clobbers)
+    };
+    // Primary V3 AArch64 pure-SSA `MFunc` pipeline (`fast_mode` skips Ext-TSP, `mopt`,
+    // `msched`, and multi-pass coalescing; SOTA runs the full backend optimization stack).
+    let mut misel_call_clobs: blaze_own::Vec<(u32, CallClobbers), Alloc<'a>> =
+        blaze_own::Vec::new_in(alloc);
+    if !opts.callee_clobbers.is_empty() {
+        for inst in 0..full_view.len() {
+            if let Some(clob) = lookup_clobbers(inst)
+                && let Ok(inst_u32) = u32::try_from(inst)
+            {
+                misel_call_clobs.push((inst_u32, clob));
+            }
+        }
+    }
+    let misel_fast_calls = collect_misel_fast_calls(full_view, opts.internal_fast_callees, alloc);
+    let must_use_misel = opts.internal_fast || !misel_fast_calls.is_empty();
+    let misel_result = misel::emit_mfunc_ssa_a64(
+        emit_v,
+        names,
+        misel::MIseOpts {
+            machine,
+            call_mode: CallMode::GotSlot,
+            scratch_gpr_order: opts.scratch_order.map(|o| o.gpr),
+            preserve_all_cold: effective_preserve_all_cold,
+            call_clobbers: misel_call_clobs.as_slice(),
+            internal_fast: opts.internal_fast,
+            internal_fast_calls: misel_fast_calls.as_slice(),
+            fast_mode,
+        },
+        alloc,
+    )
+    .map(|(emitted, clobbers, _stats)| (emitted, clobbers));
+    let emit_result = match misel_result {
+        Ok(pair) => Ok(pair),
+        Err(err) if must_use_misel => return Err(map_internal_fast_tier_err(err)),
+        Err(_) => isel::emit_sota_a64_with_abi_profile(
+            full_view,
+            names,
+            CallMode::GotSlot,
+            machine.features,
+            is_macos,
+            |inst| lookup_clobbers(inst).unwrap_or(CallClobbers::C_ABI_ARM64),
+            ra_order.as_ref(),
+            effective_preserve_all_cold,
+            fast_mode,
+            alloc,
+        ),
+    };
+    if let Ok((emitted, mut clobbers)) = emit_result {
+        if let Some((rec, insts)) = emitted_to_code_record(emitted, traps, alloc) {
+            // Soundly union callee clobbers for tail-called `Op::Call`/`Op::CallIndirect` sites
+            // (which `regalloc` excludes from `call_positions` since they do not clobber locals).
+            // `effective_preserve_all_cold` disables TCO and saves/restores modified scratch regs.
+            if !effective_preserve_all_cold {
+                for inst in 0..full_view.len() {
+                    match full_view.op(inst) {
+                        Op::Call | Op::Invoke | Op::TailCall => {
+                            let callee_clob = lookup_clobbers(inst).unwrap_or(CallClobbers::C_ABI_ARM64);
+                            clobbers.clobbered = clobbers.clobbered.union(callee_clob.clobbered);
                         }
+                        Op::CallIndirect | Op::InvokeIndirect | Op::TailCallIndirect => {
+                            clobbers.clobbered = clobbers.clobbered.union(CallClobbers::C_ABI_ARM64.clobbered);
+                        }
+                        _ => {}
                     }
                 }
-                return Ok((rec, insts, Called::NONE, clobbers));
             }
-            if must_use_misel {
-                return Err(RecordEmitError::Emit(crate::EmitError::Record {
-                    why: "misel InternalFast emitted record conversion failed",
-                }));
-            }
-        } else if must_use_misel {
+            return Ok(Some((rec, insts, clobbers)));
+        }
+        if must_use_misel {
             return Err(RecordEmitError::Emit(crate::EmitError::Record {
-                why: "misel InternalFast emission refused",
+                why: "misel InternalFast emitted record conversion failed",
             }));
         }
-        // `emit_record_sourced` indexes `form.unreachables` by `TrapSource::ordinal`; if `opt_v`
-        // changed the `Op::Unreachable` count while traps are present, delegate `func` so ordinals
-        // stay intact on the baseline path.
-        let fallback_v = if fast_mode
-            || traps.is_empty()
-            || opt_v.view().ops.iter().filter(|&&op| Op::from_byte(op) == Some(Op::Unreachable)).count()
-                == func.view().ops.iter().filter(|&&op| Op::from_byte(op) == Some(Op::Unreachable)).count()
+    } else if must_use_misel {
+        return Err(RecordEmitError::Emit(crate::EmitError::Record {
+            why: "misel InternalFast emission refused",
+        }));
+    }
+    Ok(None)
+}
+
+/// - Under [`EmitProfile::Sota`] (`opts.is_hot` below the mega-function bound): runs the full
+///   SOTA LIR mid-end + full `misel` / `isel` backend (`mopt`, `msched`, coalescing `mra`).
+///
+/// Both profiles preserve 100% identical runtime semantics, AAPCS64 / `InternalFast` /
+/// `ColdPreserveAll` ABI, IPRA `CallClobbers`, unwind frames, import sites, and trap rows.
+pub fn emit_sota_record_for_machine_with_abi<'a>(
+    func: Verified<'_>,
+    names: &dyn Names,
+    routines: &RoutinePlaces,
+    opts: SotaRecordAbiOpts<'_>,
+    traps: &[TrapSource],
+    alloc: Alloc<'a>,
+) -> Result<(CodeRecord<'a>, u32, Called, CallClobbers), RecordEmitError> {
+    let machine = opts.machine;
+    let isa = Isa {
+        lse: (machine.features & Machine::LSE) != 0,
+        os: match machine.os {
+            blaze_tier::Os::MacOs => crate::Os::MacOs,
+            blaze_tier::Os::Linux => crate::Os::Linux,
+        },
+    };
+    let has_fast_abi_req = opts.internal_fast
+        || !collect_misel_fast_calls(func.view(), opts.internal_fast_callees, alloc).is_empty();
+
+    // 1. If `func` contains non-native vector widths (e.g. `<64 x i8>`, `<32 x i8>`, `<8 x i8>`
+    //    from `core::str::pattern::simd_contains` / `core::simd`) or `f16`/`f128`, legalize it
+    //    BEFORE SOTA mid-end so SROA + GVN + `misel` optimize the scalarized IR cleanly instead
+    //    of rejecting the whole function down to stack-spilling `Reference` codegen.
+    let mut already_legalized = false;
+    if !has_fast_abi_req && needs_pre_sota_legalize(&func.view()) {
+        already_legalized = true;
+        let (legal_owned, legal_called) =
+            crate::routines::legalized(func.view(), routines, alloc).map_err(RecordEmitError::Legalize)?;
+        if let Some(owned) = legal_owned
+            && let Ok(legal_v) = verify_in(owned.view(), alloc)
+            && let Some((rec, insts, clobbers)) =
+                try_emit_sota_a64_core(legal_v, names, opts, traps, alloc)?
         {
-            opt_v
-        } else {
-            func
-        };
-        let (rec, insts, called) =
-            emit_record_sourced(fallback_v, names, routines, isa, BULK_INLINE_MOST, traps, alloc)?;
-        return Ok((rec, insts, called, CallClobbers::C_ABI_ARM64));
+            return Ok((rec, insts, legal_called, clobbers));
+        }
+    } else if let Some((rec, insts, clobbers)) =
+        try_emit_sota_a64_core(func, names, opts, traps, alloc)?
+    {
+        return Ok((rec, insts, Called::NONE, clobbers));
+    }
+
+    // 2. If a 128-bit vector function used an op outside `misel`/`isel`'s native NEON subset,
+    //    legalize it to scalar LIR on demand and retry SOTA + `misel` before falling back to
+    //    stack-spilling `Reference`.
+    if !already_legalized
+        && !has_fast_abi_req
+        && matches!(blaze_lir::legalize::needed(&func.view()), Ok(true))
+    {
+        let (legal_owned, legal_called) =
+            crate::routines::legalized(func.view(), routines, alloc).map_err(RecordEmitError::Legalize)?;
+        if let Some(owned) = legal_owned
+            && let Ok(legal_v) = verify_in(owned.view(), alloc)
+            && let Some((rec, insts, clobbers)) =
+                try_emit_sota_a64_core(legal_v, names, opts, traps, alloc)?
+        {
+            return Ok((rec, insts, legal_called, clobbers));
+        }
     }
 
     let (rec, insts, called) = emit_record_sourced(func, names, routines, isa, BULK_INLINE_MOST, traps, alloc)?;
