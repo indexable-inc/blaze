@@ -7013,8 +7013,22 @@ impl<'n> Store<'n> {
             }
             let r = v.site(v.row_range(list.start + k as u32)?)?;
             sink.set_part(SigPart::Input(inputs.len() as u32));
-            if says_misses && prm.self_kind == lf::SelfKind::No && prm.pat.is_none() {
-                return Err(Why::Unsupported("a parameter of a function with a body has no pattern", r));
+            if says_misses {
+                if prm.self_kind == lf::SelfKind::No && prm.pat.is_none() {
+                    return Err(Why::Unsupported("a parameter of a function with a body has no pattern", r));
+                }
+            } else if let Some(pat_id) = prm.pat {
+                // E0642: functions without bodies (trait method declarations, extern fns) only
+                // allow simple identifiers (`x`), wildcards (`_`), or (in Rust 2015 traits)
+                // omitted patterns — never `ref`, `mut`, tuple/struct destructuring, or `@`.
+                let allowed = matches!(
+                    v.pat(pat_id)?,
+                    lf::Pat::Wild
+                        | lf::Pat::Bind { ann: lf::BindAnn { by_ref: None, mutable: false }, sub: None, .. }
+                );
+                if !allowed {
+                    return Err(Why::Unsupported("patterns aren't allowed in functions without bodies", r));
+                }
             }
             let ty = match (prm.self_kind, self_ty) {
                 (lf::SelfKind::No | lf::SelfKind::Typed, _) => ty_or_miss(&b, &mut self.tys, &env, v, prm.ty.ok_or(Why::Unsupported("a parameter with no type", r))?, text, &mut misses, &mut sink)?,

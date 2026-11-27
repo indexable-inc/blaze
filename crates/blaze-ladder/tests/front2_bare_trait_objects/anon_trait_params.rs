@@ -72,6 +72,11 @@ trait HashWord {
     fn read_ref(&self, ref x: u8) -> u8 {
         *x
     }
+
+    fn bump_mut(&self, mut x: u8) -> u8 {
+        x = x + 0;
+        x
+    }
 }
 
 impl HashWord for u8 {
@@ -185,6 +190,7 @@ pub extern \"C\" fn main() -> i32 {
     h.hash_twice(3); // h = 1 + 2 + 3 + 3 = 9
     let t = h.sum_tuple((4, 5)); // 9
     let r = h.read_ref(2); // 2
+    let m = h.bump_mut(0); // 0
 
     let acc = Acc(1);
     let ro: [u8; 2] = [2, 0];
@@ -219,8 +225,8 @@ pub extern \"C\" fn main() -> i32 {
 
     let d = call_dyn(&acc, 4); // 5
 
-    // 9 + 9 + 2 + 23 + 6 + 1 + 6 + 11 + 6 + 5 = 78
-    (h + t + r + c + ts + ip + e1 + e2 + e3 + d) as i32
+    // 9 + 9 + 2 + 0 + 23 + 6 + 1 + 6 + 11 + 6 + 5 = 78
+    (h + t + r + m + c + ts + ip + e1 + e2 + e3 + d) as i32
 }
 ";
 
@@ -450,5 +456,69 @@ fn rust_2015_rejects_anonymous_params_in_free_fn_impl_and_bodied_trait_method() 
                 "Rust 2015 {label}: anonymous parameter must be rejected",
             );
         });
+    }
+}
+
+const BODILESS_REF_PAT: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+#[lang = \"sized\"]
+trait Sized {}
+trait T { fn f(&self, ref x: u8); }
+struct S;
+impl T for S { fn f(&self, _: u8) {} }
+fn main() { S.f(1); }
+";
+
+const BODILESS_TUPLE_PAT: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+#[lang = \"sized\"]
+trait Sized {}
+trait T { fn f(&self, (a, b): (u8, u8)); }
+struct S;
+impl T for S { fn f(&self, _: (u8, u8)) {} }
+fn main() { S.f((1, 2)); }
+";
+
+const BODILESS_MUT_PAT: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+#[lang = \"sized\"]
+trait Sized {}
+trait T { fn f(&self, mut x: u8); }
+struct S;
+impl T for S { fn f(&self, _: u8) {} }
+fn main() { S.f(1); }
+";
+
+const BODILESS_MUT_SELF: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+#[lang = \"sized\"]
+trait Sized {}
+trait T { fn f(mut self); }
+struct S;
+impl T for S { fn f(self) {} }
+fn main() { S.f(); }
+";
+
+/// Negative control (E0642): bodiless trait methods reject nontrivial patterns (`ref x`,
+/// `(a, b)`, `mut x`, `mut self`) in both Rust 2015 and Rust 2021, while bodied trait methods
+/// (`sum_tuple`, `read_ref`, `bump_mut` in `RUST_2015_PROGRAM`) accept them.
+#[test]
+fn bodiless_trait_methods_reject_patterns_e0642() {
+    let alloc = blaze_own::testing::heap().alloc();
+    for edition in ["2015", "2021"] {
+        for (label, text) in [
+            ("ref pat", BODILESS_REF_PAT),
+            ("tuple pat", BODILESS_TUPLE_PAT),
+            ("mut pat", BODILESS_MUT_PAT),
+            ("mut self", BODILESS_MUT_SELF),
+        ] {
+            with_crate(edition, text, false, |names, files| {
+                let wf = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+                assert!(
+                    Front2Program::new(names, &wf, files, alloc).is_err(),
+                    "edition {edition} bodiless trait method ({label}): pattern must be rejected (E0642)",
+                );
+            });
+        }
     }
 }

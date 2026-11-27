@@ -662,6 +662,13 @@ fn trait_item_reparser_handles_rust_2015_anonymous_and_pattern_params() {
         assert_eq!(errs, 0, "2015 trait_item `{src}` unexpected {errs} errors");
     }
 
+    // Large tuple pattern (>4096 tokens before `:`) must still be recognized as a pattern param.
+    let pat_elems = "a, ".repeat(2100);
+    let ty_elems = "u8, ".repeat(2100);
+    let large_pat = format!("fn big(&self, ({pat_elems}z): ({ty_elems}u8)) {{}}");
+    let large_errs = error_count(Reparser::trait_item(), Edition::Edition2015, &large_pat);
+    assert_eq!(large_errs, 0, "2015 trait_item >4096-token pattern param unexpected {large_errs} errors");
+
     // Negative controls: 2018+ trait_item MUST reject anonymous parameters.
     for edition in [Edition::Edition2018, Edition::Edition2021, Edition::Edition2024] {
         let errs = error_count(Reparser::trait_item(), edition, "fn hash_word(&mut self, Self);");

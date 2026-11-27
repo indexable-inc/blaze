@@ -223,20 +223,21 @@ impl<'t, S: Sink> Parser<'t, S> {
         self.inp.kind(self.pos + n)
     }
 
-    /// Bounded lookahead for a Rust 2015 trait method parameter (`Flavor::TraitFn2015`): whether
-    /// the current parameter is a `PAT: TYPE` (such as `ref x: T`, `(a, b): (T, U)`, `[a, b]:
+    /// Lookahead for a Rust 2015 trait method parameter (`Flavor::TraitFn2015`): whether the
+    /// current parameter is a `PAT: TYPE` (such as `ref x: T`, `(a, b): (T, U)`, `[a, b]:
     /// [T; 2]`, or `S { a }: S`) rather than an anonymous bare `TYPE`.
     ///
+    /// Scans at most to the current parameter's delimiter (`,` or `)` at depth 0, or `EOF`),
+    /// so total work across a `PARAM_LIST` is linear in its token count with no fixed cutoff.
     /// A bare type in a parameter list never has a single `:` (not `::`) at delimiter depth 0
     /// before `,` or `)`. Angle depth is tracked only outside `()`, `[]`, `{}` so `<` in an
     /// array length expression cannot mask a following `:`; `->` and `=>` are skipped together
     /// so their `>` does not close an angle pair.
     pub(crate) fn trait2015_param_is_pattern(&self) -> bool {
-        const MAX_LOOKAHEAD: usize = 4096;
         if self.inp.kind(self.pos) == T![ref] {
             return true;
         }
-        let limit = self.inp.len().min(self.pos.saturating_add(MAX_LOOKAHEAD));
+        let limit = self.inp.len();
         let mut pos = self.pos;
         let (mut paren, mut brack, mut brace, mut angle) = (0u32, 0u32, 0u32, 0u32);
         while pos < limit {
