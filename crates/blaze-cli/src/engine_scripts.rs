@@ -1463,13 +1463,19 @@ impl<'f> ScriptsStage<'f> {
                 Err(why) => return Err(EngineCheckError::NamesWorld(why).into()),
             };
             let module = made.script_module(name.subject).ok_or(EngineCheckError::MissingEntry { task: name, table: Table::WorldScriptModules, key: name })?;
-            let deps = if module.ran_as == crate::scripts::RanAs::Wasm
-                && crate::wasm64_compile::unit_has_dep_build_scripts(made.graph(), made.wasm_graph(), module.script_unit, false)
-            {
-                match handles.probes.dep_probe_identity_hex(cx) {
-                    Ok(probes_hex) => Some(crate::wasm64_compile::fold_dep_probes_opt(module.deps.as_deref(), probes_hex.as_str(), queue.jobs)),
+            let deps = if module.ran_as == crate::scripts::RanAs::Wasm {
+                match crate::wasm64_compile::unit_has_dep_build_scripts(made.graph(), made.wasm_graph(), module.script_unit, false) {
+                    Ok(true) => match handles.probes.dep_probe_identity_hex(cx) {
+                        Ok(probes_hex) => Some(crate::wasm64_compile::fold_dep_probes_opt(module.deps.as_deref(), probes_hex.as_str(), queue.jobs)),
+                        Err(error) => {
+                            let failed = TaskFailure { name, why: Why::Refused { what: "the build-script dependency probe pins could not be opened", rule: crate::script_modules::RULE } };
+                            let words = bstd::mem::format_in!(frame, "the build script of {} {}: {error}", module.package, module.version);
+                            return Ok(Dispatch::Answered(Completed::answer(drive, Did::Hole(failed, work::held_str(words.as_str(), frame)))?));
+                        }
+                    },
+                    Ok(false) => module.deps.as_deref().map(|s| &*queue.jobs.alloc_str(s)),
                     Err(error) => {
-                        let failed = TaskFailure { name, why: Why::Refused { what: "the build-script dependency probe pins could not be opened", rule: crate::script_modules::RULE } };
+                        let failed = TaskFailure { name, why: Why::Refused { what: "the build-script wasm64 dependency graph lookup failed", rule: crate::script_modules::RULE } };
                         let words = bstd::mem::format_in!(frame, "the build script of {} {}: {error}", module.package, module.version);
                         return Ok(Dispatch::Answered(Completed::answer(drive, Did::Hole(failed, work::held_str(words.as_str(), frame)))?));
                     }

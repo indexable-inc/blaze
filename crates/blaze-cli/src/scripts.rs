@@ -602,11 +602,15 @@ impl<'f> Scripts<'f> {
                 },
             },
         };
+        let spawn_snapshot = match probes.spawn_setting_snapshot(cx) {
+            Ok(spawn) => spawn,
+            Err(error) => return Err(SetupError::Setting(said(frame, format_args!("{error}")))),
+        };
         let setup = {
             let _cx = cx.span("scripts: each side's probe answers (library features listed) and the native runner");
             let mut features = CommandFeatures { cx, store: records, held: bstd::mem::Bytes::new_in(cx.frame(), "a library-features record") };
             blaze_world::script_setting::ScriptSetup::open_recorded(
-                blaze_world::script_setting::ScriptSetupOpts { world, target: host, macro_target: MACRO_TARGET, native: native_opts, alloc: alloc.clone() },
+                blaze_world::script_setting::ScriptSetupOpts { world, target: host, macro_target: MACRO_TARGET, native: native_opts, spawn: Some(spawn_snapshot), alloc: alloc.clone() },
                 tool.0,
                 &mut features,
             )
@@ -663,19 +667,31 @@ impl core::fmt::Display for ProbeSetupError {
     }
 }
 
+/// Fault-injection plant for [`SharedCommandProbes`] DST negative controls (`AGENTS.md` `dst-not-review`).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProbeOncePlant {
+    /// Production behavior: coalesce concurrent initializers through `bstd::sync::Once`.
+    None,
+    /// Planted bug: bypass `bstd::sync::Once` so racing callers initialize independently.
+    SkipOnce,
+}
+
 /// Command-level lazy holder for `CProbeSetting` and derived-fact `SpawnSetting`, shared across
 /// normal workspace `Script` tasks (`Scripts::open_shared`) and wasm64 dependency build scripts
 /// (`wasm64_compile`, `macros::list`, `proc_runner::make`), so:
-/// - Zero home/clang-shelf/userland I/O runs until actually needed (cache miss or unit with
-///   dependency build scripts).
-/// - `open_command_c_probes` (`HermeticClangProbe`'s `verify_flight` and `VerifiedExec`) is
-///   opened at most once per command and reused between wave-0 self-compiles and wave-1 `Script`
-///   runs (Rule 30).
+/// - Zero home/clang-shelf/userland I/O runs until actually needed (workspace `Script` run, or a
+///   unit whose wasm64 closure runs dependency build scripts).
+/// - `open_command_c_probes` (`HermeticClangProbe`'s `verify_flight` and `VerifiedExec`) and
+///   `fact_pins::command_spawn_setting` are each opened at most once per command and reused
+///   between wave-0 self-compiles/keying and wave-1 `Script` runs (Rule 30).
 /// - `fact_pins::command_spawn_setting` errors are preserved and propagated verbatim (Rule 3).
 pub(crate) struct SharedCommandProbes<'f> {
     env: &'f FetchEnv<'f>,
     c_probes: bstd::sync::Once<Option<blaze_proc_macro::probe_clang::CProbeSetting>>,
     spawn_setting: bstd::sync::Once<Result<SpawnSetting, blaze_own::String<blaze_own::SharedAlloc<'static>>>>,
+    #[cfg(test)]
+    plant: ProbeOncePlant,
 }
 
 impl<'f> SharedCommandProbes<'f> {
@@ -685,24 +701,48 @@ impl<'f> SharedCommandProbes<'f> {
             env,
             c_probes: bstd::sync::Once::new("command.c_probes"),
             spawn_setting: bstd::sync::Once::new("command.spawn_setting"),
+            #[cfg(test)]
+            plant: ProbeOncePlant::None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_plant(env: &'f FetchEnv<'f>, plant: ProbeOncePlant) -> Self {
+        Self {
+            env,
+            c_probes: bstd::sync::Once::new("command.c_probes"),
+            spawn_setting: bstd::sync::Once::new("command.spawn_setting"),
+            plant,
         }
     }
 
     /// Lazily opens and shares the single command-level `CProbeSetting` (`Ok(None)` when `HOME`
-    /// is unset). Never called on `MacroModule` cache hits.
+    /// is unset). Never called for units without dependency build scripts or on `MacroModule` hits
+    /// for units without dependency build scripts.
     pub(crate) fn c_probes(
         &self,
         cx: &Cx,
     ) -> Result<Option<blaze_proc_macro::probe_clang::CProbeSetting>, ProbeSetupError> {
+        self.c_probes_with(cx, |cx| {
+            self.env.home.map(|home| {
+                open_c_probes(cx, self.env, home, crate::graph::TRIPLE, self.env.heap.alloc())
+            })
+        })
+    }
+
+    fn c_probes_with(
+        &self,
+        cx: &Cx,
+        open: impl FnOnce(&Cx) -> Option<blaze_proc_macro::probe_clang::CProbeSetting>,
+    ) -> Result<Option<blaze_proc_macro::probe_clang::CProbeSetting>, ProbeSetupError> {
+        #[cfg(test)]
+        if matches!(self.plant, ProbeOncePlant::SkipOnce) {
+            return Ok(open(cx));
+        }
         let shared = self.env.heap.shared();
         let slot = self
             .c_probes
-            .get_or_make(cx, |cx| {
-                let opened = self.env.home.map(|home| {
-                    open_c_probes(cx, self.env, home, crate::graph::TRIPLE, self.env.heap.alloc())
-                });
-                Ok::<_, core::convert::Infallible>(opened)
-            })
+            .get_or_make(cx, |cx| Ok::<_, core::convert::Infallible>(open(cx)))
             .map_err(|error| {
                 let mut msg = blaze_own::String::new_in(shared);
                 let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("opening command C probes: {error}"));
@@ -718,19 +758,7 @@ impl<'f> SharedCommandProbes<'f> {
         let slot = self
             .spawn_setting
             .get_or_make(cx, |_cx| {
-                let res = blaze_proc_macro::fact_pins::command_spawn_setting(
-                    crate::graph::TRIPLE,
-                    self.env.heap.alloc(),
-                )
-                .map_err(|error| {
-                    let mut msg = blaze_own::String::new_in(shared);
-                    let _ = core::fmt::Write::write_fmt(
-                        &mut msg,
-                        format_args!("the command's spawn setting (the derived facts' pins): {error}"),
-                    );
-                    msg
-                });
-                Ok::<_, core::convert::Infallible>(res)
+                Ok::<_, core::convert::Infallible>(open_spawn_setting(self.env, shared))
             })
             .map_err(|error| {
                 let mut msg = blaze_own::String::new_in(shared);
@@ -743,33 +771,61 @@ impl<'f> SharedCommandProbes<'f> {
         }
     }
 
+    /// Returns an owned hermetic snapshot of the single command-level `SpawnSetting` (`Once`
+    /// cached and shared between workspace `Script` execution and wasm64 dep-script execution /
+    /// keying).
+    pub(crate) fn spawn_setting_snapshot(&self, cx: &Cx) -> Result<SpawnSetting, ProbeSetupError> {
+        let shared = self.env.heap.shared();
+        self.spawn_setting_snapshot_with(cx, |_cx| open_spawn_setting(self.env, shared))
+    }
+
+    fn spawn_setting_snapshot_with(
+        &self,
+        cx: &Cx,
+        open: impl FnOnce(&Cx) -> Result<SpawnSetting, blaze_own::String<blaze_own::SharedAlloc<'static>>>,
+    ) -> Result<SpawnSetting, ProbeSetupError> {
+        #[cfg(test)]
+        if matches!(self.plant, ProbeOncePlant::SkipOnce) {
+            return match open(cx) {
+                Ok(setting) => Ok(crate::wasm64_compile::dep_script_spawn_setting(Some(&setting))),
+                Err(why) => Err(ProbeSetupError(why)),
+            };
+        }
+        let shared = self.env.heap.shared();
+        let slot = self
+            .spawn_setting
+            .get_or_make(cx, |cx| Ok::<_, core::convert::Infallible>(open(cx)))
+            .map_err(|error| {
+                let mut msg = blaze_own::String::new_in(shared);
+                let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("opening command spawn pins: {error}"));
+                ProbeSetupError(msg)
+            })?;
+        match slot {
+            Ok(setting) => Ok(crate::wasm64_compile::dep_script_spawn_setting(Some(setting))),
+            Err(why) => Err(ProbeSetupError(blaze_own::String::from_str_in(why.as_str(), shared))),
+        }
+    }
+
     /// Computes the deterministic 64-hex digest of all probe/pin inputs observable by a dependency
-    /// build script (`host`, derived-fact `pins`, pinned `clang_sha256`, Apple `sdk_id`, and
-    /// `default_answerer_strategy_id`) without opening `CProbeSetting` or home filesystem
-    /// capabilities.
+    /// build script — including the shared `SpawnSetting` derived-fact pins AND the live C-probe
+    /// answerer's identity (`ready.answerer.id(alloc)` on Linux, which folds the live host ELF
+    /// runtime closure of `clang-23`) — reusing the single coalesced command-level `CProbeSetting`.
     pub(crate) fn dep_probe_identity_hex(
         &self,
         cx: &Cx,
     ) -> Result<crate::wasm64_compile::Hex64, ProbeSetupError> {
         let spawn = self.spawn_setting(cx)?;
+        let c_probes = self.c_probes(cx)?;
         let mut sdk_buf = [0u8; blaze_apple_sdk::SdkId::KEY_LEN * 2];
-        let (clang_sha256, sdk_id) = if self.env.home.is_some() {
-            (
-                blaze_proc_macro::probe_clang::active_clang_pin(crate::graph::TRIPLE),
-                encode_sdk_hex(self.env, &mut sdk_buf).map(|(_, id)| id),
-            )
-        } else {
-            (None, None)
-        };
-        let answerer_id = blaze_proc_macro::probe_clang::default_answerer_strategy_id();
-        Ok(crate::wasm64_compile::DepProbeIdentity {
-            host: crate::graph::TRIPLE,
-            pins: spawn.pins.as_ref(),
-            clang_sha256,
+        let sdk_id = encode_sdk_hex(self.env, &mut sdk_buf).map(|(_, id)| id);
+        crate::wasm64_compile::dep_probe_identity_from_setting(
+            crate::graph::TRIPLE,
+            spawn,
+            c_probes.as_ref(),
             sdk_id,
-            answerer_id,
-        }
-        .hex())
+            self.env.heap.alloc(),
+            self.env.heap.shared(),
+        )
     }
 
     #[cfg(test)]
@@ -781,6 +837,20 @@ impl<'f> SharedCommandProbes<'f> {
     pub(crate) fn spawn_setting_initialized(&self) -> bool {
         self.spawn_setting.get().is_some()
     }
+}
+
+fn open_spawn_setting(
+    env: &FetchEnv<'_>,
+    shared: blaze_own::SharedAlloc<'static>,
+) -> Result<SpawnSetting, blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+    blaze_proc_macro::fact_pins::command_spawn_setting(crate::graph::TRIPLE, env.heap.alloc()).map_err(|error| {
+        let mut msg = blaze_own::String::new_in(shared);
+        let _ = core::fmt::Write::write_fmt(
+            &mut msg,
+            format_args!("the command's spawn setting (the derived facts' pins): {error}"),
+        );
+        msg
+    })
 }
 
 /// Encodes any resolved Apple SDK identity from `env.sdk` into `(folder, 64-hex-id)` on `buf`.
@@ -1168,13 +1238,13 @@ pub(crate) fn job<'f: 'j, 'j>(
         Ok(opt) => opt.map(|hex| crate::work::held_str(&hex, jobs)),
         Err(error) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{error}")), hole: true }),
     };
-    let deps_digest = if crate::wasm64_compile::unit_has_dep_build_scripts(graph, scripts.wasm_graph, script, false) {
-        match probes.dep_probe_identity_hex(&cx) {
+    let deps_digest = match crate::wasm64_compile::unit_has_dep_build_scripts(graph, scripts.wasm_graph, script, false) {
+        Ok(true) => match probes.dep_probe_identity_hex(&cx) {
             Ok(probes_hex) => Some(crate::wasm64_compile::fold_dep_probes_opt(deps_digest, probes_hex.as_str(), jobs)),
             Err(error) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{error}")), hole: true }),
-        }
-    } else {
-        deps_digest
+        },
+        Ok(false) => deps_digest,
+        Err(error) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{error}")), hole: true }),
     };
     Ok(Prepared::Ready(ScriptJob { name: task.name, shared, script, side, cfg, files, producers: producers.into_bump_slice(), checkout: CheckoutReads::Hole, deps_digest }))
 }
@@ -1568,4 +1638,202 @@ pub(crate) fn outputs_record(name: Name, reads: &[(Name, ContentId)], ran_as: Ra
         return failed("a build script's record refused its outputs", format_args!("the build script of {package}: {error}"), false);
     }
     Ran::Made(made)
+}
+
+#[cfg(test)]
+mod shared_command_probes_dst {
+    use core::convert::Infallible;
+    use core::num::NonZeroU32;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::time::Duration;
+
+    use blaze_own::SharedAlloc;
+    use blaze_proc_macro::probe_clang::CProbeSetting;
+    use blaze_proc_macro::spawn_route::{FactPins, SpawnSetting};
+    use bstd::io::{Io, Limits, SimWorld};
+    use bstd::task::Class;
+
+    use super::{FetchEnv, ProbeOncePlant, SharedCommandProbes};
+
+    fn sim_env<'a>(io: &Io) -> FetchEnv<'a> {
+        FetchEnv {
+            clock: io.need_clock().expect("sim clock"),
+            checkout: "",
+            served: crate::engine_script_reads::Served::Simulated,
+            cert_file: None,
+            cert_dir: None,
+            rustflags: blaze_manifest::rustflags::RustflagsEnv::default(),
+            home: Some("/h"),
+            cargo_home: None,
+            start: None,
+            toolchain: blaze_toolchain::PINNED,
+            fs: io.need_fs().expect("sim fs"),
+            sdk: crate::sdk::NONE_IN_TESTS,
+            exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
+            lan_peer: crate::fetch::LanPeerConfig::DISABLED,
+            heap: blaze_own::testing::heap(),
+        }
+    }
+
+    /// Runs a deterministic multi-worker concurrent initialization scenario for
+    /// [`SharedCommandProbes`] under `SimWorld(seed)` and checks the single-init / identical-value
+    /// oracle. Returns `Err(reason)` if the oracle observes any violation.
+    fn run_dst_scenario(
+        seed: u64,
+        plant: ProbeOncePlant,
+        inject_spawn_error: Option<&'static str>,
+    ) -> Result<(), std::string::String> {
+        const WORKERS: usize = 6;
+        let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, 8 << 20).expect("root sim cx");
+        let clock = io.need_clock().expect("sim clock");
+        let env = sim_env(&io);
+        let probes = SharedCommandProbes::new_with_plant(&env, plant);
+        let probes_ref = &probes;
+
+        let c_inits = AtomicU32::new(0);
+        let s_inits = AtomicU32::new(0);
+        let c_inits_ref = &c_inits;
+        let s_inits_ref = &s_inits;
+        let clock_ref = &clock;
+
+        let scope = cx.scope();
+        scope.narrow_workers(NonZeroU32::new(WORKERS as u32).expect("nonzero"), Class::Foreground);
+        let mut handles = blaze_own::Vec::with_capacity_in(WORKERS, cx.frame());
+        for worker_idx in 0..WORKERS {
+            handles.push(scope.may_overlap("shared_probes_dst_worker", 64 << 10, move |wcx: &bstd::cx::Cx| {
+                // Stagger start slightly by seed & worker so interleavings cover both early and
+                // in-flight contenders.
+                let stagger_ms = ((seed.wrapping_mul(31).wrapping_add(worker_idx as u64)) % 3) + 1;
+                let _ = clock_ref.sleep(wcx, Duration::from_millis(stagger_ms));
+
+                let c_res = probes_ref.c_probes_with(wcx, |icx| {
+                    let n = c_inits_ref.fetch_add(1, Ordering::SeqCst) + 1;
+                    // Yield mid-init so contending workers park on `Once` (or race under SkipOnce).
+                    let _ = clock_ref.sleep(icx, Duration::from_millis(4));
+                    let tag = std::format!("c-probe-init-{n}-seed-{seed}");
+                    Some(CProbeSetting::Unavailable(blaze_own::Arc::from_str_in(
+                        tag.as_str(),
+                        SharedAlloc::global(),
+                    )))
+                });
+
+                let s_res = probes_ref.spawn_setting_snapshot_with(wcx, |icx| {
+                    let n = s_inits_ref.fetch_add(1, Ordering::SeqCst) + 1;
+                    let _ = clock_ref.sleep(icx, Duration::from_millis(4));
+                    match inject_spawn_error {
+                        Some(msg) => {
+                            let full = std::format!("{msg} (attempt #{n})");
+                            Err(blaze_own::String::from_str_in(full.as_str(), SharedAlloc::global()))
+                        }
+                        None => Ok(SpawnSetting::facts_only(FactPins {
+                            clang_version_text: std::format!("clang version 23.0.{n}"),
+                            macos_product_version: std::string::String::from("15.4"),
+                            macos_build_version: std::string::String::from("24E248"),
+                        })),
+                    }
+                });
+
+                let c_tag = match c_res {
+                    Ok(Some(CProbeSetting::Unavailable(s))) => Ok(std::string::String::from(s.as_ref())),
+                    Ok(other) => Err(std::format!("unexpected c_probes variant: {}", other.is_some())),
+                    Err(e) => Err(std::format!("c_probes err: {e}")),
+                };
+                let s_tag = match s_res {
+                    Ok(sp) => Ok(sp.pins.map(|p| p.clang_version_text).unwrap_or_default()),
+                    Err(e) => Err(std::string::String::from(e.0.as_str())),
+                };
+                Ok::<_, Infallible>((c_tag, s_tag))
+            }));
+        }
+
+        let mut c_tags = std::vec::Vec::with_capacity(WORKERS);
+        let mut s_tags = std::vec::Vec::with_capacity(WORKERS);
+        for h in handles.into_iter() {
+            let (ct, st) = h.join(&cx).expect("join dst worker");
+            c_tags.push(ct);
+            s_tags.push(st);
+        }
+        scope.join(&cx).expect("join dst scope");
+
+        // Oracle 1: `c_probes` must initialize exactly once and every worker sees identical value.
+        let got_c_inits = c_inits.load(Ordering::SeqCst);
+        if got_c_inits != 1 {
+            return Err(std::format!("seed {seed}: c_probes initialized {got_c_inits} times (expected 1)"));
+        }
+        for (i, ct) in c_tags.iter().enumerate() {
+            if ct != &c_tags[0] {
+                return Err(std::format!("seed {seed}: worker {i} saw c_probes {ct:?}, worker 0 saw {:?}", c_tags[0]));
+            }
+            if !matches!(ct, Ok(s) if s.contains("c-probe-init-1-")) {
+                return Err(std::format!("seed {seed}: worker {i} unexpected c_probes {ct:?}"));
+            }
+        }
+
+        // Oracle 2: `spawn_setting` must initialize exactly once and publish identical Ok/Err.
+        let got_s_inits = s_inits.load(Ordering::SeqCst);
+        if got_s_inits != 1 {
+            return Err(std::format!("seed {seed}: spawn_setting initialized {got_s_inits} times (expected 1)"));
+        }
+        for (i, st) in s_tags.iter().enumerate() {
+            if st != &s_tags[0] {
+                return Err(std::format!("seed {seed}: worker {i} saw spawn {st:?}, worker 0 saw {:?}", s_tags[0]));
+            }
+            match inject_spawn_error {
+                Some(expected_err) => match st {
+                    Err(msg) if msg.contains(expected_err) => {}
+                    other => {
+                        return Err(std::format!(
+                            "seed {seed}: worker {i} expected Err containing `{expected_err}`, got {other:?}"
+                        ));
+                    }
+                },
+                None => match st {
+                    Ok(ver) if ver == "clang version 23.0.1" => {}
+                    other => {
+                        return Err(std::format!(
+                            "seed {seed}: worker {i} expected Ok(`clang version 23.0.1`), got {other:?}"
+                        ));
+                    }
+                },
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_command_probes_dst_initializes_once_and_shares_across_interleavings() {
+        for seed in 1..=16u64 {
+            if let Err(why) = run_dst_scenario(seed, ProbeOncePlant::None, None) {
+                panic!("DST oracle failed on success path: {why}");
+            }
+        }
+    }
+
+    #[test]
+    fn shared_command_probes_dst_propagates_injected_init_failure_consistently() {
+        for seed in 101..=116u64 {
+            if let Err(why) = run_dst_scenario(
+                seed,
+                ProbeOncePlant::None,
+                Some("injected SystemVersion.plist read failure"),
+            ) {
+                panic!("DST oracle failed on injected error path: {why}");
+            }
+        }
+    }
+
+    #[test]
+    fn shared_command_probes_dst_negative_control_catches_duplicate_init() {
+        let mut caught = 0usize;
+        for seed in 1..=8u64 {
+            if run_dst_scenario(seed, ProbeOncePlant::SkipOnce, None).is_err() {
+                caught += 1;
+            }
+        }
+        assert_eq!(
+            caught, 8,
+            "DST oracle must catch planted duplicate initialization on every seed"
+        );
+    }
 }

@@ -358,7 +358,7 @@ mod with_sandbox {
                 Some(wg) => identity.with_wasm_features(side.lock.lock, wg, unit.package, |dep_id| side.place.member_files(dep_id), side.heap.alloc()),
                 None => identity,
             };
-            let identity = if crate::wasm64_compile::unit_has_dep_build_scripts(graph, names.wasm_graph(), unit_id, true) {
+            let identity = if crate::wasm64_compile::unit_has_dep_build_scripts(graph, names.wasm_graph(), unit_id, true).map_err(MakeError::Probes)? {
                 let hex = side.probes.dep_probe_identity_hex(cx).map_err(MakeError::Probes)?;
                 identity.with_dep_probes(hex.as_str())
             } else {

@@ -222,16 +222,20 @@ pub(crate) fn list(
             (_, other) => other,
         };
         let identity = match (identity, u32::try_from(idx).ok(), probes) {
-            (Ok(id), Some(uid), Some(probes))
+            (Ok(id), Some(uid), Some(probes)) => {
                 if crate::wasm64_compile::unit_has_dep_build_scripts(
                     &decoded.graph,
                     wasm_graph,
                     blaze_unit_graph::UnitId(uid),
                     true,
-                ) =>
-            {
-                let hex = probes.dep_probe_identity_hex(cx).map_err(MacrosError::Probes)?;
-                Ok(id.with_dep_probes(hex.as_str()))
+                )
+                .map_err(MacrosError::Probes)?
+                {
+                    let hex = probes.dep_probe_identity_hex(cx).map_err(MacrosError::Probes)?;
+                    Ok(id.with_dep_probes(hex.as_str()))
+                } else {
+                    Ok(id)
+                }
             }
             (other, _, _) => other,
         };
