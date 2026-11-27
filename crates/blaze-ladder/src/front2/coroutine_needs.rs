@@ -79,6 +79,8 @@ fn is_lazy_need(err: &BuildError) -> bool {
         BuildError::NoAdt { .. }
             | BuildError::MissingRecord { .. }
             | BuildError::OpaqueOwnerUnchecked { .. }
+            | BuildError::ClosureOwnerUnchecked { .. }
+            | BuildError::CoroutineOwnerUnchecked { .. }
             | BuildError::Select(_)
     )
 }
@@ -274,9 +276,7 @@ fn collect_coroutines<'a>(
                     continue;
                 }
                 let Some(closure) = facts.closure(owner, ordinal) else {
-                    return Err(BuildError::UnsupportedSig {
-                        what: "a closure whose facts the world did not answer (`LayoutFacts::closure`), met while listing the coroutines a value holds",
-                    });
+                    return Err(BuildError::ClosureOwnerUnchecked { owner, ordinal });
                 };
                 let env = blaze_build::ground(closure.types, closure.env, &args, ground, alloc, facts)?;
                 todo.push((env, mode));
@@ -438,5 +438,21 @@ mod tests {
             let found = referenced_coroutines(&mut ground, &[root], &EmptyFacts, alloc).ok();
             assert_eq!(found.as_deref(), Some(&[expected][..]));
         }
+    }
+
+    #[test]
+    fn held_reports_unchecked_closure_owner_instead_of_unsupported() {
+        let Ok(frame) = MemFrame::new(blaze_mem::tag::Tag::Infer) else { unreachable!() };
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let mut ground = PortableTys::new_in(alloc);
+        let owner = ItemKey(99);
+        let empty = ground.intern_list(&[]).ok().unwrap_or_else(|| unreachable!());
+        let closure = ground.intern(PNode::Closure { owner, ordinal: 2, args: empty }).ok().unwrap_or_else(|| unreachable!());
+        let err = held_coroutines(&mut ground, &[closure], &EmptyFacts, alloc);
+        assert!(
+            matches!(err, Err(BuildError::ClosureOwnerUnchecked { owner: o, ordinal: 2 }) if o == owner),
+            "unchecked closure owner must return ClosureOwnerUnchecked so lazy makers check it and retry: {err:?}"
+        );
     }
 }

@@ -1022,6 +1022,13 @@ pub enum BuildError {
     /// that checks fns on demand checks `owner` and builds again (blaze-ladder run/make_one.rs);
     /// any other refuses with it.
     OpaqueOwnerUnchecked { opaque: ItemKey, owner: ItemKey },
+    /// A closure's facts (`LayoutFacts::closure`) need its owning fn `owner` checked, which is not
+    /// checked yet in this program (e.g. a closure discovered after normalizing a projection or
+    /// revealing an `impl Trait` hidden type). A lazy program checks `owner` and retries.
+    ClosureOwnerUnchecked { owner: ItemKey, ordinal: u32 },
+    /// A coroutine's facts (`LayoutFacts::coroutine`) need its owning fn `owner` checked, which is
+    /// not checked yet in this program. A lazy program checks `owner` and retries.
+    CoroutineOwnerUnchecked { owner: ItemKey, ordinal: u32 },
     /// A type names ADT `adt`, which [`Adts::adt`] does not describe: the seam tabled no row
     /// for it. The key is kept so the caller can name the ADT by its path.
     NoAdt { adt: ItemKey },
@@ -1186,6 +1193,16 @@ impl fmt::Display for BuildError {
                 f,
                 "the hidden type of `impl Trait` type {:#x} needs its defining fn {:#x} checked, which is not in the program (not reached, or it did not check)",
                 opaque.0, owner.0
+            ),
+            BuildError::ClosureOwnerUnchecked { owner, ordinal } => write!(
+                f,
+                "closure #{ordinal} needs its owning fn {:#x} checked (`LayoutFacts::closure`), which is not in the program (not reached, or it did not check)",
+                owner.0
+            ),
+            BuildError::CoroutineOwnerUnchecked { owner, ordinal } => write!(
+                f,
+                "coroutine #{ordinal} needs its owning fn {:#x} checked (`LayoutFacts::coroutine`), which is not in the program (not reached, or it did not check)",
+                owner.0
             ),
             BuildError::NoAdt { adt } => {
                 write!(f, "a type names ADT {:#x}, which the build's `Adts` does not describe", adt.0)

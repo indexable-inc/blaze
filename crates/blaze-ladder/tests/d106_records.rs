@@ -3275,3 +3275,88 @@ fn a_coroutine_saved_local_needs_drop_fills_unmade_drop_impls() {
     let (first, again) = walk_async(ASYNC_SAVED_DROP, &["with_saved_copy", "with_saved_nested", "with_saved_generic"]);
     println!("d106 async saved drop over names records: first {first}; again {again}");
 }
+
+/// A generic fn (`fuse_next<I>`) whose ground argument is an `impl Trait` opaque (`make_outer`)
+/// whose hidden type reveals ANOTHER `impl Trait` opaque (`make_inner`) whose hidden type holds a
+/// closure owned by `make_inner`. When `fuse_next` is built before `make_inner`, `held_owners`
+/// only sees `make_outer` syntactically; expanding `make_outer`'s opaque reveals `make_inner`'s
+/// closure inside `held_coroutines` / `Layouts::parts` / `closure_parts`. Before the fix,
+/// `facts.closure(owner, ordinal)` returned `None` and refused with hard `UnsupportedSig` instead
+/// of returning `ClosureOwnerUnchecked { owner, ordinal }` so `make_one` checks `owner` and retries.
+const CLOSURE_BEHIND_NESTED_OPAQUE: &str = "
+trait Step {
+    fn step(&mut self) -> u32;
+}
+
+struct Map<F> {
+    f: F,
+    x: u32,
+}
+
+impl<F: FnMut(u32) -> u32> Step for Map<F> {
+    fn step(&mut self) -> u32 {
+        (self.f)(self.x)
+    }
+}
+
+struct Fuse<I> {
+    inner: I,
+}
+
+impl<I: Step> Fuse<I> {
+    fn next(&mut self) -> u32 {
+        self.inner.step()
+    }
+}
+
+fn make_map<F: FnMut(u32) -> u32>(f: F, x: u32) -> Map<F> {
+    Map { f, x }
+}
+
+fn make_inner(bias: u32) -> impl Step {
+    make_map(move |x: u32| x + bias, 40)
+}
+
+struct Outer<T>(T);
+
+impl<T: Step> Step for Outer<T> {
+    fn step(&mut self) -> u32 {
+        self.0.step()
+    }
+}
+
+fn make_outer(bias: u32) -> impl Step {
+    Outer(make_inner(bias))
+}
+
+fn drive<I: Step>(mut fuse: Fuse<I>) -> u32 {
+    fuse.next()
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    let it = make_outer(2);
+    drive(Fuse { inner: it }) as i32
+}
+";
+
+#[test]
+fn a_closure_behind_nested_opaques_checks_its_owner_on_demand_over_names_records() {
+    let text = format!("{BLOCK_MOD_PRELUDE}{CLOSURE_BEHIND_NESTED_OPAQUE}");
+    let f = fixture(&text);
+    let entry = fn_named(&f, "main");
+    let b = builder();
+    let mut store = MemoryStore::new_in(alloc());
+    let (first, _) = walk_keeping(&f, &EveryItem, entry, &mut store, &b);
+    assert!(first.reached > 0 && first.made == first.reached && first.found == 0, "every instance reached is made: {first}");
+    let (again, _) = walk_keeping(&f, &EveryItem, entry, &mut store, &b);
+    assert_eq!(
+        (again.reached, again.found, again.make_calls()),
+        (first.reached, first.reached, 0),
+        "a second walk finds every instance: {again}; first moved: {:?}",
+        again.first_moved
+    );
+    let status = run_whole(&text);
+    assert_eq!(status, 42, "nested opaque closure returns 40 + 2 = 42");
+    println!("d106 closure behind nested opaques over names records: first {first}; again {again}; status {status}");
+}

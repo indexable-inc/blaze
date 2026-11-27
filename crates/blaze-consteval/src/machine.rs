@@ -2460,6 +2460,8 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                     blaze_build::BuildError::MissingRecord { item } => Stop::Refused(Refusal::Missing { what: "trait impls", item }),
                     blaze_build::BuildError::Projection { trait_, name } => Stop::Refused(Refusal::Projection { trait_, name }),
                     blaze_build::BuildError::OpaqueOwnerUnchecked { owner, .. } => Stop::Refused(Refusal::Missing { what: "opaque defining body", item: owner }),
+                    blaze_build::BuildError::ClosureOwnerUnchecked { owner, .. } => Stop::Refused(Refusal::Missing { what: "closure facts", item: owner }),
+                    blaze_build::BuildError::CoroutineOwnerUnchecked { owner, .. } => Stop::Refused(Refusal::Missing { what: "coroutine facts", item: owner }),
                     blaze_build::BuildError::Malformed { what } => Stop::Refused(Refusal::Malformed { what }),
                     _ => Stop::Refused(Refusal::Unsupported { what: "selecting a trait impl in `type_id_vtable`" }),
                 })?;
