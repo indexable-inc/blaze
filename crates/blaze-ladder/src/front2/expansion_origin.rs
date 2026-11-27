@@ -22,8 +22,14 @@ use blaze_typeck as tc;
 
 use super::source::NamesSource;
 
-/// The most expansion levels a finding maps through: one per nested call (rule 18).
-pub const MOST_LEVELS: u32 = 64;
+/// The most expansion levels a finding or caller-site walk maps through: one per nested call
+/// (rule 18). Must stay well above `blaze_scope::RECURSION_LIMIT` (128) and `#![recursion_limit]`
+/// overrides (e.g. `wasmtime-environ`'s `for_each_vm_type!(define_vm_type_offsets)` TT-muncher
+/// reaches depth 91..106 on `VMStoreContext`, which previously exhausted 64 and returned
+/// `PositionGap::NoFile`).
+pub const MOST_LEVELS: u32 = 4096;
+
+const _: () = assert!(MOST_LEVELS >= blaze_scope::RECURSION_LIMIT as u32 + 64);
 
 /// A call's origins, as a names source answers them: the column and call read in place, and
 /// the calling text as it is today.

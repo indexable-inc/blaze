@@ -17,7 +17,7 @@
 
 use crate::enc::{self, Cond, Field, Fp1, Ftype, Pstate, Reg, Size, SysReg, ZR};
 
-/// The most operands one statement has here (`fmadd` has four).
+/// The most operands one statement has here (`fmadd` and post-index `ldp`/`stp` have four).
 const ARGS_MOST: usize = 5;
 
 /// One operand's shape and value.
@@ -25,16 +25,18 @@ const ARGS_MOST: usize = 5;
 enum Arg {
     /// A general register; 31 is `xzr`/`wzr`, or `sp`/`wsp` when `sp`.
     Gpr { reg: Reg, wide: bool, sp: bool },
-    /// An exclusive access address, [Xn|SP] with optional zero offset.
-    Base(Reg),
+    /// A memory operand `[Xn|SP]` / `[Xn|SP, #off]` (`pre = false`) or `[Xn|SP, #off]!` (`pre = true`).
+    Addr { base: Reg, off: i128, pre: bool },
     /// A scalar SIMD&FP register.
     Fp { reg: Reg, width: FpWidth },
     /// A vector register with its arrangement.
     Vec { reg: Reg, arr: Arr },
     Imm(i128),
+    /// A `sym` operand placeholder (`$sym<index>` fed by `pass/asm.rs`).
+    Sym(u32),
     /// A word (a system register, a condition, a barrier option): its text is the operand's.
     Name,
-    /// Anything else (a shifted register, an indexed address, a bare `v0`): no row takes it.
+    /// Anything else (a shifted register, a bare `v0`): no row takes it.
     Other,
 }
 
@@ -116,6 +118,8 @@ impl<'t> Ops<'t> {
 enum Fit {
     Word(u32),
     Branch { word: u32, field: Field, target: usize },
+    /// A branch (`b`) or call (`bl`) targeting `sym` operand `sym`.
+    SymCall { sym: u32, link: bool },
     /// Not this row's shape.
     No,
     /// This row's shape, but operand `at` cannot be encoded, for `why`.
@@ -130,16 +134,26 @@ struct Row {
 
 /// Every form the assembler has, by mnemonic.
 const ROWS: &[Row] = &[
-    Row { mnemonic: "b", encode: branch },                 // 000101 imm26
+    Row { mnemonic: "b", encode: branch },                 // 000101 imm26 or sym jump
+    Row { mnemonic: "bl", encode: bl_call },               // 100101 imm26 or sym call
     Row { mnemonic: "b.cond", encode: branch_cond },       // 01010100 imm19 0 cond
     Row { mnemonic: "br", encode: br_reg },                // 1101011 0000 11111 000000 Rn 00000
+    Row { mnemonic: "blr", encode: blr_reg },              // 1101011 0001 11111 000000 Rn 00000
+    Row { mnemonic: "ret", encode: ret_op },               // 1101011 0010 11111 000000 Rn 00000
     Row { mnemonic: "cbz", encode: |o| compare_branch(o, false) },  // sf 011010 0 imm19 Rt
     Row { mnemonic: "cbnz", encode: |o| compare_branch(o, true) },  // sf 011010 1 imm19 Rt
     Row { mnemonic: "tbz", encode: |o| test_branch(o, false) },     // b5 011011 0 b40 imm14 Rt
     Row { mnemonic: "tbnz", encode: |o| test_branch(o, true) },     // b5 011011 1 b40 imm14 Rt
     Row { mnemonic: "mov", encode: mov_reg },              // orr (non-sp) or add #0 (with sp)
+    Row { mnemonic: "mov", encode: mov_imm },              // movz/movn #imm16
     Row { mnemonic: "sub", encode: |o| arithmetic_imm(o, enc::sub_imm) }, // sf 1 0 100010 0 imm12 Rn Rd
+    Row { mnemonic: "sub", encode: |o| arithmetic_reg(o, enc::sub) },     // sf 1 0 01011 00 0 Rm 000000 Rn Rd
     Row { mnemonic: "add", encode: |o| arithmetic_imm(o, enc::add_imm) }, // sf 0 0 100010 0 imm12 Rn Rd
+    Row { mnemonic: "add", encode: |o| arithmetic_reg(o, enc::add) },     // sf 0 0 01011 00 0 Rm 000000 Rn Rd
+    Row { mnemonic: "stp", encode: |o| pair_mem(o, false) },
+    Row { mnemonic: "ldp", encode: |o| pair_mem(o, true) },
+    Row { mnemonic: "str", encode: |o| single_mem(o, false) },
+    Row { mnemonic: "ldr", encode: |o| single_mem(o, true) },
     // Exclusive accesses: size 001000 0 L pair Rs ordered Rt2 Rn Rt.
     Row { mnemonic: "ldxr", encode: |o| load_exclusive(o, false) },  // L=1 pair=0 Rs=31 ordered=0 Rt2=31
     Row { mnemonic: "ldaxr", encode: |o| load_exclusive(o, true) },  // L=1 pair=0 Rs=31 ordered=1 Rt2=31
@@ -156,6 +170,8 @@ const ROWS: &[Row] = &[
     Row { mnemonic: "mrs", encode: mrs },
     Row { mnemonic: "msr", encode: msr_reg },
     Row { mnemonic: "msr", encode: msr_imm },
+    Row { mnemonic: "dc", encode: dc },
+    Row { mnemonic: "ic", encode: ic },
     Row { mnemonic: "pacib", encode: pacib },
     Row { mnemonic: "tst", encode: tst_reg },
     Row { mnemonic: "tst", encode: tst_imm },
@@ -183,6 +199,7 @@ const ROWS: &[Row] = &[
 pub(super) enum Instruction<'t> {
     Word(u32),
     Branch { word: u32, field: Field, target: &'t [u8] },
+    SymCall { sym: u32, link: bool },
 }
 
 /// The instruction of a statement, retaining the target token until its offset is known.
@@ -205,6 +222,7 @@ pub(super) fn assemble(text: &[u8]) -> Result<Instruction<'_>, (&'static str, &[
         known = true;
         match (row.encode)(&ops) {
             Fit::Word(word) => return Ok(Instruction::Word(word)),
+            Fit::SymCall { sym, link } => return Ok(Instruction::SymCall { sym, link }),
             Fit::Branch { word, field, target } => {
                 let token = ops.text(target);
                 match token.split_last() {
@@ -231,17 +249,38 @@ pub(super) fn assemble(text: &[u8]) -> Result<Instruction<'_>, (&'static str, &[
 
 /// The shape of operand text `t` (trimmed).
 fn arg(t: &[u8]) -> Arg {
-    if let Some(address) = t.strip_prefix(b"[").and_then(|s| s.strip_suffix(b"]")) {
-        let mut parts = address.split(|&b| b == b',');
-        let base = parts.next().and_then(|s| gpr(super::trim(s)));
-        if let Some(offset) = parts.next() {
-            let offset = super::trim(offset);
-            if number(super::trim(offset.strip_prefix(b"#").unwrap_or(offset))) != Some(0) || parts.next().is_some() {
-                return Arg::Other;
+    if let Some(rest) = t.strip_prefix(b"$sym") {
+        if !rest.is_empty() && rest.iter().all(u8::is_ascii_digit) {
+            if let Ok(s) = core::str::from_utf8(rest)
+                && let Ok(n) = s.parse::<u32>()
+            {
+                return Arg::Sym(n);
             }
         }
+        return Arg::Other;
+    }
+    let (addr_tok, pre) = match t.strip_suffix(b"!") {
+        Some(inner) => (super::trim(inner), true),
+        None => (t, false),
+    };
+    if let Some(address) = addr_tok.strip_prefix(b"[").and_then(|s| s.strip_suffix(b"]")) {
+        let mut parts = address.split(|&b| b == b',');
+        let base = parts.next().and_then(|s| gpr(super::trim(s)));
+        let off = match parts.next() {
+            None => 0,
+            Some(offset) => {
+                if parts.next().is_some() {
+                    return Arg::Other;
+                }
+                let offset = super::trim(offset);
+                let Some(v) = number(super::trim(offset.strip_prefix(b"#").unwrap_or(offset))) else {
+                    return Arg::Other;
+                };
+                v
+            }
+        };
         return match base {
-            Some(Arg::Gpr { reg, wide: true, sp }) if reg != ZR || sp => Arg::Base(reg),
+            Some(Arg::Gpr { reg, wide: true, sp }) if reg != ZR || sp => Arg::Addr { base: reg, off, pre },
             _ => Arg::Other,
         };
     }
@@ -473,8 +512,190 @@ fn imm_bits(v: i128, wide: bool) -> Option<u64> {
 // The rows' encoders: each takes its shape or answers `No`.
 
 fn branch(ops: &Ops<'_>) -> Fit {
-    match ops.args() {
+    match *ops.args() {
+        [Arg::Sym(sym)] => Fit::SymCall { sym, link: false },
         [_] => Fit::Branch { word: enc::b(0), field: Field::Imm26, target: 0 },
+        _ => Fit::No,
+    }
+}
+
+fn bl_call(ops: &Ops<'_>) -> Fit {
+    match *ops.args() {
+        [Arg::Sym(sym)] => Fit::SymCall { sym, link: true },
+        [_] => Fit::Branch { word: enc::bl(0), field: Field::Imm26, target: 0 },
+        _ => Fit::No,
+    }
+}
+
+fn blr_reg(ops: &Ops<'_>) -> Fit {
+    let [Arg::Gpr { reg, wide: true, sp: false }] = *ops.args() else { return Fit::No };
+    Fit::Word(enc::blr(reg))
+}
+
+fn ret_op(ops: &Ops<'_>) -> Fit {
+    match *ops.args() {
+        [] => Fit::Word(enc::ret()),
+        [Arg::Gpr { reg, wide: true, sp: false }] => Fit::Word(enc::ret_reg(reg)),
+        _ => Fit::No,
+    }
+}
+
+fn arithmetic_reg(ops: &Ops<'_>, encode: fn(Reg, Reg, Reg) -> u32) -> Fit {
+    let [
+        Arg::Gpr { reg: rd, wide, sp: false },
+        Arg::Gpr { reg: rn, wide: w1, sp: false },
+        Arg::Gpr { reg: rm, wide: w2, sp: false },
+    ] = *ops.args()
+    else {
+        return Fit::No;
+    };
+    if w1 != wide || w2 != wide {
+        return Fit::No;
+    }
+    Fit::Word(enc::sf(wide, encode(rd, rn, rm)))
+}
+
+fn mov_imm(ops: &Ops<'_>) -> Fit {
+    let [Arg::Gpr { reg: rd, wide, sp: false }, Arg::Imm(v)] = *ops.args() else { return Fit::No };
+    if (0..=0xffff).contains(&v) {
+        Fit::Word(enc::sf(wide, enc::movz(rd, v as u32, 0)))
+    } else if (-0x10000..=-1).contains(&v) {
+        Fit::Word(enc::sf(wide, enc::movn(rd, ((!v) as u32) & 0xffff, 0)))
+    } else {
+        Fit::Bad { why: "a `mov` immediate outside -65536..=65535", at: 1 }
+    }
+}
+
+/// Checks a signed 7-bit scaled pair offset (`off % scale == 0` and `-64 <= off/scale <= 63`).
+fn pair_imm7(off: i128, scale: i128) -> Option<i32> {
+    if off % scale != 0 {
+        return None;
+    }
+    let scaled = off / scale;
+    (-64..=63).contains(&scaled).then_some(scaled as i32)
+}
+
+fn pair_mem(ops: &Ops<'_>, load: bool) -> Fit {
+    enum Mode {
+        Off(Reg, i128, usize),
+        Pre(Reg, i128, usize),
+        Post(Reg, i128, usize),
+    }
+    let (a, b, mode) = match *ops.args() {
+        [a, b, Arg::Addr { base, off, pre: false }] => (a, b, Mode::Off(base, off, 2)),
+        [a, b, Arg::Addr { base, off, pre: true }] => (a, b, Mode::Pre(base, off, 2)),
+        [a, b, Arg::Addr { base, off: 0, pre: false }, Arg::Imm(off)] => (a, b, Mode::Post(base, off, 3)),
+        _ => return Fit::No,
+    };
+    match (a, b) {
+        (Arg::Gpr { reg: r1, wide: true, sp: false }, Arg::Gpr { reg: r2, wide: true, sp: false }) => {
+            let (base, off, at) = match mode {
+                Mode::Off(b, o, at) | Mode::Pre(b, o, at) | Mode::Post(b, o, at) => (b, o, at),
+            };
+            if pair_imm7(off, 8).is_none() {
+                return Fit::Bad { why: "an `x` pair offset outside -512..=504 or not 8-aligned", at };
+            }
+            let off = off as i32;
+            Fit::Word(match (load, mode) {
+                (false, Mode::Off(..)) => enc::stp_off(r1, r2, base, off),
+                (true, Mode::Off(..)) => enc::ldp_off(r1, r2, base, off),
+                (false, Mode::Pre(..)) => enc::stp_pre(r1, r2, base, off),
+                (true, Mode::Pre(..)) => enc::ldp_pre(r1, r2, base, off),
+                (false, Mode::Post(..)) => enc::stp_post(r1, r2, base, off),
+                (true, Mode::Post(..)) => enc::ldp_post(r1, r2, base, off),
+            })
+        }
+        (Arg::Gpr { reg: r1, wide: false, sp: false }, Arg::Gpr { reg: r2, wide: false, sp: false }) => {
+            let Mode::Off(base, off, at) = mode else { return Fit::No };
+            if pair_imm7(off, 4).is_none() {
+                return Fit::Bad { why: "a `w` pair offset outside -256..=252 or not 4-aligned", at };
+            }
+            let off = off as i32;
+            Fit::Word(if load { enc::ldp_w_off(r1, r2, base, off) } else { enc::stp_w_off(r1, r2, base, off) })
+        }
+        (Arg::Fp { reg: r1, width: FpWidth::Q }, Arg::Fp { reg: r2, width: FpWidth::Q }) => {
+            let (base, off, at) = match mode {
+                Mode::Off(b, o, at) | Mode::Pre(b, o, at) | Mode::Post(b, o, at) => (b, o, at),
+            };
+            let Some(imm7) = pair_imm7(off, 16) else {
+                return Fit::Bad { why: "a `q` pair offset outside -1024..=1008 or not 16-aligned", at };
+            };
+            Fit::Word(match (load, mode) {
+                (false, Mode::Off(..)) => enc::stp_q_off(r1, r2, base, imm7),
+                (true, Mode::Off(..)) => enc::ldp_q_off(r1, r2, base, imm7),
+                (false, Mode::Pre(..)) => enc::stp_q_pre(r1, r2, base, imm7),
+                (true, Mode::Pre(..)) => enc::ldp_q_pre(r1, r2, base, imm7),
+                (false, Mode::Post(..)) => enc::stp_q_post(r1, r2, base, imm7),
+                (true, Mode::Post(..)) => enc::ldp_q_post(r1, r2, base, imm7),
+            })
+        }
+        (Arg::Fp { reg: r1, width: FpWidth::D }, Arg::Fp { reg: r2, width: FpWidth::D }) => {
+            let (base, off, at) = match mode {
+                Mode::Off(b, o, at) | Mode::Pre(b, o, at) | Mode::Post(b, o, at) => (b, o, at),
+            };
+            if pair_imm7(off, 8).is_none() {
+                return Fit::Bad { why: "a `d` pair offset outside -512..=504 or not 8-aligned", at };
+            }
+            let off = off as i32;
+            Fit::Word(match (load, mode) {
+                (false, Mode::Off(..)) => enc::stp_d_off(r1, r2, base, off),
+                (true, Mode::Off(..)) => enc::ldp_d_off(r1, r2, base, off),
+                (false, Mode::Pre(..)) => enc::stp_pre_d(r1, r2, base, off),
+                (true, Mode::Pre(..)) => enc::ldp_pre_d(r1, r2, base, off),
+                (false, Mode::Post(..)) => enc::stp_post_d(r1, r2, base, off),
+                (true, Mode::Post(..)) => enc::ldp_post_d(r1, r2, base, off),
+            })
+        }
+        (Arg::Fp { reg: r1, width: FpWidth::S }, Arg::Fp { reg: r2, width: FpWidth::S }) => {
+            let Mode::Off(base, off, at) = mode else { return Fit::No };
+            if pair_imm7(off, 4).is_none() {
+                return Fit::Bad { why: "an `s` pair offset outside -256..=252 or not 4-aligned", at };
+            }
+            let off = off as i32;
+            Fit::Word(if load { enc::ldp_s_off(r1, r2, base, off) } else { enc::stp_s_off(r1, r2, base, off) })
+        }
+        _ => Fit::No,
+    }
+}
+
+fn single_mem(ops: &Ops<'_>, load: bool) -> Fit {
+    match *ops.args() {
+        [Arg::Gpr { reg, wide, sp: false }, Arg::Addr { base, off, pre: false }] => {
+            let (size, scale) = if wide { (Size::X, 8i128) } else { (Size::W, 4i128) };
+            if off >= 0 && off % scale == 0 && (off / scale) < 4096 {
+                let imm12 = (off / scale) as u32;
+                Fit::Word(if load { enc::ldr(size, reg, base, imm12) } else { enc::str(size, reg, base, imm12) })
+            } else if (-256..=255).contains(&off) {
+                Fit::Word(if load { enc::ldur(size, reg, base, off as i32) } else { enc::stur(size, reg, base, off as i32) })
+            } else {
+                Fit::Bad { why: "a `ldr`/`str` offset out of unsigned scaled / unscaled range", at: 1 }
+            }
+        }
+        [Arg::Gpr { reg, wide: true, sp: false }, Arg::Addr { base, off: 0, pre: false }, Arg::Imm(off)] => {
+            if (-256..=255).contains(&off) {
+                Fit::Word(if load { enc::ldr_post(reg, base, off as i32) } else { enc::str_post(reg, base, off as i32) })
+            } else {
+                Fit::Bad { why: "a post-index `ldr`/`str` offset outside -256..=255", at: 2 }
+            }
+        }
+        [Arg::Fp { reg, width: FpWidth::Q }, Arg::Addr { base, off, pre: false }] => {
+            if off >= 0 && off % 16 == 0 && (off / 16) < 4096 {
+                let imm12 = (off / 16) as u32;
+                Fit::Word(if load { enc::ldr_q(reg, base, imm12) } else { enc::str_q(reg, base, imm12) })
+            } else {
+                Fit::Bad { why: "a `ldr`/`str q` offset out of unsigned 16-aligned range", at: 1 }
+            }
+        }
+        [Arg::Fp { reg, width: w @ (FpWidth::D | FpWidth::S) }, Arg::Addr { base, off, pre: false }] => {
+            let (size, scale) = if w == FpWidth::D { (Size::X, 8i128) } else { (Size::W, 4i128) };
+            if off >= 0 && off % scale == 0 && (off / scale) < 4096 {
+                let imm12 = (off / scale) as u32;
+                let word = if load { enc::ldr(size, reg, base, imm12) } else { enc::str(size, reg, base, imm12) };
+                Fit::Word(enc::fp_access(word))
+            } else {
+                Fit::Bad { why: "a `ldr`/`str d/s` offset out of unsigned scaled range", at: 1 }
+            }
+        }
         _ => Fit::No,
     }
 }
@@ -518,12 +739,12 @@ fn arithmetic_imm(ops: &Ops<'_>, encode: fn(Reg, Reg, u32, bool) -> u32) -> Fit 
 }
 
 fn load_exclusive(ops: &Ops<'_>, acquire: bool) -> Fit {
-    let [Arg::Gpr { reg, wide, sp: false }, Arg::Base(base)] = *ops.args() else { return Fit::No };
+    let [Arg::Gpr { reg, wide, sp: false }, Arg::Addr { base, off: 0, pre: false }] = *ops.args() else { return Fit::No };
     Fit::Word(enc::ldxr(if wide { Size::X } else { Size::W }, acquire, reg, base))
 }
 
 fn store_exclusive(ops: &Ops<'_>, release: bool) -> Fit {
-    let [Arg::Gpr { reg: status, wide: false, sp: false }, Arg::Gpr { reg, wide, sp: false }, Arg::Base(base)] = *ops.args() else {
+    let [Arg::Gpr { reg: status, wide: false, sp: false }, Arg::Gpr { reg, wide, sp: false }, Arg::Addr { base, off: 0, pre: false }] = *ops.args() else {
         return Fit::No;
     };
     if status == reg || (base != enc::SP && status == base) {
@@ -533,7 +754,7 @@ fn store_exclusive(ops: &Ops<'_>, release: bool) -> Fit {
 }
 
 fn load_pair(ops: &Ops<'_>) -> Fit {
-    let [Arg::Gpr { reg, wide, sp: false }, Arg::Gpr { reg: other, wide: w, sp: false }, Arg::Base(base)] = *ops.args() else {
+    let [Arg::Gpr { reg, wide, sp: false }, Arg::Gpr { reg: other, wide: w, sp: false }, Arg::Addr { base, off: 0, pre: false }] = *ops.args() else {
         return Fit::No;
     };
     if w != wide {
@@ -548,7 +769,7 @@ fn load_pair(ops: &Ops<'_>) -> Fit {
 fn store_pair(ops: &Ops<'_>) -> Fit {
     let [
         Arg::Gpr { reg: status, wide: false, sp: false }, Arg::Gpr { reg, wide, sp: false },
-        Arg::Gpr { reg: other, wide: w, sp: false }, Arg::Base(base),
+        Arg::Gpr { reg: other, wide: w, sp: false }, Arg::Addr { base, off: 0, pre: false },
     ] = *ops.args() else { return Fit::No };
     if w != wide {
         return Fit::No;
@@ -655,6 +876,26 @@ fn msr_imm(ops: &Ops<'_>) -> Fit {
         (Some(field), 0..=1) => Fit::Word(enc::msr_imm(field, v as u32)),
         (Some(_), _) => Fit::Bad { why: "a PSTATE field's immediate outside 0..=1", at: 1 },
         (None, _) => Fit::Bad { why: "a PSTATE field outside the assembler's table (`dit`, `ssbs`, `tco`)", at: 0 },
+    }
+}
+
+/// `dc cvau, Xt`: `sys #3, c7, c11, #1, Xt` (`0xd50b_7b20 | rt`).
+fn dc(ops: &Ops<'_>) -> Fit {
+    let [Arg::Name, Arg::Gpr { reg, wide: true, sp: false }] = *ops.args() else { return Fit::No };
+    if ops.text(0).eq_ignore_ascii_case(b"cvau") {
+        Fit::Word(0xd50b_7b20 | u32::from(reg))
+    } else {
+        Fit::Bad { why: "a `dc` cache-maintenance op outside the assembler's table (`cvau`)", at: 0 }
+    }
+}
+
+/// `ic ivau, Xt`: `sys #3, c7, c5, #1, Xt` (`0xd50b_7520 | rt`).
+fn ic(ops: &Ops<'_>) -> Fit {
+    let [Arg::Name, Arg::Gpr { reg, wide: true, sp: false }] = *ops.args() else { return Fit::No };
+    if ops.text(0).eq_ignore_ascii_case(b"ivau") {
+        Fit::Word(0xd50b_7520 | u32::from(reg))
+    } else {
+        Fit::Bad { why: "an `ic` cache-maintenance op outside the assembler's table (`ivau`)", at: 0 }
     }
 }
 

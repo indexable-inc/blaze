@@ -701,3 +701,69 @@ struct T;
     assert_eq!(run("nested_tests::col()"), nested_col, "nested macro module col");
     println!("TRACK CALLER EXPANSIONS: cfg_attr at {attr_line}:{attr_col}, nested macro at {nested_line}:{nested_col}");
 }
+
+/// Regression for Stage-2 `wasmtime_environ::vmoffsets::offsets::VMStoreContext::*`:
+/// a TT-muncher macro (`for_each_vm_type!(define_vm_type_offsets)`) whose `@impl`/`@impl_ty`
+/// field-peeling plus `@fields` member-macro chain reaches expansion depth > 64 (still well
+/// below `blaze_scope::RECURSION_LIMIT = 128`). Before raising `expansion_origin::MOST_LEVELS`
+/// above `RECURSION_LIMIT`, `Anchor::placement_cached` exhausted its 64-step loop and returned
+/// `PositionGap::NoFile` for all 15 field methods of `VMStoreContext`.
+#[test]
+fn a_deep_tt_muncher_impl_member_past_64_levels_is_placed_at_the_outermost_call() {
+    check_expansion_site_calling(
+        "macro_rules! define_offsets {\n\
+             (@fields $Name:ident) => {};\n\
+             (@fields $Name:ident [ $fname:ident : $($fty:tt)* ] $($rest:tt)*) => {\n\
+                 pub fn $fname() -> u8 { tracked(1) }\n\
+                 define_offsets!(@fields $Name $($rest)*);\n\
+             };\n\
+             (@impl $Name:ident { $( [ $fname:ident : $($fty:tt)* ] )* }) => {\n\
+                 impl $Name {\n\
+                     define_offsets!(@fields $Name $( [ $fname : $($fty)* ] )*); \n\
+                 }\n\
+             };\n\
+             (@impl $Name:ident { $($groups:tt)* } $fname:ident : $($rest:tt)*) => {\n\
+                 define_offsets!(@impl_ty $Name { $($groups)* } $fname [] $($rest)*);\n\
+             };\n\
+             (@impl_ty $Name:ident { $($groups:tt)* } $fname:ident [ $($fty:tt)* ] , $($rest:tt)*) => {\n\
+                 define_offsets!(@impl $Name { $($groups)* [ $fname : $($fty)* ] } $($rest)*);\n\
+             };\n\
+             (@impl_ty $Name:ident { $($groups:tt)* } $fname:ident [ $($fty:tt)* ] $tok:tt $($rest:tt)*) => {\n\
+                 define_offsets!(@impl_ty $Name { $($groups)* } $fname [ $($fty)* $tok ] $($rest)*);\n\
+             };\n\
+             (struct $Name:ident { $($body:tt)* }) => {\n\
+                 struct $Name;\n\
+                 define_offsets!(@impl $Name {} $($body)*);\n\
+             };\n\
+         }\n\
+         macro_rules! for_each_vm_type {\n\
+             ($mac:ident) => {\n\
+                 $mac! {\n\
+                     struct VMStoreContext {\n\
+                         f01: Cell<u64>,\n\
+                         f02: Cell<u64>,\n\
+                         f03: Cell<u64>,\n\
+                         f04: Cell<u64>,\n\
+                         f05: Cell<u64>,\n\
+                         f06: Cell<u64>,\n\
+                         f07: Cell<u64>,\n\
+                         f08: Cell<u64>,\n\
+                         f09: Cell<u64>,\n\
+                         f10: Cell<u64>,\n\
+                         f11: Cell<u64>,\n\
+                         f12: Cell<u64>,\n\
+                         f13: Cell<u64>,\n\
+                         f14: Cell<u64>,\n\
+                         sample: Cell<u64>,\n\
+                     }\n\
+                 }\n\
+             };\n\
+         }\n\
+         /// A doc comment above the macro call.\n\
+         for_each_vm_type!(define_offsets);",
+        "VMStoreContext::sample()",
+        "for_each_vm_type!(define_offsets);",
+        "/// A doc comment",
+        "/// A doc comment",
+    );
+}

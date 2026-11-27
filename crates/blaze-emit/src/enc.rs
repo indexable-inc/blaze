@@ -619,6 +619,11 @@ pub(crate) const fn stp_pre(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
     0xa980_0000 | ((((off / 8) as u32) & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
 }
 
+/// `ldp xt, xt2, [rn, #off]!`, `off` a multiple of 8 in -512..=504.
+pub(crate) const fn ldp_pre(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
+    0xa9c0_0000 | ((((off / 8) as u32) & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
+}
+
 /// `ldp xt, xt2, [rn], #off`, `off` a multiple of 8 in -512..=504.
 pub(crate) const fn ldp_post(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
     0xa8c0_0000 | ((((off / 8) as u32) & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
@@ -632,6 +637,11 @@ pub(crate) const fn stp_post(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
 /// `stp dt, dt2, [rn, #off]!` (C7.2.309, SIMD&FP 64-bit pre-index), `off` a multiple of 8 in -512..=504.
 pub(crate) const fn stp_pre_d(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
     0x6d80_0000 | ((((off / 8) as u32) & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
+}
+
+/// `ldp dt, dt2, [rn, #off]!` (C7.2.155, SIMD&FP 64-bit pre-index), `off` a multiple of 8 in -512..=504.
+pub(crate) const fn ldp_pre_d(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
+    0x6dc0_0000 | ((((off / 8) as u32) & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
 }
 
 /// `ldp dt, dt2, [rn], #off` (C7.2.155, SIMD&FP 64-bit post-index), `off` a multiple of 8 in -512..=504.
@@ -730,6 +740,11 @@ pub(crate) const fn blr(rn: Reg) -> u32 {
 /// `ret` (to `x30`).
 pub(crate) const fn ret() -> u32 {
     0xd65f_0000 | (LR << 5)
+}
+
+/// `ret xn`.
+pub(crate) const fn ret_reg(rn: Reg) -> u32 {
+    0xd65f_0000 | (rn << 5)
 }
 
 pub(crate) const fn brk(imm16: u32) -> u32 {
@@ -1413,6 +1428,16 @@ pub(crate) const fn ldp_q_off(rt1: Reg, rt2: Reg, rn: Reg, imm7: i32) -> u32 {
 /// `stp qt1, qt2, [rn, #imm7 * 16]` (C7.2 STP SIMD&FP, 128-bit pair = 32 bytes in one op).
 pub(crate) const fn stp_q_off(rt1: Reg, rt2: Reg, rn: Reg, imm7: i32) -> u32 {
     0xad00_0000 | ((imm7.cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt1
+}
+
+/// `stp qt1, qt2, [rn, #imm7 * 16]!` (C7.2.288, SIMD&FP 128-bit pre-index pair).
+pub(crate) const fn stp_q_pre(rt1: Reg, rt2: Reg, rn: Reg, imm7: i32) -> u32 {
+    0xad80_0000 | ((imm7.cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt1
+}
+
+/// `ldp qt1, qt2, [rn, #imm7 * 16]!` (C7.2.159, SIMD&FP 128-bit pre-index pair).
+pub(crate) const fn ldp_q_pre(rt1: Reg, rt2: Reg, rn: Reg, imm7: i32) -> u32 {
+    0xadc0_0000 | ((imm7.cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt1
 }
 
 /// `ldp qt1, qt2, [rn], #imm7 * 16` (C7.2.159, SIMD&FP 128-bit post-index pair = 32 bytes + advance).

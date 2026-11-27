@@ -37,13 +37,14 @@ use alloc::alloc::Allocator;
 
 use blaze_lir::{
     Op, Ty, Value,
-    func::{AsmOperandKind, AsmPieceRec},
+    func::{AsmOperandKind, AsmPieceRec, RefId},
 };
 
-use super::{EmitError, FloatWidth, Pass, unsupported};
+use super::{EmitError, FloatWidth, Label, Pass, Patch, sites::SiteTo, unsupported};
 use crate::{
-    asm::{Assembler, Dialect},
-    enc::{self, SP, Size},
+    RelocTo,
+    asm::{Assembler, Dialect, SymTarget},
+    enc::{self, Field, SP, Size},
 };
 
 /// The most operands one block may have here (the class pools hold 18 and 24 registers).
@@ -73,6 +74,8 @@ struct Placed {
     reg: u32,
     /// A class operand (a placeholder may name it); explicit ones may not be named.
     class: bool,
+    /// Index into `syms` for `sym` operands (`u32::MAX` for register operands).
+    sym: u32,
     /// The value it takes in, for `in`, `inout` and `inlateout`.
     input: Option<Value>,
     /// Its member of the result, for `out`, `lateout`, `inout` and `inlateout`.
@@ -194,15 +197,28 @@ impl<A: Allocator> Pass<'_, '_, A> {
             _ => return Err(unsupported(inst, op, "an `asm!` block of more than two outputs (a cell holds a pair at most)")),
         };
 
-        // 1. Registers: explicit ones first, then classes.
+        // 1. Registers and `sym` operands: explicit registers and symbols first, then classes.
         let mut placed: [Option<Placed>; OPERANDS_MOST] = [None; OPERANDS_MOST];
+        let mut syms: blaze_own::AVec<'_, SymTarget> = blaze_own::AVec::new_in(self.scratch);
         let (mut x_used, mut v_used) = (0u32, 0u32);
         let (mut next_input, mut next_member) = (0usize, 0u32);
         for (i, rec) in operands.iter().enumerate() {
             let kind = AsmOperandKind::from_byte(rec.kind).ok_or(unsupported(inst, op, "an `asm!` operand of no known kind"))?;
             match kind {
                 AsmOperandKind::Sym => {
-                    return Err(unsupported(inst, op, "a `sym` operand of `asm!` (a symbol in the template is not assembled yet)"));
+                    let ref_id = RefId(rec.aux);
+                    let target = if self.in_record() {
+                        let place = self.func_place(inst, op, ref_id)?;
+                        SymTarget::Record { place }
+                    } else {
+                        let (index, via) = self.literal(inst, op, ref_id)?;
+                        SymTarget::Literal { index, via }
+                    };
+                    let sym = u32::try_from(syms.len())
+                        .map_err(|_| unsupported(inst, op, "too many `sym` operands in an `asm!` block"))?;
+                    syms.push(target);
+                    placed[i] = Some(Placed { bank: Bank::X, reg: 0, class: false, sym, input: None, member: None });
+                    continue;
                 }
                 AsmOperandKind::Label => return Err(unsupported(inst, op, "a `label` operand of `asm!` outside an `asm_br`")),
                 _ => {}
@@ -223,7 +239,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 false => None,
             };
             if rec.class != 0 {
-                placed[i] = Some(Placed { bank: Bank::X, reg: u32::MAX, class: true, input, member });
+                placed[i] = Some(Placed { bank: Bank::X, reg: u32::MAX, class: true, sym: u32::MAX, input, member });
                 continue;
             }
             let name = view.asm_str(rec.reg_first, rec.reg_len);
@@ -236,7 +252,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 return Err(unsupported(inst, op, "two `asm!` operands in one explicit register"));
             }
             *used |= 1 << reg;
-            placed[i] = Some(Placed { bank, reg, class: false, input, member });
+            placed[i] = Some(Placed { bank, reg, class: false, sym: u32::MAX, input, member });
         }
         for (i, rec) in operands.iter().enumerate() {
             let Some(p) = placed[i].as_mut() else { continue };
@@ -276,7 +292,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
         }
 
         // 4. The template.
-        let mut reader = Assembler::new(Dialect::of(self.isa.os), self.code, self.scratch);
+        let mut reader = Assembler::new(Dialect::of(self.isa.os), self.code, &syms, self.scratch);
         let refused = |e: crate::asm::AsmError| EmitError::Asm { inst: inst as u32, line: e.line, why: e.why, token: e.token };
         for piece in view.asm_pieces_of(id) {
             match piece.kind {
@@ -290,6 +306,31 @@ impl<A: Allocator> Pass<'_, '_, A> {
                         .copied()
                         .flatten()
                         .ok_or(unsupported(inst, op, "an `asm!` placeholder past its operands"))?;
+                    if p.sym != u32::MAX {
+                        if piece.b != 0 {
+                            return Err(unsupported(inst, op, "a template modifier on a `sym` operand"));
+                        }
+                        let mut buf = [0u8; 16];
+                        buf[..4].copy_from_slice(b"$sym");
+                        let mut len = 4usize;
+                        let mut v = p.sym;
+                        let mut digits = [0u8; 10];
+                        let mut nd = 0usize;
+                        loop {
+                            digits[nd] = b'0' + (v % 10) as u8;
+                            nd += 1;
+                            v /= 10;
+                            if v == 0 {
+                                break;
+                            }
+                        }
+                        for &d in digits[..nd].iter().rev() {
+                            buf[len] = d;
+                            len += 1;
+                        }
+                        reader.feed(&buf[..len]).map_err(refused)?;
+                        continue;
+                    }
                     if !p.class {
                         return Err(unsupported(inst, op, "an `asm!` placeholder naming an explicit register operand"));
                     }
@@ -299,7 +340,17 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 _ => return Err(unsupported(inst, op, "an `asm!` template piece of no known kind")),
             }
         }
-        reader.finish().map_err(refused)?;
+        let sym_sites = reader.finish().map_err(refused)?;
+        for s in sym_sites {
+            match syms[s.sym as usize] {
+                SymTarget::Record { place } => {
+                    self.site(s.at, s.link, SiteTo::Import(RelocTo::Func(place)));
+                }
+                SymTarget::Literal { index, .. } => {
+                    self.patches.push(Patch { at: s.at, field: Field::Imm19, to: Label::Literal(index) });
+                }
+            }
+        }
 
         // 5. Outputs.
         for p in placed.iter().flatten() {

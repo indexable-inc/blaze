@@ -57,6 +57,8 @@ pub enum AsmArch {
 /// `noreturn` in [`Expr::Asm`]'s `options`: the bits are blaze-lower `AsmForm`'s, which equal
 /// blaze-lir `AsmRec`'s.
 pub const ASM_NORETURN: u16 = 1 << 4;
+/// `naked_asm!` in [`Expr::Asm`]'s `options` (implicitly `noreturn`).
+pub const ASM_NAKED: u16 = 1 << 9;
 
 /// How an operand passes its value (the Reference, "Operand type").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

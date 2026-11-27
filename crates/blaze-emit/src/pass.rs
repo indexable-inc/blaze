@@ -184,12 +184,15 @@ pub(crate) fn run<A: Allocator>(
     }
     let sig = view.sigs.get(view.head.sig as usize).map(|_| view.sig(SigId(view.head.sig)));
     let Some(sig) = sig else { return Err(EmitError::Signature { why: "no signature row" }) };
+    let is_naked = (view.head.attrs & blaze_lir::func::FnAttrs::NAKED) != 0;
     let is_variadic = view.sigs[view.head.sig as usize].bits & SigRec::VARIADIC != 0;
-    if is_variadic && isa.os != crate::Os::MacOs {
-        return Err(EmitError::Signature { why: variadic::VARIADIC_DEFINITION });
+    if !is_naked {
+        if is_variadic && isa.os != crate::Os::MacOs {
+            return Err(EmitError::Signature { why: variadic::VARIADIC_DEFINITION });
+        }
+        check_sig(view, isa, view.sigs[view.head.sig as usize], sig.params, sig.rets)
+            .map_err(|why| EmitError::Signature { why })?;
     }
-    check_sig(view, isa, view.sigs[view.head.sig as usize], sig.params, sig.rets)
-        .map_err(|why| EmitError::Signature { why })?;
 
     // The frame: lifetime-colored value cells (8/16/32 bytes by size class; 0 bytes for `Ty::NONE`),
     // then lifetime-colored LIR stack slots at their alignment, then the staging words; `sp`
@@ -242,6 +245,34 @@ pub(crate) fn run<A: Allocator>(
         far: reach::Far::new(reach, view, scratch),
         va_start_offset: None,
     };
+
+    if is_naked {
+        // A `#[unsafe(naked)]` function emits ONLY its `naked_asm!` instructions from the entry
+        // block: no prologue, no parameter stores, no epilogue, no unwind frame, no trailing `brk`
+        // for the `noreturn` LIR terminator, and no unreachable post-`noreturn` dead blocks
+        // (`dead_block()` in `blaze-build` may place a dummy `uninit` coercion value there).
+        pass.reach_point()?;
+        pass.block_at[0] = pass.here();
+        pass.block = Block(0);
+        let range = view.block(Block(0));
+        for inst in view.params(Block(0)).end..range.end {
+            match view.op(inst) {
+                Op::Asm => {
+                    pass.reach_point()?;
+                    pass.asm(inst, Op::Asm)?;
+                }
+                Op::Unreachable => break,
+                op => {
+                    return Err(unsupported(
+                        inst,
+                        op,
+                        "an instruction other than `naked_asm!` in a `#[unsafe(naked)]` function",
+                    ));
+                }
+            }
+        }
+        return pass.finish(None, most_align);
+    }
 
     // The prologue; the frame's size is patched in at the end, when the staging is known.
     pass.put(enc::stp_pre(FP, LR, SP, -16));
@@ -315,7 +346,7 @@ pub(crate) fn run<A: Allocator>(
     }
     pass.unwind_end()?;
 
-    pass.finish(frame_at, most_align)
+    pass.finish(Some(frame_at), most_align)
 }
 
 /// Why a signature is outside the subset, if it is.
@@ -1693,12 +1724,14 @@ impl<A: Allocator> Pass<'_, '_, A> {
     /// Writes the frame's size (and its stack-probe tail, right after the last instruction:
     /// pass/probe.rs), then places the literal words and the data after the code and patches
     /// every field.
-    fn finish(mut self, frame_at: u32, most_align: u64) -> Result<(), EmitError> {
-        // First: the tail is instructions, so it precedes every literal word and data row
-        // (the record form counts `insts` from here on).
-        self.place_frame(frame_at, most_align)?;
-        let frame = self.frame_bytes(most_align)?;
-        self.patch_restores(frame);
+    fn finish(mut self, frame_at: Option<u32>, most_align: u64) -> Result<(), EmitError> {
+        if let Some(frame_at) = frame_at {
+            // First: the tail is instructions, so it precedes every literal word and data row
+            // (the record form counts `insts` from here on).
+            self.place_frame(frame_at, most_align)?;
+            let frame = self.frame_bytes(most_align)?;
+            self.patch_restores(frame);
+        }
         // The last island, after the last instruction and the tail: the short fields to the
         // literal words and the data after the code, when those may lie past their reach.
         self.reach_end()?;

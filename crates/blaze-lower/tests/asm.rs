@@ -55,7 +55,7 @@ impl Cfg for NoCfg {
     }
 }
 
-const OPTION_NAMES: [(u16, &str); 9] = [
+const OPTION_NAMES: [(u16, &str); 10] = [
     (AsmForm::PURE, "pure"),
     (AsmForm::NOMEM, "nomem"),
     (AsmForm::READONLY, "readonly"),
@@ -65,6 +65,7 @@ const OPTION_NAMES: [(u16, &str); 9] = [
     (AsmForm::ATT_SYNTAX, "att_syntax"),
     (AsmForm::RAW, "raw"),
     (AsmForm::MAY_UNWIND, "may_unwind"),
+    (AsmForm::NAKED, "naked"),
 ];
 
 fn kind_name(k: AsmKind) -> &'static str {
@@ -216,7 +217,7 @@ fn zeroize_and_cmov_forms() {
 /// Asm(NoSuchName)` first, then one line per case, and asserts each.
 #[test]
 fn refusals_name_their_rule() {
-    let cases: [(&str, &str); 15] = [
+    let cases: [(&str, &str); 19] = [
         // [asm.ts-args.no-implicit]: `{x}` with no operand `x`.
         (r#"fn f() { unsafe { builtin # asm("/* {x} */") } }"#, "refused: Asm(NoSuchName)\n"),
         // A second `{}` with one positional operand.
@@ -269,10 +270,13 @@ fn refusals_name_their_rule() {
         // A valid template whose `{` is an escape (its value is `{0}`): blaze keeps pieces by
         // range in the literal's text, so it refuses the form by name.
         (r#"fn f(a: u64) { unsafe { builtin # asm("\u{7b}0}", in(reg) a) } }"#, "unhandled: AsmTemplateEscape\n"),
-        // A naked function's `naked_asm!` (the Reference's codegen attributes chapter: "The
-        // function body must consist of exactly one naked_asm! macro invocation"): not
-        // lowered yet (INTRINSICS.md P12), refused by name.
-        (r#"#[unsafe(naked)] extern "C" fn f() { builtin # naked_asm("ret") }"#, "unhandled: Asm\n"),
+        // A naked function's `naked_asm!`: implicitly `noreturn` + `naked`, accepts `sym`/`const`
+        // and refuses register operands, `clobber_abi`, or non-`att_syntax`/`raw` options.
+        (r#"#[unsafe(naked)] extern "C" fn f() { builtin # naked_asm("ret") }"#, "asm options=noreturn,naked pieces=[\"ret\"] operands=[] abis=0\n"),
+        (r#"#[unsafe(naked)] extern "C" fn f() { builtin # naked_asm("bl {g}", g = sym foo) }"#, "asm options=noreturn,naked pieces=[\"bl \", {0}] operands=[g = sym foo] abis=0\n"),
+        (r#"#[unsafe(naked)] extern "C" fn f(x: u64) { builtin # naked_asm("mov x0, {}", in(reg) x) }"#, "refused: Asm(NakedOperand)\n"),
+        (r#"#[unsafe(naked)] extern "C" fn f() { builtin # naked_asm("ret", options(nomem)) }"#, "refused: Asm(NakedOption)\n"),
+        (r#"#[unsafe(naked)] extern "C" fn f() { builtin # naked_asm("ret", clobber_abi("C")) }"#, "refused: Asm(NakedClobberAbi)\n"),
     ];
     for (text, want) in cases {
         let got = lowered(text);

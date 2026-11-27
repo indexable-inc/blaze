@@ -58,6 +58,9 @@ impl AsmForm {
     pub const ATT_SYNTAX: u16 = 1 << 6;
     pub const RAW: u16 = 1 << 7;
     pub const MAY_UNWIND: u16 = 1 << 8;
+    /// `naked_asm!` (the Reference, `[asm.scope.naked_asm]`): implicitly `noreturn`, only
+    /// `const`/`sym` operands and `att_syntax`/`raw` options.
+    pub const NAKED: u16 = 1 << 9;
 
     pub(crate) fn encode(self) -> Node {
         let mut n = Node::of(ROW_ASM);
@@ -329,12 +332,18 @@ pub enum AsmRule {
     /// An attribute other than `cfg`/`cfg_attr` on an operand ("asm.attributes.supported-
     /// attributes": "Other attributes are parsed but rejected").
     AttributeNotCfg,
+    /// A register or label operand in `naked_asm!` ("asm.scope.naked_asm": only `const` and `sym`).
+    NakedOperand,
+    /// `clobber_abi` in `naked_asm!` ("asm.scope.naked_asm": disallowed).
+    NakedClobberAbi,
+    /// An option other than `att_syntax` or `raw` in `naked_asm!`.
+    NakedOption,
     /// A part the parser left incomplete (its syntax error is reported too).
     Malformed,
 }
 
 impl AsmRule {
-    const ALL: [AsmRule; 20] = [
+    const ALL: [AsmRule; 23] = [
         AsmRule::NoTemplate,
         AsmRule::TemplateNotString,
         AsmRule::UnmatchedClose,
@@ -354,6 +363,9 @@ impl AsmRule {
         AsmRule::PureWithoutOutputs,
         AsmRule::NoreturnWithOutputs,
         AsmRule::AttributeNotCfg,
+        AsmRule::NakedOperand,
+        AsmRule::NakedClobberAbi,
+        AsmRule::NakedOption,
         AsmRule::Malformed,
     ];
 
@@ -783,14 +795,18 @@ impl Machine<'_, '_, '_, '_> {
             kinds.push(kind);
             self.out.exprs[t.0 as usize] = Expr::Missing.encode();
         }
-        match keyword {
-            Some(ASM_KW) => {}
+        let naked = match keyword {
+            Some(ASM_KW) => false,
+            Some(NAKED_ASM_KW) => true,
             Some(_) => {
                 self.unhandled(f.kind, r, Why::Asm);
                 return Expr::Missing;
             }
-            None => malformed = true,
-        }
+            None => {
+                malformed = true;
+                false
+            }
+        };
         // The target's architecture, a read of the record (main's ruling (A), P9b).
         let arch = self.asm_arch(r);
         if broken {
@@ -800,7 +816,7 @@ impl Machine<'_, '_, '_, '_> {
             self.diag(DiagKind::Asm(AsmRule::Malformed), r);
             return Expr::Missing;
         }
-        match self.asm_form(&templates, &kinds, &operands, options, &clobbers, arch, r) {
+        match self.asm_form(&templates, &kinds, &operands, options, &clobbers, arch, naked, r) {
             Ok(row) => Expr::Asm { row },
             Err(Refusal::Rule(rule, at)) => {
                 self.diag(DiagKind::Asm(rule), at);
@@ -819,13 +835,23 @@ impl Machine<'_, '_, '_, '_> {
         templates: &[(ExprId, Range)],
         kinds: &[TemplateKind],
         operands: &[(Node, Range)],
-        options: u16,
+        mut options: u16,
         clobbers: &[u32],
         arch: Option<blaze_typeck::AsmArch>,
+        naked: bool,
         r: Range,
     ) -> Result<RowIdx, Refusal> {
         if templates.is_empty() {
             return Err(Refusal::Rule(AsmRule::NoTemplate, r));
+        }
+        if naked {
+            if !clobbers.is_empty() {
+                return Err(Refusal::Rule(AsmRule::NakedClobberAbi, r));
+            }
+            if options & !(AsmForm::ATT_SYNTAX | AsmForm::RAW) != 0 {
+                return Err(Refusal::Rule(AsmRule::NakedOption, r));
+            }
+            options |= AsmForm::NAKED | AsmForm::NORETURN;
         }
         let alloc = *self.vals.allocator();
         let mut named: AVec<'_, (u64, u32)> = Vec::new_in(alloc);
@@ -837,6 +863,9 @@ impl Machine<'_, '_, '_, '_> {
         let mut labels = 0u32;
         for (i, &(node, range)) in operands.iter().enumerate() {
             let op = AsmOperand::decode(node).map_err(|_| Refusal::Rule(AsmRule::Malformed, range))?;
+            if naked && !matches!(op.kind, AsmKind::Sym | AsmKind::Const) {
+                return Err(Refusal::Rule(AsmRule::NakedOperand, range));
+            }
             let explicit = matches!(op.reg, Some(AsmReg::Explicit(_)));
             match op.name {
                 Some(n) => {

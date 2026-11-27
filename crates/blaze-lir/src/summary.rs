@@ -181,7 +181,7 @@ fn compute_impl<A: Allocator>(
     let blocks = view.blocks();
     let attrs = FnAttrs(view.head.attrs);
 
-    let mut has_forbidden_ops = false;
+    let mut has_forbidden_ops = (attrs.0 & FnAttrs::NAKED) != 0;
     let mut has_return = false;
     let mut is_closed = true;
 

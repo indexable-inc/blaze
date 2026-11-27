@@ -31,7 +31,28 @@ use core::{alloc::Allocator, ops::Range};
 
 use blaze_own::{AVec, Alloc};
 
-use crate::enc::Field;
+use crate::{
+    Via,
+    enc::{self, Field, Size, X16},
+};
+
+/// How a `sym` operand is reached when targeted by `bl`/`b` in an `asm!` or `naked_asm!` block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SymTarget {
+    /// Record form (`emit_record`): `adrp x16, 0; ldr x16, [x16]; blr/br x16` (3 words) bound via
+    /// an import site for function `place`.
+    Record { place: u32 },
+    /// Literal-word form (`emit`): `ldr x16, <literal>; [ldr x16, [x16]]; blr/br x16` (2 or 3 words).
+    Literal { index: u32, via: Via },
+}
+
+/// One `bl`/`b` instruction targeting a `sym` operand, emitted at byte offset `at` of `code`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct SymSite {
+    pub(crate) at: u32,
+    pub(crate) sym: u32,
+    pub(crate) link: bool,
+}
 
 /// The most bytes one statement holds once its comments are gone.
 pub(crate) const STATEMENT_MOST: usize = 256;
@@ -143,8 +164,10 @@ impl Local {
 }
 
 /// The template reader of one `asm!` block.
-pub(crate) struct Assembler<'out, 's, A: Allocator> {
+pub(crate) struct Assembler<'out, 'syms, 's, A: Allocator> {
     code: &'out mut Vec<u8, A>,
+    syms: &'syms [SymTarget],
+    sym_sites: AVec<'s, SymSite>,
     spellings: AVec<'s, u8>,
     definitions: AVec<'s, Local>,
     branches: AVec<'s, (Local, Field, u32)>,
@@ -160,10 +183,12 @@ pub(crate) struct Assembler<'out, 's, A: Allocator> {
     line: u32,
 }
 
-impl<'out, 's, A: Allocator> Assembler<'out, 's, A> {
-    pub(crate) fn new(dialect: Dialect, code: &'out mut Vec<u8, A>, scratch: Alloc<'s>) -> Self {
+impl<'out, 'syms, 's, A: Allocator> Assembler<'out, 'syms, 's, A> {
+    pub(crate) fn new(dialect: Dialect, code: &'out mut Vec<u8, A>, syms: &'syms [SymTarget], scratch: Alloc<'s>) -> Self {
         Assembler {
             code,
+            syms,
+            sym_sites: AVec::new_in(scratch),
             spellings: AVec::new_in(scratch),
             definitions: AVec::new_in(scratch),
             branches: AVec::new_in(scratch),
@@ -186,7 +211,7 @@ impl<'out, 's, A: Allocator> Assembler<'out, 's, A> {
     }
 
     /// Sort D definitions once, then find each branch's nearest definition in O(log D).
-    pub(crate) fn finish(mut self) -> Result<(), AsmError> {
+    pub(crate) fn finish(mut self) -> Result<AVec<'s, SymSite>, AsmError> {
         if self.slash {
             self.slash = false;
             self.push(b'/')?;
@@ -220,7 +245,7 @@ impl<'out, 's, A: Allocator> Assembler<'out, 's, A> {
                 .ok_or_else(|| branch.error(names, "local label outside this branch's displacement range"))?;
             self.code[branch.at..branch.at + 4].copy_from_slice(&patched.to_le_bytes());
         }
-        Ok(())
+        Ok(self.sym_sites)
     }
 
     fn byte(&mut self, byte: u8) -> Result<(), AsmError> {
@@ -330,15 +355,37 @@ impl<'out, 's, A: Allocator> Assembler<'out, 's, A> {
             return Ok(());
         }
         let instruction = table::assemble(text).map_err(|(why, token)| AsmError { line, why, token: AsmToken::of(token) })?;
-        let word = match instruction {
-            table::Instruction::Word(word) => word,
+        match instruction {
+            table::Instruction::Word(word) => self.code.extend_from_slice(&word.to_le_bytes()),
             table::Instruction::Branch { word, field, target } => {
                 let local = Local::new(&mut self.spellings, target, self.code.len(), line);
                 self.branches.push((local, field, word));
-                word
+                self.code.extend_from_slice(&word.to_le_bytes());
             }
-        };
-        self.code.extend_from_slice(&word.to_le_bytes());
+            table::Instruction::SymCall { sym, link } => {
+                let Some(&target) = self.syms.get(sym as usize) else {
+                    return Err(AsmError { line, why: "a `sym` operand index out of range", token: AsmToken::of(text) });
+                };
+                let at = u32::try_from(self.code.len())
+                    .map_err(|_| AsmError { line, why: "assembly past 4 GiB", token: AsmToken::of(text) })?;
+                self.sym_sites.push(SymSite { at, sym, link });
+                let branch_word = if link { enc::blr(X16) } else { enc::br(X16) };
+                match target {
+                    SymTarget::Record { .. } => {
+                        self.code.extend_from_slice(&enc::adrp(X16, 0).to_le_bytes());
+                        self.code.extend_from_slice(&enc::ldr(Size::X, X16, X16, 0).to_le_bytes());
+                        self.code.extend_from_slice(&branch_word.to_le_bytes());
+                    }
+                    SymTarget::Literal { via, .. } => {
+                        self.code.extend_from_slice(&enc::ldr_lit(X16, 0).to_le_bytes());
+                        if via == Via::Slot {
+                            self.code.extend_from_slice(&enc::ldr(Size::X, X16, X16, 0).to_le_bytes());
+                        }
+                        self.code.extend_from_slice(&branch_word.to_le_bytes());
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
