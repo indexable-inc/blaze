@@ -2262,7 +2262,7 @@ pub(crate) fn seed_pinned_dep_probes<D: blaze_core::Driver, S: crate::store::Sha
                 let leaf = ptr.leaves.row(i);
                 if leaf.kind == sweep::LeafKind::DepProbes {
                     let hex = crate::wasm64_compile::Hex64::from_bytes(leaf.id.0);
-                    probes.seed_checked_dep_probe_hex(cx, hex);
+                    probes.publish_checked_dep_probe_hex(hex);
                     return Ok(Some(hex));
                 }
             }
@@ -2284,7 +2284,7 @@ pub(crate) fn seed_pinned_dep_probes<D: blaze_core::Driver, S: crate::store::Sha
             && view.name == name
             && let Some(hex) = crate::wasm64_compile::Hex64::from_hex_bytes(view.payload)
         {
-            probes.seed_checked_dep_probe_hex(cx, hex);
+            probes.publish_checked_dep_probe_hex(hex);
             return Ok(Some(hex));
         }
     }
@@ -3862,16 +3862,23 @@ fn checking<'f, 's: 'f>(
     let wall_ns = phases.clock().wall().as_ns();
     // Helper invoked ONLY when a stored pointer's leaf table carries a `LeafKind::DepProbes` row
     // (workspaces with probe-dependent `MacroModule`s): validates live derived-fact pins / SDK /
-    // Linux clang closure BEFORE accepting a certificate AND populates `command_probes`'s checked
-    // snapshot so start-time `RunProcs` never recomputes live on a certificate hit.
+    // Linux clang closure BEFORE accepting a certificate and captures the verified digest so the
+    // certificate-hit branch can publish it into `command_probes` for start-time `RunProcs`.
+    let cert_dep_probe_hex: core::cell::Cell<Option<crate::wasm64_compile::Hex64>> = core::cell::Cell::new(None);
     let resolve_dep_probes = |env: &FetchEnv<'_>| -> Result<blaze_ids::ContentId, CliError> {
         let resolved_sdk = match lazy_sdk {
             Some(lazy) => lazy.resolve_on_demand(cx, Some(opened.home.dir()), wall_ns),
             None => env.sdk,
         };
         let tag = match command_probes.with_env(env).with_sdk(resolved_sdk).dep_probe_identity_hex(cx) {
-            Ok(hex) => hex,
-            Err(err) => crate::wasm64_compile::probe_error_hex(err.kind),
+            Ok(hex) => {
+                cert_dep_probe_hex.set(Some(hex));
+                hex
+            }
+            Err(err) => {
+                cert_dep_probe_hex.set(None);
+                crate::wasm64_compile::probe_error_hex(err.kind)
+            }
         };
         Ok(tag.to_content_id())
     };
@@ -3956,6 +3963,11 @@ fn checking<'f, 's: 'f>(
                 }
             };
             if (own_certifies && (whole_clean_cert || scoped_filtered.is_some())) || adopted.is_some() {
+                if let Some(hex) = cert_dep_probe_hex.get() {
+                    command_probes.publish_checked_dep_probe_hex(hex);
+                } else {
+                    command_probes.clear_checked_dep_probe_hex();
+                }
                 // The certificate's print and commit, then its profile, each in a call of its own
                 // (rule 54: no stage's temporaries in this frame).
                 let cert_root = if own_whole { whole_root.as_str() } else { answer_root.as_str() };
@@ -4398,6 +4410,11 @@ fn checking<'f, 's: 'f>(
             }
             let entering_tasks = crate::engine_ready_edit::entering_tasks(last_stored, &tools, &pre_files, &woken, alloc)?;
             drop(pre_files);
+            if let Some(hex) = ready_dep_probes.digest() {
+                command_probes.publish_checked_dep_probe_hex(hex);
+            } else {
+                command_probes.clear_checked_dep_probe_hex();
+            }
             phases.mark_cx(cx, "ready wake (the entering names from the stored pages, admitted, their tasks)", frame);
             Ok(Ok(blaze_own::Box::new_in(
                 CheckedSetup {
@@ -4571,6 +4588,11 @@ fn checking<'f, 's: 'f>(
                 };
                 if let Some(dep_probes_id) = planned_dep_probes.leaf_id() {
                     sweep::record_dep_probes(&mut rows, dep_probes_id);
+                }
+                if let Some(hex) = planned_dep_probes.digest() {
+                    command_probes.publish_checked_dep_probe_hex(hex);
+                } else {
+                    command_probes.clear_checked_dep_probe_hex();
                 }
                 let _cx = cx.span(STAGES_PLAN_SPAN);
                 let preserved_names = match (scoped.as_ref(), stored.as_ref()) {

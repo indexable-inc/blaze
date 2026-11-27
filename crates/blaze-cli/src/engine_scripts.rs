@@ -682,14 +682,24 @@ impl<'f> PlannedDepProbes<'f> {
         Self { proc_macros: Vec::new_in(frame), script_modules: Vec::new_in(frame) }
     }
 
+    /// Returns the verified 64-hex probe identity when this command planned at least one
+    /// probe-dependent `MacroModule` with a live digest (excluding `PlannedProbe::Failed`),
+    /// or `None` when no unit has a verified dependency-probe digest.
+    pub(crate) fn digest(&self) -> Option<crate::wasm64_compile::Hex64> {
+        for (_, entry) in self.proc_macros.iter().chain(self.script_modules.iter()) {
+            if let PlannedProbe::Digest(hex) = entry {
+                return Some(*hex);
+            }
+        }
+        None
+    }
+
     /// Returns the 32-byte probe identity recorded as a `LeafKind::DepProbes` certificate leaf
     /// when this command planned at least one probe-dependent `MacroModule`, or `None` when no
     /// unit in the workspace has dependency build scripts (zero overhead on unrelated workspaces).
     pub(crate) fn leaf_id(&self) -> Option<ContentId> {
-        for (_, entry) in self.proc_macros.iter().chain(self.script_modules.iter()) {
-            if let PlannedProbe::Digest(hex) = entry {
-                return Some(hex.to_content_id());
-            }
+        if let Some(hex) = self.digest() {
+            return Some(hex.to_content_id());
         }
         self.proc_macros
             .first()

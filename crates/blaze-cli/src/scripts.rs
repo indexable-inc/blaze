@@ -722,6 +722,101 @@ pub(crate) enum ProbeOncePlant {
     SkipOnce,
 }
 
+/// Lock-free updatable `Option<Hex64>` snapshot (`Send + Sync`, zero allocations, zero `std`).
+///
+/// Uses a seqlock over the 32-byte `ContentId` representation of `Hex64` so a completed check
+/// (certificate hit, accepted ready preflight, phase planning, or pinned JIT launch) can always
+/// publish or clear the exact dependency-probe tag it selected — overwriting any earlier
+/// preflight observation without blocking or allocating.
+struct CheckedHexSlot {
+    seq: core::sync::atomic::AtomicU64,
+    present: core::sync::atomic::AtomicBool,
+    words: [core::sync::atomic::AtomicU64; 4],
+}
+
+impl CheckedHexSlot {
+    fn new() -> Self {
+        Self {
+            seq: core::sync::atomic::AtomicU64::new(0),
+            present: core::sync::atomic::AtomicBool::new(false),
+            words: [
+                core::sync::atomic::AtomicU64::new(0),
+                core::sync::atomic::AtomicU64::new(0),
+                core::sync::atomic::AtomicU64::new(0),
+                core::sync::atomic::AtomicU64::new(0),
+            ],
+        }
+    }
+
+    fn acquire_write(&self) -> u64 {
+        use core::sync::atomic::Ordering;
+        let mut seq = self.seq.load(Ordering::Relaxed);
+        loop {
+            if seq & 1 != 0 {
+                core::hint::spin_loop();
+                seq = self.seq.load(Ordering::Relaxed);
+                continue;
+            }
+            let odd = seq.wrapping_add(1);
+            match self.seq.compare_exchange_weak(seq, odd, Ordering::Acquire, Ordering::Relaxed) {
+                Ok(_) => return odd,
+                Err(actual) => seq = actual,
+            }
+        }
+    }
+
+    fn publish(&self, hex: crate::wasm64_compile::Hex64) {
+        use core::sync::atomic::Ordering;
+        let odd = self.acquire_write();
+        let bytes = hex.to_content_id().0;
+        for (dst, chunk) in self.words.iter().zip(bytes.chunks_exact(8)) {
+            if let Ok(arr) = <[u8; 8]>::try_from(chunk) {
+                dst.store(u64::from_le_bytes(arr), Ordering::Relaxed);
+            }
+        }
+        self.present.store(true, Ordering::Relaxed);
+        self.seq.store(odd.wrapping_add(1), Ordering::Release);
+    }
+
+    fn clear(&self) {
+        use core::sync::atomic::Ordering;
+        let odd = self.acquire_write();
+        self.present.store(false, Ordering::Relaxed);
+        self.seq.store(odd.wrapping_add(1), Ordering::Release);
+    }
+
+    fn load(&self) -> Option<crate::wasm64_compile::Hex64> {
+        use core::sync::atomic::Ordering;
+        let [w0, w1, w2, w3] = &self.words;
+        loop {
+            let s1 = self.seq.load(Ordering::Acquire);
+            if s1 & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let present = self.present.load(Ordering::Relaxed);
+            let words = [
+                w0.load(Ordering::Relaxed),
+                w1.load(Ordering::Relaxed),
+                w2.load(Ordering::Relaxed),
+                w3.load(Ordering::Relaxed),
+            ];
+            core::sync::atomic::fence(Ordering::Acquire);
+            let s2 = self.seq.load(Ordering::Relaxed);
+            if s1 == s2 {
+                if !present {
+                    return None;
+                }
+                let mut bytes = [0u8; 32];
+                for (dst, word) in bytes.chunks_exact_mut(8).zip(words) {
+                    dst.copy_from_slice(&word.to_le_bytes());
+                }
+                return Some(crate::wasm64_compile::Hex64::from_bytes(bytes));
+            }
+        }
+    }
+}
+
 /// Lifetime-free command-level lazy holder for `CProbeSetting` and derived-fact `SpawnSetting`,
 /// instantiated once at the command's edge and paired with `&FetchEnv` via [`CommandProbes`] so:
 /// - Zero home/clang-shelf/userland I/O runs until actually needed (workspace `Script` run, or a
@@ -733,10 +828,11 @@ pub(crate) enum ProbeOncePlant {
 pub(crate) struct SharedCommandProbes {
     c_probes: bstd::sync::Once<Option<blaze_proc_macro::probe_clang::CProbeSetting>>,
     spawn_setting: bstd::sync::Once<Result<SpawnSetting, blaze_own::String<blaze_own::SharedAlloc<'static>>>>,
-    /// First verified dependency-probe identity computed during `check`, reused by start-time
-    /// proc-macro runners (`RunProcs` via `Standing`) so `run`/`test`/`export` look up the exact
-    /// `MacroModule` that `check` keyed and produced even if a host closure shifts afterwards.
-    checked_dep_probe_hex: bstd::sync::Once<crate::wasm64_compile::Hex64>,
+    /// Dependency-probe identity published by the completed `check` (or pinned certificate),
+    /// reused by start-time proc-macro runners (`RunProcs` via `Standing`) so `run`/`test`/`export`
+    /// look up the exact `MacroModule` that `check` selected and produced even if a host closure
+    /// shifts afterwards or shifted between an earlier preflight and phase planning.
+    checked_dep_probe_hex: CheckedHexSlot,
     #[cfg(test)]
     plant: ProbeOncePlant,
 }
@@ -747,7 +843,7 @@ impl SharedCommandProbes {
         Self {
             c_probes: bstd::sync::Once::new("command.c_probes"),
             spawn_setting: bstd::sync::Once::new("command.spawn_setting"),
-            checked_dep_probe_hex: bstd::sync::Once::new("command.checked_dep_probe_hex"),
+            checked_dep_probe_hex: CheckedHexSlot::new(),
             #[cfg(test)]
             plant: ProbeOncePlant::None,
         }
@@ -758,7 +854,7 @@ impl SharedCommandProbes {
         Self {
             c_probes: bstd::sync::Once::new("command.c_probes"),
             spawn_setting: bstd::sync::Once::new("command.spawn_setting"),
-            checked_dep_probe_hex: bstd::sync::Once::new("command.checked_dep_probe_hex"),
+            checked_dep_probe_hex: CheckedHexSlot::new(),
             plant,
         }
     }
@@ -768,13 +864,18 @@ impl SharedCommandProbes {
         CommandProbes { inner: self, env, sdk: env.sdk, reuse_checked_dep_probes: false }
     }
 
-    /// Seeds the verified dependency-probe identity snapshot (used by pinned JIT launches in
-    /// `engine_check::open_pinned_standing` so start-time `RunProcs` with `.with_checked_snapshot()`
-    /// look up the exact `MacroModule` records that produced the pinned certificate).
-    pub(crate) fn seed_checked_dep_probe_hex(&self, cx: &Cx, hex: crate::wasm64_compile::Hex64) {
-        let _ = self
-            .checked_dep_probe_hex
-            .get_or_make(cx, |_cx| Ok::<_, core::convert::Infallible>(hex));
+    /// Publishes the verified dependency-probe identity selected by the completed check
+    /// (certificate hit, accepted ready preflight, phase planning, or pinned JIT launch),
+    /// overwriting any earlier preflight observation so start-time `RunProcs` with
+    /// `.with_checked_snapshot()` always look up the exact `MacroModule` tag produced.
+    pub(crate) fn publish_checked_dep_probe_hex(&self, hex: crate::wasm64_compile::Hex64) {
+        self.checked_dep_probe_hex.publish(hex);
+    }
+
+    /// Clears any previously published dependency-probe snapshot when the completed check has no
+    /// verified probe-dependent `MacroModule` tag.
+    pub(crate) fn clear_checked_dep_probe_hex(&self) {
+        self.checked_dep_probe_hex.clear();
     }
 
     #[cfg(test)]
@@ -954,7 +1055,7 @@ impl<'a> CommandProbes<'a> {
         cx: &Cx,
     ) -> Result<crate::wasm64_compile::Hex64, ProbeSetupError> {
         if self.reuse_checked_dep_probes
-            && let Some(&hex) = self.inner.checked_dep_probe_hex.get()
+            && let Some(hex) = self.inner.checked_dep_probe_hex.load()
         {
             return Ok(hex);
         }
@@ -962,7 +1063,7 @@ impl<'a> CommandProbes<'a> {
         let c_probes = self.c_probes(cx)?;
         let mut sdk_buf = [0u8; blaze_apple_sdk::SdkId::KEY_LEN * 2];
         let sdk_id = encode_sdk_hex(self.sdk, &mut sdk_buf).map(|(_, id)| id);
-        let hex = crate::wasm64_compile::dep_probe_identity_from_setting(
+        crate::wasm64_compile::dep_probe_identity_from_setting(
             cx,
             crate::graph::TRIPLE,
             spawn,
@@ -970,12 +1071,7 @@ impl<'a> CommandProbes<'a> {
             sdk_id,
             self.env.heap.alloc(),
             self.env.heap.shared(),
-        )?;
-        let _ = self
-            .inner
-            .checked_dep_probe_hex
-            .get_or_make(cx, |_cx| Ok::<_, core::convert::Infallible>(hex));
-        Ok(hex)
+        )
     }
 
     #[cfg(test)]
@@ -2368,6 +2464,7 @@ mod shared_command_probes_dst {
         let check_hex = check_probes
             .dep_probe_identity_hex(&cx)
             .expect("check-time dep_probe_identity_hex");
+        holder.publish_checked_dep_probe_hex(check_hex);
         assert_eq!(c_opens.load(Ordering::SeqCst), 1);
         assert_eq!(s_opens.load(Ordering::SeqCst), 1);
 
@@ -2499,8 +2596,10 @@ mod shared_command_probes_dst {
                 }))
             })
             .expect("seed s2");
+        let cert_hex_cell = core::cell::Cell::new(None);
         let cert_cb = || -> Result<ContentId, crate::CliError> {
             let hex = probes2.dep_probe_identity_hex(&cx).expect("live cert hex");
+            cert_hex_cell.set(Some(hex));
             Ok(hex.to_content_id())
         };
         let (cert_followed, _) = follow
@@ -2509,6 +2608,7 @@ mod shared_command_probes_dst {
         let cert_moved = cert_followed.layout_moved
             || cert_followed.now.rows.iter().zip(cert_followed.was.iter()).any(|(n, w)| n.state() != *w);
         assert!(!cert_moved, "unchanged probe inputs must allow certificate hit (even with unmarked journal slice)");
+        holder2.publish_checked_dep_probe_hex(cert_hex_cell.get().expect("cert callback ran"));
 
         // Now shift live answerer AFTER the certificate hit: start-time runner reusing `holder2`
         // MUST return `hex_a` from the certificate-populated checked snapshot!
@@ -2765,5 +2865,98 @@ mod shared_command_probes_dst {
             .dep_probe_identity_hex(&cx)
             .expect("pinned start snapshot from leaf");
         assert_eq!(got_leaf, hex_b, "pinned launch must restore pointer DepProbes leaf tag");
+    }
+
+    #[test]
+    fn completed_check_probe_snapshot_overwrites_earlier_preflight_observation() {
+        use blaze_build_script::c_tasks_probe::{CanonicalProbe, ProbeAnswer, ProbeAnswerer};
+        use blaze_ids::ContentId;
+        use blaze_proc_macro::probe_clang::{CProbeStore, CScriptProbes, MemCProbeStore};
+
+        struct MutableAnswerer(std::sync::Arc<core::sync::atomic::AtomicU8>);
+        impl ProbeAnswerer for MutableAnswerer {
+            fn id<'a>(&self, _alloc: blaze_own::Alloc<'a>) -> Result<ContentId, blaze_own::AString<'a>> {
+                Ok(ContentId([self.0.load(Ordering::SeqCst); 32]))
+            }
+            fn answer<'a, 'b>(
+                &self,
+                _probe: &CanonicalProbe<'_, '_>,
+                _input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+                alloc: blaze_own::Alloc<'a>,
+            ) -> Result<ProbeAnswer<'a>, blaze_own::AString<'a>> {
+                Err(blaze_own::AString::from_str_in("unused", alloc))
+            }
+        }
+
+        let io = Io::simulated(SimWorld::new(75, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root sim cx");
+        let env = sim_env(&io);
+        let shared = SharedAlloc::global();
+        let state = std::sync::Arc::new(core::sync::atomic::AtomicU8::new(0xaa));
+
+        let holder = SharedCommandProbes::new();
+        let check_probes = holder.with_env(&env);
+        let _ = check_probes
+            .c_probes_with(&cx, |_| {
+                let answerer: blaze_own::Arc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> =
+                    blaze_own::Arc::new_in(MutableAnswerer(std::sync::Arc::clone(&state)), shared);
+                let records: blaze_own::Arc<dyn CProbeStore, SharedAlloc<'static>> =
+                    blaze_own::Arc::new_in(MemCProbeStore::default(), shared);
+                Some(CProbeSetting::Ready(CScriptProbes {
+                    answerer,
+                    #[cfg(target_os = "linux")]
+                    hermetic: None,
+                    records,
+                    sdk_dir: blaze_own::Arc::from_str_in("", shared),
+                    sdk_id: blaze_own::Arc::from_str_in("", shared),
+                    sdk_digest: [0; 32],
+                    clang_sha256: [0x99; 32],
+                }))
+            })
+            .expect("seed c_probes");
+        let _ = check_probes
+            .spawn_setting_with(&cx, |_| {
+                Ok(SpawnSetting::facts_only(FactPins {
+                    clang_version_text: std::string::String::from("clang version 23.0.0"),
+                    macos_product_version: std::string::String::new(),
+                    macos_build_version: std::string::String::new(),
+                }))
+            })
+            .expect("seed spawn_setting");
+
+        // 1. Certificate check or ready preflight observes tag A (and even if an earlier check
+        //    stage published A, subsequent phase planning must be able to supersede it).
+        let hex_a = check_probes.dep_probe_identity_hex(&cx).expect("preflight hex A");
+        holder.publish_checked_dep_probe_hex(hex_a);
+
+        // 2. Host clang runtime closure shifts to B before phase planning runs.
+        state.store(0xbb, Ordering::SeqCst);
+        let hex_b = check_probes.dep_probe_identity_hex(&cx).expect("phase-plan hex B");
+        assert_ne!(hex_b, hex_a);
+        holder.publish_checked_dep_probe_hex(hex_b);
+
+        // 3. Host clang runtime closure shifts AGAIN to C after phase planning (mid-compile /
+        //    post-check drift): live revalidation observes C WITHOUT clobbering published B.
+        state.store(0xcc, Ordering::SeqCst);
+        let hex_c = check_probes.dep_probe_identity_hex(&cx).expect("live drifted hex C");
+        assert_ne!(hex_c, hex_b);
+
+        // 4. Start-time `RunProcs` (`with_checked_snapshot`) MUST return B — the tag selected
+        //    by the completed check — NOT stale preflight A and NOT post-check drifted C.
+        let start_hex = holder
+            .with_env(&env)
+            .with_checked_snapshot()
+            .dep_probe_identity_hex(&cx)
+            .expect("start snapshot must return B");
+        assert_eq!(start_hex, hex_b, "start snapshot must return phase-planned tag B, not stale preflight A or drifted C");
+
+        // 5. Clearing the published snapshot drops B so a subsequent fallback sees live C.
+        holder.clear_checked_dep_probe_hex();
+        let after_clear = holder
+            .with_env(&env)
+            .with_checked_snapshot()
+            .dep_probe_identity_hex(&cx)
+            .expect("cleared snapshot falls back to live");
+        assert_eq!(after_clear, hex_c);
     }
 }
