@@ -3932,7 +3932,7 @@ fn export_program<'f>(
             &mut lir_builder,
             lto_opts,
             heap.shared(),
-            alloc,
+            heap.alloc(),
             &lto_runner,
             &lto_cache,
         )

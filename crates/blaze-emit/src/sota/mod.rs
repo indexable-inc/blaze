@@ -1180,12 +1180,6 @@ fn try_emit_sota_a64_core<'a>(
 ) -> Result<Option<(CodeRecord<'a>, u32, CallClobbers)>, RecordEmitError> {
     let machine = opts.machine;
 
-    if (func.view().head.attrs & FnAttrs::NAKED) != 0 {
-        let (rec, insts, called) =
-            emit_record_sourced(func, names, routines, isa, BULK_INLINE_MOST, traps, alloc)?;
-        return Ok((rec, insts, called, CallClobbers::C_ABI_ARM64));
-    }
-
     // Mega-function mid-end bound (rule 18, matching `value_info::MAX_BLOCKS` and
     // `layout::EXACT_LOOP_MAX_BLOCKS`): above this size (e.g. generated `cranelift-isle` decision
     // trees or huge functions with 10k+ blocks), use `EmitProfile::Fast` so compilation stays
@@ -1381,6 +1375,11 @@ pub fn emit_sota_record_for_machine_with_abi<'a>(
             blaze_tier::Os::Linux => crate::Os::Linux,
         },
     };
+    if (func.view().head.attrs & FnAttrs::NAKED) != 0 {
+        let (rec, insts, called) =
+            emit_record_sourced(func, names, routines, isa, BULK_INLINE_MOST, traps, alloc)?;
+        return Ok((rec, insts, called, CallClobbers::C_ABI_ARM64));
+    }
     let has_fast_abi_req = opts.internal_fast
         || !collect_misel_fast_calls(func.view(), opts.internal_fast_callees, alloc).is_empty();
 

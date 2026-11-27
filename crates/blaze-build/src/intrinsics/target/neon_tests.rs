@@ -125,7 +125,7 @@ fn every_neon_name_round_trips() {
         }
         seen += 1;
     }
-    assert_eq!(seen, 56);
+    assert_eq!(seen, 64);
     let tbl = call("llvm.aarch64.neon.tbl1.v16i8");
     assert_eq!((tbl.func(), tbl.shape()), (NeonFn::Tbl1, IntShape::V16I8));
     let tbx = call("llvm.aarch64.neon.tbx1.v16i8");
@@ -290,4 +290,60 @@ fn table_lookup_ext_and_two_register_table() {
 
     let tbl2_8 = run_ops(call("llvm.aarch64.neon.tbl2.v8i8"), &[table0, table1, index]);
     assert_eq!(tbl2_8, [10, 25, 50, 0, 13, 51, 65, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+#[test]
+fn sqdmulh_and_sqrdmulh_match_arm_saturation_and_rounding() {
+    let ref_op = |a: i128, b: i128, bits: u32, round: bool| -> i128 {
+        let mut prod = 2 * a * b;
+        if round {
+            prod += 1i128 << (bits - 1);
+        }
+        let shifted = prod.div_euclid(1i128 << bits);
+        let max = (1i128 << (bits - 1)) - 1;
+        let min = -(1i128 << (bits - 1));
+        shifted.clamp(min, max)
+    };
+
+    // 32-bit lanes (`v2i32`, `v4i32`), including `i32::MIN * i32::MIN` saturation and rounding ties.
+    let a32: [i32; 4] = [i32::MIN, i32::MIN, i32::MAX, -1];
+    let b32: [i32; 4] = [i32::MIN, i32::MAX, i32::MAX, 0x4000_0000];
+    let mut a32_b = [0u8; 16];
+    let mut b32_b = [0u8; 16];
+    for i in 0..4 {
+        a32_b[i * 4..i * 4 + 4].copy_from_slice(&a32[i].to_le_bytes());
+        b32_b[i * 4..i * 4 + 4].copy_from_slice(&b32[i].to_le_bytes());
+    }
+    for (prefix, round) in [("sqdmulh", false), ("sqrdmulh", true)] {
+        for (shape, lanes) in [("v2i32", 2usize), ("v4i32", 4usize)] {
+            let name = format!("llvm.aarch64.neon.{prefix}.{shape}");
+            let got = run(call(&name), a32_b, b32_b);
+            for i in 0..lanes {
+                let g = i32::from_le_bytes(got[i * 4..i * 4 + 4].try_into().unwrap());
+                let w = ref_op(i128::from(a32[i]), i128::from(b32[i]), 32, round) as i32;
+                assert_eq!(g, w, "{name} lane {i}");
+            }
+        }
+    }
+
+    // 16-bit lanes (`v4i16`, `v8i16`).
+    let a16: [i16; 8] = [i16::MIN, i16::MIN, i16::MAX, -1, 12345, -23456, 0, 16384];
+    let b16: [i16; 8] = [i16::MIN, i16::MAX, i16::MAX, 16384, -9876, -11111, 32767, 16384];
+    let mut a16_b = [0u8; 16];
+    let mut b16_b = [0u8; 16];
+    for i in 0..8 {
+        a16_b[i * 2..i * 2 + 2].copy_from_slice(&a16[i].to_le_bytes());
+        b16_b[i * 2..i * 2 + 2].copy_from_slice(&b16[i].to_le_bytes());
+    }
+    for (prefix, round) in [("sqdmulh", false), ("sqrdmulh", true)] {
+        for (shape, lanes) in [("v4i16", 4usize), ("v8i16", 8usize)] {
+            let name = format!("llvm.aarch64.neon.{prefix}.{shape}");
+            let got = run(call(&name), a16_b, b16_b);
+            for i in 0..lanes {
+                let g = i16::from_le_bytes(got[i * 2..i * 2 + 2].try_into().unwrap());
+                let w = ref_op(i128::from(a16[i]), i128::from(b16[i]), 16, round) as i16;
+                assert_eq!(g, w, "{name} lane {i}");
+            }
+        }
+    }
 }
