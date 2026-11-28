@@ -101,7 +101,7 @@ pub use body::{
 };
 pub use columns::{AdjustKind, Adjusts, Callees, CaptureKind, CapturePlaceRows, CaptureProjs, Captures, Checked, Closures, ConstArgs, DefaultFields, ExprDefs, Fields, FruFields, PatConstArgs, PatDefs, UnionPat, UnionPats};
 pub use columns::CoroutineWitness;
-pub use columns::SigFrom;
+pub use columns::{SigFrom, SupertraitOrigin};
 pub use env_fields::{ActiveEnv, CaptureProj, EnvField, EnvFields, EnvRule, Places, WholeBindings};
 pub use selected::{Projected, Selected};
 pub use diag::{Because, Diag, DiagCode, MOST_PENDING_SHOWN, Node, UndecidedVar, UnmetGoal, UnsafeOp, VarOrigin, Why, WhyCand, WhyDef, WhyLeaf, WhyLimit, WhyReached, WhyStep, expr_form, node_form, pat_form, range_shared, sketch};

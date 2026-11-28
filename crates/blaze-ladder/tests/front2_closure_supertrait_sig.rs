@@ -111,6 +111,70 @@ fn hrtb_supertrait_local_ref_err() {
     });
 }
 
+trait StaticObj: Fn(&'static i32) -> &'static i32 {}
+impl<F: Fn(&'static i32) -> &'static i32> StaticObj for F {}
+
+fn take_static_obj(_f: Box<dyn StaticObj>) {}
+
+fn dyn_static_supertrait_ok() {
+    take_static_obj(Box::new(|x| {
+        let s: &'static i32 = x;
+        s
+    }));
+}
+
+trait Assoc {
+    type Item<'a>;
+}
+struct Holder;
+impl Assoc for Holder {
+    type Item<'a> = &'a i32;
+}
+
+trait GatFn<A: Assoc>: for<'a> Fn(A::Item<'a>) -> &'a i32 {}
+impl<A: Assoc, F: for<'a> Fn(A::Item<'a>) -> &'a i32> GatFn<A> for F {}
+
+fn take_gat<A: Assoc, F: GatFn<A>>(_f: F) {}
+
+fn gat_supertrait_ok() {
+    take_gat::<Holder, _>(|x| x);
+}
+
+fn gat_supertrait_local_ref_err() {
+    take_gat::<Holder, _>(|_x| {
+        let y = 1;
+        &y
+    });
+}
+
+trait Consume<'a>: FnOnce() -> &'a mut i32 {}
+impl<'a, F: FnOnce() -> &'a mut i32> Consume<'a> for F {}
+
+fn run_once<'a>(f: impl Consume<'a>) -> &'a mut i32 {
+    f()
+}
+
+fn fnonce_supertrait_consume_ok(x: &mut i32) -> &mut i32 {
+    run_once(|| {
+        *x += 1;
+        x
+    })
+}
+
+trait MutCall<'a>: FnMut() -> &'a mut i32 {}
+impl<'a, F: FnMut() -> &'a mut i32> MutCall<'a> for F {}
+
+fn run_mut<'a>(mut f: impl MutCall<'a>) -> &'a mut i32 {
+    f()
+}
+
+fn fnmut_supertrait_consume_err(x: &mut i32) -> &mut i32 {
+    run_mut(|| {
+        *x += 1;
+        x
+    })
+}
+
 fn main() {}
 "#;
 
@@ -158,6 +222,9 @@ fn closure_signatures_elaborate_supertraits_end_to_end() {
         "hrtb_supertrait_ok",
         "hrtb_multihop_supertrait_ok",
         "hrtb_dyn_supertrait_ok",
+        "dyn_static_supertrait_ok",
+        "gat_supertrait_ok",
+        "fnonce_supertrait_consume_ok",
     ] {
         let b = find(name);
         let (types, borrows) = world.check_borrows(b, alloc);
@@ -171,17 +238,22 @@ fn closure_signatures_elaborate_supertraits_end_to_end() {
         );
     }
 
-    // Negative borrowck: returning a reference to a local under `for<'a> Fn(&'a i32) -> &'a i32`
-    // supertrait passes typeck and MUST fail borrowck (no refusal, at least one borrow finding).
-    let (hrtb_bad_ty, hrtb_bad_br) = world.check_borrows(find("hrtb_supertrait_local_ref_err"), alloc);
-    assert!(
-        hrtb_bad_ty.is_clean() && hrtb_bad_ty.gaps.is_empty() && hrtb_bad_ty.refused.is_none(),
-        "NEGATIVE `hrtb_supertrait_local_ref_err` typeck failed: {hrtb_bad_ty:?}"
-    );
-    assert!(
-        hrtb_bad_br.refused.is_none() && !hrtb_bad_br.findings.is_empty(),
-        "NEGATIVE `hrtb_supertrait_local_ref_err`: expected borrow finding, got {hrtb_bad_br:?}"
-    );
+    // Negative borrowck controls: clean typeck, MUST fail borrowck with a finding (no refusal).
+    for name in [
+        "hrtb_supertrait_local_ref_err",
+        "gat_supertrait_local_ref_err",
+        "fnmut_supertrait_consume_err",
+    ] {
+        let (bad_ty, bad_br) = world.check_borrows(find(name), alloc);
+        assert!(
+            bad_ty.is_clean() && bad_ty.gaps.is_empty() && bad_ty.refused.is_none(),
+            "NEGATIVE `{name}` typeck failed: {bad_ty:?}"
+        );
+        assert!(
+            bad_br.refused.is_none() && !bad_br.findings.is_empty(),
+            "NEGATIVE `{name}`: expected borrow finding, got {bad_br:?}"
+        );
+    }
 
     // Negative 1a: wrong future output inside async block fails with E0271 (`Future::Output == bool`).
     let bad_ret = world.check(find("readiness_wrong_return"), alloc);

@@ -14,7 +14,7 @@ use std::vec::Vec;
 
 use super::check_body;
 use crate::body::IntSuffix;
-use crate::columns::Checked;
+use crate::columns::{Checked, SigFrom, SupertraitOrigin};
 use crate::diag::DiagCode;
 use crate::error::{CheckError, Limit};
 use crate::fixture::{Bb, Fx};
@@ -33,6 +33,9 @@ struct World {
     generic_mapper: ItemKey,
     dyn_subtrait: ItemKey,
     cyclic_ok: ItemKey,
+    mixed_direct_and_super_out: ItemKey,
+    has_out_trait: ItemKey,
+    readiness_trait: ItemKey,
 }
 
 fn world() -> (Fx, World) {
@@ -179,6 +182,14 @@ fn world() -> (Fx, World) {
     let generic_mapper = fx.func("generic_mapper", 0, &[], unit, Vec::new());
     let dyn_subtrait = fx.func("dyn_subtrait", 0, &[], unit, Vec::new());
     let cyclic_ok = fx.func("cyclic_ok", 0, &[], unit, Vec::new());
+
+    // Mixed direct `Fn<()>` input bound + separate supertrait `HasOut` supplying `Output = Box<dyn DynVal>`:
+    let has_out_trait = fx.tr("HasOut", 1, std::vec![rc_out], &[]);
+    fx.imp("impl<F> HasOut for F", 1, p0, Some((has_out_trait, &[])), &[], std::vec![rc_out]);
+    let b_has_out = fx.bound(has_out_trait, &[p0]);
+    fx.func("take_mixed_out", 1, &[p0], unit, std::vec![rc_fn, b_has_out]);
+    let mixed_direct_and_super_out = fx.func("mixed_direct_and_super_out", 0, &[], unit, Vec::new());
+
     fx.finish();
     (
         world,
@@ -190,6 +201,9 @@ fn world() -> (Fx, World) {
             generic_mapper,
             dyn_subtrait,
             cyclic_ok,
+            mixed_direct_and_super_out,
+            has_out_trait,
+            readiness_trait: readiness,
         },
     )
 }
@@ -215,6 +229,51 @@ fn supertrait_return_coerces_boxed_concrete_to_dyn() {
     let root = b.block(&[], Some(call));
     let c = check_body(&fx, &b, w.readiness_ok, root, Plant::None, InferPlant::None);
     assert!(codes(&c).is_empty(), "expected clean check, got {:?}", c.diags);
+    assert!(
+        matches!(
+            c.closures.column::<4>().first().copied(),
+            Some(SigFrom::Supertrait {
+                origin: SupertraitOrigin::Clause { nth: 0, .. },
+                trait_,
+                nth: 0,
+                output: Some((out_t, 1)),
+            }) if trait_ == w.readiness_trait && out_t == w.readiness_trait
+        ),
+        "expected SigFrom::Supertrait with Clause origin, got {:?}",
+        c.closures.column::<4>()
+    );
+}
+
+/// Mixed direct `Fn<()>` input clause + supertrait `HasOut` output projection: preserves
+/// `output_trait = Some(HasOut)` and `output = Some(0)` on `SigFrom::Clause` (and round-trips).
+#[test]
+fn mixed_direct_fn_input_and_supertrait_output_preserves_output_trait_provenance() {
+    let (fx, w) = world();
+    let mut b = Bb::new();
+    let one = b.int(Some(IntSuffix::Uint(UintTy::U32)));
+    let mk = b.path(&["make_concrete"]);
+    let concrete = b.call(mk, &[one]);
+    let bn = b.path(&["box_new"]);
+    let boxed = b.call(bn, &[concrete]);
+    let cl = b.closure(&[], boxed);
+    let take = b.path(&["take_mixed_out"]);
+    let call = b.call(take, &[cl]);
+    let root = b.block(&[], Some(call));
+    let c = check_body(&fx, &b, w.mixed_direct_and_super_out, root, Plant::None, InferPlant::None);
+    assert!(codes(&c).is_empty(), "expected clean check, got {:?}", c.diags);
+    assert!(
+        matches!(
+            c.closures.column::<4>().first().copied(),
+            Some(SigFrom::Clause {
+                nth: 0,
+                output: Some(0),
+                output_trait: Some(ot),
+                ..
+            }) if ot == w.has_out_trait
+        ),
+        "expected SigFrom::Clause with output_trait = Some(HasOut), got {:?}",
+        c.closures.column::<4>()
+    );
 }
 
 /// Negative control: `spawn_ready(|| 1u32)` fails with E0308 against the elaborated return type.

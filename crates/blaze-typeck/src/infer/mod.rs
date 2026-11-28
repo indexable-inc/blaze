@@ -2382,6 +2382,14 @@ impl<'a, 'f> TypeCtx for InferCtxIn<'a, 'f> {
         }
     }
 
+    fn pending_obligations(&self, out: &mut blaze_own::Vec<Obligation, blaze_own::Alloc<'_>>) {
+        for (ob, &st) in self.obs.iter().zip(self.state.iter()) {
+            if st == State::Pending {
+                out.push(*ob);
+            }
+        }
+    }
+
     fn may_hold<W: World>(&mut self, goal: Goal, reads: &mut Reads<'_, '_, W>) -> Result<bool, Stop> {
         let s = self.snapshot();
         let pred = self.pred(goal);
