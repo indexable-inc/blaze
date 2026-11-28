@@ -143,8 +143,8 @@ pub enum BodyScopeRefusal<'a> {
     },
     /// The body's blocks could not be decided: the solve's own refusal, named
     /// ([`BodySolveError`]: a read the finished names cannot answer, an ambiguity, a walk out of
-    /// the body with no cut, too many rounds).
-    Undecided { body: ItemKey, error: BodySolveError },
+    /// the body with no cut, too many rounds, or unavailable proc-macro module exports).
+    Undecided { body: ItemKey, error: BodySolveError<'a> },
     /// The record's read list or bytes could not be written.
     Record { body: ItemKey, error: BuildError },
     /// An impl of the body could not be filed (its header's tokens), so its rows digest could

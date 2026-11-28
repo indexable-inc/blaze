@@ -357,3 +357,88 @@ pub fn own() {}
         assert_eq!(found_foreign, Some(Some("C")), "`ItemRow::foreign` for `{target}` must record `Some(\"C\")`");
     }
 }
+
+/// Rule 3 (`no-fallback`): when a proc-macro crate's held body is solved via `solve_held_body`
+/// and `SourceTexts::proc_exports` returns `Err(why)`, body solving MUST fail with
+/// `BodySolveError::ProcExports` rather than silently collapsing to `listed = false` (`ProcDecls::Text`).
+#[test]
+fn solve_held_body_propagates_proc_exports_error_instead_of_text_fallback() {
+    use crate::prepares::Prepares;
+    use crate::resolve::{BodyDeps, BodySolveError, resolve_crates, solve_held_body};
+    use crate::surface::BlockScopes;
+    use crate::task::Par;
+
+    const PM_WITH_BODY: &str = "#![no_core]
+fn helper() {
+    struct Local;
+    let _ = Local;
+}
+";
+    static LIST: [ProcExport<'static>; 1] = [ProcExport { kind: ProcKind::Derive, name: "Template", helpers: "template" }];
+
+    struct BodiesPar;
+    impl Par for BodiesPar {
+        fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut blaze_own::AVec<'_, T>) {
+            Serial.map(n, f, out);
+        }
+        fn block_scopes(&self) -> BlockScopes {
+            BlockScopes::Bodies
+        }
+    }
+
+    struct LoadedSources;
+    impl SourceTexts<'static> for LoadedSources {
+        fn read(&self, krate: usize, path: &str) -> Option<&'static str> {
+            (krate == 0 && path == "/macros/lib.rs").then_some(PM_WITH_BODY)
+        }
+        fn proc_macro_key(&self, krate: usize) -> Option<CrateItemKey> {
+            (krate == 0).then_some(RUNNER)
+        }
+        fn proc_exports(&self, krate: usize) -> Result<Option<&'static [ProcExport<'static>]>, &'static str> {
+            Ok((krate == 0).then_some(&LIST[..]))
+        }
+    }
+
+    struct FailingSources;
+    impl SourceTexts<'static> for FailingSources {
+        fn read(&self, krate: usize, path: &str) -> Option<&'static str> {
+            (krate == 0 && path == "/macros/lib.rs").then_some(PM_WITH_BODY)
+        }
+        fn proc_macro_key(&self, krate: usize) -> Option<CrateItemKey> {
+            (krate == 0).then_some(RUNNER)
+        }
+        fn proc_exports(&self, krate: usize) -> Result<Option<&'static [ProcExport<'static>]>, &'static str> {
+            if krate == 0 {
+                Err("missing proc-macro module")
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: true, entry: false };
+    let pm = CrateInput { implicit, ..input("macros", "/macros/lib.rs", &[]) };
+    let bump = super::SyncFrame::leaked();
+    let sysroot = Sysroot { core: None, alloc: None, std: None, proc_macro: None, bstd: None };
+    let names = resolve_crates(&[pm], sysroot, &LoadedSources, &BodiesPar, bump).expect("crate solve with loaded exports");
+    let c = names.krate(0);
+    let body = *c.bodies.first().expect("helper() must be held under BlockScopes::Bodies");
+    let deps = BodyDeps::of_names(&names, 0, bump.alloc());
+    let prepares = Prepares::new_in(bump);
+
+    // Positive control: loaded module exports solve cleanly.
+    solve_held_body(c, &deps, &pm, 0, body, &LoadedSources, prepares, bump)
+        .expect("held body must solve cleanly when proc_exports succeeds");
+
+    // Failure path: proc_exports Err must propagate as BodySolveError::ProcExports, never fall back to text.
+    let err = solve_held_body(c, &deps, &pm, 0, body, &FailingSources, prepares, bump)
+        .expect_err("held body must refuse when proc_exports fails");
+    match err {
+        BodySolveError::ProcExports { body: got, krate, why } => {
+            assert_eq!(got, body.src.key);
+            assert_eq!(krate, "macros");
+            assert_eq!(why, "missing proc-macro module");
+        }
+        other => panic!("expected BodySolveError::ProcExports, got {other:?}"),
+    }
+}
