@@ -129,6 +129,8 @@ blaze-own = { workspace = true, features = ["std", "testing"] }
 blaze-alloc-count.workspace = true
 # tests/toolchain_store/mod.rs: the `names` producer's digest in the prepared std world's key.
 blaze-producers.workspace = true
+# tests/front2_do_defer_run.rs: effect polymorphism & syscall policy end-to-end tests.
+blaze-ty.workspace = true
 
 [features]
 # D161 step 3's oracle over every body any test checks (front2 tables/task.rs `compare_asks`):

@@ -2033,3 +2033,356 @@ fn direct_fs_handler_over_real_sim_survives_crash_without_effect_enum() {
         "unflushed sibling must be lost or torn on crash across real Sim seeds"
     );
 }
+
+fn run_direct_atomic_publish_and_readback<B: super::DirectFsBackend>(
+    backend: &mut B,
+    tmp: &FileName,
+    target: &FileName,
+    payload: &[u8],
+    alloc: Alloc<'static>,
+) -> (std::vec::Vec<u8>, [Option<u64>; 2]) {
+    use super::DirectFsHandler;
+
+    let mut readback = std::vec::Vec::new();
+    let mut stat_lens = [None, None];
+
+    with_brand(|brand| {
+        let mut handler = DirectFsHandler::new(backend, TaskId(601), brand, alloc);
+        let root = handler.root();
+
+        let file = handler
+            .perform(
+                root.open_write(OpenOpts { path: tmp.clone(), create: true, truncate: true }),
+                |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        let write_req = file.write_from(WriteFromOpts {
+            at: ByteOffset(0),
+            buf: DmaBuf::from_slice_in(payload, alloc).with_registered_index(FixedBufIndex(6)),
+        });
+        let flush_req = file.flush();
+        let chain_out = handler
+            .perform(Chain::new(write_req, flush_req), |p| match p {
+                Perform::Answered(out) => out,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        let (flushed_file, proof) = match chain_out {
+            ChainOutcome::Both(Ok(buf), Ok((f, proof))) => {
+                assert_eq!(buf.registered_index(), Some(FixedBufIndex(6)));
+                buf.release();
+                (f, proof)
+            }
+            other => panic!("expected ChainOutcome::Both(Ok, Ok), got {other:?}"),
+        };
+
+        assert_eq!(
+            handler
+                .perform(flushed_file.close(), |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                })
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(
+            handler
+                .perform(
+                    root.rename_flushed(RenameFlushedOpts { flushed: proof, to: target.clone() }),
+                    |p| match p {
+                        Perform::Answered(res) => res,
+                        _ => unreachable!(),
+                    },
+                )
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(
+            handler
+                .perform(root.sync_dir(), |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                })
+                .unwrap(),
+            Ok(())
+        );
+
+        let ro = root.narrow_read_only();
+        let opened = handler
+            .perform(ro.open_read(target.clone()), |p| match p {
+                Perform::Answered(res) => res,
+                _ => unreachable!(),
+            })
+            .unwrap()
+            .unwrap();
+        let filled = handler
+            .perform(
+                opened.read_into(ReadIntoOpts {
+                    at: ByteOffset(0),
+                    buf: DmaBuf::with_capacity_in(ByteLen((payload.len() + 64) as u32), alloc),
+                }),
+                |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(filled.filled, ByteLen(payload.len() as u32));
+        readback.extend_from_slice(filled.buf.as_slice());
+        filled.buf.release();
+        assert_eq!(
+            handler
+                .perform(opened.close(), |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                })
+                .unwrap(),
+            Ok(())
+        );
+
+        let mut batch: Batch<Stat<'_>, 2> = Batch::new();
+        assert_eq!(batch.try_push(root.stat(target.clone())).unwrap(), 0);
+        assert_eq!(batch.try_push(root.stat(tmp.clone())).unwrap(), 1);
+        let ready = handler
+            .perform(batch, |p| match p {
+                Perform::Answered(v) => v,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        assert_eq!(ready.len(), 2);
+        for entry in ready.as_slice() {
+            match (&entry.answer, entry.index) {
+                (Ok(Some(meta)), idx @ (0 | 1)) => {
+                    assert!(!meta.dir);
+                    stat_lens[idx as usize] = Some(meta.len);
+                }
+                (Ok(None), idx @ (0 | 1)) => {
+                    stat_lens[idx as usize] = None;
+                }
+                (other, idx) => panic!("unexpected Stat answer at slot {idx}: {other:?}"),
+            }
+        }
+
+        // Absent source after rename must report NotFound identically on both backends.
+        let missing_open = handler
+            .perform(ro.open_read(tmp.clone()), |p| match p {
+                Perform::Answered(res) => res,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        match missing_open {
+            Err(FsError::NotFound { path }) => assert_eq!(path, *tmp),
+            Ok(f) => {
+                let _ = f.into_id();
+                panic!("renamed tmp must not exist");
+            }
+            Err(other) => panic!("expected NotFound for renamed tmp, got {other:?}"),
+        }
+
+        assert_eq!(handler.finish_checked(), Ok(()));
+    });
+
+    (readback, stat_lens)
+}
+
+#[test]
+fn direct_fs_handler_native_matches_sim_byte_for_byte() {
+    use super::direct::NativeDirectFs;
+
+    let h = heap();
+    let dir = crate::temp::TempDir::for_test("blaze-direct-conform-");
+    let root_path = dir.path().to_path_buf();
+    let mut native = NativeDirectFs::new(root_path.clone());
+    let mut sim = Sim::new(2026_1128, Faults::default());
+
+    let tmp = FileName::new("atomic.tmp").unwrap();
+    let target = FileName::new("atomic.bin").unwrap();
+    let payload: std::vec::Vec<u8> =
+        (0..2048usize).map(|i| ((i.wrapping_mul(31).wrapping_add(7)) & 0xFF) as u8).collect();
+
+    let (native_bytes, native_stats) =
+        run_direct_atomic_publish_and_readback(&mut native, &tmp, &target, &payload, h.alloc());
+    let (sim_bytes, sim_stats) =
+        run_direct_atomic_publish_and_readback(&mut sim, &tmp, &target, &payload, h.alloc());
+
+    assert_eq!(native_bytes, payload);
+    assert_eq!(native_bytes, sim_bytes);
+    assert_eq!(native_stats, [Some(payload.len() as u64), None]);
+    assert_eq!(native_stats, sim_stats);
+
+    drop(dir);
+    assert!(!root_path.exists(), "temp dir guard must clean up {}", root_path.display());
+}
+
+#[test]
+fn uring_sqe_plan_chain_flush_and_rename_sync_dir_with_planted_controls() {
+    use super::direct::{
+        DirectFsHandler, InMemoryDirectFs, PlannedSqe, SqeFlags, SqeOpcode, SqePlanPlant,
+        UringSqePlan, plan_chain_flush_sync_dir, plan_chain_flush_sync_dir_with,
+        plan_chain_rename_sync_dir, plan_chain_rename_sync_dir_with,
+    };
+
+    let h = heap();
+    let mut fs = InMemoryDirectFs::new(h.alloc());
+    let tmp = FileName::new("chain-plan.tmp").unwrap();
+    let target = FileName::new("chain-plan.bin").unwrap();
+
+    with_brand(|brand| {
+        let mut handler = DirectFsHandler::new(&mut fs, TaskId(602), brand, h.alloc());
+        let root = handler.root();
+        let dir_slot = root.id().fixed_file_slot();
+
+        let file = handler
+            .perform(
+                root.open_write(OpenOpts { path: tmp.clone(), create: true, truncate: true }),
+                |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let file_slot = file.fixed_file_slot();
+
+        let written = handler
+            .perform(
+                file.write_from(WriteFromOpts {
+                    at: ByteOffset(0),
+                    buf: DmaBuf::from_slice_in(b"chain-flush-rename-sync", h.alloc()),
+                }),
+                |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        written.release();
+
+        // 1. `Chain<Flush, SyncDir>` lowers to linked [Fsync(file) | IO_LINK, Fsync(dir)].
+        let flush_sync_chain = Chain::new(file.flush(), root.sync_dir());
+        let [sqe_flush, sqe_dir_1] = plan_chain_flush_sync_dir(&flush_sync_chain);
+        assert_eq!(
+            sqe_flush,
+            PlannedSqe {
+                opcode: SqeOpcode::Fsync,
+                flags: SqeFlags::FIXED_FILE | SqeFlags::IO_LINK,
+                fd_slot: Some(file_slot),
+                buf_index: None,
+                offset: 0,
+                len: 0,
+            }
+        );
+        assert_eq!(
+            sqe_dir_1,
+            PlannedSqe {
+                opcode: SqeOpcode::Fsync,
+                flags: SqeFlags::FIXED_FILE,
+                fd_slot: Some(dir_slot),
+                buf_index: None,
+                offset: 0,
+                len: 0,
+            }
+        );
+        assert_eq!(UringSqePlan::plan_chain_flush_sync_dir(&flush_sync_chain), [sqe_flush, sqe_dir_1]);
+
+        // Planted control: `SkipIoLinkOnChain` drops `IOSQE_IO_LINK` on the leading `Fsync`.
+        let [planted_flush, planted_dir_1] =
+            plan_chain_flush_sync_dir_with(&flush_sync_chain, SqePlanPlant::SkipIoLinkOnChain);
+        assert!(!planted_flush.flags.contains(SqeFlags::IO_LINK));
+        assert!(planted_flush.flags.contains(SqeFlags::FIXED_FILE));
+        assert_eq!(planted_dir_1, sqe_dir_1);
+
+        let [no_fixed_flush, no_fixed_dir_1] = UringSqePlan::plan_chain_flush_sync_dir_with(
+            &flush_sync_chain,
+            SqePlanPlant::SkipFixedFileFlag,
+        );
+        assert_eq!(no_fixed_flush.flags, SqeFlags::IO_LINK);
+        assert_eq!(no_fixed_dir_1.flags, SqeFlags::NONE);
+
+        // Execute the chain cleanly to consume linear handles and mint `FlushedProof`.
+        let flush_sync_out = handler
+            .perform(flush_sync_chain, |p| match p {
+                Perform::Answered(out) => out,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        let (flushed_file, proof) = match flush_sync_out {
+            ChainOutcome::Both(Ok((f, proof)), Ok(())) => (f, proof),
+            other => panic!("expected ChainOutcome::Both(Ok, Ok), got {other:?}"),
+        };
+        assert_eq!(
+            handler
+                .perform(flushed_file.close(), |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                })
+                .unwrap(),
+            Ok(())
+        );
+
+        // 2. `Chain<RenameFlushed, SyncDir>` lowers to linked [RenameAt(dir) | IO_LINK, Fsync(dir)].
+        let rename_sync_chain = Chain::new(
+            root.rename_flushed(RenameFlushedOpts { flushed: proof, to: target.clone() }),
+            root.sync_dir(),
+        );
+        let [sqe_rename, sqe_dir_2] = plan_chain_rename_sync_dir(&rename_sync_chain);
+        assert_eq!(
+            sqe_rename,
+            PlannedSqe {
+                opcode: SqeOpcode::RenameAt,
+                flags: SqeFlags::FIXED_FILE | SqeFlags::IO_LINK,
+                fd_slot: Some(dir_slot),
+                buf_index: None,
+                offset: 0,
+                len: 0,
+            }
+        );
+        assert_eq!(
+            sqe_dir_2,
+            PlannedSqe {
+                opcode: SqeOpcode::Fsync,
+                flags: SqeFlags::FIXED_FILE,
+                fd_slot: Some(dir_slot),
+                buf_index: None,
+                offset: 0,
+                len: 0,
+            }
+        );
+        assert_eq!(
+            UringSqePlan::plan_chain_rename_sync_dir(&rename_sync_chain),
+            [sqe_rename, sqe_dir_2]
+        );
+
+        // Planted control: `SkipIoLinkOnChain` drops `IOSQE_IO_LINK` on the leading `RenameAt`.
+        let [planted_rename, planted_dir_2] =
+            plan_chain_rename_sync_dir_with(&rename_sync_chain, SqePlanPlant::SkipIoLinkOnChain);
+        assert!(!planted_rename.flags.contains(SqeFlags::IO_LINK));
+        assert!(planted_rename.flags.contains(SqeFlags::FIXED_FILE));
+        assert_eq!(planted_dir_2, sqe_dir_2);
+
+        let [no_fixed_rename, no_fixed_dir_2] = UringSqePlan::plan_chain_rename_sync_dir_with(
+            &rename_sync_chain,
+            SqePlanPlant::SkipFixedFileFlag,
+        );
+        assert_eq!(no_fixed_rename.flags, SqeFlags::IO_LINK);
+        assert_eq!(no_fixed_dir_2.flags, SqeFlags::NONE);
+
+        // Execute the rename+sync chain cleanly so every linear value is consumed.
+        let rename_sync_out = handler
+            .perform(rename_sync_chain, |p| match p {
+                Perform::Answered(out) => out,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        assert_eq!(rename_sync_out, ChainOutcome::Both(Ok(()), Ok(())));
+
+        assert_eq!(handler.finish_checked(), Ok(()));
+    });
+}

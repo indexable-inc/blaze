@@ -174,6 +174,9 @@ impl fmt::Debug for Procs {
 /// D177: one way to run a program hermetically.
 #[cfg(unix)]
 pub mod hermetic;
+/// Zero-alloc typed linear process requests (`SpawnReq`, `WaitExitReq`, `KillReq`) and inert
+/// generational [`req::ChildHandle`].
+pub mod req;
 
 // Children started linked to this process (test zygote, run parent): a native world's only.
 #[cfg(unix)]

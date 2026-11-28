@@ -1260,6 +1260,12 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     }
 }
 
+/// Returns `true` if `body` contains at least one postfix `.do` suspension expression
+/// (`Expr::Do`).
+pub fn has_do_exprs(body: &BodyView<'_>) -> bool {
+    body.exprs.iter().any(|e| matches!(e, Expr::Do(_)))
+}
+
 /// Builds a type-checked one-shot lexical `.do` body into verified pre-split LIR (containing
 /// `Op::Suspend` / `Op::Cancelled`) and its [`blaze_lir::coroutine_machine::MachineShape`].
 pub fn build_do_machine_body<A: Allocator + Copy>(
@@ -1305,6 +1311,30 @@ pub fn split_do_machine_body<A: Allocator + Copy>(
 ) -> Result<blaze_lir::coroutine_machine::MachineSplit<A>, DoMachineError> {
     let (func, shape) = build_do_machine_body(body, checked, sig, subst, adts, grace_max_steps, alloc)?;
     let split = blaze_lir::coroutine_machine::split_machine(func.view(), shape, alloc)?;
+    Ok(split)
+}
+
+/// Builds a type-checked one-shot lexical `.do` body and feeds it directly into
+/// [`blaze_lir::coroutine_machine::split_machine_bounded`], enforcing `budget` on the lowered
+/// zero-`Pin` machine's suspended state size (`#[blaze::max_state_bytes]`).
+pub fn split_do_machine_body_bounded<A: Allocator + Copy>(
+    body: &BodyView<'_>,
+    checked: &Checked<'_>,
+    sig: &FnSig<'_>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    grace_max_steps: u32,
+    budget: blaze_lir::coroutine_machine::MachineBudget,
+    alloc: A,
+) -> Result<blaze_lir::coroutine_machine::MachineSplit<A>, DoMachineError> {
+    let (func, shape) = build_do_machine_body(body, checked, sig, subst, adts, grace_max_steps, alloc)?;
+    let split = blaze_lir::coroutine_machine::split_machine_bounded(
+        func.view(),
+        shape,
+        budget,
+        blaze_lir::coroutine_machine::MachinePlant::None,
+        alloc,
+    )?;
     Ok(split)
 }
 

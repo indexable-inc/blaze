@@ -9,7 +9,8 @@ use std::alloc::Global;
 
 use blaze_build::layout::{LayoutFacts, Missing, ReprAttrs, ValidRange};
 use blaze_build::{
-    Abi, Adts, BuildError, OverflowChecks, Panic, Subst, UbChecks, build_do_machine_body, split_do_machine_body,
+    Abi, Adts, BuildError, DoMachineError, OverflowChecks, Panic, Subst, UbChecks, build_do_machine_body,
+    has_do_exprs, split_do_machine_body, split_do_machine_body_bounded,
 };
 use blaze_ladder::crates::{Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::program::Front2Program;
@@ -23,7 +24,20 @@ use blaze_lir::coroutine_machine::{
     MachineBudget, MachineEdge, MachineEdgeKind, MachineError, MachinePlant, split_machine_bounded,
 };
 use blaze_own::Alloc;
-use blaze_typeck::{Adt, ExprId, ItemKey, Name, PTy, PortableTys, TypedFinding};
+use bstd::machine::{
+    EdgeKind, GraphEdge, GraphError, GraphPlant, HandleOp, MachineGraph, StateId, StateNode, verify_graph,
+    verify_graph_with,
+};
+use blaze_surface::tool_attrs::{BlazeAttr, KNOWN, Stage, State, classify};
+use blaze_ty::effect_ty::{
+    EffectPolyError, EffectRow, EffectRowSet, EffectSet, EffectVar, LoweringMode, check_dyn_fn_effects,
+    check_higher_order_call, specialize_call,
+};
+use blaze_ty::syscall_ty::{SyscallPolicyError, SyscallSet};
+use blaze_typeck::{
+    Adt, ExprId, ItemKey, Name, PTy, PortableTys, SansIoBodyFinding, TypeAttrs, TypedFinding,
+    check_body_syscall_policy, check_sans_io_effects,
+};
 
 const EDITION: &str = "blaze-2026.11";
 
@@ -476,5 +490,717 @@ fn real_rust_local_borrow_across_do_is_rejected_by_typeck() {
         matches!(bad_checked.findings[0], TypedFinding::LocalBorrowAcrossDo { local, .. } if local == Name::of("x")),
         "expected TypedFinding::LocalBorrowAcrossDo for local `x`, got {:?}",
         bad_checked.findings[0],
+    );
+}
+
+/// Real `#![no_core]` Rust source with a pure helper fn and a `.do` workflow annotated with
+/// `#[blaze::max_state_bytes(16)]`.
+const MAX_STATE_BYTES_PROGRAM: &str = r#"#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = "sized"]
+trait Sized {}
+
+#[lang = "copy"]
+trait Copy {}
+
+impl Copy for u64 {}
+
+trait Request {
+    type Answer;
+}
+
+struct Ping(u64);
+impl Copy for Ping {}
+
+impl Request for Ping {
+    type Answer = u64;
+}
+
+fn pure_add(x: u64, y: u64) -> u64 {
+    x + y
+}
+
+#[blaze::max_state_bytes(16)]
+fn bounded_workflow(x: u64, req: Ping) -> u64 {
+    let y = pure_add(x, 10);
+    let a = req.do;
+    y + a
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    let _ = bounded_workflow(1, Ping(2));
+    0
+}
+"#;
+
+/// Real `#![no_core]` Rust source with 2 nested `defer` blocks wrapping 2 `.do` suspension points,
+/// proving LIFO cleanup paths on both normal exit and cancellation with zero local borrows across
+/// `.do`.
+const DEFER_DO_PROGRAM: &str = r#"#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = "sized"]
+trait Sized {}
+
+#[lang = "copy"]
+trait Copy {}
+
+impl Copy for u64 {}
+
+trait Request {
+    type Answer;
+}
+
+struct Ping(u64);
+impl Copy for Ping {}
+
+impl Request for Ping {
+    type Answer = u64;
+}
+
+fn deferred_workflow(out: &mut u64, req: Ping) -> u64 {
+    {
+        defer { *out = *out * 10 + 1; }
+        let a = req.do;
+        {
+            defer { *out = *out * 10 + 2; }
+            let b = req.do;
+            a + b
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    let mut log: u64 = 0;
+    let _ = deferred_workflow(&mut log, Ping(1));
+    0
+}
+"#;
+
+/// Counts constant-value `Op::Store` instructions targeting `tag_offset` in `view`.
+fn count_const_tag_stores(view: blaze_lir::View<'_>, tag_offset: u32) -> usize {
+    let mut count = 0usize;
+    for inst in 0..view.len() {
+        if view.op(inst) != Op::Store {
+            continue;
+        }
+        let mut o = view.operands(inst);
+        let value = o.value();
+        let _ptr = o.value();
+        let offset = o.offset();
+        if offset == tag_offset as i32 && view.op(value.index()) == Op::Iconst {
+            count += 1;
+        }
+    }
+    count
+}
+
+#[test]
+fn real_rust_do_machine_respects_max_state_bytes_attr_and_bounded_split() {
+    let BlazeAttr::Known(idx) = classify("max_state_bytes") else {
+        panic!("expected `blaze::max_state_bytes` to classify as Known");
+    };
+    assert_eq!(KNOWN[usize::from(idx)].state, State::Checked(Stage::Effects));
+
+    let alloc = Alloc::global();
+    let tc = Toolchain::none(alloc);
+    let root = "/do-budget/src/main.rs";
+    let files = [(root.to_owned(), MAX_STATE_BYTES_PROGRAM.to_owned())];
+    let user = UserCrate {
+        name: "do_budget",
+        dir: "/do-budget/",
+        root,
+        files: &files,
+        edition: edition::PackageEdition::of_manifest(EDITION).expect("blaze edition"),
+        panic: Panic::Abort,
+    };
+    let inputs = Inputs::new(&user, &tc).expect("inputs");
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("resolve names");
+    let sources = [SourceFile { path: "src/main.rs", text: MAX_STATE_BYTES_PROGRAM }];
+
+    let check_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("check frame");
+    let mut world = ProjectWorld::new(&names, &check_frame, &sources, alloc).expect("project world");
+    for fn_name in ["pure_add", "bounded_workflow"] {
+        let key = names
+            .items(0)
+            .find_map(|(k, _, _)| (names.item_text(k)?.name == Some(fn_name)).then_some(k))
+            .unwrap_or_else(|| panic!("missing item `{fn_name}`"));
+        let verdict = world.check(BodyRef::Free(key), alloc);
+        assert!(verdict.is_clean(), "`{fn_name}` must typecheck clean: {verdict:?}");
+        assert!(verdict.undecided.is_empty(), "`{fn_name}` must have no undecided items: {verdict:?}");
+        assert!(verdict.findings.is_empty(), "`{fn_name}` must have zero findings: {verdict:?}");
+    }
+
+    let prog_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("program frame");
+    let mut program = Front2Program::new(&names, &prog_frame, &sources, alloc).expect("front2 program");
+    let checked = program.check_all().expect("check_all");
+
+    let find_fn = |name: &str| {
+        (0..program.fn_count())
+            .find(|&i| {
+                let path = program.function(i).path;
+                path == name || path.ends_with(&format!("::{name}"))
+            })
+            .unwrap_or_else(|| panic!("missing `{name}` in Front2Program"))
+    };
+
+    let pure_idx = find_fn("pure_add");
+    let pure_checked = checked[pure_idx].as_ref().expect("pure_add checked record");
+    let (pure_body, _) = program.function(pure_idx).body.expect("pure_add body");
+    let pure_view = pure_body.view(program.body_types(pure_idx));
+    assert!(!pure_checked.suspends, "pure fn must not mark checked.suspends");
+    assert!(!has_do_exprs(&pure_view), "pure fn must report has_do_exprs == false");
+
+    let wf_idx = find_fn("bounded_workflow");
+    let wf_checked = checked[wf_idx].as_ref().expect("bounded_workflow checked record");
+    let (wf_body, _) = program.function(wf_idx).body.expect("bounded_workflow body");
+    let wf_view = wf_body.view(program.body_types(wf_idx));
+    let wf_sig = program.sig(wf_idx);
+    let adts = ProgramAdts(&program);
+    assert!(wf_checked.suspends, "`.do` workflow must mark checked.suspends == true");
+    assert!(has_do_exprs(&wf_view), "`.do` workflow must report has_do_exprs == true");
+
+    let mut ground_unbounded = PortableTys::new_in(alloc);
+    let mut subst_unbounded = Subst { args: &[], ground: &mut ground_unbounded, scratch: alloc };
+    let unbounded = split_do_machine_body_bounded(
+        &wf_view,
+        wf_checked,
+        &wf_sig,
+        &mut subst_unbounded,
+        &adts,
+        1,
+        MachineBudget::UNBOUNDED,
+        Global,
+    )
+    .unwrap_or_else(|e| panic!("unbounded split_do_machine_body_bounded failed: {e}"));
+    let state_size = unbounded.layout.size;
+    assert!(state_size > 0, "suspended state must have non-zero size");
+    assert!(unbounded.graph.zero_pin_proven);
+    assert_eq!(unbounded.graph.points, 1);
+
+    let mut ground_exact = PortableTys::new_in(alloc);
+    let mut subst_exact = Subst { args: &[], ground: &mut ground_exact, scratch: alloc };
+    let exact = split_do_machine_body_bounded(
+        &wf_view,
+        wf_checked,
+        &wf_sig,
+        &mut subst_exact,
+        &adts,
+        1,
+        MachineBudget::max_bytes(state_size),
+        Global,
+    )
+    .unwrap_or_else(|e| panic!("exact state_size budget must pass: {e}"));
+    assert_eq!(exact.layout.size, state_size);
+    assert!(exact.graph.zero_pin_proven);
+
+    let tight = state_size - 1;
+    let mut ground_tight = PortableTys::new_in(alloc);
+    let mut subst_tight = Subst { args: &[], ground: &mut ground_tight, scratch: alloc };
+    let err = split_do_machine_body_bounded(
+        &wf_view,
+        wf_checked,
+        &wf_sig,
+        &mut subst_tight,
+        &adts,
+        1,
+        MachineBudget::max_bytes(tight),
+        Global,
+    )
+    .err()
+    .expect("budget - 1 must fail with DoMachineError::Machine(MachineError::StateSizeExceeded)");
+    match err {
+        DoMachineError::Machine(MachineError::StateSizeExceeded { actual, max, largest_field_size }) => {
+            assert_eq!(actual, state_size);
+            assert_eq!(max, tight);
+            assert!(largest_field_size > 0, "largest_field_size must be positive");
+        }
+        other => panic!("expected DoMachineError::Machine(StateSizeExceeded), got {other:?}"),
+    }
+}
+
+#[test]
+fn real_rust_defer_lifo_on_cancel_and_normal_exit_graph_proof() {
+    let alloc = Alloc::global();
+    let tc = Toolchain::none(alloc);
+    let root = "/defer-do/src/main.rs";
+    let files = [(root.to_owned(), DEFER_DO_PROGRAM.to_owned())];
+    let user = UserCrate {
+        name: "defer_do",
+        dir: "/defer-do/",
+        root,
+        files: &files,
+        edition: edition::PackageEdition::of_manifest(EDITION).expect("blaze edition"),
+        panic: Panic::Abort,
+    };
+    let inputs = Inputs::new(&user, &tc).expect("inputs");
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("resolve names");
+    let sources = [SourceFile { path: "src/main.rs", text: DEFER_DO_PROGRAM }];
+
+    let check_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("check frame");
+    let mut world = ProjectWorld::new(&names, &check_frame, &sources, alloc).expect("project world");
+    let wf_key = names
+        .items(0)
+        .find_map(|(k, _, _)| (names.item_text(k)?.name == Some("deferred_workflow")).then_some(k))
+        .expect("deferred_workflow item");
+    let verdict = world.check(BodyRef::Free(wf_key), alloc);
+    assert!(verdict.is_clean(), "deferred_workflow must typecheck clean: {verdict:?}");
+    assert!(verdict.undecided.is_empty(), "deferred_workflow must have no undecided items: {verdict:?}");
+    assert!(verdict.findings.is_empty(), "deferred_workflow must have zero findings: {verdict:?}");
+
+    let prog_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("program frame");
+    let mut program = Front2Program::new(&names, &prog_frame, &sources, alloc).expect("front2 program");
+    let checked = program.check_all().expect("check_all");
+    let wf_idx = (0..program.fn_count())
+        .find(|&i| {
+            let path = program.function(i).path;
+            path == "deferred_workflow" || path.ends_with("::deferred_workflow")
+        })
+        .expect("deferred_workflow row in Front2Program");
+    let wf_checked = checked[wf_idx].as_ref().expect("deferred_workflow checked record");
+    assert!(wf_checked.suspends, "deferred_workflow must mark checked.suspends == true");
+
+    let (body, _) = program.function(wf_idx).body.expect("deferred_workflow body");
+    let view = body.view(program.body_types(wf_idx));
+    assert!(has_do_exprs(&view), "deferred_workflow must report has_do_exprs == true");
+    let sig = program.sig(wf_idx);
+    let adts = ProgramAdts(&program);
+
+    // 1. Build pre-split LIR and confirm 2 suspend points and bounded grace_max_steps == 2.
+    let mut ground_pre = PortableTys::new_in(alloc);
+    let mut subst_pre = Subst { args: &[], ground: &mut ground_pre, scratch: alloc };
+    let (pre_func, shape) = build_do_machine_body(&view, wf_checked, &sig, &mut subst_pre, &adts, 2, Global)
+        .unwrap_or_else(|e| panic!("build_do_machine_body failed: {e}"));
+    blaze_lir::verify(pre_func.view()).expect("pre-split deferred `.do` body must verify");
+    let suspend_count = (0..pre_func.view().len()).filter(|&i| pre_func.view().op(i) == Op::Suspend).count();
+    assert_eq!(suspend_count, 2, "expected 2 Op::Suspend ops in nested defer `.do` workflow");
+    assert_eq!(shape.grace_max_steps, 2);
+
+    // 2. Lower via `split_do_machine_body_bounded` and verify `on_cancel` reachability from every
+    //    suspended state plus normal exit path.
+    let mut ground_split = PortableTys::new_in(alloc);
+    let mut subst_split = Subst { args: &[], ground: &mut ground_split, scratch: alloc };
+    let split = split_do_machine_body_bounded(
+        &view,
+        wf_checked,
+        &sig,
+        &mut subst_split,
+        &adts,
+        2,
+        MachineBudget::UNBOUNDED,
+        Global,
+    )
+    .unwrap_or_else(|e| panic!("split_do_machine_body_bounded failed: {e}"));
+    assert!(split.graph.zero_pin_proven, "nested defer `.do` machine must prove zero_pin_proven");
+    assert_eq!(split.graph.points, 2);
+    assert!(split.graph.reaches_return(), "machine must reach normal Return");
+    assert!(split.graph.has_cancel_edge(0), "suspend point 0 must reach on_cancel");
+    assert!(split.graph.has_cancel_edge(1), "suspend point 1 must reach on_cancel");
+    assert!(
+        split
+            .graph
+            .edges
+            .contains(&MachineEdge { from_point: None, to_point: None, kind: MachineEdgeKind::Cancel }),
+        "entry state must have an unresumed Cancel edge: {:?}",
+        split.graph.edges,
+    );
+    blaze_lir::verify(split.step.view()).expect("split step function must verify");
+    blaze_lir::verify(split.on_cancel.view()).expect("split on_cancel function must verify");
+
+    // 3. Project the lowered transition summary + LIFO defer cleanup chain into `MachineGraph`
+    //    and prove bounded cancellation termination within `shape.grace_max_steps` (2 steps:
+    //    inner defer -> outer defer -> Abandon), plus planted-bug controls.
+    let states = [
+        StateNode { id: StateId(0), name: "Entry", loop_state: false, initial_handles: 0 },
+        StateNode { id: StateId(1), name: "Suspend0", loop_state: false, initial_handles: 0 },
+        StateNode { id: StateId(2), name: "Suspend1", loop_state: false, initial_handles: 0 },
+        StateNode { id: StateId(3), name: "CancelInnerDefer", loop_state: false, initial_handles: 0 },
+        StateNode { id: StateId(4), name: "CancelOuterDefer", loop_state: false, initial_handles: 0 },
+    ];
+    let mut graph_edges = std::vec::Vec::new();
+    for edge in &split.graph.edges {
+        let from = match edge.from_point {
+            None => StateId(0),
+            Some(p) => StateId((p + 1) as u16),
+        };
+        let (kind, label) = match (edge.kind, edge.from_point, edge.to_point) {
+            (MachineEdgeKind::Suspend, _, Some(to)) => (EdgeKind::Ask { to: StateId((to + 1) as u16) }, "do_suspend"),
+            (MachineEdgeKind::Return, _, None) => (EdgeKind::Done, "normal_exit_lifo_defers"),
+            (MachineEdgeKind::Cancel, None, None) => (EdgeKind::Abandon, "cancel_unresumed"),
+            (MachineEdgeKind::Cancel, Some(0), None) => {
+                (EdgeKind::CancelCleanup { to: StateId(4) }, "cancel_p0_outer_defer")
+            }
+            (MachineEdgeKind::Cancel, Some(1), None) => {
+                (EdgeKind::CancelCleanup { to: StateId(3) }, "cancel_p1_inner_defer")
+            }
+            other => panic!("unexpected lowered machine edge: {other:?}"),
+        };
+        graph_edges.push(GraphEdge { from, kind, handle_op: HandleOp::None, label });
+    }
+    graph_edges.push(GraphEdge {
+        from: StateId(3),
+        kind: EdgeKind::CancelCleanup { to: StateId(4) },
+        handle_op: HandleOp::None,
+        label: "lifo_inner_to_outer_defer",
+    });
+    graph_edges.push(GraphEdge {
+        from: StateId(4),
+        kind: EdgeKind::Abandon,
+        handle_op: HandleOp::None,
+        label: "outer_defer_complete",
+    });
+
+    let verified_graph = MachineGraph {
+        name: "deferred_workflow",
+        entry: StateId(0),
+        grace_max_steps: shape.grace_max_steps,
+        states: &states,
+        edges: &graph_edges,
+    };
+    assert_eq!(verify_graph(&verified_graph), Ok(()));
+
+    // Tighter grace budget (1 < 2 nested defer cleanup steps) must be rejected by `verify_graph`,
+    // and only passes when `GraphPlant::SkipCancelBoundCheck` is planted.
+    let tight_grace_graph = MachineGraph { grace_max_steps: 1, ..verified_graph };
+    assert_eq!(
+        verify_graph(&tight_grace_graph),
+        Err(GraphError::UnboundedCancelCleanup { start: StateId(2), steps: 2, max_steps: 1 }),
+    );
+    assert_eq!(verify_graph_with(&tight_grace_graph, GraphPlant::SkipCancelBoundCheck), Ok(()));
+
+    // LIR-level `MachinePlant` controls on the exact real-Rust pre-split body:
+    // (a) `MachinePlant::SkipStateSizeCheck` bypasses a tight budget that `MachinePlant::None` rejects.
+    let tight_budget = MachineBudget::max_bytes(split.layout.size - 1);
+    assert!(matches!(
+        split_machine_bounded(pre_func.view(), shape, tight_budget, MachinePlant::None, Global),
+        Err(MachineError::StateSizeExceeded { .. }),
+    ));
+    let bypassed = split_machine_bounded(
+        pre_func.view(),
+        shape,
+        tight_budget,
+        MachinePlant::SkipStateSizeCheck,
+        Global,
+    )
+    .expect("SkipStateSizeCheck plant must bypass tight budget");
+    assert_eq!(bypassed.layout.size, split.layout.size);
+
+    // (b) Both suspend points plus terminal return emit explicit tag stores in `step`, and both
+    //     lowered functions (`step` and `on_cancel`) verify cleanly as LIR.
+    let clean_tag_stores = count_const_tag_stores(split.step.view(), split.layout.tag_offset);
+    assert!(
+        clean_tag_stores >= 3,
+        "two suspend points + terminal return must emit >= 3 tag stores (got {clean_tag_stores})",
+    );
+    blaze_lir::verify(split.step.view()).expect("split.step must verify cleanly");
+    blaze_lir::verify(split.on_cancel.view()).expect("split.on_cancel must verify cleanly");
+}
+
+/// Real `#![no_core]` Rust source containing a pure function and a suspending `.do` function used
+/// to verify effect-polymorphic specialization (`PlainFn` vs `MachineCoroutine`) end to end.
+const EFFECT_POLY_PROGRAM: &str = r#"#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = "sized"]
+trait Sized {}
+
+#[lang = "copy"]
+trait Copy {}
+
+impl Copy for u64 {}
+
+trait Request {
+    type Answer;
+}
+
+struct Ping(u64);
+impl Copy for Ping {}
+
+impl Request for Ping {
+    type Answer = u64;
+}
+
+fn pure_step(x: u64) -> u64 {
+    x + 1
+}
+
+fn suspending_step(x: u64, req: Ping) -> u64 {
+    let a = req.do;
+    x + a
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    let p = pure_step(1);
+    let _ = suspending_step(p, Ping(2));
+    0
+}
+"#;
+
+/// Real `#![no_core]` Rust source carrying both `#![blaze::sans_io]` at the crate root and
+/// `#[blaze::syscalls(fs, clock)]` on a driver-boundary function.
+const SANS_IO_SYSCALLS_PROGRAM: &str = r#"#![feature(no_core, lang_items, register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::sans_io]
+#![no_core]
+#![no_main]
+
+#[lang = "sized"]
+trait Sized {}
+
+#[lang = "copy"]
+trait Copy {}
+
+impl Copy for u64 {}
+
+fn pure_core(x: u64) -> u64 {
+    x + 1
+}
+
+#[blaze::syscalls(fs, clock)]
+fn fs_clock_driver(x: u64) -> u64 {
+    pure_core(x) + 2
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    let _ = fs_clock_driver(1);
+    0
+}
+"#;
+
+#[test]
+fn real_rust_effect_polymorphic_higher_order_lowers_pure_to_plain_fn_and_do_to_machine() {
+    let alloc = Alloc::global();
+    let tc = Toolchain::none(alloc);
+    let root = "/effect-poly/src/main.rs";
+    let files = [(root.to_owned(), EFFECT_POLY_PROGRAM.to_owned())];
+    let user = UserCrate {
+        name: "effect_poly",
+        dir: "/effect-poly/",
+        root,
+        files: &files,
+        edition: edition::PackageEdition::of_manifest(EDITION).expect("blaze edition"),
+        panic: Panic::Abort,
+    };
+    let inputs = Inputs::new(&user, &tc).expect("inputs");
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("resolve names");
+    let sources = [SourceFile { path: "src/main.rs", text: EFFECT_POLY_PROGRAM }];
+
+    let prog_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("program frame");
+    let mut program = Front2Program::new(&names, &prog_frame, &sources, alloc).expect("front2 program");
+    let checked = program.check_all().expect("check_all");
+
+    let find_fn = |name: &str| {
+        (0..program.fn_count())
+            .find(|&i| {
+                let path = program.function(i).path;
+                path == name || path.ends_with(&format!("::{name}"))
+            })
+            .unwrap_or_else(|| panic!("missing `{name}` in Front2Program"))
+    };
+
+    // 1. Real pure body: zero `.do` expressions -> `EffectSet::PURE` -> `LoweringMode::PlainFn`.
+    let pure_idx = find_fn("pure_step");
+    let pure_checked = checked[pure_idx].as_ref().expect("pure_step checked record");
+    assert!(pure_checked.diags.is_empty(), "pure_step diags: {:?}", pure_checked.diags);
+    assert!(!pure_checked.suspends, "pure_step must not mark checked.suspends");
+    let (pure_body, _) = program.function(pure_idx).body.expect("pure_step body");
+    let pure_view = pure_body.view(program.body_types(pure_idx));
+    assert!(!has_do_exprs(&pure_view), "pure_step must report has_do_exprs == false");
+
+    // 2. Real `.do` body: has `.do` expression -> `EffectSet::SUSPEND` -> `LoweringMode::MachineCoroutine`.
+    let do_idx = find_fn("suspending_step");
+    let do_checked = checked[do_idx].as_ref().expect("suspending_step checked record");
+    assert!(do_checked.diags.is_empty(), "suspending_step diags: {:?}", do_checked.diags);
+    assert!(do_checked.suspends, "suspending_step must mark checked.suspends == true");
+    let (do_body, _) = program.function(do_idx).body.expect("suspending_step body");
+    let do_view = do_body.view(program.body_types(do_idx));
+    assert!(has_do_exprs(&do_view), "suspending_step must report has_do_exprs == true");
+    let do_sig = program.sig(do_idx);
+    let adts = ProgramAdts(&program);
+
+    let mut ground = PortableTys::new_in(alloc);
+    let mut subst = Subst { args: &[], ground: &mut ground, scratch: alloc };
+    let split = split_do_machine_body_bounded(
+        &do_view,
+        do_checked,
+        &do_sig,
+        &mut subst,
+        &adts,
+        1,
+        MachineBudget::UNBOUNDED,
+        Global,
+    )
+    .unwrap_or_else(|e| panic!("split_do_machine_body_bounded failed: {e}"));
+    assert!(split.graph.zero_pin_proven);
+    assert!(split.graph.points >= 1, "expected >= 1 suspend point, got {}", split.graph.points);
+
+    // 3. Higher-order polymorphic effect row `expect(e)` specializes cleanly to `PlainFn` for the
+    //    pure callback and `MachineCoroutine` for the `.do` callback.
+    let e = EffectVar(0);
+    let ho_row_set = EffectRowSet::poly(EffectSet::PURE, e);
+    let ho_row = EffectRow::poly(EffectSet::PURE, e);
+    assert_eq!(ho_row_set.lowering_mode(), None, "uninstantiated polymorphic row has no fixed mode");
+
+    let pure_effects = if has_do_exprs(&pure_view) { EffectSet::SUSPEND } else { EffectSet::PURE };
+    let do_effects = if has_do_exprs(&do_view) { EffectSet::SUSPEND } else { EffectSet::PURE };
+    assert_eq!(pure_effects, EffectSet::PURE);
+    assert_eq!(do_effects, EffectSet::SUSPEND);
+    assert_eq!(LoweringMode::for_effects(pure_effects), LoweringMode::PlainFn);
+    assert_eq!(LoweringMode::for_effects(do_effects), LoweringMode::MachineCoroutine);
+
+    assert_eq!(
+        specialize_call(ho_row_set, &[(e, pure_effects)], EffectSet::PURE),
+        Ok((EffectSet::PURE, LoweringMode::PlainFn)),
+    );
+    assert_eq!(
+        check_higher_order_call(ho_row, pure_effects, EffectSet::PURE),
+        Ok((EffectSet::PURE, LoweringMode::PlainFn)),
+    );
+
+    assert_eq!(
+        specialize_call(ho_row_set, &[(e, do_effects)], EffectSet::SUSPEND),
+        Ok((EffectSet::SUSPEND, LoweringMode::MachineCoroutine)),
+    );
+    assert_eq!(
+        check_higher_order_call(ho_row, do_effects, EffectSet::SUSPEND),
+        Ok((EffectSet::SUSPEND, LoweringMode::MachineCoroutine)),
+    );
+    assert_eq!(
+        specialize_call(ho_row_set, &[(e, do_effects)], EffectSet::PURE),
+        Err(EffectPolyError::EffectExceedsAllowed {
+            required: EffectSet::SUSPEND,
+            allowed: EffectSet::PURE,
+        }),
+    );
+
+    // 4. `dyn Fn` object-safety: pure callback coerces cleanly, while suspending `.do` callback
+    //    is refused with `EffectPolyError::SuspendBehindDyn`.
+    assert_eq!(check_dyn_fn_effects(pure_effects, EffectSet::ALLOC), Ok(()));
+    assert_eq!(
+        check_dyn_fn_effects(do_effects, EffectSet::ALL),
+        Err(EffectPolyError::SuspendBehindDyn { callback_effects: EffectSet::SUSPEND }),
+    );
+}
+
+#[test]
+fn real_rust_sans_io_and_syscalls_attr_policy_enforcement() {
+    // 1. Verify `blaze-surface` classifies both `sans_io` and `syscalls` in `Stage::Effects`.
+    let BlazeAttr::Known(sans_io_idx) = classify("sans_io") else {
+        panic!("expected `blaze::sans_io` to classify as Known");
+    };
+    assert_eq!(KNOWN[usize::from(sans_io_idx)].planned, Stage::Effects);
+
+    let BlazeAttr::Known(syscalls_idx) = classify("syscalls") else {
+        panic!("expected `blaze::syscalls` to classify as Known");
+    };
+    assert_eq!(KNOWN[usize::from(syscalls_idx)].state, State::Checked(Stage::Effects));
+
+    // 2. Compile real `#![no_core]` Rust source carrying `#![blaze::sans_io]` and
+    //    `#[blaze::syscalls(fs, clock)]` cleanly through `front2` with zero diagnostics.
+    let alloc = Alloc::global();
+    let tc = Toolchain::none(alloc);
+    let root = "/sans-io-policy/src/main.rs";
+    let files = [(root.to_owned(), SANS_IO_SYSCALLS_PROGRAM.to_owned())];
+    let user = UserCrate {
+        name: "sans_io_policy",
+        dir: "/sans-io-policy/",
+        root,
+        files: &files,
+        edition: edition::PackageEdition::of_manifest(EDITION).expect("blaze edition"),
+        panic: Panic::Abort,
+    };
+    let inputs = Inputs::new(&user, &tc).expect("inputs");
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("resolve names");
+    let sources = [SourceFile { path: "src/main.rs", text: SANS_IO_SYSCALLS_PROGRAM }];
+
+    let check_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("check frame");
+    let mut world = ProjectWorld::new(&names, &check_frame, &sources, alloc).expect("project world");
+    for fn_name in ["pure_core", "fs_clock_driver"] {
+        let key = names
+            .items(0)
+            .find_map(|(k, _, _)| (names.item_text(k)?.name == Some(fn_name)).then_some(k))
+            .unwrap_or_else(|| panic!("missing item `{fn_name}`"));
+        let verdict = world.check(BodyRef::Free(key), alloc);
+        assert!(verdict.is_clean(), "`{fn_name}` must typecheck clean: {verdict:?}");
+        assert!(verdict.undecided.is_empty(), "`{fn_name}` must have no undecided items: {verdict:?}");
+        assert!(verdict.findings.is_empty(), "`{fn_name}` must have zero findings: {verdict:?}");
+    }
+
+    let prog_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("program frame");
+    let mut program = Front2Program::new(&names, &prog_frame, &sources, alloc).expect("front2 program");
+    let checked = program.check_all().expect("check_all");
+
+    let find_fn = |name: &str| {
+        (0..program.fn_count())
+            .find(|&i| {
+                let path = program.function(i).path;
+                path == name || path.ends_with(&format!("::{name}"))
+            })
+            .unwrap_or_else(|| panic!("missing `{name}` in Front2Program"))
+    };
+
+    let pure_idx = find_fn("pure_core");
+    let driver_idx = find_fn("fs_clock_driver");
+    let pure_key = program.function(pure_idx).key;
+    let driver_key = program.function(driver_idx).key;
+    assert!(checked[pure_idx].as_ref().expect("pure_core checked").diags.is_empty());
+    assert!(checked[driver_idx].as_ref().expect("fs_clock_driver checked").diags.is_empty());
+
+    // 3. Enforce `#![blaze::sans_io]` via `check_sans_io_effects`: pure computation passes, while
+    //    `SyscallSet::NET` and `EffectSet::SUSPEND` are refused.
+    let sans_io_attrs = TypeAttrs(TypeAttrs::SANS_IO);
+    assert_eq!(check_sans_io_effects(pure_key, sans_io_attrs, EffectSet::PURE, SyscallSet::EMPTY), Ok(()));
+    assert_eq!(
+        check_sans_io_effects(pure_key, sans_io_attrs, EffectSet::PURE, SyscallSet::NET),
+        Err(SansIoBodyFinding {
+            owner: pure_key,
+            error: SyscallPolicyError::SansIoViolation {
+                effects: EffectSet::PURE,
+                syscalls: SyscallSet::NET,
+            },
+        }),
+    );
+    assert_eq!(
+        check_sans_io_effects(pure_key, sans_io_attrs, EffectSet::SUSPEND, SyscallSet::EMPTY),
+        Err(SansIoBodyFinding {
+            owner: pure_key,
+            error: SyscallPolicyError::SansIoViolation {
+                effects: EffectSet::SUSPEND,
+                syscalls: SyscallSet::EMPTY,
+            },
+        }),
+    );
+
+    // 4. Enforce `#[blaze::syscalls(fs, clock)]` via `check_body_syscall_policy`: accepts
+    //    `FS | CLOCK` and refuses `PROC`.
+    let fs = SyscallSet::from_word("fs").expect("`fs` syscall domain");
+    let clock = SyscallSet::from_word("clock").expect("`clock` syscall domain");
+    assert_eq!(fs, SyscallSet::FS);
+    assert_eq!(clock, SyscallSet::CLOCK);
+    let allowed = fs.union(clock);
+    assert_eq!(check_body_syscall_policy(driver_key, allowed, allowed), Ok(()));
+    assert_eq!(check_body_syscall_policy(driver_key, SyscallSet::FS, allowed), Ok(()));
+    assert_eq!(check_body_syscall_policy(driver_key, SyscallSet::CLOCK, allowed), Ok(()));
+    assert_eq!(
+        check_body_syscall_policy(driver_key, SyscallSet::PROC, allowed),
+        Err(SansIoBodyFinding {
+            owner: driver_key,
+            error: SyscallPolicyError::SyscallExceedsPolicy {
+                required: SyscallSet::PROC,
+                allowed,
+            },
+        }),
     );
 }

@@ -713,6 +713,289 @@ impl<'a> Machine for HttpExchangeMachine<'a> {
     }
 }
 
+/// Handler-level error returned by [`NetHttpHandler`] on invalid handles, out-of-bounds sends,
+/// or requests after close.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NetHttpHandlerError {
+    /// Request named a [`ConnHandle`] other than the one bound to this handler.
+    UnknownHandle { expected: ConnHandle, got: ConnHandle },
+    /// Request attempted I/O or a second close after the underlying connection was already closed.
+    AlreadyClosed { conn: ConnHandle },
+    /// [`HttpStepReq::Send`] requested a byte range outside the encoded request wire buffer.
+    SendOutOfBounds { offset: usize, len: usize, wire_len: usize },
+}
+
+impl fmt::Display for NetHttpHandlerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            NetHttpHandlerError::UnknownHandle { expected, got } => write!(
+                f,
+                "net http handler handle mismatch: expected {:?}, got {:?}",
+                expected, got
+            ),
+            NetHttpHandlerError::AlreadyClosed { conn } => {
+                write!(f, "net http handler connection {:?} is already closed", conn)
+            }
+            NetHttpHandlerError::SendOutOfBounds { offset, len, wire_len } => write!(
+                f,
+                "net http handler send range {offset}..+{len} out of bounds for wire len {wire_len}"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for NetHttpHandlerError {}
+
+/// Failure returned by [`drive_exchange_over_net`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum NetExchangeError {
+    /// Establishing the underlying [`crate::net::Conn`] failed.
+    Connect(crate::net::NetError),
+    /// Driving [`HttpExchangeMachine`] failed (protocol, timeout, transport, or handler error).
+    Drive(blaze_machine::DriveError<HttpExchangeError, NetHttpHandlerError>),
+    /// Closing any remaining linear connection after driving failed.
+    Finish(crate::net::NetError),
+}
+
+impl fmt::Display for NetExchangeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NetExchangeError::Connect(err) => write!(f, "net http connect failed: {err}"),
+            NetExchangeError::Drive(err) => write!(f, "net http exchange failed: {err}"),
+            NetExchangeError::Finish(err) => write!(f, "net http finish failed: {err}"),
+        }
+    }
+}
+
+impl core::error::Error for NetExchangeError {}
+
+/// Real [`blaze_machine::Handler`]`<`[`HttpStepReq`]`>` adapter driving [`HttpExchangeMachine`]
+/// directly over a [`crate::net::Conn`] and [`crate::cx::Cx`] with zero duplicate HTTP framing.
+///
+/// Linear (`#[blaze::linear]`): owns the open [`crate::net::Conn`] until [`HttpStepReq::Close`]
+/// consumes it via [`crate::net::Conn::finish`], and must be finalized with
+/// [`NetHttpHandler::finish`] so an abandoned machine can never leak its connection.
+#[blaze::linear]
+#[must_use = "a NetHttpHandler owns a linear Conn and must be finalized with finish()"]
+pub struct NetHttpHandler<'cx, 'w> {
+    cx: &'cx crate::cx::Cx,
+    expected: ConnHandle,
+    conn: Option<crate::net::Conn>,
+    wire: &'w [u8],
+    bytes_sent: usize,
+    closed: bool,
+}
+
+impl<'cx, 'w> NetHttpHandler<'cx, 'w> {
+    /// Wraps an already-connected [`crate::net::Conn`] and encoded HTTP/1.1 request wire slice.
+    #[inline]
+    pub const fn new(
+        cx: &'cx crate::cx::Cx,
+        expected: ConnHandle,
+        conn: crate::net::Conn,
+        wire: &'w [u8],
+    ) -> Self {
+        Self { cx, expected, conn: Some(conn), wire, bytes_sent: 0, closed: false }
+    }
+
+    /// Connects to `at` through `net` under `cx` and wraps the resulting [`crate::net::Conn`].
+    pub fn connect(
+        cx: &'cx crate::cx::Cx,
+        net: &crate::net::Net,
+        at: &crate::net::Addr,
+        expected: ConnHandle,
+        wire: &'w [u8],
+    ) -> Result<Self, crate::net::NetError> {
+        let conn = net.connect(cx, at)?;
+        Ok(Self::new(cx, expected, conn, wire))
+    }
+
+    /// Returns `true` once [`HttpStepReq::Close`] has consumed and closed the underlying
+    /// [`crate::net::Conn`].
+    #[inline]
+    pub const fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Total request wire bytes written through [`HttpStepReq::Send`].
+    #[inline]
+    pub const fn bytes_sent(&self) -> usize {
+        self.bytes_sent
+    }
+
+    /// Consumes this linear handler, closing the underlying [`crate::net::Conn`] if the machine
+    /// terminated without emitting [`HttpStepReq::Close`].
+    #[blaze::consumes]
+    pub fn finish(self) -> Result<(), crate::net::NetError> {
+        let Self { cx, conn, .. } = self;
+        match conn {
+            Some(conn) => conn.finish(cx),
+            None => Ok(()),
+        }
+    }
+
+    fn step_cx(&self, timeout: Duration) -> crate::cx::Cx {
+        let deadline = blaze_core::wait::Deadline::after(self.cx.io().now(), timeout);
+        self.cx.until(deadline)
+    }
+}
+
+impl blaze_machine::Handler<HttpStepReq> for NetHttpHandler<'_, '_> {
+    type Error = NetHttpHandlerError;
+
+    fn perform<Out>(
+        &mut self,
+        request: HttpStepReq,
+        deliver: impl FnOnce(blaze_machine::Perform<HttpStepAns<'_>>) -> Out,
+    ) -> Result<Out, Self::Error> {
+        use blaze_machine::{GraceBudget, Perform};
+
+        match request {
+            HttpStepReq::Send { conn, offset, len, timeout } => {
+                if conn != self.expected {
+                    return Err(NetHttpHandlerError::UnknownHandle {
+                        expected: self.expected,
+                        got: conn,
+                    });
+                }
+                let Some(end) = offset.checked_add(len) else {
+                    return Err(NetHttpHandlerError::SendOutOfBounds {
+                        offset,
+                        len,
+                        wire_len: self.wire.len(),
+                    });
+                };
+                let Some(slice) = self.wire.get(offset..end) else {
+                    return Err(NetHttpHandlerError::SendOutOfBounds {
+                        offset,
+                        len,
+                        wire_len: self.wire.len(),
+                    });
+                };
+                let wait = self.step_cx(timeout);
+                let own_timeout = wait.deadline() != self.cx.deadline();
+                let Some(net_conn) = self.conn.as_ref() else {
+                    return Err(NetHttpHandlerError::AlreadyClosed { conn });
+                };
+                match net_conn.send_all(&wait, slice) {
+                    Ok(()) => {
+                        self.bytes_sent = self.bytes_sent.saturating_add(slice.len());
+                        Ok(deliver(Perform::Answered(HttpStepAns::Sent(
+                            RaceOutcome::First(Ok(slice.len())),
+                        ))))
+                    }
+                    Err(err) => match err.kind {
+                        crate::net::NetKind::Stopped(crate::Stopped::Deadline { .. })
+                            if own_timeout =>
+                        {
+                            Ok(deliver(Perform::Answered(HttpStepAns::Sent(
+                                RaceOutcome::Second(()),
+                            ))))
+                        }
+                        crate::net::NetKind::Stopped(crate::Stopped::Cancelled { .. }) => {
+                            Ok(deliver(Perform::Stopped(Stopped::cancelled(
+                                GraceBudget::DEFAULT,
+                            ))))
+                        }
+                        crate::net::NetKind::Stopped(_) => Ok(deliver(Perform::Stopped(
+                            Stopped::deadline(GraceBudget::DEFAULT),
+                        ))),
+                        _ => Ok(deliver(Perform::Answered(HttpStepAns::Sent(
+                            RaceOutcome::First(Err(TransportError::WriteFailed)),
+                        )))),
+                    },
+                }
+            }
+            HttpStepReq::RecvWithTimeout { conn, max_bytes, timeout } => {
+                if conn != self.expected {
+                    return Err(NetHttpHandlerError::UnknownHandle {
+                        expected: self.expected,
+                        got: conn,
+                    });
+                }
+                let wait = self.step_cx(timeout);
+                let own_timeout = wait.deadline() != self.cx.deadline();
+                let Some(net_conn) = self.conn.as_ref() else {
+                    return Err(NetHttpHandlerError::AlreadyClosed { conn });
+                };
+                let mut received = self.cx.bytes();
+                match net_conn.recv(&wait, max_bytes, &mut received) {
+                    Ok(_) => Ok(deliver(Perform::Answered(HttpStepAns::RecvOrTimeout(
+                        RaceOutcome::First(Ok(received.as_slice())),
+                    )))),
+                    Err(err) => match err.kind {
+                        crate::net::NetKind::Stopped(crate::Stopped::Deadline { .. })
+                            if own_timeout =>
+                        {
+                            Ok(deliver(Perform::Answered(HttpStepAns::RecvOrTimeout(
+                                RaceOutcome::Second(()),
+                            ))))
+                        }
+                        crate::net::NetKind::Stopped(crate::Stopped::Cancelled { .. }) => {
+                            Ok(deliver(Perform::Stopped(Stopped::cancelled(
+                                GraceBudget::DEFAULT,
+                            ))))
+                        }
+                        crate::net::NetKind::Stopped(_) => Ok(deliver(Perform::Stopped(
+                            Stopped::deadline(GraceBudget::DEFAULT),
+                        ))),
+                        _ => Ok(deliver(Perform::Answered(HttpStepAns::RecvOrTimeout(
+                            RaceOutcome::First(Err(TransportError::ReadFailed)),
+                        )))),
+                    },
+                }
+            }
+            HttpStepReq::Close { conn } => {
+                if conn != self.expected {
+                    return Err(NetHttpHandlerError::UnknownHandle {
+                        expected: self.expected,
+                        got: conn,
+                    });
+                }
+                let Some(net_conn) = self.conn.take() else {
+                    return Err(NetHttpHandlerError::AlreadyClosed { conn });
+                };
+                self.closed = true;
+                let res = match net_conn.finish(self.cx) {
+                    Ok(()) => Ok(()),
+                    Err(_) => Err(TransportError::CloseFailed),
+                };
+                Ok(deliver(Perform::Answered(HttpStepAns::Closed(res))))
+            }
+        }
+    }
+}
+
+/// Connects to `at` over `net` and drives `machine` to completion through [`crate::cx::Cx::drive_machine`]
+/// using [`NetHttpHandler`], guaranteeing linear teardown of the underlying [`crate::net::Conn`].
+pub fn drive_exchange_over_net<'a>(
+    cx: &crate::cx::Cx,
+    net: &crate::net::Net,
+    at: &crate::net::Addr,
+    wire: &[u8],
+    machine: HttpExchangeMachine<'a>,
+    handle: ConnHandle,
+    opts: blaze_machine::DriveOpts,
+) -> Result<HttpExchangeOut<'a>, NetExchangeError> {
+    let mut handler =
+        NetHttpHandler::connect(cx, net, at, handle, wire).map_err(NetExchangeError::Connect)?;
+    let driven = cx.drive_machine(
+        "bstd.requests.net_exchange",
+        &mut handler,
+        &mut (),
+        machine,
+        opts,
+    );
+    let finish_res = handler.finish();
+    match driven {
+        Ok(out) => match finish_res {
+            Ok(()) => Ok(out),
+            Err(err) => Err(NetExchangeError::Finish(err)),
+        },
+        Err(err) => Err(NetExchangeError::Drive(err)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::{num::NonZeroU32, time::Duration};
@@ -1304,5 +1587,169 @@ mod tests {
         assert!(text.contains("RecvWithTimeout {"), "missing RecvWithTimeout request:\n{text}");
         assert!(text.contains("Close {"), "missing Close request:\n{text}");
         assert!(text.contains("RecvOrTimeout("), "missing RecvOrTimeout answer:\n{text}");
+    }
+
+    /// Drives [`HttpExchangeMachine`] over a real simulated TCP pair (`Io::sim()` + `bstd::net`)
+    /// through [`NetHttpHandler`] and [`crate::cx::Cx::drive_machine`], verifying request wire
+    /// delivery, chunked response parsing, and linear connection teardown.
+    #[test]
+    fn net_http_handler_drives_http_exchange_over_sim_tcp_peer() {
+        use crate::net::{Addr, HostPort};
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let io = Io::simulated(SimWorld::new(41, Limits::USUAL));
+        let cx = io.cx(Duration::from_secs(10), TASK_FRAME).expect("root cx");
+        let net = io.need_net().expect("sim net");
+        let addr = Addr::Tcp(HostPort::parse("127.0.0.1:18080").expect("valid host:port"));
+        let mut listener = net.listen(&cx, &addr).expect("listen");
+
+        let client_conn = net.connect(&cx, &addr).expect("connect");
+        let server_conn = listener.accept(&cx).expect("accept");
+
+        // Pre-stage a chunked HTTP/1.1 response on the peer end of the simulated TCP pair.
+        server_conn
+            .send_all(
+                &cx,
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n-bstd!\r\n0\r\n\r\n",
+            )
+            .expect("server send response");
+
+        let conn_handle = test_conn();
+        let head = sample_head();
+        let (wire, machine) = HttpExchangeMachine::for_request(
+            &head,
+            b"",
+            HttpExchangeOpts {
+                conn: conn_handle,
+                method: Method::Get,
+                range: None,
+                body_most: 64 << 10,
+                reads_most: 16,
+                wait_most: TIMEOUT,
+                recv_chunk: CHUNK,
+                alloc,
+                plant: HttpExchangePlant::None,
+            },
+        )
+        .expect("encode request");
+
+        let mut handler = NetHttpHandler::new(&cx, conn_handle, client_conn, wire.as_slice());
+        let out = cx
+            .drive_machine(
+                "bstd.requests.net_http_handler",
+                &mut handler,
+                &mut (),
+                machine,
+                DriveOpts { max_steps: 16 },
+            )
+            .expect("net exchange succeeds");
+
+        assert!(handler.is_closed(), "HttpExchangeMachine must close NetHttpHandler linearly");
+        assert_eq!(handler.bytes_sent(), wire.len());
+        handler.finish().expect("finish already-closed NetHttpHandler");
+
+        assert_eq!(out.status, 200);
+        assert_eq!(out.body.as_slice(), b"hello-bstd!");
+        assert_eq!(out.range, None);
+
+        // Verify the simulated TCP server received the exact encoded HTTP/1.1 request wire bytes.
+        let mut req_buf = cx.bytes();
+        let mut read_total = 0usize;
+        while read_total < wire.len() {
+            let n = server_conn.recv(&cx, 4096, &mut req_buf).expect("server recv request");
+            if n == 0 {
+                break;
+            }
+            read_total += n;
+        }
+        assert_eq!(req_buf.as_slice(), wire.as_slice());
+
+        server_conn.finish(&cx).expect("server finish");
+        listener.close(&cx).expect("listener close");
+    }
+
+    /// Verifies [`NetHttpHandler`] translates per-step timeouts into [`HttpExchangeError::Silent`],
+    /// closes the underlying [`crate::net::Conn`] linearly, and rejects mismatched handles.
+    #[test]
+    fn net_http_handler_reports_step_timeout_and_closes_handle_linearly() {
+        use crate::net::{Addr, HostPort};
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let io = Io::simulated(SimWorld::new(43, Limits::USUAL));
+        let cx = io.cx(Duration::from_secs(10), TASK_FRAME).expect("root cx");
+        let net = io.need_net().expect("sim net");
+        let addr = Addr::Tcp(HostPort::parse("127.0.0.1:18081").expect("valid host:port"));
+        let mut listener = net.listen(&cx, &addr).expect("listen");
+
+        // 1. Stalling peer: server accepts and never responds -> per-step timeout -> Silent + Close.
+        let client_conn = net.connect(&cx, &addr).expect("connect");
+        let server_conn = listener.accept(&cx).expect("accept");
+
+        let conn_handle = test_conn();
+        let short_timeout = Duration::from_millis(25);
+        let head = sample_head();
+        let (wire, machine) = HttpExchangeMachine::for_request(
+            &head,
+            b"",
+            HttpExchangeOpts {
+                conn: conn_handle,
+                method: Method::Get,
+                range: None,
+                body_most: 4096,
+                reads_most: 4,
+                wait_most: short_timeout,
+                recv_chunk: CHUNK,
+                alloc,
+                plant: HttpExchangePlant::None,
+            },
+        )
+        .expect("encode request");
+
+        let mut handler = NetHttpHandler::new(&cx, conn_handle, client_conn, wire.as_slice());
+        let res = cx.drive_machine(
+            "bstd.requests.net_http_timeout",
+            &mut handler,
+            &mut (),
+            machine,
+            DriveOpts { max_steps: 16 },
+        );
+        assert!(
+            matches!(
+                res,
+                Err(DriveError::Machine(HttpExchangeError::Silent { waited }))
+                    if waited == short_timeout
+            ),
+            "expected Silent timeout error, got {res:?}"
+        );
+        assert!(handler.is_closed(), "timeout path must still emit Close on NetHttpHandler");
+        handler.finish().expect("finish closed NetHttpHandler");
+        server_conn.finish(&cx).expect("server finish");
+
+        // 2. Mismatched ConnHandle is refused with NetHttpHandlerError::UnknownHandle and finish()
+        //    still closes the linear Conn cleanly.
+        let client_conn2 = net.connect(&cx, &addr).expect("connect 2");
+        let server_conn2 = listener.accept(&cx).expect("accept 2");
+        let wrong_handle = ConnHandle::new(99, NonZeroU32::new(2).expect("non-zero generation"));
+        let mut handler2 = NetHttpHandler::new(&cx, conn_handle, client_conn2, wire.as_slice());
+        let bad_res = cx.run_with(
+            "bstd.requests.net_http_bad_handle",
+            &mut handler2,
+            HttpStepReq::Close { conn: wrong_handle },
+            |ans| matches!(ans, HttpStepAns::Closed(Ok(()))),
+        );
+        assert!(
+            matches!(
+                bad_res,
+                Err(crate::cx::RunError::Handler(NetHttpHandlerError::UnknownHandle {
+                    expected,
+                    got,
+                })) if expected == conn_handle && got == wrong_handle
+            ),
+            "expected UnknownHandle error, got {bad_res:?}"
+        );
+        assert!(!handler2.is_closed());
+        handler2.finish().expect("finish unclosed NetHttpHandler");
+        server_conn2.finish(&cx).expect("server finish 2");
+        listener.close(&cx).expect("listener close");
     }
 }

@@ -1397,6 +1397,7 @@ dependencies = [
  "blaze-sys",
  "blaze-tier",
  "blaze-toolchain",
+ "blaze-ty",
  "blaze-typeck",
  "blaze-unit-graph",
  "edition",
