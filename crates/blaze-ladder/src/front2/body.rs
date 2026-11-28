@@ -1527,7 +1527,7 @@ fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, 
         return Err(BodyError::NoBody(key));
     }
     if head_text_inline {
-        store.ensure_field_default_site(names, head_lib, key, head_text);
+        store.ensure_field_default_site(names, head_lib, key, head_text).map_err(|why| BodyError::Record { item: head_lib, owner: key, why })?;
     }
     let head: &FnHead<'n> = match store.fns.get(&key) {
         Some(head) => head,
@@ -2122,14 +2122,19 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     }
     let Some((typeck, tys, type_misses)) = typeck else { return Err(BodyError::Rounds { item, last }) };
     defaults_gate(names, krate, &typeck).map_err(|why| BodyError::Record { item, owner, why })?;
-    if Store::view_has_record_type(&view) {
-        let body_env = Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts, body: None };
+    if Store::view_has_record_type(&view) || !store.record_defaults_by_owner.is_empty() {
         let rec_owner = store
             .locals
             .local_head_owner(names, owner, text)
             .or_else(|| store.locals.library_body(names, keys, item, owner, text).map(|body_lib| (body_lib, text)));
         let rec_lib = rec_owner.map_or(item, |(k, _)| k);
-        store.register_record_defaults(names, keys, rec_lib, rec_owner, &body_env, text_marks, &view).map_err(|why| BodyError::Record { item, owner, why })?;
+        if Store::view_has_record_type(&view) {
+            let body_env = Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts, body: None };
+            store.register_record_defaults(names, keys, rec_lib, rec_owner, &body_env, text_marks, &view).map_err(|why| BodyError::Record { item, owner, why })?;
+        }
+        if !store.record_defaults_by_owner.is_empty() {
+            store.propagate_record_alias_defaults(names, rec_lib, module, text_marks, &view);
+        }
     }
 
     let in_scope = names.traits_in_scope(module, alloc).map_err(|error| BodyError::Traits { item, error })?;

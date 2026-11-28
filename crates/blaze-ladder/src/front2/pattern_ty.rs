@@ -57,16 +57,18 @@ impl<'n, H: Heads, S: NamesSource<'n>> Builder<'_, H, S> {
         if !impls.is_empty() {
             return Err(Why::Unsupported("an `impl Trait` a type macro writes outside a fn's return type", r));
         }
-        // The expansion is a text of its own, read at `env.module`: the item's marks are not
-        // its tokens' (front2 item_site.rs), while enclosing head ownership is carried through
-        // `ExpandedOwner` so item-declaring const blocks in the expansion map back to the
-        // `blaze-scope` expansion block modules created under the direct head call.
+        // The expansion is a text of its own, read at `env.module`: its own expansion marks carry
+        // `$crate`/def-site hygiene onto constant expressions inside the expanded type, while
+        // enclosing head ownership is carried through `ExpandedOwner` so item-declaring const
+        // blocks in the expansion map back to the `blaze-scope` expansion block modules created
+        // under the direct head call.
+        let exp_marks = x.expansion_marks();
         let expanded = self.owner.and_then(|(item, owner_text)| {
             blaze_scope::expansion_origins::offset_in(owner_text, text).map(|base_offset| {
-                super::types::ExpandedOwner { item, owner_text, base_offset, view: x.view() }
+                super::types::ExpandedOwner { item, owner_text, base_offset, view: x.view(), marks: exp_marks }
             })
         });
-        let own = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks: None, owner: self.owner, expanded };
+        let own = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks: exp_marks, owner: self.owner, expanded };
         let own_env = Env { anon: &[], ..*env };
         match sink {
             Some(s) => {

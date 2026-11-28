@@ -857,6 +857,7 @@ pub(super) struct ExpandedOwner<'b> {
     pub(super) owner_text: &'b str,
     pub(super) base_offset: u32,
     pub(super) view: View<'b>,
+    pub(super) marks: Option<blaze_scope::crate_roots::TextMarks<'b>>,
 }
 
 /// The type builder of one item: its resolver, over the names source `S`
@@ -879,6 +880,23 @@ pub struct Builder<'b, H: Heads, S> {
 }
 
 impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
+    /// Selects the token-mark column whose text holds `slice` (`self.marks` or `self.expanded`'s
+    /// expansion marks), falling back to `self.marks`.
+    fn marks_for(&self, slice: &str) -> Option<blaze_scope::crate_roots::TextMarks<'b>> {
+        if let Some(m) = self.marks
+            && blaze_scope::expansion_origins::offset_in(m.text, slice).is_some()
+        {
+            return Some(m);
+        }
+        if let Some(exp) = self.expanded
+            && let Some(em) = exp.marks
+            && blaze_scope::expansion_origins::offset_in(em.text, slice).is_some()
+        {
+            return Some(em);
+        }
+        self.marks
+    }
+
     /// Resolves the `blaze-scope` `MacroCall` key and outermost owner-text call offset for
     /// expansion `target_exp` inside `exp.view`.
     fn resolve_expansion_call(&self, exp: ExpandedOwner<'_>, target_exp: u32) -> Option<super::anon::HeadExpansion> {
@@ -1133,7 +1151,8 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // refused there refuses this head, naming the leaf and the reason.
         let resolve_ty = |abs: bool, segs: &[&str]| self.resolver.path(env.module, abs, segs, Ns::Type);
         let owner_site = carried_owner.or_else(|| self.head_owner_of(orig_source));
-        let need_edits = owner_site.is_some() || self.marks.is_some();
+        let active_marks = self.marks_for(orig_source);
+        let need_edits = owner_site.is_some() || active_marks.is_some();
         blaze_mem::frame::task(blaze_mem::Tag::Parse, |frame| {
         let scratch = blaze_own::Erased::new(frame);
         let mut qpath_edits = need_edits.then(|| self.heads.mark_alloc()).flatten().map(blaze_own::AVec::new_in);
@@ -1155,7 +1174,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             // written path of a macro-written head does (item_site.rs `written_site`): a
             // `$crate::N` another crate's macro wrote is that crate's `N`.
             let first = segs.first().copied().unwrap_or("");
-            let mark = match self.marks.map(|m| m.mark_of(first)) {
+            let mark = match active_marks.map(|m| m.mark_of(first)) {
                 Some(Ok(mark)) => mark,
                 Some(Err(miss)) if first == "crate" => return Err(program(format!("the constant path `{source}`: {miss}"), r)),
                 Some(Err(_)) | None => None,
@@ -1190,7 +1209,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             // `head_marks_with_edits`), and keyed by them (`Ask::carry_marks`): zerocopy's
             // `{ $crate::cryptocorrosion_derive_traits!(..) }` in an impl it writes in ppv-lite86,
             // including after inherent-constant and/or qualified-constant substitution.
-            let carried_marks = if let Some(marks) = self.marks {
+            let carried_marks = if let Some(marks) = active_marks {
                 let mark_edits = final_edits.as_deref().unwrap_or(&[]);
                 match super::anon::head_marks_with_edits(marks, orig_source, text, mark_edits, alloc, r)? {
                     Some(rows) => Some(rows),
@@ -1270,7 +1289,8 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         let self_adt = super::const_inherent::ground_self_adt(tys.view(), env);
         let orig_text = text;
         let orig_owner = self.head_owner_of(orig_text);
-        let need_edits = orig_owner.is_some() || self.marks.is_some();
+        let active_marks = self.marks_for(orig_text);
+        let need_edits = orig_owner.is_some() || active_marks.is_some();
         let mut inherent_edits = need_edits.then(|| self.heads.mark_alloc()).flatten().map(blaze_own::AVec::new_in);
         // The substituted text is kept in the allocator of the type table this call holds.
         let substituted = match super::const_inherent::substitute_mapped(self.heads, &inherent_resolve, self_adt, text, tys.alloc(), inherent_edits.as_mut()) {
@@ -1317,7 +1337,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // anonymous constant is filed with that `Self` in scope. Every other expression is
         // read as before; one over a generic parameter is refused there by name.
         let bits = match super::const_open::ground_self(tys.view(), env, text) {
-            Some((self_ty, self_node)) => super::anon::self_value(self.heads, env.module, node, orig_text, text, self_ty, self_node, self.marks, orig_owner, inherent_edits, r)?,
+            Some((self_ty, self_node)) => super::anon::self_value(self.heads, env.module, node, orig_text, text, self_ty, self_node, active_marks, orig_owner, inherent_edits, r)?,
             None => self.const_value_bits_owned(env, orig_text, text, r, node, orig_owner, inherent_edits)?,
         };
         intern(tys, PNode::ConstValue { ty, bits })

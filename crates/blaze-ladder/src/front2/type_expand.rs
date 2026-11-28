@@ -37,6 +37,9 @@ pub(super) struct Expanded<'a, 't> {
     lowered: Lowered<'a, 't>,
     /// The expanded type, in [`Expanded::view`].
     pub root: lf::TypeId,
+    /// Origin-mark column built over `lowered.view().expanded` when any expansion token carried a
+    /// mark (`$crate` / def-site hygiene); `None` (zero allocation) when unmarked.
+    marks_bytes: Option<blaze_own::AVec<'a, u8>>,
 }
 
 impl<'a, 't> Expanded<'a, 't> {
@@ -44,6 +47,16 @@ impl<'a, 't> Expanded<'a, 't> {
     /// view alone.
     pub(super) fn view(&self) -> View<'_> {
         self.lowered.view()
+    }
+
+    /// Token marks over `self.view().expanded` for constant expressions written inside the
+    /// expanded type (`$crate::N`, def-site hygiene). `None` when the expansion wrote no marked
+    /// tokens.
+    pub(super) fn expansion_marks(&self) -> Option<blaze_scope::crate_roots::TextMarks<'_>> {
+        let bytes = self.marks_bytes.as_deref()?;
+        let text = self.lowered.view().expanded_text().ok()?;
+        let (column, _) = blaze_expand::origin_column::OriginsRef::open(bytes).ok()?;
+        Some(blaze_scope::crate_roots::TextMarks { text, column })
     }
 
     /// The expansion's `impl Trait` types in [`return_impls`]' order (preorder, left to right,
@@ -83,5 +96,11 @@ pub(super) fn expand_type_text<'n, 'a, 't, S: NamesSource<'n>>(
     let lowered = blaze_lower::lower_type_text_expanding(text, edition, &mut CrateCfg(atoms), &mut expand, alloc)
         .map_err(|e| Why::TypeMacro(format!("`{text}`: {e}").into_boxed_str(), r))?;
     let root = lowered.view().type_root().ok_or_else(|| Why::TypeMacro(format!("`{text}` expanded to no type").into_boxed_str(), r))?;
-    Ok(Expanded { lowered, root })
+    let marks_bytes = lowered
+        .view()
+        .expanded_marks(alloc)
+        .ok()
+        .flatten()
+        .and_then(|(exp_str, marked)| blaze_lower::mark_site::column_of_copy(exp_str, &marked, alloc).ok());
+    Ok(Expanded { lowered, root, marks_bytes })
 }

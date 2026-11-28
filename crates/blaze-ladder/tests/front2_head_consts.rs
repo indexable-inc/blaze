@@ -2363,9 +2363,10 @@ fn main() {}
     expect("generic default with owned lifetime and item-declaring const block", &got, &[true, false]);
 }
 
-/// Round 12 P1 #4: identical structural-record default text in two different modules/owners
-/// must receive distinct anonymous default keys (`owner_lib` in `record_default_member_name`)
-/// so the second owner never overwrites the first's `FnHead` or `HeadAnon`.
+/// Round 12 P1 #4 + Round 13 P1 #1: identical structural-record default text in two different
+/// modules/owners must receive distinct anonymous default keys AND stay owner-scoped in
+/// `World::field_defaults` so checking bodies for `a::Rec` and `b::Rec` AFTER both are loaded
+/// evaluates `a::Rec`'s default in `mod a` (`N == 1`) and `b::Rec`'s default in `mod b` (`N == 2`).
 #[test]
 fn structural_record_defaults_with_identical_text_in_distinct_modules_do_not_collide() {
     use blaze_ladder::front2::consts::int_of;
@@ -2377,11 +2378,15 @@ fn structural_record_defaults_with_identical_text_in_distinct_modules_do_not_col
 mod a {
     pub const N: isize = 1;
     pub type Rec = { n: isize = { enum E { V = N } E::V as isize } };
+    pub fn mk() -> Rec { { .. } }
 }
 mod b {
     pub const N: isize = 2;
     pub type Rec = { n: isize = { enum E { V = N } E::V as isize } };
+    pub fn mk() -> Rec { { .. } }
 }
+fn mk_a_root() -> a::Rec { { .. } }
+fn mk_b_root() -> b::Rec { { .. } }
 fn main() {}
 ";
     let alloc = test_alloc();
@@ -2395,16 +2400,15 @@ fn main() {}
     let sources = [SourceFile { path: "src/main.rs", text: TEXT }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
     let front = Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
-    let rec_a = names::path(&names, names.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments: &["a", "Rec"] }, alloc)
-        .unwrap_or_else(|e| panic!("a::Rec: {e}"))
-        .whole(2)
-        .expect("a::Rec key")
-        .key;
-    let rec_b = names::path(&names, names.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments: &["b", "Rec"] }, alloc)
-        .unwrap_or_else(|e| panic!("b::Rec: {e}"))
-        .whole(2)
-        .expect("b::Rec key")
-        .key;
+    let lookup = |ns, segs: &[&str]| {
+        names::path(&names, names.root(0), ns, Written { kind: PathKind::Plain, segments: segs }, alloc)
+            .unwrap_or_else(|e| panic!("{segs:?}: {e}"))
+            .whole(segs.len())
+            .expect("key")
+            .key
+    };
+    let rec_a = lookup(Namespace::Types, &["a", "Rec"]);
+    let rec_b = lookup(Namespace::Types, &["b", "Rec"]);
 
     let mut store = Store::new(front.index.lang("sized"), &frame, alloc);
     let mut keys = Keys::new();
@@ -2412,18 +2416,267 @@ fn main() {}
     let rk = schema.defaults_key();
 
     store.ensure(&names, &mut keys, Want::Head(rec_a)).unwrap_or_else(|e| panic!("ensure a::Rec: {e}"));
-    let dk_a = store.field_defaults.get(&rk).expect("a::Rec field_defaults")[0].expect("a::Rec default key");
+    let dk_a = store.record_defaults_by_owner.get(&(rec_a, rk)).expect("a::Rec record_defaults")[0].expect("a::Rec default key");
 
     store.ensure(&names, &mut keys, Want::Head(rec_b)).unwrap_or_else(|e| panic!("ensure b::Rec: {e}"));
-    let dk_b = store.field_defaults.get(&rk).expect("b::Rec field_defaults")[0].expect("b::Rec default key");
+    let dk_b = store.record_defaults_by_owner.get(&(rec_b, rk)).expect("b::Rec record_defaults")[0].expect("b::Rec default key");
 
     assert_ne!(dk_a, dk_b, "identical structural-record default text in distinct modules must produce distinct keys");
 
+    // Check bodies for BOTH `a::Rec` and `b::Rec` AFTER `b::Rec` has been registered:
+    // `World::field_defaults` must resolve `dk_a` for `a::mk` / `mk_a_root` and `dk_b` for
+    // `b::mk` / `mk_b_root` (NOT overwritten by `b::Rec`!).
     let prepared = Prepares::new_in(blaze_own::testing::bump());
     let (mut buckets, mut consts) = (None, Consts::default());
-    let mut r = Records { names: &names, index: &front.index, store: &mut store, keys: &mut keys, buckets: &mut buckets, consts: None, order: BuildOrder::AsAsked };
-    let val_a = int_of(consts.value(&mut r, prepared, dk_a).unwrap_or_else(|e| panic!("eval a::Rec default: {e}")));
-    let val_b = int_of(consts.value(&mut r, prepared, dk_b).unwrap_or_else(|e| panic!("eval b::Rec default: {e}")));
-    assert_eq!(val_a, Some(1), "a::Rec default must evaluate in mod a (N == 1)");
-    assert_eq!(val_b, Some(2), "b::Rec default must evaluate in mod b (N == 2)");
+    let cases: [(&[&str], u128, &str); 4] = [
+        (&["a", "mk"], 1, "a::mk must pick a::Rec default (N == 1)"),
+        (&["b", "mk"], 2, "b::mk must pick b::Rec default (N == 2)"),
+        (&["mk_a_root"], 1, "mk_a_root must pick a::Rec default (N == 1)"),
+        (&["mk_b_root"], 2, "mk_b_root must pick b::Rec default (N == 2)"),
+    ];
+    for (segs, expected, msg) in cases {
+        let fn_key = lookup(Namespace::Values, segs);
+        let body = lower_fn(&names, prepared, &mut keys, &mut store, fn_key).unwrap_or_else(|e| panic!("lower {segs:?}: {e}"));
+        let view = body.lowered.view();
+        let spell = Spelling::of(&view).unwrap_or_else(|e| panic!("spell {segs:?}: {e:?}"));
+        let scope = body.scope(&spell);
+        let picked_dk = {
+            let mut r = Records { names: &names, index: &front.index, store: &mut store, keys: &mut keys, buckets: &mut buckets, consts: Some((&mut consts, prepared)), order: BuildOrder::AsAsked };
+            let done = check_body(&mut r, &body, &scope).unwrap_or_else(|e| panic!("check {segs:?}: {e}"));
+            assert!(done.diags.is_empty(), "{segs:?} diags: {:?}", done.diags);
+            *done.default_fields.column::<2>().first().unwrap_or_else(|| panic!("{segs:?} must record default_fields"))
+        };
+        let mut r2 = Records { names: &names, index: &front.index, store: &mut store, keys: &mut keys, buckets: &mut buckets, consts: None, order: BuildOrder::AsAsked };
+        let got = int_of(consts.value(&mut r2, prepared, picked_dk).unwrap_or_else(|e| panic!("eval {segs:?} default: {e}")));
+        assert_eq!(got, Some(expected), "{msg}");
+    }
+}
+
+/// Round 13 P1 #2: inserting a blank line above a frozen nominal ADT whose field default uses
+/// `line!()` + a local enum invalidates the frozen ADT cell (`file_frozen` rejects the stale key),
+/// `ensure_field_default_site` refuses to attach moved coordinates to the stale key, and fresh
+/// lowering produces a new key evaluating to the shifted line.
+#[test]
+fn frozen_nominal_field_default_with_line_macro_rejects_stale_key_after_line_shift() {
+    use blaze_ladder::front2::consts::int_of;
+    use blaze_ladder::front2::head_record::{self, HeadAt};
+    use blaze_ladder::front2::heads::Want;
+    use blaze_ladder::front2::keys::{Keys, checker_of};
+    use blaze_ladder::front2::tables::head::{FrozenHead, Plant, export, file_frozen};
+
+    const BEFORE: &str = "#![feature(default_field_values)]
+pub struct Opts {
+    pub n: usize = { #[repr(u16)] enum ShiftEnum { A = 0, B = 1 } line!() as usize + core::mem::size_of::<ShiftEnum>() },
+}
+fn main() {}
+";
+    const AFTER: &str = "#![feature(default_field_values)]
+
+pub struct Opts {
+    pub n: usize = { #[repr(u16)] enum ShiftEnum { A = 0, B = 1 } line!() as usize + core::mem::size_of::<ShiftEnum>() },
+}
+fn main() {}
+";
+
+    let alloc = test_alloc();
+    let tc = open_toolchain();
+    let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
+    let files_before = [("/hello-world/src/main.rs".to_string(), BEFORE.to_string())];
+    let user_before = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files_before, edition, panic: blaze_build::Panic::Unwind };
+    let inputs_before = Inputs::new(&user_before, &tc).unwrap_or_else(|e| panic!("crates before: {e}"));
+    let crates_before = inputs_before.crates();
+    let names_before = inputs_before.resolve(&crates_before, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve before: {e}"));
+
+    let files_after = [("/hello-world/src/main.rs".to_string(), AFTER.to_string())];
+    let user_after = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files_after, edition, panic: blaze_build::Panic::Unwind };
+    let inputs_after = Inputs::new(&user_after, &tc).unwrap_or_else(|e| panic!("crates after: {e}"));
+    let crates_after = inputs_after.crates();
+    let names_after = inputs_after.resolve(&crates_after, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve after: {e}"));
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+    let front_before = Front2::new(&names_before, &frame, &[SourceFile { path: "src/main.rs", text: BEFORE }], alloc).unwrap_or_else(|e| panic!("front before: {e}"));
+    let front_after = Front2::new(&names_after, &frame, &[SourceFile { path: "src/main.rs", text: AFTER }], alloc).unwrap_or_else(|e| panic!("front after: {e}"));
+    let find_opts = |names: &blaze_scope::resolve::Names<'_>| {
+        names::path(names, names.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments: &["Opts"] }, alloc)
+            .unwrap_or_else(|e| panic!("Opts: {e}"))
+            .whole(1)
+            .expect("Opts key")
+            .key
+    };
+    let opts_before = find_opts(&names_before);
+    let opts_after = find_opts(&names_after);
+    let sized = front_before.index.lang("sized");
+
+    // Lower and freeze `Opts` at BEFORE (line 3 -> 3 + 2 = 5).
+    let mut maker = Store::new(sized, &frame, alloc);
+    let mut maker_keys = Keys::new();
+    maker.ensure(&names_before, &mut maker_keys, Want::Adt(opts_before)).unwrap_or_else(|e| panic!("ensure before: {e}"));
+    let dk_before = maker.field_defaults.get(&checker_of(opts_before)).expect("defaults before")[0].expect("dk_before");
+    let frozen_bytes = export(&names_before, &maker_keys, &mut maker, Want::Adt(opts_before), Plant::None, alloc).unwrap_or_else(|e| panic!("export before: {e}"));
+    let encoded_dk = {
+        let head_ref = head_record::from_store(&maker, HeadAt::Fn(dk_before)).unwrap_or_else(|e| panic!("from_store dk_before: {e}"));
+        head_record::encode(head_ref, maker.tys.view(), alloc).unwrap_or_else(|e| panic!("encode dk_before: {e}"))
+    };
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
+    let val_before = {
+        let (mut buckets, mut consts) = (None, Consts::default());
+        let mut r = Records { names: &names_before, index: &front_before.index, store: &mut maker, keys: &mut maker_keys, buckets: &mut buckets, consts: None, order: BuildOrder::AsAsked };
+        int_of(consts.value(&mut r, prepared, dk_before).unwrap_or_else(|e| panic!("eval before: {e}")))
+    };
+    assert_eq!(val_before, Some(5), "BEFORE line 3 + size_of::<ShiftEnum>() (2) == 5");
+
+    // 1) Importing the stale frozen cell into AFTER must fail validation (line shifted 3 -> 4).
+    let frozen = FrozenHead::read(&frozen_bytes).unwrap_or_else(|e| panic!("read frozen: {e}"));
+    let seeded_check = Store::new(front_after.index.lang("sized"), &frame, alloc);
+    let seeded_keys = Keys::new();
+    assert!(
+        file_frozen(&names_after, Want::Adt(opts_after), frozen, &seeded_check, &seeded_keys, alloc).is_err(),
+        "file_frozen must reject stale frozen ADT field default after blank-line shift"
+    );
+
+    // 2) Even if seeded directly via `file_heads`, `ensure_field_default_site` must refuse the stale key.
+    let mut direct = Store::new(front_after.index.lang("sized"), &frame, alloc);
+    let mut direct_keys = Keys::new();
+    let mut keep_text = |s: &str| -> &str { frame.alloc_str(s) };
+    let decoded = head_record::decode_with_origins_boxed_inline(&encoded_dk, None, &direct.tys, alloc, &mut keep_text, &mut |_, _| Ok(()))
+        .unwrap_or_else(|e| panic!("decode dk_before: {e}"));
+    direct
+        .file_heads(Want::Adt(opts_after), [(HeadAt::Fn(dk_before), blaze_own::Box::into_inner(decoded))])
+        .unwrap_or_else(|e| panic!("file_heads: {e}"));
+    let mut stale_defaults = blaze_own::AVec::new_in(alloc);
+    stale_defaults.push(Some(dk_before));
+    direct.field_defaults.insert(checker_of(opts_after), stale_defaults);
+    assert!(
+        blaze_ladder::front2::body::lower_member(&names_after, prepared, &mut direct_keys, &mut direct, dk_before).is_err(),
+        "lower_member must refuse stale field default key after blank-line shift"
+    );
+
+    // 3) Freshly lowering `Opts` on AFTER produces a new key evaluating to line 4 + 2 = 6.
+    let mut fresh = Store::new(front_after.index.lang("sized"), &frame, alloc);
+    let mut fresh_keys = Keys::new();
+    fresh.ensure(&names_after, &mut fresh_keys, Want::Adt(opts_after)).unwrap_or_else(|e| panic!("ensure after: {e}"));
+    let dk_after = fresh.field_defaults.get(&checker_of(opts_after)).expect("defaults after")[0].expect("dk_after");
+    assert_ne!(dk_before, dk_after, "shifted line must produce a distinct field default key");
+    let (mut buckets, mut consts) = (None, Consts::default());
+    let mut r = Records { names: &names_after, index: &front_after.index, store: &mut fresh, keys: &mut fresh_keys, buckets: &mut buckets, consts: None, order: BuildOrder::AsAsked };
+    let val_after = int_of(consts.value(&mut r, prepared, dk_after).unwrap_or_else(|e| panic!("eval after: {e}")));
+    assert_eq!(val_after, Some(6), "AFTER line 4 + size_of::<ShiftEnum>() (2) == 6");
+}
+
+/// Round 13 P1 #3: a cross-crate `#[macro_export]` type macro expanding to a type with an
+/// item-declaring const block AND `$crate::` paths preserves expansion hygiene marks in BOTH
+/// `pattern_ty.rs::macro_ty` (`type A = dep::ty!();`) and `heads.rs::fn_head` (`fn ret() -> dep::ty!()`).
+#[test]
+fn cross_crate_type_macro_in_head_preserves_dollar_crate_hygiene_and_block_owner() {
+    use blaze_id::CrateItemKey;
+    use blaze_ids::ContentId;
+    use blaze_scope::graph::{CrateId, Sysroot};
+    use blaze_scope::resolve::{SourceTexts, resolve_crates};
+
+    struct WithDep<'t> {
+        base: &'t blaze_ladder::crates::Texts<'t>,
+        dep: usize,
+        files: &'t [(&'t str, &'t str)],
+    }
+
+    impl<'t> SourceTexts<'t> for WithDep<'t> {
+        fn read(&self, krate: usize, path: &str) -> Option<&'t str> {
+            if krate == self.dep {
+                return self.files.iter().find(|(p, _)| *p == path).map(|(_, t)| *t);
+            }
+            self.base.read(krate, path)
+        }
+    }
+
+    const DEP: &str = "
+pub const N: isize = 5;
+pub const EXTRA: usize = 3;
+#[macro_export]
+macro_rules! ty_enum_hygiene {
+    () => {
+        [u8; {
+            enum TyHygEnum { V = $crate::N }
+            TyHygEnum::V as usize + $crate::EXTRA
+        }]
+    };
+}
+";
+    const APP: &str = "
+pub const N: isize = 99;
+pub const EXTRA: usize = 77;
+type A = dep::ty_enum_hygiene!();
+fn ret_ty() -> dep::ty_enum_hygiene!() { [0u8; 8] }
+
+fn alias_ok(x: A) -> [u8; 8] { x }
+fn alias_bad(x: A) -> [u8; 9] { x }
+fn ret_ok() -> [u8; 8] { ret_ty() }
+fn ret_bad() -> [u8; 9] { ret_ty() }
+fn main() {}
+";
+
+    let alloc = test_alloc();
+    let tc = open_toolchain();
+    let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
+    let user_files = [("/user/src/main.rs".to_string(), APP.to_string())];
+    let dep_files = [("/dep/src/lib.rs", DEP)];
+    let user = UserCrate { name: "user", dir: "/user/", root: "/user/src/main.rs", files: &user_files, edition, panic: blaze_build::Panic::Unwind };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let mut crates = inputs.crates();
+    let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(u32::try_from(i).expect("few crates")));
+    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd"), proc_macro: at("proc_macro") };
+    let dep_at = crates.len();
+    let user_deps: [(&str, usize); 1] = [("dep", dep_at)];
+    let (cfg, crate_edition, implicit) = (crates[0].cfg, crates[0].edition, crates[0].implicit);
+    crates[0].deps = &user_deps;
+    crates.push(blaze_scope::resolve::CrateInput {
+        name: "dep",
+        key: CrateItemKey(ContentId([0x55; 32])),
+        edition: crate_edition,
+        implicit,
+        root: "/dep/src/lib.rs",
+        shown_from: "/dep/",
+        features: &[],
+        deps: &[],
+        cfg,
+        script: None,
+    });
+    let texts = WithDep { base: &inputs.texts, dep: dep_at, files: &dep_files };
+    let names = resolve_crates(&crates, sysroot, &texts, &blaze_scope::task::Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let sources = [SourceFile { path: "src/main.rs", text: APP }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+    let mut front = Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
+    let mut store = Store::new(front.index.lang("sized"), &frame, alloc);
+    let (mut buckets, mut consts) = (None, Consts::default());
+    let mut got = blaze_own::AVec::new_in(alloc);
+    for &n in &["alias_ok", "alias_bad", "ret_ok", "ret_bad"] {
+        let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &[n] }, alloc).unwrap_or_else(|e| panic!("`{n}`: {e}"));
+        let k = found.whole(1).unwrap_or_else(|| panic!("`{n}` not named")).key;
+        let mut lens = 0;
+        let outcome = loop {
+            match lower_fn(&names, prepared, &mut front.keys, &mut store, k) {
+                Err(BodyError::Convert { why: Some(Why::NeedConst(c, _)), .. }) | Err(BodyError::Head { error: HeadError::Item(_, Why::NeedConst(c, _)), .. }) if lens < MOST_LENS => {
+                    lens += 1;
+                    let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
+                    if let Err(e) = eval_len(&mut records, c) {
+                        break format!("not lowered: {e}");
+                    }
+                }
+                Err(e) => break format!("not lowered: {e}"),
+                Ok(body) => {
+                    let view = body.lowered.view();
+                    let spell = Spelling::of(&view).unwrap_or_else(|e| panic!("spelling `{n}`: {e:?}"));
+                    let scope = body.scope(&spell);
+                    let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
+                    break match check_body(&mut records, &body, &scope) {
+                        Ok(done) if done.diags.is_empty() => "clean".to_string(),
+                        Ok(done) => format!("diags {:?}", done.diags),
+                        Err(CheckFail::Diags { diags, .. }) => format!("diags {diags:?}"),
+                        Err(e) => format!("not checked: {e}"),
+                    };
+                }
+            }
+        };
+        got.push((n.to_string(), outcome));
+    }
+    expect("cross-crate type macro with $crate hygiene and local enum", &got, &[true, false, true, false]);
 }

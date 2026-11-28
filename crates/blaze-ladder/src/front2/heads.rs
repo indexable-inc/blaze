@@ -917,7 +917,7 @@ pub(crate) fn field_default_label_for_frozen<'n, 'a, S: NamesSource<'n>>(
     alloc: Alloc<'a>,
 ) -> Option<blaze_own::String<Alloc<'a>>> {
     let plain = field_default_label_from_decl(variant, field, decl, alloc)?;
-    if super::keys::member_key_of(container, MemberKind::Anon, plain.as_str()) == expected || !decl.contains('!') {
+    if !decl.contains('!') {
         return Some(plain);
     }
     let owner_text = super::locals::owner_scanned_text(names, adt)?;
@@ -943,7 +943,10 @@ pub(crate) fn field_default_label_for_frozen<'n, 'a, S: NamesSource<'n>>(
     })
     .ok()
     .flatten();
-    situated.or(Some(plain))
+    if let Some(label) = situated {
+        return Some(label);
+    }
+    (super::keys::member_key_of(container, MemberKind::Anon, plain.as_str()) == expected).then_some(plain)
 }
 
 pub(crate) fn field_default_allowed<'n, S: NamesSource<'n>>(names: S, adt: LibKey, kind: tc::AdtKind, ctor: tc::CtorKind, r: Range) -> Result<(), Why> {
@@ -2842,6 +2845,12 @@ pub struct Store<'n> {
     /// no field has one. A head record carries them (head_record.rs, form 8); a row filed
     /// without its entry is the world's gap `field_defaults`, never "no defaults".
     pub field_defaults: Rows<ItemKey, blaze_own::Vec<Option<ItemKey>, Alloc<'static>>>,
+    /// Structural record defaults indexed by `(owner_lib, RecordSchema::defaults_key())` so two
+    /// distinct owners/modules with the same structural field schema never overwrite each other.
+    pub record_defaults_by_owner: Rows<(LibKey, ItemKey), blaze_own::Vec<Option<ItemKey>, Alloc<'static>>>,
+    /// Structural record defaults indexed by `(module, RecordSchema::defaults_key())` for module-
+    /// scoped lookups (`World::field_defaults` walking enclosing modules before fallback).
+    pub record_defaults_by_module: Rows<(LibKey, ItemKey), blaze_own::Vec<Option<ItemKey>, Alloc<'static>>>,
     pub impls: Rows<ItemKey, ImplHead>,
     /// Trait impls whose header is lowered while one of their associated types waits on a
     /// constant ([`ProvisionalImpl`]). Visible only while that impl's `waiting_const` is on
@@ -3516,6 +3525,8 @@ impl<'n> Store<'n> {
             auto_copy_pub: Rows::new_in(alloc),
             adt_declarations: Rows::new_in(alloc),
             field_defaults: Rows::new_in(alloc),
+            record_defaults_by_owner: Rows::new_in(alloc),
+            record_defaults_by_module: Rows::new_in(alloc),
             impls: Rows::new_in(alloc),
             provisional_impls: Rows::new_in(alloc),
             provisional_used: core::cell::RefCell::new(blaze_own::Vec::new_in(alloc)),
@@ -3599,6 +3610,8 @@ impl<'n> Store<'n> {
             auto_copy_pub,
             adt_declarations,
             field_defaults,
+            record_defaults_by_owner,
+            record_defaults_by_module,
             impls,
             provisional_impls,
             provisional_used,
@@ -3678,6 +3691,8 @@ impl<'n> Store<'n> {
         auto_copy_pub.clear();
         adt_declarations.clear();
         field_defaults.clear();
+        record_defaults_by_owner.clear();
+        record_defaults_by_module.clear();
         impls.clear();
         provisional_impls.clear();
         provisional_used.get_mut().clear();
@@ -4196,17 +4211,112 @@ impl<'n> Store<'n> {
         Ok(self.fns.contains_key(&cond))
     }
 
+    /// Looks up structural record defaults for `rk = RecordSchema::defaults_key()` scoped first to
+    /// `owner` (the defining/using item), then walking enclosing modules from `module` outward,
+    /// before callers fall back to `self.field_defaults`.
+    pub(super) fn record_defaults_for<S: NamesSource<'n>>(
+        &self,
+        names: S,
+        owner: Option<LibKey>,
+        module: LibKey,
+        rk: ItemKey,
+    ) -> Option<&[Option<ItemKey>]> {
+        if let Some(ol) = owner
+            && let Some(ds) = self.record_defaults_by_owner.get(&(ol, rk))
+        {
+            return Some(&ds[..]);
+        }
+        let mut cur = Some(module);
+        for _ in 0..64 {
+            let Some(m) = cur else { break };
+            if let Some(ds) = self.record_defaults_by_module.get(&(m, rk)) {
+                return Some(&ds[..]);
+            }
+            cur = names.home_of(m);
+        }
+        None
+    }
+
+    /// Resolves a type path in `v` to a `TypeAlias`'s library key (for propagating owner-scoped
+    /// structural record defaults across type aliases and spreads).
+    fn resolve_record_alias<S: NamesSource<'n>>(
+        names: S,
+        module: LibKey,
+        marks: Option<TextMarks<'_>>,
+        v: &View<'_>,
+        p: blaze_typeck::PathIdx,
+    ) -> Option<LibKey> {
+        let pr = v.path(p).ok()?;
+        let rows = v.segments(pr).ok()?;
+        let mut segs: [&str; 8] = [""; 8];
+        if rows.is_empty() || rows.len() > segs.len() {
+            return None;
+        }
+        for (idx, &row) in rows.iter().enumerate() {
+            let seg = lf::Segment::decode(row).ok()?;
+            let text = match (seg.kind, seg.name) {
+                (lf::SegKind::Ident, Some(n)) => blaze_scope::task::unraw(v.name_text(n).ok()?),
+                (lf::SegKind::SelfMod, _) => "self",
+                (lf::SegKind::Super, _) => "super",
+                (lf::SegKind::Crate, _) => "crate",
+                (lf::SegKind::DollarCrate, _) => "$crate",
+                _ => return None,
+            };
+            let slot = segs.get_mut(idx)?;
+            *slot = text;
+        }
+        let slice = segs.get(..rows.len())?;
+        let resolver = Paths { names };
+        let target = super::item_site::resolve_written(&resolver, marks, module, v, p, pr.absolute, slice, crate::resolve::Ns::Type, Range::new(0, 0)).ok()?;
+        (target.kind == crate::resolve::Kind::TypeAlias && usize::try_from(target.consumed).ok() == Some(slice.len())).then_some(target.key)
+    }
+
+    /// Propagates owner-scoped structural record defaults from any `TypeAlias` named in `v` onto
+    /// `owner_lib` (without overwriting defaults written directly in `owner_lib`). No-op when
+    /// `self.record_defaults_by_owner` is empty.
+    pub(super) fn propagate_record_alias_defaults<S: NamesSource<'n>>(
+        &self,
+        names: S,
+        owner_lib: LibKey,
+        module: LibKey,
+        marks: Option<TextMarks<'_>>,
+        v: &View<'_>,
+    ) {
+        if self.record_defaults_by_owner.is_empty() {
+            return;
+        }
+        let alloc = self.tys.alloc();
+        for i in 0..v.types.len() {
+            let Ok(ti) = u32::try_from(i) else { break };
+            let Ok(lf::TypeRef::Path(p)) = v.ty(lf::TypeId(ti)) else { continue };
+            let Some(alias_lib) = Self::resolve_record_alias(names, module, marks, v, p) else { continue };
+            let mut to_copy: blaze_own::Vec<(ItemKey, blaze_own::Vec<Option<ItemKey>, Alloc<'static>>), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+            for (&(al, rk), ds) in self.record_defaults_by_owner.iter() {
+                if al == alias_lib && !self.record_defaults_by_owner.contains_key(&(owner_lib, rk)) {
+                    to_copy.push((rk, exact_in(ds.as_slice(), alloc)));
+                }
+            }
+            for (rk, ds) in to_copy {
+                self.record_defaults_by_owner.insert((owner_lib, rk), ds);
+            }
+        }
+    }
+
     /// Registers `HeadAnon` alignment and remapped hygiene `anon_marks` for a frozen/seeded
     /// inline field default (`text_inline: true`) — both nominal ADT field defaults (keyed under
     /// `checker_of(item)`) and structural record field defaults (keyed under
     /// `RecordSchema::defaults_key()`) — when lowered in a fresh store whose `locals.head_anons`
     /// and `anon_marks` were not populated by `Store::adt` / `Store::register_record_defaults`.
-    pub(super) fn ensure_field_default_site<S: NamesSource<'n>>(&mut self, names: S, item: LibKey, owner: ItemKey, text: &'n str) {
+    ///
+    /// Returns `Err` if a frozen nominal field default's key disagrees with the current source's
+    /// observable placement (e.g. a `line!()` default shifted to another line), refusing to attach
+    /// moved coordinates to a stale key.
+    pub(super) fn ensure_field_default_site<S: NamesSource<'n>>(&mut self, names: S, item: LibKey, owner: ItemKey, text: &'n str) -> Result<(), Why> {
         if self.locals.head_anon(owner).is_some() || self.locals.head(owner).is_some() || self.anon_marks.contains_key(&owner) {
-            return;
+            return Ok(());
         }
         if !self.fns.get(&owner).is_some_and(|h| h.text_inline) {
-            return;
+            return Ok(());
         }
         enum DefaultKind {
             Nominal(usize),
@@ -4216,34 +4326,45 @@ impl<'n> Store<'n> {
         let kind = if let Some(field_idx) = self.field_defaults.get(&item_ck).and_then(|ds| ds.iter().position(|d| *d == Some(owner))) {
             DefaultKind::Nominal(field_idx)
         } else if let Some((rk, rec_idx)) = self
-            .field_defaults
+            .record_defaults_by_owner
             .iter()
-            .find_map(|(&rk, ds)| (rk != item_ck).then(|| ds.iter().position(|d| *d == Some(owner)).map(|j| (rk, j))).flatten())
+            .find_map(|(&(ol, rk), ds)| (ol == item).then(|| ds.iter().position(|d| *d == Some(owner)).map(|j| (rk, j))).flatten())
+            .or_else(|| {
+                self.record_defaults_by_module
+                    .iter()
+                    .find_map(|(&(_, rk), ds)| ds.iter().position(|d| *d == Some(owner)).map(|j| (rk, j)))
+            })
+            .or_else(|| {
+                self.field_defaults
+                    .iter()
+                    .find_map(|(&rk, ds)| (rk != item_ck).then(|| ds.iter().position(|d| *d == Some(owner)).map(|j| (rk, j))).flatten())
+            })
         {
             DefaultKind::Record(rk, rec_idx)
         } else {
-            return;
+            return Ok(());
         };
         let Some(owner_text) = super::locals::owner_scanned_text(names, item) else {
-            return;
+            return Ok(());
         };
         let lower_key = if names.crate_of(item).is_some() { item } else { names.member_owner(item).map_or(item, |(c, _)| c) };
         let alloc = self.tys.alloc();
         let Ok(low) = self.lower_alloc_here(names, lower_key, owner_text, alloc) else {
-            return;
+            return Ok(());
         };
         let v = low.view();
         let mut found: Option<(&str, &str)> = None;
         match kind {
             DefaultKind::Nominal(field_idx) => {
                 let mut seen = 0usize;
+                let mut located_field: Option<(usize, usize, &str, &str)> = None;
                 let is_enum = matches!(names.detail_of(item), Some(ItemDetail::Enum));
                 if is_enum {
                     if let Ok(variants) = v.rows(v.list(head::FIELDS)) {
-                        'outer: for &vn in variants {
+                        'outer: for (vi, &vn) in variants.iter().enumerate() {
                             let Ok(var) = lf::Variant::decode(vn) else { continue };
                             let Ok(rows) = v.rows(var.fields) else { continue };
-                            for &fn_row in rows {
+                            for (j, &fn_row) in rows.iter().enumerate() {
                                 if seen == field_idx {
                                     if let Ok(f) = lf::Field::decode(fn_row)
                                         && let Some(c) = f.default
@@ -4252,7 +4373,7 @@ impl<'n> Store<'n> {
                                         && let Ok(at) = v.const_range(c)
                                         && let Ok(val) = v.text_at(at)
                                     {
-                                        found = Some((ty_s.trim(), val.trim()));
+                                        located_field = Some((vi, j, ty_s.trim(), val.trim()));
                                     }
                                     break 'outer;
                                 }
@@ -4269,7 +4390,19 @@ impl<'n> Store<'n> {
                     && let Ok(at) = v.const_range(c)
                     && let Ok(val) = v.text_at(at)
                 {
-                    found = Some((ty_s.trim(), val.trim()));
+                    located_field = Some((0, field_idx, ty_s.trim(), val.trim()));
+                }
+                if let Some((vi, j, ty_text, value_text)) = located_field {
+                    let site = blaze_scope::expansion_origins::offset_in(owner_text, value_text)
+                        .and_then(|off| super::anon::head_site_of(names, item, off, value_text));
+                    let label = Self::field_default_member_name(vi, j, ty_text, value_text, site, alloc);
+                    if super::keys::member_key_of(item_ck, MemberKind::Anon, label.as_str()) != owner {
+                        return Err(Why::Program(
+                            "a frozen field default's key disagrees with its current source placement".into(),
+                            Range::new(0, 0),
+                        ));
+                    }
+                    found = Some((ty_text, value_text));
                 }
             }
             DefaultKind::Record(rk, rec_idx) => {
@@ -4294,7 +4427,7 @@ impl<'n> Store<'n> {
                 }
             }
         }
-        let Some((ty_text, value_text)) = found else { return };
+        let Some((ty_text, value_text)) = found else { return Ok(()) };
         let ty_prefix = "const _: ".len();
         let val_prefix = ty_prefix + ty_text.len() + " = ".len();
         if blaze_file_items::nested::may_write_block(value_text)
@@ -4306,6 +4439,7 @@ impl<'n> Store<'n> {
         if let Some(marks) = self.owner_item_marks(names, item, owner_text) {
             let _ = super::anon::file_parts_marks(&mut self.anon_marks, owner, text, Some(marks), &[(ty_prefix, ty_text), (val_prefix, value_text)], alloc);
         }
+        Ok(())
     }
 
     /// Whether ADT `item` is eligible for Blaze-edition automatic `Copy`/`Clone`
@@ -5401,6 +5535,7 @@ impl<'n> Store<'n> {
             self.opaques.insert(o.key, (alias_ck, o.index));
         }
         self.register_record_defaults(names, keys, key, owner, &env, marks, v)?;
+        self.propagate_record_alias_defaults(names, key, module, marks, v);
         self.maps.alias_defaults.insert(key, defaults);
         self.maps.aliases.insert(key, Some((generics, ty)));
         self.maps.const_params.insert(key, cs);
@@ -6396,6 +6531,7 @@ impl<'n> Store<'n> {
         sans_io |= names.in_sans_io_scope(key, module);
         let discrs = discriminants(&b, &mut self.tys, &env, v, repr, &written)?;
         self.register_record_defaults(names, keys, key, owner, &env, marks, v)?;
+        self.propagate_record_alias_defaults(names, key, module, marks, v);
         let (lifetimes, field_region_at, field_region_list) = super::borrows::freeze_field_regions(names, keys, self, ck, v, kind, &fields, self.tys.alloc())?;
         let field_regions = super::borrows::FieldRegions::new(field_region_at, field_region_list, self.tys.alloc());
         let auto_copy = is_auto_copy_pub_view(names, key, module, kind, v)?;
@@ -7092,7 +7228,16 @@ impl<'n> Store<'n> {
                             spread_ok = false;
                             break;
                         }
-                        let base_defaults = self.field_defaults.get(&base_schema.defaults_key());
+                        let base_rk = base_schema.defaults_key();
+                        let spread_alias = match v.ty(f.ty) {
+                            Ok(lf::TypeRef::Path(p)) => Self::resolve_record_alias(names, env.module, marks, v, p),
+                            _ => None,
+                        };
+                        let owner_lib_for_spread = owner.map_or(lib, |(k, _)| k);
+                        let base_defaults = spread_alias
+                            .and_then(|al| self.record_defaults_by_owner.get(&(al, base_rk)).map(|ds| &ds[..]))
+                            .or_else(|| self.record_defaults_for(names, Some(owner_lib_for_spread), env.module, base_rk))
+                            .or_else(|| self.field_defaults.get(&base_rk).map(|ds| &ds[..]));
                         for (idx, &bnm) in base_names.iter().enumerate() {
                             let Some(btext) = self.maps.record_field_name(bnm) else {
                                 spread_ok = false;
@@ -7203,6 +7348,9 @@ impl<'n> Store<'n> {
                 self.fns.insert(dk, row);
                 defaults.push(Some(dk));
             }
+            let owner_lib_rec = owner.map_or(lib, |(k, _)| k);
+            self.record_defaults_by_owner.insert((owner_lib_rec, rk), exact_in(defaults.as_slice(), alloc));
+            self.record_defaults_by_module.insert((env.module, rk), exact_in(defaults.as_slice(), alloc));
             self.field_defaults.insert(rk, defaults);
         }
         Ok(())
@@ -7299,13 +7447,20 @@ impl<'n> Store<'n> {
         // fn's module; the item's marks are not its tokens', while enclosing head ownership is
         // carried through `ExpandedOwner` so item-declaring const blocks in the expansion resolve
         // to the `blaze-scope` expansion block modules created under the direct head call.
+        let exp_marks = expanded.as_ref().and_then(|(_, x)| x.expansion_marks());
         let ret_expanded = match (&expanded, owner) {
             (Some((ret_text, x)), Some((item, owner_text))) => blaze_scope::expansion_origins::offset_in(owner_text, ret_text).map(|base_offset| {
-                super::types::ExpandedOwner { item, owner_text, base_offset, view: x.view() }
+                super::types::ExpandedOwner { item, owner_text, base_offset, view: x.view(), marks: exp_marks }
             }),
             _ => None,
         };
-        let rb = Builder { resolver: Paths { names }, heads: &self.maps, marks: if expanded.is_some() { None } else { marks }, owner, expanded: ret_expanded };
+        let rb = Builder {
+            resolver: Paths { names },
+            heads: &self.maps,
+            marks: if expanded.is_some() { exp_marks.or(marks) } else { marks },
+            owner,
+            expanded: ret_expanded,
+        };
         // A LOCAL fn's, const's or static's signature stands in the block it is declared in
         // (the Reference, "Statements", "Item declarations": its scope is the block's), so a
         // written type's first segment is first asked of that block's `use` items: the body
@@ -7844,10 +7999,12 @@ impl<'n> Store<'n> {
             self.locals.file_head_anon(cond_key, head_owner, None, &[], prefix);
         }
         file_regions(self, key, filed);
+        let fn_owner_lib = owner.map_or(lib, |(k, _)| k);
         if Self::view_has_record_type(v) {
             let rec_env = Env { module, params: &ps, bounds: Bounds::Done(&bounds), self_, self_assoc: self_assoc_slice, anon: &anon, consts: &cs, body: None };
-            self.register_record_defaults(names, keys, owner.map_or(lib, |(k, _)| k), owner, &rec_env, marks, v)?;
+            self.register_record_defaults(names, keys, fn_owner_lib, owner, &rec_env, marks, v)?;
         }
+        self.propagate_record_alias_defaults(names, fn_owner_lib, module, marks, v);
         self.fns.insert(
             key,
             FnHead {

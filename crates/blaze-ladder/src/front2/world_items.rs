@@ -755,6 +755,12 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     }
 
     fn field_defaults_once(&self, adt: ItemKey) -> Fetch<&[Option<ItemKey>]> {
+        if !self.store.adts.contains_key(&adt) {
+            let owner_lib = self.keys.library_in(self.names, self.owner).or_else(|| self.store.fns.get(&self.owner).map(|h| h.lib));
+            if let Some(d) = self.store.record_defaults_for(self.names, owner_lib, self.module, adt) {
+                return Ok(d);
+            }
+        }
         if let Some(d) = self.store.field_defaults.get(&adt) {
             return Ok(&d[..]);
         }
