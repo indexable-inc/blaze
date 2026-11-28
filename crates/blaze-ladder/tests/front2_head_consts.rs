@@ -2389,12 +2389,53 @@ fn mk_a_root() -> a::Rec { { .. } }
 fn mk_b_root() -> b::Rec { { .. } }
 fn take_a(r: a::Rec) -> isize { r.n }
 fn take_b(r: b::Rec) -> isize { r.n }
+struct Sink;
+impl Sink {
+    fn take_a(&self, r: a::Rec) -> isize { r.n }
+    fn take_b(&self, r: b::Rec) -> isize { r.n }
+    fn assoc_a(r: a::Rec) -> isize { r.n }
+    fn assoc_b(r: b::Rec) -> isize { r.n }
+}
+struct Wrapper {
+    a: a::Rec,
+    b: b::Rec,
+}
 fn both_in_one_fn(_: a::Rec, _: b::Rec) {
     let _x: a::Rec = { .. };
     let _y: b::Rec = { .. };
 }
 fn both_calls_in_one_fn() -> isize {
     take_a({ .. }) + take_b({ .. })
+}
+fn both_methods_in_one_fn(sink: &Sink) -> isize {
+    sink.take_a({ .. }) + sink.take_b({ .. })
+}
+fn both_local_methods_in_one_fn() -> isize {
+    let s = Sink;
+    s.take_a({ .. }) + s.take_b({ .. })
+}
+fn both_assoc_calls_in_one_fn() -> isize {
+    Sink::assoc_a({ .. }) + Sink::assoc_b({ .. })
+}
+fn both_struct_fields_in_one_fn() -> Wrapper {
+    Wrapper { a: { .. }, b: { .. } }
+}
+fn both_match_many_arms_in_one_fn(k: u32) -> isize {
+    let ra: a::Rec = match k {
+        0 => { .. }, 1 => { .. }, 2 => { .. }, 3 => { .. }, 4 => { .. }, 5 => { .. }, 6 => { .. }, 7 => { .. },
+        8 => { .. }, 9 => { .. }, 10 => { .. }, 11 => { .. }, 12 => { .. }, 13 => { .. }, 14 => { .. }, 15 => { .. },
+        16 => { .. }, 17 => { .. }, 18 => { .. }, 19 => { .. }, 20 => { .. }, 21 => { .. }, 22 => { .. }, 23 => { .. },
+        24 => { .. }, 25 => { .. }, 26 => { .. }, 27 => { .. }, 28 => { .. }, 29 => { .. }, 30 => { .. }, 31 => { .. },
+        32 => { .. }, 33 => { .. }, 34 => { .. }, 35 => { .. }, 36 => { .. }, 37 => { .. }, 38 => { .. }, _ => { .. },
+    };
+    let rb: b::Rec = match k {
+        0 => { .. }, 1 => { .. }, 2 => { .. }, 3 => { .. }, 4 => { .. }, 5 => { .. }, 6 => { .. }, 7 => { .. },
+        8 => { .. }, 9 => { .. }, 10 => { .. }, 11 => { .. }, 12 => { .. }, 13 => { .. }, 14 => { .. }, 15 => { .. },
+        16 => { .. }, 17 => { .. }, 18 => { .. }, 19 => { .. }, 20 => { .. }, 21 => { .. }, 22 => { .. }, 23 => { .. },
+        24 => { .. }, 25 => { .. }, 26 => { .. }, 27 => { .. }, 28 => { .. }, 29 => { .. }, 30 => { .. }, 31 => { .. },
+        32 => { .. }, 33 => { .. }, 34 => { .. }, 35 => { .. }, 36 => { .. }, 37 => { .. }, 38 => { .. }, _ => { .. },
+    };
+    ra.n + rb.n
 }
 fn main() {}
 ";
@@ -2460,10 +2501,18 @@ fn main() {}
         assert_eq!(got, Some(expected), "{msg}");
     }
 
-    // Round 14 P1 #1: a single function referencing BOTH `a::Rec` and `b::Rec` (via `let`
-    // annotations AND via calls `take_a({ .. }) + take_b({ .. })`) must pick `dk_a` (1) for the
-    // first record literal and `dk_b` (2) for the second without shadowing.
-    for segs in [&["both_in_one_fn"][..], &["both_calls_in_one_fn"][..]] {
+    // Round 14/15 P1 #1: a single function referencing BOTH `a::Rec` and `b::Rec` via `let`
+    // annotations, free calls, method calls (param & local receiver), associated fn calls, and
+    // struct field initializers must pick `dk_a` (1) for the first record literal and `dk_b` (2)
+    // for the second without shadowing.
+    for segs in [
+        &["both_in_one_fn"][..],
+        &["both_calls_in_one_fn"][..],
+        &["both_methods_in_one_fn"][..],
+        &["both_local_methods_in_one_fn"][..],
+        &["both_assoc_calls_in_one_fn"][..],
+        &["both_struct_fields_in_one_fn"][..],
+    ] {
         let fn_key = lookup(Namespace::Values, segs);
         let body = lower_fn(&names, prepared, &mut keys, &mut store, fn_key).unwrap_or_else(|e| panic!("lower {segs:?}: {e}"));
         let view = body.lowered.view();
@@ -2484,6 +2533,72 @@ fn main() {}
         let v1 = int_of(consts.value(&mut r2, prepared, picked[1]).unwrap_or_else(|e| panic!("eval {segs:?}[1]: {e}")));
         assert_eq!((v0, v1), (Some(1), Some(2)), "{segs:?} must evaluate a::Rec -> 1 and b::Rec -> 2 in the same function");
     }
+
+    // Round 15 P2 #2: a `match` with >32 arms (40 arms each for `a::Rec` and `b::Rec`) must NOT
+    // truncate record-default provenance after 32 arms.
+    {
+        let segs = &["both_match_many_arms_in_one_fn"][..];
+        let fn_key = lookup(Namespace::Values, segs);
+        let body = lower_fn(&names, prepared, &mut keys, &mut store, fn_key).unwrap_or_else(|e| panic!("lower {segs:?}: {e}"));
+        let view = body.lowered.view();
+        let spell = Spelling::of(&view).unwrap_or_else(|e| panic!("spell {segs:?}: {e:?}"));
+        let scope = body.scope(&spell);
+        let picked: blaze_own::AVec<'_, blaze_typeck::ItemKey> = {
+            let mut r = Records { names: &names, index: &front.index, store: &mut store, keys: &mut keys, buckets: &mut buckets, consts: Some((&mut consts, prepared)), order: BuildOrder::AsAsked };
+            let done = check_body(&mut r, &body, &scope).unwrap_or_else(|e| panic!("check {segs:?}: {e}"));
+            assert!(done.diags.is_empty(), "{segs:?} diags: {:?}", done.diags);
+            let mut out = blaze_own::AVec::new_in(alloc);
+            out.extend_from_slice(done.default_fields.column::<2>());
+            out
+        };
+        assert_eq!(picked.len(), 80, "both 40-arm matches must record all 80 default_fields entries");
+        let mut r2 = Records { names: &names, index: &front.index, store: &mut store, keys: &mut keys, buckets: &mut buckets, consts: None, order: BuildOrder::AsAsked };
+        for (idx, &dk) in picked.iter().enumerate() {
+            let expected = if idx < 40 { 1 } else { 2 };
+            let got = int_of(consts.value(&mut r2, prepared, dk).unwrap_or_else(|e| panic!("eval arm {idx}: {e}")));
+            assert_eq!(got, Some(expected), "arm {idx} must evaluate to {expected} without truncation");
+        }
+    }
+}
+
+/// Round 15 P1 #4: an unbraced head macro reached through `super::` inside an inner module
+/// (`[u8; super::make_len!()]`) where `inner` defines a shadowing `make_len!` must resolve
+/// `super::make_len` to the parent module's macro (NOT `inner`'s) and evaluate its block item.
+#[test]
+fn super_head_macro_call_resolves_parent_and_evaluates_head_const() {
+    const TEXT: &str = "
+pub mod parent {
+    macro_rules! make_len {
+        () => {
+            {
+                #[repr(u16)]
+                enum ParentEnum { A = 0, B = 1 }
+                core::mem::size_of::<ParentEnum>()
+            }
+        };
+    }
+    pub(crate) use make_len;
+
+    pub mod inner {
+        macro_rules! make_len {
+            () => {
+                {
+                    struct WrongInner([u8; 99]);
+                    core::mem::size_of::<WrongInner>()
+                }
+            };
+        }
+        pub(crate) use make_len;
+
+        pub type Arr = [u8; super::make_len!()];
+    }
+}
+fn ok_len() -> parent::inner::Arr { [0u8; 2] }
+fn wrong_inner_len() -> parent::inner::Arr { [0u8; 99] }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["ok_len", "wrong_inner_len"]);
+    expect("super::make_len!() in inner module", &got, &[true, false]);
 }
 
 /// Round 13 P1 #2: inserting a blank line above a frozen nominal ADT whose field default uses

@@ -1230,3 +1230,118 @@ fn cfg_disabled_head_macro_calls_are_not_expanded_while_enabled_ones_are() {
         .unwrap_or_else(|e| panic!("`HeadCfgEnum` in fn `r` raw-cfg enabled call: {e}"));
     assert_eq!(re.def.kind, DefKind::Enum);
 }
+
+const SUPER_HEAD_MACRO_CALL: &str = r#"#![no_core]
+pub mod outer {
+    macro_rules! deep_len {
+        () => {
+            {
+                pub enum DeepOuterEnum { A = 0 }
+                1
+            }
+        };
+    }
+    pub(crate) use deep_len;
+
+    pub mod parent {
+        macro_rules! make_len {
+            () => {
+                {
+                    pub enum ParentMacroEnum { A = 0, B = 1 }
+                    pub trait Mark {}
+                    impl Mark for ParentMacroEnum {}
+                    2
+                }
+            };
+        }
+        pub(crate) use make_len;
+
+        pub mod inner {
+            macro_rules! make_len {
+                () => {
+                    {
+                        pub enum WrongInnerEnum { X = 0 }
+                        99
+                    }
+                };
+            }
+            pub(crate) use make_len;
+
+            macro_rules! local_len {
+                () => {
+                    {
+                        pub enum LocalSelfEnum { L = 0 }
+                        3
+                    }
+                };
+            }
+            pub(crate) use local_len;
+
+            pub type FromParent = [u8; super::make_len!()];
+            pub type FromOuter = [u8; super::super::deep_len!()];
+            pub type FromSelf = [u8; self::local_len!()];
+        }
+
+        pub mod inner_no_shadow {
+            pub type FromParent = [u8; super::make_len!()];
+        }
+    }
+}
+"#;
+
+static SUPER_HEAD_MACRO_CALL_TEXTS: Texts = Texts(&[&[("/user/lib.rs", SUPER_HEAD_MACRO_CALL)]]);
+
+#[test]
+fn super_and_self_head_macro_calls_resolve_in_enclosing_module_context() {
+    use blaze_surface::DefKind;
+    let alloc = blaze_own::testing::heap().alloc();
+    let crates = [input("user", "/user/lib.rs", &[])];
+    let names = resolved(&crates, &SUPER_HEAD_MACRO_CALL_TEXTS);
+    assert!(
+        !names.notes(0).iter().any(|n| matches!(n, crate::resolve::NamesNote::Expand { .. })),
+        "super/self head macro calls must expand cleanly: {:?}",
+        names.notes(0)
+    );
+    let root = names.root(0);
+    let check_alias = |segs: &[&str], expected_enum: &str| {
+        let alias = names
+            .item_at(root, Namespace::Types, Written { kind: PathKind::Plain, segments: segs }, alloc)
+            .unwrap_or_else(|e| panic!("{segs:?}: {e}"));
+        let head_mod = crate::blocks::head_call_module(names.krate(0).key, alias.def.key);
+        let call_key = crate::task::key_of(names.krate(0).key, head_mod, "MacroCall", "", 0);
+        let exp_name = crate::expanded_blocks::expansion_block_name(call_key, 0, alloc);
+        let exp_mod = crate::task::key_of(names.krate(0).key, call_key, "mod", exp_name.as_str(), 0);
+        let e = names
+            .item_at(exp_mod, Namespace::Types, Written { kind: PathKind::Plain, segments: &[expected_enum] }, alloc)
+            .unwrap_or_else(|e| panic!("`{expected_enum}` in {segs:?} expansion block module: {e}"));
+        assert_eq!(e.def.kind, DefKind::Enum);
+    };
+    check_alias(&["outer", "parent", "inner", "FromParent"], "ParentMacroEnum");
+    check_alias(&["outer", "parent", "inner", "FromOuter"], "DeepOuterEnum");
+    check_alias(&["outer", "parent", "inner", "FromSelf"], "LocalSelfEnum");
+    check_alias(&["outer", "parent", "inner_no_shadow", "FromParent"], "ParentMacroEnum");
+    let expected_mods: std::vec::Vec<_> = [&["outer", "parent", "inner", "FromParent"][..], &["outer", "parent", "inner_no_shadow", "FromParent"][..]]
+        .into_iter()
+        .map(|segs| {
+            let alias = names
+                .item_at(root, Namespace::Types, Written { kind: PathKind::Plain, segments: segs }, alloc)
+                .unwrap_or_else(|e| panic!("{segs:?}: {e}"));
+            let head_mod = crate::blocks::head_call_module(names.krate(0).key, alias.def.key);
+            let call_key = crate::task::key_of(names.krate(0).key, head_mod, "MacroCall", "", 0);
+            let exp_name = crate::expanded_blocks::expansion_block_name(call_key, 0, alloc);
+            crate::task::key_of(names.krate(0).key, call_key, "mod", exp_name.as_str(), 0)
+        })
+        .collect();
+    let got_mods: std::vec::Vec<_> = names
+        .krate(0)
+        .tables
+        .impls
+        .iter()
+        .filter(|i| i.header.chars().filter(|c| !c.is_whitespace()).collect::<std::string::String>().trim_end_matches('{').ends_with("MarkforParentMacroEnum"))
+        .map(|i| i.module)
+        .collect();
+    assert_eq!(got_mods.len(), 2, "both inner::FromParent and inner_no_shadow::FromParent must expand parent::make_len");
+    for exp_mod in &expected_mods {
+        assert!(got_mods.contains(exp_mod), "missing Mark impl in {exp_mod:x}, got {got_mods:?}");
+    }
+}

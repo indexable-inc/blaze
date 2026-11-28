@@ -1597,6 +1597,9 @@ pub fn block_scopes_bodies_side<'a, 'o: 'a, S: SourceTexts<'a>, P: Par>(
                 Err(refusal) => {
                     let nested = blaze_file_items::nested::scan(held.src.text, alloc);
                     refused_blocks.extend(crate::blocks::block_modules(c.key, held.src.key, &nested, alloc).iter().flatten().copied());
+                    if !nested.head_calls.is_empty() {
+                        refused_blocks.push(crate::blocks::head_call_module(c.key, held.src.key));
+                    }
                     refused.push(refusal);
                 }
             }

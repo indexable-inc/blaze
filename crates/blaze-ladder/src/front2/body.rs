@@ -2136,7 +2136,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             store.register_record_defaults(names, keys, rec_lib, rec_owner, &body_env, text_marks, &view).map_err(|why| BodyError::Record { item, owner, why })?;
         }
         if view_has_rec_expr {
-            collect_record_expr_defaults(names, keys, store, owner, rec_lib, module, text_marks, &view, typeck.root, &mut typeck.record_expr_defaults);
+            collect_record_expr_defaults(names, keys, store, owner, rec_lib, module, self_, text_marks, &view, typeck.root, &mut typeck.record_expr_defaults);
         }
     }
 
@@ -2167,9 +2167,10 @@ fn view_has_record_expr(v: &View<'_>) -> bool {
 }
 
 /// Maps each anonymous `Expr::Record` literal in `view` whose expected type comes from a specific
-/// structural record type alias, function parameter/return type, or inline record type with
-/// defaults to its owner-scoped `Store::field_defaults` key, so multiple same-schema record
-/// aliases/types with different defaults coexist inside a single function body.
+/// structural record type alias, function/method parameter or return type, struct field, local
+/// assignment, closure return, or inline record type with defaults to its owner-scoped
+/// `Store::field_defaults` key, so multiple same-schema record aliases/types with different
+/// defaults coexist inside a single function body without fixed-capacity truncation.
 #[expect(clippy::too_many_arguments, reason = "body context for per-expr structural record default provenance")]
 fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
     names: S,
@@ -2178,55 +2179,33 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
     owner: ItemKey,
     rec_lib: LibKey,
     module: LibKey,
+    self_: SelfTy,
     marks: Option<TextMarks<'_>>,
     v: &View<'_>,
     root: ExprId,
     out: &mut blaze_own::AVec<'_, (ExprId, ItemKey)>,
 ) {
-    fn push_record_target(v: &View<'_>, root_expr: ExprId, srk: ItemKey, out: &mut blaze_own::AVec<'_, (ExprId, ItemKey)>) {
-        let mut stack: [ExprId; 32] = [ExprId(0); 32];
-        let mut sp = 0usize;
-        if let Some(slot) = stack.get_mut(sp) {
-            *slot = root_expr;
-            sp += 1;
-        }
-        while let Some(next_sp) = sp.checked_sub(1) {
-            sp = next_sp;
-            let Some(&expr) = stack.get(sp) else { break };
+    let work_alloc = store.work_alloc();
+
+    fn push_record_target(v: &View<'_>, root_expr: ExprId, srk: ItemKey, work_alloc: Alloc<'_>, out: &mut blaze_own::AVec<'_, (ExprId, ItemKey)>) {
+        let mut stack: blaze_own::Vec<ExprId, Alloc<'_>> = blaze_own::Vec::new_in(work_alloc);
+        stack.push(root_expr);
+        while let Some(expr) = stack.pop() {
             match v.expr(expr) {
                 Ok(blaze_lower::Expr::Record { .. }) => out.push((expr, srk)),
-                Ok(blaze_lower::Expr::Paren(inner)) => {
-                    if let Some(slot) = stack.get_mut(sp) {
-                        *slot = inner;
-                        sp += 1;
-                    }
-                }
-                Ok(blaze_lower::Expr::Block { tail: Some(tail), .. }) => {
-                    if let Some(slot) = stack.get_mut(sp) {
-                        *slot = tail;
-                        sp += 1;
-                    }
-                }
+                Ok(blaze_lower::Expr::Paren(inner)) => stack.push(inner),
+                Ok(blaze_lower::Expr::Block { tail: Some(tail), .. }) => stack.push(tail),
                 Ok(blaze_lower::Expr::If { then, else_, .. }) => {
-                    if let Some(slot) = stack.get_mut(sp) {
-                        *slot = then;
-                        sp += 1;
-                    }
-                    if let Some(e) = else_
-                        && let Some(slot) = stack.get_mut(sp)
-                    {
-                        *slot = e;
-                        sp += 1;
+                    stack.push(then);
+                    if let Some(e) = else_ {
+                        stack.push(e);
                     }
                 }
                 Ok(blaze_lower::Expr::Match { arms, .. }) => {
                     if let Ok(rows) = v.rows(arms) {
                         for &row in rows {
-                            if let Ok(arm) = lf::Arm::decode(row)
-                                && let Some(slot) = stack.get_mut(sp)
-                            {
-                                *slot = arm.body;
-                                sp += 1;
+                            if let Ok(arm) = lf::Arm::decode(row) {
+                                stack.push(arm.body);
                             }
                         }
                     }
@@ -2236,50 +2215,25 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
         }
     }
 
-    fn expr_targets_record(v: &View<'_>, root_expr: ExprId) -> bool {
-        let mut stack: [ExprId; 32] = [ExprId(0); 32];
-        let mut sp = 0usize;
-        if let Some(slot) = stack.get_mut(sp) {
-            *slot = root_expr;
-            sp += 1;
-        }
-        while let Some(next_sp) = sp.checked_sub(1) {
-            sp = next_sp;
-            let Some(&expr) = stack.get(sp) else { break };
+    fn expr_targets_record(v: &View<'_>, root_expr: ExprId, work_alloc: Alloc<'_>) -> bool {
+        let mut stack: blaze_own::Vec<ExprId, Alloc<'_>> = blaze_own::Vec::new_in(work_alloc);
+        stack.push(root_expr);
+        while let Some(expr) = stack.pop() {
             match v.expr(expr) {
                 Ok(blaze_lower::Expr::Record { .. }) => return true,
-                Ok(blaze_lower::Expr::Paren(inner)) => {
-                    if let Some(slot) = stack.get_mut(sp) {
-                        *slot = inner;
-                        sp += 1;
-                    }
-                }
-                Ok(blaze_lower::Expr::Block { tail: Some(tail), .. }) => {
-                    if let Some(slot) = stack.get_mut(sp) {
-                        *slot = tail;
-                        sp += 1;
-                    }
-                }
+                Ok(blaze_lower::Expr::Paren(inner)) => stack.push(inner),
+                Ok(blaze_lower::Expr::Block { tail: Some(tail), .. }) => stack.push(tail),
                 Ok(blaze_lower::Expr::If { then, else_, .. }) => {
-                    if let Some(slot) = stack.get_mut(sp) {
-                        *slot = then;
-                        sp += 1;
-                    }
-                    if let Some(e) = else_
-                        && let Some(slot) = stack.get_mut(sp)
-                    {
-                        *slot = e;
-                        sp += 1;
+                    stack.push(then);
+                    if let Some(e) = else_ {
+                        stack.push(e);
                     }
                 }
                 Ok(blaze_lower::Expr::Match { arms, .. }) => {
                     if let Ok(rows) = v.rows(arms) {
                         for &row in rows {
-                            if let Ok(arm) = lf::Arm::decode(row)
-                                && let Some(slot) = stack.get_mut(sp)
-                            {
-                                *slot = arm.body;
-                                sp += 1;
+                            if let Ok(arm) = lf::Arm::decode(row) {
+                                stack.push(arm.body);
                             }
                         }
                     }
@@ -2299,18 +2253,13 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
         v: &View<'_>,
         expr: ExprId,
         ty_id: blaze_lower::form::TypeId,
+        work_alloc: Alloc<'_>,
         out: &mut blaze_own::AVec<'_, (ExprId, ItemKey)>,
     ) {
-        let mut stack: [(ExprId, blaze_lower::form::TypeId); 32] = [(ExprId(0), blaze_lower::form::TypeId(0)); 32];
-        let mut sp = 0usize;
-        if let Some(slot) = stack.get_mut(sp) {
-            *slot = (expr, ty_id);
-            sp += 1;
-        }
-        while let Some(next_sp) = sp.checked_sub(1) {
-            sp = next_sp;
-            let Some(&(mut cur_e, cur_t)) = stack.get(sp) else { break };
-            for _ in 0..16 {
+        let mut stack: blaze_own::Vec<(ExprId, blaze_lower::form::TypeId), Alloc<'_>> = blaze_own::Vec::new_in(work_alloc);
+        stack.push((expr, ty_id));
+        while let Some((mut cur_e, cur_t)) = stack.pop() {
+            loop {
                 match v.expr(cur_e) {
                     Ok(blaze_lower::Expr::Paren(inner)) => cur_e = inner,
                     Ok(blaze_lower::Expr::Block { tail: Some(tail), .. }) => cur_e = tail,
@@ -2318,33 +2267,51 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
                 }
             }
             if let Some(srk) = store.record_default_key_for_type(names, rec_lib, module, marks, v, cur_t) {
-                push_record_target(v, cur_e, srk, out);
+                push_record_target(v, cur_e, srk, work_alloc, out);
                 continue;
             }
-            if let (Ok(blaze_lower::Expr::Tuple { elems }), Ok(blaze_lower::form::TypeRef::Tuple(ty_elems))) = (v.expr(cur_e), v.ty(cur_t))
-                && let (Ok(e_ids), Ok(t_ids)) = (v.ids(elems), v.ids(ty_elems))
-            {
-                for (&ei, &ti) in e_ids.iter().zip(t_ids.iter()) {
-                    if let Some(slot) = stack.get_mut(sp) {
-                        *slot = (ExprId(ei), blaze_lower::form::TypeId(ti));
-                        sp += 1;
+            match (v.expr(cur_e), v.ty(cur_t)) {
+                (Ok(blaze_lower::Expr::If { then, else_, .. }), _) => {
+                    stack.push((then, cur_t));
+                    if let Some(e) = else_ {
+                        stack.push((e, cur_t));
                     }
                 }
+                (Ok(blaze_lower::Expr::Match { arms, .. }), _) => {
+                    if let Ok(rows) = v.rows(arms) {
+                        for &row in rows {
+                            if let Ok(arm) = lf::Arm::decode(row) {
+                                stack.push((arm.body, cur_t));
+                            }
+                        }
+                    }
+                }
+                (Ok(blaze_lower::Expr::Tuple { elems }), Ok(blaze_lower::form::TypeRef::Tuple(ty_elems))) => {
+                    if let (Ok(e_ids), Ok(t_ids)) = (v.ids(elems), v.ids(ty_elems)) {
+                        for (&ei, &ti) in e_ids.iter().zip(t_ids.iter()) {
+                            stack.push((ExprId(ei), blaze_lower::form::TypeId(ti)));
+                        }
+                    }
+                }
+                (Ok(blaze_lower::Expr::Array { elems }), Ok(blaze_lower::form::TypeRef::Array { elem, .. })) => {
+                    if let Ok(e_ids) = v.ids(elems) {
+                        for &ei in e_ids {
+                            stack.push((ExprId(ei), elem));
+                        }
+                    }
+                }
+                (Ok(blaze_lower::Expr::Repeat { elem: rep_elem, .. }), Ok(blaze_lower::form::TypeRef::Array { elem, .. })) => {
+                    stack.push((rep_elem, elem));
+                }
+                _ => {}
             }
         }
     }
 
-    fn resolve_callee_fn<'n, S: NamesSource<'n>>(
-        names: S,
-        module: LibKey,
-        marks: Option<TextMarks<'_>>,
-        v: &View<'_>,
-        p: blaze_typeck::PathIdx,
-    ) -> Option<LibKey> {
+    fn path_segments<'v>(v: &'v View<'_>, p: blaze_typeck::PathIdx, out_segs: &mut [&'v str; 8]) -> Option<(bool, usize)> {
         let pr = v.path(p).ok()?;
         let rows = v.segments(pr).ok()?;
-        let mut segs: [&str; 8] = [""; 8];
-        if rows.is_empty() || rows.len() > segs.len() {
+        if rows.is_empty() || rows.len() > out_segs.len() {
             return None;
         }
         for (idx, &row) in rows.iter().enumerate() {
@@ -2352,18 +2319,348 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
             let text = match (seg.kind, seg.name) {
                 (blaze_lower::form::SegKind::Ident, Some(n)) => blaze_scope::task::unraw(v.name_text(n).ok()?),
                 (blaze_lower::form::SegKind::SelfMod, _) => "self",
+                (blaze_lower::form::SegKind::SelfTy, _) => "Self",
                 (blaze_lower::form::SegKind::Super, _) => "super",
                 (blaze_lower::form::SegKind::Crate, _) => "crate",
                 (blaze_lower::form::SegKind::DollarCrate, _) => "$crate",
                 _ => return None,
             };
-            let slot = segs.get_mut(idx)?;
+            let slot = out_segs.get_mut(idx)?;
             *slot = text;
         }
-        let slice = segs.get(..rows.len())?;
+        Some((pr.absolute, rows.len()))
+    }
+
+    fn crate_of_ck<'n, S: NamesSource<'n>>(names: S, ck: ItemKey) -> Option<usize> {
+        let mut bytes = [0u8; 32];
+        bytes[..16].copy_from_slice(&ck.0.to_be_bytes());
+        names.crate_of(LibKey(blaze_ids::ContentId(bytes)))
+    }
+
+    fn pty_to_adt_ck(store: &Store<'_>, ty: PTy) -> Option<ItemKey> {
+        let mut cur = ty;
+        for _ in 0..8 {
+            match store.tys.view().get(cur).copied()? {
+                blaze_typeck::PNode::Adt(adt_ck, _) => return Some(adt_ck),
+                blaze_typeck::PNode::Ref(_, inner) | blaze_typeck::PNode::Ptr(_, inner) => cur = inner,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn self_adt_ck(store: &Store<'_>, self_: SelfTy) -> Option<ItemKey> {
+        let SelfTy::Ty(ty, _) = self_ else { return None };
+        pty_to_adt_ck(store, ty)
+    }
+
+    fn resolve_path_adt<'n, S: NamesSource<'n>>(
+        names: S,
+        store: &mut Store<'n>,
+        keys: &mut Keys,
+        module: LibKey,
+        self_: SelfTy,
+        marks: Option<TextMarks<'_>>,
+        v: &View<'_>,
+        p: blaze_typeck::PathIdx,
+        ns: crate::resolve::Ns,
+    ) -> Option<(Option<LibKey>, ItemKey, u32)> {
+        let mut segs: [&str; 8] = [""; 8];
+        let (absolute, len) = path_segments(v, p, &mut segs)?;
+        let slice = segs.get(..len)?;
+        if !absolute && slice == ["Self"] {
+            return self_adt_ck(store, self_).map(|ck| (None, ck, 0));
+        }
         let resolver = Paths { names };
-        let target = super::item_site::resolve_written(&resolver, marks, module, v, p, pr.absolute, slice, crate::resolve::Ns::Value, Range::new(0, 0)).ok()?;
-        (target.kind == crate::resolve::Kind::Fn && usize::try_from(target.consumed).ok() == Some(slice.len())).then_some(target.key)
+        let target = super::item_site::resolve_written(&resolver, marks, module, v, p, absolute, slice, ns, Range::new(0, 0)).ok()?;
+        if usize::try_from(target.consumed).ok() != Some(slice.len()) {
+            return None;
+        }
+        match target.kind {
+            crate::resolve::Kind::Struct | crate::resolve::Kind::Enum | crate::resolve::Kind::Union => {
+                let _ = keys.item(target.key);
+                Some((Some(target.key), checker_of(target.key), 0))
+            }
+            crate::resolve::Kind::Variant { adt, index } => {
+                let _ = keys.item(adt);
+                Some((Some(adt), checker_of(adt), index))
+            }
+            crate::resolve::Kind::TypeAlias => {
+                let _ = keys.item(target.key);
+                let _ = store.ensure(names, keys, Want::Head(target.key));
+                let (_, alias_ty) = store.maps.aliases.get(&target.key).copied().flatten()?;
+                pty_to_adt_ck(store, alias_ty).map(|ck| (None, ck, 0))
+            }
+            _ => None,
+        }
+    }
+
+    fn resolve_type_adt<'n, S: NamesSource<'n>>(
+        names: S,
+        store: &mut Store<'n>,
+        keys: &mut Keys,
+        module: LibKey,
+        self_: SelfTy,
+        marks: Option<TextMarks<'_>>,
+        v: &View<'_>,
+        mut ty_id: lf::TypeId,
+    ) -> Option<ItemKey> {
+        for _ in 0..8 {
+            match v.ty(ty_id).ok()? {
+                lf::TypeRef::Ref { inner, .. } | lf::TypeRef::Ptr { inner, .. } => ty_id = inner,
+                lf::TypeRef::Path(p) => return resolve_path_adt(names, store, keys, module, self_, marks, v, p, crate::resolve::Ns::Type).map(|(_, ck, _)| ck),
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn find_method_on_adt<'n, S: NamesSource<'n>>(
+        names: S,
+        keys: &mut Keys,
+        store: &mut Store<'n>,
+        adt_ck: ItemKey,
+        module: LibKey,
+        method_name: &str,
+        work_alloc: Alloc<'_>,
+    ) -> Option<ItemKey> {
+        let adt_krate = crate_of_ck(names, adt_ck)?;
+        let mut impls: blaze_own::Vec<LibKey, Alloc<'_>> = blaze_own::Vec::new_in(work_alloc);
+        names.each_impl(adt_krate, &mut |at| {
+            let mut has_member = false;
+            names.each_member(at.key, &mut |m| {
+                if m.kind == blaze_surface::ItemKind::Function && m.name == Some(method_name) {
+                    has_member = true;
+                }
+            });
+            if has_member {
+                impls.push(at.key);
+            }
+        });
+        let mut trait_match: Option<(LibKey, ItemKey)> = None;
+        let method_nm = Name::of(method_name);
+        for &imp_lib in impls.iter() {
+            let imp_ck = checker_of(imp_lib);
+            if !store.impls.contains_key(&imp_ck) {
+                let _ = store.ensure(names, keys, Want::Impl(imp_lib));
+            }
+            let Some(ih) = store.impls.get(&imp_ck) else { continue };
+            let self_matches = matches!(store.tys.view().get(ih.self_ty).copied(), Some(blaze_typeck::PNode::Adt(ck, _)) if ck == adt_ck);
+            if !self_matches {
+                continue;
+            }
+            let Some(mk) = ih.fns.iter().find_map(|&(nm, mk)| (nm == method_nm).then_some(mk)) else { continue };
+            if ih.trait_.is_none() {
+                if !store.fns.contains_key(&mk) {
+                    let _ = store.ensure(names, keys, Want::MemberFn(imp_lib, mk));
+                }
+                return Some(mk);
+            } else if trait_match.is_none() {
+                trait_match = Some((imp_lib, mk));
+            }
+        }
+        if let Some((imp_lib, mk)) = trait_match {
+            if !store.fns.contains_key(&mk) {
+                let _ = store.ensure(names, keys, Want::MemberFn(imp_lib, mk));
+            }
+            return Some(mk);
+        }
+        if let Ok(in_scope) = names.traits_in_scope(module, work_alloc) {
+            for &tr_lib in in_scope.iter() {
+                let mut has_fn = false;
+                names.each_member(tr_lib, &mut |m| {
+                    if m.kind == blaze_surface::ItemKind::Function && m.name == Some(method_name) {
+                        has_fn = true;
+                    }
+                });
+                if has_fn {
+                    let _ = store.ensure(names, keys, Want::Members(tr_lib));
+                    let tr_ck = checker_of(tr_lib);
+                    if let Ok(mk) = keys.member(tr_ck, MemberKind::Fn, method_name)
+                        && store.fn_record_defaults.contains_key(&mk)
+                    {
+                        return Some(mk);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn resolve_callee_fn<'n, S: NamesSource<'n>>(
+        names: S,
+        keys: &mut Keys,
+        store: &mut Store<'n>,
+        module: LibKey,
+        self_: SelfTy,
+        marks: Option<TextMarks<'_>>,
+        v: &View<'_>,
+        p: blaze_typeck::PathIdx,
+        work_alloc: Alloc<'_>,
+    ) -> Option<ItemKey> {
+        let mut segs: [&str; 8] = [""; 8];
+        let (absolute, len) = path_segments(v, p, &mut segs)?;
+        let slice = segs.get(..len)?;
+        if !absolute && slice.len() == 2 && slice.first() == Some(&"Self") {
+            let method = *slice.get(1)?;
+            let adt_ck = self_adt_ck(store, self_)?;
+            return find_method_on_adt(names, keys, store, adt_ck, module, method, work_alloc);
+        }
+        let resolver = Paths { names };
+        if let Ok(target) = super::item_site::resolve_written(&resolver, marks, module, v, p, absolute, slice, crate::resolve::Ns::Value, Range::new(0, 0))
+            && target.kind == crate::resolve::Kind::Fn
+            && usize::try_from(target.consumed).ok() == Some(slice.len())
+        {
+            let fn_ck = checker_of(target.key);
+            if !store.fns.contains_key(&fn_ck) {
+                let _ = store.ensure(names, keys, Want::Fn(target.key));
+            }
+            return Some(fn_ck);
+        }
+        if slice.len() >= 2
+            && let Some((&method, type_segs)) = slice.split_last()
+            && let Ok(target) = super::item_site::resolve_written(&resolver, marks, module, v, p, absolute, type_segs, crate::resolve::Ns::Type, Range::new(0, 0))
+            && usize::try_from(target.consumed).ok() == Some(type_segs.len())
+        {
+            match target.kind {
+                crate::resolve::Kind::Struct | crate::resolve::Kind::Enum | crate::resolve::Kind::Union => {
+                    let _ = keys.item(target.key);
+                    return find_method_on_adt(names, keys, store, checker_of(target.key), module, method, work_alloc);
+                }
+                crate::resolve::Kind::TypeAlias => {
+                    let _ = keys.item(target.key);
+                    let _ = store.ensure(names, keys, Want::Head(target.key));
+                    let (_, alias_ty) = store.maps.aliases.get(&target.key).copied().flatten()?;
+                    let adt_ck = pty_to_adt_ck(store, alias_ty)?;
+                    return find_method_on_adt(names, keys, store, adt_ck, module, method, work_alloc);
+                }
+                crate::resolve::Kind::Trait => {
+                    let _ = store.ensure(names, keys, Want::Members(target.key));
+                    let tr_ck = checker_of(target.key);
+                    if let Ok(mk) = keys.member(tr_ck, MemberKind::Fn, method) {
+                        return Some(mk);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn resolve_expr_adt<'n, S: NamesSource<'n>>(
+        names: S,
+        keys: &mut Keys,
+        store: &mut Store<'n>,
+        module: LibKey,
+        self_: SelfTy,
+        marks: Option<TextMarks<'_>>,
+        v: &View<'_>,
+        local_tys: &blaze_hash::HashMap<lf::PatId, lf::TypeId, Alloc<'_>>,
+        local_adts: &blaze_hash::HashMap<lf::PatId, ItemKey, Alloc<'_>>,
+        mut expr: ExprId,
+        depth: u32,
+        work_alloc: Alloc<'_>,
+    ) -> Option<ItemKey> {
+        if depth > 8 {
+            return None;
+        }
+        loop {
+            match v.expr(expr).ok()? {
+                blaze_lower::Expr::Paren(inner)
+                | blaze_lower::Expr::Ref { operand: inner, .. }
+                | blaze_lower::Expr::Unary { op: lf::UnOp::Deref, operand: inner } => expr = inner,
+                blaze_lower::Expr::Block { tail: Some(tail), .. } => expr = tail,
+                blaze_lower::Expr::Local { pat, path } => {
+                    if let Some(&ty_id) = local_tys.get(&pat) {
+                        return resolve_type_adt(names, store, keys, module, self_, marks, v, ty_id);
+                    }
+                    if let Some(&adt_ck) = local_adts.get(&pat) {
+                        return Some(adt_ck);
+                    }
+                    let mut segs: [&str; 8] = [""; 8];
+                    if let Some((false, 1)) = path_segments(v, path, &mut segs)
+                        && segs.first() == Some(&"self")
+                    {
+                        return self_adt_ck(store, self_);
+                    }
+                    return None;
+                }
+                blaze_lower::Expr::Struct { path, .. } => {
+                    return resolve_path_adt(names, store, keys, module, self_, marks, v, path, crate::resolve::Ns::Type).map(|(_, ck, _)| ck);
+                }
+                blaze_lower::Expr::Path(p) => {
+                    return resolve_path_adt(names, store, keys, module, self_, marks, v, p, crate::resolve::Ns::Value).map(|(_, ck, _)| ck);
+                }
+                blaze_lower::Expr::Call { callee, .. } => {
+                    if let Ok(blaze_lower::Expr::Path(p)) = v.expr(callee)
+                        && let Some(fn_ck) = resolve_callee_fn(names, keys, store, module, self_, marks, v, p, work_alloc)
+                        && let Some(fh) = store.fns.get(&fn_ck)
+                    {
+                        return pty_to_adt_ck(store, fh.output);
+                    }
+                    return None;
+                }
+                blaze_lower::Expr::MethodCall { row, .. } => {
+                    let mc = lf::MethodCall::decode(v.row(row).ok()?).ok()?;
+                    let recv_adt = resolve_expr_adt(names, keys, store, module, self_, marks, v, local_tys, local_adts, mc.receiver, depth + 1, work_alloc)?;
+                    let method_name = blaze_scope::task::unraw(v.name_text(mc.name).ok()?);
+                    let fn_ck = find_method_on_adt(names, keys, store, recv_adt, module, method_name, work_alloc)?;
+                    let fh = store.fns.get(&fn_ck)?;
+                    return pty_to_adt_ck(store, fh.output);
+                }
+                blaze_lower::Expr::Field { base, name } => {
+                    let base_ck = resolve_expr_adt(names, keys, store, module, self_, marks, v, local_tys, local_adts, base, depth + 1, work_alloc)?;
+                    if !store.adts.contains_key(&base_ck)
+                        && let Some(&Origin::Item(base_lib)) = keys.origin(base_ck)
+                    {
+                        let _ = store.ensure(names, keys, Want::Adt(base_lib));
+                    }
+                    let fname = Name(v.name(name).ok()?);
+                    let adt = store.adts.get(&base_ck)?;
+                    let field_ty = adt.fields.iter().find(|f| f.name == fname)?.ty;
+                    return pty_to_adt_ck(store, field_ty);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    let mut local_tys: blaze_hash::HashMap<lf::PatId, lf::TypeId, Alloc<'_>> = blaze_hash::HashMap::new_in(work_alloc);
+    let mut local_adts: blaze_hash::HashMap<lf::PatId, ItemKey, Alloc<'_>> = blaze_hash::HashMap::new_in(work_alloc);
+    let mut local_rec_defaults: blaze_hash::HashMap<lf::PatId, ItemKey, Alloc<'_>> = blaze_hash::HashMap::new_in(work_alloc);
+    if let Some((_, param_pats)) = v.body() {
+        if let Some(fh) = store.fns.get(&owner) {
+            for (&pat_raw, &input_pty) in param_pats.iter().zip(fh.inputs.iter()) {
+                if let Some(adt_ck) = pty_to_adt_ck(store, input_pty) {
+                    local_adts.insert(lf::PatId(pat_raw), adt_ck);
+                }
+            }
+        }
+        if let Some(fn_recs) = store.fn_record_defaults.get(&owner) {
+            for &(pos, srk) in fn_recs.iter() {
+                if let Some(pi) = pos
+                    && let Ok(pi_usize) = usize::try_from(pi)
+                    && let Some(&pat_raw) = param_pats.get(pi_usize)
+                {
+                    local_rec_defaults.insert(lf::PatId(pat_raw), srk);
+                }
+            }
+        }
+    }
+    for i in 0..v.stmts.len() {
+        let Ok(idx) = u32::try_from(i) else { break };
+        if let Ok(blaze_lower::Stmt::Let { pat, ty, init, .. }) = v.stmt(blaze_lower::StmtId(idx)) {
+            if let Some(t) = ty {
+                local_tys.insert(pat, t);
+                if let Some(init) = init {
+                    bind_expr_to_type(names, store, rec_lib, module, marks, v, init, t, work_alloc, out);
+                }
+            } else if let Some(init) = init
+                && let Some(adt) = resolve_expr_adt(names, keys, store, module, self_, marks, v, &local_tys, &local_adts, init, 0, work_alloc)
+            {
+                local_adts.insert(pat, adt);
+            }
+        }
     }
 
     let ret_default = store
@@ -2371,47 +2668,98 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
         .get(&owner)
         .and_then(|rows| rows.iter().find_map(|&(pos, srk)| pos.is_none().then_some(srk)));
 
-    for i in 0..v.stmts.len() {
-        let Ok(idx) = u32::try_from(i) else { break };
-        if let Ok(blaze_lower::Stmt::Let { ty: Some(t), init: Some(init), .. }) = v.stmt(blaze_lower::StmtId(idx)) {
-            bind_expr_to_type(names, store, rec_lib, module, marks, v, init, t, out);
-        }
-    }
     for i in 0..v.exprs.len() {
         let Ok(idx) = u32::try_from(i) else { break };
         match v.expr(ExprId(idx)) {
             Ok(blaze_lower::Expr::Call { callee, args }) => {
                 if let Ok(arg_ids) = v.ids(args)
-                    && arg_ids.iter().any(|&id| expr_targets_record(v, ExprId(id)))
+                    && arg_ids.iter().any(|&id| expr_targets_record(v, ExprId(id), work_alloc))
                     && let Ok(blaze_lower::Expr::Path(p)) = v.expr(callee)
-                    && let Some(fn_lib) = resolve_callee_fn(names, module, marks, v, p)
+                    && let Some(fn_ck) = resolve_callee_fn(names, keys, store, module, self_, marks, v, p, work_alloc)
+                    && let Some(fn_recs) = store.fn_record_defaults.get(&fn_ck)
                 {
-                    let fn_ck = checker_of(fn_lib);
-                    if !store.fns.contains_key(&fn_ck) {
-                        let _ = store.ensure(names, keys, Want::Fn(fn_lib));
+                    for &(pos, srk) in fn_recs.iter() {
+                        if let Some(pi) = pos
+                            && let Ok(pi_usize) = usize::try_from(pi)
+                            && let Some(&arg_id) = arg_ids.get(pi_usize)
+                        {
+                            push_record_target(v, ExprId(arg_id), srk, work_alloc, out);
+                        }
                     }
-                    if let Some(fn_recs) = store.fn_record_defaults.get(&fn_ck) {
+                }
+            }
+            Ok(blaze_lower::Expr::MethodCall { row, .. }) => {
+                if let Ok(node) = v.row(row)
+                    && let Ok(mc) = lf::MethodCall::decode(node)
+                    && let Ok(arg_ids) = v.ids(mc.args)
+                    && arg_ids.iter().any(|&id| expr_targets_record(v, ExprId(id), work_alloc))
+                    && let Ok(raw_name) = v.name_text(mc.name)
+                    && let Some(recv_adt) = resolve_expr_adt(names, keys, store, module, self_, marks, v, &local_tys, &local_adts, mc.receiver, 0, work_alloc)
+                {
+                    let method_name = blaze_scope::task::unraw(raw_name);
+                    if let Some(fn_ck) = find_method_on_adt(names, keys, store, recv_adt, module, method_name, work_alloc)
+                        && let Some(fn_recs) = store.fn_record_defaults.get(&fn_ck)
+                    {
+                        let shift = usize::from(store.fns.get(&fn_ck).is_some_and(|fh| fh.self_param));
                         for &(pos, srk) in fn_recs.iter() {
                             if let Some(pi) = pos
                                 && let Ok(pi_usize) = usize::try_from(pi)
-                                && let Some(&arg_id) = arg_ids.get(pi_usize)
+                                && let Some(arg_idx) = pi_usize.checked_sub(shift)
+                                && let Some(&arg_id) = arg_ids.get(arg_idx)
                             {
-                                push_record_target(v, ExprId(arg_id), srk, out);
+                                push_record_target(v, ExprId(arg_id), srk, work_alloc, out);
                             }
                         }
                     }
                 }
             }
+            Ok(blaze_lower::Expr::Struct { path, fields, .. }) => {
+                if let Ok(rows) = v.rows(fields)
+                    && rows.iter().any(|&r| lf::FieldInit::decode(r).is_ok_and(|fi| expr_targets_record(v, fi.expr, work_alloc)))
+                    && let Some((adt_lib, adt_ck, variant)) = resolve_path_adt(names, store, keys, module, self_, marks, v, path, crate::resolve::Ns::Type)
+                {
+                    if !store.adts.contains_key(&adt_ck)
+                        && let Some(lib) = adt_lib
+                    {
+                        let _ = store.ensure(names, keys, Want::Adt(lib));
+                    }
+                    for &row in rows {
+                        if let Ok(fi) = lf::FieldInit::decode(row)
+                            && let Ok(name_hash) = v.name(fi.name)
+                            && let Some(&srk) = store.adt_field_record_defaults.get(&(adt_ck, variant, Name(name_hash)))
+                        {
+                            push_record_target(v, fi.expr, srk, work_alloc, out);
+                        }
+                    }
+                }
+            }
+            Ok(blaze_lower::Expr::Assign { lhs, rhs }) => {
+                if let Ok(blaze_lower::Expr::Local { pat, .. }) = v.expr(lhs) {
+                    if let Some(&ty_id) = local_tys.get(&pat) {
+                        bind_expr_to_type(names, store, rec_lib, module, marks, v, rhs, ty_id, work_alloc, out);
+                    } else if let Some(&srk) = local_rec_defaults.get(&pat) {
+                        push_record_target(v, rhs, srk, work_alloc, out);
+                    }
+                }
+            }
+            Ok(blaze_lower::Expr::Closure { row }) => {
+                if let Ok(node) = v.row(row)
+                    && let Ok(cl) = lf::Closure::decode(node)
+                    && let Some(ret_ty) = cl.ret
+                {
+                    bind_expr_to_type(names, store, rec_lib, module, marks, v, cl.body, ret_ty, work_alloc, out);
+                }
+            }
             Ok(blaze_lower::Expr::Return { value: Some(val) }) => {
                 if let Some(srk) = ret_default {
-                    push_record_target(v, val, srk, out);
+                    push_record_target(v, val, srk, work_alloc, out);
                 }
             }
             _ => {}
         }
     }
     if let Some(srk) = ret_default {
-        push_record_target(v, root, srk, out);
+        push_record_target(v, root, srk, work_alloc, out);
     }
     out.sort_unstable_by_key(|&(id, _)| id);
     out.dedup_by_key(|(id, _)| *id);

@@ -1402,7 +1402,7 @@ impl MethodCall {
         }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<MethodCall, BadRow> {
+    pub fn decode(n: Node) -> Result<MethodCall, BadRow> {
         check_tag!(n, ROW_METHOD, "method calls");
         Ok(MethodCall {
             receiver: ExprId(n.a),
@@ -1475,7 +1475,7 @@ impl Closure {
         }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<Closure, BadRow> {
+    pub fn decode(n: Node) -> Result<Closure, BadRow> {
         check_tag!(n, ROW_CLOSURE, "closures");
         Ok(Closure {
             params: list(n.a, n.b),

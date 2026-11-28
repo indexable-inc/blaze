@@ -2305,9 +2305,22 @@ pub fn cell_id(view: Tables<'_, '_>, read: TableRead) -> Result<Option<CellId>, 
         ReadOf::Source { key } if key.crate_prefix() == blaze_scope::BUILTIN_PREFIX => return Ok(None),
         ReadOf::Source { key } => blaze_drive::key::fact_of(&key.0.0),
         ReadOf::File { krate, .. } if krate == blaze_scope::BUILTIN_PREFIX => return Ok(None),
-        ReadOf::File { krate, .. } => {
-            let key = crate_by(&krate).ok_or(TaskError::NoCrate { prefix: krate })?;
-            blaze_drive::key::crate_scope_name(&key)
+        ReadOf::File { krate, file } => {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&krate);
+            let at = records.crate_of(ItemKey(ContentId(bytes))).ok_or(TaskError::NoCrate { prefix: krate })?;
+            let key = records
+                .crate_key(at)
+                .filter(|key| key.0.0.starts_with(&krate))
+                .ok_or(TaskError::NoCrate { prefix: krate })?;
+            let of = match records.file_paths(at, file) {
+                Some(paths) => {
+                    let path = paths.shown.strip_prefix("/0/").unwrap_or(paths.shown);
+                    Name::file(path.as_bytes())
+                }
+                None => blaze_drive::key::crate_scope_name(&key),
+            };
+            return Ok(Some(CellId { of, cell: Cell([0; 16]) }));
         }
         ReadOf::Head { item } => super::head::signature_name(item),
         ReadOf::Impls { krate } if krate == [0; 16] => Name::new(Kind::ImplBucket, ABSENT),
@@ -5718,6 +5731,52 @@ pub fn entry(x: u8) -> u8 {
         bad_ptr.extend_from_slice(&[99u8, 0, 0, 0]);
         bad_ptr.extend_from_slice(&0u32.to_le_bytes());
         assert_eq!(StretchFront::decode(&bad_ptr, shared).err(), Some(StretchFrontError::PointerTag { tag: 99 }));
+    }
+
+    #[test]
+    fn standalone_file_read_places_on_file_items_whole_cell() {
+        use blaze_drive::key::Key;
+        use blaze_engine::{Phase, Planned, Stage};
+        use super::super::head_tests::cells;
+
+        struct StubMake;
+        impl Make<'static> for StubMake {
+            fn make(&self, id: &CellId, _made: &mut SVec<'static, Made<'static>>) -> Result<ContentId, MakeRefused> {
+                Ok(ContentId::of("test stub cell", &id.of.subject.0))
+            }
+        }
+
+        let (records, _, frame) = world_of("#![no_std]\n#[rustc_builtin_macro]\nmacro_rules! line { () => {} }\npub fn line_user() -> u32 { line!() }");
+        let unused = Recorder::new(RecorderOpts { alloc: a() });
+        let tables = Tables::new(TablesOpts { records, impls: None, lang_crates: &[CORE_AT], reads: &unused });
+        let user_key = records.crate_key(0).expect("user crate key");
+        let user_prefix = user_key.prefix();
+        let file_read = TableRead::File { krate: user_prefix, file: 0 };
+        let placed = cell_id(tables, file_read).expect("file read placed").expect("user file cell");
+        let expected_path = records.file_paths(0, 0).expect("user file paths").shown;
+        let expected_path = expected_path.strip_prefix("/0/").unwrap_or(expected_path);
+        assert_eq!(placed.of, Name::file(expected_path.as_bytes()), "TableRead::File must place on the file's FileItems subject");
+        assert_eq!(placed.of.kind, Kind::FileItems, "TableRead::File must not place on CrateScope");
+        assert_eq!(placed.cell, Cell([0; 16]), "TableRead::File must use the WHOLE cell");
+
+        let heads = cells(records);
+        let key = heads.iter().map(|want| want.key()).find(|&k| records.name_of(k) == Some("line_user")).expect("line_user");
+        let task = Task {
+            planned: Planned { name: Name::new(Kind::BodyCheck, key.0), phase: Phase::new(Stage::Bodies, 0), source: ABSENT, file: Name::new(Kind::FileItems, ABSENT) },
+            key: Key(ABSENT),
+        };
+        let body_frame = BodyFrame { frame, alloc: a(), plant_drop: None, cost: None, needs: NeedsMet::All, heads: None, sources: None, goals: None, prepared: None, front: None };
+        let checked = check_body_split(tables, &task, &body_frame, &StubMake, a(), blaze_own::testing::heap().shared()).expect("check_body_split");
+        assert!(
+            checked.reads.iter().any(|r| matches!(r, TableRead::File { krate, file: 0 } if *krate == user_prefix)),
+            "line_user must record TableRead::File: {:?}",
+            checked.reads
+        );
+        assert!(
+            checked.cells.iter().any(|&(id, _)| id == placed),
+            "check_body_split must place TableRead::File on {placed:?}, got {:?}",
+            checked.cells
+        );
     }
 }
 

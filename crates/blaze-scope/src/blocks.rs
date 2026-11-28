@@ -142,6 +142,11 @@ pub(crate) fn module_text_with_blocks<'a>(
     if !nested.head_calls.is_empty() {
         let name_start = u32::try_from(out.len() + "mod ".len()).unwrap_or(u32::MAX);
         synthetic_blocks.push(name_start);
+        // `HEAD_BLOCK_MODULE` begins with `BLOCK_MODULE` (`__blaze_block_`), so `is_block_module`
+        // is `true`: the cell core treats it as an anonymous scope (`Cells::anonymous`), skipping
+        // it for written `self::` / `super::` paths (`Cells::up`, `names::written_up`) while the
+        // leading `use super::*;` acts as the lexical glob (`Cells::lexical_glob`) inheriting the
+        // enclosing module's items.
         let _ = writeln!(out, "mod {HEAD_BLOCK_MODULE} {{\nuse super::*;");
         for c in nested.head_calls.iter() {
             crate::expanded_blocks::emit_cfg_attrs(text, c.attrs, &mut out, copied, alloc);

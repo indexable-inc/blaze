@@ -2860,6 +2860,10 @@ pub struct Store<'n> {
     /// Maps a function/const/static checker key to per-parameter (`Some(idx)`) and output (`None`)
     /// owner-scoped structural record `field_defaults` keys.
     pub fn_record_defaults: Rows<ItemKey, blaze_own::Vec<(Option<u32>, ItemKey), Alloc<'static>>>,
+    /// Maps `(adt_ck, variant_index, field_name)` to an owner-scoped structural record
+    /// `field_defaults` key when an ADT field's written type is a structural record (or alias)
+    /// with defaults.
+    pub adt_field_record_defaults: Rows<(ItemKey, u32, Name), ItemKey>,
     pub impls: Rows<ItemKey, ImplHead>,
     /// Trait impls whose header is lowered while one of their associated types waits on a
     /// constant ([`ProvisionalImpl`]). Visible only while that impl's `waiting_const` is on
@@ -3539,6 +3543,7 @@ impl<'n> Store<'n> {
             record_type_defaults: Rows::new_in(alloc),
             alias_record_defaults: Rows::new_in(alloc),
             fn_record_defaults: Rows::new_in(alloc),
+            adt_field_record_defaults: Rows::new_in(alloc),
             impls: Rows::new_in(alloc),
             provisional_impls: Rows::new_in(alloc),
             provisional_used: core::cell::RefCell::new(blaze_own::Vec::new_in(alloc)),
@@ -3627,6 +3632,7 @@ impl<'n> Store<'n> {
             record_type_defaults,
             alias_record_defaults,
             fn_record_defaults,
+            adt_field_record_defaults,
             impls,
             provisional_impls,
             provisional_used,
@@ -3711,6 +3717,7 @@ impl<'n> Store<'n> {
         record_type_defaults.clear();
         alias_record_defaults.clear();
         fn_record_defaults.clear();
+        adt_field_record_defaults.clear();
         impls.clear();
         provisional_impls.clear();
         provisional_used.get_mut().clear();
@@ -6547,6 +6554,16 @@ impl<'n> Store<'n> {
         sans_io |= names.in_sans_io_scope(key, module);
         let discrs = discriminants(&b, &mut self.tys, &env, v, repr, &written)?;
         self.register_record_defaults(names, keys, key, owner, &env, marks, v)?;
+        if Self::view_has_record_type(v) || !self.alias_record_defaults.is_empty() {
+            let adt_owner_lib = owner.map_or(key, |(k, _)| k);
+            for (fi_idx, fa) in field_at.iter().enumerate() {
+                if let Some(srk) = self.record_default_key_for_type(names, adt_owner_lib, module, marks, v, fa.written)
+                    && let Some(field) = fields.get(fi_idx)
+                {
+                    self.adt_field_record_defaults.insert((ck, fa.variant, field.name), srk);
+                }
+            }
+        }
         let (lifetimes, field_region_at, field_region_list) = super::borrows::freeze_field_regions(names, keys, self, ck, v, kind, &fields, self.tys.alloc())?;
         let field_regions = super::borrows::FieldRegions::new(field_region_at, field_region_list, self.tys.alloc());
         let auto_copy = is_auto_copy_pub_view(names, key, module, kind, v)?;
