@@ -118,26 +118,14 @@ jobs:
         with:
           name: toolchain-shelf
           path: ${{ runner.temp }}/toolchain-shelf
-      - uses: ./.github/actions/blaze
-      - name: Build release blaze, blaze-launcher, and blaze-fact-shim with blaze
+      - uses: ./.github/actions/toolchain
+      - name: Build release blaze, blaze-launcher, and blaze-fact-shim (one-time bootstrap seed)
         env:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
         run: |
           set -euo pipefail
-          mkdir -p target/release
-          run_bounded() {
-            local secs=$1; shift
-            if command -v timeout >/dev/null 2>&1; then
-              timeout -k 30 "$secs" "$@"
-            elif command -v gtimeout >/dev/null 2>&1; then
-              gtimeout -k 30 "$secs" "$@"
-            else
-              "$@"
-            fi
-          }
-          run_bounded 9000 blaze build --release -p blaze-cli --bin blaze -o target/release/blaze
-          run_bounded 1800 blaze build --release -p blaze-cli --bin blaze-fact-shim -o target/release/blaze-fact-shim
-          run_bounded 1800 blaze build --release -p blaze-launcher --bin blaze-launcher -o target/release/blaze-launcher
+          cargo build --release --locked --target-dir target -p blaze-cli --bin blaze --bin blaze-fact-shim -p blaze-launcher --bin blaze-launcher
+          ls -lh target/release/blaze target/release/blaze-fact-shim target/release/blaze-launcher
       - name: Archive and checksum
         run: |
           set -euo pipefail
