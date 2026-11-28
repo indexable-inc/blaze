@@ -625,6 +625,9 @@ impl<F: Facts> Facts for WithRegions<'_, F> {
     fn copy_args(&self, adt: ItemKey) -> Option<&[bool]> {
         self.base.copy_args(adt)
     }
+    fn inst_is_copy(&self, ty: PTy) -> Option<bool> {
+        self.base.inst_is_copy(ty)
+    }
     fn drop_args(&self, adt: ItemKey) -> Option<&[bool]> {
         self.base.drop_args(adt)
     }

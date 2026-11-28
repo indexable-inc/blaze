@@ -503,6 +503,14 @@ pub trait Facts {
     /// lowering does not check (`T: Tr`) gives `None`. Whoever answers files the read of the
     /// impl's header in the body's read list (rule 21).
     fn copy_args(&self, adt: ItemKey) -> Option<&[bool]>;
+    /// Whether the instantiated type `ty` (in the body's own `PTys` table) implements `Copy`,
+    /// consulted when an ADT's `Copy` impl has clauses beyond simple per-argument `T: Copy`
+    /// bounds (`Facts::copy_args(k)` returned `None`, e.g. `impl<T: ?Sized, I: Invariants<Aliasing = Shared>> Copy for Ptr<'_, T, I>`).
+    /// `Some(true)` proves `ty: Copy`; `Some(false)` proves `ty: !Copy`; `None` falls back to
+    /// checking every generic argument of `ty`.
+    fn inst_is_copy(&self, _ty: PTy) -> Option<bool> {
+        None
+    }
     /// For each generic argument of `adt` (the record's argument list, as
     /// [`Facts::copy_args`] counts it), whether `adt`'s drop glue drops a value of that
     /// argument: `[false]` for `slice::Iter<'a, T>` (holds `NonNull<T>`, `*const T`,
@@ -1989,7 +1997,11 @@ pub fn pty_is_copy<'a, 'c, F: Facts, A: Allocator + Copy, E>(
                 match walk.adt_args {
                     AdtCopyArgs::All => stack.extend_from_slice(args),
                     AdtCopyArgs::Facts => match walk.facts.copy_args(k) {
-                        None => stack.extend_from_slice(args),
+                        None => match walk.facts.inst_is_copy(t) {
+                            Some(true) => {}
+                            Some(false) => return set_false(),
+                            None => stack.extend_from_slice(args),
+                        },
                         Some(need) if need.len() == args.len() => {
                             for (&a, &req) in args.iter().zip(need.iter()) {
                                 if req {

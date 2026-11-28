@@ -1130,8 +1130,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         use blaze_typeck::Def;
 
         let facts: &'b F = self.facts;
-        // Walk up from `ce` through transparent wrappers (`Paren`, `&`, `Box::new`, `Cast`)
-        // to find the coerced erased `PNode::Dynamic` target type.
+        // Walk up from `ce` through transparent wrappers (`Paren`, `&`, `Box::new`/smart-ptr
+        // `new`, `Cast`) to find the coerced erased `PNode::Dynamic` target type.
         let mut cur = ce;
         let mut want_dyn: Option<PTy> = None;
         for _ in 0..8 {
@@ -1156,7 +1156,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                             && es[0] == cur
                             && let Ok(pty) = self.expr_ty(pe)
                             && let Ok(PNode::Adt(k, _)) = self.node(pty, e)
-                            && facts.adt(k).is_some_and(|a| a.is_box)
+                            && (facts.adt(k).is_some_and(|a| a.is_box)
+                                || (facts.adt(k).is_some_and(|a| a.lifetimes == 0)
+                                    && self.adjusted_ty(pe).ok().and_then(|t| self.peel_body_dyn(t, e).ok().flatten()).is_some()))
                         {
                             next = Some(pe);
                             break;
@@ -1173,72 +1175,172 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
 
         let mut found: Option<(PTy, &'b [Region], u32)> = None;
 
-        // 1. Direct expecting site (struct field, tuple ctor, direct fn or method call arg).
-        for (ix, expr) in self.body.exprs.iter().enumerate() {
-            let pe = ExprId(to_u32(ix));
-            match *expr {
-                Expr::Struct { fields, .. } => {
-                    let Some(fs) = self.body.field_inits.get(fields.range()) else { continue };
-                    let Some(f) = fs.iter().find(|f| f.expr == target_expr) else { continue };
-                    let (adt, variant) = match self.expr_def(pe) {
-                        Some(Def::Ctor { adt, variant, .. }) => (adt, variant),
-                        Some(Def::Adt(adt)) if facts.adt(adt).is_some_and(|a| !a.is_enum) => (adt, 0),
-                        _ => continue,
-                    };
-                    let Some(fi) = facts.field(adt, variant, f.name) else { continue };
-                    if let Ok(col) = facts.regions().field(adt, variant, fi)
-                        && let Ok(Some(m)) = self.find_unique_dyn_with_binder(col.ty(), col.as_slice(), 0, heads, want_dyn, e)
-                    {
-                        found = Some(m);
+        // 1. Walk up from `target_expr` through enclosing aggregates/wrappers (`Tuple`, `Array`,
+        //    `Repeat`, `Struct`, `Call`, `MethodCall`, `Block`, `If`, `Match`, `Paren`, `Ref`,
+        //    `Cast`, `Assign`) to the expecting site's declared head (field, callee signature,
+        //    or generic container receiver/lhs traced back to a static/const/field/param/call).
+        let mut walk_cur = target_expr;
+        for _ in 0..16 {
+            let mut next_parent: Option<ExprId> = None;
+            let mut stop = false;
+            for (ix, expr) in self.body.exprs.iter().enumerate() {
+                let pe = ExprId(to_u32(ix));
+                match *expr {
+                    Expr::Struct { fields, .. } => {
+                        let Some(fs) = self.body.field_inits.get(fields.range()) else { continue };
+                        let Some(f) = fs.iter().find(|f| f.expr == walk_cur) else { continue };
+                        if let Some((adt, variant)) = match self.expr_def(pe) {
+                            Some(Def::Ctor { adt, variant, .. }) => Some((adt, variant)),
+                            Some(Def::Adt(adt)) if facts.adt(adt).is_some_and(|a| !a.is_enum) => Some((adt, 0)),
+                            _ => None,
+                        } && let Some(fi) = facts.field(adt, variant, f.name)
+                            && let Ok(col) = facts.regions().field(adt, variant, fi)
+                            && let Ok(Some(m)) = self.find_unique_dyn_with_binder(col.ty(), col.as_slice(), 0, heads, want_dyn, e)
+                        {
+                            found = Some(m);
+                            stop = true;
+                        } else {
+                            next_parent = Some(pe);
+                        }
                         break;
                     }
-                }
-                Expr::Call { callee, args } => {
-                    let Some(es) = self.body.expr_lists.get(args.range()) else { continue };
-                    let Some(arg_i) = es.iter().position(|&a| a == target_expr) else { continue };
-                    match self.expr_def(callee) {
-                        Some(Def::Ctor { adt, variant, .. }) => {
-                            if let Ok(col) = facts.regions().field(adt, variant, to_u32(arg_i))
-                                && let Ok(Some(m)) = self.find_unique_dyn_with_binder(col.ty(), col.as_slice(), 0, heads, want_dyn, e)
-                            {
-                                found = Some(m);
-                                break;
-                            }
-                        }
-                        Some(Def::Fn(item)) => {
-                            if let Ok(sig) = facts.sig(item)
-                                && let Some(in_slots) = sig.input(to_u32(arg_i))
-                                && let Ok(in_ty) = self.sig_declared(sig, to_u32(arg_i), e)
-                            {
-                                let base = self.fn_sig_param_binder(sig, to_u32(arg_i), heads);
-                                if let Ok(Some(m)) = self.find_unique_dyn_with_binder(in_ty, in_slots, base, heads, want_dyn, e) {
+                    Expr::Call { callee, args } => {
+                        let Some(es) = self.body.expr_lists.get(args.range()) else { continue };
+                        let Some(arg_i) = es.iter().position(|&a| a == walk_cur) else { continue };
+                        match self.expr_def(callee) {
+                            Some(Def::Ctor { adt, variant, .. }) => {
+                                if let Ok(col) = facts.regions().field(adt, variant, to_u32(arg_i))
+                                    && let Ok(Some(m)) = self.find_unique_dyn_with_binder(col.ty(), col.as_slice(), 0, heads, want_dyn, e)
+                                {
                                     found = Some(m);
+                                    stop = true;
                                     break;
                                 }
                             }
+                            Some(Def::Fn(item)) => {
+                                if let Ok(sig) = facts.sig(item)
+                                    && let Some(in_slots) = sig.input(to_u32(arg_i))
+                                    && let Ok(in_ty) = self.sig_declared(sig, to_u32(arg_i), e)
+                                {
+                                    let base = self.fn_sig_param_binder(sig, to_u32(arg_i), heads);
+                                    if let Ok(Some(m)) = self.find_unique_dyn_with_binder(in_ty, in_slots, base, heads, want_dyn, e) {
+                                        found = Some(m);
+                                        stop = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            _ => {
+                                if let Some((item, _)) = self.callee_of(pe)
+                                    && let Ok(sig) = facts.sig(item)
+                                    && let Some(in_slots) = sig.input(to_u32(arg_i))
+                                    && let Ok(in_ty) = self.sig_declared(sig, to_u32(arg_i), e)
+                                {
+                                    let base = self.fn_sig_param_binder(sig, to_u32(arg_i), heads);
+                                    if let Ok(Some(m)) = self.find_unique_dyn_with_binder(in_ty, in_slots, base, heads, want_dyn, e) {
+                                        found = Some(m);
+                                        stop = true;
+                                        break;
+                                    }
+                                }
+                            }
                         }
-                        _ => {}
-                    }
-                }
-                Expr::MethodCall { args, .. } => {
-                    let Some(es) = self.body.expr_lists.get(args.range()) else { continue };
-                    let Some(arg_i) = es.iter().position(|&a| a == target_expr) else { continue };
-                    let param_i = to_u32(arg_i + 1);
-                    if let Some(pos) = self.ck.callees.column::<0>().iter().position(|&x| x == pe)
-                        && let Some(&item) = self.ck.callees.column::<1>().get(pos)
-                        && let Ok(sig) = facts.sig(item)
-                        && let Some(in_slots) = sig.input(param_i)
-                        && let Ok(in_ty) = self.sig_declared(sig, param_i, e)
-                    {
-                        let base = self.fn_sig_param_binder(sig, param_i, heads);
-                        if let Ok(Some(m)) = self.find_unique_dyn_with_binder(in_ty, in_slots, base, heads, want_dyn, e) {
+                        // Generic UFCS container mutation (e.g. `Vec::push(&mut readers, (id, Box::new(...)))`):
+                        // trace sibling arguments to a unique container root carrying `want_dyn`.
+                        let mut arg_match: Option<(PTy, &'b [Region], u32)> = None;
+                        let mut ambiguous = false;
+                        for (j, &other) in es.iter().enumerate() {
+                            if j == arg_i {
+                                continue;
+                            }
+                            if let Ok(Some(m)) = self.trace_dyn_root(other, want_dyn, heads, e) {
+                                match arg_match {
+                                    None => arg_match = Some(m),
+                                    Some((_, prev_s, prev_b)) if prev_b == m.2 && prev_s == m.1 => {}
+                                    Some(_) => {
+                                        ambiguous = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if !ambiguous && let Some(m) = arg_match {
                             found = Some(m);
+                            stop = true;
+                        } else {
+                            next_parent = Some(pe);
+                        }
+                        break;
+                    }
+                    Expr::MethodCall { receiver, args, .. } => {
+                        let Some(es) = self.body.expr_lists.get(args.range()) else { continue };
+                        let Some(arg_i) = es.iter().position(|&a| a == walk_cur) else { continue };
+                        let param_i = to_u32(arg_i + 1);
+                        if let Some(pos) = self.ck.callees.column::<0>().iter().position(|&x| x == pe)
+                            && let Some(&item) = self.ck.callees.column::<1>().get(pos)
+                            && let Ok(sig) = facts.sig(item)
+                            && let Some(in_slots) = sig.input(param_i)
+                            && let Ok(in_ty) = self.sig_declared(sig, param_i, e)
+                        {
+                            let base = self.fn_sig_param_binder(sig, param_i, heads);
+                            if let Ok(Some(m)) = self.find_unique_dyn_with_binder(in_ty, in_slots, base, heads, want_dyn, e) {
+                                found = Some(m);
+                                stop = true;
+                                break;
+                            }
+                        }
+                        if let Ok(Some(m)) = self.trace_dyn_root(receiver, want_dyn, heads, e) {
+                            found = Some(m);
+                            stop = true;
+                        } else {
+                            next_parent = Some(pe);
+                        }
+                        break;
+                    }
+                    Expr::Assign { lhs, rhs } if rhs == walk_cur => {
+                        if let Ok(Some(m)) = self.trace_dyn_root(lhs, want_dyn, heads, e) {
+                            found = Some(m);
+                        }
+                        stop = true;
+                        break;
+                    }
+                    Expr::Tuple { elems } | Expr::Array { elems } => {
+                        if self.body.expr_lists.get(elems.range()).is_some_and(|es| es.contains(&walk_cur)) {
+                            next_parent = Some(pe);
                             break;
                         }
                     }
+                    Expr::Repeat { elem, .. } if elem == walk_cur => {
+                        next_parent = Some(pe);
+                        break;
+                    }
+                    Expr::Paren(inner)
+                    | Expr::Ref { operand: inner, .. }
+                    | Expr::Cast { operand: inner, .. }
+                    | Expr::Block { tail: Some(inner), .. }
+                        if inner == walk_cur =>
+                    {
+                        next_parent = Some(pe);
+                        break;
+                    }
+                    Expr::If { then, else_, .. } if then == walk_cur || else_ == Some(walk_cur) => {
+                        next_parent = Some(pe);
+                        break;
+                    }
+                    Expr::Match { arms, .. } => {
+                        if self.body.arms.get(arms.range()).is_some_and(|al| al.iter().any(|arm| arm.body == walk_cur)) {
+                            next_parent = Some(pe);
+                            break;
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+            if stop {
+                break;
+            }
+            let Some(parent) = next_parent else { break };
+            walk_cur = parent;
         }
 
         // 2. When the immediate call is generic (e.g. `HashMap::insert(k, Box::new(closure))` into
@@ -1314,6 +1416,204 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         }
         let (args_tup, args_slots) = args_match?;
         Some((args_slots, args_tup, out_match, dyn_binder))
+    }
+
+    /// Traces a container expression `start` (e.g. `readers` bound from `READERS.write()`,
+    /// `READERS.write().unwrap()`, `self.readers`, or a fn parameter) back to a declared head
+    /// (static, const, struct field, callee output, or owner parameter) carrying a unique
+    /// `PNode::Dynamic` matching `want_dyn`, returning `(dyn_ty, dyn_slots, dyn_binder)`.
+    #[allow(clippy::type_complexity)]
+    fn trace_dyn_root(
+        &self,
+        start: ExprId,
+        want_dyn: PTy,
+        heads: &blaze_borrow::Columns<'_>,
+        e: ExprId,
+    ) -> Result<Option<(PTy, &'b [Region], u32)>, Refusal> {
+        use blaze_typeck::{Def, Stmt, UnOp};
+
+        let facts: &'b F = self.facts;
+        let mut cur = start;
+        for _ in 0..24 {
+            match self.expr(cur)? {
+                Expr::Paren(i)
+                | Expr::Unary { op: UnOp::Deref, operand: i }
+                | Expr::Ref { operand: i, .. }
+                | Expr::Cast { operand: i, .. }
+                | Expr::Block { tail: Some(i), .. } => cur = i,
+                Expr::Index { base, .. } => cur = base,
+                Expr::Path(_) => match self.expr_def(cur) {
+                    Some(Def::Static(item, _) | Def::Const(item)) => {
+                        if let Ok(sig) = facts.sig(item)
+                            && let Some(out_slots) = sig.output()
+                            && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                        {
+                            let base = self.fn_sig_param_binder(sig, sig.inputs(), heads);
+                            return self.find_unique_dyn_with_binder(out_ty, out_slots, base, heads, want_dyn, e);
+                        }
+                        return Ok(None);
+                    }
+                    _ => return Ok(None),
+                },
+                Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
+                    let field_idx = match self.expr(cur)? {
+                        Expr::Field { .. } => self.field_of(cur),
+                        Expr::TupleField { index, .. } => Some(index),
+                        _ => None,
+                    };
+                    if let Some(fi) = field_idx
+                        && let Some(adt) = self.peel_field_adt(base, e)?
+                        && let Ok(col) = facts.regions().field(adt, 0, fi)
+                        && let Some(m) = self.find_unique_dyn_with_binder(col.ty(), col.as_slice(), 0, heads, want_dyn, e)?
+                    {
+                        return Ok(Some(m));
+                    }
+                    cur = base;
+                }
+                Expr::Call { callee, args } => {
+                    let callee_item = self.callee_of(cur).map(|(k, _)| k).or_else(|| match self.expr_def(callee) {
+                        Some(Def::Fn(k)) => Some(k),
+                        _ => None,
+                    });
+                    if let Some(item) = callee_item
+                        && let Ok(sig) = facts.sig(item)
+                        && let Some(out_slots) = sig.output()
+                        && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                    {
+                        let base = self.fn_sig_param_binder(sig, sig.inputs(), heads);
+                        if let Some(m) = self.find_unique_dyn_with_binder(out_ty, out_slots, base, heads, want_dyn, e)? {
+                            return Ok(Some(m));
+                        }
+                    }
+                    if let Some(&[only]) = self.body.expr_lists.get(args.range()) {
+                        cur = only;
+                        continue;
+                    }
+                    return Ok(None);
+                }
+                Expr::MethodCall { receiver, .. } => {
+                    if let Some((item, _)) = self.callee_of(cur)
+                        && let Ok(sig) = facts.sig(item)
+                        && let Some(out_slots) = sig.output()
+                        && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                    {
+                        let base = self.fn_sig_param_binder(sig, sig.inputs(), heads);
+                        if let Some(m) = self.find_unique_dyn_with_binder(out_ty, out_slots, base, heads, want_dyn, e)? {
+                            return Ok(Some(m));
+                        }
+                    }
+                    cur = receiver;
+                }
+                Expr::Match { scrutinee, arms } => {
+                    let Some(arm_list) = self.body.arms.get(arms.range()) else { return Ok(None) };
+                    let mut live_arm: Option<&blaze_typeck::Arm> = None;
+                    for arm in arm_list.iter() {
+                        if let Ok(bt) = self.expr_ty(arm.body)
+                            && matches!(self.node(bt, e), Ok(PNode::Never))
+                        {
+                            continue;
+                        }
+                        if live_arm.is_some() {
+                            return Ok(None);
+                        }
+                        live_arm = Some(arm);
+                    }
+                    let Some(arm) = live_arm else { return Ok(None) };
+                    if let Expr::Local(v) = self.expr(arm.body)?
+                        && self.pat_contains(arm.pat, v)?
+                        && let Expr::Call { args, .. } = self.expr(scrutinee)?
+                        && let Some(&[only]) = self.body.expr_lists.get(args.range())
+                    {
+                        if let Some((item, _)) = self.callee_of(scrutinee)
+                            && let Ok(sig) = facts.sig(item)
+                            && let Some(out_slots) = sig.output()
+                            && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                        {
+                            let base = self.fn_sig_param_binder(sig, sig.inputs(), heads);
+                            if let Some(m) = self.find_unique_dyn_with_binder(out_ty, out_slots, base, heads, want_dyn, e)? {
+                                return Ok(Some(m));
+                            }
+                        }
+                        if let (Ok(only_ty), Ok(arm_ty)) = (self.adjusted_ty(only), self.expr_ty(arm.body))
+                            && let Ok(PNode::Adt(_, adt_args)) = self.node(only_ty, e)
+                            && self.list(adt_args, e)?.contains(&arm_ty)
+                        {
+                            cur = only;
+                            continue;
+                        }
+                    }
+                    cur = arm.body;
+                }
+                Expr::Local(p) => {
+                    if let Some((adt, variant, field)) = self.pat_field_source(p)?
+                        && let Ok(col) = facts.regions().field(adt, variant, field)
+                        && let Some(m) = self.find_unique_dyn_with_binder(col.ty(), col.as_slice(), 0, heads, want_dyn, e)?
+                    {
+                        return Ok(Some(m));
+                    }
+                    if let Some(param) = self.body.params.iter().position(|x| *x == p)
+                        && let Ok(param32) = u32::try_from(param)
+                        && let Ok(own_sig) = facts.sig(self.body.owner)
+                        && let Some(in_slots) = own_sig.input(param32)
+                        && let Ok(in_ty) = self.sig_declared(own_sig, param32, e)
+                    {
+                        let base = self.fn_sig_param_binder(own_sig, param32, heads);
+                        if let Some(m) = self.find_unique_dyn_with_binder(in_ty, in_slots, base, heads, want_dyn, e)? {
+                            return Ok(Some(m));
+                        }
+                    }
+                    // Allow tracing through `let mut readers = READERS.write();` (mutably
+                    // borrowing a container for `push`/`insert` does not change its declared type,
+                    // whereas an explicit `let` type annotation or direct reassignment might).
+                    let reassigned = self.body.exprs.iter().any(|ex| {
+                        matches!(
+                            *ex,
+                            Expr::Assign { lhs, .. } | Expr::AssignOp { lhs, .. }
+                                if matches!(self.body.exprs.get(lhs.ix()), Some(&Expr::Local(q)) if q == p)
+                        )
+                    });
+                    if reassigned {
+                        return Ok(None);
+                    }
+                    let mut init_expr: Option<ExprId> = None;
+                    for stmt in self.body.stmts.iter() {
+                        if let Stmt::Let { pat, ty, init: Some(i), .. } = *stmt
+                            && self.pat_contains(pat, p)?
+                        {
+                            if ty.is_some() || init_expr.is_some() {
+                                return Ok(None);
+                            }
+                            init_expr = Some(i);
+                        }
+                    }
+                    for expr in self.body.exprs.iter() {
+                        match *expr {
+                            Expr::Let { pat, init } if self.pat_contains(pat, p)? => {
+                                if init_expr.is_some() {
+                                    return Ok(None);
+                                }
+                                init_expr = Some(init);
+                            }
+                            Expr::Match { scrutinee, arms } => {
+                                for arm in self.body.arms.get(arms.range()).unwrap_or(&[]) {
+                                    if self.pat_contains(arm.pat, p)? {
+                                        if init_expr.is_some() {
+                                            return Ok(None);
+                                        }
+                                        init_expr = Some(scrutinee);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let Some(init) = init_expr else { return Ok(None) };
+                    cur = init;
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
     }
 
     /// Searches a head-table type `(root, slots)` in exact pre-order (tracking binder indices

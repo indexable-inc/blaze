@@ -145,3 +145,231 @@ fn own_bodies_move_and_borrow_checked() {
     assert!(types.is_clean(), "with_closure's types: {types:?}");
     assert!(v.is_clean(), "with_closure: {v:?}");
 }
+
+const DYN_AND_COPY_MAIN: &str = r#"
+use core::cell::UnsafeCell;
+use core::marker::PhantomData;
+use core::ops::{Deref, DerefMut};
+
+trait MyErr {}
+
+impl dyn MyErr + 'static {
+    fn downcast(&self) -> bool {
+        true
+    }
+}
+
+type Reader = Box<dyn Fn(&(dyn MyErr + 'static)) -> bool + Send + Sync>;
+
+struct Lock<T>(UnsafeCell<T>);
+unsafe impl<T: Send> Sync for Lock<T> {}
+
+struct Guard<'a, T>(&'a mut T);
+
+impl<T> Deref for Guard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.0
+    }
+}
+
+impl<T> DerefMut for Guard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.0
+    }
+}
+
+impl<T> Lock<T> {
+    const fn new(v: T) -> Self {
+        Self(UnsafeCell::new(v))
+    }
+    fn write(&self) -> Guard<'_, T> {
+        unsafe { Guard(&mut *self.0.get()) }
+    }
+    fn try_write(&self) -> Result<Guard<'_, T>, ()> {
+        Ok(self.write())
+    }
+}
+
+static READERS: Lock<Vec<(u32, Reader)>> = Lock::new(Vec::new());
+
+fn dyn_expect_static_local_guard() {
+    let mut readers = READERS.write();
+    readers.push((
+        1u32,
+        Box::new(move |link| link.downcast()),
+    ));
+}
+
+fn dyn_expect_static_chained_unwrap() {
+    READERS
+        .try_write()
+        .unwrap()
+        .push((2u32, Box::new(move |link| link.downcast())));
+}
+
+fn dyn_expect_param_vec_tuple(v: &mut Vec<(u32, Reader)>) {
+    v.push((3u32, Box::new(move |link| link.downcast())));
+}
+
+fn dyn_expect_negative_elided(v: &mut Vec<(u32, Box<dyn Fn(&(dyn MyErr + '_)) -> bool>)>) {
+    v.push((4u32, Box::new(move |link| link.downcast())));
+}
+
+trait Sealed {}
+trait Alignment: Sealed {}
+trait Invariants {
+    type Aliasing;
+}
+
+struct Shared;
+struct Exclusive;
+
+struct SharedInv;
+impl Invariants for SharedInv {
+    type Aliasing = Shared;
+}
+
+struct ExclusiveInv;
+impl Invariants for ExclusiveInv {
+    type Aliasing = Exclusive;
+}
+
+#[derive(Clone, Copy)]
+struct ExclusiveCopyInv;
+impl Invariants for ExclusiveCopyInv {
+    type Aliasing = Exclusive;
+}
+
+impl<A, AA: Alignment> Invariants for (A, AA) {
+    type Aliasing = A;
+}
+
+struct Ptr<'a, T: ?Sized, I>(&'a T, PhantomData<I>);
+
+impl<'a, T: 'a + ?Sized, I: Invariants<Aliasing = Shared>> Copy for Ptr<'a, T, I> {}
+impl<'a, T: 'a + ?Sized, I: Invariants<Aliasing = Shared>> Clone for Ptr<'a, T, I> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_proj_shared_ok(x: &u8) {
+    let p: Ptr<'_, u8, SharedInv> = Ptr(x, PhantomData);
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_proj_generic_tuple_shared_ok<A: Alignment>(p: Ptr<'_, u8, (Shared, A)>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_proj_exclusive_err(x: &u8) {
+    let p: Ptr<'_, u8, ExclusiveInv> = Ptr(x, PhantomData);
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_proj_exclusive_copy_arg_err(x: &u8) {
+    let p: Ptr<'_, u8, ExclusiveCopyInv> = Ptr(x, PhantomData);
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_proj_generic_tuple_exclusive_err<A: Alignment>(p: Ptr<'_, u8, (Exclusive, A)>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn main() {}
+"#;
+
+#[test]
+fn dyn_closure_expectation_and_conditional_copy_projection() {
+    let heap = blaze_own::testing::heap();
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let files = [("/dyn-copy-test/src/main.rs".to_string(), DYN_AND_COPY_MAIN.to_string())];
+    let edition = edition::PackageEdition::of_manifest("2024").expect("a known edition");
+    let user = UserCrate {
+        name: "dyn_copy_test",
+        dir: "/dyn-copy-test/",
+        root: "/dyn-copy-test/src/main.rs",
+        files: &files,
+        edition,
+        panic: blaze_build::Panic::Unwind,
+    };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+
+    let sources = [SourceFile { path: "src/main.rs", text: DYN_AND_COPY_MAIN }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
+    let mut world = ProjectWorld::new(&names, &frame, &sources, heap.alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let bodies = world.bodies(heap.alloc());
+    let name_of = |b: &BodyRef<'_>| -> String {
+        match b {
+            BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name).unwrap_or("?").to_string(),
+            BodyRef::Member { name, .. } => name.to_string(),
+        }
+    };
+    let find = |n: &str| bodies.iter().find(|(b, _)| name_of(b) == n).map(|(b, _)| *b).unwrap_or_else(|| panic!("`{n}` listed"));
+    let text_of = |b: BodyRef<'_>| {
+        let k = match b {
+            BodyRef::Free(k) => k,
+            BodyRef::Member { container, .. } => container,
+        };
+        names.item_text(k).expect("the body's item text").text
+    };
+
+    for ok_fn in [
+        "dyn_expect_static_local_guard",
+        "dyn_expect_static_chained_unwrap",
+        "dyn_expect_param_vec_tuple",
+        "copy_proj_shared_ok",
+        "copy_proj_generic_tuple_shared_ok",
+    ] {
+        let body = find(ok_fn);
+        let (types, v) = world.check_borrows(body, heap.alloc());
+        assert!(types.is_clean(), "{ok_fn} types: {types:?}");
+        assert!(v.is_clean(), "{ok_fn} borrows: {}", shown(text_of(body), &v));
+    }
+
+    // Negative control: `dyn Fn(&(dyn MyErr + '_))` MUST still fail with E0521.
+    {
+        let body = find("dyn_expect_negative_elided");
+        let (types, v) = world.check_borrows(body, heap.alloc());
+        assert!(types.is_clean(), "dyn_expect_negative_elided types: {types:?}");
+        assert!(v.refused.is_none(), "dyn_expect_negative_elided refused: {:?}", v.refused);
+        assert!(
+            v.findings.iter().any(|d| d.code == "E0521"),
+            "dyn_expect_negative_elided expected E0521, got: {}",
+            shown(text_of(body), &v)
+        );
+    }
+
+    // Negative controls: `Ptr` with `Aliasing = Exclusive` MUST still fail with E0382
+    // (including when the invariant marker itself implements `Copy` or is a generic tuple).
+    for err_fn in [
+        "copy_proj_exclusive_err",
+        "copy_proj_exclusive_copy_arg_err",
+        "copy_proj_generic_tuple_exclusive_err",
+    ] {
+        let body = find(err_fn);
+        let (types, v) = world.check_borrows(body, heap.alloc());
+        assert!(types.is_clean(), "{err_fn} types: {types:?}");
+        assert!(v.refused.is_none(), "{err_fn} refused: {:?}", v.refused);
+        assert!(
+            v.findings.iter().any(|d| d.code == "E0382"),
+            "{err_fn} expected E0382, got: {}",
+            shown(text_of(body), &v)
+        );
+    }
+}

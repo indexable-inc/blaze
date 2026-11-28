@@ -1424,6 +1424,9 @@ pub(super) struct InstDropEval<'a> {
     active: AVec<'a, tc::PTy>,
     active_goals: AVec<'a, (tc::ItemKey, tc::PTy)>,
     adt_cache: AVec<'a, (tc::ItemKey, InstAdtInfo)>,
+    owner_loaded: Option<tc::ItemKey>,
+    owner_traits: AVec<'a, (tc::ItemKey, AVec<'a, tc::PTy>)>,
+    owner_projs: AVec<'a, (tc::ItemKey, tc::Name, AVec<'a, tc::PTy>, tc::PTy)>,
     read_adts: AVec<'a, (u128, u64)>,
     read_impls: AVec<'a, (u128, u64)>,
     read_queries: AVec<'a, (u128, u64, u64)>,
@@ -1438,6 +1441,9 @@ impl<'a> InstDropEval<'a> {
             active: AVec::new_in(alloc),
             active_goals: AVec::new_in(alloc),
             adt_cache: AVec::new_in(alloc),
+            owner_loaded: None,
+            owner_traits: AVec::new_in(alloc),
+            owner_projs: AVec::new_in(alloc),
             read_adts: AVec::new_in(alloc),
             read_impls: AVec::new_in(alloc),
             read_queries: AVec::new_in(alloc),
@@ -1456,6 +1462,173 @@ impl<'a> InstDropEval<'a> {
         let mut budget = MOST_INST_DROP_STEPS;
         let root = self.copy_from_table(body_tys, ty, None, 0, &mut budget)?;
         self.eval_inst_ty(r, langs, root, 0, &mut budget)
+    }
+
+    /// Evaluates whether the instantiated body type `ty` (in `body_tys`) implements `Copy`,
+    /// solving conditional `Copy` impls (including associated-type projection clauses like
+    /// `I: Invariants<Aliasing = Shared>`) under `owner`'s `where` clauses and their supertraits.
+    pub(super) fn eval_body_copy<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        langs: super::BorrowLangs,
+        owner: tc::ItemKey,
+        body_tys: tc::PTys<'_>,
+        ty: tc::PTy,
+    ) -> Option<bool> {
+        let copy = langs.copy?;
+        self.ensure_owner_clauses(r, owner);
+        let mut budget = MOST_INST_DROP_STEPS;
+        let root = self.copy_from_table(body_tys, ty, None, 0, &mut budget)?;
+        match self.prove_trait(r, langs, copy, &[root], 0, &mut budget) {
+            Truth::True => Some(true),
+            Truth::False => Some(false),
+            Truth::Unknown => None,
+        }
+    }
+
+    fn ensure_owner_clauses<'n, S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, owner: tc::ItemKey) {
+        if self.owner_loaded == Some(owner) {
+            return;
+        }
+        self.owner_loaded = Some(owner);
+        self.owner_traits.clear();
+        self.owner_projs.clear();
+        let mut budget = MOST_INST_DROP_STEPS;
+        if let Some(preds) = r.store.preds.get(&owner) {
+            let stys = r.store.tys.view();
+            for c in preds.clauses.iter() {
+                match *c {
+                    tc::PClause::Trait { trait_, args } => {
+                        if let Ok(al) = stys.list(args) {
+                            let mut inst: AVec<'a, tc::PTy> = AVec::with_capacity_in(al.len(), self.alloc);
+                            let mut ok = true;
+                            for &a in al {
+                                match self.copy_from_table(stys, a, None, 0, &mut budget) {
+                                    Some(t) => inst.push(t),
+                                    None => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if ok && !self.owner_traits.iter().any(|(ot, oa)| *ot == trait_ && oa.as_slice() == inst.as_slice()) {
+                                self.owner_traits.push((trait_, inst));
+                            }
+                        }
+                    }
+                    tc::PClause::Projection { trait_, name, args, term } => {
+                        if let Ok(al) = stys.list(args) {
+                            let mut inst: AVec<'a, tc::PTy> = AVec::with_capacity_in(al.len(), self.alloc);
+                            let mut ok = true;
+                            for &a in al {
+                                match self.copy_from_table(stys, a, None, 0, &mut budget) {
+                                    Some(t) => inst.push(t),
+                                    None => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if ok
+                                && let Some(iterm) = self.copy_from_table(stys, term, None, 0, &mut budget)
+                                && !self.owner_projs.iter().any(|(pt, pn, pa, _)| *pt == trait_ && *pn == name && pa.as_slice() == inst.as_slice())
+                            {
+                                self.owner_projs.push((trait_, name, inst, iterm));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Elaborate supertraits of `owner`'s trait clauses (bounded to 64 clauses, Rule 18) and
+        // record Rule 21 digests for each trait's `supertraits` inspected.
+        let super_shape_digest = tc::StableHasher::new("blaze-ladder front2 inst drop super shape v1").finish();
+        let mut cursor = 0usize;
+        while self.owner_traits.len() < 64 && budget > 0 {
+            let Some((tr, tr_args)) = self.owner_traits.get(cursor) else { break };
+            let tr = *tr;
+            let mut subst: AVec<'a, tc::PTy> = AVec::with_capacity_in(tr_args.len(), self.alloc);
+            subst.extend_from_slice(tr_args);
+            cursor += 1;
+            if !r.store.trait_defs.contains_key(&tr)
+                && let Some(lib) = r.keys.library_in(r.names, tr)
+            {
+                super::ensure_one(r, Want::Members(lib));
+            }
+            let mut h = tc::StableHasher::new("blaze-ladder front2 inst drop super v1");
+            if let Some(def) = r.store.trait_defs.get(&tr) {
+                h.tag(1);
+                h.u32(u32::try_from(def.supertraits.len()).unwrap_or(u32::MAX));
+                let stys = r.store.tys.view();
+                let mut hstack: AVec<'a, tc::PTy> = AVec::new_in(self.alloc);
+                for sc in def.supertraits.iter() {
+                    match *sc {
+                        tc::PClause::Trait { trait_: sup, args: sargs } => {
+                            h.tag(1);
+                            h.u128(sup.0);
+                            if let Ok(al) = stys.list(sargs) {
+                                h.u32(u32::try_from(al.len()).unwrap_or(u32::MAX));
+                                let mut inst: AVec<'a, tc::PTy> = AVec::with_capacity_in(al.len(), self.alloc);
+                                let mut ok = true;
+                                for &a in al {
+                                    let mut hb = MOST_DROP_NODES;
+                                    hash_pty_structural(stys, a, &mut h, &mut hb, &mut hstack);
+                                    if ok {
+                                        match self.copy_from_table(stys, a, Some(&subst), 0, &mut budget) {
+                                            Some(t) => inst.push(t),
+                                            None => ok = false,
+                                        }
+                                    }
+                                }
+                                if ok
+                                    && self.owner_traits.len() < 64
+                                    && !self.owner_traits.iter().any(|(ot, oa)| *ot == sup && oa.as_slice() == inst.as_slice())
+                                {
+                                    self.owner_traits.push((sup, inst));
+                                }
+                            }
+                        }
+                        tc::PClause::Projection { trait_: sup, name, args: sargs, term } => {
+                            h.tag(2);
+                            h.u128(sup.0);
+                            h.u64(name.0);
+                            if let Ok(al) = stys.list(sargs) {
+                                h.u32(u32::try_from(al.len()).unwrap_or(u32::MAX));
+                                let mut inst: AVec<'a, tc::PTy> = AVec::with_capacity_in(al.len(), self.alloc);
+                                let mut ok = true;
+                                for &a in al {
+                                    let mut hb = MOST_DROP_NODES;
+                                    hash_pty_structural(stys, a, &mut h, &mut hb, &mut hstack);
+                                    if ok {
+                                        match self.copy_from_table(stys, a, Some(&subst), 0, &mut budget) {
+                                            Some(t) => inst.push(t),
+                                            None => ok = false,
+                                        }
+                                    }
+                                }
+                                let mut hb = MOST_DROP_NODES;
+                                hash_pty_structural(stys, term, &mut h, &mut hb, &mut hstack);
+                                if ok
+                                    && self.owner_projs.len() < 64
+                                    && let Some(iterm) = self.copy_from_table(stys, term, Some(&subst), 0, &mut budget)
+                                    && !self.owner_projs.iter().any(|(pt, pn, pa, _)| *pt == sup && *pn == name && pa.as_slice() == inst.as_slice())
+                                {
+                                    self.owner_projs.push((sup, name, inst, iterm));
+                                }
+                            }
+                        }
+                        _ => h.tag(0),
+                    }
+                }
+            } else {
+                h.tag(0);
+            }
+            let super_digest = h.finish();
+            if !self.read_queries.iter().any(|&(t, sd, _)| t == tr.0 && sd == super_shape_digest) {
+                self.read_queries.push((tr.0, super_shape_digest, super_digest));
+            }
+        }
     }
 
     /// Flushes deduplicated Rule 21 read rows for every ADT, impl, and trait query inspected.
@@ -1883,6 +2056,13 @@ impl<'a> InstDropEval<'a> {
             norm_args.push(self.normalize_deep(r, langs, a, norm_depth + 1, budget)?);
         }
         let &self_ty = norm_args.first()?;
+        if let Some(&(_, _, _, pterm)) = self
+            .owner_projs
+            .iter()
+            .find(|(pt, pn, pa, _)| *pt == trait_ && *pn == name && pa.as_slice() == norm_args.as_slice())
+        {
+            return self.normalize_deep(r, langs, pterm, norm_depth + 1, budget);
+        }
         // Builtin `FnOnce::Output` on `FnPtr` or `FnDef`.
         if langs.fn_traits.contains(&Some(trait_)) && name == tc::Name::of("Output") {
             match self.tys.view().node(self_ty).ok()? {
@@ -2006,8 +2186,10 @@ impl<'a> InstDropEval<'a> {
         if self.active_goals.scan_for(&(trait_, self_ty)).is_some() {
             return ImplMatch::Unknown;
         }
-        let Some(shape) = shape_of(self.tys.view(), self_ty) else {
-            return ImplMatch::Unknown;
+        let shape = match shape_of(self.tys.view(), self_ty) {
+            Some(s) => s,
+            None if matches!(self.tys.view().node(self_ty), Ok(tc::PNode::Param(_))) => tc::Shape::Param,
+            None => return ImplMatch::Unknown,
         };
         let (impls, has_gap) = if let Some(v) = answer_impls(r, trait_, shape) {
             (v, false)
@@ -2132,7 +2314,7 @@ impl<'a> InstDropEval<'a> {
             (Some((imp, subst, trait_arg_count)), true) if self.impl_has_no_default(r, imp) => {
                 ImplMatch::Selected { imp, subst, trait_arg_count }
             }
-            (None, false) => ImplMatch::None,
+            (None, false) if shape != tc::Shape::Param => ImplMatch::None,
             _ => ImplMatch::Unknown,
         }
     }
@@ -2290,8 +2472,17 @@ impl<'a> InstDropEval<'a> {
             }
         }
         let Some(&self_ty) = args.first() else { return Truth::Unknown };
+        if self.owner_traits.iter().any(|(ot, oargs)| *ot == trait_ && oargs.as_slice() == args.as_slice()) {
+            return Truth::True;
+        }
+        if Some(trait_) == meta_sized
+            && let Some(sz) = sized
+            && self.owner_traits.iter().any(|(ot, oargs)| *ot == sz && oargs.as_slice() == args.as_slice())
+        {
+            return Truth::True;
+        }
         if Some(trait_) == sized || Some(trait_) == meta_sized {
-            return match self.is_known_sized(r, self_ty, 0, budget) {
+            return match self.is_known_sized(r, sized, self_ty, 0, budget) {
                 Some(true) => Truth::True,
                 Some(false) if Some(trait_) == sized => Truth::False,
                 _ => Truth::Unknown,
@@ -2339,6 +2530,48 @@ impl<'a> InstDropEval<'a> {
                 _ => {}
             }
         }
+        if Some(trait_) == langs.copy {
+            match self.tys.view().node(self_ty) {
+                Ok(
+                    tc::PNode::Bool
+                    | tc::PNode::Char
+                    | tc::PNode::Int(_)
+                    | tc::PNode::Uint(_)
+                    | tc::PNode::Float(_)
+                    | tc::PNode::Never
+                    | tc::PNode::Ptr(..)
+                    | tc::PNode::Ref(tc::Mutbl::Not, _)
+                    | tc::PNode::FnDef(..)
+                    | tc::PNode::FnPtr(..)
+                    | tc::PNode::ConstValue { .. }
+                    | tc::PNode::ConstParam(_),
+                ) => return Truth::True,
+                Ok(
+                    tc::PNode::Ref(tc::Mutbl::Mut, _)
+                    | tc::PNode::Str
+                    | tc::PNode::Slice(_)
+                    | tc::PNode::Dynamic(_)
+                    | tc::PNode::Foreign(_),
+                ) => return Truth::False,
+                Ok(tc::PNode::Array(elem, _) | tc::PNode::Pat(elem, _)) => {
+                    return self.prove_trait(r, langs, trait_, &[elem], norm_depth + 1, budget);
+                }
+                Ok(tc::PNode::Tuple(l) | tc::PNode::Record(_, l) | tc::PNode::Union(l)) => {
+                    let Some(elems) = self.copy_own_list(l) else { return Truth::Unknown };
+                    let mut any_unknown = false;
+                    for &el in elems.iter() {
+                        match self.prove_trait(r, langs, trait_, &[el], norm_depth + 1, budget) {
+                            Truth::True => {}
+                            Truth::False => return Truth::False,
+                            Truth::Unknown => any_unknown = true,
+                        }
+                    }
+                    return if any_unknown { Truth::Unknown } else { Truth::True };
+                }
+                Ok(tc::PNode::Adt(..)) => {}
+                Ok(_) | Err(_) => return Truth::Unknown,
+            }
+        }
         match self.select_impl(r, langs, trait_, &args, norm_depth + 1, budget) {
             ImplMatch::Selected { .. } => Truth::True,
             ImplMatch::None => Truth::False,
@@ -2349,6 +2582,7 @@ impl<'a> InstDropEval<'a> {
     fn is_known_sized<'n, S: NamesSource<'n>>(
         &mut self,
         r: &mut Records<'_, 'n, S>,
+        sized: Option<tc::ItemKey>,
         ty: tc::PTy,
         depth: u32,
         budget: &mut u32,
@@ -2372,11 +2606,20 @@ impl<'a> InstDropEval<'a> {
             | tc::PNode::ConstValue { .. }
             | tc::PNode::ConstParam(_) => Some(true),
             tc::PNode::Str | tc::PNode::Slice(_) | tc::PNode::Dynamic(_) | tc::PNode::Foreign(_) => Some(false),
-            tc::PNode::Pat(inner, _) => self.is_known_sized(r, inner, depth + 1, budget),
+            tc::PNode::Pat(inner, _) => self.is_known_sized(r, sized, inner, depth + 1, budget),
+            tc::PNode::Param(_) => {
+                if let Some(sz) = sized
+                    && self.owner_traits.iter().any(|(ot, oargs)| *ot == sz && oargs.as_slice() == [ty])
+                {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
             tc::PNode::Tuple(l) | tc::PNode::Record(_, l) | tc::PNode::Union(l) => {
                 let elems = self.copy_own_list(l)?;
                 for &e in elems.iter() {
-                    if !self.is_known_sized(r, e, depth + 1, budget)? {
+                    if !self.is_known_sized(r, sized, e, depth + 1, budget)? {
                         return Some(false);
                     }
                 }
@@ -2400,7 +2643,7 @@ impl<'a> InstDropEval<'a> {
                     let stys = r.store.tys.view();
                     self.copy_from_table(stys, last.ty, Some(&args), 0, budget)?
                 };
-                self.is_known_sized(r, last_field, depth + 1, budget)
+                self.is_known_sized(r, sized, last_field, depth + 1, budget)
             }
             _ => None,
         }

@@ -365,3 +365,96 @@ fn inst_needs_drop_overrides_structural_drop_only() {
     assert!(!run_case(false, None).expect("checks").is_empty(), "inst_needs_drop=None conservatively keeps borrow alive");
     assert!(!run_case(true, Some(false)).expect("checks").is_empty(), "real Drop impl must never be overridden by inst_needs_drop=Some(false)");
 }
+
+/// Instantiated `Copy` via [`Facts::inst_is_copy`]: when `copy_args(adt)` is `None` (e.g. a
+/// conditional `Copy` impl with a projection clause like `I: Invariants<Aliasing = Shared>`),
+/// `inst_is_copy(ty) == Some(true)` allows copying even when a type argument is non-`Copy`,
+/// `inst_is_copy(ty) == Some(false)` rejects copying even when every type argument is `Copy`,
+/// and `None` falls back to checking every type argument.
+#[test]
+fn inst_is_copy_resolves_conditional_copy_when_copy_args_none() {
+    struct InstCopyWorld {
+        ptr: ItemKey,
+        marker: ItemKey,
+        marker_copy: bool,
+        inst: Option<bool>,
+    }
+
+    impl Facts for InstCopyWorld {
+        fn regions(&self) -> &dyn crate::RegionFacts { &crate::NoRegions }
+        fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> { None }
+        fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
+            if k == self.ptr {
+                Some(AdtFacts { copy: true, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: false, is_box: false })
+            } else if k == self.marker {
+                Some(AdtFacts { copy: self.marker_copy, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: false, is_box: false })
+            } else {
+                None
+            }
+        }
+        fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
+            Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
+        }
+        fn adt_variances(&self, _: ItemKey) -> Option<&[crate::Variance]> { None }
+        fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> { None }
+        fn constant_initializer(&self) -> bool { false }
+        fn fn_binders(&self) -> bool { true }
+        fn closure_bodies_checked(&self) -> bool { false }
+        fn closure_requirements(&self, _: blaze_typeck::ExprId) -> &[crate::Requirement] { &[] }
+        fn async_bodies_checked(&self) -> bool { false }
+        fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> { None }
+        fn shape(&self, _: ItemKey) -> Option<crate::Shape<'_>> { None }
+        fn object_trait_lifetimes(&self, _: ItemKey) -> Option<bool> { None }
+        fn call_bounds(&self, _: ItemKey) -> Option<crate::CallBounds<'_>> { None }
+        fn trait_lifetimes(&self, _: ItemKey) -> Option<u32> { None }
+        fn alias_lifetimes(&self, _: ItemKey, _: blaze_typeck::Name) -> Option<u32> { None }
+        fn ties(&self, _: ItemKey) -> Option<crate::Ties<'_>> { None }
+        fn field(&self, _: ItemKey, _: u32, _: blaze_typeck::Name) -> Option<u32> { None }
+        fn field_param(&self, _: ItemKey, _: u32, _: u32) -> Option<u32> { None }
+        fn field_lead(&self, _: ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> { None }
+        fn field_regions(&self, _: ItemKey, _: u32, _: u32) -> Option<&[crate::FieldRegion]> { None }
+        fn field_count(&self, _: ItemKey, _: u32) -> Option<u32> { None }
+        fn copy_args(&self, _: ItemKey) -> Option<&[bool]> { None }
+        fn inst_is_copy(&self, _: blaze_typeck::PTy) -> Option<bool> { self.inst }
+        fn param_copy(&self, _: u32) -> bool { false }
+    }
+
+    let run_case = |marker_copy: bool, inst: Option<bool>| {
+        let mut fx = Fx::new();
+        let u8_t = fx.u8();
+        let marker = fx.strukt("Marker", 0, &[]);
+        let marker_ty = fx.adt(marker, &[]);
+        let ptr = fx.strukt("Ptr", 2, &[]);
+        let ptr_ty = fx.adt(ptr, &[u8_t, marker_ty]);
+        let unit = fx.unit();
+        let take = fx.func("take", 0, &[ptr_ty], unit, Default::default());
+        let f = fx.func("f", 0, &[ptr_ty], unit, Default::default());
+        fx.finish();
+
+        let mut decls = Decls::new();
+        decls.adt(marker, 0);
+        decls.adt(ptr, 0);
+        decls.func(take, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[ptr_ty], output: unit, slots: &[] });
+        decls.func(f, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[ptr_ty], output: unit, slots: &[] });
+
+        // `fn f(p: Ptr<u8, Marker>) { take(p); take(p); }`
+        let mut b = Bb::new();
+        let pp = b.param("p");
+        let p_take1 = b.path(&["take"]);
+        let lp1 = b.local(pp);
+        let c1 = b.call(p_take1, &[lp1]);
+        let s1 = b.semi(c1);
+        let p_take2 = b.path(&["take"]);
+        let lp2 = b.local(pp);
+        let c2 = b.call(p_take2, &[lp2]);
+        let s2 = b.semi(c2);
+        let root = b.block(&[s1, s2], None);
+
+        findings(&fx, &b, f, root, &InstCopyWorld { ptr, marker, marker_copy, inst }, &decls, Plant::None)
+    };
+
+    assert_eq!(run_case(false, Some(true)), Ok(Default::default()), "inst_is_copy=Some(true) makes Ptr Copy even with non-Copy Marker");
+    assert!(!run_case(true, Some(false)).expect("checks").is_empty(), "inst_is_copy=Some(false) rejects copy even when Marker is Copy");
+    assert!(!run_case(false, None).expect("checks").is_empty(), "inst_is_copy=None falls back to checking args (non-Copy Marker rejects)");
+    assert_eq!(run_case(true, None), Ok(Default::default()), "inst_is_copy=None falls back to checking args (Copy Marker accepts)");
+}
