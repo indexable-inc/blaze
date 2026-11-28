@@ -277,6 +277,9 @@ pub enum ItemsRecordError {
     /// written, so the record is not written.
     Generics { item: ItemKey, why: blaze_file_items::GenericsError },
     FileItemsUnavailable { file: u32, what: &'static str },
+    /// A cached pack `FileItems` CAS record (or in-memory slot for the same text and edition)
+    /// carries a surface digest that disagrees with `ItemsRecord`'s expected surface (rule 3, 21).
+    FileItemsSurfaceConflict { file: u32, expected: ContentId, found: ContentId },
     FileItemsBuild { file: u32, why: blaze_surface::BuildError },
     FileItemsRead { file: u32, why: blaze_format::FormatError },
 }

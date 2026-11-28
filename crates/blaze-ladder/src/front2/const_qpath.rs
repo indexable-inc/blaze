@@ -654,13 +654,15 @@ pub fn substitute_mapped<'a, 'h, H: Heads + ?Sized>(
 }
 
 /// Answers the leaf under need key `c` and every other asked leaf that has no answer yet (one
-/// round for a head of many leaves). `false`: `c` is not a leaf's need key, and nothing was
-/// done. A value is filed in `Maps::const_bits` with its type in the table; a refusal is
-/// filed in `Maps::anon_failed` as printed, and the head that wrote the leaf is refused by
-/// name when it is made again ([`substitute`]'s `Stop::Failed`), and only that head.
-pub fn eval_asked<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey) -> bool {
+/// round for a head of many leaves). `None`: `c` is not a leaf's need key, and nothing was
+/// done. A value is filed in `Maps::const_bits` with its type in the table; a non-infrastructure
+/// refusal is filed in `Maps::anon_failed` as printed, and the head that wrote the leaf is
+/// refused by name when it is made again ([`substitute`]'s `Stop::Failed`), and only that head.
+/// An infrastructure refusal (`HeadError::NoText`, `Cfg`, `Filed`) is returned as `Some(Err(..))`
+/// so it is never cached in `anon_failed` or persisted as an `AliasGap`.
+pub fn eval_asked<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey) -> Option<Result<(), ConstFail>> {
     if !r.store.maps.qpaths.borrow().has(c) {
-        return false;
+        return None;
     }
     let mut i = 0usize;
     loop {
@@ -702,6 +704,9 @@ pub fn eval_asked<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
                 r.store.maps.file_bits(need, bits);
                 r.store.maps.qpaths.borrow_mut().tys.push((need, ty));
             }
+            Err(e) if e.infra_head_error().is_some() => {
+                return Some(Err(e));
+            }
             Err(e) => {
                 use core::fmt::Write as _;
                 let mut why = String::new_in(r.store.work_alloc());
@@ -713,7 +718,7 @@ pub fn eval_asked<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
             }
         }
     }
-    true
+    Some(Ok(()))
 }
 
 /// Selects and evaluates one leaf: its value's bits and its type.

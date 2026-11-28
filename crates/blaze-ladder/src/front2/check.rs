@@ -2587,7 +2587,12 @@ fn make<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> Result
             Err(ConstFail::Nested { .. }) if r.consts.is_none() && r.store.maps.evaluating.get() == 0 && super::anon::need_key(checker_of(c)) == c => {
                 r.store.maps.anon_failed.insert(c, Box::from("this caller has no constant evaluator (`Records::consts` is `None`)"));
             }
-            Err(e) => return Err(MakeFail::Const(c, e)),
+            Err(e) => {
+                if let Some(head_err) = e.infra_head_error() {
+                    return Err(MakeFail::Head(head_err));
+                }
+                return Err(MakeFail::Const(c, e));
+            }
         }
     }
 }
@@ -2611,14 +2616,18 @@ fn eval_len_inner<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
     // A qualified constant leaf of a head's expression (`<B4 as Spec>::BITS`:
     // front2/const_qpath.rs) is answered by selection, with every leaf asked beside it; its
     // refusal is filed for the head that wrote it, as an anonymous constant's is below.
-    if r.consts.is_some() && super::const_qpath::eval_asked(r, c) {
-        return Ok(());
+    if r.consts.is_some()
+        && let Some(res) = super::const_qpath::eval_asked(r, c)
+    {
+        return res;
     }
     // An inherent constant leaf (`Self::MAX_SIZE`: front2/const_inherent.rs) is answered by
     // the impl member constant's evaluation, every asked leaf in the same round, its refusal
     // filed for the head that wrote it.
-    if r.consts.is_some() && super::const_inherent::eval_asked(r, c) {
-        return Ok(());
+    if r.consts.is_some()
+        && let Some(res) = super::const_inherent::eval_asked(r, c)
+    {
+        return res;
     }
     let Some((consts, prepared)) = r.consts.take() else {
         return Err(ConstFail::Nested { item: checker_of(c), shown: lib_shown(r, c) });
@@ -2643,10 +2652,13 @@ fn eval_len_inner<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
     // name when it is made again (`Builder::const_value_bits`), and only that head: an impl
     // whose header writes `W<{ size_of::<u8>() }>` stays a refused candidate, a named gap of
     // the questions it could answer, as before there was an evaluator behind the heads.
+    // Infrastructure errors (`HeadError::NoText`, `Cfg`, `Filed`) are NEVER swallowed into
+    // `anon_failed` so they propagate cleanly and can never poison a cached `AliasGap`.
     let anonymous = |k: LibKey| super::anon::need_key(checker_of(k)) == k;
     let eval_alloc = r.store.work_alloc();
     let mut more: blaze_own::Vec<(LibKey, u128), blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(eval_alloc);
     let mut failed: blaze_own::Vec<(LibKey, Box<str>), blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(eval_alloc);
+    let mut infra_err: Option<ConstFail> = None;
     for &o in asked.iter() {
         if o == c || r.store.maps.const_bits.contains_key(&o) || r.store.maps.anon_failed.contains_key(&o) {
             continue;
@@ -2658,10 +2670,17 @@ fn eval_len_inner<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
         match got {
             Ok(Some(bits)) => more.push((o, bits)),
             Ok(None) => failed.push((o, Box::from("its value is not an integer of at most 16 bytes"))),
+            Err(e) if e.infra_head_error().is_some() => {
+                infra_err = Some(e);
+                break;
+            }
             Err(e) => failed.push((o, format!("{e}").into_boxed_str())),
         }
     }
     r.consts = Some((consts, prepared));
+    if let Some(e) = infra_err {
+        return Err(e);
+    }
     for &(o, bits) in more.iter() {
         r.store.maps.file_bits(o, bits);
     }
@@ -2670,7 +2689,7 @@ fn eval_len_inner<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
         r.store.maps.anon_failed.insert(o, why);
     }
     let value = match value {
-        Err(e) if anonymous(c) => {
+        Err(e) if anonymous(c) && e.infra_head_error().is_none() => {
             r.store.maps.anon_failed.insert(c, format!("{e}").into_boxed_str());
             return Ok(());
         }

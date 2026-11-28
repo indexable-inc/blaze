@@ -844,6 +844,13 @@ fn eval_const_into<'n, H: ConstSource<'n>>(
     *by_eval = by_eval.saturating_add(store.lowered.saturating_sub(before));
     match evaluated {
         Ok(()) => Ok(()),
+        Err(ConstRefused::Eval(e)) if e.infra_head_error().is_some() => {
+            if let Some(head_err) = e.infra_head_error() {
+                Err(FreezeError::Head { want, error: head_err })
+            } else {
+                Err(FreezeError::Const { want, c, error: ConstRefused::Eval(e) })
+            }
+        }
         Err(error) if matches!(want, Want::Members(_)) => {
             let mut s = blaze_own::String::new_in(scratch);
             let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{error}"));

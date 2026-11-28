@@ -145,6 +145,12 @@ pub(super) fn answer<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, made: &
     match r.store.ensure(r.names, &mut *r.keys, want) {
         Ok(()) => Ok(()),
         Err(e) => {
+            if let Some(infra) = super::consts::head_infra_error(&e) {
+                return Err(ConstFail::Body {
+                    item: callee,
+                    error: super::body::BodyError::Head { item: want.key(), error: infra },
+                });
+            }
             let why = Some(head_error_shown(r.names, &e).into_boxed_str());
             Err(ConstFail::FnFact { callee, shown: shown(r, callee), fact, made: Some(want), why })
         }
