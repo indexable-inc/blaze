@@ -152,7 +152,7 @@ fn expand_census() {
             cb += 1;
             let scoped = Scoped { names: &names, module: *module, prepared: Some(&prepared) };
             let mut expand = ByName::with_names(&scoped, NoHost, Alloc::global());
-            if blaze_lower::lower_body_expanding(text, ed, &mut CrateCfg(atoms), &mut blaze_lower::NoModule, &mut expand, Alloc::global()).is_err() {
+            if blaze_lower::lower_body_expanding(text, ed, &mut CrateCfg { atoms, cfg_version: false }, &mut blaze_lower::NoModule, &mut expand, Alloc::global()).is_err() {
                 continue;
             }
             let mut seen: Vec<String> = Vec::new();

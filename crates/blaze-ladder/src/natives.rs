@@ -432,12 +432,18 @@ fn search_dirs<'a>(package: &'a str, outputs: &OutputsRef<'a>, dirs: &mut AVec<'
     Ok(())
 }
 
-/// The program's own crate's link arguments for a binary: `-pthread` and `-Wl,-dead_strip_dylibs`
-/// (NATIVE.md 3.2; Blaze's exporter only links referenced dylibs).
+/// The program's own crate's link arguments for a binary: `-pthread`, `-Wl,-dead_strip_dylibs`,
+/// and `-Wl,--build-id=sha1` (NATIVE.md 3.2; Blaze's exporter only links referenced dylibs and
+/// writes a deterministic ELF build-id note natively).
 fn link_args<'a>(package: &'a str, outputs: &OutputsRef<'a>) -> Result<(), NativeError<'a>> {
     let binary = [LinkTo::All.code(), LinkTo::Bins.code(), LinkTo::Bin("").code()];
     for (to, _bin, arg) in outputs.link_args() {
-        if binary.contains(&to) && !matches!(arg, "-pthread" | "-Wl,-dead_strip_dylibs" | "-dead_strip_dylibs") {
+        if binary.contains(&to)
+            && !matches!(
+                arg,
+                "-pthread" | "-Wl,-dead_strip_dylibs" | "-dead_strip_dylibs" | "-Wl,--build-id=sha1" | "--build-id=sha1"
+            )
+        {
             return Err(NativeError::LinkArg { package, arg });
         }
     }
@@ -892,8 +898,10 @@ mod tests {
         let producer = producers.get::<Whole>();
         let links = links("", bump);
         let pthread = record("cargo:rustc-link-arg=-pthread\n", &[], alloc);
+        let build_id = record("cargo:rustc-link-arg=-Wl,--build-id=sha1\n", &[], alloc);
         let rpath = record("cargo:rustc-link-arg=-Wl,-rpath,/x\n", &[], alloc);
         two_crates(&pthread, &pthread, &links, &producer, alloc, None);
+        two_crates(&build_id, &pthread, &links, &producer, alloc, None);
         two_crates(&rpath, &pthread, &links, &producer, alloc, Some(NativeError::LinkArg { package: "app@0.1.0", arg: "-Wl,-rpath,/x" }));
         two_crates(&pthread, &rpath, &links, &producer, alloc, None);
     }

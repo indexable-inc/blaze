@@ -4209,7 +4209,7 @@ mod tests {
                 Path::new("/shelf"),
                 "x86_64-unknown-linux-gnu",
                 None,
-                PathBuf::from("/work/tasks"),
+                Path::new("/work/tasks").to_path_buf(),
                 alloc,
             )
             .expect("construct HermeticClangProbe");
