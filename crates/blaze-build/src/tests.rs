@@ -4521,3 +4521,4 @@ mod coroutine_id_agree;
 mod coroutines_emit;
 mod never_reads;
 mod track_caller;
+mod do_defer;

@@ -40,6 +40,16 @@ use core::{fmt, time::Duration};
 
 use blaze_h1::{ContentRange, Follow, HeaderFault, Range, Redirects};
 
+/// Explicit sans-IO HTTP/1.1 exchange state machine over [`blaze_machine::Machine`] and
+/// [`blaze_h1`].
+pub mod machine;
+pub use machine::{
+    BorrowedConnHttpHandler, ConnHandle, HttpExchangeError, HttpExchangeMachine, HttpExchangeOpts,
+    HttpExchangeOut, HttpExchangePlant, HttpScriptAns, HttpStepAns, HttpStepReq, NetExchangeError,
+    NetHttpHandler, NetHttpHandlerError, TransportError, drive_exchange_over_net,
+    encode_request_in,
+};
+
 use crate::{
     Plant, Stopped,
     clock::Clock,
@@ -689,80 +699,110 @@ fn hosted(io: &Io, cx: &Cx, request: &Request<'_>, into: &mut Bytes<'_>) -> Resu
     }
 }
 
-/// The driver of [`Http::over`]: receives from `conn` fed to blaze-http's h1 core until the
-/// answer to `request` is whole and its connection closed, its body added to `into`. Bounded
-/// by [`Wire::wait_most`] a receive, [`Wire::reads_most`] receives and [`Wire::body_most`]
-/// bytes of body (or the range's length, when less). A range asked is checked as soon as the
-/// head is whole, before any of the body is added to `into`.
+/// The driver of [`Http::over`]: drives [`HttpExchangeMachine::for_connected_recv`] over
+/// [`BorrowedConnHttpHandler`] and [`Cx::drive_machine`] until the answer to `request` is whole
+/// and its connection closed, adding the decoded body to `into`. Bounded by [`Wire::wait_most`] a
+/// receive, [`Wire::reads_most`] receives and [`Wire::body_most`] bytes of body (or the range's
+/// length, when less). A range asked is checked as soon as the head is whole, before any of the
+/// body is added to `into`.
 fn read_answer(cx: &Cx, conn: &Conn, request: &Request<'_>, line: &Line, into: &mut Bytes<'_>) -> Result<Answer, HttpKind> {
     let cx = cx.span("bstd::requests: an answer's bytes");
     let wire = line.wire;
-    // The body is held by the core itself, before a byte past it is written, to `body_most`
-    // or the range asked, whichever is less; the head to 64 KiB and 100 lines.
-    let most_body = match request.range {
-        Some(Range { first, last: Some(last) }) if last >= first => (last - first + 1).min(wire.body_most as u64),
-        Some(_) | None => wire.body_most as u64,
-    };
-    let limits = blaze_h1::Limits { most_head: 64 << 10, most_headers: 100, most_body, ..blaze_h1::Limits::SHIPPED };
-    // alloc: the core's head and its body's next piece, `Vec`s freed as this returns.
-    let mut answer = blaze_h1::Response::new_in(limits, request.method == Method::Head, alloc::alloc::Global);
-    let mut decoded: Vec<u8> = Vec::new();
-    let mut received = cx.bytes();
-    let over = |error: blaze_h1::Error| match error.why {
-        blaze_h1::Why::BodyOver { .. } => HttpKind::TooBig { most: most_body as usize },
-        _ => HttpKind::Protocol(error),
-    };
-    let after_end = |answer: &blaze_h1::Response<_>| {
-        HttpKind::Protocol(blaze_h1::Error { at: answer.body_len(), why: blaze_h1::Why::AfterEnd })
-    };
-    let mut range = None;
-    let mut checked = false;
-    for _ in 0..wire.reads_most {
-        received.clear();
-        let wait = step(&cx, line);
-        let got = conn.recv(&wait, RECV, &mut received).map_err(|error| waited(&cx, &wait, wire, error))?;
-        if answer.is_done() {
-            // It asked for the close: anything but the close after the answer's end is a
-            // byte the answer did not promise.
-            if got > 0 {
-                return Err(after_end(&answer));
-            }
-            break;
+    let handle = ConnHandle::new(0, core::num::NonZeroU32::MIN);
+    let erased = blaze_own::Erased::new(cx.frame());
+    let alloc = erased.handle();
+    let machine = HttpExchangeMachine::for_connected_recv(
+        HttpExchangeOpts {
+            conn: handle,
+            method: request.method,
+            range: request.range,
+            body_most: wire.body_most,
+            reads_most: wire.reads_most,
+            wait_most: wire.wait_most,
+            recv_chunk: RECV,
+            alloc,
+            plant: HttpExchangePlant::None,
+        },
+        plant::range_unchecked(),
+    );
+    let mut handler = BorrowedConnHttpHandler::new(&cx, conn, handle);
+    let max_steps = u32::try_from(wire.reads_most).unwrap_or(u32::MAX).saturating_add(2);
+    match cx.drive_machine(
+        "bstd.requests.http_exchange",
+        &mut handler,
+        &mut (),
+        machine,
+        blaze_machine::DriveOpts { max_steps },
+    ) {
+        Ok(out) => {
+            into.try_extend(out.body.as_slice())?;
+            // alloc: once per redirect, its `Location` as sent.
+            let location = out.location.map(|loc| loc.as_slice().to_vec());
+            Ok(Answer { status: out.status, range: out.range, location })
         }
-        if got == 0 {
-            // The peer closed: that ends a body framed by the close, and nothing else.
-            answer.closed().map_err(HttpKind::Protocol)?;
-            break;
-        }
-        let fed = answer.feed(received.as_slice(), &mut decoded);
-        // A range is checked as soon as the head says what it holds, before its body is taken,
-        // and before the body's bound is told: a head the bound refuses (a 404's longer body)
-        // is named by what it answered.
-        // blaze-h1 refuses a `Content-Length` past the bound as its head ends: the status and
-        // headers are read by then, so the range is checked first.
-        let head_over = matches!(&fed, Err(blaze_h1::Error { why: blaze_h1::Why::BodyOver { .. }, .. }));
-        if !checked && (answer.has_head() || head_over) {
-            checked = true;
-            if let Some(asked) = request.range
-                && !blaze_h1::is_redirect(answer.status())
-                && !plant::range_unchecked()
-            {
-                range = Some(answer.ranged(asked).map_err(HttpKind::Protocol)?);
-            }
-        }
-        let fed = fed.map_err(over)?;
-        if fed.consumed < got {
-            return Err(after_end(&answer));
-        }
-        into.try_extend(&decoded)?;
-        decoded.clear();
+        Err(err) => Err(map_exchange_error(&cx, conn, wire, &mut handler, err)),
     }
-    if !answer.is_done() {
-        return Err(HttpKind::Unending { reads: wire.reads_most });
+}
+
+/// Maps a [`blaze_machine::DriveError`] from [`HttpExchangeMachine::for_connected_recv`] back to
+/// [`HttpKind`], preserving full [`NetError`] diagnostics captured by [`BorrowedConnHttpHandler`].
+fn map_exchange_error(
+    cx: &Cx,
+    conn: &Conn,
+    wire: Wire,
+    handler: &mut BorrowedConnHttpHandler<'_, '_>,
+    err: blaze_machine::DriveError<HttpExchangeError, NetHttpHandlerError>,
+) -> HttpKind {
+    let map_stopped = |stopped: blaze_machine::Stopped| match cx.stopped_by(cx.io().now()) {
+        Err(bstd_stopped) => HttpKind::Net(crate::net::error(
+            crate::net::NetOp::Recv,
+            conn.peer(),
+            NetKind::Stopped(bstd_stopped),
+        )),
+        Ok(()) => HttpKind::Stopped(match stopped.reason {
+            blaze_machine::CancelReason::Cancelled => Stopped::Cancelled { span: cx.name() },
+            blaze_machine::CancelReason::Deadline => {
+                Stopped::Deadline { span: cx.name(), at: cx.deadline().get() }
+            }
+        }),
+    };
+    match err {
+        blaze_machine::DriveError::Machine(HttpExchangeError::Protocol(e)) => HttpKind::Protocol(e),
+        blaze_machine::DriveError::Machine(HttpExchangeError::TooBig { most }) => {
+            HttpKind::TooBig { most }
+        }
+        blaze_machine::DriveError::Machine(HttpExchangeError::Unending { reads }) => {
+            HttpKind::Unending { reads }
+        }
+        blaze_machine::DriveError::Machine(HttpExchangeError::Silent { waited }) => {
+            HttpKind::Silent { waited }
+        }
+        blaze_machine::DriveError::Machine(HttpExchangeError::Transport(_)) => {
+            match handler.take_net_error() {
+                Some(net_err) => HttpKind::Net(net_err),
+                None => HttpKind::Net(crate::net::error(
+                    crate::net::NetOp::Recv,
+                    conn.peer(),
+                    // alloc: an error's message.
+                    NetKind::Driver(String::from("http exchange transport failed")),
+                )),
+            }
+        }
+        blaze_machine::DriveError::Machine(HttpExchangeError::Stopped(stopped))
+        | blaze_machine::DriveError::Stopped(stopped) => map_stopped(stopped),
+        blaze_machine::DriveError::Machine(HttpExchangeError::Alloc(failure)) => {
+            HttpKind::Protocol(blaze_h1::Error { at: 0, why: blaze_h1::Why::Alloc(failure) })
+        }
+        blaze_machine::DriveError::StepBudgetExhausted { .. } => {
+            HttpKind::Unending { reads: wire.reads_most }
+        }
+        blaze_machine::DriveError::Handler(herr) => HttpKind::Net(crate::net::error(
+            crate::net::NetOp::Recv,
+            conn.peer(),
+            // alloc: an error's message.
+            NetKind::Driver(alloc::format!("{herr}")),
+        )),
     }
-    // alloc: once per redirect, its `Location` as sent.
-    let location = answer.header("location").map(<[u8]>::to_vec);
-    Ok(Answer { status: answer.status(), range, location })
 }
 
 /// One answer read: its status, the range it holds when one was asked, and its `Location`.

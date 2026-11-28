@@ -30,7 +30,7 @@ use blaze_own::{AVec, Alloc, Bump};
 use blaze_scope::resolve::CrateNames;
 use blaze_surface::ItemIndex;
 
-use crate::front2::links::{CrateExport, CrateLinks, LinkDecl, LinkKind, LinksError, Modifiers, scope_links};
+use crate::front2::links::{CrateExport, CrateInit, CrateLinks, LinkDecl, LinkKind, LinksError, Modifiers, scope_links};
 pub use crate::natives::Asked;
 use crate::natives::{CrateNative, NativeError, NativeInputs, NativeSummary, asked, native_key, native_layout, native_library};
 pub use blaze_native::libraries::{Library, LibraryKind, Linked, Source};
@@ -38,7 +38,9 @@ pub use blaze_native::tbd::TbdError;
 
 pub const TABLE_MAGIC: [u8; 4] = *b"BZLK";
 /// The table's FORMAT number: a change of the layout above says so here.
-pub const TABLE_FORM: u16 = 1;
+/// 2: appends `inits` count and each `CrateInit` (`section`, 32-byte `item`, `priority` u32 with
+/// `u32::MAX` for none) for Rust `.init_array` / `__mod_init_func` statics.
+pub const TABLE_FORM: u16 = 2;
 const DIGEST_DOMAIN: &str = "blaze-ladder link table digest";
 const HEAD: usize = 8;
 
@@ -69,7 +71,7 @@ where
 /// `links` as a state-0 table.
 pub fn write_table(links: &CrateLinks<'_>, out: &mut AVec<'_, u8>) -> Result<(), TableError> {
     head(out, 0)?;
-    for n in [links.decls.len(), links.foreign.len(), links.exports.len()] {
+    for n in [links.decls.len(), links.foreign.len(), links.exports.len(), links.inits.len()] {
         put_u32(out, n)?;
     }
     for d in links.decls.iter() {
@@ -90,6 +92,11 @@ pub fn write_table(links: &CrateLinks<'_>, out: &mut AVec<'_, u8>) -> Result<(),
         put_str(out, e.name)?;
         push_all(out, &e.item.0.0)?;
         put_str(out, e.ident)?;
+    }
+    for init in links.inits.iter() {
+        put_str(out, init.section)?;
+        push_all(out, &init.item.0.0)?;
+        push_all(out, &init.priority.unwrap_or(u32::MAX).to_le_bytes())?;
     }
     Ok(())
 }
@@ -127,8 +134,13 @@ pub fn open_table<'a>(bytes: &'a [u8], alloc: Alloc<'a>) -> Result<Table<'a>, Ta
     let table = match state {
         1 => Table::Refused(r.str()?),
         0 => {
-            let (nd, nf, ne) = (r.u32()?, r.u32()?, r.u32()?);
-            let mut links = CrateLinks { decls: AVec::new_in(alloc), foreign: AVec::new_in(alloc), exports: AVec::new_in(alloc) };
+            let (nd, nf, ne, ni) = (r.u32()?, r.u32()?, r.u32()?, r.u32()?);
+            let mut links = CrateLinks {
+                decls: AVec::new_in(alloc),
+                foreign: AVec::new_in(alloc),
+                exports: AVec::new_in(alloc),
+                inits: AVec::new_in(alloc),
+            };
             for _ in 0..nd {
                 let name = r.str()?;
                 let at = r.at;
@@ -157,6 +169,20 @@ pub fn open_table<'a>(bytes: &'a [u8], alloc: Alloc<'a>) -> Result<Table<'a>, Ta
                 let ident = r.str()?;
                 let item = blaze_id::ItemKey(ContentId(key));
                 links.exports.try_push(CrateExport { name, item, ident }).map_err(|_| TableError::Alloc)?;
+            }
+            for _ in 0..ni {
+                let section = r.str()?;
+                let mut key = [0u8; 32];
+                key.copy_from_slice(r.take(32)?);
+                let prio_at = r.at;
+                let raw_prio = r.u32()?;
+                let priority = match raw_prio {
+                    u32::MAX => None,
+                    p if p <= 65535 => Some(p),
+                    _ => return Err(TableError::Form { at: prio_at, why: "an initializer priority past 65535" }),
+                };
+                let item = blaze_id::ItemKey(ContentId(key));
+                links.inits.try_push(CrateInit { section, item, priority }).map_err(|_| TableError::Alloc)?;
             }
             Table::Links(links)
         }

@@ -78,6 +78,8 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::refinement",
             "blaze::cost_contract",
             "blaze::capability_in_sans_io",
+            "blaze::local_borrow_across_do",
+            "blaze::suspend_in_sans_io",
             "blaze::todo",
             "blaze::undeclared_effect",
             "blaze::unfulfilled_effect",

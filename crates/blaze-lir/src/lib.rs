@@ -61,6 +61,9 @@ pub mod builder;
 /// The coroutine pass (decision D73): a body with `suspend`s to its `poll`, its state's drop
 /// glue and the state's layout.
 pub mod coroutine;
+/// The zero-`Pin` sans-IO Machine ABI lowering and verification pass for one-shot lexical `.do`
+/// coroutines (docs/v2/plan/design/sans-io-machines.md).
+pub mod coroutine_machine;
 /// The reference evaluator backends are tested against: in this crate's tests, and for a
 /// backend's tests through the `eval` feature. Never in a build.
 #[cfg(any(test, feature = "eval"))]

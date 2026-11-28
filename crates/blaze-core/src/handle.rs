@@ -54,6 +54,10 @@ pub struct MapKind;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct LockKind;
 
+/// Registered `io_uring` fixed-file table slot (`IORING_REGISTER_FILES`, rule 73).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct FixedFileSlot(pub u32);
+
 /// Inert 8-byte generational handle branded to driver scope `'io`.
 ///
 /// Allowed inside `#![blaze::sans_io]` state structs (`#[blaze::handle]`); carries zero executing
@@ -87,6 +91,12 @@ impl<'io, K> Handle<'io, K> {
     #[inline]
     pub const fn slot(self) -> u32 {
         self.slot
+    }
+
+    /// Returns the registered `io_uring` fixed-file slot corresponding to this handle's slot index.
+    #[inline]
+    pub const fn fixed_file_slot(self) -> FixedFileSlot {
+        FixedFileSlot(self.slot)
     }
 
     #[inline]
@@ -154,6 +164,11 @@ impl<'io, Mode> File<'io, Mode> {
         self.id
     }
 
+    #[inline]
+    pub const fn fixed_file_slot(&self) -> FixedFileSlot {
+        self.id.fixed_file_slot()
+    }
+
     /// Consumes this linear file handle into its raw [`FileId`] (driver/request boundary only).
     #[blaze::consumes]
     #[inline]
@@ -164,11 +179,26 @@ impl<'io, Mode> File<'io, Mode> {
 
 /// Inert handle to a scoped directory in driver scope `'io`.
 #[blaze::handle]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Debug)]
 pub struct Dir<'io, Mode = ReadWrite> {
     id: DirId<'io>,
     _mode: PhantomData<Mode>,
 }
+
+impl<'io, Mode> Copy for Dir<'io, Mode> {}
+impl<'io, Mode> Clone for Dir<'io, Mode> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<'io, Mode> PartialEq for Dir<'io, Mode> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+impl<'io, Mode> Eq for Dir<'io, Mode> {}
 
 impl<'io, Mode> Dir<'io, Mode> {
     #[inline]
@@ -196,6 +226,9 @@ pub struct Conn<'io> {
     id: ConnId<'io>,
 }
 
+const _: () = assert!(size_of::<Conn<'_>>() == 8);
+const _: () = assert!(size_of::<Option<Conn<'_>>>() == 8);
+
 impl<'io> Conn<'io> {
     #[inline]
     pub(crate) const fn from_id(id: ConnId<'io>) -> Self {
@@ -207,9 +240,115 @@ impl<'io> Conn<'io> {
         self.id
     }
 
+    #[inline]
+    pub const fn fixed_file_slot(&self) -> FixedFileSlot {
+        self.id.fixed_file_slot()
+    }
+
     #[blaze::consumes]
     #[inline]
     pub(crate) const fn into_id(self) -> ConnId<'io> {
+        self.id
+    }
+}
+
+/// Linear handle to a bound stream listener in driver scope `'io`.
+///
+/// Must be consumed via `listener.unlisten()` (emitting [`crate::request::Unlisten`]).
+#[blaze::handle]
+#[blaze::linear]
+#[derive(Debug)]
+pub struct Listener<'io> {
+    id: ListenerId<'io>,
+}
+
+const _: () = assert!(size_of::<Listener<'_>>() == 8);
+const _: () = assert!(size_of::<Option<Listener<'_>>>() == 8);
+
+impl<'io> Listener<'io> {
+    #[inline]
+    pub(crate) const fn from_id(id: ListenerId<'io>) -> Self {
+        Self { id }
+    }
+
+    #[inline]
+    pub const fn id(&self) -> ListenerId<'io> {
+        self.id
+    }
+
+    #[inline]
+    pub const fn fixed_file_slot(&self) -> FixedFileSlot {
+        self.id.fixed_file_slot()
+    }
+
+    #[blaze::consumes]
+    #[inline]
+    pub(crate) const fn into_id(self) -> ListenerId<'io> {
+        self.id
+    }
+}
+
+/// Linear handle to a bound datagram socket in driver scope `'io`.
+#[blaze::handle]
+#[blaze::linear]
+#[derive(Debug)]
+pub struct Socket<'io> {
+    id: SocketId<'io>,
+}
+
+const _: () = assert!(size_of::<Socket<'_>>() == 8);
+const _: () = assert!(size_of::<Option<Socket<'_>>>() == 8);
+
+impl<'io> Socket<'io> {
+    #[inline]
+    pub(crate) const fn from_id(id: SocketId<'io>) -> Self {
+        Self { id }
+    }
+
+    #[inline]
+    pub const fn id(&self) -> SocketId<'io> {
+        self.id
+    }
+
+    #[inline]
+    pub const fn fixed_file_slot(&self) -> FixedFileSlot {
+        self.id.fixed_file_slot()
+    }
+
+    #[blaze::consumes]
+    #[inline]
+    pub(crate) const fn into_id(self) -> SocketId<'io> {
+        self.id
+    }
+}
+
+/// Linear handle to a held advisory file lock in driver scope `'io`.
+///
+/// Must be consumed via `lock.unlock()` (emitting [`crate::request::Unlock`]).
+#[blaze::handle]
+#[blaze::linear]
+#[derive(Debug)]
+pub struct Lock<'io> {
+    id: LockId<'io>,
+}
+
+const _: () = assert!(size_of::<Lock<'_>>() == 8);
+const _: () = assert!(size_of::<Option<Lock<'_>>>() == 8);
+
+impl<'io> Lock<'io> {
+    #[inline]
+    pub(crate) const fn from_id(id: LockId<'io>) -> Self {
+        Self { id }
+    }
+
+    #[inline]
+    pub const fn id(&self) -> LockId<'io> {
+        self.id
+    }
+
+    #[blaze::consumes]
+    #[inline]
+    pub(crate) const fn into_id(self) -> LockId<'io> {
         self.id
     }
 }
@@ -221,6 +360,9 @@ impl<'io> Conn<'io> {
 pub struct Child<'io> {
     id: ChildId<'io>,
 }
+
+const _: () = assert!(size_of::<Child<'_>>() == 8);
+const _: () = assert!(size_of::<Option<Child<'_>>>() == 8);
 
 impl<'io> Child<'io> {
     #[inline]

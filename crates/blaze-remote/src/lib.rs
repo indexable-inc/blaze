@@ -109,6 +109,7 @@ pub mod find;
 pub mod http;
 #[cfg(feature = "bucket")]
 pub mod http3;
+pub mod machine;
 pub mod name;
 pub mod privacy;
 pub mod published;

@@ -83,6 +83,9 @@ pub(super) fn atom_expr<S: Sink>(
     if p.at_contextual_kw(T![inline]) && p.nth_at(1, T![for]) {
         return Some((inline_for_expr(p, None), BlockLike::Block));
     }
+    if !r.forbid_structs && p.at_contextual_kw(T![defer]) && p.nth(1) == T!['{'] {
+        return Some((defer_expr(p), BlockLike::Block));
+    }
     if paths::is_path_start(p) {
         return Some(path_expr(p, r));
     }
@@ -792,6 +795,14 @@ fn inline_for_expr<S: Sink>(p: &mut Parser<'_, S>, m: Option<Marker>) -> Complet
     let m = m.unwrap_or_else(|| p.start());
     p.bump_remap(T![inline]);
     for_expr(p, Some(m))
+}
+
+fn defer_expr<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
+    assert!(p.at_contextual_kw(T![defer]) && p.nth(1) == T!['{']);
+    let m = p.start();
+    p.bump_remap(T![defer]);
+    block_expr(p);
+    m.complete(p, DEFER_EXPR)
 }
 
 // test for_expr

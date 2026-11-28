@@ -30,6 +30,8 @@
 //! [`Toolchain::open`] over a `Shelf`, a [`Tree`] for the checkout).
 
 #![no_std]
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
 
 #[cfg(any(test, feature = "std"))]
 extern crate std;
@@ -40,6 +42,8 @@ pub mod check_scope;
 pub mod crate_list;
 pub mod fixture;
 pub mod lib_features_record;
+#[cfg(feature = "std")]
+pub mod machine;
 #[cfg(feature = "procs")]
 pub mod procs;
 mod list;
@@ -72,6 +76,8 @@ use blaze_unit_graph::sources::Records;
 pub use checkout::Checkout;
 pub use list::{Listed, ScriptWorld, Side, crate_list, needs, open_list, open_list_light, script_world, world, world_from_list};
 pub use script::{ScriptRecords, ScriptRecordsError, joined, script_subject};
+#[cfg(feature = "std")]
+pub use machine::StoredFileFetchMachine;
 #[cfg(feature = "std")]
 pub use stored_files::StoredFiles;
 pub use toolchain::{Needs, Toolchain, ToolchainCrate};

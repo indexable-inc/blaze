@@ -3038,4 +3038,140 @@ pub fn use_bit_array() {
         }
         assert!(saw_expanded_array, "expected expanded `[u64; W]` in lowered BitArray path args");
     }
+
+    /// End-to-end test for attribute proc-macros on associated items inside generic `impl` blocks
+    /// (starlark's `impl<'v> ListRef<'v> { #[ref_cast_custom] pub(crate) fn new<'a>(slice: &'a [Value<'v>]) -> &'a ListRef<'v>; }`):
+    /// the `;`-terminated method is replaced by the attribute proc-macro's expansion with a body,
+    /// its head has `has_body == true`, and both `S::new` and its caller `from_value` lower and
+    /// typecheck cleanly with zero diagnostics.
+    #[test]
+    fn front2_assoc_attr_proc_macro_expands_body_and_typechecks() {
+        use blaze_expand::{HostAsk, HostError, HostWhy, MacroDefinition, ProcCall, ProcKind, Produced, Reads, TokenOrigin, Transparency, lex};
+        use blaze_own::{AVec, Alloc};
+
+        use crate::front2::check::{BuildOrder, CheckFail, Records, check_body};
+        use crate::front2::consts::Consts;
+        use crate::front2::keys::{MemberKind, checker_of};
+        use crate::front2::spell::Spelling;
+
+        const PM: &str = "#![no_core]\n#[proc_macro_attribute]\npub fn my_attr(_attr: TokenStream, item: TokenStream) -> TokenStream { item }\n";
+        const USER: &str = r#"#![no_core]
+#[lang = "sized"]
+pub trait Sized {}
+
+pub struct S<'a>(&'a [u32]);
+
+impl<'a> S<'a> {
+    #[macros::my_attr]
+    pub(crate) fn new(x: &'a [u32]) -> &'a S<'a>;
+}
+
+pub fn from_value<'a>(x: &'a [u32]) -> &'a S<'a> {
+    S::new(x)
+}
+"#;
+
+        const RUNNER: CrateItemKey = CrateItemKey(ContentId([17; 32]));
+        struct AssocAttrRunner;
+        impl<'a> SourceTexts<'a> for AssocAttrRunner {
+            fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+                match (krate, path) {
+                    (0, "/user/src/lib.rs") => Some(USER),
+                    (1, "/macros/src/lib.rs") => Some(PM),
+                    _ => None,
+                }
+            }
+            fn proc_macro_key(&self, krate: usize) -> Option<CrateItemKey> {
+                (krate == 1).then_some(RUNNER)
+            }
+            fn run_proc_macro<'b>(&self, _: usize, def: &MacroDefinition<'_>, call: ProcCall<'_>, alloc: Alloc<'b>) -> Result<Produced<'b>, HostError> {
+                let refused = HostError { ask: HostAsk::ProcMacro, why: HostWhy::Refused };
+                let text = match (call.kind, def.proc_name()) {
+                    (ProcKind::Attr, Some("my_attr")) => {
+                        "pub(crate) fn new(x: &'a [u32]) -> &'a S<'a> { unsafe { &*(x as *const [u32] as *const u32 as *const S<'a>) } }"
+                    }
+                    _ => return Err(refused),
+                };
+                let tokens = lex(text, Edition::E2024, alloc).map_err(|_| refused)?;
+                let mut origins = AVec::new_in(alloc);
+                origins.extend(tokens.tokens().iter().map(|_| TokenOrigin::Made(Transparency::Transparent)));
+                Ok(Produced { tokens, origins, reads: Reads::new_in(alloc), diagnostics: AVec::new_in(alloc), text: AVec::new_in(alloc) })
+            }
+        }
+
+        let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let heap = blaze_own::testing::heap();
+        let store_alloc = heap.alloc();
+        let inputs = [
+            CrateInput {
+                name: "user",
+                key: CrateItemKey(ContentId::of("front2_assoc_attr_user", b"user")),
+                root: "/user/src/lib.rs",
+                shown_from: "/user/",
+                edition: Edition::E2024,
+                implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2024), proc_macro: false, entry: false },
+                features: &[],
+                deps: &[("macros", 1)],
+                cfg: &[],
+                script: None,
+            },
+            CrateInput {
+                name: "macros",
+                key: CrateItemKey(ContentId::of("front2_assoc_attr_pm", b"macros")),
+                root: "/macros/src/lib.rs",
+                shown_from: "/macros/",
+                edition: Edition::E2024,
+                implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2024), proc_macro: true, entry: false },
+                features: &[],
+                deps: &[],
+                cfg: &[],
+                script: None,
+            },
+        ];
+        let names = resolve_crates(&inputs, Sysroot::default(), &AssocAttrRunner, &Serial, bump).expect("resolve");
+        let front_frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("front frame");
+        let files = [SourceFile { path: "src/lib.rs", text: USER }];
+        let mut front = Front2::new(&names, &front_frame, &files, store_alloc).expect("front2");
+        let prepared = Prepares::new_in(bump);
+        let mut store = Store::new(front.index.lang("sized"), front.frame, store_alloc);
+
+        // Locate `impl<'a> S<'a>` and ensure its head + `S::new` member fn head.
+        let impl_lib = names.krate(0).tables.impls[0].key;
+        store.ensure(&names, &mut front.keys, super::Want::Impl(impl_lib)).expect("impl head");
+        let new_ck = front.keys.filed_member(checker_of(impl_lib), MemberKind::Fn, "new").expect("`S::new` filed on impl");
+        let new_body = lower_member(&names, &prepared, &mut front.keys, &mut store, new_ck).expect("lower_member `S::new`");
+        let new_head = store.fns.get(&new_ck).expect("`S::new` head in store");
+        assert!(new_head.has_body, "`S::new` expanded by #[my_attr] must have has_body == true");
+
+        // Locate and lower `from_value`.
+        let (from_value_lib, _, _) = names
+            .items(0)
+            .find(|(k, _, _)| names.item_text(*k).and_then(|t| t.name) == Some("from_value"))
+            .expect("from_value item");
+        let from_body = lower_fn(&names, &prepared, &mut front.keys, &mut store, from_value_lib).expect("lower_fn `from_value`");
+
+        // Typecheck BOTH `S::new` and `from_value` cleanly.
+        let (mut buckets, mut consts) = (None, Consts::default());
+        for (label, body) in [("S::new", &new_body), ("from_value", &from_body)] {
+            let view = body.lowered.view();
+            let spell = Spelling::of(&view).expect("spelling");
+            let scope = body.scope(&spell);
+            let mut records = Records {
+                names: &names,
+                keys: &mut front.keys,
+                index: &front.index,
+                store: &mut store,
+                buckets: &mut buckets,
+                order: BuildOrder::AsAsked,
+                consts: Some((&mut consts, &prepared)),
+            };
+            match check_body(&mut records, body, &scope) {
+                Ok(done) => assert!(done.diags.is_empty(), "{label} unexpected diags: {:?}", done.diags),
+                Err(CheckFail::Diags { diags, .. }) => panic!("{label} typecheck diags: {diags:?}"),
+                Err(err) => panic!("{label} typecheck failed: {err}"),
+            }
+        }
+    }
 }

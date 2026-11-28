@@ -64,7 +64,7 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AString, AVec, Alloc, String, Vec};
 use blaze_proc_macro::native_c::Laid;
 use blaze_proc_macro::native_c_tasks::{self, COMPILE_DEADLINE, CTasksSetting};
-use blaze_proc_macro::native_setting::{OwnedNativeSetting, command_native_setting};
+use blaze_proc_macro::native_setting::{LinuxLinkInputs, OwnedNativeSetting, command_native_setting_with_link};
 use blaze_world::crate_list::CrateList;
 use bstd::cx::Cx;
 use bstd::mem::Frame;
@@ -101,6 +101,9 @@ static SNAPSHOT_PART_SEQ: AtomicU64 = AtomicU64::new(0);
 /// `SDKROOT`) and the shelf. They show only in the prefix maps, so in no output of two
 /// checkouts differently (rule 25).
 const GUEST_SDK: &str = "/sdk";
+const GUEST_SDK_EXTRA: &str = "/sdk-headers";
+const GUEST_SDK_LIB: &str = "/sdk-lib";
+const GUEST_SDK_RPATH: &str = "/sdk-rpath";
 const GUEST_SHELF: &str = "/toolchain/clang";
 /// The folder every crate's guest `OUT_DIR` is under (blaze-build-script env.rs).
 const GUEST_BUILDS: &str = "/target/debug/build";
@@ -165,11 +168,17 @@ impl fmt::Display for Said<'_> {
     }
 }
 
-/// Target C library sysroot for [`CTasks`]: macOS Apple SDK or Linux host `/usr`.
+/// Deferred Linux host sysroot resolver (backed by `LazySdk`'s `OnceCell`), invoked only when a
+/// crate actually has deferred C requests so pure-Rust `run`/`test`/`export` never probes host
+/// compiler wrappers.
+pub(crate) type LinuxSysrootResolver<'e> = &'e (dyn Fn() -> Result<Option<crate::sdk::LinuxHostSysroot<'e>>, crate::sdk::LinuxSysrootError<'e>> + 'e);
+
+/// Target C library sysroot for [`CTasks`]: macOS Apple SDK or a lazy Linux host sysroot resolver
+/// (`/usr` on FHS Linux, or NixOS glibc-dev resolved at the command's edge on first C-task demand).
 #[derive(Clone, Copy)]
 pub(crate) enum TargetSdk<'e> {
     Macos(blaze_apple_sdk::Sdk<'e>),
-    LinuxHost,
+    LinuxHost(LinuxSysrootResolver<'e>),
 }
 
 /// Target sysroot identity bytes hashed into `Toolchain::sdk` and `Setup::sdk_digest`.
@@ -205,28 +214,28 @@ struct Setup {
 /// What [`built_for`] reads beyond one crate: handed by engine_native.rs `image_for`, for the
 /// whole image. The tasks' results and the setup are held on `heap` (the command's, handed in:
 /// compile results cross worker threads there, native_c_tasks.rs `CTasksSetting::heap`).
-pub(crate) struct CTasks<'e> {
+pub(crate) struct CTasks<'e, 'f> {
     home: Option<&'e str>,
     /// The checkout's canonical root directory resolved once at the command's edge
     /// (`Served::root_text`), used to locate `Place::Checkout | Place::CheckoutDep` packages.
     checkout_root: Option<&'e str>,
     sdk: TargetSdk<'e>,
-    fs: &'e bstd::fs::Fs,
+    fs: &'f bstd::fs::Fs,
     workers: u32,
     heap: &'static blaze_own::Heap,
     setup: Option<Setup>,
     dirs: PackDirs,
 }
 
-impl<'e> CTasks<'e> {
+impl<'e, 'f> CTasks<'e, 'f> {
     pub(crate) fn new(
         home: Option<&'e str>,
         checkout_root: Option<&'e str>,
         sdk: TargetSdk<'e>,
-        fs: &'e bstd::fs::Fs,
+        fs: &'f bstd::fs::Fs,
         workers: u32,
         heap: &'static blaze_own::Heap,
-    ) -> CTasks<'e> {
+    ) -> CTasks<'e, 'f> {
         CTasks { home, checkout_root, sdk, fs, workers, heap, setup: None, dirs: PackDirs::default() }
     }
 
@@ -246,11 +255,22 @@ fn kept<'s>(scratch: &'s Frame, words: fmt::Arguments<'_>) -> &'s str {
 fn set_up<'w>(home: Option<&str>, sdk: TargetSdk<'_>, alloc: Alloc<'static>, scratch: &'w Frame) -> Result<Setup, CTaskWhy<'w>> {
     let words = |what: fmt::Arguments<'_>| CTaskWhy::Setup { words: kept(scratch, what) };
     let Some(home) = home else { return Err(words(format_args!("HOME is not set, and the shelf and the work folder are beneath it"))) };
-    let sdk_folder = match sdk {
-        TargetSdk::Macos(sdk) => sdk.folder(),
-        TargetSdk::LinuxHost => blaze_build_script::toolchain::LINUX_HOST_SYSROOT_DIR,
+    let (sdk_folder, link) = match sdk {
+        TargetSdk::Macos(sdk) => (sdk.folder(), LinuxLinkInputs::default()),
+        TargetSdk::LinuxHost(resolve) => match resolve().map_err(|e| words(format_args!("{e}")))? {
+            Some(sysroot) => (
+                sysroot.dir,
+                LinuxLinkInputs {
+                    lib_dir: sysroot.lib_dir,
+                    dynamic_linker: sysroot.dynamic_linker,
+                    rpaths: sysroot.rpaths,
+                },
+            ),
+            None => (blaze_build_script::toolchain::LINUX_HOST_SYSROOT_DIR, LinuxLinkInputs::default()),
+        },
     };
-    let setting = command_native_setting(home, sdk_folder, WORK, crate::graph::TRIPLE, alloc).map_err(|e| words(format_args!("{e}")))?;
+    let setting = command_native_setting_with_link(home, sdk_folder, link, WORK, crate::graph::TRIPLE, alloc)
+        .map_err(|e| words(format_args!("{e}")))?;
     let mut clang = String::from_str_in(setting.shelf.as_str(), alloc);
     clang.push_str("/bin/clang");
     let real = std::fs::canonicalize(clang.as_str()).map_err(|e| words(format_args!("{}: {e}", clang.as_str())))?;
@@ -268,7 +288,7 @@ fn set_up<'w>(home: Option<&str>, sdk: TargetSdk<'_>, alloc: Alloc<'static>, scr
     let area = String::from_str_in(real, alloc);
     let sdk_key = match sdk {
         TargetSdk::Macos(sdk) => SdkKey::Macos(sdk.identity().key()),
-        TargetSdk::LinuxHost => {
+        TargetSdk::LinuxHost(_) => {
             let bytes = hex32(setting.sdk_version.as_str())
                 .ok_or_else(|| words(format_args!("Linux host sysroot digest is malformed: {}", setting.sdk_version.as_str())))?;
             SdkKey::LinuxHost(bytes)
@@ -357,7 +377,7 @@ enum PkgSource<'s, 'l, 'a> {
 #[expect(clippy::too_many_arguments, reason = "each is one input of the crate's built record, named at the call")]
 pub(crate) fn built_for<'s, 'm: 's>(
     cx: &Cx,
-    c: &mut CTasks<'_>,
+    c: &mut CTasks<'_, '_>,
     store: &mut dyn Store<'m>,
     list: &CrateList<'_>,
     r: usize,
@@ -482,10 +502,35 @@ pub(crate) fn built_for<'s, 'm: 's>(
         blaze_build_script::toolchain::Sysroot::LinuxHost => "the Linux host sysroot",
         blaze_build_script::toolchain::Sysroot::Pinned { .. } => "the pinned sysroot",
     };
+    let sdk_extra = setup.setting.sdk_extra.as_ref().map(|host| Laid {
+        guest: GUEST_SDK_EXTRA,
+        host: host.as_str(),
+        digest: setup.sdk_digest,
+        name: "the Linux host kernel headers",
+    });
+    let sdk_lib = setup.setting.sdk_lib.as_ref().map(|host| Laid {
+        guest: GUEST_SDK_LIB,
+        host: host.as_str(),
+        digest: setup.sdk_digest,
+        name: "the Linux host libc libraries",
+    });
+    let mut sdk_rpaths: AVec<'_, Laid<'_>> = Vec::with_capacity_in(setup.setting.sdk_rpaths.len(), alloc);
+    for host in setup.setting.sdk_rpaths.iter() {
+        sdk_rpaths.push(Laid {
+            guest: GUEST_SDK_RPATH,
+            host: host.as_str(),
+            digest: setup.sdk_digest,
+            name: "a Linux host libc rpath root",
+        });
+    }
     let setting = CTasksSetting {
         clang: setup.clang.as_str(),
         shelf: Laid { guest: GUEST_SHELF, host: setup_shelf, digest: setup.compiler, name: "the pinned clang's shelf" },
         sdk: Laid { guest: GUEST_SDK, host: setup.setting.sdk.as_str(), digest: setup.sdk_digest, name: sdk_name },
+        sdk_extra,
+        sdk_lib,
+        sdk_dynamic_linker: setup.setting.sdk_dynamic_linker.as_deref(),
+        sdk_rpaths: sdk_rpaths.as_slice(),
         sysroot: setup.sysroot,
         work: setup.setting.work.as_str(),
         area: setup.area.as_str(),
@@ -701,7 +746,7 @@ fn dep_tree<'d, 's, 'a>(
 /// A producer's `OUT_DIR` laid read-only from the record its C step left ([`dep_out`]:
 /// `<work>/dep/<its content digest>`, made once:
 /// written beside and renamed into place), its real path.
-fn lay_dep_out<'s>(c: &CTasks<'_>, script: ScriptIn<'_>, key: [u8; 32], scratch: &'s Frame) -> Result<&'s str, CTaskWhy<'s>> {
+fn lay_dep_out<'s>(c: &CTasks<'_, '_>, script: ScriptIn<'_>, key: [u8; 32], scratch: &'s Frame) -> Result<&'s str, CTaskWhy<'s>> {
     let lay = |what: fmt::Arguments<'_>| CTaskWhy::Lay { words: kept(scratch, what) };
     let hex = crate::fetch::key_hex(&ContentId(key));
     let hex = core::str::from_utf8(&hex).map_err(|_| lay(format_args!("a digest's hex is not text")))?;
@@ -754,7 +799,7 @@ fn package_digest(list: &CrateList<'_>, r: usize, files: [u8; 32]) -> ContentId 
 /// Crate `r`'s package laid from its pack under the work folder (made once: written beside and
 /// renamed into place, so a folder there is whole), and its digest (the pack's files and the
 /// package's folder in it).
-fn lay_package<'s>(cx: &Cx, c: &mut CTasks<'_>, list: &CrateList<'_>, r: usize, files: [u8; 32], scratch: &'s Frame) -> Result<(&'s str, [u8; 32]), CTaskWhy<'s>> {
+fn lay_package<'s>(cx: &Cx, c: &mut CTasks<'_, '_>, list: &CrateList<'_>, r: usize, files: [u8; 32], scratch: &'s Frame) -> Result<(&'s str, [u8; 32]), CTaskWhy<'s>> {
     let lay = |what: fmt::Arguments<'_>| CTaskWhy::Lay { words: kept(scratch, what) };
     let root = list.root(r);
     let k: usize = root.strip_prefix('/').and_then(|rest| rest.split('/').next()).and_then(|k| k.parse().ok()).ok_or_else(|| lay(format_args!("its root `{root}` names no tree")))?;
@@ -1280,6 +1325,42 @@ mod dep_out_tests {
         let failed = Producers { scripts: &scripts, done: &[], refused: &[4], graph: &[] };
         assert_eq!(dep_out(&failed, OUT).map(|(_, d)| d), Err(DepOut::Refused { r: 4 }));
         assert_eq!(dep_out(&producers, "/target/debug/build/lz4-sys-9/out").map(|(_, d)| d), Err(DepOut::NoProducer));
+    }
+
+    #[test]
+    fn linux_sysroot_resolution_is_deferred_until_c_task_setup() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let resolver = || -> Result<Option<crate::sdk::LinuxHostSysroot<'_>>, crate::sdk::LinuxSysrootError<'_>> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(crate::sdk::LinuxSysrootError::ReadFile {
+                path: "/nix/store/bad-wrapper/nix-support/libc-cflags",
+                why: "invalid UTF-8",
+            })
+        };
+
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(17, bstd::io::Limits::USUAL));
+        let fs = io.need_fs().expect("simulated fs");
+        let mut tasks = CTasks::new(
+            Some("/tmp/blaze-test-unused-home"),
+            None,
+            TargetSdk::LinuxHost(&resolver),
+            &fs,
+            1,
+            blaze_own::testing::heap(),
+        );
+        // Pure-Rust commands construct `CTasks` without invoking the Linux sysroot resolver.
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "constructing CTasks must not resolve Linux sysroot");
+
+        // Once a crate with deferred C requests triggers setup, the resolver runs and propagates
+        // the exact Nix wrapper error through `CTaskWhy::Setup`.
+        let scratch = Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("scratch frame");
+        let why = tasks.setup(&scratch).err().expect("failing Linux sysroot resolver must fail C setup");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "setup must invoke Linux sysroot resolver once");
+        let msg = std::format!("{why}");
+        assert!(msg.contains("/nix/store/bad-wrapper/nix-support/libc-cflags"), "missing path in setup error: {msg}");
+        assert!(msg.contains("invalid UTF-8"), "missing detail in setup error: {msg}");
     }
 }
 

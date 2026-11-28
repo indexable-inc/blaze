@@ -410,7 +410,10 @@ pub struct ShelfClang<'s> {
     /// read, never in a read list (the toolchain's identity covers them).
     pub shelf: Laid<'s>,
     pub sdk: Laid<'s>,
-    /// Sysroot model for clang (`-isysroot <sdk>` on macOS, `--sysroot=/` + `-resource-dir` on Linux).
+    /// Optional extra read-only root for split Linux kernel headers (NixOS `linux-headers`).
+    pub sdk_extra: Option<Laid<'s>>,
+    /// Sysroot model for clang (`-isysroot <sdk>` on macOS, `--sysroot=/` or
+    /// `--sysroot=<sdk> -idirafter <sdk>/include` + `-resource-dir` on Linux).
     pub sysroot: Sysroot,
     /// The package, the script's `OUT_DIR` as its record laid, each dependency's laid
     /// `OUT_DIR`: the roots a read list names.
@@ -436,9 +439,10 @@ const PREFIX_MAPS: &[&str] = &["-ffile-prefix-map=", "-fdebug-prefix-map=", "-fm
 const JOINED: &[&str] = &["-isystem", "-iquote", "-idirafter", "-include", "-imacros", "-isysroot", "-I"];
 
 impl<'s> ShelfClang<'s> {
-    /// Every laid root, in [`RootId`] order: the sources, then the SDK and the shelf.
+    /// Every laid root, in [`RootId`] order: the sources, then the SDK, the shelf, and any split
+    /// kernel-headers root.
     fn laid(&self) -> impl Iterator<Item = Laid<'s>> + '_ {
-        self.sources.iter().copied().chain([self.sdk, self.shelf])
+        self.sources.iter().copied().chain([self.sdk, self.shelf]).chain(self.sdk_extra)
     }
 
     /// The guest path `guest` at its host folder.
@@ -529,17 +533,33 @@ fn refused<'a>(alloc: Alloc<'a>, parts: &[&str]) -> Refused<'a> {
     Refused { words }
 }
 
-/// Computes the `--sysroot=...` argument for a Linux host sysroot whose read root is `sdk_host`
-/// (e.g. `"/usr"` -> `"--sysroot=/"`, `"/tmp/root/usr"` -> `"--sysroot=/tmp/root"`).
-fn linux_sysroot_flag<'a>(sdk_host: &str, alloc: Alloc<'a>) -> AString<'a> {
-    let root = match sdk_host.strip_suffix("/usr") {
-        Some("") => "/",
-        Some(parent) => parent,
-        None => sdk_host,
-    };
-    let mut out = String::from_str_in("--sysroot=", alloc);
-    out.push_str(root);
-    out
+/// Appends Clang sysroot and system-include flags for a Linux host sysroot whose read root is
+/// `sdk_host`:
+/// - Standard FHS roots ending in `"/usr"` (`"/usr"` -> `"--sysroot=/"`,
+///   `"/tmp/root/usr"` -> `"--sysroot=/tmp/root"`) emit `--sysroot=<prefix>` so Clang searches
+///   `<prefix>/usr/include` and multiarch subdirectories.
+/// - Flat roots not ending in `"/usr"` (e.g. NixOS `"/nix/store/<hash>-glibc-<ver>-dev"`, whose
+///   headers live at `<sdk_host>/include/features.h`) emit `--sysroot=<sdk_host>` (preventing
+///   ambient `/usr/include` and `/usr/local/include` lookups) plus `-idirafter <sdk_host>/include`
+///   so Clang's `-resource-dir/include` builtin headers are searched before glibc headers.
+pub(crate) fn push_linux_sysroot_flags<'a>(sdk_host: &str, out: &mut AVec<'a, AString<'a>>, alloc: Alloc<'a>) {
+    match sdk_host.strip_suffix("/usr") {
+        Some("") => out.push(String::from_str_in("--sysroot=/", alloc)),
+        Some(parent) => {
+            let mut flag = String::from_str_in("--sysroot=", alloc);
+            flag.push_str(parent);
+            out.push(flag);
+        }
+        None => {
+            let mut sysroot = String::from_str_in("--sysroot=", alloc);
+            sysroot.push_str(sdk_host);
+            out.push(sysroot);
+            out.push(String::from_str_in("-idirafter", alloc));
+            let mut inc = String::from_str_in(sdk_host, alloc);
+            inc.push_str("/include");
+            out.push(inc);
+        }
+    }
 }
 
 impl CCompiler for ShelfClang<'_> {
@@ -596,7 +616,7 @@ impl CCompiler for ShelfClang<'_> {
                     held.push(text(&[self.sdk.host]));
                 }
                 Sysroot::LinuxHost => {
-                    held.push(linux_sysroot_flag(self.sdk.host, alloc));
+                    push_linux_sysroot_flags(self.sdk.host, &mut held, alloc);
                 }
                 Sysroot::Pinned { .. } => {
                     held.push(text(&["--sysroot=", self.sdk.host]));
@@ -737,7 +757,7 @@ fn replace_all<'a>(text: &str, from: &str, to: &str, alloc: Alloc<'a>) -> AStrin
 mod tests {
     use core::time::Duration;
 
-    use super::{Depfile, Laid, PATH_MOST, join, laid_of, lang_flags, linux_sysroot_flag, needs_self_exec};
+    use super::{Depfile, Laid, PATH_MOST, join, laid_of, lang_flags, needs_self_exec, push_linux_sysroot_flags};
     use blaze_build_script::c_tasks::Lang;
     use blaze_core::wait::Deadline;
     use blaze_roots::{Digest, Mount, Root, RootId, RootKind, Roots};
@@ -841,10 +861,26 @@ mod tests {
     }
 
     #[test]
-    fn linux_sysroot_flag_maps_usr_to_root() {
+    fn linux_sysroot_flags_handle_fhs_and_nixos_flat_sysroots() {
         let alloc = blaze_own::testing::heap().alloc();
-        assert_eq!(linux_sysroot_flag("/usr", alloc).as_str(), "--sysroot=/");
-        assert_eq!(linux_sysroot_flag("/tmp/fake/usr", alloc).as_str(), "--sysroot=/tmp/fake");
-        assert_eq!(linux_sysroot_flag("/opt/sysroot", alloc).as_str(), "--sysroot=/opt/sysroot");
+        let flags = |sdk_host: &str| {
+            let mut out = blaze_own::Vec::new_in(alloc);
+            push_linux_sysroot_flags(sdk_host, &mut out, alloc);
+            out.iter().map(|s| s.as_str().to_owned()).collect::<std::vec::Vec<_>>()
+        };
+        assert_eq!(flags("/usr"), ["--sysroot=/"]);
+        assert_eq!(flags("/tmp/fake/usr"), ["--sysroot=/tmp/fake"]);
+        assert_eq!(
+            flags("/nix/store/abc-glibc-2.44-dev"),
+            [
+                "--sysroot=/nix/store/abc-glibc-2.44-dev",
+                "-idirafter",
+                "/nix/store/abc-glibc-2.44-dev/include",
+            ]
+        );
+        assert_eq!(
+            flags("/opt/sysroot"),
+            ["--sysroot=/opt/sysroot", "-idirafter", "/opt/sysroot/include"]
+        );
     }
 }

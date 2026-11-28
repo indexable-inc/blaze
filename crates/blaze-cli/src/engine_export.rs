@@ -26,7 +26,7 @@ use blaze_code::datum::{DatumView, OWN_DATUM, Place as DatumPlace};
 use blaze_code::record::{CodeRecord, CodeView, NO_TARGET, PositionPart, Site, SiteKind, Space, Symbol as CodeSymbol, Target};
 use blaze_export::{
     Data, DataPlace, DataWord, Entry, ExportError, ExportLinkTimes, ExportRunner, Exported, Function, Panic, Platform,
-    Profile, ProgramIn, SequentialExportRunner, Tier, TlsRuntime,
+    InitStatic, Profile, ProgramIn, SequentialExportRunner, Tier, TlsRuntime,
 };
 use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
 use blaze_ladder::body_ids::{self, BodyIds as _, RowKind, Scratch, Stepped, Walk};
@@ -3551,7 +3551,7 @@ fn export_program<'f>(
     let names = run_names::names_in(cx, root, crates, procs, &seen, frame).map_err(CliError::RunNames)?;
 
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Roots));
-    let export_items: &[blaze_id::ItemKey] = native_export.as_ref().map_or(&[], |n| n.items.as_slice());
+    let export_items: &[blaze_id::ItemKey] = native_export.items.as_slice();
     let roots = run_roots(names.records, names.lang_crates, builder.settings.panic, export_items, names.frame, heap.alloc(), alloc).map_err(|why| {
         box_err(
             ExportCliError::Roots { shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
@@ -3578,7 +3578,8 @@ fn export_program<'f>(
     );
     let mut codes = HomeCodeStore::new(lent);
 
-    // Whole-program reachability closure from all roots.
+    // Whole-program reachability closure from all roots (entry, C-called Rust exports, personality,
+    // and Rust `.init_array` / `__mod_init_func` initializer statics).
     let mut walk = Walk::new_in(alloc);
     for i in 0..roots.len() {
         walk.root::<RunError>(roots.row(i), MOST_WALKED).map_err(|why| {
@@ -3587,6 +3588,18 @@ fn export_program<'f>(
                 heap,
             )
         })?;
+    }
+    let mut rust_inits: AVec<'_, InitStatic> = Vec::with_capacity_in(native_export.inits.len(), alloc);
+    for &(init_item, priority) in native_export.inits.iter() {
+        let checker_item = blaze_ladder::front2::keys::checker_of(init_item);
+        let init_sym = blaze_ladder::symbols::static_symbol(checker_item);
+        walk.root_static::<RunError>(checker_item, MOST_WALKED).map_err(|why| {
+            box_err(
+                ExportCliError::Walk { symbol: init_sym.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
+        rust_inits.push(InitStatic { symbol: init_sym, priority });
     }
 
     let mut scratch = Scratch::new_in(alloc);
@@ -3625,7 +3638,7 @@ fn export_program<'f>(
             )
         })?;
     let (mut compiled, mut cached, mut unkeyed, mut stubs) = (0usize, 0usize, 0usize, 0usize);
-    let root_count = roots.len();
+    let root_count = walk.len();
     let export_workers = usize::try_from(standing.workers.get().min(cx.workers()).saturating_sub(1))
         .unwrap_or(0)
         .min(MAX_EXPORT_WORKERS);
@@ -4392,8 +4405,9 @@ fn export_program<'f>(
         personality,
         tls: tls_runtime,
         profile: export_profile,
-        natives: native_export.as_ref().map(|n| &n.image),
-        exports: native_export.as_ref().map_or(&[], |n| n.exports.as_slice()),
+        natives: native_export.image.as_ref(),
+        exports: native_export.exports.as_slice(),
+        inits: rust_inits.as_slice(),
         symbol_names: symbol_names.as_slice(),
     };
 
@@ -6242,6 +6256,7 @@ mod tests {
             profile: None,
             natives: None,
             exports: &[],
+            inits: &[],
             symbol_names: &[],
         };
 

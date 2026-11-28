@@ -940,8 +940,9 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
         let word_id = t.word;
         if word_id == NO_WORD {
             // No rule reads this word (every word below is in the table, a compile-time check
-            // in sequences.rs): only a recursive call, `match` discriminant table, or
-            // `#[proc_macro*]` attribute can be its use.
+            // in sequences.rs): only a recursive call, `match` discriminant table,
+            // `#[proc_macro*]` attribute, or direct `blaze_sys` syscall path in a sans-IO core
+            // can be its use.
             self.defining = false;
             let len = t.end - t.start;
             if len == 5 && self.rules.runs(Rule::HandWrittenDerivable) && self.str_of(t) == "match" {
@@ -953,6 +954,17 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                 && self.back(i, 2).is_some_and(|b| b.k == K::P(b'#'))
             {
                 self.push(Template::ProcMacroDef, self.toks[i - 2].start, t.end, None);
+            } else if len == 9
+                && self.scope.sans_io
+                && self.rules.runs(Rule::SansIoCore)
+                && self.str_of(t) == "blaze_sys"
+                && !self.method(i)
+                && (self.colons_at(i + 1)
+                    || (self.in_use && self.is_word(self.back(i, 1), "use"))
+                    || (self.is_word(self.back(i, 1), "crate") && self.is_word(self.back(i, 2), "extern")))
+            {
+                self.cost.add(Rule::SansIoCore);
+                self.push(Template::SansIoPath, t.start, t.end, None);
             }
             if self.rules.runs(Rule::Recursion) {
                 self.cost.add(Rule::Recursion);
@@ -2483,12 +2495,14 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
         any
     }
 
-    /// In a sans-IO core, a word of [`SANS_IO_WORDS`]: a path through an IO module of std
-    /// (`std::fs`, or `fs::` as a path's head), an IO type or system-call crate, `File::open`
-    /// and its kin, a blocking call (`.recv()`, `.join()`, `.lock()` with no argument, `.wait(`,
-    /// `block_on(`), the wall clock (`Instant::now`, `SystemTime::now`), a print macro. A bare head
-    /// `io::` is not reported in a file that declares or imports `io` as its own module
-    /// ([`crate::OwnHeads`], in the scope): there the name cannot be std's.
+    /// In a sans-IO core, a word of [`SANS_IO_WORDS`]: a path through an IO module of std/bstd
+    /// (`std::fs`, `bstd::os`, or `fs::` as a path's head), an IO type or system-call crate,
+    /// `File::open` and its kin, a blocking call (`.recv()`, `.join()`, `.lock()` with no
+    /// argument, `.wait(`, `block_on(`), the wall clock (`Instant::now`, `SystemTime::now`), a
+    /// print macro. A bare head `io::` is not reported in a file that declares or imports `io`
+    /// as its own module ([`crate::OwnHeads`], in the scope): there the name cannot be std's.
+    /// Pure non-IO FFI representation paths (`os::raw::*`, `os::unix::ffi::*`, `os::wasi::ffi::*`,
+    /// `os::windows::ffi::*`) and grouped imports under a non-std/non-bstd module are exempt.
     fn sans_io_word(&mut self, i: usize, t: Tok, word_id: u8, class: u16) {
         let next = self.tok(i + 1);
         let open_next = matches!(next, Some(n) if n.k == K::P(b'('));
@@ -2497,12 +2511,17 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                 return;
             }
             let w = self.str_of(t);
-            let after_std = self.colons_before(i) && matches!(self.back(i, 3), Some(p) if p.word == W_STD);
+            let after_std_or_bstd = self.colons_before(i)
+                && matches!(self.back(i, 3), Some(p) if p.word == W_STD || self.str_of(p) == "bstd");
             // A bare head is std's only when the file does not make that name its own
-            // (`mod io;`, `use crate::io;`: the scope's `own_heads`, read by `OwnHeads::read`).
+            // (`mod io;`, `use crate::io;`: the scope's `own_heads`, read by `OwnHeads::read`),
+            // and is not nested inside a non-std/non-bstd grouped `use` (`use crate::foo::{os::..}`).
             let own = IO_MODULES.iter().position(|m| *m == w).is_some_and(|at| self.scope.own_heads.0 & (1 << at) != 0);
-            let head = !self.colons_before(i) && self.colons_at(i + 1) && !own;
-            if !after_std && !head {
+            let head = !self.colons_before(i) && self.colons_at(i + 1) && !own && !self.in_non_std_use_group(i);
+            if !after_std_or_bstd && !head {
+                return;
+            }
+            if w == "os" && self.is_pure_os_ffi_path(i) {
                 return;
             }
             (Template::SansIoPath, t.end)
@@ -2549,6 +2568,57 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
             return;
         };
         self.push(template, t.start, end, None);
+    }
+
+    /// True when token `i` (`os`) starts a pure non-IO FFI representation path:
+    /// `os::raw::*` (C primitive type aliases) or `os::{unix,wasi,windows}::ffi::*`
+    /// (zero-syscall `OsStrExt` / `OsStringExt` byte-slice conversions).
+    fn is_pure_os_ffi_path(&self, i: usize) -> bool {
+        if !self.colons_at(i + 1) {
+            return false;
+        }
+        match self.word(self.tok(i + 3)) {
+            Some("raw") => true,
+            Some("unix" | "wasi" | "windows") => {
+                self.colons_at(i + 4) && self.word(self.tok(i + 6)) == Some("ffi")
+            }
+            _ => false,
+        }
+    }
+
+    /// True when token `i` sits at the start of an entry inside a grouped `use` tree whose
+    /// enclosing `{` follows `<segment>::` where `<segment>` is neither `std` nor `bstd`
+    /// (e.g. `use crate::foo::{os::Target};`). `use std::{fs::File};`, `use super::std::{..};`,
+    /// and `use bstd::{os::Fd};` return `false` so std/bstd IO paths stay flagged.
+    fn in_non_std_use_group(&self, i: usize) -> bool {
+        if !self.in_use || !matches!(self.back(i, 1), Some(p) if p.k == K::P(b'{') || p.k == K::P(b',')) {
+            return false;
+        }
+        let mut depth = 0usize;
+        let mut j = i;
+        // Bounded: each turn steps `j` back by one token toward 0.
+        while j > 0 {
+            j -= 1;
+            let tok = self.toks[j];
+            match tok.k {
+                K::P(b'}') => depth += 1,
+                K::P(b'{') => {
+                    if depth > 0 {
+                        depth -= 1;
+                    } else if self.prefixed_by_segment(j) {
+                        let seg = self.back(j, 3);
+                        let is_io_root = matches!(seg, Some(p) if p.word == W_STD || self.str_of(p) == "bstd");
+                        return !is_io_root;
+                    } else if !matches!(self.back(j, 1), Some(p) if p.k == K::P(b'{') || p.k == K::P(b',')) {
+                        return false;
+                    }
+                }
+                K::Ident | K::Raw | K::P(b':' | b',' | b'*') => {}
+                _ if depth > 0 => {}
+                _ => return false,
+            }
+        }
+        false
     }
 
     // ---- locks (D179) -------------------------------------------------------------------

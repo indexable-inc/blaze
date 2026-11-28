@@ -61,7 +61,8 @@ mod tool_attrs {
         assert!(TOOLS.windows(2).all(|w| w[0] < w[1]), "TOOLS sorted, no name twice");
         assert!(TOOLS.contains(&BLAZE), "blaze is a registered tool");
         assert!(KNOWN.windows(2).all(|w| w[0].name < w[1].name), "KNOWN sorted, no name twice");
-        // `args` (rule 83), `capability` and `handle` (two-tier sans-IO firewall), and `cost` (complexity contracts) are checked by a stage.
+        // `args` (rule 83), `capability` and `handle` (two-tier sans-IO firewall), `cost` (complexity contracts),
+        // and `max_state_bytes` / `syscalls` (machine state budget & syscall effects) are checked by a stage.
         assert!(
             KNOWN.iter().all(|k| {
                 k.state == State::Unchecked
@@ -69,8 +70,10 @@ mod tool_attrs {
                     || (k.name == "capability" && k.state == State::Checked(crate::tool_attrs::Stage::Ownership))
                     || (k.name == "handle" && k.state == State::Checked(crate::tool_attrs::Stage::Ownership))
                     || (k.name == "cost" && k.state == State::Checked(crate::tool_attrs::Stage::Proofs))
+                    || (k.name == "max_state_bytes" && k.state == State::Checked(crate::tool_attrs::Stage::Effects))
+                    || (k.name == "syscalls" && k.state == State::Checked(crate::tool_attrs::Stage::Effects))
             }),
-            "no stage checks a blaze attribute in this build yet but `args`, `capability`, `handle`, and `cost`"
+            "unexpected checked blaze attribute in this build"
         );
     }
 

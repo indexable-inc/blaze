@@ -91,6 +91,9 @@ mod sip_key;
 /// (blaze-cas's plain store under the command), fenced to one directory.
 mod lend;
 pub use lend::LentDriver;
+/// Zero-alloc typed linear standard I/O requests (`ReadStdinReq`, `WriteStdoutReq`,
+/// `WriteStderrReq`) and deterministic [`req::SimStdioHandler`].
+pub mod req;
 #[cfg(test)]
 mod tests;
 

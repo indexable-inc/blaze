@@ -2323,3 +2323,85 @@ fn code_relay_reports_producer_suite_and_supports_suite_private_retry() {
     assert_eq!(p1_retry, None, "unkeyed suite-private retry has no cross-suite producer");
     assert_eq!(b1_retry, 1u32.to_le_bytes(), "private retry must run SuiteId(1)'s own job");
 }
+
+#[test]
+fn code_relay_routes_distinct_suites_to_affinity_workers() {
+    use core::cell::RefCell;
+
+    use blaze_engine::SVec;
+    use blaze_engine::code_pool::relay::Reply;
+    use blaze_engine::code_pool::{Child, Worker};
+    use blaze_ladder::body_ids::{Order, RowKind};
+    use blaze_ladder::code_records::CodeKey;
+    use blaze_run::Nanos;
+
+    use crate::run_ids::Checked;
+    use crate::run_parent::CodeRefusal;
+    use crate::test_drive::{CodeRelay, CodeWorkers, Job, OneError};
+    use crate::test_loop::SuiteId;
+
+    struct RecordingWorkers {
+        count: usize,
+        seen: RefCell<std::vec::Vec<(Worker, SuiteId)>>,
+        done: RefCell<std::vec::Vec<(Worker, Result<SVec<'static, u8>, CodeRefusal>)>>,
+        alloc: blaze_own::SharedAlloc<'static>,
+    }
+
+    impl CodeWorkers<'static> for RecordingWorkers {
+        fn count(&self) -> usize {
+            self.count
+        }
+        fn give(&self, worker: Worker, job: Job<'static>) -> Result<(), OneError> {
+            self.seen.borrow_mut().push((worker, job.suite));
+            let mut bytes = SVec::with_capacity_in(4, self.alloc);
+            bytes.extend_from_slice(&job.suite.0.to_le_bytes());
+            self.done.borrow_mut().push((worker, Ok(bytes)));
+            Ok(())
+        }
+        fn finished(&self) -> Result<Option<(Worker, Result<SVec<'static, u8>, CodeRefusal>)>, OneError> {
+            Ok(self.done.borrow_mut().pop())
+        }
+    }
+
+    let heap = blaze_own::testing::heap();
+    let workers = RecordingWorkers {
+        count: 3,
+        seen: RefCell::new(std::vec::Vec::new()),
+        done: RefCell::new(std::vec::Vec::new()),
+        alloc: heap.shared(),
+    };
+    let now = || Nanos(1_000);
+    let relay = CodeRelay::new(3, &workers, &now, heap.shared(), 99).expect("relay");
+    let proof = Checked::Clean.runs(ItemKey(1)).expect("runnable");
+    let make_job = |suite: SuiteId| Job {
+        suite,
+        order: Order { tabled: ItemKey(1), kind: RowKind::Instance },
+        name: SVec::new_in(heap.shared()),
+        proof,
+        entry: None,
+        start: blaze_ladder::run::special::MakerStart::ByRule,
+        enclosers: crate::test_drive::suite_cache::LocalEnclosers::default(),
+    };
+    let key = |tag: u8| CodeKey(blaze_ids::ContentId::of("affinity test key", &[tag]));
+
+    // Warm Suite 0 -> Worker(0), Suite 1 -> cold Worker(1), Suite 2 -> cold Worker(2),
+    // then verify follow-up jobs for Suites 0, 1, 2 stay pinned to Workers 0, 1, 2.
+    for (round, base) in [(0u8, 0u8), (1u8, 10u8)] {
+        for s in 0u32..3u32 {
+            let child = Child(s as usize);
+            relay.ask(child, Some(key(base + s as u8)), make_job(SuiteId(s))).expect("ask");
+            relay.pump().expect("pump");
+            let answered = relay.answer(child, |_, r| matches!(r, Reply::Made(_))).expect("answer");
+            assert_eq!(answered, Some(true), "round {round} suite {s} answered");
+        }
+    }
+    let expected = [
+        (Worker(0), SuiteId(0)),
+        (Worker(1), SuiteId(1)),
+        (Worker(2), SuiteId(2)),
+        (Worker(0), SuiteId(0)),
+        (Worker(1), SuiteId(1)),
+        (Worker(2), SuiteId(2)),
+    ];
+    assert_eq!(workers.seen.borrow().as_slice(), &expected, "CodeRelay must route suites to their affinity workers");
+}

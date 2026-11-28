@@ -12,7 +12,7 @@ use blaze_own::{AVec, Alloc, Vec};
 use crate::eh_out::{Outside, eh_room_with, eh_sections_with};
 use crate::error::ExportError;
 use crate::input::{Entry, Panic, Platform, ProgramIn, Tier};
-use crate::layout::{Member, TlsPlan, lay_out_with_tls_par};
+use crate::layout::{InitPlan, Member, TlsPlan, lay_out_with_tls_par};
 use crate::native_merge::{self, MergeError};
 use crate::par::{ExportLinkTimes, ExportRunner, SequentialExportRunner};
 use crate::start::{main_of, start};
@@ -161,21 +161,25 @@ pub fn export_par<'a, R: ExportRunner>(
             Some((image, native_merge::libraries(image, alloc).map_err(ExportError::Native)?))
         }
     };
-    let (plan, initial_root) = match platform {
-        Platform::MacosArm64 => (macho::plan_for(natives.as_ref().map(|(_, libraries)| &libraries[..])), 0u64),
+    let (plan, initial_root, native_tail_len) = match platform {
+        Platform::MacosArm64 => (macho::plan_for(natives.as_ref().map(|(_, libraries)| &libraries[..])), 0u64, 0u64),
         Platform::LinuxArm64 => {
             let libs = natives.as_ref().map(|(_, libraries)| &libraries[..]);
-            let has_inits = natives.as_ref().is_some_and(|(image, _)| image.region(NativeRegion::Inits).is_some_and(|r| r.len > 0));
+            let native_inits_len = natives.as_ref().and_then(|(image, _)| image.region(NativeRegion::Inits)).map_or(0, |r| r.len);
+            let has_rust_inits = !program.inits.is_empty();
+            let has_inits = has_rust_inits || native_inits_len > 0;
+            let native_tail_len = if has_rust_inits { native_inits_len } else { 0 };
             let root_off = elf::tls_root_offset(natives.as_ref().map(|(image, _)| *image)).map_err(ExportError::Native)?;
-            (elf::plan_for(libs, has_inits), root_off | blaze_code::tls::ROOT_OWN)
+            (elf::plan_for(libs, has_inits), root_off | blaze_code::tls::ROOT_OWN, native_tail_len)
         }
         Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),
     };
-    let tls_plan = program.tls.map(|t| TlsPlan { descriptor: t.descriptor, mod_init_fn: start.tls_init, initial_root });
+    let tls_plan = program.tls.map(|t| TlsPlan { descriptor: t.descriptor, initial_root });
+    let init_plan = InitPlan { tls_init_fn: start.tls_init, statics: program.inits, native_tail_len };
     let t_eh_room = runner.now_ns();
     let room = eh_room_with(&members, program.personality, platform, program.natives, alloc)?;
     times.eh_room_ns = runner.now_ns().saturating_sub(t_eh_room);
-    let laid = lay_out_with_tls_par(&members, program.data, start.entry, program.profile, plan, room, tls_plan, alloc, runner, &mut times)?;
+    let laid = lay_out_with_tls_par(&members, program.data, start.entry, program.profile, plan, room, tls_plan, init_plan, alloc, runner, &mut times)?;
     let seed = program.profile.map_or([0u8; 32], |p| p.digest);
     let (eh, identity, bound) = match platform {
         Platform::MacosArm64 => {

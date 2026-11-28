@@ -315,6 +315,15 @@ pub enum Rule {
     /// ([`Rule::typed`]). Error at every step ([`Step::levels`]). The lint
     /// `blaze::capability_in_sans_io`.
     CapabilityInSansIo = 48,
+    /// A reference to a function's own local variable held live across a `.do` suspension point:
+    /// a TYPED rule, decided by `blaze-typeck` (`rules/do_expr.rs`), never by this crate's token
+    /// pass ([`Rule::typed`]). Error at every step ([`Step::levels`]). The lint
+    /// `blaze::local_borrow_across_do`.
+    LocalBorrowAcrossDo = 49,
+    /// A `.do` suspension point inside a `#![blaze::sans_io]` body: a TYPED rule, decided by
+    /// `blaze-typeck` (`rules/capability.rs`), never by this crate's token pass ([`Rule::typed`]).
+    /// Error at every step ([`Step::levels`]). The lint `blaze::suspend_in_sans_io`.
+    SuspendInSansIo = 50,
 }
 
 impl Rule {
@@ -371,6 +380,8 @@ impl Rule {
         Rule::ParallelVecs,
         Rule::CostContract,
         Rule::CapabilityInSansIo,
+        Rule::LocalBorrowAcrossDo,
+        Rule::SuspendInSansIo,
     ];
 
     /// The ten rules ported from blaze's scripts: what [`Step::Strict`] runs. The rules after
@@ -443,6 +454,8 @@ impl Rule {
             Rule::ParallelVecs => "parallel-vecs",
             Rule::CostContract => "cost-contract",
             Rule::CapabilityInSansIo => "capability-in-sans-io",
+            Rule::LocalBorrowAcrossDo => "local-borrow-across-do",
+            Rule::SuspendInSansIo => "suspend-in-sans-io",
         }
     }
 
@@ -487,6 +500,8 @@ impl Rule {
             Rule::ParallelVecs => Some("parallel_vecs"),
             Rule::CostContract => Some("cost_contract"),
             Rule::CapabilityInSansIo => Some("capability_in_sans_io"),
+            Rule::LocalBorrowAcrossDo => Some("local_borrow_across_do"),
+            Rule::SuspendInSansIo => Some("suspend_in_sans_io"),
             _ => None,
         }
     }
@@ -501,7 +516,15 @@ impl Rule {
     /// A typed rule is in no [`RuleSet`] a step makes, so a token record's key never moves with
     /// it; the step turns it on through its level alone ([`Step::levels`]).
     pub const fn typed(self) -> bool {
-        matches!(self, Rule::ArgsInline | Rule::UnsafeOpInUnsafeFn | Rule::CostContract | Rule::CapabilityInSansIo)
+        matches!(
+            self,
+            Rule::ArgsInline
+                | Rule::UnsafeOpInUnsafeFn
+                | Rule::CostContract
+                | Rule::CapabilityInSansIo
+                | Rule::LocalBorrowAcrossDo
+                | Rule::SuspendInSansIo
+        )
     }
 
     /// The rule configuration names `name` ([`Rule::name`]'s spelling), if any.
@@ -1514,6 +1537,8 @@ impl Step {
         };
         levels[Rule::CostContract as usize - 1] = Level::Error;
         levels[Rule::CapabilityInSansIo as usize - 1] = Level::Error;
+        levels[Rule::LocalBorrowAcrossDo as usize - 1] = Level::Error;
+        levels[Rule::SuspendInSansIo as usize - 1] = Level::Error;
         Levels(levels)
     }
 }

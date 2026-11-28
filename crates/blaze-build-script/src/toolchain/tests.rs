@@ -3,7 +3,8 @@ use blaze_pins::CLANG_JSON as PIN;
 use blaze_unit_graph::UnitId;
 
 use super::{
-    CInputs, ClangPin, Mode, NATIVE_EVERY_MODE, PinError, SHELF_MEMBERS_LINUX, Shelf, Sysroot, c_env, clang_major, clang_pin, depfile_reads, headers_digest,
+    CInputs, ClangPin, Mode, NATIVE_EVERY_MODE, PinError, SHELF_MEMBERS_LINUX, Shelf, Sysroot, c_env, clang_major, clang_pin, depfile_reads,
+    for_each_nix_lib_candidate, for_each_nix_rpath_in_flags, for_each_nix_sysroot_candidate, headers_digest, nix_dynamic_linker_in_flags,
     placement, shelf_missing_for, sysroot,
 };
 use crate::native::Runner;
@@ -121,4 +122,82 @@ fn the_mode_decides_the_runner() {
     // native (its C compile).
     assert_eq!(placement(spawns, Mode::Check, "libusb1-sys"), Runner::Wasm);
     assert_eq!(placement(spawns, Mode::Build, "libusb1-sys"), native);
+}
+
+#[test]
+fn nix_sysroot_candidates_parses_isystem_and_idirafter_flags() {
+    fn collect(flags: &str) -> std::vec::Vec<&str> {
+        let mut out = std::vec::Vec::new();
+        for_each_nix_sysroot_candidate(flags, |dir| out.push(dir));
+        out
+    }
+
+    // Real NixOS `nix-support/libc-cflags` shape (trailing space + -fmacro-prefix-map ignored).
+    let libc_cflags = "-idirafter /nix/store/2gh2-glibc-2.44-57-dev/include -fmacro-prefix-map=/nix/store/2gh2-glibc-2.44-57-dev/include=/nix/store/eeee-glibc-2.44-57-dev/include ";
+    assert_eq!(collect(libc_cflags), ["/nix/store/2gh2-glibc-2.44-57-dev"]);
+
+    // Joined, quoted, trailing-slash, and multiple flags in `NIX_CFLAGS_COMPILE`.
+    let nix_cflags = r#"-O2 -isystem/nix/store/aaa-foo-dev/include -isystem "/nix/store/bbb-glibc-dev/include/" -idirafter '/nix/store/ccc-bar-dev/include' -idirafter/nix/store/ddd-baz-dev/include"#;
+    assert_eq!(
+        collect(nix_cflags),
+        [
+            "/nix/store/aaa-foo-dev",
+            "/nix/store/bbb-glibc-dev",
+            "/nix/store/ccc-bar-dev",
+            "/nix/store/ddd-baz-dev",
+        ]
+    );
+
+    // Negative controls: non-matching flags, relative paths, non-`/include` dirs, bare `/include`, dangling flag.
+    let non_matching = "-I/nix/store/xxx/include -isystem relative/include -isystem /nix/store/xxx/not-include -isystem /nix/store/xxx/myinclude -idirafter /include -isystem";
+    assert!(collect(non_matching).is_empty(), "non-matching flags must yield no candidates");
+}
+
+#[test]
+fn nix_lib_candidates_parses_crt_and_library_flags() {
+    fn collect(flags: &str) -> std::vec::Vec<&str> {
+        let mut out = std::vec::Vec::new();
+        for_each_nix_lib_candidate(flags, |dir| out.push(dir));
+        out
+    }
+
+    assert_eq!(
+        collect("-B/nix/store/nhph-glibc-2.44-57/lib/ "),
+        ["/nix/store/nhph-glibc-2.44-57/lib"]
+    );
+    assert_eq!(
+        collect(r#"-rpath /nix/store/x/lib -L /nix/store/a-glibc/lib/ -L"/nix/store/b-glibc/lib" -B '/nix/store/c-glibc/lib/'"#),
+        ["/nix/store/a-glibc/lib", "/nix/store/b-glibc/lib", "/nix/store/c-glibc/lib"]
+    );
+    // Negative controls: relative paths, bare `/`, unrelated flags, dangling `-L`.
+    assert!(collect("-I/nix/store/x/include -L relative/lib -B / -Wl,-rpath=/nix/store/x/lib -L").is_empty());
+}
+
+#[test]
+fn nix_dynamic_linker_and_rpath_flags_parse_raw_ld_and_wl_forms() {
+    fn rpaths(flags: &str) -> std::vec::Vec<&str> {
+        let mut out = std::vec::Vec::new();
+        for_each_nix_rpath_in_flags(flags, |dir| out.push(dir));
+        out
+    }
+
+    assert_eq!(
+        nix_dynamic_linker_in_flags("-dynamic-linker /nix/store/g-glibc/lib/ld-linux-aarch64.so.1 -rpath /nix/store/g-glibc/lib"),
+        Some("/nix/store/g-glibc/lib/ld-linux-aarch64.so.1")
+    );
+    assert_eq!(
+        nix_dynamic_linker_in_flags("-Wl,--dynamic-linker=/nix/store/g-glibc/lib/ld-linux-x86-64.so.2"),
+        Some("/nix/store/g-glibc/lib/ld-linux-x86-64.so.2")
+    );
+    assert_eq!(
+        nix_dynamic_linker_in_flags("-Wl,-dynamic-linker,/nix/store/g-glibc/lib/ld-linux-aarch64.so.1"),
+        Some("/nix/store/g-glibc/lib/ld-linux-aarch64.so.1")
+    );
+    assert_eq!(nix_dynamic_linker_in_flags("-dynamic-linker relative/ld.so -L/nix/store/g/lib"), None);
+
+    assert_eq!(
+        rpaths("-rpath /nix/store/a/lib/ -Wl,-rpath,/nix/store/b/lib:/nix/store/c/lib -R/nix/store/d/lib --rpath=/nix/store/e/lib"),
+        ["/nix/store/a/lib", "/nix/store/b/lib", "/nix/store/c/lib", "/nix/store/d/lib", "/nix/store/e/lib"]
+    );
+    assert!(rpaths("-rpath relative/lib -Wl,-rpath,/ -L/nix/store/a/lib").is_empty());
 }

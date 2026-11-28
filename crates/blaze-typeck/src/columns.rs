@@ -239,6 +239,8 @@ pub struct Checked<'a> {
     /// When the owner's return signature wrote one or more `_` placeholders (`-> _`,
     /// `-> Option<_>`, `-> Result<T, _>`), the concrete finalized return type in `types`.
     pub inferred_output: Option<PTy>,
+    /// Whether this body contains any `.do` suspension point (`rules/do_expr.rs`).
+    pub suspends: bool,
 }
 
 /// Two two-column tables are equal column by column.
@@ -409,6 +411,7 @@ impl<'a> Checked<'a> {
             && self.findings == other.findings
             && self.undecided == other.undecided
             && self.inferred_output == other.inferred_output
+            && self.suspends == other.suspends
     }
 }
 
@@ -450,6 +453,7 @@ impl<'a> core::fmt::Debug for Checked<'a> {
             .field("findings", &self.findings)
             .field("undecided", &self.undecided)
             .field("inferred_output", &self.inferred_output)
+            .field("suspends", &self.suspends)
             .field("reads", &self.reads)
             .field("needs", &self.needs)
             .finish()

@@ -400,6 +400,9 @@ pub enum LangItem {
     /// `core::ffi::VaList` (`#[lang = "va_list"]`): the type of the `...` parameter in a
     /// C-variadic fn definition. Last, so the earlier items keep their content hashes.
     VaList,
+    /// `blaze_machine::Request` (`#[lang = "blaze_request"]`): `.do` is typed `<T as Request>::Answer`.
+    /// Last, so the earlier items keep their content hashes.
+    Request,
 }
 
 impl LangItem {
@@ -435,7 +438,7 @@ impl LangItem {
     /// and the checked-body record ([`crate::checked_record`]) write. The one home of the list
     /// (blaze-ladder's front2/langs.rs `ALL` names this one; tests/front2_bounds.rs checks its
     /// length against `variant_count` and its order, so a new variant cannot be left out).
-    pub const ALL: [LangItem; 103] = {
+    pub const ALL: [LangItem; 104] = {
         use LangItem::*;
         [
             Sized, Copy, Deref, DerefMut, Add, Sub, Mul, Div, Rem, BitAnd, BitOr, BitXor, Shl, Shr, AddAssign, SubAssign, MulAssign, DivAssign, RemAssign, BitAndAssign, BitOrAssign,
@@ -446,7 +449,7 @@ impl LangItem {
             RangeToInclusive, IntoFutureIntoFuture, FuturePoll, PinNewUnchecked, GetContext, PollReady, PollPending, FutureOutput, TryTraitFromOutput,
             Freeze,
             AsyncFn, AsyncFnMut, AsyncFnOnce, AsyncFnOnceOutput, CallOnceFuture, CallRefFuture,
-            From, Enum, UnitEnum, TryAsDyn, VaList,
+            From, Enum, UnitEnum, TryAsDyn, VaList, Request,
         ]
     };
 

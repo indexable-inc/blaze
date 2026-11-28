@@ -449,9 +449,13 @@ pub fn write_native_par<'a, R: ExportRunner>(
     for &at in extra_needed.iter() {
         dyn_entries.push((DT_NEEDED, u64::from(at)));
     }
-    if let Some(inits) = native.and_then(|m| m.inits) {
-        dyn_entries.push((DT_INIT_ARRAY, inits.vaddr));
-        dyn_entries.push((DT_INIT_ARRAYSZ, inits.len));
+    let elf_inits = match laid.inits {
+        Some((vaddr, len)) => Some((vaddr, len)),
+        None => native.and_then(|m| m.inits).map(|i| (i.vaddr, i.len)),
+    };
+    if let Some((vaddr, len)) = elf_inits {
+        dyn_entries.push((DT_INIT_ARRAY, vaddr));
+        dyn_entries.push((DT_INIT_ARRAYSZ, len));
     }
     let dt_flags = if native.is_some_and(|m| m.static_tls) { DF_BIND_NOW | DF_STATIC_TLS } else { DF_BIND_NOW };
     dyn_entries.extend_from_slice(&[

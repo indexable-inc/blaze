@@ -67,7 +67,7 @@ use crate::error::ExportError;
 use crate::export::{Exported, Panics};
 use crate::input::{Data, Entry, Panic, Platform, Profile, Tier, TlsRuntime};
 use crate::layout::{
-    FixTo, Fixup, Import, Laid, LayoutMember, Placed, Plan, TlsPlan, bolt_order_members, check_data, find_member, lay_out_const_and_data, pad_to,
+    FixTo, Fixup, Import, InitPlan, Laid, LayoutMember, Placed, Plan, TlsPlan, bolt_order_members, check_data, find_member, lay_out_const_and_data, pad_to,
     rebase_target, target_home,
 };
 use crate::start::{main_of, start};
@@ -339,11 +339,12 @@ pub fn export_optimized<'a>(program: &ProgramIn02<'_>, platform: Platform, out: 
         Platform::LinuxArm64 => (elf::plan(), elf::TLS_ROOT_OFFSET | blaze_code::tls::ROOT_OWN),
         Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),
     };
-    let tls_plan = program.tls.map(|t| TlsPlan { descriptor: t.descriptor, mod_init_fn: start.tls_init, initial_root });
+    let tls_plan = program.tls.map(|t| TlsPlan { descriptor: t.descriptor, initial_root });
+    let init_plan = InitPlan { tls_init_fn: start.tls_init, statics: &[], native_tail_len: 0 };
     let rows = rows_of(&members, alloc);
     let unwinds = unwinds(&members, &rows, alloc)?;
     let room = eh_room_rows(&unwinds, program.personality, platform, alloc)?;
-    let laid = lay_out_records_with_tls(&members, program.data, start.entry, program.profile, plan, room, tls_plan, alloc)?;
+    let laid = lay_out_records_with_tls(&members, program.data, start.entry, program.profile, plan, room, tls_plan, init_plan, alloc)?;
     let eh = eh_sections_rows(&laid, &unwinds, program.personality, platform, alloc)?;
     let panics = match program.panic {
         Panic::Unwind => Panics::Unwind { functions: eh.functions },
@@ -459,10 +460,11 @@ pub fn lay_out_records<'a, 'r>(
     tail: u64,
     alloc: Alloc<'a>,
 ) -> Result<Laid<'a, 'r>, ExportError> {
-    lay_out_records_with_tls(members, data, entry, profile, plan, tail, None, alloc)
+    lay_out_records_with_tls(members, data, entry, profile, plan, tail, None, InitPlan::default(), alloc)
 }
 
-/// [`lay_out_records`] with an optional Rust thread-local runtime plan ([`TlsPlan`]).
+/// [`lay_out_records`] with optional Rust thread-local runtime ([`TlsPlan`]) and initializer table
+/// ([`InitPlan`]) plans.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lay_out_records_with_tls<'a, 'r>(
     members: &[Member02<'r>],
@@ -472,6 +474,7 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
     plan: Plan,
     tail: u64,
     tls_plan: Option<TlsPlan>,
+    init_plan: InitPlan<'_>,
     alloc: Alloc<'a>,
 ) -> Result<Laid<'a, 'r>, ExportError> {
     let n = members.len();
@@ -622,7 +625,7 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
     }
     let text_end = plan.text_at + text.len() as u64;
 
-    let mut regions = lay_out_const_and_data(members, &order, &rep, data, &by_target, imports.len(), tls_plan, text_end, plan, tail, alloc)?;
+    let mut regions = lay_out_const_and_data(members, &order, &rep, data, &by_target, imports.len(), tls_plan, init_plan, text_end, plan, tail, alloc)?;
     let got_at = regions.got_at;
     let word_of = |symbol: Symbol| -> u64 {
         match import_of(symbol) {

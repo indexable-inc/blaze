@@ -138,6 +138,10 @@ pub enum Expr {
     FormatArgs { args: List, uses: List },
     /// `operand.await`: `<T as IntoFuture>::Output`; only in an async body.
     Await(ExprId),
+    /// `operand.do`: `<T as Request>::Answer`; one-shot lexical algebraic effect suspension.
+    Do(ExprId),
+    /// `defer { body }`: lexical scope-exit cleanup block, type `()`.
+    Defer(ExprId),
     /// `async { body }` / `async move { body }`.
     AsyncBlock { body: ExprId, capture: Capture },
     /// `_`: only the left side of an assignment (`_ = f()`), where it discards the value.
@@ -689,6 +693,8 @@ impl<'b> BodyView<'b> {
             | Expr::OffsetOf { .. } => {}
             Expr::Paren(x)
             | Expr::Await(x)
+            | Expr::Do(x)
+            | Expr::Defer(x)
             | Expr::Loop { body: x }
             | Expr::Field { base: x, .. }
             | Expr::TupleField { base: x, .. }

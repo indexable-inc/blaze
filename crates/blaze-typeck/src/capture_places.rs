@@ -640,7 +640,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 return Err(CheckError::Limit(Limit::Steps).into());
             }
             let node = self.body.expr(e)?;
-            if !nested && matches!(node, Expr::Await(_)) {
+            if !nested && matches!(node, Expr::Await(_) | Expr::Do(_)) {
                 suspends = true;
             }
             let inner = nested || (e != owner && matches!(node, Expr::AsyncBlock { .. } | Expr::Closure { .. } | Expr::ConstBlock { .. }));
@@ -751,7 +751,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             Expr::Paren(i) => cp.tasks.push(Task::Walk(i, need)),
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => cp.tasks.push(Task::Walk(base, need)),
             Expr::Unary { op: UnOp::Deref, operand } => cp.tasks.push(Task::Walk(operand, need)),
-            Expr::Unary { operand, .. } | Expr::Cast { operand, .. } | Expr::Await(operand) | Expr::Loop { body: operand } => {
+            Expr::Unary { operand, .. } | Expr::Cast { operand, .. } | Expr::Await(operand) | Expr::Do(operand) | Expr::Defer(operand) | Expr::Loop { body: operand } => {
                 cp.tasks.push(Task::Consume(operand));
             }
             Expr::Repeat { elem, .. } => cp.tasks.push(Task::Consume(elem)),

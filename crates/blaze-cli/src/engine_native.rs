@@ -71,10 +71,10 @@ const RULE: &str = "engine_native.rs";
 /// every closure crate; 2 held the SDK version alone; 1 had no SDK identity.
 const KEY_FORM: &str = "blaze-cli engine native image key 4";
 
-/// Canonical 20-byte encoding of an empty valid state-0 link table (`native_links::write_table`
-/// with 0 decls, 0 foreign names, 0 exports). A crate with no build script and this exact table
-/// contributes nothing to the native link closure.
-const EMPTY_LINK_TABLE: [u8; 20] = [
+/// Canonical 24-byte encoding of an empty valid state-0 link table (`native_links::write_table`
+/// with 0 decls, 0 foreign names, 0 exports, 0 inits). A crate with no build script and this exact
+/// table contributes nothing to the native link closure.
+const EMPTY_LINK_TABLE: [u8; 24] = [
     native_links::TABLE_MAGIC[0],
     native_links::TABLE_MAGIC[1],
     native_links::TABLE_MAGIC[2],
@@ -85,6 +85,7 @@ const EMPTY_LINK_TABLE: [u8; 20] = [
     0, 0, 0, 0, // decls = 0
     0, 0, 0, 0, // foreign = 0
     0, 0, 0, 0, // exports = 0
+    0, 0, 0, 0, // inits = 0
 ];
 
 /// Whether `c` contributes to the native image: a build script, or a link table other than the
@@ -255,14 +256,18 @@ pub(crate) struct ProgramImage<'w> {
     pub(crate) send: Option<NativeSend<'w>>,
 }
 
-/// The program's laid-out native image and Rust C exports for `blaze export`
-/// (`engine_export.rs`, `blaze_export::ProgramIn::natives` and `exports`).
+/// The program's laid-out native image, Rust C exports, and Rust `.init_array`/`__mod_init_func`
+/// initializer statics for `blaze export` (`engine_export.rs`, `blaze_export::ProgramIn`).
 pub(crate) struct ExportNative<'a> {
-    pub(crate) image: blaze_native::image::Image<'a>,
+    /// `None` when the program links no native C objects, initializers, Rust words, or extra libs.
+    pub(crate) image: Option<blaze_native::image::Image<'a>>,
     /// Sorted by `name`, for `blaze_export::ProgramIn::exports`.
     pub(crate) exports: AVec<'a, blaze_export::CExport<'a>>,
     /// The library items of the Rust functions the native image's C words call, for `run_roots`.
     pub(crate) items: AVec<'a, blaze_id::ItemKey>,
+    /// Rust `#[link_section = ".init_array..."]` (Linux) or `"__DATA,__mod_init_func"` (macOS)
+    /// initializer statics across all crates in the program closure: `(library item key, priority)`.
+    pub(crate) inits: AVec<'a, (blaze_id::ItemKey, Option<u32>)>,
 }
 
 /// The install name every image links and the launcher has already loaded.
@@ -806,7 +811,7 @@ fn prepare_crates<'r, 'm: 's, 's>(
                 return Err(NativeError::Sdk { words: held(bstd::mem::format_in!(scratch, "{why}").as_str(), ask) });
             }
         },
-        Platform::LinuxArm64 => (None, crate::native_runner_c::TargetSdk::LinuxHost),
+        Platform::LinuxArm64 => (None, crate::native_runner_c::TargetSdk::LinuxHost(standing.linux_sysroot_resolver())),
     };
     // Disjoint fields: the ask and the readers are shared, the store is the one mutable borrow.
     let (ask, names, graph) = (&standing.native, standing.names, standing.graph);
@@ -986,9 +991,8 @@ pub(crate) fn image_for<'r>(
     Ok(ProgramImage { key: image.key, send })
 }
 
-/// The laid-out native image (`blaze_native::image::Image`) and sorted Rust C exports for
-/// `blaze export`, allocated in `out_bump`. Returns `Ok(None)` when the program links no native
-/// objects, initializers, Rust words, or libraries beyond libSystem/libc.
+/// The laid-out native image (`blaze_native::image::Image`), sorted Rust C exports, and Rust
+/// `.init_array`/`__mod_init_func` initializer statics for `blaze export`, allocated in `out_bump`.
 pub(crate) fn export_native_for<'r, 'm: 's, 's>(
     cx: &Cx,
     standing: &mut Standing<'r, 'm>,
@@ -996,7 +1000,7 @@ pub(crate) fn export_native_for<'r, 'm: 's, 's>(
     watch: &dyn blaze_screen::Watch,
     out_frame: &'s Frame,
     out_bump: blaze_own::Bump<'s>,
-) -> Result<Option<ExportNative<'s>>, NativeError<'r>> {
+) -> Result<ExportNative<'s>, NativeError<'r>> {
     let cx = cx.span("native: layout for export");
     let prepared = prepare_crates(&cx, standing, closure, watch, out_frame)?;
     let ask = &standing.native;
@@ -1023,6 +1027,34 @@ pub(crate) fn export_native_for<'r, 'm: 's, 's>(
     }
     let tables = tables.into_bump_slice();
     let outputs = outputs.into_bump_slice();
+
+    // Collect Rust initializer statics matching the target platform's section convention across
+    // EVERY crate in the closure (even when the program links no native C objects, e.g. pure-Rust
+    // `bstd` binaries on Linux that capture `(argc, argv, envp)` via `.init_array.00098`).
+    let mut inits: AVec<'s, (blaze_id::ItemKey, Option<u32>)> = Vec::new_in(alloc);
+    for table in tables.iter() {
+        for init in table.inits.iter() {
+            let matches_platform = match prepared.platform {
+                Platform::LinuxArm64 => init.section == ".init_array" || init.section.starts_with(".init_array."),
+                Platform::MacosArm64 => {
+                    init.section == "__DATA,__mod_init_func"
+                        || init.section == "__DATA_CONST,__mod_init_func"
+                        || init.section.starts_with("__DATA,__mod_init_func,")
+                        || init.section.starts_with("__DATA_CONST,__mod_init_func,")
+                }
+            };
+            if matches_platform {
+                inits.push((init.item, init.priority));
+            }
+        }
+    }
+    inits.sort_unstable_by(|a, b| {
+        a.1.unwrap_or(u32::MAX)
+            .cmp(&b.1.unwrap_or(u32::MAX))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    inits.dedup_by(|later, kept| later.0 == kept.0);
+
     let mut linked = Vec::with_capacity_in(crates.len(), out_frame);
     for (c, (table, output)) in crates.iter().zip(tables.iter().zip(outputs.iter().copied())) {
         linked.push(ProgramCrate { package: c.package, outputs: output, links: table });
@@ -1041,7 +1073,7 @@ pub(crate) fn export_native_for<'r, 'm: 's, 's>(
     let has_text = image.region(blaze_native::image::Region::Text).is_some_and(|r| r.len > 0);
     let has_extra_lib = image.libraries.iter().any(|l| l.install().as_bytes() != LIB_SYSTEM && l.install().as_bytes() != LIBC_LINUX);
     if !has_text && image.words.is_empty() && image.inits == 0 && image.tls.is_empty() && !has_extra_lib {
-        return Ok(None);
+        return Ok(ExportNative { image: None, exports: Vec::new_in(alloc), items: Vec::new_in(alloc), inits });
     }
     // Collect only the Rust C exports referenced by `image.words` (matching `send_of`), sorted by
     // name for `native_merge`. Unreferenced `#[no_mangle]` items in the closure (such as Linux
@@ -1072,7 +1104,7 @@ pub(crate) fn export_native_for<'r, 'm: 's, 's>(
         }
     }
     exports.sort_unstable_by(|a, b| a.name.cmp(b.name));
-    Ok(Some(ExportNative { image, exports, items }))
+    Ok(ExportNative { image: Some(image), exports, items, inits })
 }
 
 /// The link table of the crate whose `CrateScope` record `scope` names: that record's `links`
@@ -1184,7 +1216,7 @@ pub(crate) fn image_in<'w>(
             reads.push((script.name, script.out));
         }
     }
-    let encoded = crate::store::record_codec::encode_selective_in(image.as_slice(), scratch)
+    let encoded = crate::store::record_codec::encode_selective_in(image.as_slice(), NATIVE_IMAGE_MAX_BYTES, scratch)
         .map_err(|why| NativeError::Link { what: "compressing the program's native image", words: held(bstd::mem::format_in!(scratch, "{why}").as_str(), ask) })?;
     let stored_payload = encoded.as_slice();
     let head = blaze_drive::record::write_plain_head(record_name, key.0, out, &reads, stored_payload.len(), alloc);
@@ -1297,7 +1329,7 @@ mod tests {
         t.extend_from_slice(&native_links::TABLE_MAGIC);
         t.extend_from_slice(&native_links::TABLE_FORM.to_le_bytes());
         t.extend_from_slice(&[0, 0]);
-        for n in [decls.len(), 0, 0] {
+        for n in [decls.len(), 0, 0, 0] {
             t.extend_from_slice(&u32::try_from(n).expect("a small count").to_le_bytes());
         }
         for name in decls {
@@ -1734,7 +1766,7 @@ mod tests {
         // 2. Small (< 4 KiB) raw payload stays zero-copy (Decoded::Borrowed, not compressed).
         let mut small_raw = std::vec![0xcf, 0xfa, 0xed, 0xfe];
         small_raw.resize(1024, 0xab);
-        let enc_small = crate::store::record_codec::encode_selective_in(&small_raw, &f.scratch).expect("encode small");
+        let enc_small = crate::store::record_codec::encode_selective_in(&small_raw, NATIVE_IMAGE_MAX_BYTES, &f.scratch).expect("encode small");
         assert!(!enc_small.is_compressed(), "small payloads stay raw");
         let dec_small = decode_image_payload(made.key, enc_small.as_slice(), &f.scratch).expect("decode small");
         assert!(!dec_small.was_compressed(), "raw payloads borrow zero-copy");

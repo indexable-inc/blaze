@@ -64,8 +64,18 @@ impl<'a> Export<'a> {
     }
 }
 
+/// Trailing metadata columns assembled in [`Machine::wb_tail_metadata`].
+struct TailMetadata<'a> {
+    findings: Vec<crate::rules::args_inline::TypedFinding, Alloc<'a>>,
+    undecided: Vec<crate::rules::unsafety::Undecided, Alloc<'a>>,
+    index_mut: Vec<ExprId, Alloc<'a>>,
+    coroutine_witnesses: Vec<(ExprId, crate::columns::CoroutineWitness), Alloc<'a>>,
+    inferred_output: Option<PTy>,
+}
+
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// The children of one level of a type.
+    #[inline(never)]
     pub(super) fn ty_children(&self, v: TyView, out: &mut Vec<Ty, Alloc<'a>>) {
         let list = |l: TyList, out: &mut Vec<Ty, Alloc<'a>>| {
             for i in 0..self.ty.list_len(l) {
@@ -112,25 +122,29 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// An unmet goal of a finding, into the record's table: each argument exported, then the list.
-    fn export_goal(&mut self, ex: &mut Export<'a>, g: crate::diag::PendingGoal, at: At) -> Result<crate::diag::UnmetGoal, CheckError> { use crate::diag::{PendingGoal, UnmetGoal};
-    let (PendingGoal::Trait { args, .. } | PendingGoal::Projection { args, .. }) = g;
-    let n = self.ty.list_len(args);
-    let mut v: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
-    for i in 0..n {
-        let t = self.ty.list_get(args, i);
-        v.push(self.export(ex, t, at)?);
-    }
-    let list = ex.out.intern_list(&v)?;
-    Ok(match g {
-        PendingGoal::Trait { trait_, .. } => UnmetGoal::Trait { trait_, args: list },
-        PendingGoal::Projection { trait_, name, term, .. } => {
-            UnmetGoal::Projection { trait_, args: list, name, term: self.export(ex, term, at)? }
+    #[inline(never)]
+    fn export_goal(&mut self, ex: &mut Export<'a>, g: crate::diag::PendingGoal, at: At) -> Result<crate::diag::UnmetGoal, CheckError> {
+        use crate::diag::{PendingGoal, UnmetGoal};
+        let (PendingGoal::Trait { args, .. } | PendingGoal::Projection { args, .. }) = g;
+        let n = self.ty.list_len(args);
+        let mut v: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
+        for i in 0..n {
+            let t = self.ty.list_get(args, i);
+            v.push(self.export(ex, t, at)?);
         }
-    }) }
+        let list = ex.out.intern_list(&v)?;
+        Ok(match g {
+            PendingGoal::Trait { trait_, .. } => UnmetGoal::Trait { trait_, args: list },
+            PendingGoal::Projection { trait_, name, term, .. } => {
+                UnmetGoal::Projection { trait_, args: list, name, term: self.export(ex, term, at)? }
+            }
+        })
+    }
 
     /// An E0282's undecided variable into the record: its origin as kept, each pending goal
     /// exported as an unmet goal is (the variable itself exports as the error type: the
     /// finding is this one).
+    #[inline(never)]
     fn export_undecided(&mut self, ex: &mut Export<'a>, u: crate::diag::PendingUndecided, at: At) -> Result<crate::diag::UndecidedVar, CheckError> {
         let mut pending = [None; crate::diag::MOST_PENDING_SHOWN];
         for (slot, goal) in pending.iter_mut().zip(u.pending) {
@@ -145,6 +159,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// in order): where it was made ([`Machine::var_origins`], the first variable made in its
     /// unification set that a rule named) and the goals still pending that name it (rule 19).
     /// `None` when `t` holds no type variable. Bounded by [`MOST_UNDECIDED_STEPS`] (rule 18).
+    #[inline(never)]
     pub(crate) fn undecided_of(&mut self, t: Ty) -> Result<Option<crate::diag::PendingUndecided>, CheckError> {
         use crate::diag::{MOST_PENDING_SHOWN, PendingGoal, PendingUndecided, VarOrigin};
         let Some(root) = self.first_ty_var(t)? else { return Ok(None) };
@@ -192,6 +207,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// The first type variable `t` holds, resolved (itself when it is one), children in order.
+    #[inline(never)]
     fn first_ty_var(&mut self, t: Ty) -> Result<Option<Ty>, CheckError> {
         let mut stack: Vec<Ty, Alloc<'a>> = Vec::new_in(self.alloc);
         let mut kids: Vec<Ty, Alloc<'a>> = Vec::new_in(self.alloc);
@@ -218,6 +234,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// Whether any of `tys` holds the (resolved) variable `root`.
+    #[inline(never)]
     fn mentions_var(&mut self, tys: &[Ty], root: Ty) -> Result<bool, CheckError> {
         let mut stack: Vec<Ty, Alloc<'a>> = Vec::new_in(self.alloc);
         let mut kids: Vec<Ty, Alloc<'a>> = Vec::new_in(self.alloc);
@@ -244,6 +261,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     /// A finding's why-chain into the record: each step's goal exported as an unmet goal is,
     /// the steps appended to `out` (the record's `why` column), root first.
+    #[inline(never)]
     fn export_why(&mut self, ex: &mut Export<'a>, w: crate::diag::PendingWhy, at: At, out: &mut Vec<crate::diag::WhyStep, Alloc<'a>>) -> Result<crate::diag::Why, CheckError> {
         let start = u32::try_from(out.len()).map_err(|_| CheckError::Limit(Limit::Steps))?;
         for i in 0..w.len {
@@ -259,6 +277,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         Ok(crate::diag::Why { start, len: w.len, leaf: w.leaf })
     }
 
+    #[inline(never)]
     fn export_list(&mut self, ex: &mut Export<'a>, parent: Ty, l: TyList) -> Result<List, CheckError> {
         let n = self.ty.list_len(l);
         let mut v: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
@@ -270,7 +289,75 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         ex.out.intern_list(&v)
     }
 
+    /// Exports one resolved type node whose children are already cached in `ex`.
+    #[inline(never)]
+    fn export_node(&mut self, ex: &mut Export<'a>, x: Ty, x_res: Ty, v: TyView) -> Result<PNode, CheckError> {
+        let owner = self.body.owner;
+        let one = |ex: &Export<'a>, c: Ty, ctx: &mut C| -> Result<PTy, CheckError> {
+            let c = ctx.shallow_resolve(c);
+            Ok(ex.child(owner, x_res, c)?.0)
+        };
+        Ok(match v {
+            TyView::Bool => PNode::Bool,
+            TyView::Char => PNode::Char,
+            TyView::Int(i) => PNode::Int(i),
+            TyView::Uint(u) => PNode::Uint(u),
+            TyView::Float(f) => PNode::Float(f),
+            TyView::Str => PNode::Str,
+            TyView::Never => PNode::Never,
+            TyView::Tuple(l) => PNode::Tuple(self.export_list(ex, x_res, l)?),
+            TyView::Record(s, l) => PNode::Record(s, self.export_list(ex, x_res, l)?),
+            TyView::Union(l) => PNode::Union(self.export_list(ex, x_res, l)?),
+            TyView::Ref(m, c) => PNode::Ref(m, one(ex, c, self.ty)?),
+            TyView::Ptr(m, c) => PNode::Ptr(m, one(ex, c, self.ty)?),
+            TyView::Array(c, n) => PNode::Array(one(ex, c, self.ty)?, one(ex, n, self.ty)?),
+            TyView::Slice(c) => PNode::Slice(one(ex, c, self.ty)?),
+            TyView::Pat(c, l) => PNode::Pat(one(ex, c, self.ty)?, self.export_list(ex, x_res, l)?),
+            TyView::Adt(k, l) => PNode::Adt(k, self.export_list(ex, x_res, l)?),
+            TyView::FnDef(k, l) => PNode::FnDef(k, self.export_list(ex, x_res, l)?),
+            TyView::FnPtr(l, h) => PNode::FnPtr(self.export_list(ex, x_res, l)?, h),
+            // A closure of this body is named by its ordinal at the owner's own parameters
+            // (typeck.md, "A closure's identity"); its signature goes to `Checked::closures`.
+            TyView::Closure(e, _) => {
+                let ordinal = self.closure_ordinal(ex, e)?;
+                let mut ps: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(self.own_params as usize, self.alloc);
+                for i in 0..self.own_params {
+                    let is_const = self.own_consts.binary_search_by_key(&i, |&(index, _)| index).is_ok();
+                    ps.push(ex.out.intern(if is_const { PNode::ConstParam(i) } else { PNode::Param(i) })?);
+                }
+                PNode::Closure { owner: self.body.owner, ordinal, args: ex.out.intern_list(&ps)? }
+            }
+            TyView::ClosureOf { owner, ordinal, args, .. } => PNode::Closure { owner, ordinal, args: self.export_list(ex, x_res, args)? },
+            TyView::Future(e, o, i) => PNode::Future(e, one(ex, o, self.ty)?, one(ex, i, self.ty)?),
+            TyView::CoroutineOf { owner, ordinal, args, .. } => PNode::Coroutine { owner, ordinal, args: self.export_list(ex, x_res, args)? },
+            TyView::Param(i) => PNode::Param(i),
+            TyView::Alias { trait_, name, args } => PNode::Alias { trait_, name, args: self.export_list(ex, x_res, args)? },
+            TyView::Opaque(k, l) => PNode::Opaque(k, self.export_list(ex, x_res, l)?),
+            TyView::ConstValue { ty, bits } => PNode::ConstValue { ty: one(ex, ty, self.ty)?, bits },
+            TyView::ConstParam(i) => PNode::ConstParam(i),
+            TyView::Dynamic(l) => PNode::Dynamic(self.export_list(ex, x_res, l)?),
+            TyView::ExTrait(k, l) => PNode::ExTrait(k, self.export_list(ex, x_res, l)?),
+            TyView::ExProj { trait_, name, args_term } => {
+                let n = self.ty.list_len(args_term);
+                let mut v: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
+                for i in 0..n {
+                    let c = self.ty.list_get(args_term, i);
+                    v.push(one(ex, c, self.ty)?);
+                }
+                let Some((&term, args)) = v.split_last() else {
+                    return Err(CheckError::Malformed(crate::error::Malformed::ObjectPreds { node: x.0 }));
+                };
+                PNode::ExProj { trait_, name, args: ex.out.intern_list(args)?, term }
+            }
+            TyView::ExAuto(k) => PNode::ExAuto(k),
+            TyView::Foreign(k) => PNode::Foreign(k),
+            // A variable is `holds_var` above.
+            TyView::Infer(_) | TyView::ConstInfer(_) | TyView::Error => PNode::Error,
+        })
+    }
+
     /// Exports `t`, resolved, reporting an unresolved variable at `at`.
+    #[inline(never)]
     fn export(&mut self, ex: &mut Export<'a>, t: Ty, at: At) -> Result<PTy, CheckError> {
         let owner = self.body.owner;
         let t = self.ty.resolve(t)?;
@@ -322,10 +409,6 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 ex.insert(x_res, p, true);
                 continue;
             }
-            let one = |ex: &Export<'a>, c: Ty, ctx: &mut C| -> Result<PTy, CheckError> {
-                let c = ctx.shallow_resolve(c);
-                Ok(ex.child(owner, x_res, c)?.0)
-            };
             if let TyView::Record(s, l) = v {
                 let list = self.export_list(ex, x_res, l)?;
                 let tag = self.ty.record_defaults_tag(x_res);
@@ -334,63 +417,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 ex.insert(x_res, p, false);
                 continue;
             }
-            let node = match v {
-                TyView::Bool => PNode::Bool,
-                TyView::Char => PNode::Char,
-                TyView::Int(i) => PNode::Int(i),
-                TyView::Uint(u) => PNode::Uint(u),
-                TyView::Float(f) => PNode::Float(f),
-                TyView::Str => PNode::Str,
-                TyView::Never => PNode::Never,
-                TyView::Tuple(l) => PNode::Tuple(self.export_list(ex, x_res, l)?),
-                TyView::Record(s, l) => PNode::Record(s, self.export_list(ex, x_res, l)?),
-                TyView::Union(l) => PNode::Union(self.export_list(ex, x_res, l)?),
-                TyView::Ref(m, c) => PNode::Ref(m, one(ex, c, self.ty)?),
-                TyView::Ptr(m, c) => PNode::Ptr(m, one(ex, c, self.ty)?),
-                TyView::Array(c, n) => PNode::Array(one(ex, c, self.ty)?, one(ex, n, self.ty)?),
-                TyView::Slice(c) => PNode::Slice(one(ex, c, self.ty)?),
-                TyView::Pat(c, l) => PNode::Pat(one(ex, c, self.ty)?, self.export_list(ex, x_res, l)?),
-                TyView::Adt(k, l) => PNode::Adt(k, self.export_list(ex, x_res, l)?),
-                TyView::FnDef(k, l) => PNode::FnDef(k, self.export_list(ex, x_res, l)?),
-                TyView::FnPtr(l, h) => PNode::FnPtr(self.export_list(ex, x_res, l)?, h),
-                // A closure of this body is named by its ordinal at the owner's own parameters
-                // (typeck.md, "A closure's identity"); its signature goes to `Checked::closures`.
-                TyView::Closure(e, _) => {
-                    let ordinal = self.closure_ordinal(ex, e)?;
-                    let mut ps: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(self.own_params as usize, self.alloc);
-                    for i in 0..self.own_params {
-                        let is_const = self.own_consts.binary_search_by_key(&i, |&(index, _)| index).is_ok();
-                        ps.push(ex.out.intern(if is_const { PNode::ConstParam(i) } else { PNode::Param(i) })?);
-                    }
-                    PNode::Closure { owner: self.body.owner, ordinal, args: ex.out.intern_list(&ps)? }
-                }
-                TyView::ClosureOf { owner, ordinal, args, .. } => PNode::Closure { owner, ordinal, args: self.export_list(ex, x_res, args)? },
-                TyView::Future(e, o, i) => PNode::Future(e, one(ex, o, self.ty)?, one(ex, i, self.ty)?),
-                TyView::CoroutineOf { owner, ordinal, args, .. } => PNode::Coroutine { owner, ordinal, args: self.export_list(ex, x_res, args)? },
-                TyView::Param(i) => PNode::Param(i),
-                TyView::Alias { trait_, name, args } => PNode::Alias { trait_, name, args: self.export_list(ex, x_res, args)? },
-                TyView::Opaque(k, l) => PNode::Opaque(k, self.export_list(ex, x_res, l)?),
-                TyView::ConstValue { ty, bits } => PNode::ConstValue { ty: one(ex, ty, self.ty)?, bits },
-                TyView::ConstParam(i) => PNode::ConstParam(i),
-                TyView::Dynamic(l) => PNode::Dynamic(self.export_list(ex, x_res, l)?),
-                TyView::ExTrait(k, l) => PNode::ExTrait(k, self.export_list(ex, x_res, l)?),
-                TyView::ExProj { trait_, name, args_term } => {
-                    let n = self.ty.list_len(args_term);
-                    let mut v: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
-                    for i in 0..n {
-                        let c = self.ty.list_get(args_term, i);
-                        v.push(one(ex, c, self.ty)?);
-                    }
-                    let Some((&term, args)) = v.split_last() else {
-                        return Err(CheckError::Malformed(crate::error::Malformed::ObjectPreds { node: x.0 }));
-                    };
-                    PNode::ExProj { trait_, name, args: ex.out.intern_list(args)?, term }
-                }
-                TyView::ExAuto(k) => PNode::ExAuto(k),
-                TyView::Foreign(k) => PNode::Foreign(k),
-                // A variable is `holds_var` above.
-                TyView::Infer(_) | TyView::ConstInfer(_) | TyView::Error => PNode::Error,
-            };
+            let node = self.export_node(ex, x, x_res, v)?;
             let p = ex.out.intern(node)?;
             ex.insert(x, p, false);
             ex.insert(x_res, p, false);
@@ -400,6 +427,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     /// Closure `e`'s ordinal: the number of closure expressions before it in `ExprId` order
     /// (typeck.md, "A closure's identity": nested closures count in the item's sequence).
+    #[inline(never)]
     fn closure_ordinal(&self, ex: &mut Export<'a>, e: ExprId) -> Result<u32, CheckError> {
         if e.ix() >= self.body.exprs.len() {
             return Err(CheckError::Malformed(crate::error::Malformed::Unreached(e)));
@@ -422,11 +450,185 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         Ok(before.iter().filter(|x| matches!(x, crate::body::Expr::Closure { .. })).count() as u32)
     }
 
+    /// Marks every node in `0..=top` reachable from `top` and returns `Some(reached)` iff at
+    /// least one `PNode::Future` is reachable.
+    #[inline(never)]
+    fn mark_reachable_futures(&self, out: &PortableTys<'a>, top: usize, len: usize) -> Result<Option<Vec<bool, Alloc<'a>>>, CheckError> {
+        let to_idx = |id: u32| -> Result<usize, CheckError> {
+            usize::try_from(id).map_err(|_| CheckError::Malformed(Malformed::TypeOrder { node: id, child: id }))
+        };
+        let to_u32 = |at: usize| -> Result<u32, CheckError> {
+            u32::try_from(at).map_err(|_| CheckError::Malformed(Malformed::TypeOrder { node: u32::MAX, child: u32::MAX }))
+        };
+        let mut reached: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(len, self.alloc);
+        reached.resize(len, false);
+        if let Some(slot) = reached.get_mut(top) {
+            *slot = true;
+        }
+        let mut children: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut has_future = false;
+        let view = out.view();
+        for at in (0..=top).rev() {
+            if !reached.get(at).copied().unwrap_or(false) {
+                continue;
+            }
+            let at_u32 = to_u32(at)?;
+            let node = view.node(PTy(at_u32))?;
+            if matches!(node, PNode::Future(..)) {
+                has_future = true;
+                continue;
+            }
+            children.clear();
+            view.children_of(node, &mut children)?;
+            for &child in children.iter() {
+                let child_idx = to_idx(child.0)?;
+                let Some(slot) = reached.get_mut(child_idx) else {
+                    return Err(CheckError::Malformed(Malformed::TypeOrder { node: at_u32, child: child.0 }));
+                };
+                *slot = true;
+            }
+        }
+        Ok(if has_future { Some(reached) } else { None })
+    }
+
+    /// Rewrites one node of `canonicalize_futures` after all its children have been mapped.
+    #[inline(never)]
+    fn rewrite_future_node(
+        &self,
+        out: &mut PortableTys<'a>,
+        at_u32: u32,
+        cur: PTy,
+        owner_args: List,
+        mapped: &[PTy],
+        kids: &mut Vec<PTy, Alloc<'a>>,
+    ) -> Result<PTy, CheckError> {
+        let lookup = |c: PTy| -> Result<PTy, CheckError> {
+            let idx = usize::try_from(c.0).map_err(|_| CheckError::Malformed(Malformed::TypeOrder { node: c.0, child: c.0 }))?;
+            mapped.get(idx).copied().ok_or(CheckError::Malformed(Malformed::TypeOrder { node: at_u32, child: c.0 }))
+        };
+        let map_list = |out: &mut PortableTys<'a>, l: List, kids: &mut Vec<PTy, Alloc<'a>>| -> Result<(List, bool), CheckError> {
+            kids.clear();
+            let mut changed = false;
+            for &c in out.view().list(l)? {
+                let m = lookup(c)?;
+                changed |= m != c;
+                kids.push(m);
+            }
+            if changed { Ok((out.intern_list(kids)?, true)) } else { Ok((l, false)) }
+        };
+        let raw = out.view().node(cur)?;
+        Ok(match raw {
+            PNode::Future(e, ..) => {
+                let Some(ordinal) = crate::coroutine_id::coroutine_ordinal(&self.body, e) else {
+                    return Err(CheckError::Malformed(crate::error::Malformed::Unreached(e)));
+                };
+                out.intern(PNode::Coroutine { owner: self.body.owner, ordinal, args: owner_args })?
+            }
+            PNode::Bool
+            | PNode::Char
+            | PNode::Int(_)
+            | PNode::Uint(_)
+            | PNode::Float(_)
+            | PNode::Str
+            | PNode::Never
+            | PNode::Param(_)
+            | PNode::ConstParam(_)
+            | PNode::Infer
+            | PNode::Error
+            | PNode::ExAuto(_)
+            | PNode::Foreign(_) => cur,
+            PNode::Ref(m, c) => {
+                let mc = lookup(c)?;
+                if mc == c { cur } else { out.intern(PNode::Ref(m, mc))? }
+            }
+            PNode::Ptr(m, c) => {
+                let mc = lookup(c)?;
+                if mc == c { cur } else { out.intern(PNode::Ptr(m, mc))? }
+            }
+            PNode::Slice(c) => {
+                let mc = lookup(c)?;
+                if mc == c { cur } else { out.intern(PNode::Slice(mc))? }
+            }
+            PNode::ConstValue { ty: c, bits } => {
+                let mc = lookup(c)?;
+                if mc == c { cur } else { out.intern(PNode::ConstValue { ty: mc, bits })? }
+            }
+            PNode::Array(a, b) => {
+                let (ma, mb) = (lookup(a)?, lookup(b)?);
+                if ma == a && mb == b { cur } else { out.intern(PNode::Array(ma, mb))? }
+            }
+            PNode::Pat(c, l) => {
+                let mc = lookup(c)?;
+                let (ml, ch) = map_list(out, l, kids)?;
+                if mc == c && !ch { cur } else { out.intern(PNode::Pat(mc, ml))? }
+            }
+            PNode::ExProj { trait_, name, args, term } => {
+                let mt = lookup(term)?;
+                let (ml, ch) = map_list(out, args, kids)?;
+                if mt == term && !ch { cur } else { out.intern(PNode::ExProj { trait_, name, args: ml, term: mt })? }
+            }
+            PNode::Tuple(l) => {
+                let (ml, ch) = map_list(out, l, kids)?;
+                if !ch { cur } else { out.intern(PNode::Tuple(ml))? }
+            }
+            PNode::Record(s, l) => {
+                let (ml, ch) = map_list(out, l, kids)?;
+                if !ch {
+                    cur
+                } else {
+                    let tag = out.view().record_defaults_tag(cur);
+                    out.intern_record_with_defaults(s, ml, tag)?
+                }
+            }
+            PNode::Union(l) => {
+                let (ml, ch) = map_list(out, l, kids)?;
+                if !ch { cur } else { out.intern(PNode::Union(ml))? }
+            }
+            PNode::Adt(k, l) => {
+                let (ml, ch) = map_list(out, l, kids)?;
+                if !ch { cur } else { out.intern(PNode::Adt(k, ml))? }
+            }
+            PNode::FnDef(k, l) => {
+                let (ml, ch) = map_list(out, l, kids)?;
+                if !ch { cur } else { out.intern(PNode::FnDef(k, ml))? }
+            }
+            PNode::FnPtr(l, h) => {
+                let (ml, ch) = map_list(out, l, kids)?;
+                if !ch { cur } else { out.intern(PNode::FnPtr(ml, h))? }
+            }
+            PNode::Closure { owner, ordinal, args } => {
+                let (ml, ch) = map_list(out, args, kids)?;
+                if !ch { cur } else { out.intern(PNode::Closure { owner, ordinal, args: ml })? }
+            }
+            PNode::Coroutine { owner, ordinal, args } => {
+                let (ml, ch) = map_list(out, args, kids)?;
+                if !ch { cur } else { out.intern(PNode::Coroutine { owner, ordinal, args: ml })? }
+            }
+            PNode::Alias { trait_, name, args } => {
+                let (ml, ch) = map_list(out, args, kids)?;
+                if !ch { cur } else { out.intern(PNode::Alias { trait_, name, args: ml })? }
+            }
+            PNode::Opaque(k, l) => {
+                let (ml, ch) = map_list(out, l, kids)?;
+                if !ch { cur } else { out.intern(PNode::Opaque(k, ml))? }
+            }
+            PNode::Dynamic(l) => {
+                let (ml, ch) = map_list(out, l, kids)?;
+                if !ch { cur } else { out.intern(PNode::Dynamic(ml))? }
+            }
+            PNode::ExTrait(k, l) => {
+                let (ml, ch) = map_list(out, l, kids)?;
+                if !ch { cur } else { out.intern(PNode::ExTrait(k, ml))? }
+            }
+        })
+    }
+
     /// Rewrites every `PNode::Future` reachable from `root` (at top level or nested inside an
     /// ADT, tuple, reference, combinator, etc.) to its cross-body identity `PNode::Coroutine`
     /// (`coroutine_id::coroutine_ordinal` at the owner's generic parameters). Types that cross a
     /// body boundary (`Checked::hidden`, `Checked::inferred_output`) must never carry a
     /// body-local expression id.
+    #[inline(never)]
     fn canonicalize_futures(&self, out: &mut PortableTys<'a>, root: PTy) -> Result<PTy, CheckError> {
         let to_idx = |id: u32| -> Result<usize, CheckError> {
             usize::try_from(id).map_err(|_| CheckError::Malformed(Malformed::TypeOrder { node: id, child: id }))
@@ -436,39 +638,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         };
         let top = to_idx(root.0)?;
         let len = top.checked_add(1).ok_or(CheckError::Malformed(Malformed::TypeOrder { node: root.0, child: root.0 }))?;
-        let mut reached: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(len, self.alloc);
-        reached.resize(len, false);
-        if let Some(slot) = reached.get_mut(top) {
-            *slot = true;
-        }
-        let mut children: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
-        let mut has_future = false;
-        {
-            let view = out.view();
-            for at in (0..=top).rev() {
-                if !reached.get(at).copied().unwrap_or(false) {
-                    continue;
-                }
-                let at_u32 = to_u32(at)?;
-                let node = view.node(PTy(at_u32))?;
-                if matches!(node, PNode::Future(..)) {
-                    has_future = true;
-                    continue;
-                }
-                children.clear();
-                view.children_of(node, &mut children)?;
-                for &child in children.iter() {
-                    let child_idx = to_idx(child.0)?;
-                    let Some(slot) = reached.get_mut(child_idx) else {
-                        return Err(CheckError::Malformed(Malformed::TypeOrder { node: at_u32, child: child.0 }));
-                    };
-                    *slot = true;
-                }
-            }
-        }
-        if !has_future {
+        let Some(reached) = self.mark_reachable_futures(out, top, len)? else {
             return Ok(root);
-        }
+        };
         let mut ps: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(to_idx(self.own_params)?, self.alloc);
         for i in 0..self.own_params {
             let is_const = self.own_consts.binary_search_by_key(&i, |&(index, _)| index).is_ok();
@@ -478,131 +650,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let mut mapped: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(len, self.alloc);
         mapped.resize(len, PTy(u32::MAX));
         let mut kids: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
-        let lookup = |mapped: &[PTy], at_u32: u32, c: PTy| -> Result<PTy, CheckError> {
-            let idx = to_idx(c.0)?;
-            mapped.get(idx).copied().ok_or(CheckError::Malformed(Malformed::TypeOrder { node: at_u32, child: c.0 }))
-        };
         for at in 0..=top {
             if !reached.get(at).copied().unwrap_or(false) {
                 continue;
             }
             let at_u32 = to_u32(at)?;
-            let cur = PTy(at_u32);
-            let raw = out.view().node(cur)?;
-            let map_list = |out: &mut PortableTys<'a>, l: List, mapped: &[PTy], kids: &mut Vec<PTy, Alloc<'a>>| -> Result<(List, bool), CheckError> {
-                kids.clear();
-                let mut changed = false;
-                for &c in out.view().list(l)? {
-                    let m = lookup(mapped, at_u32, c)?;
-                    changed |= m != c;
-                    kids.push(m);
-                }
-                if changed { Ok((out.intern_list(kids)?, true)) } else { Ok((l, false)) }
-            };
-            let next = match raw {
-                PNode::Future(e, ..) => {
-                    let Some(ordinal) = crate::coroutine_id::coroutine_ordinal(&self.body, e) else {
-                        return Err(CheckError::Malformed(crate::error::Malformed::Unreached(e)));
-                    };
-                    out.intern(PNode::Coroutine { owner: self.body.owner, ordinal, args: owner_args })?
-                }
-                PNode::Bool
-                | PNode::Char
-                | PNode::Int(_)
-                | PNode::Uint(_)
-                | PNode::Float(_)
-                | PNode::Str
-                | PNode::Never
-                | PNode::Param(_)
-                | PNode::ConstParam(_)
-                | PNode::Infer
-                | PNode::Error
-                | PNode::ExAuto(_)
-                | PNode::Foreign(_) => cur,
-                PNode::Ref(m, c) => {
-                    let mc = lookup(&mapped, at_u32, c)?;
-                    if mc == c { cur } else { out.intern(PNode::Ref(m, mc))? }
-                }
-                PNode::Ptr(m, c) => {
-                    let mc = lookup(&mapped, at_u32, c)?;
-                    if mc == c { cur } else { out.intern(PNode::Ptr(m, mc))? }
-                }
-                PNode::Slice(c) => {
-                    let mc = lookup(&mapped, at_u32, c)?;
-                    if mc == c { cur } else { out.intern(PNode::Slice(mc))? }
-                }
-                PNode::ConstValue { ty: c, bits } => {
-                    let mc = lookup(&mapped, at_u32, c)?;
-                    if mc == c { cur } else { out.intern(PNode::ConstValue { ty: mc, bits })? }
-                }
-                PNode::Array(a, b) => {
-                    let (ma, mb) = (lookup(&mapped, at_u32, a)?, lookup(&mapped, at_u32, b)?);
-                    if ma == a && mb == b { cur } else { out.intern(PNode::Array(ma, mb))? }
-                }
-                PNode::Pat(c, l) => {
-                    let mc = lookup(&mapped, at_u32, c)?;
-                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
-                    if mc == c && !ch { cur } else { out.intern(PNode::Pat(mc, ml))? }
-                }
-                PNode::ExProj { trait_, name, args, term } => {
-                    let mt = lookup(&mapped, at_u32, term)?;
-                    let (ml, ch) = map_list(out, args, &mapped, &mut kids)?;
-                    if mt == term && !ch { cur } else { out.intern(PNode::ExProj { trait_, name, args: ml, term: mt })? }
-                }
-                PNode::Tuple(l) => {
-                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
-                    if !ch { cur } else { out.intern(PNode::Tuple(ml))? }
-                }
-                PNode::Record(s, l) => {
-                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
-                    if !ch {
-                        cur
-                    } else {
-                        let tag = out.view().record_defaults_tag(cur);
-                        out.intern_record_with_defaults(s, ml, tag)?
-                    }
-                }
-                PNode::Union(l) => {
-                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
-                    if !ch { cur } else { out.intern(PNode::Union(ml))? }
-                }
-                PNode::Adt(k, l) => {
-                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
-                    if !ch { cur } else { out.intern(PNode::Adt(k, ml))? }
-                }
-                PNode::FnDef(k, l) => {
-                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
-                    if !ch { cur } else { out.intern(PNode::FnDef(k, ml))? }
-                }
-                PNode::FnPtr(l, h) => {
-                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
-                    if !ch { cur } else { out.intern(PNode::FnPtr(ml, h))? }
-                }
-                PNode::Closure { owner, ordinal, args } => {
-                    let (ml, ch) = map_list(out, args, &mapped, &mut kids)?;
-                    if !ch { cur } else { out.intern(PNode::Closure { owner, ordinal, args: ml })? }
-                }
-                PNode::Coroutine { owner, ordinal, args } => {
-                    let (ml, ch) = map_list(out, args, &mapped, &mut kids)?;
-                    if !ch { cur } else { out.intern(PNode::Coroutine { owner, ordinal, args: ml })? }
-                }
-                PNode::Alias { trait_, name, args } => {
-                    let (ml, ch) = map_list(out, args, &mapped, &mut kids)?;
-                    if !ch { cur } else { out.intern(PNode::Alias { trait_, name, args: ml })? }
-                }
-                PNode::Opaque(k, l) => {
-                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
-                    if !ch { cur } else { out.intern(PNode::Opaque(k, ml))? }
-                }
-                PNode::Dynamic(l) => {
-                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
-                    if !ch { cur } else { out.intern(PNode::Dynamic(ml))? }
-                }
-                PNode::ExTrait(k, l) => {
-                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
-                    if !ch { cur } else { out.intern(PNode::ExTrait(k, ml))? }
-                }
-            };
+            let next = self.rewrite_future_node(out, at_u32, PTy(at_u32), owner_args, &mapped, &mut kids)?;
             if let Some(slot) = mapped.get_mut(at) {
                 *slot = next;
             }
@@ -610,17 +663,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         mapped.get(top).copied().ok_or(CheckError::Malformed(Malformed::TypeOrder { node: root.0, child: root.0 }))
     }
 
-    /// `resolve_type_vars_in_body`: the record, or the needs when writeback's own reads met a
-    /// hole (a run past a hole makes no record: world.rs `Hole`).
-    pub(crate) fn writeback(mut self) -> Result<crate::Outcome<'a>, CheckError> {
-        let alloc = self.alloc;
-        let mut ex = Export {
-            out: PortableTys::new_in(alloc),
-            cache: HashMap::new_in(alloc),
-            closure_ordinals: None,
-            steps: 0,
-            reported: false,
-        };
+    /// Stage 1: registers structural record schemas in `ex.out`.
+    #[inline(never)]
+    fn wb_register_record_schemas(&self, ex: &mut Export<'a>) -> Result<(), CheckError> {
         for &(schema, list) in self.record_schemas.iter() {
             let names = if list.len == 0 {
                 &[][..]
@@ -631,29 +676,51 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 .register_record_schema(schema, names)
                 .map_err(|_| CheckError::Limit(Limit::Table))?;
         }
+        Ok(())
+    }
+
+    /// Stage 2: exports dense per-node type tables (`expr_ty`, `pat_ty`, `local_ty`).
+    #[inline(never)]
+    fn wb_node_tys(
+        &mut self,
+        ex: &mut Export<'a>,
+    ) -> Result<(Vec<PTy, Alloc<'a>>, Vec<PTy, Alloc<'a>>, Vec<PTy, Alloc<'a>>), CheckError> {
+        let alloc = self.alloc;
         let mut expr_ty: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(self.expr_ty.len(), alloc);
         for i in 0..self.expr_ty.len() {
             let t = self.expr_ty[i];
-            expr_ty.push(self.export(&mut ex, t, At::Expr(ExprId(i as u32)))?);
+            expr_ty.push(self.export(ex, t, At::Expr(ExprId(i as u32)))?);
         }
         let mut pat_ty: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(self.pat_ty.len(), alloc);
         for i in 0..self.pat_ty.len() {
             let t = self.pat_ty[i];
-            pat_ty.push(self.export(&mut ex, t, At::Pat(PatId(i as u32)))?);
+            pat_ty.push(self.export(ex, t, At::Pat(PatId(i as u32)))?);
         }
         let mut local_ty: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(self.local_ty.len(), alloc);
         for i in 0..self.local_ty.len() {
             let t = self.local_ty[i];
-            local_ty.push(self.export(&mut ex, t, At::Pat(PatId(i as u32)))?);
+            local_ty.push(self.export(ex, t, At::Pat(PatId(i as u32)))?);
         }
-        let mut adjusts: Adjusts<'a> = Soa::with_capacity_in(self.adjust.len(), alloc);
+        Ok((expr_ty, pat_ty, local_ty))
+    }
+
+    /// Stage 3: exports adjustments, stably sorted by expression.
+    #[inline(never)]
+    fn wb_adjusts(&mut self, ex: &mut Export<'a>) -> Result<Adjusts<'a>, CheckError> {
+        let mut adjusts: Adjusts<'a> = Soa::with_capacity_in(self.adjust.len(), self.alloc);
         for i in 0..self.adjust.len() {
             let Some((&e, &kind, &t)) = self.adjust.get(i) else { break };
-            let p = self.export(&mut ex, t, At::Expr(e))?;
+            let p = self.export(ex, t, At::Expr(e))?;
             adjusts.push((e, kind, p));
         }
         adjusts.sort_by_key(|rows, i| rows.column::<0>()[i]);
-        let mut callees: Callees<'a> = Soa::with_capacity_in(self.callees.len(), alloc);
+        Ok(adjusts)
+    }
+
+    /// Stage 4: exports resolved callees and their generic arguments, stably sorted by expression.
+    #[inline(never)]
+    fn wb_callees(&mut self, ex: &mut Export<'a>) -> Result<Callees<'a>, CheckError> {
+        let mut callees: Callees<'a> = Soa::with_capacity_in(self.callees.len(), self.alloc);
         for i in 0..self.callees.len() {
             let (e, item, args) = self.callees[i];
             // An operator whose final operand types are builtin scalars is the builtin
@@ -669,24 +736,31 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             for j in 0..n {
                 let t = self.ty.list_get(args, j);
                 let t = self.ty.resolve(t)?;
-                exported.push(self.export(&mut ex, t, At::Expr(e))?);
+                exported.push(self.export(ex, t, At::Expr(e))?);
             }
             let l = ex.out.intern_list(&exported)?;
             callees.push((e, item, l));
         }
         callees.sort_by_key(|rows, i| rows.column::<0>()[i]);
+        Ok(callees)
+    }
+
+    /// Stage 5: exports constant-path generic arguments for expressions and patterns.
+    #[inline(never)]
+    fn wb_const_args(&mut self, ex: &mut Export<'a>) -> Result<(ConstArgs<'a>, PatConstArgs<'a>), CheckError> {
         // A constant path's arguments, resolved like a callee's: an argument still unknown here
         // is the export's ordinary "type annotations needed" at the path, never an empty list.
+        let alloc = self.alloc;
         let mut const_args: ConstArgs<'a> = Soa::with_capacity_in(self.const_args.len(), alloc);
         let mut pat_const_args: PatConstArgs<'a> = Soa::new_in(alloc);
         for i in 0..self.const_args.len() {
             let (at, args) = self.const_args[i];
             let n = self.ty.list_len(args);
-            let mut exported: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
+            let mut exported: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(n as usize, alloc);
             for j in 0..n {
                 let t = self.ty.list_get(args, j);
                 let t = self.ty.resolve(t)?;
-                exported.push(self.export(&mut ex, t, at)?);
+                exported.push(self.export(ex, t, at)?);
             }
             let l = ex.out.intern_list(&exported)?;
             match at {
@@ -697,6 +771,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         const_args.sort_by_key(|rows, i| rows.column::<0>()[i]);
         pat_const_args.sort_by_key(|rows, i| rows.column::<0>()[i]);
+        Ok((const_args, pat_const_args))
+    }
+
+    /// Stage 6: partitions and sorts resolved path definitions (`expr_defs`, `pat_defs`).
+    #[inline(never)]
+    fn wb_defs(&self) -> (ExprDefs<'a>, PatDefs<'a>) {
+        let alloc = self.alloc;
         let mut expr_defs: ExprDefs<'a> = Soa::new_in(alloc);
         let mut pat_defs: PatDefs<'a> = Soa::new_in(alloc);
         for &(at, d) in self.defs.iter() {
@@ -708,6 +789,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         expr_defs.sort_by_key(|rows, i| rows.column::<0>()[i]);
         pat_defs.sort_by_key(|rows, i| rows.column::<0>()[i]);
+        (expr_defs, pat_defs)
+    }
+
+    /// Stage 7: copies and sorts union patterns, field accesses, and whole-binding captures.
+    #[inline(never)]
+    fn wb_fields_and_captures(&self) -> (UnionPats<'a>, Fields<'a>, Captures<'a>) {
+        let alloc = self.alloc;
         let mut union_pats: UnionPats<'a> = Soa::with_capacity_in(self.union_pats.len(), alloc);
         for &(p, kind) in self.union_pats.iter() {
             union_pats.push((p, kind));
@@ -722,10 +810,20 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         for &(c, p, k) in self.captures.iter() {
             captures.push((c, p, k));
         }
+        (union_pats, fields, captures)
+    }
+
+    /// Stage 8: exports captured places and their projection runs.
+    #[inline(never)]
+    fn wb_capture_places(
+        &mut self,
+        ex: &mut Export<'a>,
+    ) -> Result<(CapturePlaceRows<'a>, CaptureProjs<'a>), CheckError> {
         // The captured places, one row per environment field: sorted by closure, stable, so a
         // closure's rows stay in field order; the projection runs stay where they were filed.
         // Each place's run was filed just before its row (capture_places.rs `file_places`), so
         // the runs, taken in row order, are the projection rows in order.
+        let alloc = self.alloc;
         let mut capture_places: CapturePlaceRows<'a> = Soa::with_capacity_in(self.capture_place_rows.len(), alloc);
         let mut capture_projs: CaptureProjs<'a> = Soa::with_capacity_in(self.capture_proj_rows.len(), alloc);
         for i in 0..self.capture_place_rows.len() {
@@ -735,15 +833,22 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             for j in start..start + len {
                 let (pk, v, f, pt) = self.capture_proj_rows[j as usize];
-                let pt = self.export(&mut ex, pt, At::Expr(c))?;
+                let pt = self.export(ex, pt, At::Expr(c))?;
                 capture_projs.push((pk, v, f, pt));
             }
-            let t = self.export(&mut ex, t, At::Expr(c))?;
+            let t = self.export(ex, t, At::Expr(c))?;
             capture_places.push((c, p, start, len, k, t));
         }
         capture_places.sort_by_key(|rows, i| rows.column::<0>()[i]);
+        Ok((capture_places, capture_projs))
+    }
+
+    /// Stage 9: exports one row per closure expression in `ExprId` order.
+    #[inline(never)]
+    fn wb_closures(&mut self, ex: &mut Export<'a>) -> Result<Closures<'a>, CheckError> {
         // One row per closure expression, in `ExprId` order: row `i` is ordinal `i`. The kind
         // is the strongest of its captures' (`analyze_closures`'s rule, which settled it).
+        let alloc = self.alloc;
         let closure_kinds_map = if self.closure_kinds.len() > NAME_HASH_THRESHOLD {
             let mut m = Map::new(MapOpts { hasher: FixedState, alloc, capacity: Some(self.closure_kinds.len()) });
             for &(c, k, env) in self.closure_kinds.iter() {
@@ -778,10 +883,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             };
             let t = self.ty.resolve(self.expr_ty[i])?;
             let sig = match self.ty.view(t) {
-                TyView::Closure(_, sig) => self.export(&mut ex, sig, At::Expr(e))?,
+                TyView::Closure(_, sig) => self.export(ex, sig, At::Expr(e))?,
                 _ => ex.out.intern(PNode::Error)?,
             };
-            let upvars = upvars.map(|t| self.export(&mut ex, t, At::Expr(e))).transpose()?;
+            let upvars = upvars.map(|t| self.export(ex, t, At::Expr(e))).transpose()?;
             // Where its signature came from (D148): a closure the walk never reached took no
             // expectation, so every region of it is its maker's (`Inferred`).
             let sig_from = match &closure_sig_from_map {
@@ -790,14 +895,24 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             };
             closures.push((e, kind, sig, upvars, sig_from));
         }
+        Ok(closures)
+    }
+
+    /// Stage 10: exports struct-update (`fru_fields`) and RFC 3681 (`default_fields`) rows.
+    #[inline(never)]
+    fn wb_struct_fields(
+        &mut self,
+        ex: &mut Export<'a>,
+    ) -> Result<(FruFields<'a>, crate::columns::DefaultFields<'a>), CheckError> {
         // The fields each struct update takes from its base, exported before the diagnostics
         // are made so a field type still unknown is the export's E0282 at the struct
         // expression, never a missing row the flow lowering would read as "not taken".
+        let alloc = self.alloc;
         let mut fru_fields: FruFields<'a> = Soa::with_capacity_in(self.fru_fields.len(), alloc);
         for i in 0..self.fru_fields.len() {
             let (e, at, t) = self.fru_fields[i];
             let t = self.ty.resolve(t)?;
-            let p = self.export(&mut ex, t, At::Expr(e))?;
+            let p = self.export(ex, t, At::Expr(e))?;
             fru_fields.push((e, at, p));
         }
         fru_fields.sort_by_key(|rows, i| (rows.column::<0>()[i], rows.column::<1>()[i]));
@@ -806,15 +921,21 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             default_fields.push(row);
         }
         default_fields.sort_by_key(|rows, i| (rows.column::<0>()[i], rows.column::<1>()[i]));
+        Ok((fru_fields, default_fields))
+    }
+
+    /// Stage 11: exports stalled auto-trait goals for deferred exact-interior checks.
+    #[inline(never)]
+    fn wb_stalled(&mut self, ex: &mut Export<'a>) -> Result<Vec<crate::stalled::Stalled, Alloc<'a>>, CheckError> {
         // The stalled auto-trait goals (src/stalled.rs), each with the finding it becomes when it
         // fails on the exact interior, made as a finding of `diags` is made below.
-        let mut stalled: Vec<crate::stalled::Stalled, Alloc<'a>> = Vec::with_capacity_in(self.stalled.len(), alloc);
+        let mut stalled: Vec<crate::stalled::Stalled, Alloc<'a>> = Vec::with_capacity_in(self.stalled.len(), self.alloc);
         for si in 0..self.stalled.len() {
             let s = self.stalled[si];
             let d = s.diag;
-            let ty = self.export(&mut ex, s.ty, d.at)?;
+            let ty = self.export(ex, s.ty, d.at)?;
             let found = match d.found {
-                Some(t) => Some(self.export(&mut ex, t, d.at)?),
+                Some(t) => Some(self.export(ex, t, d.at)?),
                 None => None,
             };
             let at = self.range_of(d.at);
@@ -823,9 +944,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             let because = match d.unmet {
                 Some((goal, leaf)) => {
-                    let goal = self.export_goal(&mut ex, goal, d.at)?;
+                    let goal = self.export_goal(ex, goal, d.at)?;
                     let leaf = match leaf {
-                        Some(l) => Some(self.export_goal(&mut ex, l, d.at)?),
+                        Some(l) => Some(self.export_goal(ex, l, d.at)?),
                         None => None,
                     };
                     Some(crate::diag::Because::Unmet { goal, leaf })
@@ -836,6 +957,16 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             let diag = d.export(at, None, found, because, None, None);
             stalled.push(crate::stalled::Stalled { trait_: s.trait_, ty, diag });
         }
+        Ok(stalled)
+    }
+
+    /// Stage 12: exports body diagnostics and their why-chains.
+    #[inline(never)]
+    fn wb_diags(
+        &mut self,
+        ex: &mut Export<'a>,
+    ) -> Result<(Vec<Diag, Alloc<'a>>, Vec<crate::diag::WhyStep, Alloc<'a>>), CheckError> {
+        let alloc = self.alloc;
         let mut diags: Vec<Diag, Alloc<'a>> = Vec::with_capacity_in(self.diags.len(), alloc);
         // The findings' why-chains, each finding's `Why` a range of it.
         let mut why_rows: Vec<crate::diag::WhyStep, Alloc<'a>> = Vec::with_capacity_in(self.why_steps.len(), alloc);
@@ -845,22 +976,22 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             let d = self.diags[i];
             i += 1;
             let expected = match d.expected {
-                Some(t) => Some(self.export(&mut ex, t, d.at)?),
+                Some(t) => Some(self.export(ex, t, d.at)?),
                 None => None,
             };
             let found = match d.found {
-                Some(t) => Some(self.export(&mut ex, t, d.at)?),
+                Some(t) => Some(self.export(ex, t, d.at)?),
                 None => None,
             };
             let at = self.range_of(d.at);
             if at.end <= at.start && !d.code.covers_the_item() {
-                return Err(CheckError::DiagWithoutPlace { code: d.code, name: d.name }.into());
+                return Err(CheckError::DiagWithoutPlace { code: d.code, name: d.name });
             }
             let because = match d.unmet {
                 Some((goal, leaf)) => {
-                    let goal = self.export_goal(&mut ex, goal, d.at)?;
+                    let goal = self.export_goal(ex, goal, d.at)?;
                     let leaf = match leaf {
-                        Some(l) => Some(self.export_goal(&mut ex, l, d.at)?),
+                        Some(l) => Some(self.export_goal(ex, l, d.at)?),
                         None => None,
                     };
                     Some(crate::diag::Because::Unmet { goal, leaf })
@@ -868,45 +999,69 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 None => d.because,
             };
             let why = match d.why {
-                Some(w) => Some(self.export_why(&mut ex, w, d.at, &mut why_rows)?),
+                Some(w) => Some(self.export_why(ex, w, d.at, &mut why_rows)?),
                 None => None,
             };
             let undecided = match d.undecided {
-                Some(u) => Some(self.export_undecided(&mut ex, u, d.at)?),
+                Some(u) => Some(self.export_undecided(ex, u, d.at)?),
                 None => None,
             };
             diags.push(d.export(at, expected, found, because, why, undecided));
         }
-        // Writeback runs only when the walk finished (`needs` here are prefetch hints for next
-        // time, not open questions): with no diagnostic, every recorded type must be named.
-        if diags.is_empty() {
-            // `local_ty` has a row per pattern; only a binding's row is a recorded type.
-            let mut binds: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(self.body.pats.len(), alloc);
-            for p in self.body.pats {
-                binds.push(matches!(p, crate::body::Pat::Bind { .. }));
-            }
-            let mut holes: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(self.body.exprs.len(), alloc);
-            for e in self.body.exprs {
-                holes.push(matches!(e, crate::body::Expr::Missing));
-            }
-            // A pattern hole (`Pat::Missing`: a tuple's or struct's `..`, in no list) has no
-            // value, as an expression hole has none.
-            let mut pat_holes: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(self.body.pats.len(), alloc);
-            for p in self.body.pats {
-                pat_holes.push(matches!(p, crate::body::Pat::Missing));
-            }
-            let r = Recs { types: &ex.out, expr_ty: &expr_ty, pat_ty: &pat_ty, local_ty: &local_ty, binds: &binds, holes: &holes, pat_holes: &pat_holes, adjusts: &adjusts, callees: &callees };
-            if let Some(at) = first_unknown(r, alloc)? {
-                // A node the walk never reached is the lowering's, not an unknown type.
-                if let crate::error::Recorded::ExprTy(x) = at
-                    && !self.reached.get(x.ix()).copied().unwrap_or(true)
-                {
-                    return Err(CheckError::Malformed(crate::error::Malformed::Unreached(x)));
-                }
-                return Err(CheckError::UnknownInCleanBody { at });
-            }
+        Ok((diags, why_rows))
+    }
+
+    /// Stage 13: verifies a diagnostic-free body has no unknown/error types recorded.
+    #[inline(never)]
+    fn wb_verify_clean_body(
+        &self,
+        ex: &Export<'a>,
+        expr_ty: &[PTy],
+        pat_ty: &[PTy],
+        local_ty: &[PTy],
+        adjusts: &Adjusts<'a>,
+        callees: &Callees<'a>,
+    ) -> Result<(), CheckError> {
+        let alloc = self.alloc;
+        // `local_ty` has a row per pattern; only a binding's row is a recorded type.
+        let mut binds: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(self.body.pats.len(), alloc);
+        for p in self.body.pats {
+            binds.push(matches!(p, crate::body::Pat::Bind { .. }));
         }
+        let mut holes: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(self.body.exprs.len(), alloc);
+        for e in self.body.exprs {
+            holes.push(matches!(e, crate::body::Expr::Missing));
+        }
+        // A pattern hole (`Pat::Missing`: a tuple's or struct's `..`, in no list) has no
+        // value, as an expression hole has none.
+        let mut pat_holes: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(self.body.pats.len(), alloc);
+        for p in self.body.pats {
+            pat_holes.push(matches!(p, crate::body::Pat::Missing));
+        }
+        let r = Recs { types: &ex.out, expr_ty, pat_ty, local_ty, binds: &binds, holes: &holes, pat_holes: &pat_holes, adjusts, callees };
+        if let Some(at) = first_unknown(r, alloc)? {
+            // A node the walk never reached is the lowering's, not an unknown type.
+            if let crate::error::Recorded::ExprTy(x) = at
+                && !self.reached.get(x.ix()).copied().unwrap_or(true)
+            {
+                return Err(CheckError::Malformed(crate::error::Malformed::Unreached(x)));
+            }
+            return Err(CheckError::UnknownInCleanBody { at });
+        }
+        Ok(())
+    }
+
+    /// Stage 14: exports unresolved one-segment name expectations and collects fix candidates.
+    #[inline(never)]
+    fn wb_suggests(
+        &mut self,
+        ex: &mut Export<'a>,
+        expr_ty: &[PTy],
+        local_ty: &[PTy],
+        diags: &[Diag],
+    ) -> Result<crate::rules::suggest::Suggests<'a>, CheckError> {
         // The fixes' facts (rules/suggest.rs): only where a one-segment name did not resolve.
+        let alloc = self.alloc;
         let mut expects: Vec<(ExprId, Option<PTy>), Alloc<'a>> = Vec::with_capacity_in(self.named_holes.len(), alloc);
         for i in 0..self.named_holes.len() {
             let (e, expect) = self.named_holes[i];
@@ -919,8 +1074,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         // Exporting may report an unknown type once (E0282): a fix's facts add
                         // no finding, so that one is taken back and the hole has no expectation.
                         let n = self.diags.len();
-                        let p = self.export(&mut ex, t, At::Expr(e))?;
-                        if self.diags.len() == n { Some(p) } else {
+                        let p = self.export(ex, t, At::Expr(e))?;
+                        if self.diags.len() == n {
+                            Some(p)
+                        } else {
                             self.diags.truncate(n);
                             None
                         }
@@ -930,24 +1087,33 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             };
             expects.push((e, expected));
         }
-        let suggests = crate::rules::suggest::collect(&crate::rules::suggest::Facts {
+        crate::rules::suggest::collect(&crate::rules::suggest::Facts {
             body: &self.body,
             types: ex.out.view(),
-            expr_ty: &expr_ty,
-            local_ty: &local_ty,
-            diags: &diags,
+            expr_ty,
+            local_ty,
+            diags,
             holes: &expects,
             alloc,
-        })?;
+        })
+    }
+
+    /// Stage 15: exports defined opaque hidden types, promoted borrows, and awaited futures.
+    #[inline(never)]
+    fn wb_hidden_and_awaited(
+        &mut self,
+        ex: &mut Export<'a>,
+    ) -> Result<(Vec<(ItemKey, PTy), Alloc<'a>>, Vec<ExprId, Alloc<'a>>, Vec<(ExprId, PTy), Alloc<'a>>), CheckError> {
+        let alloc = self.alloc;
         // The hidden type of each opaque this body defines (rules/opaque_def.rs): the Reference,
         // "Abstract return types": "Each possible return value from the function must resolve
         // to the same concrete type": that type, per opaque key. A hidden type that is not
         // wholly known adds no finding here (the body's own diagnostics say why) and no row.
         let defined = self.defined_hidden()?;
-        let mut hidden: Vec<(crate::ids::ItemKey, PTy), Alloc<'a>> = Vec::with_capacity_in(defined.len(), alloc);
+        let mut hidden: Vec<(ItemKey, PTy), Alloc<'a>> = Vec::with_capacity_in(defined.len(), alloc);
         for &(k, t) in defined.iter() {
             let n = self.diags.len();
-            let p = self.export(&mut ex, t, At::Body)?;
+            let p = self.export(ex, t, At::Body)?;
             let p = self.canonicalize_futures(&mut ex.out, p)?;
             if self.diags.len() == n {
                 hidden.push((k, p));
@@ -955,17 +1121,17 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 self.diags.truncate(n);
             }
         }
-        let mut promoted: Vec<crate::ids::ExprId, Alloc<'a>> = Vec::with_capacity_in(self.promoted.len(), alloc);
+        let mut promoted: Vec<ExprId, Alloc<'a>> = Vec::with_capacity_in(self.promoted.len(), alloc);
         promoted.extend_from_slice(&self.promoted);
         // The future each `.await` holds while suspended (rules/async_fmt.rs `expr_await`):
         // what the flow lowering's `.await` holds across its suspension (blaze-flow-lower
         // coroutine.rs). A future not wholly known adds no finding here (the body's own
         // diagnostics say why) and no row: the lowering refuses that `.await` by name.
-        let mut awaited: Vec<(crate::ids::ExprId, PTy), Alloc<'a>> = Vec::with_capacity_in(self.awaited.len(), alloc);
+        let mut awaited: Vec<(ExprId, PTy), Alloc<'a>> = Vec::with_capacity_in(self.awaited.len(), alloc);
         for i in 0..self.awaited.len() {
             let (e, t) = self.awaited[i];
             let n = self.diags.len();
-            let p = self.export(&mut ex, t, At::Expr(e))?;
+            let p = self.export(ex, t, At::Expr(e))?;
             if self.diags.len() == n {
                 awaited.push((e, p));
             } else {
@@ -973,15 +1139,33 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
         }
         awaited.sort_unstable_by_key(|r| r.0);
+        Ok((hidden, promoted, awaited))
+    }
+
+    /// Stage 16: computes `Checked::selected` rows, returning `Ok(None)` when a read hit a hole.
+    #[inline(never)]
+    fn wb_selected(
+        &mut self,
+        ex: &mut Export<'a>,
+        closures: &Closures<'a>,
+        expr_ty: &[PTy],
+        adjusts: &Adjusts<'a>,
+    ) -> Result<Option<Vec<crate::selected::Projected, Alloc<'a>>>, CheckError> {
         // The impl chosen for each projection of a callee's signature at each call
         // (writeback/selected_rows.rs), over the body's own reads: before they are finished.
-        let selected = self.selected_rows(&mut ex, &closures, &expr_ty, &adjusts);
+        let selected = self.selected_rows(ex, closures, expr_ty, adjusts);
         // Reading an unfiled coroutine supplies a stand-in. Any result of selection
         // using it (including a missing-facts error) belongs to this unfinished round.
         if self.reads.holed() {
-            return Ok(crate::Outcome::Need(self.reads.finish_need(None, alloc)));
+            return Ok(None);
         }
-        let selected = selected?;
+        Ok(Some(selected?))
+    }
+
+    /// Stage 17: sorts trailing lint/unsafety/index/witness lists and exports `inferred_output`.
+    #[inline(never)]
+    fn wb_tail_metadata(&mut self, ex: &mut Export<'a>) -> Result<TailMetadata<'a>, CheckError> {
+        let alloc = self.alloc;
         let mut findings: Vec<crate::rules::args_inline::TypedFinding, Alloc<'a>> = Vec::with_capacity_in(self.typed_findings.len(), alloc);
         findings.extend_from_slice(&self.typed_findings);
         findings.sort_unstable_by_key(|f| f.order());
@@ -989,7 +1173,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         undecided.extend_from_slice(&self.undecided);
         undecided.sort_unstable_by_key(|u| u.order());
         // The overloaded indexes that are mutable places (rules/mut_places.rs), sorted.
-        let mut index_mut: Vec<crate::ids::ExprId, Alloc<'a>> = Vec::with_capacity_in(self.index_mut.len(), alloc);
+        let mut index_mut: Vec<ExprId, Alloc<'a>> = Vec::with_capacity_in(self.index_mut.len(), alloc);
         index_mut.extend_from_slice(&self.index_mut);
         index_mut.sort_unstable();
         let mut coroutine_witnesses = Vec::with_capacity_in(self.futures.len(), alloc);
@@ -997,22 +1181,60 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         coroutine_witnesses.sort_unstable_by_key(|r| r.0);
         let inferred_output = match self.inferred_output_ty {
             Some(t) => {
-                let p = self.export(&mut ex, t, At::Expr(self.body.root))?;
+                let p = self.export(ex, t, At::Expr(self.body.root))?;
                 Some(self.canonicalize_futures(&mut ex.out, p)?)
             }
             None => None,
         };
+        Ok(TailMetadata { findings, undecided, index_mut, coroutine_witnesses, inferred_output })
+    }
+
+    /// `resolve_type_vars_in_body`: the record, or the needs when writeback's own reads met a
+    /// hole (a run past a hole makes no record: world.rs `Hole`).
+    pub(crate) fn writeback(mut self) -> Result<crate::Outcome<'a>, CheckError> {
+        let alloc = self.alloc;
+        let mut ex = Export {
+            out: PortableTys::new_in(alloc),
+            cache: HashMap::new_in(alloc),
+            closure_ordinals: None,
+            steps: 0,
+            reported: false,
+        };
+        self.wb_register_record_schemas(&mut ex)?;
+        let (expr_ty, pat_ty, local_ty) = self.wb_node_tys(&mut ex)?;
+        let adjusts = self.wb_adjusts(&mut ex)?;
+        let callees = self.wb_callees(&mut ex)?;
+        let (const_args, pat_const_args) = self.wb_const_args(&mut ex)?;
+        let (expr_defs, pat_defs) = self.wb_defs();
+        let (union_pats, fields, captures) = self.wb_fields_and_captures();
+        let (capture_places, capture_projs) = self.wb_capture_places(&mut ex)?;
+        let closures = self.wb_closures(&mut ex)?;
+        let (fru_fields, default_fields) = self.wb_struct_fields(&mut ex)?;
+        let stalled = self.wb_stalled(&mut ex)?;
+        let (diags, why_rows) = self.wb_diags(&mut ex)?;
+        // Writeback runs only when the walk finished (`needs` here are prefetch hints for next
+        // time, not open questions): with no diagnostic, every recorded type must be named.
+        if diags.is_empty() {
+            self.wb_verify_clean_body(&ex, &expr_ty, &pat_ty, &local_ty, &adjusts, &callees)?;
+        }
+        let suggests = self.wb_suggests(&mut ex, &expr_ty, &local_ty, &diags)?;
+        let (hidden, promoted, awaited) = self.wb_hidden_and_awaited(&mut ex)?;
+        let Some(selected) = self.wb_selected(&mut ex, &closures, &expr_ty, &adjusts)? else {
+            return Ok(crate::Outcome::Need(self.reads.finish_need(None, alloc)));
+        };
+        let tail = self.wb_tail_metadata(&mut ex)?;
         let (reads, needs) = self.reads.finish(alloc);
         Ok(crate::Outcome::Done(Checked {
-            findings,
-            undecided,
-            inferred_output,
-            index_mut,
+            findings: tail.findings,
+            undecided: tail.undecided,
+            inferred_output: tail.inferred_output,
+            suspends: self.suspends,
+            index_mut: tail.index_mut,
             suggests,
             hidden,
             promoted,
             stalled,
-            coroutine_witnesses,
+            coroutine_witnesses: tail.coroutine_witnesses,
             awaited,
             selected,
             fru_fields,
@@ -1039,7 +1261,6 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             needs,
         }))
     }
-
 }
 
 /// The recorded facts of one body, as written back: what [`first_unknown`] scans.
@@ -1064,6 +1285,7 @@ struct Recs<'r, 'a> {
 /// expression types, pattern types, binding types, adjustments, callees' arguments. A table's
 /// children come before their parent (`Malformed::TypeOrder`), so one pass in index order
 /// marks every node holding one: no recursion, linear in the table.
+#[inline(never)]
 fn first_unknown(r: Recs<'_, '_>, alloc: Alloc<'_>) -> Result<Option<crate::error::Recorded>, CheckError> {
     use crate::error::Recorded;
     let v = r.types.view();

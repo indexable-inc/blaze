@@ -18,6 +18,8 @@
 //! `<store>/proc-macro/compiled/<code key>` and its `.seal`, keyed by the wasm's digest and the
 //! runtime ([`COMPILED_DIR`]; `host.rs`, "Compiled records").
 
+use std::fs::{File, read, read_dir};
+use std::io::{Error as IoError, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use blaze_build_script::served::{InPackage, in_package};
@@ -64,6 +66,9 @@ pub enum ClosureError {
     NotLocked { name: String, version: String },
     /// A path package in the closure: its sources are pinned by nothing in the lock.
     Unpinned { name: String, version: String },
+    /// The resolved `wasm64-blaze-wasip1` unit graph has no `ProcMacro` unit matching this
+    /// package and exact feature set.
+    WasmRootMissing { name: String, version: String },
 }
 
 impl std::fmt::Display for ClosureError {
@@ -72,6 +77,9 @@ impl std::fmt::Display for ClosureError {
             ClosureError::NotLocked { name, version } => write!(f, "the lock has no package {name} {version}"),
             ClosureError::Unpinned { name, version } => {
                 write!(f, "{name} {version} is a path package under a proc-macro crate: the lock pins nothing of its sources")
+            }
+            ClosureError::WasmRootMissing { name, version } => {
+                write!(f, "{name} {version}: no matching ProcMacro unit with exact features in the wasm64 unit graph")
             }
         }
     }
@@ -252,6 +260,68 @@ fn display_eq(value: &impl core::fmt::Display, expected: &str) -> bool {
     write!(writer, "{value}").is_ok() && writer.ok && writer.rest.is_empty()
 }
 
+/// Streaming SHA-256 hasher for [`files_digest`]: feeds each `(path, bytes)` entry in sorted
+/// byte order of `path` as `path || 0u8 || (bytes.len() as u64).to_le_bytes() || bytes` without
+/// concatenating file contents into a buffer.
+pub struct FilesHasher {
+    hasher: blaze_sha256::Sha256,
+}
+
+impl Default for FilesHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FilesHasher {
+    pub const fn new() -> Self {
+        Self { hasher: blaze_sha256::Sha256::new() }
+    }
+
+    /// Starts streaming one regular file entry with its raw `/`-separated relative path bytes and
+    /// declared byte length. Callers must follow with [`Self::update_chunk`] calls totaling
+    /// exactly `len` bytes.
+    pub fn begin_file(&mut self, path_bytes: &[u8], len: u64) {
+        self.hasher.update(path_bytes);
+        self.hasher.update(&[0]);
+        self.hasher.update(&len.to_le_bytes());
+    }
+
+    /// Streams a chunk of bytes for the file started with [`Self::begin_file`].
+    pub fn update_chunk(&mut self, chunk: &[u8]) {
+        self.hasher.update(chunk);
+    }
+
+    /// Feeds one regular file entry by its raw `/`-separated relative path bytes. Callers must
+    /// pass entries in ascending byte order of `path_bytes` to match [`package_files_digest_in`]
+    /// and [`files_digest`].
+    pub fn update_file_bytes(&mut self, path_bytes: &[u8], bytes: &[u8]) {
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        self.begin_file(path_bytes, len);
+        self.update_chunk(bytes);
+    }
+
+    /// Feeds one regular file entry. Callers must pass entries in ascending byte order of `path`
+    /// to match [`files_digest`].
+    pub fn update_file(&mut self, path: &str, bytes: &[u8]) {
+        self.update_file_bytes(path.as_bytes(), bytes);
+    }
+
+    pub fn finish(self) -> [u8; 32] {
+        self.hasher.finish()
+    }
+
+    pub fn finish_hex_in<A: core::alloc::Allocator>(self, alloc: A) -> blaze_own::String<A> {
+        use core::fmt::Write as _;
+        let digest = self.hasher.finish();
+        let mut out = blaze_own::String::with_capacity_in(digest.len() * 2, alloc);
+        for byte in digest {
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
+}
+
 /// The digest a path package's sources are pinned by: SHA-256 over its files, in the byte
 /// order of their paths relative to the package's folder, each as the path, a zero byte, its
 /// length as 8 little-endian bytes and its bytes. `files` holds every regular file of the
@@ -260,44 +330,134 @@ fn display_eq(value: &impl core::fmt::Display, expected: &str) -> bool {
 /// builder's module by it).
 pub fn files_digest(files: &mut [(String, Vec<u8>)]) -> String {
     files.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-    let mut all = Vec::new();
+    let mut hasher = FilesHasher::new();
     for (path, bytes) in files.iter() {
-        all.extend_from_slice(path.as_bytes());
-        all.push(0);
-        all.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        all.extend_from_slice(bytes);
+        hasher.update_file(path.as_str(), bytes.as_slice());
     }
-    sha256_hex(&all)
+    hex(&hasher.finish())
 }
 
-/// The files of the package at `dir` that [`files_digest`] covers, by their paths relative to
-/// it (`/`-separated): each entry `served::in_package` takes. Walked with a stack of folders.
-pub fn package_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, ModuleError> {
-    let io = |path: &Path, error: std::io::Error| ModuleError::Io { path: path.to_owned(), error };
-    let mut out = Vec::new();
-    let mut folders = vec![(dir.to_owned(), String::new())];
-    while let Some((folder, relative)) = folders.pop() {
-        for entry in std::fs::read_dir(&folder).map_err(|e| io(&folder, e))? {
+/// Walks `dir` by the one package rule (`served::in_package`), collecting `(raw_rel_bytes, full_path)`
+/// for every regular file and sorting strictly by ascending `raw_rel_bytes` (`/`-separated raw
+/// encoded OS filename bytes, never lossy UTF-8) so ordering is unique and filesystem-independent.
+fn walk_package_entries<'f>(
+    dir: &Path,
+    frame: &'f bstd::mem::Frame,
+) -> Result<blaze_own::Vec<(blaze_own::Vec<u8, &'f bstd::mem::Frame>, PathBuf), &'f bstd::mem::Frame>, ModuleError> {
+    let io = |path: &Path, error: IoError| ModuleError::Io { path: path.to_owned(), error };
+    let mut files: blaze_own::Vec<(blaze_own::Vec<u8, &'f bstd::mem::Frame>, PathBuf), &'f bstd::mem::Frame> =
+        blaze_own::Vec::new_in(frame);
+    let mut folders: blaze_own::Vec<(blaze_own::Vec<u8, &'f bstd::mem::Frame>, PathBuf), &'f bstd::mem::Frame> =
+        blaze_own::Vec::new_in(frame);
+    folders.push((blaze_own::Vec::new_in(frame), dir.to_path_buf()));
+    while let Some((relative, folder)) = folders.pop() {
+        for entry in read_dir(&folder).map_err(|e| io(&folder, e))? {
             let entry = entry.map_err(|e| io(&folder, e))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
+            let file_name = entry.file_name();
+            let raw_name = file_name.as_encoded_bytes();
             let path = entry.path();
             let kind = entry.file_type().map_err(|e| io(&path, e))?;
             let place = if relative.is_empty() { InPackage::Root } else { InPackage::Beneath };
-            if !in_package(entry.file_name().as_encoded_bytes(), kind.is_dir(), place) {
+            if !in_package(raw_name, kind.is_dir(), place) {
                 continue;
             }
-            let at = if relative.is_empty() { name.clone() } else { format!("{relative}/{name}") };
+            let mut at = blaze_own::Vec::with_capacity_in(relative.len() + usize::from(!relative.is_empty()) + raw_name.len(), frame);
+            if !relative.is_empty() {
+                at.extend_from_slice(relative.as_slice());
+                at.push(b'/');
+            }
+            at.extend_from_slice(raw_name);
             if kind.is_dir() {
-                folders.push((path, at));
+                folders.push((at, path));
             } else if kind.is_file() {
-                out.push((at, std::fs::read(&path).map_err(|e| io(&path, e))?));
+                files.push((at, path));
             }
         }
+    }
+    files.sort_unstable_by(|a, b| a.0.as_slice().cmp(b.0.as_slice()));
+    Ok(files)
+}
+
+/// Streams one regular file from `reader` directly into `hasher` in fixed `chunk`-sized pieces
+/// without retaining the file's full contents in memory, verifying that the observed byte count
+/// matches `expected_len` (Rule 3: never hash a concurrent grow/shrink under a stale length).
+fn stream_file_into_hasher(
+    hasher: &mut FilesHasher,
+    rel_bytes: &[u8],
+    reader: &mut impl Read,
+    expected_len: u64,
+    chunk: &mut [u8],
+) -> Result<(), IoError> {
+    hasher.begin_file(rel_bytes, expected_len);
+    let mut total: u64 = 0;
+    loop {
+        match reader.read(chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let Some(slice) = chunk.get(..n) else { break };
+                total = total.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+                if total > expected_len {
+                    return Err(IoError::new(
+                        ErrorKind::InvalidData,
+                        "file grew while streaming package files digest",
+                    ));
+                }
+                hasher.update_chunk(slice);
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    if total != expected_len {
+        return Err(IoError::new(
+            ErrorKind::UnexpectedEof,
+            "file shrank while streaming package files digest",
+        ));
+    }
+    Ok(())
+}
+
+/// Computes the canonical package-wide files digest directly from `dir`, streaming one file at a
+/// time in bounded 64 KiB chunks into [`FilesHasher`] in strict ascending byte order of raw
+/// `/`-separated relative paths (`as_encoded_bytes()`, bit-for-bit identical to [`files_digest`]
+/// for UTF-8 paths and uniquely ordered for distinct non-UTF-8 Unix filenames). Allocates the
+/// returned 64-byte hex digest in `alloc` with zero per-file heap or frame buffering.
+pub fn package_files_digest_in<A: core::alloc::Allocator>(dir: &Path, alloc: A) -> Result<blaze_own::String<A>, ModuleError> {
+    let io = |path: &Path, error: IoError| ModuleError::Io { path: path.to_owned(), error };
+    let frame = bstd::mem::Frame::new(bstd::mem::Tag::Other)
+        .map_err(|e| io(dir, IoError::other(format!("allocating package_files_digest_in frame: {e:?}"))))?;
+    let files = walk_package_entries(dir, &frame)?;
+    let mut hasher = FilesHasher::new();
+    let mut chunk = [0u8; 64 * 1024];
+    for (rel_bytes, full_path) in files.iter() {
+        let mut file = File::open(full_path).map_err(|e| io(full_path, e))?;
+        let expected_len = file.metadata().map_err(|e| io(full_path, e))?.len();
+        stream_file_into_hasher(&mut hasher, rel_bytes.as_slice(), &mut file, expected_len, &mut chunk)
+            .map_err(|e| io(full_path, e))?;
+    }
+    Ok(hasher.finish_hex_in(alloc))
+}
+
+/// The files of the package at `dir` that [`files_digest`] covers, by their UTF-8 paths relative
+/// to it (`/`-separated): each entry `served::in_package` takes. Fails cleanly on non-UTF-8
+/// filenames instead of corrupting them lossily; callers computing a package's digest should use
+/// [`package_files_digest_in`] directly.
+pub fn package_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, ModuleError> {
+    let io = |path: &Path, error: IoError| ModuleError::Io { path: path.to_owned(), error };
+    let frame = bstd::mem::Frame::new(bstd::mem::Tag::Other)
+        .map_err(|e| io(dir, IoError::other(format!("allocating package_files frame: {e:?}"))))?;
+    let files = walk_package_entries(dir, &frame)?;
+    let mut out = Vec::with_capacity(files.len());
+    for (rel_bytes, path) in files.iter() {
+        let at = core::str::from_utf8(rel_bytes.as_slice())
+            .map(str::to_owned)
+            .map_err(|_| io(path, IoError::new(ErrorKind::InvalidData, "non-UTF-8 path in package_files; use package_files_digest_in")))?;
+        out.push((at, read(path).map_err(|e| io(path, e))?));
     }
     Ok(out)
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     use core::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -322,8 +482,12 @@ pub const MODULE_HEADER: &str = "blaze proc-macro module wasm64 11";
 /// Folds the resolved `wasm64-blaze-wasip1` dependency closure's unified feature sets (bound to
 /// each package's source pin — registry checksum/source, git commit+URL, or path files digest)
 /// into a proc-macro crate's `deps` digest so enabling, removing, or swapping features across
-/// dependencies (including same-name/same-version packages from different sources) invalidates
-/// the module key (rule 21).
+/// dependencies (including same-name/same-version packages from different sources and dependency
+/// build-script closures) invalidates the module key (rule 21).
+///
+/// Requires an exact `(package, UnitKind::ProcMacro, features)` match in `wasm_graph` (returning
+/// [`ClosureError::WasmRootMissing`] otherwise) and refuses any reachable `LockSource::Path`
+/// dependency whose digest cannot be supplied ([`ClosureError::Unpinned`], rule 3).
 pub fn deps_with_wasm_features<S: AsRef<str>, D: AsRef<str>, A: core::alloc::Allocator + Copy>(
     lock_deps: &str,
     lock: &Lock<'_>,
@@ -332,7 +496,7 @@ pub fn deps_with_wasm_features<S: AsRef<str>, D: AsRef<str>, A: core::alloc::All
     features: &[S],
     mut path_files: impl FnMut(blaze_manifest::lock::LockId) -> Option<D>,
     alloc: A,
-) -> blaze_own::String<A> {
+) -> Result<blaze_own::String<A>, ClosureError> {
     use core::fmt::Write as _;
     let mut want_feats = blaze_own::Vec::with_capacity_in(features.len(), alloc);
     for f in features {
@@ -349,93 +513,124 @@ pub fn deps_with_wasm_features<S: AsRef<str>, D: AsRef<str>, A: core::alloc::All
         got.dedup();
         got.as_slice() == want_feats.as_slice()
     };
-    let root_idx = wasm_graph
+    let Some(root_idx) = wasm_graph
         .units
         .iter()
         .position(|u| u.package == package && u.kind == blaze_unit_graph::UnitKind::ProcMacro && feats_match(u))
-        .or_else(|| {
-            wasm_graph
-                .units
-                .iter()
-                .position(|u| u.package == package && u.kind == blaze_unit_graph::UnitKind::ProcMacro)
+    else {
+        let root_pkg = lock.package(package);
+        let mut version = blaze_own::String::new_in(alloc);
+        let _ = write!(version, "{}", root_pkg.version);
+        return Err(ClosureError::WasmRootMissing {
+            name: root_pkg.name.as_str().to_owned(),
+            version: version.as_str().to_owned(),
         });
-    let mut rows = blaze_own::Vec::<blaze_own::String<A>, A>::new_in(alloc);
-    if let Some(root_idx) = root_idx {
-        let mut visited = blaze_own::Vec::with_capacity_in(wasm_graph.units.len(), alloc);
-        visited.resize(wasm_graph.units.len(), false);
-        if let Some(slot) = visited.get_mut(root_idx) {
+    };
+    let mut visited = blaze_own::Vec::with_capacity_in(wasm_graph.units.len(), alloc);
+    visited.resize(wasm_graph.units.len(), false);
+    let mut stack = blaze_own::Vec::new_in(alloc);
+    let push_deps = |u: &blaze_unit_graph::Unit<'_>,
+                     visited: &mut blaze_own::Vec<bool, A>,
+                     stack: &mut blaze_own::Vec<usize, A>| {
+        for dep in u.deps.iter() {
+            let didx = dep.unit.index();
+            if wasm_graph
+                .units
+                .get(didx)
+                .is_some_and(|du| matches!(du.kind, blaze_unit_graph::UnitKind::Lib | blaze_unit_graph::UnitKind::ProcMacro))
+                && let Some(slot) = visited.get_mut(didx)
+                && !*slot
+            {
+                *slot = true;
+                stack.push(didx);
+            }
+        }
+    };
+    let push_build_script = |u: &blaze_unit_graph::Unit<'_>,
+                             visited: &mut blaze_own::Vec<bool, A>,
+                             stack: &mut blaze_own::Vec<usize, A>| {
+        if let Some(bs_id) = u.build_script
+            && let Some(slot) = visited.get_mut(bs_id.index())
+            && !*slot
+        {
             *slot = true;
-        }
-        let mut stack = blaze_own::Vec::new_in(alloc);
-        if let Some(root_u) = wasm_graph.units.get(root_idx) {
-            for dep in root_u.deps.iter() {
-                let idx = dep.unit.index();
-                if wasm_graph
-                    .units
-                    .get(idx)
-                    .is_some_and(|du| matches!(du.kind, blaze_unit_graph::UnitKind::Lib | blaze_unit_graph::UnitKind::ProcMacro))
-                    && let Some(slot) = visited.get_mut(idx)
-                    && !*slot
-                {
-                    *slot = true;
-                    stack.push(idx);
-                }
+            if let Some(bs_unit) = wasm_graph.units.get(bs_id.index()) {
+                push_deps(bs_unit, visited, stack);
             }
         }
-        while let Some(idx) = stack.pop() {
-            let Some(u) = wasm_graph.units.get(idx) else { continue };
-            for dep in u.deps.iter() {
-                let didx = dep.unit.index();
-                if wasm_graph
-                    .units
-                    .get(didx)
-                    .is_some_and(|du| matches!(du.kind, blaze_unit_graph::UnitKind::Lib | blaze_unit_graph::UnitKind::ProcMacro))
-                    && let Some(slot) = visited.get_mut(didx)
-                    && !*slot
-                {
-                    *slot = true;
-                    stack.push(didx);
-                }
+    };
+    if let Some(slot) = visited.get_mut(root_idx) {
+        *slot = true;
+    }
+    if let Some(root_u) = wasm_graph.units.get(root_idx) {
+        push_deps(root_u, &mut visited, &mut stack);
+        push_build_script(root_u, &mut visited, &mut stack);
+    }
+    let mut path_cache: blaze_own::Vec<Option<blaze_own::String<A>>, A> =
+        blaze_own::Vec::with_capacity_in(lock.packages.len(), alloc);
+    for _ in 0..lock.packages.len() {
+        path_cache.push(None);
+    }
+    let mut rows = blaze_own::Vec::<blaze_own::String<A>, A>::new_in(alloc);
+    while let Some(idx) = stack.pop() {
+        let Some(u) = wasm_graph.units.get(idx) else { continue };
+        push_deps(u, &mut visited, &mut stack);
+        push_build_script(u, &mut visited, &mut stack);
+        let mut ufeats = blaze_own::Vec::with_capacity_in(u.features.len(), alloc);
+        for f in u.features.iter() {
+            ufeats.push(f.as_str());
+        }
+        ufeats.sort_unstable();
+        ufeats.dedup();
+        let kind_word = match u.kind {
+            blaze_unit_graph::UnitKind::ProcMacro => "proc-macro",
+            _ => "lib",
+        };
+        let pkg = lock.package(u.package);
+        let mut row = blaze_own::String::new_in(alloc);
+        let _ = write!(row, "{} {} {} ", u.name.as_str(), u.version.as_str(), kind_word);
+        match (&pkg.checksum, &pkg.source) {
+            (Checksum::Sha256(sum), _) => {
+                let _ = write!(row, "checksum:{} {}", sum.as_str(), pkg.source_text.as_str());
             }
-            let mut ufeats = blaze_own::Vec::with_capacity_in(u.features.len(), alloc);
-            for f in u.features.iter() {
-                ufeats.push(f.as_str());
-            }
-            ufeats.sort_unstable();
-            ufeats.dedup();
-            let kind_word = match u.kind {
-                blaze_unit_graph::UnitKind::ProcMacro => "proc-macro",
-                _ => "lib",
-            };
-            let pkg = lock.package(u.package);
-            let mut row = blaze_own::String::new_in(alloc);
-            let _ = write!(row, "{} {} {} ", u.name.as_str(), u.version.as_str(), kind_word);
-            match (&pkg.checksum, &pkg.source) {
-                (Checksum::Sha256(sum), _) => {
-                    let _ = write!(row, "checksum:{} {}", sum.as_str(), pkg.source_text.as_str());
-                }
-                (Checksum::Absent, LockSource::Path) => match path_files(u.package) {
+            (Checksum::Absent, LockSource::Path) => {
+                let cached = match path_cache.get_mut(u.package.index()) {
+                    Some(Some(hex)) => Some(hex.as_str()),
+                    Some(slot @ None) => match path_files(u.package) {
+                        Some(hex) => Some(slot.insert(blaze_own::String::from_str_in(hex.as_ref(), alloc)).as_str()),
+                        None => None,
+                    },
+                    None => None,
+                };
+                match cached {
                     Some(hex) => {
-                        let _ = write!(row, "files:{}", hex.as_ref());
+                        let _ = write!(row, "files:{hex}");
                     }
-                    None => row.push_str("path:unpinned"),
-                },
-                (Checksum::Absent, LockSource::Git { commit, .. }) => {
-                    let _ = write!(row, "git:{} {}", commit.as_str(), pkg.source_text.as_str());
-                }
-                (Checksum::Absent, LockSource::Registry { .. }) => {
-                    let _ = write!(row, "source:{}", pkg.source_text.as_str());
+                    None => {
+                        let mut version = blaze_own::String::new_in(alloc);
+                        let _ = write!(version, "{}", pkg.version);
+                        return Err(ClosureError::Unpinned {
+                            name: pkg.name.as_str().to_owned(),
+                            version: version.as_str().to_owned(),
+                        });
+                    }
                 }
             }
-            row.push(' ');
-            for (i, f) in ufeats.iter().enumerate() {
-                if i > 0 {
-                    row.push(',');
-                }
-                row.push_str(f);
+            (Checksum::Absent, LockSource::Git { commit, .. }) => {
+                let _ = write!(row, "git:{} {}", commit.as_str(), pkg.source_text.as_str());
             }
-            rows.push(row);
+            (Checksum::Absent, LockSource::Registry { .. }) => {
+                let _ = write!(row, "source:{}", pkg.source_text.as_str());
+            }
         }
+        row.push(' ');
+        for (i, f) in ufeats.iter().enumerate() {
+            if i > 0 {
+                row.push(',');
+            }
+            row.push_str(f);
+        }
+        rows.push(row);
     }
     rows.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
     rows.dedup_by(|a, b| a.as_str() == b.as_str());
@@ -453,7 +648,7 @@ pub fn deps_with_wasm_features<S: AsRef<str>, D: AsRef<str>, A: core::alloc::All
     for byte in digest {
         let _ = write!(out, "{byte:02x}");
     }
-    out
+    Ok(out)
 }
 
 /// The crate's identity as text: what the module key is the digest of.
@@ -842,8 +1037,8 @@ mod header_tests {
 
         let wg_on = mk_wasm_graph(&["extra_wasi"]);
         let wg_off = mk_wasm_graph(&[]);
-        let d_on = deps_with_wasm_features("same-lock-closure", &lock, &wg_on, LockId(0), &[] as &[&str], |_| None::<&str>, alloc);
-        let d_off = deps_with_wasm_features("same-lock-closure", &lock, &wg_off, LockId(0), &[] as &[&str], |_| None::<&str>, alloc);
+        let d_on = deps_with_wasm_features("same-lock-closure", &lock, &wg_on, LockId(0), &[] as &[&str], |_| None::<&str>, alloc).expect("d_on");
+        let d_off = deps_with_wasm_features("same-lock-closure", &lock, &wg_off, LockId(0), &[] as &[&str], |_| None::<&str>, alloc).expect("d_off");
         assert_ne!(d_on.as_str(), d_off.as_str(), "proc-macro deps digest must change when a WASI-only dep feature toggles");
     }
 
@@ -925,12 +1120,209 @@ mod header_tests {
 
         let wg_ab = mk_wasm_graph(&["feat_a"], &["feat_b"]);
         let wg_ba = mk_wasm_graph(&["feat_b"], &["feat_a"]);
-        let d_ab = deps_with_wasm_features("same-lock-closure", &lock, &wg_ab, LockId(0), &[] as &[&str], |_| None::<&str>, alloc);
-        let d_ba = deps_with_wasm_features("same-lock-closure", &lock, &wg_ba, LockId(0), &[] as &[&str], |_| None::<&str>, alloc);
+        let d_ab = deps_with_wasm_features("same-lock-closure", &lock, &wg_ab, LockId(0), &[] as &[&str], |_| None::<&str>, alloc).expect("d_ab");
+        let d_ba = deps_with_wasm_features("same-lock-closure", &lock, &wg_ba, LockId(0), &[] as &[&str], |_| None::<&str>, alloc).expect("d_ba");
         assert_ne!(
             d_ab.as_str(),
             d_ba.as_str(),
             "swapping features A and B between two same-name/version packages from different sources must change the digest"
         );
+    }
+
+    #[test]
+    fn deps_with_wasm_features_rejects_mismatched_root_traverses_dep_build_scripts_and_refuses_unpinned_paths() {
+        use blaze_manifest::lock::LockId;
+        use blaze_own::Vec as OwnVec;
+        use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Packages:
+        //   0: demo_pm (proc-macro)
+        //   1: dep_lib (registry lib with a build.rs)
+        //   2: wasi_bs_helper (WASI-only path build-dependency of dep_lib's build.rs)
+        let lock_text = "version = 4\n\n\
+            [[package]]\nname = \"demo_pm\"\nversion = \"0.1.0\"\ndependencies = [\"dep_lib\"]\n\n\
+            [[package]]\nname = \"dep_lib\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"1111111111111111111111111111111111111111111111111111111111111111\"\ndependencies = [\"wasi_bs_helper\"]\n\n\
+            [[package]]\nname = \"wasi_bs_helper\"\nversion = \"0.1.0\"\n";
+        let lock = Lock::read(lock_text.as_bytes(), alloc).expect("lock");
+
+        let mk_unit = |pkg: u32, name: &str, kind: UnitKind<'static>, feats: &[&str], deps: &[(&str, u32)], bs: Option<u32>| {
+            let mut d = OwnVec::new_in(alloc);
+            for &(dn, du) in deps {
+                d.push(UnitDep { name: Text::from_str_in(dn, alloc), unit: UnitId(du) });
+            }
+            let mut f = OwnVec::new_in(alloc);
+            for &feat in feats {
+                f.push(Text::from_str_in(feat, alloc));
+            }
+            let root = if kind == UnitKind::BuildScript { "build.rs" } else { "src/lib.rs" };
+            Unit {
+                package: LockId(pkg),
+                name: Text::from_str_in(name, alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in(name, alloc),
+                root: Text::from_str_in(root, alloc),
+                features: f,
+                cfg: OwnVec::new_in(alloc),
+                deps: d,
+                build_script: bs.map(UnitId),
+                links: None,
+            }
+        };
+
+        // wasm_graph:
+        //   0: demo_pm (ProcMacro, features=["feat_a"]) -> [1 (dep_lib)]
+        //   1: dep_lib (Lib, build_script=Some(2))
+        //   2: dep_lib (BuildScript) -> [3 (wasi_bs_helper)]
+        //   3: wasi_bs_helper (Lib, path)
+        let mut units = OwnVec::new_in(alloc);
+        units.push(mk_unit(0, "demo_pm", UnitKind::ProcMacro, &["feat_a"], &[("dep_lib", 1)], None));
+        units.push(mk_unit(1, "dep_lib", UnitKind::Lib, &[], &[], Some(2)));
+        units.push(mk_unit(1, "dep_lib", UnitKind::BuildScript, &[], &[("wasi_bs_helper", 3)], None));
+        units.push(mk_unit(2, "wasi_bs_helper", UnitKind::Lib, &[], &[], None));
+        let wg = UnitGraph { units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        // 1. Mismatched feature set (asking for ["feat_b"] when wasm_graph only has ["feat_a"])
+        //    must return `Err(ClosureError::WasmRootMissing)` instead of folding another variant.
+        let err_mismatch = deps_with_wasm_features("base", &lock, &wg, LockId(0), &["feat_b"], |_| Some("helper-v1"), alloc)
+            .expect_err("mismatched proc-macro features must be rejected");
+        assert_eq!(
+            err_mismatch,
+            ClosureError::WasmRootMissing { name: "demo_pm".to_owned(), version: "0.1.0".to_owned() }
+        );
+
+        // 2. Reachable dep's `build_script` WASI-only path build-dep MUST enter and invalidate the key.
+        let d_v1 = deps_with_wasm_features("base", &lock, &wg, LockId(0), &["feat_a"], |id| (id == LockId(2)).then_some("helper-v1"), alloc)
+            .expect("d_v1");
+        let d_v2 = deps_with_wasm_features("base", &lock, &wg, LockId(0), &["feat_a"], |id| (id == LockId(2)).then_some("helper-v2"), alloc)
+            .expect("d_v2");
+        assert_ne!(
+            d_v1.as_str(),
+            d_v2.as_str(),
+            "editing a dependency build-script's WASI-only path helper must move the proc-macro key"
+        );
+
+        // 3. Unpinned/missing digest for a reachable path dependency must return `Err(ClosureError::Unpinned)`
+        //    instead of silently succeeding with `"path:unpinned"`.
+        let err_unpinned = deps_with_wasm_features("base", &lock, &wg, LockId(0), &["feat_a"], |_| None::<&str>, alloc)
+            .expect_err("missing digest for reachable path dep must be refused");
+        assert_eq!(
+            err_unpinned,
+            ClosureError::Unpinned { name: "wasi_bs_helper".to_owned(), version: "0.1.0".to_owned() }
+        );
+    }
+
+    #[test]
+    fn streaming_files_digest_and_package_files_digest_match_exact_wire_format() {
+        let dir = std::env::temp_dir().join(format!("blaze-module-streaming-digest-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/nested")).expect("mkdir src/nested");
+        std::fs::create_dir_all(dir.join("target/ignored")).expect("mkdir target");
+        std::fs::write(dir.join("Cargo.toml"), b"[package]\nname = \"demo\"\n").expect("write Cargo.toml");
+        std::fs::write(dir.join("src/lib.rs"), b"pub fn a() -> u32 { 1 }\n").expect("write src/lib.rs");
+        std::fs::write(dir.join("src/nested/mod.rs"), b"pub const X: &[u8] = b\"\x00\xff\";\n").expect("write nested");
+        std::fs::write(dir.join("target/ignored/out.bin"), b"must be excluded").expect("write ignored");
+
+        // Reference oracle using explicit `path || 0u8 || len_le64 || bytes` concatenation.
+        let mut expected_entries = vec![
+            ("Cargo.toml", &b"[package]\nname = \"demo\"\n"[..]),
+            ("src/lib.rs", &b"pub fn a() -> u32 { 1 }\n"[..]),
+            ("src/nested/mod.rs", &b"pub const X: &[u8] = b\"\x00\xff\";\n"[..]),
+        ];
+        expected_entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let mut wire = Vec::new();
+        for (path, bytes) in &expected_entries {
+            wire.extend_from_slice(path.as_bytes());
+            wire.push(0);
+            wire.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            wire.extend_from_slice(bytes);
+        }
+        let oracle = sha256_hex(&wire);
+
+        // `files_digest` (unsorted input) must match oracle bit-for-bit.
+        let mut unsorted: Vec<(String, Vec<u8>)> = expected_entries
+            .iter()
+            .rev()
+            .map(|(p, b)| ((*p).to_owned(), (*b).to_vec()))
+            .collect();
+        assert_eq!(files_digest(&mut unsorted), oracle);
+
+        // `package_files` + `files_digest` must match oracle.
+        let mut collected = package_files(&dir).expect("package_files");
+        assert_eq!(files_digest(&mut collected), oracle);
+
+        // `FilesHasher::finish_hex_in` and `package_files_digest_in` must match oracle as well.
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut hasher = FilesHasher::new();
+        for (path, bytes) in &expected_entries {
+            hasher.update_file(path, bytes);
+        }
+        assert_eq!(hasher.finish_hex_in(alloc).as_str(), oracle);
+        assert_eq!(package_files_digest_in(&dir, alloc).expect("package_files_digest_in").as_str(), oracle);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_files_digest_in_orders_colliding_non_utf8_paths_canonically() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = std::env::temp_dir().join(format!("blaze-module-non-utf8-order-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // Both filenames collapse to `bad_\u{FFFD}.rs` under `to_string_lossy()`, so raw byte
+        // ordering (`0xfe < 0xff`) must distinguish and order them deterministically.
+        std::fs::write(dir.join(OsStr::from_bytes(b"bad_\xff.rs")), b"ff-bytes").expect("write ff");
+        std::fs::write(dir.join(OsStr::from_bytes(b"bad_\xfe.rs")), b"fe-bytes").expect("write fe");
+
+        let mut wire = Vec::new();
+        for (rel, bytes) in [(&b"bad_\xfe.rs"[..], &b"fe-bytes"[..]), (&b"bad_\xff.rs"[..], &b"ff-bytes"[..])] {
+            wire.extend_from_slice(rel);
+            wire.push(0);
+            wire.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            wire.extend_from_slice(bytes);
+        }
+        let oracle = sha256_hex(&wire);
+        let alloc = blaze_own::testing::heap().alloc();
+        assert_eq!(
+            package_files_digest_in(&dir, alloc).expect("digest").as_str(),
+            oracle,
+            "package_files_digest_in must sort and hash colliding non-UTF-8 names by raw relative bytes"
+        );
+        // Legacy UTF-8 `package_files` refuses non-UTF-8 names loudly instead of corrupting them lossily.
+        assert!(package_files(&dir).is_err(), "package_files must refuse non-UTF-8 paths instead of lossy replacement");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chunked_file_streaming_matches_update_file_bytes_and_detects_size_mismatch() {
+        let payload: Vec<u8> = (0..200_000usize).map(|i| (i.wrapping_mul(31) & 0xff) as u8).collect();
+        let mut expected = FilesHasher::new();
+        expected.update_file_bytes(b"assets/large.bin", &payload);
+
+        let mut streamed = FilesHasher::new();
+        let mut small_chunk = [0u8; 4096];
+        let mut cursor = std::io::Cursor::new(&payload);
+        stream_file_into_hasher(&mut streamed, b"assets/large.bin", &mut cursor, payload.len() as u64, &mut small_chunk)
+            .expect("chunked streaming must succeed when observed length matches expected_len");
+        assert_eq!(streamed.finish(), expected.finish(), "chunked streaming digest must match update_file_bytes bit-for-bit");
+
+        // Negative control 1: file grew beyond declared metadata length.
+        let mut grew = FilesHasher::new();
+        let mut cur_grew = std::io::Cursor::new(&payload);
+        let err_grew = stream_file_into_hasher(&mut grew, b"assets/large.bin", &mut cur_grew, (payload.len() - 1) as u64, &mut small_chunk)
+            .expect_err("file growth beyond expected_len must fail");
+        assert_eq!(err_grew.kind(), ErrorKind::InvalidData);
+
+        // Negative control 2: file shrank below declared metadata length.
+        let mut shrank = FilesHasher::new();
+        let mut cur_shrank = std::io::Cursor::new(&payload);
+        let err_shrank = stream_file_into_hasher(&mut shrank, b"assets/large.bin", &mut cur_shrank, (payload.len() + 1) as u64, &mut small_chunk)
+            .expect_err("file shrink below expected_len must fail");
+        assert_eq!(err_shrank.kind(), ErrorKind::UnexpectedEof);
     }
 }

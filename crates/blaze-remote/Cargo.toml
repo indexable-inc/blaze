@@ -42,6 +42,8 @@ blaze-zstd.workspace = true
 # Settings and the commands' typed input.
 blaze-data.workspace = true
 blaze-json.workspace = true
+# Explicit typestate sans-IO machine ABI, state-graph verifier, and `Script`/`RecordHandler`.
+blaze-machine.workspace = true
 
 [features]
 # The bucket's HTTP drivers (S3 over HTTP/1.1, anonymous reads over HTTP/3) and `blaze cache`'s

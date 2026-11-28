@@ -1234,6 +1234,14 @@ pub(crate) enum Plant {
     /// Planted bug: ignores the same-boot check before probing a lease's PID, proving the DST
     /// oracle catches cross-boot lease reaping (phase_commit_tests DST).
     ReapOtherBootPid,
+    /// Planted bug: blindly refuses commits whenever wall-clock elapsed exceeds `GRACE_NS / 2`,
+    /// ignoring empty segment sets, unchanged generation, still-retired segments, and live lease
+    /// protection (pre-fix false-positive `CommitTooSlow` control in phase_commit_tests DST).
+    CommitTooSlowBlind,
+    /// Planted bug: skips the `CommitTooSlow` unlink-safety guard completely even when a slow
+    /// unleased commit's segment was retired and unlinked by concurrent compaction (unsoundness
+    /// control in phase_commit_tests DST).
+    CommitSkipsUnlinkGuard,
 }
 
 /// What one slice of the background pass did ([`Plain::scrub_next`]).
@@ -4777,6 +4785,30 @@ impl<A: Allocator + Clone> Plain<A> {
         Ok(())
     }
 
+    /// Advances an in-flight commit's `started_ns` to `now_ns` right before the driver submits the
+    /// commit's first disk write effects, excluding pre-write CPU/mmap work (`lay_out_plan_par`,
+    /// `reused_par`) that ran before any segment file existed on disk.
+    pub fn stamp_commit_write_start(&mut self, now_ns: u64) {
+        match &mut self.phase {
+            Phase::Writing(_, why) => {
+                if let Why::Commit { started_ns, .. } = &mut **why {
+                    *started_ns = (*started_ns).max(now_ns);
+                }
+            }
+            Phase::Flipping(flip) => {
+                if let Change::Commit { started_ns, .. } = &mut flip.change {
+                    *started_ns = (*started_ns).max(now_ns);
+                }
+            }
+            Phase::LoadingBloom => {
+                if let Some(Change::Commit { started_ns, .. }) = self.bloom_parked_flip.as_mut() {
+                    *started_ns = (*started_ns).max(now_ns);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Checks `count` unique candidate commit entries (accessed via `entry_at`) against prior
     /// committed segments in `namespace`, using [`Par::for_each_mut_chunks`] when
     /// `count >= PAR_TWO_VALUES_MIN_KEYS && par.workers() > 1 && !self.maps.is_empty()`.
@@ -7492,10 +7524,64 @@ impl<A: Allocator + Clone> Plain<A> {
                     }
                     true
                 };
+                let own_live_lease_opened_ns = m
+                    .leases
+                    .iter()
+                    .find(|it| it.holder == own_nonce && is_lease_live(it))
+                    .map(|it| it.opened_ns);
+                let own_gen = self.manifest.generation;
+                let own_retired = &self.manifest.retired;
+                let seg_may_be_unlinked = |seg_id: u64| -> bool {
+                    if base_gen == own_gen {
+                        // Zero other flips landed since our manifest view: no compaction retired
+                        // or unlinked any segment of this commit.
+                        return false;
+                    }
+                    if m.segments.iter().any(|it| it.id == seg_id && it.local) {
+                        // Already live and local in the current on-disk manifest (identical
+                        // content-addressed digest).
+                        return false;
+                    }
+                    if m.retired.iter().any(|it| it.id == seg_id && !it.log) {
+                        // Even if a concurrent compaction adopted this segment as an orphan, it is
+                        // still in `m.retired` right now under the exclusive flip lock, so no flip
+                        // has removed it from `m.retired` or queued `Effect::Remove`; the flip
+                        // below atomically rescues it via `m.retired.retain`.
+                        return false;
+                    }
+                    let was_retired_before = own_retired.iter().any(|it| it.id == seg_id && !it.log);
+                    if !was_retired_before && base_gen == own_gen.saturating_add(1) {
+                        // Only one flip landed since our view and this segment was not already in
+                        // `self.manifest.retired`: a single flip can at most retire an orphan with
+                        // `since_ns = flip_now_ns`, never unlink it in the same flip
+                        // (`since_ns + GRACE_NS > flip_now_ns`).
+                        return false;
+                    }
+                    if !was_retired_before
+                        && own_live_lease_opened_ns.is_some_and(|opened| opened <= *started_ns)
+                    {
+                        // Our own lease is present and live in `m.leases` right now (and only this
+                        // process inserts/removes `own_nonce`), so it was live at every flip since
+                        // `started_ns`. Because `seg_id` was not already retired before, any
+                        // orphan retirement after `started_ns` had `since_ns >= started_ns >=
+                        // opened`, so `opened < since_ns + GRACE_NS` held at every flip and the
+                        // unlink rule prevented any process from queuing this file for unlink.
+                        return false;
+                    }
+                    true
+                };
+                let commit_too_slow = if self.plant() == Plant::CommitSkipsUnlinkGuard {
+                    false
+                } else if self.plant() == Plant::CommitTooSlowBlind {
+                    now_ns.saturating_sub(*started_ns) > GRACE_NS / 2
+                } else {
+                    now_ns.saturating_sub(*started_ns) > GRACE_NS / 2
+                        && segs.iter().any(|(seg, _)| seg_may_be_unlinked(seg.id))
+                };
                 if refused.is_some() || map_all_retry {
-                } else if now_ns.saturating_sub(*started_ns) > GRACE_NS / 2 {
-                    // A compaction may have retired its segment as named by no generation:
-                    // it is not flipped.
+                } else if commit_too_slow {
+                    // A concurrent compaction may have retired and unlinked one of this commit's
+                    // segments as an orphan while we held no lease protecting it: do not flip.
                     refused = Some(StoreError::CommitTooSlow { took_s: now_ns.saturating_sub(*started_ns) / 1_000_000_000, grace_s: GRACE_NS / 1_000_000_000 });
                 } else if let Some(&(segment, key)) = self.touches.iter().find(|(id, _)| touch_missing(id)).or_else(|| extra_carry.first())
                     && self.plant() != Plant::CarrySkipped
@@ -8543,204 +8629,251 @@ impl<A: Allocator + Clone> Plain<A> {
             return;
         }
         let done = completion.done;
-        let outcome: Result<(), StoreError> = (|| {
-            let unexpected = |phase: &'static str| StoreError::Unasked { op, index, phase };
-            let fail = |doing: &'static str, file: &FileName, done: &Done| io(doing, file, done);
-            let unlink_early = self.plant() == Plant::UnlinkEarly;
-            match (op, &mut self.phase) {
-            (BLOOM_MAP, _) if self.bloom_loading => {
-                self.bloom_loading = false;
-                if let Done::Mapped(map) = done {
-                    self.bloom.set_mapping(map);
-                    if self.slot.is_some() {
-                        self.bloom.index_manifest(&self.manifest.segments, &self.manifest.roots);
+        let unlink_early = self.plant() == Plant::UnlinkEarly;
+        let outcome: Result<(), StoreError> = match (op, &self.phase) {
+            (BLOOM_MAP, _) if self.bloom_loading => self.complete_bloom_map(done, now_ns, par, effects),
+            (HEAD_READ, Phase::ReadHead(_)) => self.complete_head_read(index, &done, now_ns, effects),
+            (MANIFEST_READ, Phase::ReadManifest { .. }) => self.complete_manifest_read(index, &done, now_ns, effects),
+            (HEAD_MAKE, Phase::MakeHead) => self.complete_head_make(index, &done, effects),
+            (LIST, Phase::CheckLog { .. }) => self.complete_check_log(index, &done, now_ns, effects),
+            (LIST | FOOTER_READ, Phase::Orphans { .. }) => self.complete_orphans(op, index, &done, effects),
+            (MAP, Phase::Mapping { .. }) => self.complete_map_segment(index, done, par, effects),
+            (LIST, Phase::CheckMaps { .. }) => self.complete_check_maps(index, &done, par, effects),
+            (BARRIER, Phase::Sealing { .. }) => self.complete_sealing(index, &done, effects),
+            (REMOVE, Phase::Removing { .. }) => self.complete_removing(index, &done, effects),
+            (LIST, Phase::Listing) => self.complete_listing(index, done, now_ns, effects),
+            (SEG_TRUNCATE | SEG_PIECE, Phase::Writing(_, _)) => self.complete_segment_write(op, index, &done, batches, records, effects),
+            (SEG_RENAME, Phase::Renaming(_, _))
+            | (SEG_UNWRITE, Phase::Unwriting { .. })
+            | (SEG_SYNC, Phase::SyncingSegment(_, _)) => self.complete_segment_finish(op, index, &done, batches, records, effects),
+            (REMOVE | BLOOM_STAGE | LOCK | LOCK_WAIT, Phase::Flipping(flip))
+                if (op == REMOVE && unlink_early && index >= EARLY_REMOVE && flip.early > 0)
+                    || (op == BLOOM_STAGE && flip.bloom_staging)
+                    || op == LOCK
+                    || op == LOCK_WAIT =>
+            {
+                self.complete_flip_acquire(op, index, &done, effects)
+            }
+            (LOG_TRUNCATE | LOG_WRITE | LOG_SYNC | DIR_SYNC | BLOOM_WRITE, Phase::Flipping(_)) => {
+                self.complete_flip_log(op, index, &done, effects)
+            }
+            (SLOT_WRITE | HEAD_SYNC | UNLOCK, Phase::Flipping(_)) => {
+                self.complete_flip_slot(op, index, &done, effects)
+            }
+            _ => Err(StoreError::Unasked { op, index, phase: self.what() }),
+        };
+        if let Err(why) = outcome {
+            self.fail_completion(why, effects);
+        }
+    }
+
+    #[inline(never)]
+    fn complete_bloom_map<P: Par>(&mut self, done: Done, now_ns: u64, par: &P, effects: &mut EffectList) -> Result<(), StoreError> {
+        self.bloom_loading = false;
+        if let Done::Mapped(map) = done {
+            self.bloom.set_mapping(map);
+            if self.slot.is_some() {
+                self.bloom.index_manifest(&self.manifest.segments, &self.manifest.roots);
+            }
+        }
+        if let Some(parked) = self.open_parked.take() {
+            return self.resolved(Ctx::Open, parked.base, false, parked.fell_back, now_ns, effects);
+        }
+        if matches!(self.phase, Phase::LoadingBloom) {
+            self.phase = Phase::Ready;
+            if let Some(keys) = self.bloom_parked_keys.take() {
+                let _ = self.map_matching_keys_par(keys.as_slice(), now_ns, par, effects)?;
+            } else if let Some(change) = self.bloom_parked_flip.take() {
+                self.start_flip(change, effects);
+            }
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn complete_head_read(&mut self, index: u32, done: &Done, now_ns: u64, effects: &mut EffectList) -> Result<(), StoreError> {
+        let Phase::ReadHead(ctx) = &self.phase else { unreachable!() };
+        let ctx = *ctx;
+        let Done::Read(bytes) = done else {
+            return Err(io("reading the head", &self.head, done).unwrap_or(StoreError::Unasked {
+                op: HEAD_READ,
+                index,
+                phase: "reading the head",
+            }));
+        };
+        let read = format::read_head(bytes);
+        if let HeadRead::Refused(why) = &read {
+            return Err(why.clone());
+        }
+        if let HeadRead::Version { found, .. } = read {
+            // A store of the previous layout (rule 26): refused by name, never read as
+            // empty; there is no migration, the store is rebuilt from what made it.
+            return Err(StoreError::Format { what: format::HEAD_SLOT, found, wanted: FORMAT });
+        }
+        if bytes.len() < HEAD_LEN {
+            // A plain head (or nothing) short of its length: made at its full length
+            // and synced before anything else is written, so no flip ever extends or
+            // rewrites it. The cut extends with zeros and never touches a byte there.
+            if ctx == Ctx::Flip || self.head_made {
+                return Err(StoreError::Head { what: format::HEAD_CUT, at: bytes.len() as u64 });
+            }
+            self.head_made = true;
+            // The trace a cut head holds is kept: the zeros the cut adds are not one.
+            self.head_torn = match read {
+                HeadRead::Fresh { torn } | HeadRead::Committed(_, _, torn) => torn,
+                HeadRead::Refused(_) | HeadRead::Version { .. } => None,
+            };
+            // THE FOLDERS FIRST (the module's "Durable names"): the cache directory tag
+            // written durably, which makes the store's folder and every folder above it
+            // that is missing, each one's name synced into its parent (blaze-core
+            // `Effect::Write`, `make_parent_durably`), before anything else is made in
+            // it. The head is made after, so its Truncate makes no folder.
+            let tag_file = self.name(CACHEDIR_TAG);
+            let tag_bytes = CACHEDIR_SIGNATURE.to_vec();
+            let tag = self.tag(HEAD_MAKE, 0);
+            effects.push(Effect::Write { file: tag_file, bytes: tag_bytes, tag });
+            self.phase = Phase::MakeHead;
+            return Ok(());
+        }
+        let torn = match read {
+            HeadRead::Fresh { torn } | HeadRead::Committed(_, _, torn) => torn.or(self.head_torn.take()),
+            HeadRead::Refused(_) | HeadRead::Version { .. } => None,
+        };
+        if let Some(at) = torn
+            && ctx == Ctx::Open
+        {
+            self.torn_stamp = true;
+            self.report.lost.push(Lost {
+                file: self.head.share(),
+                segment: None,
+                records: None,
+                why: format!("its slot {at} is torn: a flip a power cut cut short; what no whole generation names is read from the segments' own footers and reported"),
+            });
+        }
+        match read {
+            HeadRead::Refused(_) | HeadRead::Version { .. } => unreachable!("refused above"),
+            // No whole slot: at an open, what the directory holds is read from the
+            // files' own footers and reported (nothing, for a store never written).
+            HeadRead::Fresh { .. } => self.resolved(ctx, Base { slot: None, manifest: Manifest::default() }, true, ctx == Ctx::Open, now_ns, effects),
+            HeadRead::Committed(newest, older, _) => {
+                if ctx == Ctx::Flip && self.plant() == Plant::StaleBase && self.slot.is_some() {
+                    let base = Base { slot: self.slot, manifest: self.manifest.clone() };
+                    return self.resolved(ctx, base, false, false, now_ns, effects);
+                }
+                if ctx == Ctx::Flip && Some(newest) == self.slot {
+                    // Nothing flipped since this process last read: its manifest is the base.
+                    let base = Base { slot: self.slot, manifest: self.manifest.clone() };
+                    return self.resolved(ctx, base, false, false, now_ns, effects);
+                }
+                // A torn slot beside it: a newer flip was cut, and the segments it
+                // named are found and reported by the directory's look.
+                if ctx == Ctx::Open && !self.bloom_loading {
+                    if self.eager || self.plant() == Plant::MapsAllAtOpen {
+                        self.bloom_loading = true;
+                        effects.push(Effect::Map { file: self.bloom_file.share(), extent: Extent::Whole, tag: self.tag(BLOOM_MAP, 0) });
+                    } else {
+                        self.bloom_deferred = true;
                     }
                 }
-                if let Some(parked) = self.open_parked.take() {
-                    return self.resolved(Ctx::Open, parked.base, false, parked.fell_back, now_ns, effects);
-                }
-                if matches!(self.phase, Phase::LoadingBloom) {
-                    self.phase = Phase::Ready;
-                    if let Some(keys) = self.bloom_parked_keys.take() {
-                        let _ = self.map_matching_keys_par(keys.as_slice(), now_ns, par, effects)?;
-                    } else if let Some(change) = self.bloom_parked_flip.take() {
-                        self.start_flip(change, effects);
-                    }
-                }
+                self.read_manifest(ctx, [Some(newest), older], 0, ctx == Ctx::Open && torn.is_some(), effects);
                 Ok(())
             }
-            (REMOVE, Phase::Flipping(flip)) if unlink_early && index >= EARLY_REMOVE && flip.early > 0 => {
-                flip.early -= 1;
-                if flip.early == 0
-                    && let Some(first) = flip.deferred.take()
-                {
-                    effects.push(first);
-                }
-                Ok(())
+        }
+    }
+
+    #[inline(never)]
+    fn complete_manifest_read(&mut self, index: u32, done: &Done, now_ns: u64, effects: &mut EffectList) -> Result<(), StoreError> {
+        let Phase::ReadManifest { ctx, slots, at, fell_back } = &self.phase else { unreachable!() };
+        let (ctx, slots, at, fell_back) = (*ctx, *slots, *at, *fell_back);
+        let slot = slots[at].expect("read");
+        let log = self.log_file(slot.log);
+        let bytes = match done {
+            Done::Read(bytes) => bytes,
+            done => {
+                // Whether the log is there decides what the failure means: one the
+                // directory still holds failed to read (an error); one a power cut took
+                // is the same as torn.
+                let why = io("reading a manifest", &log, done).unwrap_or(StoreError::Unasked {
+                    op: MANIFEST_READ,
+                    index,
+                    phase: "reading a manifest",
+                });
+                effects.push(Effect::List { dir: self.cfg.dir.share().into(), tag: self.tag(LIST, 0) });
+                self.phase = Phase::CheckLog { ctx, slots, at, why };
+                return Ok(());
             }
-            (HEAD_READ, Phase::ReadHead(ctx)) => {
-                let ctx = *ctx;
-                let Done::Read(bytes) = done else {
-                    return Err(fail("reading the head", &self.head, &done).unwrap_or_else(|| unexpected("reading the head")));
-                };
-                let read = format::read_head(&bytes);
-                if let HeadRead::Refused(why) = &read {
-                    return Err(why.clone());
+        };
+        let most = self.tiers().segment_most();
+        let manifest = (bytes.len() == slot.manifest_len as usize && crc32c::crc32c(bytes) == slot.manifest_crc)
+            .then(|| Manifest::decode(bytes, most))
+            .transpose();
+        match manifest {
+            Ok(Some(manifest)) if manifest.generation == slot.generation => {
+                // Read back whole: the log is there to append to.
+                self.log_lost = false;
+                if ctx == Ctx::Open {
+                    self.report.whole = Some(manifest.generation);
                 }
-                if let HeadRead::Version { found, .. } = read {
-                    // A store of the previous layout (rule 26): refused by name, never read as
-                    // empty; there is no migration, the store is rebuilt from what made it.
-                    return Err(StoreError::Format { what: format::HEAD_SLOT, found, wanted: FORMAT });
-                }
-                if bytes.len() < HEAD_LEN {
-                    // A plain head (or nothing) short of its length: made at its full length
-                    // and synced before anything else is written, so no flip ever extends or
-                    // rewrites it. The cut extends with zeros and never touches a byte there.
-                    if ctx == Ctx::Flip || self.head_made {
-                        return Err(StoreError::Head { what: format::HEAD_CUT, at: bytes.len() as u64 });
-                    }
-                    self.head_made = true;
-                    // The trace a cut head holds is kept: the zeros the cut adds are not one.
-                    self.head_torn = match read {
-                        HeadRead::Fresh { torn } | HeadRead::Committed(_, _, torn) => torn,
-                        HeadRead::Refused(_) | HeadRead::Version { .. } => None,
-                    };
-                    // THE FOLDERS FIRST (the module's "Durable names"): the cache directory tag
-                    // written durably, which makes the store's folder and every folder above it
-                    // that is missing, each one's name synced into its parent (blaze-core
-                    // `Effect::Write`, `make_parent_durably`), before anything else is made in
-                    // it. The head is made after, so its Truncate makes no folder.
-                    let tag_file = self.name(CACHEDIR_TAG);
-                    let bytes = CACHEDIR_SIGNATURE.to_vec();
-                    let tag = self.tag(HEAD_MAKE, 0);
-                    effects.push(Effect::Write { file: tag_file, bytes, tag });
-                    self.phase = Phase::MakeHead;
-                    return Ok(());
-                }
-                let torn = match read {
-                    HeadRead::Fresh { torn } | HeadRead::Committed(_, _, torn) => torn.or(self.head_torn.take()),
-                    HeadRead::Refused(_) | HeadRead::Version { .. } => None,
-                };
-                if let Some(at) = torn
-                    && ctx == Ctx::Open
-                {
-                    self.torn_stamp = true;
-                    self.report.lost.push(Lost {
-                        file: self.head.share(),
-                        segment: None,
-                        records: None,
-                        why: format!("its slot {at} is torn: a flip a power cut cut short; what no whole generation names is read from the segments' own footers and reported"),
-                    });
-                }
-                match read {
-                    HeadRead::Refused(_) | HeadRead::Version { .. } => unreachable!("refused above"),
-                    // No whole slot: at an open, what the directory holds is read from the
-                    // files' own footers and reported (nothing, for a store never written).
-                    HeadRead::Fresh { .. } => self.resolved(ctx, Base { slot: None, manifest: Manifest::default() }, true, ctx == Ctx::Open, now_ns, effects),
-                    HeadRead::Committed(newest, older, _) => {
-                        if ctx == Ctx::Flip && self.plant() == Plant::StaleBase && self.slot.is_some() {
-                            let base = Base { slot: self.slot, manifest: self.manifest.clone() };
-                            return self.resolved(ctx, base, false, false, now_ns, effects);
-                        }
-                        if ctx == Ctx::Flip && Some(newest) == self.slot {
-                            // Nothing flipped since this process last read: its manifest is the base.
-                            let base = Base { slot: self.slot, manifest: self.manifest.clone() };
-                            return self.resolved(ctx, base, false, false, now_ns, effects);
-                        }
-                        // A torn slot beside it: a newer flip was cut, and the segments it
-                        // named are found and reported by the directory's look.
-                        if ctx == Ctx::Open && !self.bloom_loading {
-                            if self.eager || self.plant() == Plant::MapsAllAtOpen {
-                                self.bloom_loading = true;
-                                effects.push(Effect::Map { file: self.bloom_file.share(), extent: Extent::Whole, tag: self.tag(BLOOM_MAP, 0) });
-                            } else {
-                                self.bloom_deferred = true;
-                            }
-                        }
-                        self.read_manifest(ctx, [Some(newest), older], 0, ctx == Ctx::Open && torn.is_some(), effects);
-                        Ok(())
-                    }
-                }
+                self.resolved(ctx, Base { slot: Some(slot), manifest }, false, fell_back, now_ns, effects)
             }
-            (MANIFEST_READ, Phase::ReadManifest { ctx, slots, at, fell_back }) => {
-                let (ctx, slots, at, fell_back) = (*ctx, *slots, *at, *fell_back);
-                let slot = slots[at].expect("read");
-                let log = self.log_file(slot.log);
-                let bytes = match done {
-                    Done::Read(bytes) => bytes,
-                    done => {
-                        // Whether the log is there decides what the failure means: one the
-                        // directory still holds failed to read (an error); one a power cut took
-                        // is the same as torn.
-                        let why = fail("reading a manifest", &log, &done).unwrap_or_else(|| unexpected("reading a manifest"));
-                        effects.push(Effect::List { dir: self.cfg.dir.share().into(), tag: self.tag(LIST, 0) });
-                        self.phase = Phase::CheckLog { ctx, slots, at, why };
-                        return Ok(());
-                    }
-                };
-                let most = self.tiers().segment_most();
-                let manifest = (bytes.len() == slot.manifest_len as usize && crc32c::crc32c(&bytes) == slot.manifest_crc)
-                    .then(|| Manifest::decode(&bytes, most))
-                    .transpose();
-                match manifest {
-                    Ok(Some(manifest)) if manifest.generation == slot.generation => {
-                        // Read back whole: the log is there to append to.
-                        self.log_lost = false;
-                        if ctx == Ctx::Open {
-                            self.report.whole = Some(manifest.generation);
-                        }
-                        self.resolved(ctx, Base { slot: Some(slot), manifest }, false, fell_back, now_ns, effects)
-                    }
-                    Err(why) => Err(why),
-                    _ => self.manifest_torn(ctx, slots, at, now_ns, effects),
-                }
-            }
-            (HEAD_MAKE, Phase::MakeHead) => {
-                let tag_file = self.name(CACHEDIR_TAG);
-                let (doing, file) = match index {
-                    0 => ("writing the cache directory tag, which makes the store's folders durably", &tag_file),
-                    1 => ("making the head at its length", &self.head),
-                    2 => ("syncing the head made", &self.head),
-                    _ => ("syncing the store's directory after making the head", &self.cfg.dir),
-                };
-                if let Some(why) = fail(doing, file, &done) {
-                    return Err(why);
-                }
-                if index == 0 {
-                    // The folders are durable: the head now, a Truncate that keeps what a cut
-                    // head holds and extends it with zeros (never a whole-file write: another
-                    // process may have made the head and flipped since this one read it short,
-                    // and a Truncate to the length it has is no change).
-                    effects.push(Effect::Truncate { file: self.head.share(), len: HEAD_LEN as u64, tag: self.tag(HEAD_MAKE, 1) });
-                } else if index == 1 {
-                    // Ordered before `SyncDir` below, which flushes the barriered head bytes and
-                    // its directory entry together in one hardware sync instead of two.
-                    effects.push(Effect::Barrier { file: self.head.share(), tag: self.tag(HEAD_MAKE, 2) });
-                } else if index == 2 {
-                    // And its name with it: a power cut never keeps a segment's name and loses
-                    // the head's.
-                    effects.push(Effect::SyncDir { dir: self.cfg.dir.share().into(), tag: self.tag(HEAD_MAKE, 3) });
-                } else {
-                    self.phase = Phase::ReadHead(Ctx::Open);
-                    effects.push(Effect::ReadAll { file: self.head.share(), tag: self.tag(HEAD_READ, 0) });
-                }
-                Ok(())
-            }
-            (LIST, Phase::CheckLog { .. }) => {
-                let Phase::CheckLog { ctx, slots, at, why } = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!() };
+            Err(why) => Err(why),
+            _ => self.manifest_torn(ctx, slots, at, now_ns, effects),
+        }
+    }
+
+    #[inline(never)]
+    fn complete_head_make(&mut self, index: u32, done: &Done, effects: &mut EffectList) -> Result<(), StoreError> {
+        let tag_file = self.name(CACHEDIR_TAG);
+        let (doing, file) = match index {
+            0 => ("writing the cache directory tag, which makes the store's folders durably", &tag_file),
+            1 => ("making the head at its length", &self.head),
+            2 => ("syncing the head made", &self.head),
+            _ => ("syncing the store's directory after making the head", &self.cfg.dir),
+        };
+        if let Some(why) = io(doing, file, done) {
+            return Err(why);
+        }
+        if index == 0 {
+            // The folders are durable: the head now, a Truncate that keeps what a cut
+            // head holds and extends it with zeros (never a whole-file write: another
+            // process may have made the head and flipped since this one read it short,
+            // and a Truncate to the length it has is no change).
+            effects.push(Effect::Truncate { file: self.head.share(), len: HEAD_LEN as u64, tag: self.tag(HEAD_MAKE, 1) });
+        } else if index == 1 {
+            // Ordered before `SyncDir` below, which flushes the barriered head bytes and
+            // its directory entry together in one hardware sync instead of two.
+            effects.push(Effect::Barrier { file: self.head.share(), tag: self.tag(HEAD_MAKE, 2) });
+        } else if index == 2 {
+            // And its name with it: a power cut never keeps a segment's name and loses
+            // the head's.
+            effects.push(Effect::SyncDir { dir: self.cfg.dir.share().into(), tag: self.tag(HEAD_MAKE, 3) });
+        } else {
+            self.phase = Phase::ReadHead(Ctx::Open);
+            effects.push(Effect::ReadAll { file: self.head.share(), tag: self.tag(HEAD_READ, 0) });
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn complete_check_log(&mut self, index: u32, done: &Done, now_ns: u64, effects: &mut EffectList) -> Result<(), StoreError> {
+        let Phase::CheckLog { ctx, slots, at, why } = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!() };
+        let Done::Listed(listed) = done else {
+            return Err(io("listing", &self.cfg.dir, done).unwrap_or(StoreError::Unasked { op: LIST, index, phase: "listing" }));
+        };
+        let log = self.log_file(slots[at].expect("read").log);
+        let leaf = log.as_str().rsplit('/').next().unwrap_or(log.as_str());
+        if listed.iter().any(|(name, _)| name.as_str().rsplit('/').next() == Some(leaf)) {
+            return Err(why);
+        }
+        self.manifest_torn(ctx, slots, at, now_ns, effects)
+    }
+
+    #[inline(never)]
+    fn complete_orphans(&mut self, op: u8, index: u32, done: &Done, effects: &mut EffectList) -> Result<(), StoreError> {
+        match op {
+            LIST => {
                 let Done::Listed(listed) = done else {
-                    return Err(fail("listing", &self.cfg.dir, &done).unwrap_or_else(|| unexpected("listing")));
-                };
-                let log = self.log_file(slots[at].expect("read").log);
-                let leaf = log.as_str().rsplit('/').next().unwrap_or(log.as_str());
-                if listed.iter().any(|(name, _)| name.as_str().rsplit('/').next() == Some(leaf)) {
-                    return Err(why);
-                }
-                self.manifest_torn(ctx, slots, at, now_ns, effects)
-            }
-            (LIST, Phase::Orphans { .. }) => {
-                let Done::Listed(listed) = done else {
-                    return Err(fail("listing", &self.cfg.dir, &done).unwrap_or_else(|| unexpected("listing")));
+                    return Err(io("listing", &self.cfg.dir, done).unwrap_or(StoreError::Unasked { op: LIST, index, phase: "listing" }));
                 };
                 let current_log = self.slot.map(|it| it.log);
                 let mut left = 0;
@@ -8772,12 +8905,13 @@ impl<A: Allocator + Clone> Plain<A> {
                 }
                 Ok(())
             }
-            (FOOTER_READ, Phase::Orphans { left }) => {
+            FOOTER_READ => {
+                let Phase::Orphans { left } = &mut self.phase else { unreachable!() };
                 *left -= 1;
                 let left = *left;
                 let (ref file, id) = self.listed[index as usize];
                 let file = file.share();
-                let records = match &done {
+                let records = match done {
                     Done::Read(bytes) => format::footer_count(bytes).map(u64::from),
                     _ => None,
                 };
@@ -8787,80 +8921,110 @@ impl<A: Allocator + Clone> Plain<A> {
                 }
                 Ok(())
             }
-            (MAP, Phase::Mapping { left, then }) => {
-                *left -= 1;
-                let (left, then) = (*left, *then);
-                self.on_map_par(index, done, par)?;
-                if left == 0 {
-                    if self.unopened.is_empty() {
-                        self.mapped_par(then, par, effects);
-                    } else {
-                        effects.push(Effect::List { dir: self.cfg.dir.share().into(), tag: self.tag(LIST, 0) });
-                        self.phase = Phase::CheckMaps { then };
-                    }
-                }
-                Ok(())
-            }
-            (LIST, Phase::CheckMaps { then }) => {
-                let then = *then;
-                let Done::Listed(listed) = done else {
-                    return Err(fail("listing", &self.cfg.dir, &done).unwrap_or_else(|| unexpected("listing")));
-                };
-                let generation = self.manifest.generation;
-                for (seg, file, why) in std::mem::replace(&mut self.unopened, Vec::new_in(self.alloc.clone())) {
-                    let leaf = file.as_str().rsplit('/').next().unwrap_or(file.as_str());
-                    if listed.iter().any(|(name, _)| name.as_str().rsplit('/').next() == Some(leaf)) {
-                        // Here, and its map failed: the failure, by name, never a loss.
-                        return Err(why);
-                    }
-                    let why = format!("generation {generation} names it, written in an earlier boot, and it is gone: a power cut before the kernel wrote its directory entry back; its records are dropped");
-                    self.lose(seg, file, LostKind::Gone, why);
-                }
+            _ => unreachable!(),
+        }
+    }
+
+    #[inline(never)]
+    fn complete_map_segment<P: Par>(&mut self, index: u32, done: Done, par: &P, effects: &mut EffectList) -> Result<(), StoreError> {
+        let Phase::Mapping { left, then } = &mut self.phase else { unreachable!() };
+        *left -= 1;
+        let (left, then) = (*left, *then);
+        self.on_map_par(index, done, par)?;
+        if left == 0 {
+            if self.unopened.is_empty() {
                 self.mapped_par(then, par, effects);
-                Ok(())
+            } else {
+                effects.push(Effect::List { dir: self.cfg.dir.share().into(), tag: self.tag(LIST, 0) });
+                self.phase = Phase::CheckMaps { then };
             }
-            (BARRIER, Phase::Sealing { left, ids }) => {
-                let id = ids.get(index as usize).map(|it| it.0).ok_or_else(|| unexpected("sealing"))?;
-                *left -= 1;
-                let left = *left;
-                if let Some(why) = fail("ordering a segment before the flip that seals it", &self.segment_file(id), &done) {
-                    return Err(why);
-                }
-                if !matches!(done, Done::Ordered | Done::Synced) {
-                    return Err(unexpected("sealing"));
-                }
-                if left == 0 {
-                    let Phase::Sealing { ids, .. } = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!("sealing") };
-                    self.start_flip(Change::Seal { ids }, effects);
-                }
-                Ok(())
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn complete_check_maps<P: Par>(&mut self, index: u32, done: &Done, par: &P, effects: &mut EffectList) -> Result<(), StoreError> {
+        let Phase::CheckMaps { then } = &self.phase else { unreachable!() };
+        let then = *then;
+        let Done::Listed(listed) = done else {
+            return Err(io("listing", &self.cfg.dir, done).unwrap_or(StoreError::Unasked { op: LIST, index, phase: "listing" }));
+        };
+        let generation = self.manifest.generation;
+        for (seg, file, why) in std::mem::replace(&mut self.unopened, Vec::new_in(self.alloc.clone())) {
+            let leaf = file.as_str().rsplit('/').next().unwrap_or(file.as_str());
+            if listed.iter().any(|(name, _)| name.as_str().rsplit('/').next() == Some(leaf)) {
+                // Here, and its map failed: the failure, by name, never a loss.
+                return Err(why);
             }
-            (REMOVE, Phase::Removing { left, then }) => {
-                *left -= 1;
-                let (left, then) = (*left, *then);
-                if let Some(why) = fail("unlinking a file retired past its grace period", &self.removing[index as usize], &done) {
-                    return Err(why);
+            let why = format!("generation {generation} names it, written in an earlier boot, and it is gone: a power cut before the kernel wrote its directory entry back; its records are dropped");
+            self.lose(seg, file, LostKind::Gone, why);
+        }
+        self.mapped_par(then, par, effects);
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn complete_sealing(&mut self, index: u32, done: &Done, effects: &mut EffectList) -> Result<(), StoreError> {
+        let Phase::Sealing { left, ids } = &mut self.phase else { unreachable!() };
+        let id = ids.get(index as usize).map(|it| it.0).ok_or(StoreError::Unasked { op: BARRIER, index, phase: "sealing" })?;
+        *left -= 1;
+        let left = *left;
+        if let Some(why) = io("ordering a segment before the flip that seals it", &self.segment_file(id), done) {
+            return Err(why);
+        }
+        if !matches!(done, Done::Ordered | Done::Synced) {
+            return Err(StoreError::Unasked { op: BARRIER, index, phase: "sealing" });
+        }
+        if left == 0 {
+            let Phase::Sealing { ids, .. } = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!("sealing") };
+            self.start_flip(Change::Seal { ids }, effects);
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn complete_removing(&mut self, index: u32, done: &Done, effects: &mut EffectList) -> Result<(), StoreError> {
+        let Phase::Removing { left, then } = &mut self.phase else { unreachable!() };
+        *left -= 1;
+        let (left, then) = (*left, *then);
+        if let Some(why) = io("unlinking a file retired past its grace period", &self.removing[index as usize], done) {
+            return Err(why);
+        }
+        if left == 0 {
+            match then {
+                Then::Compact(stats) if self.sliced.is_some_and(|it| it.aborted) => {
+                    let _ = stats;
+                    self.phase = Phase::Ready;
                 }
-                if left == 0 {
-                    match then {
-                        Then::Compact(stats) if self.sliced.is_some_and(|it| it.aborted) => {
-                            let _ = stats;
-                            self.phase = Phase::Ready;
-                        }
-                        then => self.map_new(then, effects),
-                    }
-                }
-                Ok(())
+                then => self.map_new(then, effects),
             }
-            (LIST, Phase::Listing) => {
-                let Done::Listed(listed) = done else {
-                    return Err(fail("listing", &self.cfg.dir, &done).unwrap_or_else(|| unexpected("listing")));
-                };
-                self.listed_compact(listed, now_ns, effects);
-                Ok(())
-            }
-            (SEG_TRUNCATE, Phase::Writing(writing, _)) => {
-                if let Some(why) = fail("making a segment", &writing.file, &done) {
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn complete_listing(&mut self, index: u32, done: Done, now_ns: u64, effects: &mut EffectList) -> Result<(), StoreError> {
+        let Done::Listed(listed) = done else {
+            return Err(io("listing", &self.cfg.dir, &done).unwrap_or(StoreError::Unasked { op: LIST, index, phase: "listing" }));
+        };
+        self.listed_compact(listed, now_ns, effects);
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn complete_segment_write(
+        &mut self,
+        op: u8,
+        index: u32,
+        done: &Done,
+        batches: &[&Batch],
+        records: &[LentRecord<'_>],
+        effects: &mut EffectList,
+    ) -> Result<(), StoreError> {
+        match op {
+            SEG_TRUNCATE => {
+                let Phase::Writing(writing, _) = &mut self.phase else { unreachable!() };
+                if let Some(why) = io("making a segment", &writing.file, done) {
                     return Err(why);
                 }
                 let pieces = std::mem::replace(&mut writing.pieces, Vec::new_in(self.alloc.clone()));
@@ -8874,8 +9038,9 @@ impl<A: Allocator + Clone> Plain<A> {
                 self.commit_stream_on(batches, records, effects);
                 Ok(())
             }
-            (SEG_PIECE, Phase::Writing(writing, _)) => {
-                if let Some(why) = fail("writing a segment", &writing.file, &done) {
+            SEG_PIECE => {
+                let Phase::Writing(writing, _) = &mut self.phase else { unreachable!() };
+                if let Some(why) = io("writing a segment", &writing.file, done) {
                     return Err(why);
                 }
                 writing.left -= 1;
@@ -8910,16 +9075,33 @@ impl<A: Allocator + Clone> Plain<A> {
                 }
                 Ok(())
             }
-            (SEG_RENAME, Phase::Renaming(writing, _)) => {
-                if let Some(why) = fail("renaming a merge's copy to its digest's name", &writing.file, &done) {
+            _ => unreachable!(),
+        }
+    }
+
+    #[inline(never)]
+    fn complete_segment_finish(
+        &mut self,
+        op: u8,
+        index: u32,
+        done: &Done,
+        batches: &[&Batch],
+        records: &[LentRecord<'_>],
+        effects: &mut EffectList,
+    ) -> Result<(), StoreError> {
+        match op {
+            SEG_RENAME => {
+                let Phase::Renaming(writing, _) = &self.phase else { unreachable!() };
+                if let Some(why) = io("renaming a merge's copy to its digest's name", &writing.file, done) {
                     return Err(why);
                 }
                 let Phase::Renaming(writing, why) = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!() };
                 self.segment_done(*writing, *why, batches, records, effects);
                 Ok(())
             }
-            (SEG_UNWRITE, Phase::Unwriting { temp, .. }) => {
-                if let Some(why) = fail("removing a merge's copy whose bytes are named already", temp, &done) {
+            SEG_UNWRITE => {
+                let Phase::Unwriting { temp, .. } = &self.phase else { unreachable!() };
+                if let Some(why) = io("removing a merge's copy whose bytes are named already", temp, done) {
                     return Err(why);
                 }
                 let Phase::Unwriting { writing, why, .. } = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!() };
@@ -8947,20 +9129,39 @@ impl<A: Allocator + Clone> Plain<A> {
                 self.segment_written(Synced::already_named(*writing), *why, batches, records, effects);
                 Ok(())
             }
-            (SEG_SYNC, Phase::SyncingSegment(writing, _)) => {
-                if let Some(why) = fail("ordering a segment", &writing.file, &done) {
+            SEG_SYNC => {
+                let Phase::SyncingSegment(writing, _) = &self.phase else { unreachable!() };
+                if let Some(why) = io("ordering a segment", &writing.file, done) {
                     return Err(why);
                 }
                 if !matches!(done, Done::Ordered | Done::Synced) {
-                    return Err(unexpected("ordering a segment"));
+                    return Err(StoreError::Unasked { op: SEG_SYNC, index, phase: "ordering a segment" });
                 }
                 let Phase::SyncingSegment(writing, why) = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!() };
                 self.segment_written(Synced::by_sync(*writing), *why, batches, records, effects);
                 Ok(())
             }
-            (BLOOM_STAGE, Phase::Flipping(flip)) if flip.bloom_staging => {
+            _ => unreachable!(),
+        }
+    }
+
+    #[inline(never)]
+    fn complete_flip_acquire(&mut self, op: u8, index: u32, done: &Done, effects: &mut EffectList) -> Result<(), StoreError> {
+        match op {
+            REMOVE => {
+                let Phase::Flipping(flip) = &mut self.phase else { unreachable!() };
+                flip.early -= 1;
+                if flip.early == 0
+                    && let Some(first) = flip.deferred.take()
+                {
+                    effects.push(first);
+                }
+                Ok(())
+            }
+            BLOOM_STAGE => {
                 // `bloom` is a rebuildable acceleration sidecar: staging failure outside the lock
                 // never aborts the flip; fall through to acquiring `flip` with `bloom_staged = None`.
+                let Phase::Flipping(flip) = &mut self.phase else { unreachable!() };
                 flip.bloom_staging = false;
                 if matches!(done, Done::Failed(_) | Done::Broken { .. }) {
                     flip.bloom_staged = None;
@@ -8968,13 +9169,14 @@ impl<A: Allocator + Clone> Plain<A> {
                 effects.push(Effect::Lock { file: self.flip.share(), mode: LockMode::Exclusive, tag: self.tag(LOCK, 0) });
                 Ok(())
             }
-            (LOCK, Phase::Flipping(flip)) => match done {
+            LOCK => match done {
                 Done::Locked => {
                     self.holds_lock = true;
                     self.phase_ctx_read_head(effects);
                     Ok(())
                 }
                 Done::Contended => {
+                    let Phase::Flipping(flip) = &mut self.phase else { unreachable!() };
                     // This flip's earlier asks, then this one's step ([`lock_step`]).
                     let earlier = flip.waits;
                     flip.waits += 1;
@@ -8992,38 +9194,54 @@ impl<A: Allocator + Clone> Plain<A> {
                     effects.push(Effect::Timer { after: Duration::from_nanos(step), tag: self.tag(LOCK_WAIT, 0) });
                     Ok(())
                 }
-                done => Err(fail("taking the flip lock", &self.flip, &done).unwrap_or_else(|| unexpected("taking the flip lock"))),
+                done => Err(io("taking the flip lock", &self.flip, done).unwrap_or(StoreError::Unasked {
+                    op: LOCK,
+                    index,
+                    phase: "taking the flip lock",
+                })),
             },
-            (LOCK_WAIT, Phase::Flipping(_)) => {
+            LOCK_WAIT => {
                 effects.push(Effect::Lock { file: self.flip.share(), mode: LockMode::Exclusive, tag: self.tag(LOCK, 0) });
                 Ok(())
             }
-            (LOG_TRUNCATE, Phase::Flipping(flip)) => {
-                if let Some(why) = fail("making a manifest log", &flip.log, &done) {
+            _ => unreachable!(),
+        }
+    }
+
+    #[inline(never)]
+    fn complete_flip_log(&mut self, op: u8, index: u32, done: &Done, effects: &mut EffectList) -> Result<(), StoreError> {
+        match op {
+            LOG_TRUNCATE => {
+                let Phase::Flipping(flip) = &mut self.phase else { unreachable!() };
+                if let Some(why) = io("making a manifest log", &flip.log, done) {
                     return Err(why);
                 }
                 let bytes = std::mem::take(&mut flip.manifest_bytes);
-                effects.push(Effect::WriteAt { file: flip.log.share(), at: 0, bytes, tag: self.tag(LOG_WRITE, 0) });
+                let log = flip.log.share();
+                effects.push(Effect::WriteAt { file: log, at: 0, bytes, tag: self.tag(LOG_WRITE, 0) });
                 Ok(())
             }
-            (LOG_WRITE, Phase::Flipping(flip)) => {
-                if let Some(why) = fail("writing a manifest", &flip.log, &done) {
+            LOG_WRITE => {
+                let Phase::Flipping(flip) = &self.phase else { unreachable!() };
+                if let Some(why) = io("writing a manifest", &flip.log, done) {
                     return Err(why);
                 }
                 if self.commit_durability.orders_before_flip() {
+                    let log = flip.log.share();
                     self.put_path.barriers += 1;
-                    effects.push(Effect::Barrier { file: flip.log.share(), tag: self.tag(LOG_SYNC, 0) });
+                    effects.push(Effect::Barrier { file: log, tag: self.tag(LOG_SYNC, 0) });
                 } else {
                     self.write_slot(effects);
                 }
                 Ok(())
             }
-            (LOG_SYNC, Phase::Flipping(flip)) => {
-                if let Some(why) = fail("ordering a manifest log", &flip.log, &done) {
+            LOG_SYNC => {
+                let Phase::Flipping(flip) = &self.phase else { unreachable!() };
+                if let Some(why) = io("ordering a manifest log", &flip.log, done) {
                     return Err(why);
                 }
                 if !matches!(done, Done::Ordered | Done::Synced) {
-                    return Err(unexpected("ordering a manifest log"));
+                    return Err(StoreError::Unasked { op: LOG_SYNC, index, phase: "ordering a manifest log" });
                 }
                 if !self.commit_durability.flushes_flip() || self.plant() == Plant::SkipDirSync {
                     self.write_slot(effects);
@@ -9035,20 +9253,21 @@ impl<A: Allocator + Clone> Plain<A> {
                 }
                 Ok(())
             }
-            (DIR_SYNC, Phase::Flipping(_)) => {
-                if let Some(why) = fail("syncing the store's directory", &self.cfg.dir, &done) {
+            DIR_SYNC => {
+                if let Some(why) = io("syncing the store's directory", &self.cfg.dir, done) {
                     return Err(why);
                 }
                 self.write_slot(effects);
                 Ok(())
             }
-            (BLOOM_WRITE, Phase::Flipping(flip)) => {
+            BLOOM_WRITE => {
                 // `bloom` is a rebuildable acceleration sidecar: an I/O error renaming or
                 // appending to it never aborts the generation flip, but we clear `bloom_written`
                 // so `BloomIndex::mapped_bytes` is only updated when the write actually succeeded.
                 // When `RenameUnsynced` succeeded (`Done::Renamed`), the temp file was atomically
                 // consumed so clear `bloom_staged`; otherwise leave `bloom_staged` so `flipped()`
                 // removes the unused temp file after unlock.
+                let Phase::Flipping(flip) = &mut self.phase else { unreachable!() };
                 if matches!(done, Done::Renamed) {
                     flip.bloom_staged = None;
                 } else if matches!(done, Done::Failed(_) | Done::Broken { .. }) {
@@ -9057,7 +9276,14 @@ impl<A: Allocator + Clone> Plain<A> {
                 self.write_slot(effects);
                 Ok(())
             }
-            (SLOT_WRITE, Phase::Flipping(_)) => {
+            _ => unreachable!(),
+        }
+    }
+
+    #[inline(never)]
+    fn complete_flip_slot(&mut self, op: u8, index: u32, done: &Done, effects: &mut EffectList) -> Result<(), StoreError> {
+        match op {
+            SLOT_WRITE => {
                 // One write at a time, the slot last ([`Plain::write_slot`]): a failure here
                 // stops the store with nothing of this flip in flight under the lock, and
                 // before the slot, with nothing of it committed.
@@ -9067,7 +9293,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     _ => "writing the head",
                 };
                 let file = if index == 1 { self.name(CACHEDIR_TAG) } else { self.head.share() };
-                if let Some(why) = fail(what, &file, &done) {
+                if let Some(why) = io(what, &file, done) {
                     return Err(why);
                 }
                 match index {
@@ -9088,44 +9314,45 @@ impl<A: Allocator + Clone> Plain<A> {
                 }
                 Ok(())
             }
-            (HEAD_SYNC, Phase::Flipping(_)) => {
-                if let Some(why) = fail("syncing the head", &self.head, &done) {
+            HEAD_SYNC => {
+                if let Some(why) = io("syncing the head", &self.head, done) {
                     return Err(why);
                 }
                 self.unlock(effects);
                 Ok(())
             }
-            (UNLOCK, Phase::Flipping(_)) => {
-                if let Some(why) = fail("letting go of the flip lock", &self.flip, &done) {
+            UNLOCK => {
+                if let Some(why) = io("letting go of the flip lock", &self.flip, done) {
                     return Err(why);
                 }
                 self.flipped(effects);
                 Ok(())
             }
-            _ => Err(unexpected(self.what())),
+            _ => unreachable!(),
         }
-        })();
-        if let Err(why) = outcome {
-            if let Phase::Flipping(flip) = &mut self.phase
-                && let Some(staged) = flip.bloom_staged.take()
-            {
-                effects.push(Effect::Remove { file: staged.file, tag: self.tag(BLOOM_CLEANUP, 0) });
-            }
-            if let Some(flip) = self.flip_parked.as_mut()
-                && let Some(staged) = flip.bloom_staged.take()
-            {
-                effects.push(Effect::Remove { file: staged.file, tag: self.tag(BLOOM_CLEANUP, 0) });
-            }
-            if self.holds_lock {
-                // A failure under the flip lock lets the lock go as the store stops, with
-                // nothing this process wrote under it still in flight (a flip writes under it
-                // one effect at a time, [`Plain::write_slot`]): a process
-                // that lives on with a broken store (a daemon) must not hold every other
-                // process's commit for good, and the kernel would let it go only at exit.
-                self.unlock(effects);
-            }
-            self.stop(why);
+    }
+
+    #[inline(never)]
+    fn fail_completion(&mut self, why: StoreError, effects: &mut EffectList) {
+        if let Phase::Flipping(flip) = &mut self.phase
+            && let Some(staged) = flip.bloom_staged.take()
+        {
+            effects.push(Effect::Remove { file: staged.file, tag: self.tag(BLOOM_CLEANUP, 0) });
         }
+        if let Some(flip) = self.flip_parked.as_mut()
+            && let Some(staged) = flip.bloom_staged.take()
+        {
+            effects.push(Effect::Remove { file: staged.file, tag: self.tag(BLOOM_CLEANUP, 0) });
+        }
+        if self.holds_lock {
+            // A failure under the flip lock lets the lock go as the store stops, with
+            // nothing this process wrote under it still in flight (a flip writes under it
+            // one effect at a time, [`Plain::write_slot`]): a process
+            // that lives on with a broken store (a daemon) must not hold every other
+            // process's commit for good, and the kernel would let it go only at exit.
+            self.unlock(effects);
+        }
+        self.stop(why);
     }
 
     /// The flip lock is held: the head is read again, under it.

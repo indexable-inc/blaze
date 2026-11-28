@@ -1792,3 +1792,246 @@ pub fn confinement_digest(text: &[u8]) -> Digest {
     hasher.update(text);
     Digest(hasher.finalize())
 }
+
+/// Maps hermetic child capabilities (`allow_net`, `allow_procs`) into a minimal
+/// [`blaze_sys::effects::DomainMask`] covering baseline filesystem/clock/rng/vm/stat/sync
+/// authority while omitting `NET` and `PROC` unless explicitly requested.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub const fn domain_mask_for_hermetic(
+    allow_net: bool,
+    allow_procs: bool,
+) -> blaze_sys::effects::DomainMask {
+    use blaze_sys::effects::DomainMask;
+    let mut mask = DomainMask::CLOCK
+        .union(DomainMask::RNG)
+        .union(DomainMask::VM)
+        .union(DomainMask::STAT)
+        .union(DomainMask::FS)
+        .union(DomainMask::SYNC);
+    if allow_net {
+        mask = mask.union(DomainMask::NET);
+    }
+    if allow_procs {
+        mask = mask.union(DomainMask::PROC);
+    }
+    mask
+}
+
+/// Renders a default-deny macOS Seatbelt SBPL profile for `mask` directly into `out` via
+/// [`blaze_sys::effects::synthesize_seatbelt_sbpl`] with zero heap allocation.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn render_effect_seatbelt_sbpl(
+    mask: blaze_sys::effects::DomainMask,
+    out: &mut impl core::fmt::Write,
+) -> core::fmt::Result {
+    blaze_sys::effects::synthesize_seatbelt_sbpl(mask, out)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<'a> HermeticSpec<'a> {
+    /// Returns the minimal [`blaze_sys::effects::DomainMask`] required by this hermetic spec:
+    /// never grants `NET`, and grants `PROC` only when [`Self::starts_programs`] is true.
+    #[blaze::noalloc]
+    #[blaze::nopanic]
+    pub const fn domain_mask(&self) -> blaze_sys::effects::DomainMask {
+        domain_mask_for_hermetic(false, !self.helpers.is_empty() || !self.helper_folders.is_empty())
+    }
+
+    /// Renders a default-deny macOS Seatbelt SBPL profile for this spec's [`Self::domain_mask`]
+    /// directly into `out` via [`blaze_sys::effects::synthesize_seatbelt_sbpl`] with zero heap
+    /// allocation.
+    pub fn seatbelt_sbpl(&self, out: &mut impl core::fmt::Write) -> core::fmt::Result {
+        render_effect_seatbelt_sbpl(self.domain_mask(), out)
+    }
+
+    /// Compiles a Linux Classic-BPF seccomp filter enforcing this spec's [`Self::domain_mask`] on
+    /// `arch` via [`blaze_sys::effects::compile_seccomp_bpf`] with zero heap allocation.
+    #[blaze::noalloc]
+    #[blaze::nopanic]
+    pub const fn seccomp_bpf(
+        &self,
+        arch: blaze_sys::effects::SeccompArch,
+    ) -> blaze_sys::effects::BpfProgram {
+        blaze_sys::effects::compile_seccomp_bpf(self.domain_mask(), arch)
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod effect_policy_tests {
+    use core::time::Duration;
+
+    use blaze_core::wait::Deadline;
+    use blaze_own::FixedString;
+    use blaze_roots::{Digest, Mount, Root, RootId, RootKind, Roots};
+    use blaze_sys::effects::{
+        BpfVerdict, DomainMask, SeccompArch, audit_arch, eval_seccomp_bpf, linux_syscall_nr,
+    };
+
+    use super::{
+        Budget, Capture, ClockSpec, HermeticOpts, HermeticSpec, HermeticStreams, Level, Program,
+        ReportSpec, domain_mask_for_hermetic, render_effect_seatbelt_sbpl,
+    };
+
+    #[test]
+    fn hermetic_domain_mask_default_omits_net_and_proc_and_renders_default_deny_sbpl() {
+        let mask = domain_mask_for_hermetic(false, false);
+        assert!(!mask.contains(DomainMask::NET), "default hermetic mask must omit NET");
+        assert!(!mask.contains(DomainMask::PROC), "default hermetic mask must omit PROC");
+        assert!(mask.contains(DomainMask::FS));
+        assert!(mask.contains(DomainMask::CLOCK));
+        assert!(mask.contains(DomainMask::RNG));
+        assert!(mask.contains(DomainMask::VM));
+        assert!(mask.contains(DomainMask::STAT));
+        assert!(mask.contains(DomainMask::SYNC));
+
+        let mut sbpl = FixedString::<2048>::new();
+        assert_eq!(render_effect_seatbelt_sbpl(mask, &mut sbpl), Ok(()));
+        let text = sbpl.text().expect("SBPL profile fits in 2048 bytes");
+        assert!(
+            text.starts_with("(version 1)\n(deny default)\n"),
+            "missing default-deny header:\n{text}"
+        );
+        assert!(
+            !text.contains("network*"),
+            "default hermetic SBPL must not permit network*:\n{text}"
+        );
+        assert!(
+            !text.contains("process-fork"),
+            "default hermetic SBPL must not permit process-fork:\n{text}"
+        );
+        assert!(
+            !text.contains("process-exec"),
+            "default hermetic SBPL must not permit process-exec:\n{text}"
+        );
+
+        let net_mask = domain_mask_for_hermetic(true, false);
+        assert!(net_mask.contains(DomainMask::NET));
+        assert!(!net_mask.contains(DomainMask::PROC));
+        let mut net_sbpl = FixedString::<2048>::new();
+        assert_eq!(render_effect_seatbelt_sbpl(net_mask, &mut net_sbpl), Ok(()));
+        let net_text = net_sbpl.text().expect("net SBPL fits");
+        assert!(net_text.contains("(allow network*)"), "missing network*:\n{net_text}");
+        assert!(!net_text.contains("process-fork"), "unexpected process-fork:\n{net_text}");
+
+        let proc_mask = domain_mask_for_hermetic(false, true);
+        assert!(!proc_mask.contains(DomainMask::NET));
+        assert!(proc_mask.contains(DomainMask::PROC));
+        let mut proc_sbpl = FixedString::<2048>::new();
+        assert_eq!(render_effect_seatbelt_sbpl(proc_mask, &mut proc_sbpl), Ok(()));
+        let proc_text = proc_sbpl.text().expect("proc SBPL fits");
+        assert!(!proc_text.contains("network*"), "unexpected network*:\n{proc_text}");
+        assert!(
+            proc_text.contains("(allow process-fork process-exec)"),
+            "missing process-fork/exec:\n{proc_text}"
+        );
+    }
+
+    #[test]
+    fn hermetic_domain_mask_compiles_seccomp_bpf_for_both_arches() {
+        let root_list = [Root { name: "out", kind: RootKind::Output }];
+        let roots = Roots::new(&root_list).expect("valid output root");
+        let mounts = [Mount { spelling: b"/o", root: RootId(0) }];
+
+        let make_spec = |helpers: &'static [&'static str]| {
+            HermeticSpec::new(HermeticOpts {
+                program: Program::Stored {
+                    name: "cc",
+                    digest: Digest([1; 32]),
+                    path: "/t/bin/cc",
+                },
+                args: &[],
+                env: &[],
+                roots,
+                mounts: &mounts,
+                cwd: "/o",
+                helpers,
+                helper_folders: &[],
+                channels: &[],
+                clock: ClockSpec::NeverAsks,
+                seed: 1,
+                budget: Budget {
+                    cpu: Duration::from_secs(1),
+                    memory: 1 << 28,
+                    steps: None,
+                },
+                deadline: Deadline::at(Duration::from_secs(5)),
+                streams: HermeticStreams { stdout: Capture::Null, stderr: Capture::Null },
+                level: Level::Inputs,
+                report: ReportSpec::WholeRoots,
+            })
+            .expect("valid hermetic spec")
+        };
+
+        let no_proc_spec = make_spec(&[]);
+        assert!(!no_proc_spec.domain_mask().contains(DomainMask::NET));
+        assert!(!no_proc_spec.domain_mask().contains(DomainMask::PROC));
+        assert!(no_proc_spec.domain_mask().contains(DomainMask::CLOCK));
+
+        let mut sbpl = FixedString::<2048>::new();
+        assert_eq!(no_proc_spec.seatbelt_sbpl(&mut sbpl), Ok(()));
+        let sbpl_text = sbpl.text().expect("SBPL fits");
+        assert!(!sbpl_text.contains("network*"));
+        assert!(!sbpl_text.contains("process-exec"));
+
+        let with_proc_spec = make_spec(&["/t/bin/helper"]);
+        assert!(!with_proc_spec.domain_mask().contains(DomainMask::NET));
+        assert!(with_proc_spec.domain_mask().contains(DomainMask::PROC));
+        assert!(with_proc_spec.domain_mask().contains(DomainMask::CLOCK));
+
+        for arch in [SeccompArch::Aarch64, SeccompArch::X86_64] {
+            let arch_word = audit_arch(arch);
+            let wrong_arch = match arch {
+                SeccompArch::Aarch64 => audit_arch(SeccompArch::X86_64),
+                SeccompArch::X86_64 => audit_arch(SeccompArch::Aarch64),
+            };
+            let sys_socket = linux_syscall_nr("socket", arch).expect("socket syscall nr");
+            let sys_clock_gettime =
+                linux_syscall_nr("clock_gettime", arch).expect("clock_gettime syscall nr");
+            let sys_execve = linux_syscall_nr("execve", arch).expect("execve syscall nr");
+
+            // 1. Default hermetic spec denies NET (socket) and PROC (execve), allows CLOCK.
+            let prog = no_proc_spec.seccomp_bpf(arch);
+            assert!(!prog.is_empty());
+            assert_eq!(
+                eval_seccomp_bpf(&prog, wrong_arch, sys_clock_gettime),
+                BpfVerdict::KillProcess,
+                "wrong arch must kill process on {arch:?}"
+            );
+            assert_eq!(
+                eval_seccomp_bpf(&prog, arch_word, sys_socket),
+                BpfVerdict::DenyErrno(1),
+                "SYS_SOCKET must be rejected with EPERM when NET is denied on {arch:?}"
+            );
+            assert_eq!(
+                eval_seccomp_bpf(&prog, arch_word, sys_execve),
+                BpfVerdict::DenyErrno(1),
+                "SYS_EXECVE must be rejected with EPERM when PROC is denied on {arch:?}"
+            );
+            assert_eq!(
+                eval_seccomp_bpf(&prog, arch_word, sys_clock_gettime),
+                BpfVerdict::Allow,
+                "SYS_CLOCK_GETTIME must be allowed when CLOCK is permitted on {arch:?}"
+            );
+
+            // 2. Spec with helpers permits PROC (execve) and CLOCK, still denies NET (socket).
+            let proc_prog = with_proc_spec.seccomp_bpf(arch);
+            assert_eq!(
+                eval_seccomp_bpf(&proc_prog, arch_word, sys_socket),
+                BpfVerdict::DenyErrno(1),
+                "SYS_SOCKET must remain denied even when helpers are allowed on {arch:?}"
+            );
+            assert_eq!(
+                eval_seccomp_bpf(&proc_prog, arch_word, sys_execve),
+                BpfVerdict::Allow,
+                "SYS_EXECVE must be allowed when helpers enable PROC on {arch:?}"
+            );
+            assert_eq!(
+                eval_seccomp_bpf(&proc_prog, arch_word, sys_clock_gettime),
+                BpfVerdict::Allow,
+                "SYS_CLOCK_GETTIME must remain allowed on {arch:?}"
+            );
+        }
+    }
+}

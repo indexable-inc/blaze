@@ -87,7 +87,10 @@ pub use instance::{ResolveError, Resolved, holds, normalize_projection, resolve_
 pub use drop_impl::adt_drop_impl;
 pub use rules::async_fn::{EXTERNAL_WITNESS_GAP, INTERIOR_GAP};
 pub use rules::args_inline::{ArgsMisuse, TypedFinding};
-pub use rules::capability::{CapabilityFinding, check_adt_capabilities};
+pub use rules::capability::{
+    CapabilityFinding, SansIoBodyFinding, check_adt_capabilities, check_body_syscall_policy,
+    check_sans_io_body, check_sans_io_effects,
+};
 pub use rules::cost::{CostViolation, EffectiveCost, effective_cost, loop_effective_cost};
 pub use rules::unsafety::Undecided;
 pub use stalled::{Stalled, StalledDecision, StalledError, check_deferring, decide_stalled, decide_stalled_listed};
@@ -305,5 +308,9 @@ fn walk<W: World, C: TypeCtx>(m: &mut Machine<'_, '_, '_, '_, W, C>) -> Result<(
     // Opt-in checked complexity cost contracts (`#[blaze::cost(..)]`, rules/cost.rs).
     m.cost_contract()?;
     // Sans-IO capability firewall (`#[blaze::capability]` in `#![blaze::sans_io]` ADTs).
-    m.capability_in_sans_io()
+    m.capability_in_sans_io()?;
+    // No `.do` suspension inside a `#![blaze::sans_io]` body (rules/capability.rs).
+    m.suspend_in_sans_io()?;
+    // No local borrow held across a `.do` suspension point (rules/do_expr.rs).
+    m.local_borrow_across_do()
 }

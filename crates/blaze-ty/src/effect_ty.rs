@@ -10,10 +10,15 @@
 //! - **Effect subtyping**: `e1 ⊆ e2` lets a purer `fn() expect()` coerce to `fn() expect(alloc)` or
 //!   `fn() expect(suspend)`, and rejects passing a suspending or allocating callback where `expect()`
 //!   is required.
-//! - **Effect polymorphism**: [`EffectRow`] models `expect(base | e)` on higher-order functions
-//!   and trait methods (`fn map<F: Fn(A) -> B expect(e)>(f: F) expect(e)`), removing `sync`/`async`
-//!   function coloring across `bstd`.
+//! - **Effect polymorphism**: [`EffectRow`] and multi-variable [`EffectRowSet`] model
+//!   `expect(base | e1 | e2)` on higher-order functions and trait methods
+//!   (`fn map<F: Fn(A) -> B expect(e)>(f: F) expect(e)`), removing `sync`/`async` function coloring
+//!   across `bstd`.
+//! - **Tail-resumptive specialization**: [`LoweringMode`] elides coroutine state-machine overhead
+//!   (`PlainFn`) whenever an instantiated effect set omits `SUSPEND`, lowering to
+//!   `MachineCoroutine` only when `SUSPEND` is present.
 
+use core::cmp::Ordering;
 use core::fmt;
 
 use crate::tys::FnHeader;
@@ -212,6 +217,332 @@ impl EffectRow {
                 va.0 == vb.0 && a.is_subset_of(b)
             }
             (Self::Poly { .. }, Self::Concrete(b)) => b.bits() == EffectSet::ALL.bits(),
+        }
+    }
+
+    /// Determines the lowering mode if already fixed by `self`:
+    /// - `Some(LoweringMode::MachineCoroutine)` when `SUSPEND` is already in `base` (monotone:
+    ///   instantiation can only add effects, never remove `SUSPEND`),
+    /// - `Some(LoweringMode::PlainFn)` when concrete without `SUSPEND`,
+    /// - `None` when still polymorphic over an uninstantiated variable without `SUSPEND` in `base`.
+    #[inline]
+    pub const fn lowering_mode(&self) -> Option<LoweringMode> {
+        match *self {
+            Self::Concrete(set) => Some(LoweringMode::for_effects(set)),
+            Self::Poly { base, .. } => {
+                if base.contains(EffectSet::SUSPEND) {
+                    Some(LoweringMode::MachineCoroutine)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Monomorphization lowering strategy chosen from an instantiated effect set.
+///
+/// Higher-order functions whose instantiated effect set omits [`EffectSet::SUSPEND`] compile to a
+/// plain direct function (`PlainFn`) with zero coroutine state-enum overhead; only instantiations
+/// carrying `SUSPEND` lower to a resumable `blaze-machine` coroutine.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum LoweringMode {
+    /// Direct non-suspending function: zero coroutine state-machine overhead.
+    PlainFn,
+    /// Resumable coroutine lowered through `blaze-machine` because execution may `suspend`.
+    MachineCoroutine,
+}
+
+impl LoweringMode {
+    /// Selects [`LoweringMode::PlainFn`] when `!set.contains(EffectSet::SUSPEND)` and
+    /// [`LoweringMode::MachineCoroutine`] when `set.contains(EffectSet::SUSPEND)`.
+    #[inline]
+    pub const fn for_effects(set: EffectSet) -> Self {
+        if set.contains(EffectSet::SUSPEND) {
+            Self::MachineCoroutine
+        } else {
+            Self::PlainFn
+        }
+    }
+}
+
+/// Maximum distinct effect variables tracked inline in an [`EffectRowSet`] (zero heap allocation).
+pub const MAX_ROW_VARS: usize = 4;
+
+/// Multi-variable polymorphic effect row (`base | e1 | e2 | ...`) stored inline with zero heap
+/// allocation (`#![no_std]`).
+///
+/// Active variables occupy `vars[..var_count]` in strictly ascending [`EffectVar`] order, with
+/// unused trailing slots zeroed (`EffectVar(0)`), so equality and hashing are canonical and
+/// independent of union or instantiation order.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct EffectRowSet {
+    vars: [EffectVar; MAX_ROW_VARS],
+    var_count: u8,
+    base: EffectSet,
+}
+
+impl EffectRowSet {
+    /// Pure concrete row set (`expect()`).
+    pub const PURE: EffectRowSet = Self::concrete(EffectSet::PURE);
+
+    /// Fixed concrete row set with no polymorphic effect variables.
+    #[inline]
+    pub const fn concrete(base: EffectSet) -> Self {
+        Self { vars: [EffectVar(0); MAX_ROW_VARS], var_count: 0, base }
+    }
+
+    /// Lifts a single-variable [`EffectRow`] into an [`EffectRowSet`].
+    #[inline]
+    pub const fn from_row(row: EffectRow) -> Self {
+        match row {
+            EffectRow::Concrete(base) => Self::concrete(base),
+            EffectRow::Poly { base, var } => Self::poly(base, var),
+        }
+    }
+
+    /// Single-variable polymorphic row set `base | var`.
+    #[inline]
+    pub const fn poly(base: EffectSet, var: EffectVar) -> Self {
+        let mut vars = [EffectVar(0); MAX_ROW_VARS];
+        vars[0] = var;
+        Self { vars, var_count: 1, base }
+    }
+
+    /// Fixed base effects always present regardless of variable instantiation.
+    #[inline]
+    pub const fn base(self) -> EffectSet {
+        self.base
+    }
+
+    /// Active unbound effect variables in canonical ascending order.
+    #[inline]
+    pub fn vars(&self) -> &[EffectVar] {
+        &self.vars[..usize::from(self.var_count)]
+    }
+
+    /// Number of active unbound effect variables.
+    #[inline]
+    pub fn var_count(self) -> usize {
+        usize::from(self.var_count)
+    }
+
+    /// Combines two polymorphic effect rows (`self ∪ other`), deduplicating shared [`EffectVar`]s.
+    ///
+    /// Returns [`EffectPolyError::TooManyEffectVars`] if the union would hold more than
+    /// [`MAX_ROW_VARS`] distinct unbound effect variables.
+    pub fn union(self, other: EffectRowSet) -> Result<EffectRowSet, EffectPolyError> {
+        let a = self.vars();
+        let b = other.vars();
+        let mut out = [EffectVar(0); MAX_ROW_VARS];
+        let mut out_len = 0usize;
+        let mut i = 0usize;
+        let mut j = 0usize;
+
+        while i < a.len() || j < b.len() {
+            let next = match (a.get(i), b.get(j)) {
+                (Some(&va), Some(&vb)) => match va.cmp(&vb) {
+                    Ordering::Less => {
+                        i += 1;
+                        va
+                    }
+                    Ordering::Greater => {
+                        j += 1;
+                        vb
+                    }
+                    Ordering::Equal => {
+                        i += 1;
+                        j += 1;
+                        va
+                    }
+                },
+                (Some(&va), None) => {
+                    i += 1;
+                    va
+                }
+                (None, Some(&vb)) => {
+                    j += 1;
+                    vb
+                }
+                (None, None) => break,
+            };
+            if out_len >= MAX_ROW_VARS {
+                return Err(EffectPolyError::TooManyEffectVars { max: MAX_ROW_VARS });
+            }
+            out[out_len] = next;
+            out_len += 1;
+        }
+
+        let var_count = u8::try_from(out_len).unwrap_or(u8::MAX);
+        Ok(Self { vars: out, var_count, base: self.base.union(other.base) })
+    }
+
+    /// Instantiates a single effect variable `var` with concrete effects `arg`.
+    #[inline]
+    pub fn instantiate_one(self, var: EffectVar, arg: EffectSet) -> EffectRowSet {
+        self.instantiate_all(|v| if v == var { Some(arg) } else { None })
+    }
+
+    /// Instantiates every effect variable for which `lookup` returns `Some(arg)`, merging its
+    /// concrete effects into `base` and preserving any remaining unbound variables.
+    pub fn instantiate_all(self, lookup: impl Fn(EffectVar) -> Option<EffectSet>) -> EffectRowSet {
+        let mut base = self.base;
+        let mut out = [EffectVar(0); MAX_ROW_VARS];
+        let mut out_len = 0usize;
+        for &v in self.vars() {
+            if let Some(arg) = lookup(v) {
+                base = base.union(arg);
+            } else {
+                out[out_len] = v;
+                out_len += 1;
+            }
+        }
+        let var_count = u8::try_from(out_len).unwrap_or(u8::MAX);
+        Self { vars: out, var_count, base }
+    }
+
+    /// Returns the concrete [`EffectSet`] iff no unbound effect variables remain (`var_count == 0`).
+    #[inline]
+    pub const fn as_concrete(self) -> Option<EffectSet> {
+        if self.var_count == 0 {
+            Some(self.base)
+        } else {
+            None
+        }
+    }
+
+    /// Returns `true` if `SUSPEND` is already in `base` or an unbound effect variable may later be
+    /// instantiated with `SUSPEND`.
+    #[inline]
+    pub const fn may_suspend(self) -> bool {
+        self.base.contains(EffectSet::SUSPEND) || self.var_count > 0
+    }
+
+    /// Determines the lowering mode if already fixed by `self`:
+    /// - `Some(LoweringMode::MachineCoroutine)` when `SUSPEND` is already in `base`,
+    /// - `Some(LoweringMode::PlainFn)` when concrete (`var_count == 0`) without `SUSPEND`,
+    /// - `None` when still polymorphic over an uninstantiated variable without `SUSPEND` in `base`.
+    #[inline]
+    pub const fn lowering_mode(&self) -> Option<LoweringMode> {
+        if self.base.contains(EffectSet::SUSPEND) {
+            Some(LoweringMode::MachineCoroutine)
+        } else if self.var_count == 0 {
+            Some(LoweringMode::PlainFn)
+        } else {
+            None
+        }
+    }
+}
+
+impl From<EffectRow> for EffectRowSet {
+    #[inline]
+    fn from(row: EffectRow) -> Self {
+        Self::from_row(row)
+    }
+}
+
+impl From<EffectSet> for EffectRowSet {
+    #[inline]
+    fn from(set: EffectSet) -> Self {
+        Self::concrete(set)
+    }
+}
+
+/// Errors produced by effect-polymorphic call specialization, multi-variable row unions, and
+/// `dyn Fn` object-safety checking.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EffectPolyError {
+    /// Instantiated call or callback requires effects outside the caller's allowed `expect(..)` set.
+    EffectExceedsAllowed { required: EffectSet, allowed: EffectSet },
+    /// Suspending callbacks (`expect(suspend)`) cannot be erased behind unboxed `dyn Fn`; they
+    /// must be statically monomorphized so `blaze-machine` can build their state machine.
+    SuspendBehindDyn { callback_effects: EffectSet },
+    /// A polymorphic effect variable remained unbound when specializing a call site.
+    UnboundEffectVar(EffectVar),
+    /// Combining polymorphic rows exceeded the inline capacity [`MAX_ROW_VARS`].
+    TooManyEffectVars { max: usize },
+}
+
+impl fmt::Display for EffectPolyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            EffectPolyError::EffectExceedsAllowed { required, allowed } => {
+                write!(f, "effect set '{required}' exceeds caller allowance '{allowed}'")
+            }
+            EffectPolyError::SuspendBehindDyn { callback_effects } => {
+                write!(
+                    f,
+                    "cannot coerce suspending callback '{callback_effects}' to `dyn Fn`: `suspend` requires static monomorphization"
+                )
+            }
+            EffectPolyError::UnboundEffectVar(EffectVar(id)) => {
+                write!(f, "unbound polymorphic effect variable `e{id}` at call site")
+            }
+            EffectPolyError::TooManyEffectVars { max } => {
+                write!(f, "polymorphic effect row exceeds inline capacity of {max} distinct effect variables")
+            }
+        }
+    }
+}
+
+/// Object-safety and effect-subtyping check for coercing a closure or function with `callback`
+/// effects into a `dyn Fn(...) expect(allowed)` trait object.
+///
+/// Suspending callbacks (`EffectSet::SUSPEND`) cannot be erased behind unboxed `dyn Fn` because
+/// coroutine lowering requires static monomorphization; they are refused with
+/// [`EffectPolyError::SuspendBehindDyn`]. Non-suspending callbacks must satisfy
+/// `callback ⊆ allowed`.
+pub const fn check_dyn_fn_effects(callback: EffectSet, allowed: EffectSet) -> Result<(), EffectPolyError> {
+    if callback.contains(EffectSet::SUSPEND) {
+        return Err(EffectPolyError::SuspendBehindDyn { callback_effects: callback });
+    }
+    if !callback.is_subset_of(allowed) {
+        return Err(EffectPolyError::EffectExceedsAllowed { required: callback, allowed });
+    }
+    Ok(())
+}
+
+/// Instantiates a polymorphic callee's [`EffectRowSet`] at a call site using `bindings`, verifies
+/// that no unbound effect variables remain and that `instantiated ⊆ caller_allowed`, and returns
+/// the concrete instantiated [`EffectSet`] together with its specialized [`LoweringMode`].
+pub fn specialize_call(
+    sig_row: EffectRowSet,
+    bindings: &[(EffectVar, EffectSet)],
+    caller_allowed: EffectSet,
+) -> Result<(EffectSet, LoweringMode), EffectPolyError> {
+    let resolved = sig_row.instantiate_all(|var| {
+        let mut combined: Option<EffectSet> = None;
+        for &(bound_var, eff) in bindings {
+            if bound_var == var {
+                combined = Some(combined.map_or(eff, |acc| acc.union(eff)));
+            }
+        }
+        combined
+    });
+
+    if let Some(&unbound) = resolved.vars().first() {
+        return Err(EffectPolyError::UnboundEffectVar(unbound));
+    }
+
+    let instantiated = resolved.base();
+    if !instantiated.is_subset_of(caller_allowed) {
+        return Err(EffectPolyError::EffectExceedsAllowed { required: instantiated, allowed: caller_allowed });
+    }
+
+    Ok((instantiated, LoweringMode::for_effects(instantiated)))
+}
+
+/// Instantiates and checks a single-callback higher-order call (`EffectRow`) with `callback_effects`
+/// against `caller_allowed`, returning the concrete [`EffectSet`] and specialized [`LoweringMode`].
+pub fn check_higher_order_call(
+    sig_row: EffectRow,
+    callback_effects: EffectSet,
+    caller_allowed: EffectSet,
+) -> Result<(EffectSet, LoweringMode), EffectPolyError> {
+    match sig_row {
+        EffectRow::Concrete(base) => specialize_call(EffectRowSet::concrete(base), &[], caller_allowed),
+        EffectRow::Poly { base, var } => {
+            specialize_call(EffectRowSet::poly(base, var), &[(var, callback_effects)], caller_allowed)
         }
     }
 }

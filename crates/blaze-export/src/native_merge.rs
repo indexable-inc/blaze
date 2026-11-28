@@ -571,18 +571,41 @@ pub fn merge_elf<'a, 'i>(
         None
     };
 
-    // Initializers: `DT_INIT_ARRAY` / `DT_INIT_ARRAYSZ` when non-empty.
+    // Initializers: `DT_INIT_ARRAY` / `DT_INIT_ARRAYSZ` when non-empty. When `laid.native_inits_at`
+    // reserves a trailing slice inside `laid.inits` (program has both Rust `.init_array` statics
+    // and native C `Region::Inits`), redirect every fixup inside `Region::Inits` into that slice
+    // so the ELF carries one contiguous `DT_INIT_ARRAY`.
     let inits_reg = region(Region::Inits)?;
+    let inits_end = inits_reg.at + inits_reg.len;
     let inits = if inits_reg.len > 0 {
         if !inits_reg.at.is_multiple_of(8) || !inits_reg.len.is_multiple_of(8) {
             return Err(MergeError::Shape { what: "Inits not 8-byte aligned or sized", at: inits_reg.at });
         }
-        if inits_reg.at < got_at || inits_reg.at + inits_reg.len > init_end {
+        if inits_reg.at < got_at || inits_end > init_end {
             return Err(MergeError::Shape { what: "Inits outside writable file bytes", at: inits_reg.at });
         }
         Some(ElfInits { vaddr: inits_reg.at + shift, len: inits_reg.len })
     } else {
         None
+    };
+    let native_inits_dest = laid.native_inits_at;
+    if let Some(dest) = native_inits_dest {
+        let Some((laid_at, laid_len)) = laid.inits else {
+            return Err(MergeError::Shape { what: "native_inits_at without laid.inits", at: dest });
+        };
+        if inits_reg.len == 0 || dest < laid_at || dest.saturating_add(inits_reg.len) > laid_at.saturating_add(laid_len) {
+            return Err(MergeError::Shape { what: "native Inits past reserved laid.inits tail", at: dest });
+        }
+    }
+    let fixup_vaddr = |at: u64| -> u64 {
+        if let Some(dest) = native_inits_dest
+            && at >= inits_reg.at
+            && at < inits_end
+        {
+            dest + (at - inits_reg.at)
+        } else {
+            at + shift
+        }
     };
 
     // ELF C names carry no leading underscore.
@@ -600,22 +623,23 @@ pub fn merge_elf<'a, 'i>(
         if !f.at.is_multiple_of(8) || f.at < got_at || f.at + 8 > init_end {
             return Err(MergeError::Shape { what: "a fixup outside writable file bytes, or not 8-aligned", at: f.at });
         }
+        let target_at = fixup_vaddr(f.at);
         match f.to {
             NativeFix::Rebase { address, high8 } => {
                 let moved = Addr56::new(address.get() + shift).ok_or(MergeError::TooLarge { what: "a rebase target past 56 bits", len: address.get() + shift })?;
-                relative.push((f.at + shift, moved.tagged(high8)));
+                relative.push((target_at, moved.tagged(high8)));
             }
             NativeFix::Import { index, addend } => {
                 let idx = usize::try_from(index).map_err(|_| MergeError::TooLarge { what: "an import index of the native image", len: u64::from(index) })?;
                 if idx >= image.imports.len() {
                     return Err(MergeError::TooLarge { what: "an import index of the native image", len: u64::from(index) });
                 }
-                other.push(ElfRela { at: f.at + shift, kind: ElfRelaKind::Import { import: index, addend, got: f.at < got_end } });
+                other.push(ElfRela { at: target_at, kind: ElfRelaKind::Import { import: index, addend, got: f.at < got_end } });
             }
             NativeFix::Word { index } => {
                 let idx = usize::try_from(index).map_err(|_| MergeError::RustWordMissing { word: index })?;
                 let at = word_at.get(idx).ok_or(MergeError::RustWordMissing { word: index })?;
-                relative.push((f.at + shift, *at));
+                relative.push((target_at, *at));
             }
         }
     }
@@ -831,7 +855,8 @@ mod tests {
             placed: homes,
             placed_member: Vec::new_in(a),
             tables_room: 0x8000 - START,
-            mod_init_at: None,
+            inits: None,
+            native_inits_at: None,
             has_tls: false,
             tls_count: 0,
         }

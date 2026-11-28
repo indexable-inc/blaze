@@ -40,7 +40,7 @@
 use blaze_id::ContentId;
 use blaze_own::{SharedAlloc, VecDeque};
 
-use super::{Action, Cause, Child, CodeKey, CodePool, Error as PoolError, Event, Finished, Options as PoolOptions, Record, Thread, Time, Wait as PoolWait, Worker};
+use super::{Action, Affinity, Cause, Child, CodeKey, CodePool, Error as PoolError, Event, Finished, Options as PoolOptions, Record, Thread, Time, Wait as PoolWait, Worker};
 use crate::{SMap, SSet, SVec};
 
 /// The domain of an unkeyed ask's own key (a counter under it): never a walk's key.
@@ -219,9 +219,9 @@ impl<'a, J, E> Relay<'a, J, E> {
 
     /// The earliest of the asks' deadlines and the pool's, with what it waits on; `None`: no
     /// ask is open and nothing is being made.
-    pub fn wait(&self) -> Option<(Wait, Time)> {
+    pub fn next_wait(&self) -> Option<(Wait, Time)> {
         let code = self.due.first().and_then(|&(due, child)| self.askers[child].asked.map(|asked| (Wait::Code { child: Child(child), key: asked.key }, Time(due))));
-        let pool = self.pool.wait().map(|(waiting, until)| (Wait::Pool(waiting), until));
+        let pool = self.pool.next_wait().map(|(waiting, until)| (Wait::Pool(waiting), until));
         match (code, pool) {
             (Some(code), Some(pool)) => Some(if code.1.0 <= pool.1.0 { code } else { pool }),
             (code, pool) => code.or(pool),
@@ -238,9 +238,9 @@ impl<'a, J, E> Relay<'a, J, E> {
         self.askers.get(child.0).is_some_and(|asker| asker.got.is_some())
     }
 
-    /// `child` asks for the instance under `key` (`None`: unkeyed, its own), to be made by
-    /// `order` unless another ask of the key is made or being made.
-    pub fn ask(&mut self, now: Time, child: Child, key: Option<CodeKey>, order: J) -> Result<(), RelayError> {
+    /// `child` asks for the instance under `key` (`None`: unkeyed, its own) with suite `affinity`,
+    /// to be made by `order` unless another ask of the key is made or being made.
+    pub fn ask(&mut self, now: Time, child: Child, key: Option<CodeKey>, affinity: Affinity, order: J) -> Result<(), RelayError> {
         self.expire(now)?;
         let asker = self.askers.get(child.0).ok_or(RelayError::UnknownChild(child))?;
         if asker.end != End::Live {
@@ -266,7 +266,7 @@ impl<'a, J, E> Relay<'a, J, E> {
         if self.pool.find(key).is_none() {
             self.orders.insert(key, Ordered { order, unkeyed });
         }
-        self.feed(now, Event::Demand { child, thread: Thread(0), key })
+        self.feed(now, Event::Demand { child, thread: Thread(0), key, affinity })
     }
 
     /// The next make for a worker, in the pool's order: the driver hands it to that worker.

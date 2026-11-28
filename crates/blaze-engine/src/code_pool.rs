@@ -1,6 +1,6 @@
 //! The cold Code pool for one request. Construct it with [`CodePool::new`]. On each turn:
 //!
-//! 1. Call [`CodePool::wait`] for the named wait and its absolute deadline on the driver's
+//! 1. Call [`CodePool::next_wait`] for the named wait and its absolute deadline on the driver's
 //!    clock. Receive one child, store, producer or worker event, or a tick at the deadline.
 //!    `None` ends the request after the last child exits and outstanding work drains.
 //! 2. Call [`CodePool::step`] with the time, event and an empty, reusable action buffer.
@@ -47,6 +47,10 @@ pub struct Child(pub usize);
 pub struct Thread(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Worker(pub usize);
+/// Suite/context affinity tag used to route demands toward workers whose resident makers are
+/// already warm for the same suite (avoiding cross-suite maker eviction and frame resets).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Affinity(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Slot(pub usize);
 /// A tick of the monotonic clock chosen by the driver, in the same units as its deadline.
@@ -90,7 +94,7 @@ pub enum Finished<'r> {
 
 #[derive(Clone, Copy, Debug)]
 pub enum Event<'r> {
-    Demand { child: Child, thread: Thread, key: CodeKey },
+    Demand { child: Child, thread: Thread, key: CodeKey, affinity: Affinity },
     Looked { key: CodeKey, result: Result<Option<Record<'r>>, Cause> },
     Direct { worker: Worker, key: CodeKey, callees: &'r [CodeKey] },
     Finished { worker: Worker, key: CodeKey, result: Finished<'r> },
@@ -203,10 +207,20 @@ impl State {
     }
 }
 
+/// Number of recent suite affinities tracked per worker (matches `SuiteMakers`'s 2-slot cap).
+const WORKER_AFFINITY_SLOTS: usize = 2;
+/// Maximum number of times a queued demanded row may be bypassed in favor of a queued demanded
+/// row whose suite already matches an idle warm worker (rule 18: bounded, zero starvation).
+const MAX_AFFINITY_SKIPS: u8 = 4;
+
 struct Row<'a> {
     key: CodeKey,
     state: State,
     demanded: bool,
+    /// Suite affinity of the demand that owns this row (`None` for purely speculative rows).
+    affinity: Option<Affinity>,
+    /// Bounded bypass count when an idle warm worker picks a matching suite ahead of this row.
+    affinity_skips: u8,
     /// Live children which demanded this caller, even after their reply.
     callers: SVec<'a, Child>,
     /// Live children sponsoring preparation of this key.
@@ -235,6 +249,7 @@ pub struct CodePool<'a> {
     rows: SVec<'a, Row<'a>>,
     children: SVec<'a, ChildState<'a>>,
     workers: SVec<'a, WorkerState>,
+    worker_affinity: SVec<'a, [Option<Affinity>; WORKER_AFFINITY_SLOTS]>,
     idle: VecDeque<Worker, SharedAlloc<'a>>,
     // false (demanded) sorts before true. Removal on promotion leaves one queue entry.
     queue: SSet<'a, (bool, RowId)>,
@@ -257,6 +272,7 @@ impl<'a> CodePool<'a> {
         Ok(Self {
             opts, index: Table::new_in(a), rows: SVec::new_in(a), children,
             workers: SVec::from_elem_in(WorkerState::Unavailable { warm: false }, opts.workers, a),
+            worker_affinity: SVec::from_elem_in([None; WORKER_AFFINITY_SLOTS], opts.workers, a),
             idle: VecDeque::new_in(a),
             queue: SSet::new_in(a), frontier: SSet::new_in(a),
             background: 0, demands: 0, spec_claims: 0,
@@ -267,7 +283,7 @@ impl<'a> CodePool<'a> {
 
     /// The first child's head demand names the critical wait. With no waiter, outstanding
     /// operations still need draining, including builds whose last interested child has exited.
-    pub fn wait(&self) -> Option<(Wait, Time)> {
+    pub fn next_wait(&self) -> Option<(Wait, Time)> {
         let waiting = self.children.iter().find_map(|c| c.pending.front().and_then(|(id, _)| self.row_wait(*id)))
             .or_else(|| self.frontier.first().and_then(|&id| self.row_wait(id)))
             .or_else(|| self.children.iter().position(|c| c.live).map(|i| Wait::Child(Child(i))))
@@ -311,8 +327,16 @@ impl<'a> CodePool<'a> {
     fn claim(&mut self, key: CodeKey, out: &mut SVec<'_, Action>) -> RowId {
         let id = self.rows.len();
         let a = self.opts.alloc;
-        self.rows.push(Row { key, state: State::Lookup, demanded: false,
-            callers: SVec::new_in(a), sponsors: SVec::new_in(a), direct: SVec::new_in(a) });
+        self.rows.push(Row {
+            key,
+            state: State::Lookup,
+            demanded: false,
+            affinity: None,
+            affinity_skips: 0,
+            callers: SVec::new_in(a),
+            sponsors: SVec::new_in(a),
+            direct: SVec::new_in(a),
+        });
         self.index.insert(Probe { key, seed: self.opts.hash_seed }, id);
         out.push(Action::Lookup(key));
         id
@@ -327,11 +351,11 @@ impl<'a> CodePool<'a> {
     }
 
     pub fn step(&mut self, now: Time, event: Event<'_>, out: &mut SVec<'_, Action>) -> Result<(), Error> {
-        if now.0 >= self.opts.deadline.0 && let Some((waiting, deadline)) = self.wait() {
+        if now.0 >= self.opts.deadline.0 && let Some((waiting, deadline)) = self.next_wait() {
             return Err(Error::Deadline { waiting, deadline });
         }
         match event {
-            Event::Demand { child, thread, key } => self.demand(child, thread, key, out)?,
+            Event::Demand { child, thread, key, affinity } => self.demand(child, thread, key, affinity, out)?,
             Event::Exited(child) => self.exit(child, out)?,
             Event::Free(worker) => match self.workers.get_mut(worker.0) {
                 Some(state @ WorkerState::Unavailable { .. }) => {
@@ -401,7 +425,7 @@ impl<'a> CodePool<'a> {
         }
     }
 
-    fn demand(&mut self, child: Child, thread: Thread, key: CodeKey, out: &mut SVec<'_, Action>) -> Result<(), Error> {
+    fn demand(&mut self, child: Child, thread: Thread, key: CodeKey, affinity: Affinity, out: &mut SVec<'_, Action>) -> Result<(), Error> {
         self.live(child)?;
         if self.demands == self.opts.demands {
             return Err(Error::DemandLimit { child, key, limit: self.opts.demands });
@@ -413,6 +437,9 @@ impl<'a> CodePool<'a> {
         let slot = *state.slots.entry(key).or_insert(next);
         state.pending.push_back((id, Demand { child, thread, key, slot }));
         let row = &mut self.rows[id];
+        if row.affinity.is_none() {
+            row.affinity = Some(affinity);
+        }
         if !row.demanded {
             self.frontier.remove(&id);
             row.sponsors.clear();
@@ -524,14 +551,89 @@ impl<'a> CodePool<'a> {
         Ok(())
     }
 
+    fn worker_has_affinity(&self, worker: Worker, affinity: Affinity) -> bool {
+        self.worker_affinity.get(worker.0).is_some_and(|slots| slots.contains(&Some(affinity)))
+    }
+
+    fn worker_is_cold(&self, worker: Worker) -> bool {
+        self.worker_affinity.get(worker.0).and_then(|slots| slots.first().copied()).flatten().is_none()
+    }
+
+    fn record_worker_affinity(&mut self, worker: Worker, affinity: Option<Affinity>) {
+        let Some(affinity) = affinity else { return };
+        let Some([first, second]) = self.worker_affinity.get_mut(worker.0) else { return };
+        if *first == Some(affinity) {
+            return;
+        }
+        if *second == Some(affinity) || second.is_none() {
+            *second = *first;
+            *first = Some(affinity);
+        } else {
+            // A 3rd distinct suite evicts the LRU maker and resets the worker's frame: clear slot 1
+            // so old evicted suites stop routing here while keeping sticky to `affinity`.
+            *first = Some(affinity);
+            *second = None;
+        }
+    }
+
+    fn pick_worker(&mut self, affinity: Option<Affinity>) -> Option<Worker> {
+        if self.idle.is_empty() {
+            return None;
+        }
+        if let Some(target) = affinity {
+            // 1. Prefer the most-recently-warm idle worker already resident for `target`.
+            if let Some(pos) = self.idle.iter().position(|&w| self.worker_has_affinity(w, target)) {
+                return self.idle.remove(pos);
+            }
+            // 2. Otherwise prefer a cold idle worker so warm workers stay dedicated to their suites.
+            if let Some(pos) = self.idle.iter().position(|&w| self.worker_is_cold(w)) {
+                return self.idle.remove(pos);
+            }
+            // 3. All idle workers are warm for other suites: reuse the least-recently-used worker.
+            return self.idle.pop_back();
+        }
+        self.idle.pop_front()
+    }
+
     fn dispatch(&mut self, out: &mut SVec<'_, Action>) {
-        while let Some(&(speculative, id)) = self.queue.first() {
+        while let Some(&(speculative, head_id)) = self.queue.first() {
             if speculative && self.background >= self.opts.workers - 1 {
                 break;
             }
-            let Some(worker) = self.idle.pop_front() else { break };
+            if self.idle.is_empty() {
+                break;
+            }
+            let mut id = head_id;
+            if !speculative
+                && let Some(head_row) = self.rows.get(head_id)
+                && let Some(head_aff) = head_row.affinity
+                && head_row.affinity_skips < MAX_AFFINITY_SKIPS
+                && !self.idle.iter().any(|&w| self.worker_has_affinity(w, head_aff) || self.worker_is_cold(w))
+            {
+                let mut matched = None;
+                for &(is_spec, cand_id) in self.queue.iter().skip(1) {
+                    if is_spec {
+                        break;
+                    }
+                    if let Some(cand_aff) = self.rows.get(cand_id).and_then(|r| r.affinity)
+                        && self.idle.iter().any(|&w| self.worker_has_affinity(w, cand_aff))
+                    {
+                        matched = Some(cand_id);
+                        break;
+                    }
+                }
+                if let Some(cand_id) = matched {
+                    if let Some(head_mut) = self.rows.get_mut(head_id) {
+                        head_mut.affinity_skips = head_mut.affinity_skips.saturating_add(1);
+                    }
+                    id = cand_id;
+                }
+            }
+            let affinity = self.rows.get(id).and_then(|r| r.affinity);
+            let Some(worker) = self.pick_worker(affinity) else { break };
             self.queue.remove(&(speculative, id));
             self.workers[worker.0] = WorkerState::Busy { row: id, speculative };
+            self.record_worker_affinity(worker, affinity);
             self.background += usize::from(speculative);
             self.rows[id].state = State::Building(worker);
             out.push(Action::Build { worker, key: self.rows[id].key, speculative });

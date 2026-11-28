@@ -411,6 +411,10 @@ fn bounds_through_front2() {
     assert!(langs::ALL.windows(2).all(|w| w[0] < w[1]), "langs::ALL is in declaration order, each once");
     let mut unanswered = Vec::new();
     for l in langs::ALL {
+        // `LangItem::Request` is declared in `blaze-machine`, not `library/core`.
+        if l == LangItem::Request {
+            continue;
+        }
         match langs::find(&front.index, resolver, l) {
             Ok(Some(_)) => {}
             other => unanswered.push((l, langs::mark(l), other)),

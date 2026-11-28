@@ -52,6 +52,7 @@ pub mod effect_ty;
 pub mod pat_ty;
 pub mod product_row;
 pub mod record_ty;
+pub mod syscall_ty;
 pub mod type_desc;
 pub mod type_set;
 pub mod union_ty;

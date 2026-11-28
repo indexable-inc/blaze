@@ -3,7 +3,7 @@
 //! ([`crate::drive`]) runs, so the answer is folded by one piece of code. Construct it with
 //! [`Ready::new`] over an engine made by [`Engine::new_in`]. On each turn:
 //!
-//! 1. Call [`Ready::wait`] for what it waits on; perform each [`Action`] the last step gave:
+//! 1. Call [`Ready::next_wait`] for what it waits on; perform each [`Action`] the last step gave:
 //!    [`Action::Run`] runs the task on that worker through its kind ([`crate::kinds::TaskKind`])
 //!    with a [`Host`] over [`Ready::facts`] and a fresh [`Out`]; [`Action::Grow`] asks the
 //!    grower's kind for its growth ([`crate::kinds::Ask::Grown`]).
@@ -694,7 +694,7 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>, P: Planted<ReadyPlant>> Re
 
     /// What the driver waits on and its deadline; `None` before the first step's tick has a
     /// running task.
-    pub fn wait(&self) -> Option<(Wait, Time)> {
+    pub fn next_wait(&self) -> Option<(Wait, Time)> {
         let waiting = match self.state {
             State::Start => Wait::Start,
             State::Growing { by } => Wait::Grown { by },
@@ -715,7 +715,7 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>, P: Planted<ReadyPlant>> Re
             self.deadline = Time(now.0.saturating_add(self.limits.deadline.0));
         }
         if now.0 > self.deadline.0 {
-            let waiting = self.wait().map_or(Wait::Start, |(waiting, _)| waiting);
+            let waiting = self.next_wait().map_or(Wait::Start, |(waiting, _)| waiting);
             return Err(Error::Deadline { waiting, parked: self.longest_parked(), deadline: self.deadline });
         }
         match (self.state, event) {

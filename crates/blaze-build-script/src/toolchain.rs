@@ -137,6 +137,297 @@ pub const LINUX_HOST_SYSROOT_DIR: &str = "/usr";
 /// Marker header under a Linux host sysroot whose bytes identify the host C library headers.
 pub const LINUX_HOST_SYSROOT_MARKER: &str = "include/features.h";
 
+/// Yields each candidate Linux host sysroot root directory named by `-isystem` or `-idirafter`
+/// flags in `flags` (e.g. `NIX_CFLAGS_COMPILE` or a Nix wrapper's `nix-support/libc-cflags`).
+///
+/// Recognizes separated (`-idirafter /nix/store/.../include`, `-isystem "/nix/store/.../include"`)
+/// and joined (`-isystem/nix/store/.../include`, `-idirafter/nix/store/.../include`) forms.
+/// Only absolute include directories ending in `/include` (after trimming trailing slashes) with
+/// a non-empty parent root are yielded, as that parent root (e.g. `/nix/store/...-glibc-dev`).
+/// Sans-IO: no filesystem access; callers check `<candidate>/include/features.h`.
+pub fn for_each_nix_sysroot_candidate<'a>(flags: &'a str, mut each: impl FnMut(&'a str)) {
+    let bytes = flags.as_bytes();
+    let mut at = 0usize;
+    let mut expect_dir = false;
+    let next_token = |at: &mut usize| -> Option<&'a str> {
+        while let Some(&b) = bytes.get(*at) {
+            if !b.is_ascii_whitespace() {
+                break;
+            }
+            *at += 1;
+        }
+        let &quote = bytes.get(*at)?;
+        if quote == b'"' || quote == b'\'' {
+            *at += 1;
+            let start = *at;
+            while let Some(&b) = bytes.get(*at) {
+                if b == quote {
+                    break;
+                }
+                *at += 1;
+            }
+            let token = flags.get(start..*at)?;
+            if bytes.get(*at) == Some(&quote) {
+                *at += 1;
+            }
+            Some(token)
+        } else {
+            let start = *at;
+            while let Some(&b) = bytes.get(*at) {
+                if b.is_ascii_whitespace() {
+                    break;
+                }
+                *at += 1;
+            }
+            flags.get(start..*at)
+        }
+    };
+    let mut emit_dir = |raw: &'a str| {
+        let trimmed = raw.trim_end_matches('/');
+        if trimmed.starts_with('/')
+            && let Some(root) = trimmed.strip_suffix("/include")
+            && !root.is_empty()
+        {
+            each(root);
+        }
+    };
+    while let Some(token) = next_token(&mut at) {
+        if expect_dir {
+            expect_dir = false;
+            emit_dir(token);
+            continue;
+        }
+        if token == "-isystem" || token == "-idirafter" {
+            expect_dir = true;
+            continue;
+        }
+        if let Some(dir) = token.strip_prefix("-isystem").or_else(|| token.strip_prefix("-idirafter"))
+            && !dir.is_empty()
+        {
+            let unquoted = dir
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| dir.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                .unwrap_or(dir);
+            emit_dir(unquoted);
+        }
+    }
+}
+
+/// Yields each candidate Linux libc library/CRT directory named by `-B` or `-L` flags in `flags`
+/// (e.g. a Nix wrapper's `nix-support/libc-crt1-cflags`, `nix-support/libc-ldflags`, or
+/// `NIX_LDFLAGS`).
+///
+/// Recognizes separated (`-L /nix/store/.../lib`, `-B "/nix/store/.../lib/"`) and joined
+/// (`-B/nix/store/.../lib/`, `-L/nix/store/.../lib`) forms. Yields normalized absolute paths with
+/// trailing slashes removed. Sans-IO: callers check for link artifacts such as `crt1.o`/`libc.so`.
+pub fn for_each_nix_lib_candidate<'a>(flags: &'a str, mut each: impl FnMut(&'a str)) {
+    let bytes = flags.as_bytes();
+    let mut at = 0usize;
+    let mut expect_dir = false;
+    let next_token = |at: &mut usize| -> Option<&'a str> {
+        while let Some(&b) = bytes.get(*at) {
+            if !b.is_ascii_whitespace() {
+                break;
+            }
+            *at += 1;
+        }
+        let &quote = bytes.get(*at)?;
+        if quote == b'"' || quote == b'\'' {
+            *at += 1;
+            let start = *at;
+            while let Some(&b) = bytes.get(*at) {
+                if b == quote {
+                    break;
+                }
+                *at += 1;
+            }
+            let token = flags.get(start..*at)?;
+            if bytes.get(*at) == Some(&quote) {
+                *at += 1;
+            }
+            Some(token)
+        } else {
+            let start = *at;
+            while let Some(&b) = bytes.get(*at) {
+                if b.is_ascii_whitespace() {
+                    break;
+                }
+                *at += 1;
+            }
+            flags.get(start..*at)
+        }
+    };
+    let mut emit_dir = |raw: &'a str| {
+        let trimmed = raw.trim_end_matches('/');
+        if trimmed.starts_with('/') && trimmed.len() > 1 {
+            each(trimmed);
+        }
+    };
+    while let Some(token) = next_token(&mut at) {
+        if expect_dir {
+            expect_dir = false;
+            emit_dir(token);
+            continue;
+        }
+        if token == "-B" || token == "-L" {
+            expect_dir = true;
+            continue;
+        }
+        if let Some(dir) = token.strip_prefix("-B").or_else(|| token.strip_prefix("-L"))
+            && !dir.is_empty()
+        {
+            let unquoted = dir
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| dir.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                .unwrap_or(dir);
+            emit_dir(unquoted);
+        }
+    }
+}
+
+/// Yields whitespace-delimited shell-like tokens from `flags` (stripping outer `"` / `'`),
+/// using only checked slicing (sans-IO, zero panics, zero allocations).
+fn for_each_shell_token<'a>(flags: &'a str, mut each: impl FnMut(&'a str)) {
+    let bytes = flags.as_bytes();
+    let mut at = 0usize;
+    while let Some(&b) = bytes.get(at) {
+        if b.is_ascii_whitespace() {
+            at += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            at += 1;
+            let start = at;
+            while let Some(&c) = bytes.get(at) {
+                if c == b {
+                    break;
+                }
+                at += 1;
+            }
+            if let Some(tok) = flags.get(start..at) {
+                each(tok);
+            }
+            if bytes.get(at) == Some(&b) {
+                at += 1;
+            }
+        } else {
+            let start = at;
+            while let Some(&c) = bytes.get(at) {
+                if c.is_ascii_whitespace() {
+                    break;
+                }
+                at += 1;
+            }
+            if let Some(tok) = flags.get(start..at) {
+                each(tok);
+            }
+        }
+    }
+}
+
+/// Extracts the first absolute ELF dynamic-linker path named in `flags` (e.g. Nix wrapper's
+/// `nix-support/libc-ldflags` or `NIX_LDFLAGS`): recognizes `-dynamic-linker <p>`,
+/// `--dynamic-linker <p>`, `-dynamic-linker=<p>`, `--dynamic-linker=<p>`, and `-Wl,...` forms.
+/// Sans-IO.
+pub fn nix_dynamic_linker_in_flags(flags: &str) -> Option<&str> {
+    fn take_abs<'a>(found: &mut Option<&'a str>, raw: &'a str) {
+        if found.is_none() && raw.starts_with('/') && raw.len() > 1 {
+            *found = Some(raw);
+        }
+    }
+    let mut found: Option<&str> = None;
+    let mut expect_path = false;
+    for_each_shell_token(flags, |token| {
+        if found.is_some() {
+            return;
+        }
+        if expect_path {
+            expect_path = false;
+            take_abs(&mut found, token);
+            return;
+        }
+        if matches!(token, "-dynamic-linker" | "--dynamic-linker") {
+            expect_path = true;
+            return;
+        }
+        if let Some(path) = token.strip_prefix("--dynamic-linker=").or_else(|| token.strip_prefix("-dynamic-linker=")) {
+            take_abs(&mut found, path);
+            return;
+        }
+        if let Some(wl) = token.strip_prefix("-Wl,") {
+            let mut wl_expect = false;
+            for part in wl.split(',') {
+                if wl_expect {
+                    take_abs(&mut found, part);
+                    break;
+                }
+                if matches!(part, "-dynamic-linker" | "--dynamic-linker") {
+                    wl_expect = true;
+                } else if let Some(path) = part.strip_prefix("--dynamic-linker=").or_else(|| part.strip_prefix("-dynamic-linker=")) {
+                    take_abs(&mut found, path);
+                    break;
+                }
+            }
+        }
+    });
+    found
+}
+
+/// Yields each absolute runtime library search directory (`rpath`) named in `flags` (e.g.
+/// `nix-support/libc-ldflags` or `NIX_LDFLAGS`): recognizes `-rpath <dir>`, `--rpath <dir>`,
+/// `-rpath=<dir>`, `--rpath=<dir>`, `-R <dir>`, `-R<dir>`, and `-Wl,...` forms. Sans-IO.
+pub fn for_each_nix_rpath_in_flags<'a>(flags: &'a str, mut each: impl FnMut(&'a str)) {
+    let mut expect_dir = false;
+    let mut emit = |raw: &'a str| {
+        for piece in raw.split(':') {
+            let trimmed = piece.trim_end_matches('/');
+            if trimmed.starts_with('/') && trimmed.len() > 1 {
+                each(trimmed);
+            }
+        }
+    };
+    for_each_shell_token(flags, |token| {
+        if expect_dir {
+            expect_dir = false;
+            emit(token);
+            return;
+        }
+        if matches!(token, "-rpath" | "--rpath" | "-R") {
+            expect_dir = true;
+            return;
+        }
+        if let Some(dir) = token
+            .strip_prefix("--rpath=")
+            .or_else(|| token.strip_prefix("-rpath="))
+            .or_else(|| token.strip_prefix("-R").filter(|d| d.starts_with('/')))
+        {
+            emit(dir);
+            return;
+        }
+        if let Some(wl) = token.strip_prefix("-Wl,") {
+            let mut wl_expect = false;
+            for part in wl.split(',') {
+                if wl_expect {
+                    wl_expect = false;
+                    emit(part);
+                    continue;
+                }
+                if matches!(part, "-rpath" | "--rpath" | "-R") {
+                    wl_expect = true;
+                } else if let Some(dir) = part
+                    .strip_prefix("--rpath=")
+                    .or_else(|| part.strip_prefix("-rpath="))
+                    .or_else(|| part.strip_prefix("-R").filter(|d| d.starts_with('/')))
+                {
+                    emit(dir);
+                }
+            }
+        }
+    });
+}
+
 /// Where a target's C library headers come from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sysroot {

@@ -97,6 +97,20 @@ pub enum TypedFinding {
         borrowed: bool,
         at: Range,
     },
+    /// `local-borrow-across-do`: a reference to a function's own local variable held live across
+    /// a `.do` suspension point (rules/do_expr.rs), which would make the compiled machine
+    /// self-referential and require `Pin`.
+    LocalBorrowAcrossDo {
+        local: crate::ids::Name,
+        at: Range,
+    },
+    /// `suspend-in-sans-io`: a `.do` suspension point inside a `#![blaze::sans_io]` body
+    /// (rules/capability.rs), forbidden because sans-IO cores must be pure, synchronous state
+    /// transitions that return requests rather than suspending.
+    SuspendInSansIo {
+        owner: ItemKey,
+        at: Range,
+    },
 }
 
 impl TypedFinding {
@@ -107,6 +121,8 @@ impl TypedFinding {
             TypedFinding::UnsafeOpInUnsafeFn { .. } => "unsafe-op-in-unsafe-fn",
             TypedFinding::Cost { .. } => "cost-contract",
             TypedFinding::CapabilityInSansIo { .. } => "capability-in-sans-io",
+            TypedFinding::LocalBorrowAcrossDo { .. } => "local-borrow-across-do",
+            TypedFinding::SuspendInSansIo { .. } => "suspend-in-sans-io",
         }
     }
 
@@ -116,7 +132,9 @@ impl TypedFinding {
             TypedFinding::ArgsInline { at, .. }
             | TypedFinding::UnsafeOpInUnsafeFn { at, .. }
             | TypedFinding::Cost { at, .. }
-            | TypedFinding::CapabilityInSansIo { at, .. } => at,
+            | TypedFinding::CapabilityInSansIo { at, .. }
+            | TypedFinding::LocalBorrowAcrossDo { at, .. }
+            | TypedFinding::SuspendInSansIo { at, .. } => at,
         }
     }
 
@@ -128,6 +146,8 @@ impl TypedFinding {
             TypedFinding::UnsafeOpInUnsafeFn { at, .. } => (at.start, at.end, 1, 0),
             TypedFinding::Cost { violation, at, .. } => (at.start, at.end, 2, violation as u8),
             TypedFinding::CapabilityInSansIo { borrowed, at, .. } => (at.start, at.end, 3, if borrowed { 1 } else { 0 }),
+            TypedFinding::LocalBorrowAcrossDo { at, .. } => (at.start, at.end, 4, 0),
+            TypedFinding::SuspendInSansIo { at, .. } => (at.start, at.end, 5, 0),
         }
     }
 }

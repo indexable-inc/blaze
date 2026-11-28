@@ -99,6 +99,7 @@ fn main() -> ExitCode {
         profile: None,
         natives: None,
         exports: &[],
+        inits: &[],
         symbol_names: &[],
     };
     let mut file = Vec::new_in(alloc);

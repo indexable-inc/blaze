@@ -1799,6 +1799,7 @@ impl<'r> CheckedRecord<'r> {
             findings: Vec::new_in(alloc),
             undecided: Vec::new_in(alloc),
             inferred_output: None,
+            suspends: false,
         })
     }
 }

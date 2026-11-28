@@ -72,18 +72,26 @@ pub trait Waiting<Ctx = ()>: Sized {
 }
 ```
 
-### Concurrency and batching are first-class requests
+### Concurrency, linking, and batching are first-class requests
 
 A single-op ping-pong loop cannot saturate `io_uring` or handle duplex child pipes (`stdout` +
-`stderr` + exit without deadlocking). `blaze-machine` defines structured concurrency combinators
-directly as `Request`s:
+`stderr` + exit without deadlocking). `blaze-machine` defines structured concurrency and linking
+combinators directly as `Request`s:
 
 - **`Race<A, B>`** (product submitted, sum returned): submits both `A` and `B`, resumes on the
   first completion (`RaceOutcome::First` / `RaceOutcome::Second`), and cancels the loser—holding
   any owned DMA buffer lent to the loser until the kernel's cancel CQE drains.
+- **`Chain<A, B>`** (linked pair, `IOSQE_IO_LINK`): submits `A` and `B` as one linked kernel
+  chain (`WriteFrom -> Flush -> Close` in one syscall round-trip), returning `ChainOutcome::Both`
+  or `ChainOutcome::FirstOnly` on linked short-circuit.
 - **`Batch<R, const CAP: usize>`** (bounded-N fan-out): submits up to `CAP` requests into one
   `io_uring` batch (directory walks, tree copies, pipelined CAS/HTTP fetches) and yields
   completions (`BatchReady { index, answer }`) as they land.
+- **Unified Machine Graph Verifier & Lean 4 Emitter (`blaze_machine::graph`):** verifies both
+  explicit `Waiting` graphs and LIR-lowered `.do` graphs (`blaze_lir::coroutine_machine`) for
+  reachability, dead ends, unmarked cycles, linear handle leak/double-close freedom on every
+  `Done`/`Fail` edge, and bounded `GraceBudget` on every `CancelCleanup` chain—and emits Lean 4
+  `inductive State` / `inductive Step` / `theorem verified_machine_no_leak` transition systems.
 
 ### Compile-time guarantees
 
@@ -115,19 +123,28 @@ A direct-style function over lexical branded capabilities (`fs: Fs<'h>`, `net: N
 `clk: Clock<'h>`) carries `EffectSet::SUSPEND` in `FnHeader` (bit 15, packed beside
 `PANIC | ALLOC | BLOCK | DIVERGE` with zero ABI overhead) and an effect row on `A | B`:
 
-- **Tail-resumptive operations** (`Clock::now`, `Rng::next`, `Alloc`) inline directly with zero
-  suspension frame.
-- **Suspending operations** are explicitly marked at every call site (so every yield, interleaving,
-  cancellation, and crash point stays visible in source) and obey the **no-local-borrow across
-  suspension** rule: values live across a yield are owned or in the task's `Frame`.
-- `blaze-lir/coroutine.rs` lowers suspending functions to the **exact same `Machine` ABI** as
-  explicit state-graph machines, driven by the same `Handler` (`IoUring`, `Kqueue`, `Sim`,
-  `Script`).
-- Effect polymorphism (`fn map<T, U, E>(.., f: fn(T) -> U / E) -> .. / E`) removes `sync`/`async`
-  function coloring across `bstd`. Suspending effects are monomorphized statically (not behind
-  unboxed `dyn Fn`); tail-resumptive effects work behind `dyn` freely.
+- **Tail-resumptive operations** (`Clock::now`, `Rng::next`, `Alloc`, and non-blocking syscalls)
+  specialize via `LoweringMode::PlainFn` (`blaze-ty::effect_ty`) with zero suspension frame.
+- **Suspending operations** use **postfix `.do`** (`dir.open_write(..).do?.flush().do?`), so every
+  yield, interleaving, cancellation, and crash point stays visible in source, paired with
+  context-sensitive lexical **`defer { ... }`** (`DEFER_EXPR` / `Expr::Defer`) for ergonomic linear
+  handle cleanup across `.do?` early returns—and obey the **no-local-borrow across `.do`** rule
+  (`local-borrow-across-do` in `blaze-typeck` + `LocalSlotAddrAcrossSuspend` in
+  `blaze-lir::coroutine_machine`).
+- `blaze-lir::coroutine_machine::split_machine` lowers suspending functions to the **exact same
+  zero-`Pin` `Machine` ABI** as explicit state-graph machines, driven by the same `Handler`
+  (`IoUring`, `Kqueue`, `Sim`, `Script`).
+- Effect polymorphism (`EffectRowSet` in `blaze-ty::effect_ty`: `fn map<T, U, / E>(.., f: fn(T) -> U / E) -> .. / E`)
+  removes `sync`/`async` function coloring across `bstd`. Suspending effects are monomorphized
+  statically (`SuspendBehindDyn` refused behind unboxed `dyn Fn`); tail-resumptive effects work
+  behind `dyn` freely.
 - Continuations are strictly **one-shot linear**, so linear handles and typestate protocols
   (`UnflushedFile -> flush() -> FlushedFile -> rename()`) hold across suspension points.
+- **Fine-grained Syscall Effects (`SyscallSet`):** kernel authority in `blaze-sys` partitions into
+  tail-resumptive (`sys::clock`, `sys::rng`, `sys::vm`, `sys::stat`) and suspending (`sys::fs`,
+  `sys::net`, `sys::proc`, `sys::sync`) domains, enabling compile-time minimal `seccomp-bpf` /
+  Seatbelt sandbox synthesis, zero-`#[cfg]` unikernel/wasm64 handler portability, and sound
+  `#![blaze::sans_io]` enforcement (`effects ∩ (SYSCALL_ALL | SUSPEND) == ∅`).
 
 ## 2. Two-tier capabilities and generational handles (`blaze-core`, module `handle`)
 
@@ -198,9 +215,13 @@ Groups: `file` (`Open`, `Close`, `Read`, `ReadInto`, `ReadMany`, `WriteFrom`, `F
 
 | Wave | What | Effort |
 |---|---|---|
-| 1 | **ABI & compiler foundation (built first):** `EffectSet::SUSPEND` (`FnHeader` bit 15); `#[blaze::handle]` two-tier firewall (`blaze-surface`, `blaze-typeck`, `blaze-ladder`); `crates/blaze-machine` (`Request`, `Waiting`, `Ask`, `Race`, `Batch`, `Call`, `Machine`, `TaskFrame`, `Handler`, `Script`); `crates/blaze-core/{handle,request}` (`Handle<'io, K>`, `HandleTable`, typestate `File`, `DmaBuf`, `SimHandler` + DSTs) | `[████░░░░░░]` |
-| 2 | **Compiler lexical effects & lowering:** one-shot `perform` syntax, effect rows over `A \| B`, no-local-borrow check, `blaze-lir/coroutine.rs` lowering to `Machine` ABI, `DropWith<C>` / linear-across-yield | `[███████░░░]` |
-| 3 | **Whole-tree port (one pass):** capability methods return requests with `#[blaze::args]` `*Opts` + `ByteOffset`/`ByteLen`; delete `Done::Read(Vec<u8>)`; port protocols/journals (`blaze-cas`, `blaze-h1-net`, `blaze-fetch` transport) as explicit typestate `Machine`s and workflows (`bgit`, `blaze-cli`, `dir walk`, `tree copy`, `scripts`) directly onto lexical effects + `drop-with.md` arenas | `[████████░░]` |
+| 1 | **ABI & compiler foundation (landed in #2850):** `EffectSet::SUSPEND` (`FnHeader` bit 15); `#[blaze::handle]` two-tier firewall (`blaze-surface`, `blaze-typeck`, `blaze-ladder`); `crates/blaze-machine` (`Request`, `Waiting`, `Ask`, `Race`, `Batch`, `Call`, `Machine`, `TaskFrame`, `Handler`, `Script`); `crates/blaze-core/{handle,request}` (`Handle<'io, K>`, `HandleTable`, typestate `File`, `DmaBuf`, `SimHandler` + DSTs) | `[████░░░░░░]` |
+| 2 | **Compiler `.do` + `defer`, effect polymorphism, LIR Machine pass & generic `DriverHandler` (landed):** postfix `.do` (`DO_EXPR`/`Expr::Do`) + `local-borrow-across-do`; context-sensitive lexical `defer { ... }` (`DEFER_EXPR`/`Expr::Defer`); `EffectRowSet` + `LoweringMode::{PlainFn, MachineCoroutine}` + `SuspendBehindDyn`; `blaze-lir::coroutine_machine` zero-`Pin` splitter; `Chain<A, B>` + `blaze-machine::graph` verifier & Lean 4 emitter; non-monomorphized `DriverHandler<D>` + `FixedBufIndex`/`FixedFileSlot`; `bstd::machine`, `Cx::drive_machine`, `HttpExchangeMachine` | `[███████░░░]` |
+| 3 | **Syscall Effects, live `.do`/`defer` codegen, `Join`/`LeasedBuf`/`RecordHandler` & first real ports (landed):** 8-domain `SyscallSet` (`blaze-ty`) + 0-dep `blaze-sys::effects` Seatbelt SBPL / Linux seccomp policy synthesizer + sound `blaze-typeck`/`blaze-lint` sans-IO checks; `Join<A, B>` + `ScopeBudget`, linear `LeasedBuf<'io>`/`BufferRing`, `RecordHandler<H>` -> `Script` reproducer; `MachineBudget::max_bytes` state-size bound (`blaze-lir`); `Chain`/`Batch` + zero-`Effect`-bridge `DirectFsHandler` + `UringSqePlan` (`blaze-core`); `Cx::run`/`run_with`, `bstd::fs::req` + `AtomicPublishMachine`, `bstd::net::req`; `FetchUnitMachine` (`blaze-fetch`) + `CasRecordPublishMachine` (`blaze-cas`); `blaze-build` LIFO `defer` + `.do` -> `split_machine` codegen | `[████████░░]` |
+| 4 | **End-to-end real-Rust `.do`/`defer`, Seccomp BPF compiler, Sim Rule-16 fix & `bstd`/crate ports (landed):** real `#![no_core]` Rust `.do` + `defer` E2E runner (`blaze-ladder/tests/front2_do_defer_run.rs`); `#[blaze::max_state_bytes]` & `#[blaze::syscalls]` in `blaze-surface`; cross-platform classic-BPF seccomp compiler + `#![no_std]` BPF VM oracle in `blaze-sys::effects` wired into `linux/confine.rs::build_domain_filter`; Rule-16 decomposition of `Sim::submit` & `Sim::complete` + direct `DirectFsBackend for Sim` (zero `Effect`/`Done` bridge); `bstd::time::req`, `bstd::rng::req`, `procs/hermetic.rs` `DomainMask`->SBPL bridge, `HttpExchangeMachine` `RecordHandler` replay; `blaze-remote` `RemoteCacheMachine` + `bgit` dual-linear-handle `AtomicRefUpdateMachine`; `core::contracts::{requires, ensures}` fix in `blaze-scope` | `[████████░░]` |
+| 5 | **Native `DirectFsBackend`, full `bstd` request facades, Rule-16 hotspot splits & full E2E `.do`/effect-polymorphism proofs (landed):** `NativeDirectFs` zero-`Effect`-bridge OS backend + byte-for-byte conformance test against `Sim` + `UringSqePlan` flush/rename-sync chains (`blaze-core`); `bstd::procs::req`, `bstd::io::req`, `bstd::watch::req`, `HermeticSpec::seccomp_bpf`, and `NetHttpHandler` driving `HttpExchangeMachine` over `bstd::net::Conn`; `blaze-build::{has_do_exprs, split_do_machine_body_bounded}` + 4 additional real-Rust E2E tests in `blaze-ladder` (`#[blaze::max_state_bytes]`, `EffectRowSet`/`LoweringMode`, `#![blaze::sans_io]`/`#[blaze::syscalls]`, nested `defer` + `MachineGraph` cancel-bound proof); Rule-16 P0 decompositions of `Threads::run_kept` (35.9k blocks), `blaze-cas` `Plain::complete_with_par` (37.6k blocks, 608->61 lines), and `blaze-typeck` `Machine::writeback` (41.6k blocks / 3.64 MB frame) | `[████████░░]` |
+| 6 | **Live `suspend-in-sans-io`, real `bstd::requests::Http` & `DirectNetHandler` wiring, `blaze-world`/`blaze-proc-macro` machines & `blaze-ladder` Rule-16 splits (landed):** live `suspend-in-sans-io` compiler error across `blaze-typeck` -> `blaze-lint` -> `blaze-lint-defs` -> `blaze-ladder` (propagating `TypeAttrs::SANS_IO` onto `Fn` items); real `bstd::requests::Http::over` (`read_answer`) wired onto `HttpExchangeMachine` + `BorrowedConnHttpHandler` (plus `blaze-h1` `BodyOver` head-state fix, 13/13 `bstd::requests` tests green) and `bstd::fs::publish_atomic_direct` wired onto `AtomicPublishMachine` + `DirectFsHandler`; Linux `uring::sqe_from_plan` lowering `UringSqePlan` into kernel `Sqe` + zero-`Effect`-bridge `DirectNetBackend`/`DirectNetHandler` (`InMemoryDirectNet` + real OS `NativeDirectNet` loopback conformance); `BuildScriptExecMachine` (`blaze-proc-macro`) & `StoredFileFetchMachine` (`blaze-world`); all 7 `warning[sans-io-core]` warnings in `blaze-fetch`/`blaze-engine`/`blaze-run` eliminated; Rule-16 decompositions of `blaze-ladder` `Front2Program::make_from` (-83%), `build_from` (-78%), and `Store::file_heads` (-98%) | `[█████████░]` |
+| 7 | **Long-term multi-day migration (after self-hosting removes nightly `rustc` bootstrap):** native Linux `io_uring` & macOS `kqueue` direct `Handler<R>` drivers over `UringSqePlan`, deleting the 63-variant `Effect`/`Done` enum; migrating the 232 legacy blocking `bstd` methods and porting `blaze-cli`, `blaze-launch-rt`, and `scripts` onto direct-style `.do` + `defer` | `[██████████]` |
 
 ## 6. How it is proven
 

@@ -592,4 +592,10 @@ pub(super) const BLAZE: &[Lint] = &[
     // Sans-IO capability firewall (`#[blaze::capability]` stored in `#![blaze::sans_io]` ADT), checked by blaze-typeck's `capability-in-sans-io` rule.
     l("blaze::capability_in_sans_io", Deny, "detects a `#[blaze::capability]` type stored (directly or transitively) as a field inside a type defined in a `#![blaze::sans_io]` crate or module")
         .externally_loaded(),
+    // No local borrow held across a `.do` suspension point, checked by blaze-typeck's `local-borrow-across-do` rule.
+    l("blaze::local_borrow_across_do", Deny, "detects a reference to a local variable held live across a `.do` suspension point")
+        .externally_loaded(),
+    // No `.do` suspension point inside a `#![blaze::sans_io]` body, checked by blaze-typeck's `suspend-in-sans-io` rule.
+    l("blaze::suspend_in_sans_io", Deny, "detects a `.do` suspension point inside a `#![blaze::sans_io]` body")
+        .externally_loaded(),
 ];

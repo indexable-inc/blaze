@@ -16,6 +16,8 @@
 //!   [`MAX_WALK_DEPTH`] so recursive types (`struct Node { next: *const Node }`) terminate cleanly.
 
 use blaze_own::{Alloc, Vec};
+use blaze_ty::effect_ty::EffectSet;
+use blaze_ty::syscall_ty::{SyscallPolicyError, SyscallSet, check_sans_io, check_syscall_policy};
 
 use crate::body::Expr;
 use crate::diag::At;
@@ -25,7 +27,7 @@ use crate::machine::Machine;
 use crate::portable::{PNode, PTy, PTys};
 use crate::rules::args_inline::TypedFinding;
 use crate::ty::{TyView, TypeCtx};
-use crate::world::{AdtKind, Reads, World};
+use crate::world::{AdtKind, Reads, TypeAttrs, World};
 
 /// Maximum nesting depth for transitive capability field walks (Rule 18).
 const MAX_WALK_DEPTH: usize = 32;
@@ -366,5 +368,332 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
         }
         Ok(())
+    }
+
+    /// Body-level `suspend-in-sans-io` check after the end sequence: rejects any `.do`
+    /// suspension point inside a `#![blaze::sans_io]` body (unless marked `#[blaze::capability]`)
+    /// with [`TypedFinding::SuspendInSansIo`].
+    pub(crate) fn suspend_in_sans_io(&mut self) -> Result<(), Stop> {
+        // Zero-cost fast path: skip immediately if this body contains no `.do` expressions.
+        if !self.body.exprs.iter().any(|x| matches!(x, Expr::Do(_))) {
+            return Ok(());
+        }
+        let owner = self.body.owner;
+        let attrs = self.reads.attrs(owner)?;
+        if !attrs.is_sans_io() || attrs.is_capability() {
+            return Ok(());
+        }
+        for (i, &x) in self.body.exprs.iter().enumerate() {
+            if matches!(x, Expr::Do(_)) {
+                let at = self.range_of(At::Expr(ExprId(i as u32)));
+                self.typed_findings.push(TypedFinding::SuspendInSansIo { owner, at });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One type-level violation of `#![blaze::sans_io]` or an explicit syscall policy on a body
+/// (`blaze_ty::syscall_ty`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SansIoBodyFinding {
+    /// The body's owner item.
+    pub owner: ItemKey,
+    /// The typed effect/syscall policy error (`SansIoViolation` or `SyscallExceedsPolicy`).
+    pub error: SyscallPolicyError,
+}
+
+/// Validates a body's inferred `(effects, syscalls)` against its [`TypeAttrs`] `#![blaze::sans_io]`
+/// mark via [`check_sans_io`].
+///
+/// - Fast path: non-`#![blaze::sans_io]` items and `#[blaze::capability]` definitions pass
+///   immediately without restriction.
+/// - `#![blaze::sans_io]` bodies (including pure methods on inert `#[blaze::handle]` tokens):
+///   permits pure, allocating, panicking, or diverging computation with [`SyscallSet::EMPTY`],
+///   and refuses any non-empty [`SyscallSet`], [`EffectSet::BLOCK`], or [`EffectSet::SUSPEND`]
+///   with [`SansIoBodyFinding`] carrying [`SyscallPolicyError::SansIoViolation`].
+#[inline]
+pub const fn check_sans_io_effects(
+    owner: ItemKey,
+    attrs: TypeAttrs,
+    effects: EffectSet,
+    syscalls: SyscallSet,
+) -> Result<(), SansIoBodyFinding> {
+    if !attrs.is_sans_io() || attrs.is_capability() {
+        return Ok(());
+    }
+    match check_sans_io(effects, syscalls) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(SansIoBodyFinding { owner, error }),
+    }
+}
+
+/// Validates a body's required [`SyscallSet`] against an explicit allowed syscall policy via
+/// [`check_syscall_policy`], returning a typed [`SansIoBodyFinding`] carrying
+/// [`SyscallPolicyError::SyscallExceedsPolicy`] on any disallowed kernel domain.
+#[inline]
+pub const fn check_body_syscall_policy(
+    owner: ItemKey,
+    required: SyscallSet,
+    allowed: SyscallSet,
+) -> Result<(), SansIoBodyFinding> {
+    match check_syscall_policy(required, allowed) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(SansIoBodyFinding { owner, error }),
+    }
+}
+
+/// Checks a body's inferred `(effects, syscalls)` against its `#![blaze::sans_io]` attribute in
+/// `world` through [`Reads`] so the `Question::Attrs` dependency is recorded cleanly.
+pub fn check_sans_io_body<'a, W: World>(
+    world: &W,
+    owner: ItemKey,
+    effects: EffectSet,
+    syscalls: SyscallSet,
+    alloc: Alloc<'a>,
+) -> Result<Result<(), SansIoBodyFinding>, CheckError> {
+    let mut reads = Reads::new_in(world, alloc);
+    match check_sans_io_body_in(&mut reads, owner, effects, syscalls) {
+        Ok(verdict) => Ok(verdict),
+        Err(Stop::Error(e)) => Err(e),
+        Err(Stop::Need(_)) => Ok(Ok(())),
+    }
+}
+
+/// Shared sans-IO body effect/syscall check driven over a sealed [`Reads`] recorder.
+pub(crate) fn check_sans_io_body_in<'a, W: World>(
+    reads: &mut Reads<'_, 'a, W>,
+    owner: ItemKey,
+    effects: EffectSet,
+    syscalls: SyscallSet,
+) -> Result<Result<(), SansIoBodyFinding>, Stop> {
+    let attrs = reads.attrs(owner)?;
+    Ok(check_sans_io_effects(owner, attrs, effects, syscalls))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixture::Fx;
+
+    const ALL_DOMAINS: [SyscallSet; 8] = [
+        SyscallSet::CLOCK,
+        SyscallSet::RNG,
+        SyscallSet::VM,
+        SyscallSet::STAT,
+        SyscallSet::FS,
+        SyscallSet::NET,
+        SyscallSet::PROC,
+        SyscallSet::SYNC,
+    ];
+
+    const TAIL_RESUMPTIVE_DOMAINS: [SyscallSet; 4] = [
+        SyscallSet::CLOCK,
+        SyscallSet::RNG,
+        SyscallSet::VM,
+        SyscallSet::STAT,
+    ];
+
+    const SUSPENDING_DOMAINS: [SyscallSet; 4] = [
+        SyscallSet::FS,
+        SyscallSet::NET,
+        SyscallSet::PROC,
+        SyscallSet::SYNC,
+    ];
+
+    #[test]
+    fn check_sans_io_effects_allows_pure_compute_and_rejects_block_suspend_and_all_syscall_domains() {
+        let owner = ItemKey(101);
+        let sans_io = TypeAttrs(TypeAttrs::SANS_IO);
+        let sans_io_handle = TypeAttrs(TypeAttrs::SANS_IO | TypeAttrs::HANDLE);
+
+        // Pure, allocating, panicking, and diverging computation with zero syscalls passes.
+        let allowed_effects = [
+            EffectSet::PURE,
+            EffectSet::ALLOC,
+            EffectSet::PANIC,
+            EffectSet::DIVERGE,
+            EffectSet::ALLOC.union(EffectSet::PANIC).union(EffectSet::DIVERGE),
+        ];
+        for effects in allowed_effects {
+            assert_eq!(check_sans_io_effects(owner, sans_io, effects, SyscallSet::EMPTY), Ok(()));
+            assert_eq!(check_sans_io_effects(owner, sans_io_handle, effects, SyscallSet::EMPTY), Ok(()));
+        }
+
+        // BLOCK and SUSPEND (alone or combined with pure effects) are refused on `#![blaze::sans_io]`.
+        let forbidden_effects = [
+            EffectSet::BLOCK,
+            EffectSet::SUSPEND,
+            EffectSet::BLOCK.union(EffectSet::SUSPEND),
+            EffectSet::ALLOC.union(EffectSet::SUSPEND),
+            EffectSet::PANIC.union(EffectSet::BLOCK),
+            EffectSet::DIVERGE.union(EffectSet::SUSPEND),
+            EffectSet::ALL,
+        ];
+        for effects in forbidden_effects {
+            let expected = Err(SansIoBodyFinding {
+                owner,
+                error: SyscallPolicyError::SansIoViolation { effects, syscalls: SyscallSet::EMPTY },
+            });
+            assert_eq!(check_sans_io_effects(owner, sans_io, effects, SyscallSet::EMPTY), expected);
+            assert_eq!(check_sans_io_effects(owner, sans_io_handle, effects, SyscallSet::EMPTY), expected);
+        }
+
+        // Every one of the 8 kernel syscall domains (plus tier masks and ALL) is refused under
+        // `#![blaze::sans_io]`, whether paired with PURE, ALLOC|PANIC|DIVERGE, BLOCK, or SUSPEND.
+        for domain in ALL_DOMAINS {
+            for effects in [EffectSet::PURE, EffectSet::ALLOC, EffectSet::BLOCK, EffectSet::SUSPEND] {
+                assert_eq!(
+                    check_sans_io_effects(owner, sans_io, effects, domain),
+                    Err(SansIoBodyFinding {
+                        owner,
+                        error: SyscallPolicyError::SansIoViolation { effects, syscalls: domain },
+                    })
+                );
+            }
+        }
+        for mask in [SyscallSet::TAIL_RESUMPTIVE, SyscallSet::SUSPENDING, SyscallSet::ALL] {
+            assert_eq!(
+                check_sans_io_effects(owner, sans_io, EffectSet::PURE, mask),
+                Err(SansIoBodyFinding {
+                    owner,
+                    error: SyscallPolicyError::SansIoViolation { effects: EffectSet::PURE, syscalls: mask },
+                })
+            );
+        }
+
+        // Fast-path exemptions: non-sans-IO items, plain handles without sans-IO, and
+        // `#[blaze::capability]` definitions (even inside sans-IO crates) bypass the restriction.
+        for exempt in [
+            TypeAttrs::default(),
+            TypeAttrs(TypeAttrs::HANDLE),
+            TypeAttrs(TypeAttrs::CAPABILITY),
+            TypeAttrs(TypeAttrs::SANS_IO | TypeAttrs::CAPABILITY),
+        ] {
+            assert_eq!(check_sans_io_effects(owner, exempt, EffectSet::ALL, SyscallSet::ALL), Ok(()));
+            assert_eq!(check_sans_io_effects(owner, exempt, EffectSet::SUSPEND, SyscallSet::FS), Ok(()));
+            assert_eq!(check_sans_io_effects(owner, exempt, EffectSet::BLOCK, SyscallSet::SYNC), Ok(()));
+        }
+    }
+
+    #[test]
+    fn check_body_syscall_policy_enforces_exact_subset_across_all_eight_domains() {
+        let owner = ItemKey(202);
+
+        // Empty requirement is permitted under every policy, including EMPTY.
+        assert_eq!(check_body_syscall_policy(owner, SyscallSet::EMPTY, SyscallSet::EMPTY), Ok(()));
+        assert_eq!(check_body_syscall_policy(owner, SyscallSet::EMPTY, SyscallSet::ALL), Ok(()));
+
+        // Each of the 8 domains passes under itself and ALL, and fails under EMPTY and its exact
+        // complement `ALL \ domain`.
+        for domain in ALL_DOMAINS {
+            assert_eq!(check_body_syscall_policy(owner, domain, domain), Ok(()));
+            assert_eq!(check_body_syscall_policy(owner, domain, SyscallSet::ALL), Ok(()));
+
+            assert_eq!(
+                check_body_syscall_policy(owner, domain, SyscallSet::EMPTY),
+                Err(SansIoBodyFinding {
+                    owner,
+                    error: SyscallPolicyError::SyscallExceedsPolicy { required: domain, allowed: SyscallSet::EMPTY },
+                })
+            );
+
+            let complement = SyscallSet::ALL.difference(domain);
+            assert_eq!(
+                check_body_syscall_policy(owner, domain, complement),
+                Err(SansIoBodyFinding {
+                    owner,
+                    error: SyscallPolicyError::SyscallExceedsPolicy { required: domain, allowed: complement },
+                })
+            );
+        }
+
+        // Tier separation: tail-resumptive (`CLOCK|RNG|VM|STAT`) vs suspending (`FS|NET|PROC|SYNC`).
+        for domain in TAIL_RESUMPTIVE_DOMAINS {
+            assert_eq!(check_body_syscall_policy(owner, domain, SyscallSet::TAIL_RESUMPTIVE), Ok(()));
+            assert_eq!(
+                check_body_syscall_policy(owner, domain, SyscallSet::SUSPENDING),
+                Err(SansIoBodyFinding {
+                    owner,
+                    error: SyscallPolicyError::SyscallExceedsPolicy {
+                        required: domain,
+                        allowed: SyscallSet::SUSPENDING,
+                    },
+                })
+            );
+        }
+        for domain in SUSPENDING_DOMAINS {
+            assert_eq!(check_body_syscall_policy(owner, domain, SyscallSet::SUSPENDING), Ok(()));
+            assert_eq!(
+                check_body_syscall_policy(owner, domain, SyscallSet::TAIL_RESUMPTIVE),
+                Err(SansIoBodyFinding {
+                    owner,
+                    error: SyscallPolicyError::SyscallExceedsPolicy {
+                        required: domain,
+                        allowed: SyscallSet::TAIL_RESUMPTIVE,
+                    },
+                })
+            );
+        }
+
+        // Composite policy intersection/difference edge case.
+        let allowed = SyscallSet::CLOCK.union(SyscallSet::STAT).union(SyscallSet::FS);
+        let ok_req = SyscallSet::CLOCK.union(SyscallSet::FS);
+        let bad_req = SyscallSet::FS.union(SyscallSet::NET);
+        assert_eq!(check_body_syscall_policy(owner, ok_req, allowed), Ok(()));
+        assert_eq!(
+            check_body_syscall_policy(owner, bad_req, allowed),
+            Err(SansIoBodyFinding {
+                owner,
+                error: SyscallPolicyError::SyscallExceedsPolicy { required: bad_req, allowed },
+            })
+        );
+    }
+
+    #[test]
+    fn check_sans_io_body_enforces_do_suspension_via_world_reads() {
+        let mut fx = Fx::new();
+        let u32_ = fx.u32();
+        let sans_io_fn = fx.func("core_fn", 0, &[u32_], u32_, std::vec![]);
+        fx.set_attrs(sans_io_fn, TypeAttrs(TypeAttrs::SANS_IO));
+        let driver_fn = fx.func("driver_fn", 0, &[u32_], u32_, std::vec![]);
+        fx.finish();
+
+        let alloc = Alloc::global();
+        assert_eq!(
+            check_sans_io_body(&fx, sans_io_fn, EffectSet::PURE, SyscallSet::EMPTY, alloc).expect("pure sans_io"),
+            Ok(())
+        );
+        assert_eq!(
+            check_sans_io_body(&fx, sans_io_fn, EffectSet::SUSPEND, SyscallSet::EMPTY, alloc).expect("suspend sans_io"),
+            Err(SansIoBodyFinding {
+                owner: sans_io_fn,
+                error: SyscallPolicyError::SansIoViolation {
+                    effects: EffectSet::SUSPEND,
+                    syscalls: SyscallSet::EMPTY,
+                },
+            })
+        );
+        assert_eq!(
+            check_sans_io_body(&fx, driver_fn, EffectSet::SUSPEND, SyscallSet::FS, alloc).expect("driver suspend"),
+            Ok(())
+        );
+
+        // Verify `check_sans_io_body_in` records the `Question::Attrs(owner)` read on `Reads`.
+        let mut reads = Reads::new_in(&fx, alloc);
+        let verdict = check_sans_io_body_in(&mut reads, sans_io_fn, EffectSet::BLOCK, SyscallSet::SYNC)
+            .expect("reads verdict");
+        assert_eq!(
+            verdict,
+            Err(SansIoBodyFinding {
+                owner: sans_io_fn,
+                error: SyscallPolicyError::SansIoViolation {
+                    effects: EffectSet::BLOCK,
+                    syscalls: SyscallSet::SYNC,
+                },
+            })
+        );
+        let (read_list, _) = reads.finish(alloc);
+        assert!(read_list.holds(&crate::world::Question::Attrs(sans_io_fn)));
     }
 }

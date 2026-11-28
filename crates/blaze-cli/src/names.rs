@@ -78,7 +78,9 @@ pub(crate) mod sections;
 // `OUT_DOMAIN` 3. Source 19: `CrateScope` form 7 (32-byte `NameCell` rows + columnar `ItemsRecord` v14).
 // Source 20: `OUT_DOMAIN` 4 digests exports + Section 2 (`names_record`) + Section 3
 // (`items_record`) + expansions directory instead of dead `done.inner`.
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 20";
+// Source 21: Section 6 (`links`) `TABLE_FORM` 2 includes Rust `.init_array` / `__mod_init_func`
+// initializer statics.
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 21";
 /// The out: the exports record, Section 2 (`NAMES_OUT_DOMAIN`), Section 3 (`ITEMS_OUT_DOMAIN`),
 /// the crate's expansion record keys (`EXPANSIONS_OUT_DOMAIN`), AND the checkout files the crate
 /// holds ([`crate_out`]). "1" was the names record alone, but a body's check reads its crate's
@@ -1835,7 +1837,7 @@ fn make_world<'f>(
         };
         (world, packages.finish().leak_slice(), None)
     };
-    let _cx = cx.span("names: the world's public crates and scripts");
+    let span_cx = cx.span("names: the world's public crates and scripts");
     let from_archive = |unit: blaze_unit_graph::UnitId| {
         let package = lock.package(graph.units[unit.0 as usize].package);
         matches!(package.source, LockSource::Registry { .. }) && matches!(package.checksum, blaze_manifest::lock::Checksum::Sha256(_))
@@ -1854,37 +1856,72 @@ fn make_world<'f>(
     let mut script_roots = std::vec::Vec::new_in(Global);
     let mut script_modules = std::vec::Vec::new_in(Global);
     let mut placements = std::vec::Vec::new_in(Global);
-    for (at, script_id) in script_units(world.crates.iter().map(|krate| krate.origin), |unit| graph.units[unit.index()].build_script) {
-        let ran_as = crate::scripts::placement(Some(home), graph, script_id, heap);
-        placements.push((at, ran_as));
-        let script = &graph.units[script_id.index()];
-        script_roots.push((at, script.root.as_str()));
-        let mut features = std::vec::Vec::new_in(Global);
-        features.extend(script.features.iter().map(|feature| feature.as_str()));
-        let files = paths
-            .iter()
-            .find(|p| p.id == script.package)
-            .and_then(|p| crate::macro_files::script_files_digest_in_dir(cx, &reader.root, p.dir, script.root.as_str(), frame));
-        let deps = blaze_proc_macro::script_unit::script_deps_digest(graph, wasm_graph, lock, script_id, |dep_pkg| {
-            members
-                .iter()
-                .find(|p| p.id == dep_pkg)
-                .and_then(|p| crate::macro_files::package_files_digest_in_dir(cx, &reader.root, p.dir, frame))
-        })
-        .map_err(|_| NamesError::Frame)?;
-        let subject = crate::script_modules::subject(ran_as, script.name.as_str(), script.version.as_str(), &features, files.as_deref(), deps.as_deref());
-        script_modules.push(crate::script_modules::ScriptModule {
-            subject,
-            crate_at: at,
-            script_unit: script_id,
-            ran_as,
-            package: script.name.as_str(),
-            version: script.version.as_str(),
-            features,
-            files,
-            deps,
-        });
+    let script_scratch = Frame::new(bstd::mem::Tag::Other).map_err(|_| NamesError::Frame)?;
+    let mut io_scratch = Frame::new(bstd::mem::Tag::Other).map_err(|_| NamesError::Frame)?;
+    let mut pkg_files_cache: blaze_own::Vec<Option<Option<&str>>, &Frame> =
+        blaze_own::Vec::with_capacity_in(lock.packages.len(), &script_scratch);
+    for _ in 0..lock.packages.len() {
+        pkg_files_cache.push(None);
     }
+    collect_dedup_script_units(
+        script_units(world.crates.iter().map(|krate| krate.origin), |unit| graph.units[unit.index()].build_script),
+        graph.units.len(),
+        &script_scratch,
+        |script_id| {
+            let ran_as = crate::scripts::placement(Some(home), graph, script_id, heap);
+            let script = &graph.units[script_id.index()];
+            let features: &'static [&'static str] = {
+                let mut feat_buf: blaze_own::Vec<&'static str, &Frame> =
+                    blaze_own::Vec::with_capacity_in(script.features.len(), &io_scratch);
+                feat_buf.extend(script.features.iter().map(|feature| feature.as_str()));
+                frame.alloc_slice_copy(feat_buf.as_slice())
+            };
+            io_scratch.reset();
+            let files = paths
+                .iter()
+                .find(|p| p.id == script.package)
+                .and_then(|p| crate::macro_files::script_files_digest_in_dir(&span_cx, &reader.root, p.dir, script.root.as_str(), frame, &io_scratch));
+            io_scratch.reset();
+            let deps = blaze_proc_macro::script_unit::script_deps_digest_with(
+                graph,
+                crate::scripts::deps_wasm_graph(ran_as, wasm_graph),
+                lock,
+                script_id,
+                |dep_pkg| {
+                    let slot = pkg_files_cache.get_mut(dep_pkg.index())?;
+                    *slot.get_or_insert_with(|| {
+                        let digest = members
+                            .iter()
+                            .find(|p| p.id == dep_pkg)
+                            .and_then(|p| crate::macro_files::package_files_digest_in_dir(&span_cx, &reader.root, p.dir, &script_scratch, &io_scratch));
+                        io_scratch.reset();
+                        digest
+                    })
+                },
+                &script_scratch,
+            )
+            .map_err(|_| NamesError::Frame)?
+            .map(|hex| &*frame.alloc_str(hex.as_str()));
+            let subject = crate::script_modules::subject(ran_as, script.name.as_str(), script.version.as_str(), features, files, deps);
+            Ok(ComputedScript { ran_as, subject, features, files, deps })
+        },
+        |at, script_id, computed| {
+            placements.push((at, computed.ran_as));
+            let script = &graph.units[script_id.index()];
+            script_roots.push((at, script.root.as_str()));
+            script_modules.push(crate::script_modules::ScriptModule {
+                subject: computed.subject,
+                crate_at: at,
+                script_unit: script_id,
+                ran_as: computed.ran_as,
+                package: script.name.as_str(),
+                version: script.version.as_str(),
+                features: computed.features,
+                files: computed.files,
+                deps: computed.deps,
+            });
+        },
+    )?;
     script_modules.sort_unstable_by_key(|module| (module.subject, module.crate_at));
     for (at, _) in scripts.iter() {
         if placements.binary_search_by_key(at, |(krate, _)| *krate).is_err() {
@@ -1898,6 +1935,46 @@ fn make_world<'f>(
     // all live world allocations intact for the remainder of the command.
     frame.trim_tail();
     Ok(NamesWorld { world, crate_public, heap, scripts, script_roots, script_modules, graph, wasm_graph, placed, lazy_trees, frame, opened })
+}
+
+#[derive(Clone, Copy)]
+struct ComputedScript {
+    ran_as: crate::scripts::RanAs,
+    subject: ContentId,
+    features: &'static [&'static str],
+    files: Option<&'static str>,
+    deps: Option<&'static str>,
+}
+
+/// Evaluates `compute(script_id)` at most once per unique `script_id` across all crate targets
+/// (`lib`, `bin`, `tests/*`, `benches/*`) that share that build-script unit, delivering each
+/// `(crate_at, script_id, computed)` to `emit`.
+fn collect_dedup_script_units<T: Copy, E>(
+    entries: impl IntoIterator<Item = (usize, blaze_unit_graph::UnitId)>,
+    unit_count: usize,
+    scratch: &Frame,
+    mut compute: impl FnMut(blaze_unit_graph::UnitId) -> Result<T, E>,
+    mut emit: impl FnMut(usize, blaze_unit_graph::UnitId, T),
+) -> Result<(), E> {
+    let mut cache: blaze_own::Vec<Option<T>, &Frame> = blaze_own::Vec::with_capacity_in(unit_count, scratch);
+    for _ in 0..unit_count {
+        cache.push(None);
+    }
+    for (at, script_id) in entries {
+        let value = match cache.get_mut(script_id.index()) {
+            Some(slot) => match *slot {
+                Some(cached) => cached,
+                None => {
+                    let computed = compute(script_id)?;
+                    *slot = Some(computed);
+                    computed
+                }
+            },
+            None => compute(script_id)?,
+        };
+        emit(at, script_id, value);
+    }
+    Ok(())
 }
 
 /// Each crate (by world index, in order) made from a unit with a build script, with that
@@ -2304,6 +2381,113 @@ mod unresolved_tests {
             assert_eq!(parallel.items_out, serial.items_out, "has_surface={has_surface}: items_out mismatch");
             assert_eq!(parallel.expansions_out, serial.expansions_out, "has_surface={has_surface}: expansions_out mismatch");
         }
+    }
+
+    #[test]
+    fn collect_dedup_script_units_computes_each_script_id_once_across_shared_targets() {
+        use blaze_unit_graph::UnitId;
+        let scratch = bstd::mem::Frame::new(bstd::mem::Tag::Other).expect("scratch");
+        // Simulate 134 crate targets (lib + bins + tests + benches) sharing UnitId(2),
+        // plus 3 targets sharing UnitId(5).
+        let mut entries = std::vec::Vec::new();
+        for at in 0..134usize {
+            entries.push((at, UnitId(2)));
+        }
+        for at in 134..137usize {
+            entries.push((at, UnitId(5)));
+        }
+        let mut compute_calls = std::vec::Vec::new();
+        let mut emitted = std::vec::Vec::new();
+        super::collect_dedup_script_units(
+            entries,
+            8,
+            &scratch,
+            |script_id| -> Result<u32, ()> {
+                compute_calls.push(script_id);
+                Ok(script_id.0 * 10)
+            },
+            |at, script_id, val| emitted.push((at, script_id, val)),
+        )
+        .expect("ok");
+        assert_eq!(compute_calls, std::vec![UnitId(2), UnitId(5)], "must compute each unique script_id exactly once");
+        assert_eq!(emitted.len(), 137, "every target must still receive its emitted row");
+        assert!(emitted[..134].iter().all(|&(_, id, v)| id == UnitId(2) && v == 20));
+        assert!(emitted[134..].iter().all(|&(_, id, v)| id == UnitId(5) && v == 50));
+    }
+
+    #[test]
+    fn native_script_deps_digest_covers_host_only_path_build_dep_absent_from_wasm_graph() {
+        use blaze_manifest::lock::{Lock, LockId};
+        use blaze_own::Vec as OwnVec;
+        use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
+        let alloc = blaze_own::testing::heap().alloc();
+
+        let lock_txt = "version = 4\n\n\
+            [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"unix_host_helper\"]\n\n\
+            [[package]]\nname = \"unix_host_helper\"\nversion = \"0.1.0\"\n";
+        let lock = Lock::read(lock_txt.as_bytes(), alloc).expect("lock");
+
+        let mk_unit = |pkg: u32, name: &str, kind: UnitKind<'static>, deps: &[(&str, u32)]| {
+            let mut d = OwnVec::new_in(alloc);
+            for &(dn, du) in deps {
+                d.push(UnitDep { name: Text::from_str_in(dn, alloc), unit: UnitId(du) });
+            }
+            let root = if kind == UnitKind::BuildScript { "build.rs" } else { "src/lib.rs" };
+            Unit {
+                package: LockId(pkg),
+                name: Text::from_str_in(name, alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in(name, alloc),
+                root: Text::from_str_in(root, alloc),
+                features: OwnVec::new_in(alloc),
+                cfg: OwnVec::new_in(alloc),
+                deps: d,
+                build_script: None,
+                links: None,
+            }
+        };
+
+        // Host graph has host-only path build-dep `unix_host_helper`; wasm_graph has NO build-deps.
+        let mut host_units = OwnVec::new_in(alloc);
+        host_units.push(mk_unit(0, "app", UnitKind::BuildScript, &[("unix_host_helper", 1)]));
+        host_units.push(mk_unit(1, "unix_host_helper", UnitKind::Lib, &[]));
+        let host_graph = UnitGraph { units: host_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        let mut wasm_units = OwnVec::new_in(alloc);
+        wasm_units.push(mk_unit(0, "app", UnitKind::BuildScript, &[]));
+        let wasm_graph = UnitGraph { units: wasm_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        // Native placement uses `deps_wasm_graph(RanAs::Native, Some(&wasm_graph)) == None`,
+        // so editing the host-only path build-dep invalidates `deps_digest` and the module subject.
+        let native_wg = crate::scripts::deps_wasm_graph(crate::scripts::RanAs::Native, Some(&wasm_graph));
+        assert!(native_wg.is_none());
+        let d_v1 = blaze_proc_macro::script_unit::script_deps_digest(&host_graph, native_wg, &lock, UnitId(0), |id| {
+            (id == LockId(1)).then(|| std::string::String::from("helper-v1"))
+        })
+        .expect("ok");
+        let d_v2 = blaze_proc_macro::script_unit::script_deps_digest(&host_graph, native_wg, &lock, UnitId(0), |id| {
+            (id == LockId(1)).then(|| std::string::String::from("helper-v2"))
+        })
+        .expect("ok");
+        assert!(d_v1.is_some() && d_v2.is_some());
+        assert_ne!(d_v1, d_v2, "native script deps_digest must change when host-only path build-dep changes");
+        assert_ne!(
+            crate::script_modules::subject(crate::scripts::RanAs::Native, "app", "0.1.0", &[], None, d_v1.as_deref()),
+            crate::script_modules::subject(crate::scripts::RanAs::Native, "app", "0.1.0", &[], None, d_v2.as_deref()),
+            "native script module subject must change when host-only path build-dep changes"
+        );
+
+        // Control: Wasm placement uses `Some(&wasm_graph)`, returning None when wasm closure has zero build-deps.
+        let wasm_wg = crate::scripts::deps_wasm_graph(crate::scripts::RanAs::Wasm, Some(&wasm_graph));
+        assert!(wasm_wg.is_some());
+        let d_wasm = blaze_proc_macro::script_unit::script_deps_digest(&host_graph, wasm_wg, &lock, UnitId(0), |_| {
+            panic!("wasm closure has zero build-deps and must not hash host-only deps")
+        })
+        .expect("ok");
+        assert_eq!(d_wasm, None);
     }
 }
 

@@ -499,6 +499,8 @@ enum Task {
     FormatArgs(ExprId),
     /// The poll loop of `.await` `e`, its operand's value on top (coroutine.rs `await_poll`).
     Await(ExprId),
+    /// One-shot `.do` suspension `e`, its request operand's value on top (coroutine.rs `do_suspend`).
+    DoSuspend(ExprId),
     /// Build `asm!` `e` from its operands' values and places on top (walk/asm.rs `asm_done`).
     Asm(ExprId),
     /// An `asm!`'s `label` block `block`: its body `body`, then a jump to `join`.
@@ -658,6 +660,11 @@ struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     /// Per open drop scope (a fn's parameters first, then each block): where its bindings
     /// start in `scope_pats`.
     scope_marks: Vec<u32, A>,
+    /// Lexical `defer` bodies registered in open drop scopes: `(scope_depth, body_expr)` where
+    /// `scope_depth` is `self.scope_marks.len()` when `Expr::Defer(body)` ran. Non-decreasing in
+    /// `scope_depth`, so popping entries with `depth >= target_depth` runs them in strict LIFO
+    /// order (innermost scopes first, last-registered first within a scope).
+    defer_scopes: Vec<(usize, ExprId), A>,
     /// The parts matches by tests moved out of their scrutinees (walk/moves.rs).
     moves: moves::Moves<A>,
     /// The fields of the environment of the closure being built when one holds a captured
@@ -673,6 +680,14 @@ struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     body_bound: blaze_own::Vec<bool, A>,
     /// `Some` while a coroutine's body is built (coroutine.rs `run_coroutine`).
     co: Option<coroutine::Co>,
+    /// `Some` while a one-shot lexical `.do` machine body is built (coroutine.rs `run_do_machine`).
+    do_co: Option<coroutine::DoCo>,
+    /// In a zero-`Pin` `.do` machine body (`do_co.is_some()`): immutable non-address-taken scalar
+    /// and ZST locals held directly as SSA values instead of stack slots so no `Op::SlotAddr`
+    /// crosses an `Op::Suspend`.
+    ssa_locals: Vec<Option<V>, A>,
+    /// `true` while emitting a coroutine cancel block (refuses nested `.do` suspension).
+    in_cancel: bool,
     /// `Some` while a coroutine's body is built into a state laid from types: the flow's table
     /// of identities and what the walk named (walk/state_names.rs; ASYNC.md P8).
     names: Option<state_names::Names<'x, A>>,
@@ -1004,12 +1019,20 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         target_du: blaze_own::Vec::new_in(alloc),
         scope_pats: Vec::new_in(alloc),
         scope_marks: Vec::new_in(alloc),
+        defer_scopes: Vec::new_in(alloc),
         moves: moves::Moves::new_in(alloc),
         env_places: moves::env_places::EnvPlaces::new_in(alloc),
         captured: Vec::new_in(alloc),
         owner_expr: None,
         body_bound: blaze_own::Vec::new_in(alloc),
         co: None,
+        do_co: None,
+        ssa_locals: {
+            let mut ssa = Vec::with_capacity_in(body.pats.len(), alloc);
+            ssa.resize(body.pats.len(), None);
+            ssa
+        },
+        in_cancel: false,
         names: None,
         cleanup: false,
         nounwind: false,
@@ -2388,6 +2411,77 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         self.bind_value(p, v)
     }
 
+    /// Whether plain binding `p` can live purely in an SSA value (`self.ssa_locals`) in a
+    /// zero-`Pin` `.do` machine body without allocating a stack slot: immutable, non-dropping
+    /// scalar or ZST, never assigned, never borrowed or used in a place context, and never
+    /// captured by a closure or async block.
+    fn can_ssa_local(&mut self, p: PatId) -> Result<bool, BuildError> {
+        let Pat::Bind { ann, sub: None, .. } = self.pat(p)? else {
+            return Ok(false);
+        };
+        if ann.by_ref.is_some()
+            || self.slots.get(p.ix()).copied().flatten().is_some()
+            || self.assigned.get(p.ix()).copied().unwrap_or(true)
+            || self.needs_flag.get(p.ix()).copied().unwrap_or(true)
+            || self.partial.get(p.ix()).copied().unwrap_or(true)
+        {
+            return Ok(false);
+        }
+        let repr = self.local_repr(p)?;
+        if repr != Repr::None && repr.scalar().is_none() {
+            return Ok(false);
+        }
+        if self.checked.captures.column::<1>().contains(&p) {
+            return Ok(false);
+        }
+        for (i, &expr) in self.body.exprs.iter().enumerate() {
+            if expr != Expr::Local(p) {
+                continue;
+            }
+            let eid = ExprId(u32::try_from(i).map_err(|_| malformed("an expression index past u32"))?);
+            let rows = self.adjust_rows(eid);
+            if self.checked.adjusts.column::<1>()[rows]
+                .iter()
+                .any(|k| matches!(k, AdjustKind::Borrow { .. }))
+            {
+                return Ok(false);
+            }
+            let mut cur = eid.0;
+            while let Some(&(up, _)) = self.expr_parent.get(cur as usize) {
+                if up == NO_EXPR {
+                    break;
+                }
+                let Some(&up_expr) = self.body.exprs.get(up as usize) else {
+                    break;
+                };
+                match up_expr {
+                    Expr::Paren(_) => cur = up,
+                    Expr::Ref { .. } | Expr::RawRef { .. } | Expr::Asm { .. } => return Ok(false),
+                    Expr::Assign { lhs, .. } | Expr::AssignOp { lhs, .. } if lhs.0 == cur => return Ok(false),
+                    Expr::Field { base, .. }
+                    | Expr::TupleField { base, .. }
+                    | Expr::Index { base, .. }
+                        if base.0 == cur =>
+                    {
+                        return Ok(false);
+                    }
+                    Expr::Match { scrutinee, .. } if scrutinee.0 == cur => return Ok(false),
+                    Expr::Let { init, .. } if init.0 == cur => return Ok(false),
+                    _ => break,
+                }
+            }
+            for stmt in self.body.stmts {
+                if let Stmt::Let { pat, init: Some(init), .. } = *stmt
+                    && init.0 == cur
+                    && self.pat_has_ref(pat)?
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// Binds `v` to pattern `p`: a binding (the value stored into its slot), `_` (dropped), a
     /// tuple pattern or an array pattern (`[a, _, b]`) taken apart from the aggregate's place,
     /// by a work list; every other irrefutable pattern (a struct or only-variant pattern, `&p`,
@@ -2407,6 +2501,13 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     continue;
                 }
                 Pat::Bind { sub: None, .. } => {
+                    if self.do_co.is_some()
+                        && matches!(v, V::Scalar(_) | V::None)
+                        && self.can_ssa_local(p)?
+                    {
+                        self.ssa_locals[p.ix()] = Some(v);
+                        continue;
+                    }
                     let (home, repr) = self.bind(p)?;
                     let at = self.home(home);
                     self.store(v, repr, at)?;
@@ -2991,6 +3092,77 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         self.scope_pats[start..].iter().any(|&h| self.held_pending(h))
     }
 
+    /// Whether any `defer` block is registered at or inside drop scope `min_depth`.
+    fn has_defers_from(&self, min_depth: usize) -> bool {
+        self.defer_scopes.last().is_some_and(|&(d, _)| d >= min_depth)
+    }
+
+    /// Evaluates one popped `defer` body `body` iteratively on `self.work`, discarding (and
+    /// dropping if needed) its result. `body` has already been popped from `self.defer_scopes`
+    /// so nested defers inside `body` run cleanly in their own inner scope without looping.
+    fn eval_defer_body(&mut self, body: ExprId) -> Result<(), BuildError> {
+        if !self.live {
+            return Ok(());
+        }
+        let work_base = self.work.len();
+        let vals_base = self.vals.len();
+        let saved_task_at = self.task_at;
+        self.work.push(Task::DropValue(body));
+        self.work.push(Task::Eval(body));
+        while self.work.len() > work_base {
+            let Some(task) = self.work.pop() else { break };
+            self.note_task(&task);
+            if let Some(e) = state_names::task_expr(&task) {
+                self.task_at = Some(e);
+            }
+            self.step(task)?;
+        }
+        self.task_at = saved_task_at;
+        if self.vals.len() != vals_base {
+            return Err(malformed("a `defer` body left values on the stack"));
+        }
+        Ok(())
+    }
+
+    /// Pops and runs all `defer` bodies registered at `scope_depth >= min_depth` in strict LIFO
+    /// order for a scope that is closing (`Task::ScopeEnd`). Even in unreachable code, dead
+    /// entries are popped so they never leak into sibling branches.
+    fn run_defers_closing(&mut self, min_depth: usize) -> Result<(), BuildError> {
+        const MAX_DEFER_STEPS: usize = 4096;
+        let mut steps = 0usize;
+        while self.defer_scopes.last().is_some_and(|&(d, _)| d >= min_depth) {
+            let Some((_, body)) = self.defer_scopes.pop() else { break };
+            if self.live {
+                steps += 1;
+                if steps > MAX_DEFER_STEPS {
+                    return Err(malformed("too many nested `defer` executions in one scope exit"));
+                }
+                self.eval_defer_body(body)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs all `defer` bodies registered at `scope_depth >= min_depth` in strict LIFO order for
+    /// a non-closing exit (`return`, `break`, `continue`, or coroutine cancel). Restores the
+    /// popped `defer_scopes` suffix and static `init` vector afterward so sibling branches and
+    /// enclosing normal exits still see their registered defers intact.
+    pub(super) fn run_defers_leaving(&mut self, min_depth: usize) -> Result<(), BuildError> {
+        if !self.live || !self.has_defers_from(min_depth) {
+            return Ok(());
+        }
+        let keep = self.defer_scopes.partition_point(|&(d, _)| d < min_depth);
+        let mut saved_defers: Vec<(usize, ExprId), A> = Vec::with_capacity_in(self.defer_scopes.len() - keep, self.alloc);
+        saved_defers.extend_from_slice(&self.defer_scopes[keep..]);
+        let mut saved_init: Vec<bool, A> = Vec::with_capacity_in(self.init.len(), self.alloc);
+        saved_init.extend_from_slice(&self.init);
+        let result = self.run_defers_closing(min_depth);
+        self.defer_scopes.truncate(keep);
+        self.defer_scopes.extend_from_slice(&saved_defers);
+        self.init.copy_from_slice(&saved_init);
+        result
+    }
+
     /// Drops the entries from `start` of `scope_pats` on, last declared first, for an exit
     /// that leaves their scopes (`break`, `continue`, `return`), each with its unwind ladder
     /// (walk/unwind_ladder.rs `drop_scope`).
@@ -3001,9 +3173,10 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// A value about to outlive the drops of the bindings from `start` on: an aggregate place is
     /// copied out first, as it may be one of theirs (a field of a binding the drop changes).
     /// Settles `v` (of `repr`) leaving drop scope `(mark, depth)`: copies an aggregate place into
-    /// a fresh temporary slot when the scope has pending drops (`pending_from(mark)`) or, in a
-    /// coroutine body, when `v` is backed by a slot owned by this closing scope, so the scope's
-    /// local slot can end (`slot_dead`) and the outgoing value lives in a `SlotKind::Temp`.
+    /// a fresh temporary slot when the scope has pending drops (`pending_from(mark)`), pending
+    /// `defer`s (`has_defers_from(depth)`), or, in a coroutine body, when `v` is backed by a slot
+    /// owned by this closing scope, so the scope's local slot can end (`slot_dead`) and the
+    /// outgoing value lives in a `SlotKind::Temp`.
     fn settle_scope(&mut self, v: V, repr: Repr, mark: usize, depth: usize) -> Result<V, BuildError> {
         let in_closing_scope = self.live
             && self.co.is_some()
@@ -3024,7 +3197,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 }),
                 _ => false,
             };
-        if !in_closing_scope && !self.pending_from(mark) {
+        if !in_closing_scope && !self.pending_from(mark) && !self.has_defers_from(depth) {
             return Ok(v);
         }
         match (v, repr) {
@@ -3040,6 +3213,21 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
 
     fn settle(&mut self, v: V, repr: Repr, start: usize) -> Result<V, BuildError> {
         if !self.pending_from(start) {
+            return Ok(v);
+        }
+        match (v, repr) {
+            (V::Place(..), Repr::Agg(_)) => {
+                let at = self.temp(repr);
+                self.store(v, repr, at)?;
+                self.end_temp_val(v);
+                Ok(V::Place(at.0, at.1))
+            }
+            _ => Ok(v),
+        }
+    }
+
+    fn settle_leaving(&mut self, v: V, repr: Repr, start: usize, defer_depth: usize) -> Result<V, BuildError> {
+        if !self.pending_from(start) && !self.has_defers_from(defer_depth) {
             return Ok(v);
         }
         match (v, repr) {
@@ -3327,7 +3515,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 Expr::Closure { body: c, .. } => kids.push((c, true)),
                 Expr::FormatArgs { args, .. } => kids.extend(list(args)?.iter().map(|&c| (c, false))),
                 Expr::Asm { operands, .. } => asm::asm_kids(body, operands, &mut kids)?,
-                Expr::Await(c) => kids.push((c, false)),
+                Expr::Await(c) | Expr::Do(c) => kids.push((c, false)),
+                Expr::Defer(c) => kids.push((c, true)),
                 Expr::AsyncBlock { body: c, .. } => kids.push((c, true)),
                 Expr::Underscore | Expr::OffsetOf { .. } => {}
                 Expr::RawRef { operand: c, .. } => kids.push((c, false)),
@@ -4123,11 +4312,16 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     }
 
     /// Returns `v` from the function: as the one result, through the result pointer, or as
-    /// nothing; the value is made first, then every open scope is dropped, parameters last.
+    /// nothing; the value is made first, then every open scope's `defer`s and drops run,
+    /// parameters last.
     fn ret_value(&mut self, v: V) -> Result<(), BuildError> {
         // A coroutine's body returns `Poll::Ready(v)` (coroutine.rs).
         if self.co.is_some() {
             return self.coroutine_return(v);
+        }
+        // A `.do` machine body writes its result to `out` and returns `(DO_STATUS_DONE, 0)`.
+        if self.do_co.is_some() {
+            return self.do_machine_return(v);
         }
         let ret = self.ret;
         let mut xs = Vec::with_capacity_in(2, self.alloc);
@@ -4140,8 +4334,13 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 let _ = self.pass_arg(v, ret, p, &mut xs)?;
             }
         }
+        self.run_defers_leaving(0)?;
         self.drop_from(0)?;
-        self.b.ret(&xs);
+        if self.live {
+            self.b.ret(&xs);
+        } else {
+            self.b.unreachable();
+        }
         Ok(())
     }
 
@@ -4272,9 +4471,14 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Task::ScopeEnd { expr, adjusted } => {
                 let v = self.pop()?;
                 let depth = self.scope_marks.len();
-                let mark = self.scope_marks.pop().ok_or(malformed("a block's drop scope out of order"))? as usize;
+                let mark = *self.scope_marks.last().ok_or(malformed("a block's drop scope out of order"))? as usize;
                 let repr = if adjusted { self.adjusted_repr(expr)? } else { self.expr_repr(expr)? };
                 let v = self.settle_scope(v, repr, mark, depth)?;
+                // Run this scope's registered `defer` bodies in strict LIFO order BEFORE running
+                // the scope's value drops (keeping `scope_marks` intact while defers execute so
+                // nested blocks and early returns inside a defer still drop this scope's locals).
+                self.run_defers_closing(depth)?;
+                self.scope_marks.pop().ok_or(malformed("a block's drop scope out of order"))?;
                 // Last declared first, each with its unwind ladder (walk/unwind_ladder.rs); each
                 // binding's own drop reads only its own `owned`, so they are cleared after.
                 self.drop_scope(mark, true)?;
@@ -4519,17 +4723,27 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                         let to = (self.b.slot_addr(slot), 0);
                         self.store(v, t.repr, to)?;
                         self.end_temp_val(v);
+                        self.run_defers_leaving(scope_depth)?;
                         self.drop_from(start)?;
                         self.end_scope_slots_peek_except(start, scope_depth, Some(temp_depth), Some(slot));
-                        self.jump(t.exit, &[]);
+                        if self.live {
+                            self.jump(t.exit, &[]);
+                        } else {
+                            self.b.unreachable();
+                        }
                     }
                     None => {
-                        let v = self.settle(v, t.repr, start)?;
+                        let v = self.settle_leaving(v, t.repr, start, scope_depth)?;
                         let arg = self.arg(v, t.repr)?;
                         let kept = arg.and_then(|p| self.value_slot(p));
+                        self.run_defers_leaving(scope_depth)?;
                         self.drop_from(start)?;
                         self.end_scope_slots_peek_except(start, scope_depth, Some(temp_depth), kept);
-                        self.jump(t.exit, arg.as_slice());
+                        if self.live {
+                            self.jump(t.exit, arg.as_slice());
+                        } else {
+                            self.b.unreachable();
+                        }
                     }
                 }
                 self.dead_block();
@@ -4928,6 +5142,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Task::Repeat(e) => self.repeat(e)?,
             Task::FormatArgs(e) => self.format_args_done(e)?,
             Task::Await(e) => self.await_poll(e)?,
+            Task::DoSuspend(e) => self.do_suspend(e)?,
             Task::Asm(e) => self.asm_done(e)?,
             Task::AsmLabel { block, body, join } => self.asm_label(block, body, join),
             Task::AsmLabelEnd(join) => self.asm_label_end(join)?,
@@ -6618,20 +6833,26 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         match self.expr(e)? {
             Expr::Missing => return Err(unsupported(e, "a missing expression")),
             Expr::Lit(lit) => self.lit(e, lit)?,
-            Expr::Local(p) => match self.slots.get(p.ix()).copied().flatten() {
-                Some((home, repr)) => {
-                    // A use by value: a move, when its type needs drop (its memory is read where
-                    // the value lands, before anything else runs that could drop it).
-                    self.moved(e, p)?;
-                    let at = self.home(home);
-                    let v = self.load(repr, at);
+            Expr::Local(p) => {
+                if let Some(v) = self.ssa_locals.get(p.ix()).copied().flatten() {
                     self.push_val(v, None);
+                } else {
+                    match self.slots.get(p.ix()).copied().flatten() {
+                        Some((home, repr)) => {
+                            // A use by value: a move, when its type needs drop (its memory is read where
+                            // the value lands, before anything else runs that could drop it).
+                            self.moved(e, p)?;
+                            let at = self.home(home);
+                            let v = self.load(repr, at);
+                            self.push_val(v, None);
+                        }
+                        None if self.is_outer_local(p)? && self.local_repr(p)? == Repr::None => {
+                            self.push_val(V::None, None);
+                        }
+                        None => return Err(malformed("a local used before its binding")),
+                    }
                 }
-                None if self.is_outer_local(p)? && self.local_repr(p)? == Repr::None => {
-                    self.push_val(V::None, None);
-                }
-                None => return Err(malformed("a local used before its binding")),
-            },
+            }
             Expr::Path(_) => {
                 let t = self.expr_ty(e)?;
                 match (self.node_at(e, t)?, self.expr_def(e)) {
@@ -6733,8 +6954,16 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Expr::Let { .. } => return Err(unsupported(e, "`let` outside an `if` or `while` condition")),
             // walk/fmt.rs: the arguments, then `Task::FormatArgs`.
             Expr::FormatArgs { args, uses } => self.format_args(e, args, uses)?,
-            // coroutine.rs: the operand, then `Task::Await`; the state, its tag `Unresumed`.
+            // coroutine.rs: the operand, then `Task::Await` / `Task::DoSuspend`.
             Expr::Await(operand) => self.await_operand(e, operand)?,
+            Expr::Do(operand) => self.do_operand(e, operand)?,
+            Expr::Defer(body) => {
+                if self.live {
+                    let depth = self.scope_marks.len();
+                    self.defer_scopes.push((depth, body));
+                }
+                self.push_val(V::None, None);
+            }
             Expr::AsyncBlock { .. } => self.coroutine_value(e)?,
             // walk/asm.rs: the operands' values and places, then `Task::Asm`.
             Expr::Asm { .. } => self.asm_operands(e)?,
@@ -6838,9 +7067,14 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 let start = self.target_start(t)?;
                 let scope_depth = usize::try_from(t.depth).map_err(|_| malformed("a target depth past `usize`"))?.saturating_add(1);
                 let temp_depth = usize::try_from(t.temp_depth).map_err(|_| malformed("a target temporary depth past `usize`"))?;
+                self.run_defers_leaving(scope_depth)?;
                 self.drop_from(start)?;
                 self.end_scope_slots_peek_except(start, scope_depth, Some(temp_depth), None);
-                self.jump(header, &[]);
+                if self.live {
+                    self.jump(header, &[]);
+                } else {
+                    self.b.unreachable();
+                }
                 self.dead_block();
                 self.push_val(V::None, None);
             }
