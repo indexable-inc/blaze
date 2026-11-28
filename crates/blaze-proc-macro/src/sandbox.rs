@@ -14,7 +14,7 @@
 //!   tree (by `..` or a link) stops the run with [`ProcLimit::Paths`], naming the path.
 //! - Standard output and error are dropped.
 
-use std::{ffi::{OsStr, OsString}, fs, os::unix::ffi::OsStrExt, path::{Component, Path, PathBuf}};
+use std::{ffi::{OsStr, OsString}, fs, io::ErrorKind, os::unix::ffi::OsStrExt, path::{Component, Path, PathBuf}};
 
 use blaze_expand::ProcLimit;
 use blaze_ids::ContentId;
@@ -448,6 +448,30 @@ fn decode_hex_path(hex: &str) -> Option<PathBuf> {
     Some(PathBuf::from(OsStr::from_bytes(&bytes)))
 }
 
+/// Canonical in-tree normalization of a symlink `target` relative to `top`: absolute targets
+/// inside `top` are stripped to their `top`-relative path (machine-independent); absolute targets
+/// outside `top` return `None`.
+fn normalize_link_target(top: &Path, target: &Path) -> Option<(bool, PathBuf)> {
+    if target.is_absolute() {
+        let in_top = target
+            .strip_prefix(top)
+            .ok()
+            .map(Path::to_path_buf)
+            .or_else(|| fs::canonicalize(target).ok().and_then(|c| c.strip_prefix(top).ok().map(Path::to_path_buf)))?;
+        Some((true, in_top))
+    } else {
+        Some((false, target.to_path_buf()))
+    }
+}
+
+/// Deterministic digest of a normalized symlink target (`is_abs`, `target`), independent of
+/// the machine checkout path.
+fn link_target_digest(is_abs: bool, target: &Path) -> ContentId {
+    let mut bytes = [u8::from(is_abs)].to_vec();
+    bytes.extend_from_slice(target.as_os_str().as_encoded_bytes());
+    digest(&bytes)
+}
+
 /// What the read `subject` (as a [`Read`] names it) is answered by now, in `package`: the
 /// same answer a run would record. `None`: absent.
 pub fn answer_now(package: &Package, subject: &str) -> Result<Option<ContentId>, UnknownSubject> {
@@ -498,9 +522,13 @@ pub fn answer_now(package: &Package, subject: &str) -> Result<Option<ContentId>,
                     None
                 } else if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
                     match files.real(root, parent).map_err(UnknownSubject)? {
-                        Real::Found(parent_real, _) => {
-                            fs::read_link(parent_real.join(name)).ok().map(|target| digest(target.as_os_str().as_encoded_bytes()))
-                        }
+                        Real::Found(parent_real, top) => match fs::read_link(parent_real.join(name)) {
+                            Ok(target) => match normalize_link_target(&top, &target) {
+                                Some((is_abs, norm)) => Some(link_target_digest(is_abs, &norm)),
+                                None => return Err(unknown()),
+                            },
+                            Err(_) => None,
+                        },
                         Real::Missing | Real::Loop => None,
                     }
                 } else {
@@ -680,45 +708,43 @@ impl Sandbox {
                     cur_rel.push(s);
                 }
                 let cur_disk = top_dir.join(&cur_rel);
-                if let Ok(meta) = fs::symlink_metadata(&cur_disk) {
-                    if meta.file_type().is_symlink() {
-                        hops += 1;
-                        if hops > MAX_SYMLINK_HOPS {
-                            return Ok(Err(Errno::LOOP));
-                        }
-                        let Ok(target) = fs::read_link(&cur_disk) else {
-                            return Ok(Err(Errno::IO));
-                        };
-                        self.record(Self::subject("link", &cur_rel), Some(digest(target.as_os_str().as_encoded_bytes())));
-                        let link_shown = cur_rel.to_string_lossy().into_owned();
-                        last_link = Some(cur_rel);
-                        parts.pop();
-                        if target.is_absolute() {
-                            let in_top = target
-                                .strip_prefix(top_dir)
-                                .ok()
-                                .map(Path::to_path_buf)
-                                .or_else(|| fs::canonicalize(&target).ok().and_then(|c| c.strip_prefix(top_dir).ok().map(Path::to_path_buf)));
-                            let Some(in_top) = in_top else {
+                match fs::symlink_metadata(&cur_disk) {
+                    Ok(meta) => {
+                        if meta.file_type().is_symlink() {
+                            hops += 1;
+                            if hops > MAX_SYMLINK_HOPS {
+                                self.record(Self::subject("lstat", &cur_rel), Some(stat_digest(Filetype::SymbolicLink, meta.len())));
+                                return Ok(Err(Errno::LOOP));
+                            }
+                            let Ok(target) = fs::read_link(&cur_disk) else {
+                                return Ok(Err(Errno::IO));
+                            };
+                            let link_shown = cur_rel.to_string_lossy().into_owned();
+                            let Some((is_abs, norm)) = normalize_link_target(top_dir, &target) else {
                                 return Err(self.refuse(format!("opened {mount}/{link_shown}, a link out of {mount}, the tree the macro is served")));
                             };
-                            parts.truncate(1);
-                            for part in in_top.as_os_str().as_encoded_bytes().split(|&b| b == b'/').rev() {
+                            self.record(Self::subject("link", &cur_rel), Some(link_target_digest(is_abs, &norm)));
+                            last_link = Some(cur_rel);
+                            parts.pop();
+                            if is_abs {
+                                parts.truncate(1);
+                            }
+                            for part in norm.as_os_str().as_encoded_bytes().split(|&b| b == b'/').rev() {
                                 if !part.is_empty() {
                                     pending.push(OsStr::from_bytes(part).to_os_string());
                                 }
                             }
-                        } else {
-                            for part in target.as_os_str().as_encoded_bytes().split(|&b| b == b'/').rev() {
-                                if !part.is_empty() {
-                                    pending.push(OsStr::from_bytes(part).to_os_string());
-                                }
-                            }
+                        } else if !meta.file_type().is_dir() {
+                            self.record(Self::subject("stat", &cur_rel), Some(stat_digest(Filetype::RegularFile, meta.len())));
+                            return Ok(Err(Errno::NOTDIR));
                         }
-                    } else if !meta.file_type().is_dir() {
-                        self.record(Self::subject("stat", &cur_rel), Some(stat_digest(Filetype::RegularFile, meta.len())));
-                        return Ok(Err(Errno::NOTDIR));
                     }
+                    Err(err) if err.kind() == ErrorKind::NotFound => {
+                        self.record(Self::subject("lstat", &cur_rel), None);
+                        return Ok(Err(Errno::NOENT));
+                    }
+                    Err(err) if err.kind() == ErrorKind::NotADirectory => return Ok(Err(Errno::NOTDIR)),
+                    Err(_) => return Ok(Err(Errno::IO)),
                 }
             }
         }
@@ -1863,5 +1889,108 @@ mod dir_fd_tests {
         std::fs::remove_file(parts.join("link")).expect("unlink");
         symlink("sub", parts.join("link")).expect("retarget link");
         assert_ne!(answer_now(&pkg, &link_read.subject), Ok(link_read.digest), "retargeting intermediate symlink must invalidate link read");
+    }
+
+    /// Codex Round 4 P2 #1: a missing intermediate component before `..` (`missing/../a.rs`)
+    /// returns `Errno::NOENT` instead of silently popping `missing` and opening `a.rs`, and
+    /// creating `missing/` invalidates the recorded read.
+    #[test]
+    fn missing_intermediate_before_dotdot_returns_enoent_and_invalidates_when_created() {
+        let tree = make_workspace("missing_dotdot");
+        let (pkg, mut sandbox) = member_sandbox(&tree);
+        let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
+
+        assert_eq!(sandbox.open(dir_fd, b"missing/../a.rs", READ_ONLY).expect("not stopped"), Err(Errno::NOENT));
+        assert_eq!(sandbox.path_stat(dir_fd, b"missing/../a.rs", true).expect("not stopped"), Err(Errno::NOENT));
+        assert!(
+            !sandbox.reads.iter().any(|r| r.subject == "file:crates/m/parts/a.rs"),
+            "must not open a.rs through missing/../a.rs"
+        );
+        let missing_read = sandbox
+            .reads
+            .iter()
+            .find(|r| r.subject == "lstat:crates/m/parts/missing")
+            .expect("missing intermediate component must be recorded")
+            .clone();
+        assert_eq!(missing_read.digest, None);
+        assert_eq!(answer_now(&pkg, &missing_read.subject), Ok(None));
+
+        // Creating `missing/` makes `missing/../a.rs` valid and must invalidate the cached read.
+        std::fs::create_dir(tree.ws.join("crates/m/parts/missing")).expect("create missing dir");
+        assert_ne!(answer_now(&pkg, &missing_read.subject), Ok(missing_read.digest));
+
+        let a_fd = sandbox.open(dir_fd, b"missing/../a.rs", READ_ONLY).expect("not stopped").expect("now opens");
+        assert_eq!(read_all(&mut sandbox, a_fd), b"pub fn a() {}\n");
+    }
+
+    /// Codex Round 4 P2 #2: a 41-symlink intermediate chain hits the hop limit (`Errno::LOOP`)
+    /// AND records the 41st symlink so replacing it with a real directory invalidates `answer_now`.
+    #[cfg(unix)]
+    #[test]
+    fn hop_limit_records_41st_symlink_so_replacing_with_dir_invalidates() {
+        use std::os::unix::fs::symlink;
+
+        let tree = make_workspace("hop_limit_41");
+        let parts = tree.ws.join("crates/m/parts");
+        // Chain: l0 -> l1 -> ... -> l40 -> sub (41 symlinks total; l40 is the 41st hop).
+        for i in 0..40 {
+            symlink(format!("l{}", i + 1), parts.join(format!("l{i}"))).expect("chain symlink");
+        }
+        symlink("sub", parts.join("l40")).expect("41st symlink");
+
+        let (pkg, mut sandbox) = member_sandbox(&tree);
+        let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
+
+        assert_eq!(sandbox.open(dir_fd, b"l0/b.rs", READ_ONLY).expect("not stopped"), Err(Errno::LOOP));
+
+        let last_read = sandbox
+            .reads
+            .iter()
+            .find(|r| r.subject == "lstat:crates/m/parts/l40")
+            .expect("41st symlink that exhausted hops must be recorded")
+            .clone();
+        for read in &sandbox.reads {
+            assert_eq!(answer_now(&pkg, &read.subject), Ok(read.digest), "parity for {}", read.subject);
+        }
+
+        // Replace the 41st symlink with a real directory while leaving the first 40 links untouched:
+        // the recorded read for `l40` must now disagree with `answer_now`.
+        std::fs::remove_file(parts.join("l40")).expect("unlink l40");
+        std::fs::create_dir(parts.join("l40")).expect("create dir l40");
+        assert_ne!(answer_now(&pkg, &last_read.subject), Ok(last_read.digest), "replacing 41st link with dir must invalidate");
+    }
+
+    /// Codex Round 4 P2 #3: an intermediate absolute in-tree symlink hashes its normalized
+    /// tree-relative target so two checkouts at different machine paths produce the exact same
+    /// `link:` digest in `sandbox.reads` (and `answer_now` matches).
+    #[cfg(unix)]
+    #[test]
+    fn absolute_in_tree_symlink_hashes_identically_across_checkout_paths() {
+        use std::os::unix::fs::symlink;
+
+        let tree_a = make_workspace("abs_checkout_alpha");
+        let tree_b = make_workspace("abs_checkout_beta_longer_machine_path");
+        let target_a = std::fs::canonicalize(&tree_a.ws).expect("canon a").join("crates/m/parts/sub/deep");
+        let target_b = std::fs::canonicalize(&tree_b.ws).expect("canon b").join("crates/m/parts/sub/deep");
+        assert_ne!(target_a, target_b);
+        symlink(&target_a, tree_a.ws.join("crates/m/parts/abs_link")).expect("abs link a");
+        symlink(&target_b, tree_b.ws.join("crates/m/parts/abs_link")).expect("abs link b");
+
+        let (pkg_a, mut sb_a) = member_sandbox(&tree_a);
+        let (pkg_b, mut sb_b) = member_sandbox(&tree_b);
+
+        let fd_a = sb_a.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir a");
+        let fd_b = sb_b.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir b");
+
+        let b_fd_a = sb_a.open(fd_a, b"abs_link/../b.rs", READ_ONLY).expect("not stopped").expect("open a");
+        let b_fd_b = sb_b.open(fd_b, b"abs_link/../b.rs", READ_ONLY).expect("not stopped").expect("open b");
+        assert_eq!(read_all(&mut sb_a, b_fd_a), b"pub fn b() {}\n");
+        assert_eq!(read_all(&mut sb_b, b_fd_b), b"pub fn b() {}\n");
+
+        let link_a = sb_a.reads.iter().find(|r| r.subject == "link:crates/m/parts/abs_link").expect("link a");
+        let link_b = sb_b.reads.iter().find(|r| r.subject == "link:crates/m/parts/abs_link").expect("link b");
+        assert_eq!(link_a.digest, link_b.digest, "absolute in-tree symlink digest must be checkout-path independent");
+        assert_eq!(answer_now(&pkg_a, &link_a.subject), Ok(link_a.digest));
+        assert_eq!(answer_now(&pkg_b, &link_b.subject), Ok(link_b.digest));
     }
 }
