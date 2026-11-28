@@ -1854,6 +1854,7 @@ fn make_world<'f>(
     let mut script_modules = std::vec::Vec::new_in(Global);
     let mut placements = std::vec::Vec::new_in(Global);
     let script_scratch = Frame::new(bstd::mem::Tag::Other).map_err(|_| NamesError::Frame)?;
+    let mut io_scratch = Frame::new(bstd::mem::Tag::Other).map_err(|_| NamesError::Frame)?;
     let mut pkg_files_cache: blaze_own::Vec<Option<Option<&str>>, &Frame> =
         blaze_own::Vec::with_capacity_in(lock.packages.len(), &script_scratch);
     for _ in 0..lock.packages.len() {
@@ -1866,26 +1867,32 @@ fn make_world<'f>(
         |script_id| {
             let ran_as = crate::scripts::placement(Some(home), graph, script_id, heap);
             let script = &graph.units[script_id.index()];
-            let mut feat_buf: blaze_own::Vec<&'static str, &Frame> =
-                blaze_own::Vec::with_capacity_in(script.features.len(), &script_scratch);
-            feat_buf.extend(script.features.iter().map(|feature| feature.as_str()));
-            let features: &'static [&'static str] = frame.alloc_slice_copy(feat_buf.as_slice());
+            let features: &'static [&'static str] = {
+                let mut feat_buf: blaze_own::Vec<&'static str, &Frame> =
+                    blaze_own::Vec::with_capacity_in(script.features.len(), &io_scratch);
+                feat_buf.extend(script.features.iter().map(|feature| feature.as_str()));
+                frame.alloc_slice_copy(feat_buf.as_slice())
+            };
+            io_scratch.reset();
             let files = paths
                 .iter()
                 .find(|p| p.id == script.package)
-                .and_then(|p| crate::macro_files::script_files_digest_in_dir(&span_cx, &reader.root, p.dir, script.root.as_str(), frame, &script_scratch));
+                .and_then(|p| crate::macro_files::script_files_digest_in_dir(&span_cx, &reader.root, p.dir, script.root.as_str(), frame, &io_scratch));
+            io_scratch.reset();
             let deps = blaze_proc_macro::script_unit::script_deps_digest_with(
                 graph,
-                wasm_graph,
+                crate::scripts::deps_wasm_graph(ran_as, wasm_graph),
                 lock,
                 script_id,
                 |dep_pkg| {
                     let slot = pkg_files_cache.get_mut(dep_pkg.index())?;
                     *slot.get_or_insert_with(|| {
-                        members
+                        let digest = members
                             .iter()
                             .find(|p| p.id == dep_pkg)
-                            .and_then(|p| crate::macro_files::package_files_digest_in_dir(&span_cx, &reader.root, p.dir, &script_scratch, &script_scratch))
+                            .and_then(|p| crate::macro_files::package_files_digest_in_dir(&span_cx, &reader.root, p.dir, &script_scratch, &io_scratch));
+                        io_scratch.reset();
+                        digest
                     })
                 },
                 &script_scratch,
@@ -2403,6 +2410,81 @@ mod unresolved_tests {
         assert_eq!(emitted.len(), 137, "every target must still receive its emitted row");
         assert!(emitted[..134].iter().all(|&(_, id, v)| id == UnitId(2) && v == 20));
         assert!(emitted[134..].iter().all(|&(_, id, v)| id == UnitId(5) && v == 50));
+    }
+
+    #[test]
+    fn native_script_deps_digest_covers_host_only_path_build_dep_absent_from_wasm_graph() {
+        use blaze_manifest::lock::{Lock, LockId};
+        use blaze_own::Vec as OwnVec;
+        use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
+        let alloc = blaze_own::testing::heap().alloc();
+
+        let lock_txt = "version = 4\n\n\
+            [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"unix_host_helper\"]\n\n\
+            [[package]]\nname = \"unix_host_helper\"\nversion = \"0.1.0\"\n";
+        let lock = Lock::read(lock_txt.as_bytes(), alloc).expect("lock");
+
+        let mk_unit = |pkg: u32, name: &str, kind: UnitKind<'static>, deps: &[(&str, u32)]| {
+            let mut d = OwnVec::new_in(alloc);
+            for &(dn, du) in deps {
+                d.push(UnitDep { name: Text::from_str_in(dn, alloc), unit: UnitId(du) });
+            }
+            let root = if kind == UnitKind::BuildScript { "build.rs" } else { "src/lib.rs" };
+            Unit {
+                package: LockId(pkg),
+                name: Text::from_str_in(name, alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in(name, alloc),
+                root: Text::from_str_in(root, alloc),
+                features: OwnVec::new_in(alloc),
+                cfg: OwnVec::new_in(alloc),
+                deps: d,
+                build_script: None,
+                links: None,
+            }
+        };
+
+        // Host graph has host-only path build-dep `unix_host_helper`; wasm_graph has NO build-deps.
+        let mut host_units = OwnVec::new_in(alloc);
+        host_units.push(mk_unit(0, "app", UnitKind::BuildScript, &[("unix_host_helper", 1)]));
+        host_units.push(mk_unit(1, "unix_host_helper", UnitKind::Lib, &[]));
+        let host_graph = UnitGraph { units: host_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        let mut wasm_units = OwnVec::new_in(alloc);
+        wasm_units.push(mk_unit(0, "app", UnitKind::BuildScript, &[]));
+        let wasm_graph = UnitGraph { units: wasm_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        // Native placement uses `deps_wasm_graph(RanAs::Native, Some(&wasm_graph)) == None`,
+        // so editing the host-only path build-dep invalidates `deps_digest` and the module subject.
+        let native_wg = crate::scripts::deps_wasm_graph(crate::scripts::RanAs::Native, Some(&wasm_graph));
+        assert!(native_wg.is_none());
+        let d_v1 = blaze_proc_macro::script_unit::script_deps_digest(&host_graph, native_wg, &lock, UnitId(0), |id| {
+            (id == LockId(1)).then(|| std::string::String::from("helper-v1"))
+        })
+        .expect("ok");
+        let d_v2 = blaze_proc_macro::script_unit::script_deps_digest(&host_graph, native_wg, &lock, UnitId(0), |id| {
+            (id == LockId(1)).then(|| std::string::String::from("helper-v2"))
+        })
+        .expect("ok");
+        assert!(d_v1.is_some() && d_v2.is_some());
+        assert_ne!(d_v1, d_v2, "native script deps_digest must change when host-only path build-dep changes");
+        assert_ne!(
+            crate::script_modules::subject(crate::scripts::RanAs::Native, "app", "0.1.0", &[], None, d_v1.as_deref()),
+            crate::script_modules::subject(crate::scripts::RanAs::Native, "app", "0.1.0", &[], None, d_v2.as_deref()),
+            "native script module subject must change when host-only path build-dep changes"
+        );
+
+        // Control: Wasm placement uses `Some(&wasm_graph)`, returning None when wasm closure has zero build-deps.
+        let wasm_wg = crate::scripts::deps_wasm_graph(crate::scripts::RanAs::Wasm, Some(&wasm_graph));
+        assert!(wasm_wg.is_some());
+        let d_wasm = blaze_proc_macro::script_unit::script_deps_digest(&host_graph, wasm_wg, &lock, UnitId(0), |_| {
+            panic!("wasm closure has zero build-deps and must not hash host-only deps")
+        })
+        .expect("ok");
+        assert_eq!(d_wasm, None);
     }
 }
 

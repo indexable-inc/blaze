@@ -360,7 +360,7 @@ pub(crate) fn read_script_files(
     let cx = cx.span("macro files: read a member build script's files with their stamps");
     let mut bytes = Bytes::new_in(frame, "a member build script's file");
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut record_file = |rel: &str| -> Result<(), CliError> {
+    let mut record_file = |rel: &str, rows: &mut Rows<'_>| -> Result<(), CliError> {
         let norm = rel.trim_start_matches("./");
         if norm.is_empty() || !seen.insert(String::from(norm)) {
             return Ok(());
@@ -371,11 +371,11 @@ pub(crate) fn read_script_files(
         }
         Ok(())
     };
-    record_file(script_root)?;
+    record_file(script_root, rows)?;
     if let Some(listed) = walked(&cx, root, dir, InPackage::Root, frame)? {
         for (name, is_dir) in listed.entries() {
             if !is_dir && name.ends_with(".rs") {
-                record_file(name)?;
+                record_file(name, rows)?;
             }
         }
     }
@@ -389,13 +389,21 @@ pub(crate) fn read_script_files(
         stack.push(String::from(parent));
         while let Some(dir_rel) = stack.pop() {
             let at = under(dir, &dir_rel);
-            let Some(listed) = walked(&cx, root, &at, InPackage::Beneath, frame)? else { continue };
+            let stamp = dir_stamp(&cx, root, stamps, Plant::None, &at)?;
+            let Some(listed) = (match stamp {
+                Some(_) => walked(&cx, root, &at, InPackage::Beneath, frame)?,
+                None => None,
+            }) else {
+                continue;
+            };
+            let (flags, id) = listing_id(Some(listed.entries()));
+            rows.push(LeafKind::MacroFolder, flags, &at, stamp.flatten(), id);
             for (name, is_dir) in listed.entries() {
                 let child = std::format!("{dir_rel}/{name}");
                 if is_dir {
                     stack.push(child);
                 } else if name.ends_with(".rs") {
-                    record_file(&child)?;
+                    record_file(&child, rows)?;
                 }
             }
         }
@@ -637,5 +645,47 @@ mod tests {
             ("extra.rs", b"// top-level rs\n"),
         ]);
         assert_eq!(script_got, script_want, "streaming script_files_digest_in_dir must match exact wire digest");
+    }
+
+    #[test]
+    fn resettable_io_scratch_reclaims_traversal_and_file_buffers_across_packages() {
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(43, bstd::io::Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, 4 << 20).expect("cx");
+        let fs = io.need_fs().expect("fs");
+        let root_rw = fs.open_dir(&cx, &Path::new("ws").expect("ws")).expect("open ws");
+        let big = std::vec![b'x'; 64 * 1024];
+        for i in 0..8usize {
+            let p = std::format!("pkg{i}/src/blob.rs");
+            root_rw
+                .publish(&cx, &Path::new(&p).expect("path"), bstd::fs::Content::bytes(&big), bstd::fs::Durable::No)
+                .expect("write");
+        }
+        let out_frame = Frame::new(bstd::mem::Tag::Other).expect("out_frame");
+        let mut io_scratch = Frame::new(bstd::mem::Tag::Other).expect("io_scratch");
+        let root_ro = root_rw.read_only();
+        let mut digests = std::vec::Vec::new_in(Global);
+        for i in 0..8usize {
+            let dir = std::format!("pkg{i}");
+            let hex = package_files_digest_in_dir(&cx, &root_ro, &dir, &out_frame, &io_scratch).expect("digest");
+            digests.push(hex);
+            assert!(io_scratch.used() > 0, "io_scratch should hold traversal/digest scratch before reset");
+            io_scratch.reset();
+            assert_eq!(io_scratch.used(), 0, "io_scratch must reclaim traversal and file buffers on reset");
+        }
+        // Control: sharing one non-reset frame for both output and scratch retains far more bytes
+        // across packages than separating a resettable `io_scratch`.
+        let shared_frame = Frame::new(bstd::mem::Tag::Other).expect("shared_frame");
+        for i in 0..8usize {
+            let dir = std::format!("pkg{i}");
+            let hex = package_files_digest_in_dir(&cx, &root_ro, &dir, &shared_frame, &shared_frame).expect("digest");
+            assert_eq!(hex, digests[i]);
+        }
+        assert!(
+            out_frame.used() < 4096 && shared_frame.used() > out_frame.used() * 2,
+            "persistent out_frame ({} B) must hold only the 64-byte hex digests vs shared non-reset frame ({} B)",
+            out_frame.used(),
+            shared_frame.used()
+        );
+        assert!(digests.iter().all(|h| h.len() == 64 && *h == digests[0]));
     }
 }
