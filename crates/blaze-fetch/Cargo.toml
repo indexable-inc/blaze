@@ -16,6 +16,8 @@ doctest = false
 [dependencies]
 # The allocator as a value and the owning types every table here is kept in.
 blaze-own.workspace = true
+# Explicit typestate sans-IO machine ABI, state-graph verifier, and Script test handler.
+blaze-machine.workspace = true
 # Text without `core::fmt`: URLs and every error's words.
 blaze-text.workspace = true
 # The lock file's one reader (`lock`), without the cargo-compatible reader.

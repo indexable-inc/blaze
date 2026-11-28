@@ -214,6 +214,57 @@ pub fn coroutine_facts(
 // `async fn` is its fn's whole body (the Reference, "Async functions": "roughly equivalent to
 // a function that returns an async block").
 
+/// Machine step status returned in result 0 when a `.do` body suspends at a point (`Ask`).
+/// Result 1 carries the suspend point ordinal (`u32` zero-extended to `i64`).
+pub const DO_STATUS_ASK: u64 = 0;
+/// Machine step status returned in result 0 when a `.do` body completes (`Done`).
+pub const DO_STATUS_DONE: u64 = 1;
+
+/// Why a `.do` machine body failed to build or lower to the zero-`Pin` Machine ABI.
+#[derive(Debug)]
+pub enum DoMachineError {
+    /// Building the body to pre-split LIR failed.
+    Build(BuildError),
+    /// The zero-`Pin` machine splitter (`blaze_lir::coroutine_machine::split_machine`) refused
+    /// the built body.
+    Machine(blaze_lir::coroutine_machine::MachineError),
+}
+
+impl From<BuildError> for DoMachineError {
+    fn from(error: BuildError) -> Self {
+        DoMachineError::Build(error)
+    }
+}
+
+impl From<blaze_lir::coroutine_machine::MachineError> for DoMachineError {
+    fn from(error: blaze_lir::coroutine_machine::MachineError) -> Self {
+        DoMachineError::Machine(error)
+    }
+}
+
+impl core::fmt::Display for DoMachineError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DoMachineError::Build(error) => core::fmt::Display::fmt(error, f),
+            DoMachineError::Machine(error) => core::fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl core::error::Error for DoMachineError {}
+
+/// State carried by [`Walk`] while building a one-shot lexical `.do` machine coroutine body
+/// (separate from [`Co`], which lowers Rust `async` / `Future::poll` coroutines).
+#[derive(Clone, Copy)]
+pub(super) struct DoCo {
+    /// Entry parameter 1: pointer to the resumed `<R as Request>::Answer` value (`Ty::PTR`).
+    answer: Value,
+    /// Entry parameter 2: pointer to the output slot for the yielded request or final result.
+    out: Value,
+    /// Next suspend point ordinal (`0, 1, ...` in emit order).
+    pub(super) points: u32,
+}
+
 /// What the walk of a coroutine's BODY holds beside a fn's (`Walk::co`; `None` in every other
 /// build): the task context every poll passes, the next suspend point, and how the body's own
 /// `Poll<Output>` is made. (The state pointer, the other entry parameter, is in the upvars'
@@ -697,8 +748,13 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             }
             self.write_tag(id, co.items.ready, to);
         }
+        self.run_defers_leaving(0)?;
         self.drop_from(0)?;
-        self.b.ret(&[]);
+        if self.live {
+            self.b.ret(&[]);
+        } else {
+            self.b.unreachable();
+        }
         Ok(())
     }
 
@@ -917,6 +973,11 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             };
             self.drop_at(held, drop_at)?;
         }
+        let prev_cancel = self.in_cancel;
+        self.in_cancel = true;
+        let defer_res = self.run_defers_leaving(0);
+        self.in_cancel = prev_cancel;
+        defer_res?;
         self.drop_from(0)?;
         self.b.cancelled();
 
@@ -987,6 +1048,264 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let ix = at.0.index();
         (at.1 == 0 && ix < view.len() && view.op(ix) == Op::SlotAddr).then(|| SlotId(view.data[ix]))
     }
+
+    /// `operand.do`: one-shot lexical algebraic effect suspension. Evaluates `operand`, then
+    /// suspends via [`Task::DoSuspend`] when building inside a zero-`Pin` machine coroutine
+    /// harness (`self.do_co.is_some()`). Outside a machine harness (or inside a cancel path),
+    /// fails with a typed [`BuildError`] naming `.do`.
+    pub(super) fn do_operand(&mut self, e: ExprId, operand: ExprId) -> Result<(), BuildError> {
+        if self.in_cancel {
+            return Err(unsupported(e, "`.do` suspension inside a coroutine cancel path"));
+        }
+        if self.do_co.is_none() {
+            return Err(unsupported(
+                e,
+                "`.do` suspension outside a machine coroutine harness (`build_do_machine_body` / `split_do_machine_body`)",
+            ));
+        }
+        self.work.push(Task::DoSuspend(e));
+        self.work.push(Task::Eval(operand));
+        Ok(())
+    }
+
+    /// [`Task::DoSuspend`]: the request operand's value is on top. Writes the request into `out`,
+    /// kills any temporary slot backing it so zero-`Pin` holds, emits `Op::Suspend` with the
+    /// next point ordinal plus `resume` and `cancel` blocks, fills `cancel` (defers + drops +
+    /// `Op::Cancelled`), and binds the resumed `<R as Request>::Answer` value at `resume`.
+    pub(super) fn do_suspend(&mut self, e: ExprId) -> Result<(), BuildError> {
+        let Expr::Do(operand) = self.expr(e)? else {
+            return Err(malformed("a `.do` continuation of another expression"));
+        };
+        let mut dco = self.do_co.ok_or(malformed("a `.do` continuation outside a machine coroutine body"))?;
+        let err = |error| Self::ty_err(e, error);
+        let v = self.pop()?;
+        let ans_ty = self.expr_ty(e)?;
+        let ans_g = self.ground_ty(ans_ty).map_err(err)?;
+        let ans_repr = self.repr(ans_g).map_err(err)?;
+        if !self.live {
+            let dead = match ans_repr.kept() {
+                Kept::None => V::None,
+                Kept::Scalar(ty) => V::Scalar(self.b.uninit(ty)),
+                Kept::Agg(_) => V::Place(self.b.uninit(Ty::PTR), 0),
+            };
+            self.push_val(dead, None);
+            return Ok(());
+        }
+
+        let op_repr = self.adjusted_repr(operand)?;
+        if op_repr != Repr::None {
+            self.store(v, op_repr, (dco.out, 0))?;
+        }
+        // End any temporary slot holding the request operand before `Op::Suspend` so
+        // `blaze_lir::coroutine_machine::split_machine` proves no `Op::SlotAddr` survives.
+        self.end_temp_val(v);
+
+        let point = dco.points;
+        dco.points = point
+            .checked_add(1)
+            .ok_or(malformed("a `.do` machine with more suspend points than a `u32` counts"))?;
+        self.do_co = Some(dco);
+
+        let resume = self.create();
+        let cancel = self.create();
+        self.reach(resume);
+        self.reach(cancel);
+        let ask_tag = self.b.iconst(Ty::I64, u128::from(DO_STATUS_ASK));
+        let point_val = self.b.iconst(Ty::I64, u128::from(point));
+        self.b.suspend(point, resume, cancel, &[ask_tag, point_val]);
+
+        self.begin(cancel);
+        let prev_cancel = self.in_cancel;
+        self.in_cancel = true;
+        let defer_res = self.run_defers_leaving(0);
+        self.in_cancel = prev_cancel;
+        defer_res?;
+        self.drop_from(0)?;
+        self.b.cancelled();
+
+        self.begin(resume);
+        let ans = match ans_repr {
+            Repr::None => V::None,
+            Repr::Agg(_) => {
+                let at = self.temp(ans_repr);
+                self.store(V::Place(dco.answer, 0), ans_repr, at)?;
+                V::Place(at.0, at.1)
+            }
+            scalar => self.load(scalar, (dco.answer, 0)),
+        };
+        self.push_val(ans, None);
+        Ok(())
+    }
+
+    /// Completion return of a `.do` machine body: writes the result value into `out` (if
+    /// non-ZST), runs all open `defer` blocks and value drops, and returns `(DO_STATUS_DONE, 0)`.
+    pub(super) fn do_machine_return(&mut self, v: V) -> Result<(), BuildError> {
+        let dco = self.do_co.ok_or(malformed("a `.do` machine return outside a machine coroutine body"))?;
+        if !self.live {
+            self.b.unreachable();
+            return Ok(());
+        }
+        if self.ret != Repr::None {
+            self.store(v, self.ret, (dco.out, 0))?;
+            self.end_temp_val(v);
+        }
+        self.run_defers_leaving(0)?;
+        self.drop_from(0)?;
+        if self.live {
+            let done_tag = self.b.iconst(Ty::I64, u128::from(DO_STATUS_DONE));
+            let zero = self.b.iconst(Ty::I64, 0);
+            self.b.ret(&[done_tag, zero]);
+        } else {
+            self.b.unreachable();
+        }
+        Ok(())
+    }
+
+    /// Walks a one-shot lexical `.do` function body into pre-split LIR matching the contract of
+    /// [`blaze_lir::coroutine_machine::split_machine`]:
+    /// - Signature: `(state: ptr, answer: ptr, out: ptr) -> (i64, i64)` with `state_param = 0`.
+    /// - Parameters are laid out as a prefix tuple at offset 0 of `state` and bound directly at
+    ///   `(state, field_offset)` (zero stack slots).
+    /// - Immutable non-address-taken scalar/ZST locals stay in SSA values (`ssa_locals`) so no
+    ///   `Op::SlotAddr` crosses an `Op::Suspend`.
+    /// - Ends with an `unresumed` cancel block that drops the parameter prefix and emits
+    ///   `Op::Cancelled`.
+    pub(super) fn run_do_machine(
+        &mut self,
+        sig: &FnSig<'_>,
+        grace_max_steps: u32,
+    ) -> Result<blaze_lir::coroutine_machine::MachineShape, BuildError> {
+        if sig.inputs.len() != self.body.params.len() {
+            return Err(malformed("a `.do` machine signature and body with different parameter counts"));
+        }
+        let ret_g = self.ground_in(sig.types, sig.output).map_err(co_err)?;
+        self.ret = self.repr(ret_g).map_err(co_err)?;
+
+        let mut param_tys: Vec<PTy, A> = Vec::with_capacity_in(sig.inputs.len(), self.alloc);
+        for &inp in sig.inputs {
+            param_tys.push(self.ground_in(sig.types, inp).map_err(co_err)?);
+        }
+        let (prefix_ty, prefix_layout, prefix_size, prefix_align) = if param_tys.is_empty() {
+            (None, None, 0u32, 0u8)
+        } else {
+            let full = |_| malformed("the ground table is full");
+            let list = self.ground.intern_list(&param_tys).map_err(full)?;
+            let pty = self.ground.intern(PNode::Tuple(list)).map_err(full)?;
+            let prepr = self.repr(pty).map_err(co_err)?;
+            let (size, align) = self.size_align(prepr);
+            let le = match prepr {
+                Repr::Agg(l) => Some(l),
+                Repr::None => None,
+                _ => return Err(malformed("a `.do` parameter tuple not laid out as an aggregate or ZST")),
+            };
+            (Some(pty), le, size, align)
+        };
+
+        let own = self.b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR)],
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+        );
+        self.b.set_signature(own);
+        let entry = self.create();
+        self.reached[entry.index()] = true;
+        self.begin(entry);
+        let state = self.b.param(Ty::PTR);
+        let answer = self.b.param(Ty::PTR);
+        let out = self.b.param(Ty::PTR);
+        self.do_co = Some(DoCo { answer, out, points: 0 });
+        self.scope_marks.push(0);
+
+        for (k, &param_ty) in param_tys.iter().enumerate() {
+            let p = self.body.params[k];
+            let off = match prefix_layout {
+                Some(le) => self.field_offset(le, k)? as i32,
+                None => 0,
+            };
+            let at = (state, off);
+            if matches!(self.pat(p)?, Pat::Bind { sub: None, .. }) && self.plain_binding(p).is_ok() {
+                self.bind_capture_at(p, at)?;
+                self.own(p, true)?;
+            } else {
+                let prepr = self.repr(param_ty).map_err(co_err)?;
+                let v = self.load(prepr, at);
+                self.bind_param(p, v, param_ty)?;
+            }
+        }
+
+        self.walk_root()?;
+
+        let unresumed = self.create();
+        self.reached[unresumed.index()] = true;
+        self.begin(unresumed);
+        if let Some(pty) = prefix_ty
+            && self.needs_drop(pty).map_err(co_err)?
+        {
+            self.drop_at(pty, (state, 0))?;
+        }
+        self.b.cancelled();
+        if let Some(error) = self.b.error() {
+            return Err(BuildError::Lir(error.clone()));
+        }
+        let points = self.do_co.map_or(0, |d| d.points);
+        let grace = if grace_max_steps == 0 { points } else { grace_max_steps };
+        Ok(blaze_lir::coroutine_machine::MachineShape {
+            state_param: 0,
+            prefix_size,
+            prefix_align,
+            unresumed,
+            grace_max_steps: grace,
+        })
+    }
+}
+
+/// Builds a type-checked one-shot lexical `.do` body into verified pre-split LIR (containing
+/// `Op::Suspend` / `Op::Cancelled`) and its [`blaze_lir::coroutine_machine::MachineShape`].
+pub fn build_do_machine_body<A: Allocator + Copy>(
+    body: &BodyView<'_>,
+    checked: &Checked<'_>,
+    sig: &FnSig<'_>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    grace_max_steps: u32,
+    alloc: A,
+) -> Result<(blaze_lir::Func<A>, blaze_lir::coroutine_machine::MachineShape), BuildError> {
+    if !checked.diags.is_empty() {
+        return Err(BuildError::Diagnostics { count: u32::try_from(checked.diags.len()).unwrap_or(u32::MAX) });
+    }
+    let generics = sig
+        .parent_count
+        .checked_add(sig.own_count)
+        .ok_or(BuildError::Malformed { what: "a generic count past u32" })?;
+    if subst.args.len() != generics as usize {
+        return Err(BuildError::Malformed { what: "an instance whose argument count is not its fn's generic count" });
+    }
+    let mut w = Walk::new(body, checked, subst, adts, alloc);
+    w.scan_flags()?;
+    let shape = w.run_do_machine(sig, grace_max_steps)?;
+    let func = w.b.finish().map_err(|error| match error {
+        blaze_lir::BuildError::Verify(v) => BuildError::Verify(v),
+        other => BuildError::Lir(other),
+    })?;
+    Ok((func, shape))
+}
+
+/// Builds a type-checked one-shot lexical `.do` body and feeds it directly into
+/// [`blaze_lir::coroutine_machine::split_machine`], returning a verified zero-`Pin` sans-IO
+/// machine (`step`, `on_cancel`, `layout`, and `graph`).
+pub fn split_do_machine_body<A: Allocator + Copy>(
+    body: &BodyView<'_>,
+    checked: &Checked<'_>,
+    sig: &FnSig<'_>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    grace_max_steps: u32,
+    alloc: A,
+) -> Result<blaze_lir::coroutine_machine::MachineSplit<A>, DoMachineError> {
+    let (func, shape) = build_do_machine_body(body, checked, sig, subst, adts, grace_max_steps, alloc)?;
+    let split = blaze_lir::coroutine_machine::split_machine(func.view(), shape, alloc)?;
+    Ok(split)
 }
 
 /// Builds coroutine `ordinal` of `body` (the owner's, checked once as `checked`) at the

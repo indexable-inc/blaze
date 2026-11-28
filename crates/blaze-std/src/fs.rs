@@ -152,6 +152,9 @@ pub use private::PrivateError;
 // Linear group-commit file transactions (`Dir::txn`): N publishes/renames/removals, 1 dir sync.
 mod txn;
 pub use txn::{Committed, Txn};
+
+// Zero-alloc typed linear filesystem requests, handles, and sans-IO machines (`blaze_core::request`).
+pub mod req;
 pub use blaze_core::{Cursor, Lost};
 #[cfg(test)]
 pub(crate) use dirs::DirsPlant;

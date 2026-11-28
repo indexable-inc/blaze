@@ -1,6 +1,7 @@
+use core::num::NonZeroU32;
 use core::time::Duration;
 
-use blaze_machine::{DriveOpts, Handler, Machine, Perform, Turn, drive};
+use blaze_machine::{Batch, Chain, ChainOutcome, DriveOpts, Handler, Machine, Perform, Turn, drive};
 use blaze_own::testing::heap;
 use blaze_own::{Alloc, with_brand};
 use blaze_sim::{Broke, Config};
@@ -11,10 +12,12 @@ use super::{
     FsError, FsRequest, IoAnswer, IoRequest, LENT_READ_MAX, ListOpts, Listen, ListenOpts,
     LockOpts, LockOutcome, MaxBytes, NetError, OpenOpts, ReadAllOpts, ReadIntoOpts, ReadOpts,
     RecvIntoOpts, RenameFlushedOpts, RenameUnsyncedOpts, SendFromOpts, SimHandler,
-    SimHandlerError, Sleep, SleepOpts, TruncateOpts, WriteDurableOpts, WriteFromOpts,
+    SimHandlerError, Sleep, SleepOpts, Stat, TruncateOpts, WriteDurableOpts, WriteFrom,
+    WriteFromOpts,
 };
 use crate::handle::{
-    Conn as ConnHandle, Dir, ExitKind, File, FixedFileSlot, Listener, ReadWrite, TaskId, Unflushed,
+    Conn as ConnHandle, Dir, ExitKind, File, FixedFileSlot, Handle, Listener, ReadWrite, TaskId,
+    Unflushed,
 };
 use crate::sim::{Faults, Sim};
 use crate::{Address, DirName, Driver, FileName, LockMode, RANDOM_MOST};
@@ -1027,6 +1030,770 @@ fn fixed_buf_index_and_fixed_file_slot_survive_io_round_trip() {
             })
             .unwrap();
         assert_eq!(closed, Ok(()));
+        assert_eq!(handler.finish_task(ExitKind::Normal), Ok(0));
+    });
+}
+
+#[test]
+fn chained_write_flush_and_rename_sync_short_circuit_on_error_and_commit_on_ok() {
+    let h = heap();
+    let mut sim = Sim::new(2026, Faults::default());
+    let dir_name = FileName::new("chain").unwrap();
+    let tmp = FileName::new("chain/commit.tmp").unwrap();
+    let target = FileName::new("chain/commit.bin").unwrap();
+    let ro_path = FileName::new("chain/readonly.bin").unwrap();
+    let sc_path = FileName::new("chain/shortcircuit.bin").unwrap();
+    let payload = std::vec![0x5Au8; 1536];
+
+    // 1. Success path: `Chain<WriteFrom, Flush>` followed by `Chain<RenameFlushed, SyncDir>`.
+    with_brand(|brand| {
+        let mut handler = SimHandler::new(&mut sim, TaskId(101), brand, h.alloc());
+        let root = handler.root();
+
+        let made = handler
+            .perform(root.make_dir(dir_name.clone()), |p| match p {
+                Perform::Answered(res) => res,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        assert_eq!(made, Ok(()));
+
+        // Seed a file we will later open read-only for the short-circuit check.
+        let seed_buf = handler
+            .perform(
+                root.write_durable(WriteDurableOpts {
+                    path: ro_path.clone(),
+                    buf: DmaBuf::from_slice_in(b"immutable", h.alloc()),
+                }),
+                |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        seed_buf.release();
+
+        let file = handler
+            .perform(
+                root.open_write(OpenOpts { path: tmp.clone(), create: true, truncate: true }),
+                |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        let write_req = file.write_from(WriteFromOpts {
+            at: ByteOffset(0),
+            buf: DmaBuf::from_slice_in(&payload, h.alloc()),
+        });
+        let flush_req = file.flush();
+        let outcome = handler
+            .perform(Chain::new(write_req, flush_req), |p| match p {
+                Perform::Answered(out) => out,
+                _ => unreachable!(),
+            })
+            .unwrap();
+
+        let (flushed_file, proof) = match outcome {
+            ChainOutcome::Both(Ok(buf), Ok((flushed, proof))) => {
+                buf.release();
+                (flushed, proof)
+            }
+            other => panic!("expected ChainOutcome::Both(Ok, Ok), got {other:?}"),
+        };
+
+        let closed = handler
+            .perform(flushed_file.close(), |p| match p {
+                Perform::Answered(res) => res,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        assert_eq!(closed, Ok(()));
+
+        let rename_sync = Chain::new(
+            root.rename_flushed(RenameFlushedOpts { flushed: proof, to: target.clone() }),
+            root.sync_dir(),
+        );
+        let commit_out = handler
+            .perform(rename_sync, |p| match p {
+                Perform::Answered(out) => out,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        assert_eq!(commit_out, ChainOutcome::Both(Ok(()), Ok(())));
+
+        assert_eq!(handler.finish_task(ExitKind::Normal), Ok(0));
+    });
+
+    // Power cut: committed bytes & name MUST survive intact.
+    sim.crash();
+    assert_eq!(read_file_direct(&sim, &target).as_deref(), Some(payload.as_slice()));
+
+    // 2. Short-circuit paths: hold all syncs under `chain/` so if `Flush` ever ran, it would
+    //    either stall or increment `sim.held_syncs()`.
+    sim.hold_syncs(dir_name.clone());
+    with_brand(|brand| {
+        let mut handler = SimHandler::new(&mut sim, TaskId(102), brand, h.alloc());
+        let root = handler.root();
+
+        // 2a. `Chain<WriteFrom, Flush>` short-circuits on a read-only handle (`Flush` NOT run).
+        let ro_file = handler
+            .perform(root.narrow_read_only().open_read(ro_path.clone()), |p| match p {
+                Perform::Answered(res) => res,
+                _ => unreachable!(),
+            })
+            .unwrap()
+            .unwrap();
+        let rw_file = handler
+            .perform(
+                root.open_write(OpenOpts { path: sc_path.clone(), create: true, truncate: true }),
+                |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        let bad_write = WriteFrom {
+            file: ro_file.id(),
+            at: ByteOffset(0),
+            buf: DmaBuf::from_slice_in(b"should-fail", h.alloc()),
+        };
+        let sc_out = handler
+            .perform(Chain::new(bad_write, rw_file.flush()), |p| match p {
+                Perform::Answered(out) => out,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        match sc_out {
+            ChainOutcome::FirstOnly(Err(be)) => {
+                assert!(matches!(be.error, FsError::Io { .. }));
+                be.buf.release();
+            }
+            other => {
+                panic!("expected ChainOutcome::FirstOnly(Err) on read-only write, got {other:?}")
+            }
+        }
+        assert_eq!(handler.driver().held_syncs(), 0, "Flush must NOT run on WriteFrom error");
+
+        let closed_ro = handler
+            .perform(ro_file.close(), |p| match p {
+                Perform::Answered(res) => res,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        assert_eq!(closed_ro, Ok(()));
+
+        // 2b. `Chain<WriteFrom, Flush>` short-circuits on a stale handle (`Flush` NOT run).
+        let to_close = handler
+            .perform(
+                root.open_write(OpenOpts { path: sc_path.clone(), create: true, truncate: false }),
+                |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let stale_id = to_close.id();
+        let closed_tmp = handler
+            .perform(to_close.close(), |p| match p {
+                Perform::Answered(res) => res,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        assert_eq!(closed_tmp, Ok(()));
+
+        let rw_file2 = handler
+            .perform(
+                root.open_write(OpenOpts { path: sc_path.clone(), create: true, truncate: false }),
+                |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let stale_write = WriteFrom {
+            file: stale_id,
+            at: ByteOffset(0),
+            buf: DmaBuf::from_slice_in(b"stale", h.alloc()),
+        };
+        let stale_out = handler
+            .perform(Chain::new(stale_write, rw_file2.flush()), |p| match p {
+                Perform::Answered(out) => out,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        match stale_out {
+            ChainOutcome::FirstOnly(Err(be)) => {
+                assert!(matches!(be.error, FsError::StaleHandle(_)));
+                be.buf.release();
+            }
+            other => panic!("expected ChainOutcome::FirstOnly(Err(StaleHandle)), got {other:?}"),
+        }
+        assert_eq!(handler.driver().held_syncs(), 0, "Flush must NOT run on stale WriteFrom");
+
+        // 2c. `Chain<RenameFlushed, SyncDir>` short-circuits when `RenameFlushed` fails on stale dir.
+        let stale_dir: Dir<'_, ReadWrite> =
+            Dir::from_id(Handle::new(99, NonZeroU32::new(1).unwrap(), brand));
+        let bad_rename = stale_dir.rename_flushed(RenameFlushedOpts {
+            flushed: FlushedProof { path: tmp.clone() },
+            to: target.clone(),
+        });
+        let rename_sc = handler
+            .perform(Chain::new(bad_rename, root.sync_dir()), |p| match p {
+                Perform::Answered(out) => out,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        assert!(matches!(rename_sc, ChainOutcome::FirstOnly(Err(FsError::StaleHandle(_)))));
+
+        assert_eq!(handler.finish_task(ExitKind::Normal), Ok(0));
+    });
+}
+
+#[test]
+fn batched_stat_fanout_submits_all_and_returns_exact_indices() {
+    let h = heap();
+    let mut sim = Sim::new(4040, Faults::default());
+    let files: [(FileName, usize); 4] = [
+        (FileName::new("b0.bin").unwrap(), 11),
+        (FileName::new("b1.bin").unwrap(), 29),
+        (FileName::new("b2.bin").unwrap(), 73),
+        (FileName::new("b3.bin").unwrap(), 128),
+    ];
+    let missing = FileName::new("missing.bin").unwrap();
+
+    with_brand(|brand| {
+        let mut handler = SimHandler::new(&mut sim, TaskId(201), brand, h.alloc());
+        let root = handler.root();
+
+        // Create 4 files with distinct sizes.
+        for (i, (path, size)) in files.iter().enumerate() {
+            let data = std::vec![0x10 + i as u8; *size];
+            let buf = handler
+                .perform(
+                    root.write_durable(WriteDurableOpts {
+                        path: path.clone(),
+                        buf: DmaBuf::from_slice_in(&data, h.alloc()),
+                    }),
+                    |p| match p {
+                        Perform::Answered(res) => res,
+                        _ => unreachable!(),
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            buf.release();
+        }
+
+        // Submit a `Batch<Stat, 8>` with 5 entries: 4 existing + 1 missing (at slot 2).
+        let mut batch: Batch<Stat<'_>, 8> = Batch::new();
+        assert_eq!(batch.try_push(root.stat(files[0].0.clone())).unwrap(), 0);
+        assert_eq!(batch.try_push(root.stat(files[1].0.clone())).unwrap(), 1);
+        assert_eq!(batch.try_push(root.stat(missing.clone())).unwrap(), 2);
+        assert_eq!(batch.try_push(root.stat(files[2].0.clone())).unwrap(), 3);
+        assert_eq!(batch.try_push(root.stat(files[3].0.clone())).unwrap(), 4);
+        assert_eq!(batch.len(), 5);
+
+        let ready = handler
+            .perform(batch, |p| match p {
+                Perform::Answered(v) => v,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        assert_eq!(ready.len(), 5);
+
+        let expected: [Option<u64>; 5] = [
+            Some(files[0].1 as u64),
+            Some(files[1].1 as u64),
+            None,
+            Some(files[2].1 as u64),
+            Some(files[3].1 as u64),
+        ];
+        let mut seen = [false; 5];
+        for entry in ready.as_slice() {
+            let idx = entry.index as usize;
+            assert!(idx < 5, "unexpected batch index {idx}");
+            assert!(!seen[idx], "duplicate batch index {idx}");
+            seen[idx] = true;
+            match (&entry.answer, expected[idx]) {
+                (Ok(Some(meta)), Some(exp_len)) => {
+                    assert_eq!(meta.len, exp_len, "size mismatch at slot {idx}");
+                    assert!(!meta.dir);
+                }
+                (Ok(None), None) => {}
+                (got, exp) => panic!("slot {idx}: expected {exp:?}, got {got:?}"),
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "missing batch slot completion");
+
+        // Also verify a batch containing a stale Dir handle records `StaleHandle` without stalling
+        // while valid entries in the same batch complete cleanly.
+        let stale_dir: Dir<'_, ReadWrite> =
+            Dir::from_id(Handle::new(77, NonZeroU32::new(1).unwrap(), brand));
+        let mut mixed: Batch<Stat<'_>, 4> = Batch::new();
+        assert_eq!(mixed.try_push(stale_dir.stat(files[0].0.clone())).unwrap(), 0);
+        assert_eq!(mixed.try_push(root.stat(files[0].0.clone())).unwrap(), 1);
+        let mixed_ready = handler
+            .perform(mixed, |p| match p {
+                Perform::Answered(v) => v,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        assert_eq!(mixed_ready.len(), 2);
+        let mut saw_stale = false;
+        let mut saw_valid = false;
+        for entry in mixed_ready.as_slice() {
+            match entry.index {
+                0 => {
+                    assert!(matches!(entry.answer, Err(FsError::StaleHandle(_))));
+                    saw_stale = true;
+                }
+                1 => {
+                    let meta = entry.answer.as_ref().unwrap().as_ref().unwrap();
+                    assert_eq!(meta.len, files[0].1 as u64);
+                    saw_valid = true;
+                }
+                other => panic!("unexpected index {other}"),
+            }
+        }
+        assert!(saw_stale && saw_valid);
+
+        assert_eq!(handler.finish_task(ExitKind::Normal), Ok(0));
+    });
+}
+
+#[test]
+fn uring_sqe_plan_sets_fixed_file_fixed_buf_and_io_link_with_planted_controls() {
+    use super::{
+        DirectFsHandler, InMemoryDirectFs, PlannedSqe, ReadInto, SqeFlags, SqeOpcode, SqePlanPlant,
+        UringSqePlan, plan_batch_stat, plan_batch_stat_with, plan_chain_write_flush,
+        plan_chain_write_flush_with, plan_flush, plan_flush_with, plan_read_into,
+        plan_read_into_with, plan_write_from, plan_write_from_with,
+    };
+
+    let h = heap();
+    let mut fs = InMemoryDirectFs::new(h.alloc());
+    let path = FileName::new("sqe-plan.bin").unwrap();
+
+    with_brand(|brand| {
+        let mut handler = DirectFsHandler::new(&mut fs, TaskId(300), brand, h.alloc());
+        let root = handler.root();
+
+        let file = handler
+            .perform(
+                root.open_write(OpenOpts { path: path.clone(), create: true, truncate: true }),
+                |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let expected_slot = file.fixed_file_slot();
+
+        // 1. Unregistered vs registered `ReadInto` SQE planning.
+        let unreg_read = file.read_into(ReadIntoOpts {
+            at: ByteOffset(64),
+            buf: DmaBuf::with_capacity_in(ByteLen(128), h.alloc()),
+        });
+        assert_eq!(
+            plan_read_into(&unreg_read),
+            PlannedSqe {
+                opcode: SqeOpcode::Read,
+                flags: SqeFlags::FIXED_FILE,
+                fd_slot: Some(expected_slot),
+                buf_index: None,
+                offset: 64,
+                len: 128,
+            }
+        );
+        let ReadInto { buf: unreg_read_buf, .. } = unreg_read;
+        unreg_read_buf.release();
+
+        let reg_read = file.read_into(ReadIntoOpts {
+            at: ByteOffset(512),
+            buf: DmaBuf::with_capacity_in(ByteLen(256), h.alloc())
+                .with_registered_index(FixedBufIndex(3)),
+        });
+        let planned_reg_read = UringSqePlan::plan_read_into(&reg_read);
+        assert_eq!(
+            planned_reg_read,
+            PlannedSqe {
+                opcode: SqeOpcode::ReadFixed,
+                flags: SqeFlags::FIXED_FILE,
+                fd_slot: Some(expected_slot),
+                buf_index: Some(FixedBufIndex(3)),
+                offset: 512,
+                len: 256,
+            }
+        );
+
+        // Planted control: `SkipFixedBufOpcode` degrades `ReadFixed` -> `Read` with `buf_index: None`.
+        let planted_no_fixed_buf_read =
+            plan_read_into_with(&reg_read, SqePlanPlant::SkipFixedBufOpcode);
+        assert_eq!(planted_no_fixed_buf_read.opcode, SqeOpcode::Read);
+        assert_eq!(planted_no_fixed_buf_read.buf_index, None);
+
+        // Planted control: `SkipFixedFileFlag` drops `IOSQE_FIXED_FILE`.
+        let planted_no_fixed_file_read =
+            plan_read_into_with(&reg_read, SqePlanPlant::SkipFixedFileFlag);
+        assert!(!planted_no_fixed_file_read.flags.contains(SqeFlags::FIXED_FILE));
+
+        let ReadInto { buf: reg_read_buf, .. } = reg_read;
+        reg_read_buf.release();
+
+        // 2. Unregistered vs registered `WriteFrom` SQE planning.
+        let unreg_write = file.write_from(WriteFromOpts {
+            at: ByteOffset(16),
+            buf: DmaBuf::from_slice_in(b"unregistered-io", h.alloc()),
+        });
+        assert_eq!(
+            plan_write_from(&unreg_write),
+            PlannedSqe {
+                opcode: SqeOpcode::Write,
+                flags: SqeFlags::FIXED_FILE,
+                fd_slot: Some(expected_slot),
+                buf_index: None,
+                offset: 16,
+                len: 15,
+            }
+        );
+        let WriteFrom { buf: unreg_write_buf, .. } = unreg_write;
+        unreg_write_buf.release();
+
+        let reg_write = file.write_from(WriteFromOpts {
+            at: ByteOffset(0),
+            buf: DmaBuf::from_slice_in(b"fixed-buf-write", h.alloc())
+                .with_registered_index(FixedBufIndex(5)),
+        });
+        assert_eq!(
+            plan_write_from(&reg_write),
+            PlannedSqe {
+                opcode: SqeOpcode::WriteFixed,
+                flags: SqeFlags::FIXED_FILE,
+                fd_slot: Some(expected_slot),
+                buf_index: Some(FixedBufIndex(5)),
+                offset: 0,
+                len: 15,
+            }
+        );
+        let planted_no_fixed_buf_write =
+            plan_write_from_with(&reg_write, SqePlanPlant::SkipFixedBufOpcode);
+        assert_eq!(planted_no_fixed_buf_write.opcode, SqeOpcode::Write);
+        assert_eq!(planted_no_fixed_buf_write.buf_index, None);
+        let planted_no_fixed_file_write =
+            plan_write_from_with(&reg_write, SqePlanPlant::SkipFixedFileFlag);
+        assert!(!planted_no_fixed_file_write.flags.contains(SqeFlags::FIXED_FILE));
+
+        // 3. `Flush` + `Chain<WriteFrom, Flush>` with `IOSQE_IO_LINK` & planted control.
+        let flush_req = file.flush();
+        assert_eq!(
+            plan_flush(&flush_req),
+            PlannedSqe {
+                opcode: SqeOpcode::Fsync,
+                flags: SqeFlags::FIXED_FILE,
+                fd_slot: Some(expected_slot),
+                buf_index: None,
+                offset: 0,
+                len: 0,
+            }
+        );
+        assert!(!plan_flush_with(&flush_req, SqePlanPlant::SkipFixedFileFlag)
+            .flags
+            .contains(SqeFlags::FIXED_FILE));
+
+        let chain = Chain::new(reg_write, flush_req);
+        let [sqe_write, sqe_flush] = plan_chain_write_flush(&chain);
+        assert_eq!(sqe_write.opcode, SqeOpcode::WriteFixed);
+        assert_eq!(sqe_write.buf_index, Some(FixedBufIndex(5)));
+        assert_eq!(sqe_write.flags, SqeFlags::FIXED_FILE | SqeFlags::IO_LINK);
+        assert_eq!(sqe_write.fd_slot, Some(expected_slot));
+        assert_eq!(sqe_flush.opcode, SqeOpcode::Fsync);
+        assert_eq!(sqe_flush.flags, SqeFlags::FIXED_FILE);
+        assert!(!sqe_flush.flags.contains(SqeFlags::IO_LINK));
+        assert_eq!(sqe_flush.fd_slot, Some(expected_slot));
+
+        // Planted control: `SkipIoLinkOnChain` drops `IOSQE_IO_LINK` on the first SQE!
+        let [planted_write, _] =
+            plan_chain_write_flush_with(&chain, SqePlanPlant::SkipIoLinkOnChain);
+        assert!(!planted_write.flags.contains(SqeFlags::IO_LINK));
+        assert!(planted_write.flags.contains(SqeFlags::FIXED_FILE));
+
+        // Execute the chain so every linear value is consumed cleanly through `DirectFsHandler`.
+        let chain_out = handler
+            .perform(chain, |p| match p {
+                Perform::Answered(out) => out,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        let (flushed_file, _proof) = match chain_out {
+            ChainOutcome::Both(Ok(buf), Ok((f, proof))) => {
+                buf.release();
+                (f, proof)
+            }
+            other => panic!("expected ChainOutcome::Both(Ok, Ok), got {other:?}"),
+        };
+        let closed = handler
+            .perform(flushed_file.close(), |p| match p {
+                Perform::Answered(res) => res,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        assert_eq!(closed, Ok(()));
+
+        // 4. `Batch<Stat, 4>` lowers all 4 `Statx` SQEs for one single `io_uring_enter`.
+        let mut batch: Batch<Stat<'_>, 4> = Batch::new();
+        for name in ["s0.bin", "s1.bin", "s2.bin", "s3.bin"] {
+            batch.try_push(root.stat(FileName::new(name).unwrap())).unwrap();
+        }
+        let planned_batch = plan_batch_stat(&batch);
+        assert_eq!(planned_batch.len(), 4);
+        for sqe in planned_batch.as_slice() {
+            assert_eq!(
+                *sqe,
+                PlannedSqe {
+                    opcode: SqeOpcode::Statx,
+                    flags: SqeFlags::FIXED_FILE,
+                    fd_slot: Some(root.id().fixed_file_slot()),
+                    buf_index: None,
+                    offset: 0,
+                    len: 0,
+                }
+            );
+        }
+        let planted_batch = plan_batch_stat_with(&batch, SqePlanPlant::SkipFixedFileFlag);
+        assert_eq!(planted_batch.len(), 4);
+        for sqe in planted_batch.as_slice() {
+            assert!(!sqe.flags.contains(SqeFlags::FIXED_FILE));
+        }
+
+        // Consume `batch` cleanly via `DirectFsHandler`.
+        let ready = handler
+            .perform(batch, |p| match p {
+                Perform::Answered(v) => v,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        assert_eq!(ready.len(), 4);
+
+        assert_eq!(handler.finish_task(ExitKind::Normal), Ok(0));
+    });
+}
+
+#[test]
+fn direct_fs_handler_commits_chained_write_flush_without_effect_enum_bridge() {
+    use super::{DirectFsHandler, InMemoryDirectFs};
+
+    let h = heap();
+    let mut fs = InMemoryDirectFs::new(h.alloc());
+    let tmp = FileName::new("direct.tmp").unwrap();
+    let target = FileName::new("direct.bin").unwrap();
+    let dirty = FileName::new("unflushed.bin").unwrap();
+    let missing = FileName::new("absent.bin").unwrap();
+    let payload = b"zero-effect-bridge-direct-handler-payload";
+
+    // Phase 1: OpenWrite -> Chain<WriteFrom, Flush> -> Close -> RenameFlushed -> SyncDir,
+    // plus an unsynced/unflushed file that must vanish on crash.
+    with_brand(|brand| {
+        let mut handler = DirectFsHandler::new(&mut fs, TaskId(401), brand, h.alloc());
+        let root = handler.root();
+
+        let file = handler
+            .perform(
+                root.open_write(OpenOpts { path: tmp.clone(), create: true, truncate: true }),
+                |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        let write_req = file.write_from(WriteFromOpts {
+            at: ByteOffset(0),
+            buf: DmaBuf::from_slice_in(payload, h.alloc())
+                .with_registered_index(FixedBufIndex(2)),
+        });
+        let flush_req = file.flush();
+        let chain_out = handler
+            .perform(Chain::new(write_req, flush_req), |p| match p {
+                Perform::Answered(out) => out,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        let (flushed_file, proof) = match chain_out {
+            ChainOutcome::Both(Ok(buf), Ok((f, proof))) => {
+                assert_eq!(buf.registered_index(), Some(FixedBufIndex(2)));
+                buf.release();
+                (f, proof)
+            }
+            other => panic!("expected ChainOutcome::Both(Ok, Ok), got {other:?}"),
+        };
+
+        assert_eq!(
+            handler
+                .perform(flushed_file.close(), |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                })
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(
+            handler
+                .perform(
+                    root.rename_flushed(RenameFlushedOpts { flushed: proof, to: target.clone() }),
+                    |p| match p {
+                        Perform::Answered(res) => res,
+                        _ => unreachable!(),
+                    },
+                )
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(
+            handler
+                .perform(root.sync_dir(), |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                })
+                .unwrap(),
+            Ok(())
+        );
+
+        // Write an unflushed, unsynced file to verify power-cut rollback drops it.
+        let dirty_file = handler
+            .perform(
+                root.open_write(OpenOpts { path: dirty.clone(), create: true, truncate: true }),
+                |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let dirty_buf = handler
+            .perform(
+                dirty_file.write_from(WriteFromOpts {
+                    at: ByteOffset(0),
+                    buf: DmaBuf::from_slice_in(b"must-not-survive-crash", h.alloc()),
+                }),
+                |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        dirty_buf.release();
+        assert_eq!(
+            handler
+                .perform(dirty_file.close(), |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                })
+                .unwrap(),
+            Ok(())
+        );
+
+        assert_eq!(handler.finish_task(ExitKind::Normal), Ok(0));
+    });
+
+    // Simulate power loss: committed `target` survives intact; `dirty` vanishes.
+    fs.crash();
+
+    // Phase 2: ReadInto on surviving file + Batch<Stat, 4> after crash.
+    with_brand(|brand| {
+        let mut handler = DirectFsHandler::new(&mut fs, TaskId(402), brand, h.alloc());
+        let root = handler.root();
+        let ro = root.narrow_read_only();
+
+        let opened = handler
+            .perform(ro.open_read(target.clone()), |p| match p {
+                Perform::Answered(res) => res,
+                _ => unreachable!(),
+            })
+            .unwrap()
+            .unwrap();
+        let filled = handler
+            .perform(
+                opened.read_into(ReadIntoOpts {
+                    at: ByteOffset(0),
+                    buf: DmaBuf::with_capacity_in(ByteLen(128), h.alloc())
+                        .with_registered_index(FixedBufIndex(4)),
+                }),
+                |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(filled.filled, ByteLen(payload.len() as u32));
+        assert_eq!(filled.buf.as_slice(), payload);
+        assert_eq!(filled.buf.registered_index(), Some(FixedBufIndex(4)));
+        filled.buf.release();
+        assert_eq!(
+            handler
+                .perform(opened.close(), |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                })
+                .unwrap(),
+            Ok(())
+        );
+
+        // Unflushed file must not exist after crash.
+        let dirty_open = handler
+            .perform(ro.open_read(dirty.clone()), |p| match p {
+                Perform::Answered(res) => res,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        match dirty_open {
+            Err(FsError::NotFound { path }) => assert_eq!(path, dirty),
+            Ok(f) => {
+                let _ = f.into_id();
+                panic!("unflushed file must not exist after crash");
+            }
+            Err(other) => panic!("expected NotFound for unflushed file after crash, got {other:?}"),
+        }
+
+        // Batch<Stat, 4> across [target, tmp, dirty, missing].
+        let mut batch: Batch<Stat<'_>, 4> = Batch::new();
+        assert_eq!(batch.try_push(root.stat(target.clone())).unwrap(), 0);
+        assert_eq!(batch.try_push(root.stat(tmp.clone())).unwrap(), 1);
+        assert_eq!(batch.try_push(root.stat(dirty.clone())).unwrap(), 2);
+        assert_eq!(batch.try_push(root.stat(missing.clone())).unwrap(), 3);
+
+        let ready = handler
+            .perform(batch, |p| match p {
+                Perform::Answered(v) => v,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        assert_eq!(ready.len(), 4);
+        for entry in ready.as_slice() {
+            match entry.index {
+                0 => {
+                    let meta = entry.answer.as_ref().unwrap().as_ref().unwrap();
+                    assert_eq!(meta.len, payload.len() as u64);
+                    assert!(!meta.dir);
+                }
+                1 | 2 | 3 => {
+                    assert_eq!(entry.answer, Ok(None));
+                }
+                other => panic!("unexpected batch index {other}"),
+            }
+        }
+
         assert_eq!(handler.finish_task(ExitKind::Normal), Ok(0));
     });
 }

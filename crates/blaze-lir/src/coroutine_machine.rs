@@ -59,6 +59,23 @@ impl MachineShape {
     }
 }
 
+/// Compile-time budget on a lowered machine's suspended state size (`#[blaze::max_state_bytes]`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct MachineBudget {
+    /// Maximum allowed suspended state size in bytes, or `None` for unbounded.
+    pub max_state_bytes: Option<u32>,
+}
+
+impl MachineBudget {
+    /// No compile-time ceiling on the suspended state size.
+    pub const UNBOUNDED: Self = Self { max_state_bytes: None };
+
+    /// Enforces that the lowered suspended state fits within `n` bytes.
+    pub const fn max_bytes(n: u32) -> Self {
+        Self { max_state_bytes: Some(n) }
+    }
+}
+
 /// Planted bug selectors for simulation and oracle controls.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MachinePlant {
@@ -69,6 +86,8 @@ pub enum MachinePlant {
     SkipTagStore,
     /// Dispatch resume tag `k` to the next suspend point's resume block.
     WrongResumeTarget,
+    /// Skip the compile-time suspended state-size budget check (`#[blaze::max_state_bytes]`).
+    SkipStateSizeCheck,
 }
 
 /// Why a one-shot `.do` coroutine body cannot be lowered to the zero-`Pin` Machine ABI.
@@ -81,6 +100,8 @@ pub enum MachineError {
     LocalSlotAddrAcrossSuspend { slot: SlotId, point: u32, inst: u32 },
     /// A suspend point exists in the body whose resume block is unreachable from entry.
     UnreachableResume { point: u32 },
+    /// Suspended state layout exceeds the machine's compile-time `#[blaze::max_state_bytes]` cap.
+    StateSizeExceeded { actual: u32, max: u32, largest_field_size: u32 },
 }
 
 impl From<CoroutineError> for MachineError {
@@ -100,6 +121,10 @@ impl fmt::Display for MachineError {
             MachineError::UnreachableResume { point } => {
                 write!(f, "suspend point {point} has an unreachable resume block")
             }
+            MachineError::StateSizeExceeded { actual, max, largest_field_size } => write!(
+                f,
+                "suspended machine state is {actual} bytes, exceeding max_state_bytes budget of {max} bytes (largest spilled field: {largest_field_size} bytes; move large live values into Frame or DmaBuf)"
+            ),
         }
     }
 }
@@ -135,6 +160,20 @@ pub struct MachineGraphSummary<A: Allocator> {
     pub edges: Vec<MachineEdge, A>,
 }
 
+impl<A: Allocator> MachineGraphSummary<A> {
+    /// Returns `true` if suspend point `point` has a reachable `Cancel` transition edge.
+    pub fn has_cancel_edge(&self, point: u32) -> bool {
+        self.edges
+            .iter()
+            .any(|e| e.from_point == Some(point) && e.kind == MachineEdgeKind::Cancel)
+    }
+
+    /// Returns `true` if any reachable state in the machine transitions to `Return`.
+    pub fn reaches_return(&self) -> bool {
+        self.edges.iter().any(|e| e.kind == MachineEdgeKind::Return)
+    }
+}
+
 /// Lowered zero-`Pin` machine: its `step` and `on_cancel` functions, state layout, and graph
 /// summary.
 #[derive(Clone, Debug)]
@@ -153,6 +192,37 @@ pub fn split_machine<A: Allocator + Clone>(
     alloc: A,
 ) -> Result<MachineSplit<A>, MachineError> {
     split_machine_with_plant(body, shape, MachinePlant::None, alloc)
+}
+
+/// Lowers `body` into a verified zero-`Pin` sans-IO machine while enforcing `budget` on the
+/// resulting suspended state layout (unless bypassed by [`MachinePlant::SkipStateSizeCheck`]).
+pub fn split_machine_bounded<A: Allocator + Clone>(
+    body: View<'_>,
+    shape: MachineShape,
+    budget: MachineBudget,
+    plant: MachinePlant,
+    alloc: A,
+) -> Result<MachineSplit<A>, MachineError> {
+    let split = split_machine_with_plant(body, shape, plant, alloc)?;
+    let Some(max) = budget.max_state_bytes else {
+        return Ok(split);
+    };
+    if split.layout.size > max && plant != MachinePlant::SkipStateSizeCheck {
+        let largest_field_size = split
+            .layout
+            .fields
+            .iter()
+            .map(|f| f.size)
+            .max()
+            .unwrap_or(0)
+            .max(shape.prefix_size);
+        return Err(MachineError::StateSizeExceeded {
+            actual: split.layout.size,
+            max,
+            largest_field_size,
+        });
+    }
+    Ok(split)
 }
 
 /// [`split_machine`] with an explicit [`MachinePlant`] bug-injection selector for tests and
@@ -179,7 +249,9 @@ pub fn split_machine_with_plant<A: Allocator + Clone>(
     // 3. Reuse coroutine.rs for SSA splitting, slot packing, unwind poisoning, and LIR output
     //    verification.
     let coro_plant = match plant {
-        MachinePlant::None | MachinePlant::AllowEscapedSlotAddr => Plant::None,
+        MachinePlant::None
+        | MachinePlant::AllowEscapedSlotAddr
+        | MachinePlant::SkipStateSizeCheck => Plant::None,
         MachinePlant::SkipTagStore => Plant::TagAfterReturn,
         MachinePlant::WrongResumeTarget => Plant::ResumeNext,
     };

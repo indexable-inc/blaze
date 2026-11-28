@@ -60,6 +60,7 @@
 /// content-addressed runner keys (AGENTS.md rule 69).
 pub const CONFINEMENT_SOURCE: &[&[u8]] = &[
     include_bytes!("lib.rs"),
+    include_bytes!("effects.rs"),
     include_bytes!("errno.rs"),
     include_bytes!("flags.rs"),
     include_bytes!("types.rs"),
@@ -86,6 +87,7 @@ mod errno;
 #[macro_use]
 mod flags;
 pub mod cpu;
+pub mod effects;
 mod types;
 
 pub use cpu::{CpuError, CpuFeatures};

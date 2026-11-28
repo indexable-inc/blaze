@@ -139,3 +139,10 @@ Format for new entries:
 
 - **Observed**: `crates/blaze-cli/src/clean.rs:369` checks `fs.root().stat(cx, &Path::new(home.trim_matches('/'))?)?.is_none()` where `fs.root()` is the checkout directory, not `/`. Unless the checkout IS `/`, `held` is always `None` and `blaze clean --store` silently never deletes `<HOME>/.blaze/v2/store`.
 - **Request**: Open `fs.home(cx, "/", &Path::new(below)?)` directly (or check existence under `/`) instead of `fs.root().stat(...)`, and add a test running `blaze clean --store` from a subdirectory checkout.
+
+### 2026-11-27 — `blaze-body-lower` refuses closures under `for<'s> R: Request<Answer<'s> = A>` (`ClosureSigUnaligned { why: BinderHidden }`)
+
+- **Area**: `crates/blaze-body-lower`, `crates/blaze-machine/src/record.rs`, `crates/blaze-std/src/cx.rs`
+- **Kind**: `language` + `diagnostic`
+- **Friction / Bug**: Passing a closure `|ans: A| ans` or `|perf| ...` to a method taking `impl FnOnce(Perform<R::Answer<'_>>) -> Out` inside a function with a higher-ranked GAT bound `where R: for<'s> Request<Answer<'s> = A>` triggers `Lower(Refusal { form: ClosureSigUnaligned { part: 0, why: BinderHidden } })`, leaving the body `Typed` (borrow check refused) and blocked from `blaze test` execution even though `core::convert::identity` and non-HRTB associated types (`RecordableRequest`) pass `Clean`.
+- **Request**: Support aligning closure parameter signatures across higher-ranked GAT equality bounds (`for<'s> R: Trait<Assoc<'s> = T>`) in `blaze-body-lower` so borrow checking completes cleanly without requiring callers to factor out a non-closure function item or helper trait.

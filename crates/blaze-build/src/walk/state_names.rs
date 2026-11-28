@@ -142,6 +142,7 @@ pub(super) fn task_expr(t: &Task) -> Option<ExprId> {
         | Task::InitDefaults(e)
         | Task::FormatArgs(e)
         | Task::Await(e)
+        | Task::DoSuspend(e)
         | Task::Asm(e) => Some(e),
         Task::AsmLabel { body, .. } => Some(body),
         Task::If { expr, .. }
