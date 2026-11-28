@@ -48,17 +48,22 @@ pub const SHIM_NAME: &str = "blaze-fact-shim";
 /// environment; children inherit it).
 pub const FOLDER_VAR: &str = "BLAZE_FACT_SHIM_RUN";
 
-/// Under the run's facts folder: the links, the pins file, the probe table file, the log folder
-/// and the log.
+/// Under the run's facts folder: the links, the pins file, the probe table file, the metadata
+/// snapshot file, the log folder and the log.
 pub const BIN_DIR: &str = "bin";
 pub const PINS_FILE: &str = "pins";
 pub const PROBES_FILE: &str = "probes";
+pub const METADATA_FILE: &str = "metadata";
 pub const LOG_DIR: &str = "log";
 pub const LOG_FILE: &str = "asked";
 
 /// Logged subject prefix for an answered `rustc` try-compile probe (keyed by the command's
 /// `Table::id()` in `KeyInputs::answers`, identical to the Wasm runner).
 pub const RUSTC_PROBE_PREFIX: &str = "rustc-probe\n";
+
+/// Logged subject prefix for an answered `cargo metadata` query (keyed by the metadata snapshot
+/// digest in `KeyInputs::answers`).
+pub const CARGO_METADATA_PREFIX: &str = "cargo-metadata\n";
 
 /// The exit code of a refused question (a shell's "command not found", so a script that
 /// checks the code sees no answer).
@@ -79,6 +84,8 @@ pub enum ShimError {
     PinsTrailing,
     /// The probe table file (`probes`) is malformed.
     Probes,
+    /// The metadata snapshot file (`metadata`) is malformed.
+    Metadata,
     /// A log entry with no kind byte, no NUL end, or a subject not UTF-8.
     LogEntry { at: usize },
 }
@@ -90,12 +97,181 @@ impl core::fmt::Display for ShimError {
             ShimError::PinsField { field } => write!(f, "the fact shim's {PINS_FILE} file: field `{field}` is missing or malformed (D112)"),
             ShimError::PinsTrailing => write!(f, "the fact shim's {PINS_FILE} file has bytes after its last field (D112)"),
             ShimError::Probes => write!(f, "the fact shim's {PROBES_FILE} file is malformed (D112)"),
+            ShimError::Metadata => write!(f, "the fact shim's {METADATA_FILE} file is malformed (D112)"),
             ShimError::LogEntry { at } => write!(f, "the fact shim's {LOG_DIR}/{LOG_FILE}: entry at byte {at} is malformed (D112)"),
         }
     }
 }
 
 const PROBES_HEAD: &[u8] = b"blaze fact probes 1\n";
+const METADATA_HEAD: &[u8] = b"blaze fact metadata 1\n";
+const NO_METADATA: &[u8] = b"blaze fact metadata none\n";
+
+/// Precomputed Cargo format-1 `cargo metadata` answers staged for one native build-script run so
+/// `blaze-fact-shim` answers `cargo metadata` (e.g. `cbindgen` / `cargo_metadata`) from Blaze's
+/// resolved unit graph without spawning host `cargo` (Rule 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataSnapshot<'a> {
+    pub manifest_path: &'a str,
+    pub package_dir: &'a str,
+    pub target: &'a str,
+    pub host: &'a str,
+    pub full_json: &'a str,
+    pub no_deps_json: &'a str,
+    pub digest: ContentId,
+}
+
+fn push_len_str(s: &str, out: &mut AVec<'_, u8>) {
+    let len = u32::try_from(s.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&len.to_le_bytes());
+    let take = usize::try_from(len).unwrap_or(0);
+    if let Some(bytes) = s.as_bytes().get(..take) {
+        out.extend_from_slice(bytes);
+    }
+}
+
+fn read_len_str<'b>(rest: &mut &'b [u8]) -> Result<&'b str, ShimError> {
+    let len_bytes: [u8; 4] = rest.get(..4).and_then(|s| s.try_into().ok()).ok_or(ShimError::Metadata)?;
+    let len = usize::try_from(u32::from_le_bytes(len_bytes)).map_err(|_| ShimError::Metadata)?;
+    let after = rest.get(4..).ok_or(ShimError::Metadata)?;
+    let slice = after.get(..len).ok_or(ShimError::Metadata)?;
+    let text = core::str::from_utf8(slice).map_err(|_| ShimError::Metadata)?;
+    *rest = after.get(len..).ok_or(ShimError::Metadata)?;
+    Ok(text)
+}
+
+/// Encodes an optional [`MetadataSnapshot`] into `<facts>/metadata`.
+pub fn encode_metadata(meta: Option<&MetadataSnapshot<'_>>, out: &mut AVec<'_, u8>) {
+    let Some(meta) = meta else {
+        out.extend_from_slice(NO_METADATA);
+        return;
+    };
+    out.extend_from_slice(METADATA_HEAD);
+    out.extend_from_slice(&meta.digest.0);
+    push_len_str(meta.manifest_path, out);
+    push_len_str(meta.package_dir, out);
+    push_len_str(meta.target, out);
+    push_len_str(meta.host, out);
+    push_len_str(meta.full_json, out);
+    push_len_str(meta.no_deps_json, out);
+}
+
+/// Decodes `<facts>/metadata` written by [`encode_metadata`].
+pub fn decode_metadata<'b>(bytes: &'b [u8]) -> Result<Option<MetadataSnapshot<'b>>, ShimError> {
+    if bytes == NO_METADATA {
+        return Ok(None);
+    }
+    let mut rest = bytes.strip_prefix(METADATA_HEAD).ok_or(ShimError::Metadata)?;
+    let digest: [u8; 32] = rest.get(..32).and_then(|s| s.try_into().ok()).ok_or(ShimError::Metadata)?;
+    rest = rest.get(32..).ok_or(ShimError::Metadata)?;
+    let manifest_path = read_len_str(&mut rest)?;
+    let package_dir = read_len_str(&mut rest)?;
+    let target = read_len_str(&mut rest)?;
+    let host = read_len_str(&mut rest)?;
+    let full_json = read_len_str(&mut rest)?;
+    let no_deps_json = read_len_str(&mut rest)?;
+    if !rest.is_empty() {
+        return Err(ShimError::Metadata);
+    }
+    Ok(Some(MetadataSnapshot {
+        manifest_path,
+        package_dir,
+        target,
+        host,
+        full_json,
+        no_deps_json,
+        digest: ContentId(digest),
+    }))
+}
+
+/// Answers a `cargo metadata` invocation via [`crate::metadata_ask::classify`] and the run's
+/// keyed [`MetadataSnapshot`] without spawning host `cargo` (Rule 1, Rule 3).
+pub fn ask_cargo_metadata<'a>(
+    args: &[&str],
+    cwd: &str,
+    meta: Option<&MetadataSnapshot<'_>>,
+    alloc: Alloc<'a>,
+) -> Reply<'a> {
+    use core::fmt::Write as _;
+    let mut raw_subject = String::from_str_in("cargo", alloc);
+    for arg in args {
+        raw_subject.push('\n');
+        raw_subject.push_str(arg);
+    }
+    let refuse = |why: core::fmt::Arguments<'_>, subject: AString<'a>| -> Reply<'a> {
+        let mut stderr = String::new_in(alloc);
+        let _ = write!(stderr, "{SHIM_NAME}: `cargo");
+        for arg in args {
+            stderr.push(' ');
+            stderr.push_str(arg);
+        }
+        let _ = writeln!(stderr, "` refused (D112 interim, rule 3): {why}");
+        Reply { code: REFUSED_CODE, stdout: String::new_in(alloc), stderr, answered: false, subject }
+    };
+    let ask = match crate::metadata_ask::classify("cargo", args, alloc) {
+        Ok(ask) => ask,
+        Err(refused) => return refuse(format_args!("{refused}"), raw_subject),
+    };
+    let Some(meta) = meta else {
+        return refuse(format_args!("no metadata snapshot was staged for this native build script"), raw_subject);
+    };
+    let expected_manifest = crate::metadata_ask::normalize_manifest_path(meta.manifest_path, meta.package_dir, alloc);
+    let expected_pkg = crate::metadata_ask::normalize_manifest_path(meta.package_dir, "/", alloc);
+    match ask.manifest_path {
+        Some(raw) => {
+            let asked = crate::metadata_ask::normalize_manifest_path(raw, cwd, alloc);
+            if asked.as_str() != expected_manifest.as_str() {
+                return refuse(
+                    format_args!(
+                        "`--manifest-path {raw}` (resolved `{}`) does not match this package's manifest `{}`",
+                        asked.as_str(),
+                        expected_manifest.as_str()
+                    ),
+                    raw_subject,
+                );
+            }
+        }
+        None => {
+            let norm_cwd = crate::metadata_ask::normalize_manifest_path(cwd, "/", alloc);
+            let inside_pkg = norm_cwd.as_str() == expected_pkg.as_str()
+                || norm_cwd.as_str().strip_prefix(expected_pkg.as_str()).is_some_and(|rest| rest.starts_with('/'));
+            if !inside_pkg {
+                return refuse(
+                    format_args!("working directory `{cwd}` is outside package root `{}`", expected_pkg.as_str()),
+                    raw_subject,
+                );
+            }
+        }
+    }
+    if !ask.no_deps {
+        for platform in ask.platforms.iter() {
+            if *platform != meta.target && *platform != meta.host {
+                return refuse(
+                    format_args!(
+                        "`--filter-platform {platform}` does not match target `{}` or host `{}`",
+                        meta.target,
+                        meta.host
+                    ),
+                    raw_subject,
+                );
+            }
+        }
+    }
+    let mut stdout = String::from_str_in(if ask.no_deps { meta.no_deps_json } else { meta.full_json }, alloc);
+    if !stdout.as_str().ends_with('\n') {
+        stdout.push('\n');
+    }
+    let stderr = if ask.format_given {
+        String::new_in(alloc)
+    } else {
+        String::from_str_in("warning: please specify `--format-version` flag explicitly to avoid compatibility problems\n", alloc)
+    };
+    let mut digest_hex = String::new_in(alloc);
+    push_hex32(&meta.digest.0, &mut digest_hex);
+    let mut subject = String::from_str_in(CARGO_METADATA_PREFIX, alloc);
+    subject.push_str(digest_hex.as_str());
+    Reply { code: 0, stdout, stderr, answered: true, subject }
+}
 
 /// Encodes `host` and `table` (the sorted keyed `rustc` probe table from `ScriptSetup`) for
 /// `blaze-fact-shim` to answer `autocfg` and try-compile probes without host `rustc` (Rule 1).
@@ -647,5 +823,75 @@ mod tests {
             alloc,
         );
         assert_eq!((devnull.code, devnull.answered), (0, true));
+    }
+
+    #[test]
+    fn ask_cargo_metadata_answers_cbindgen_and_refuses_unsupported_flags_or_manifests() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let snapshot = super::MetadataSnapshot {
+            manifest_path: "/work/pkg/Cargo.toml",
+            package_dir: "/work/pkg",
+            target: "aarch64-unknown-linux-gnu",
+            host: "aarch64-unknown-linux-gnu",
+            full_json: r#"{"packages":[{"name":"hegeltest-c"}],"version":1,"workspace_root":"/work/pkg"}"#,
+            no_deps_json: r#"{"packages":[{"name":"hegeltest-c"}],"resolve":null,"version":1,"workspace_root":"/work/pkg"}"#,
+            digest: blaze_ids::ContentId([0x42; 32]),
+        };
+        let mut encoded = Vec::new_in(alloc);
+        super::encode_metadata(Some(&snapshot), &mut encoded);
+        assert_eq!(super::decode_metadata(encoded.as_slice()), Ok(Some(snapshot)));
+
+        let mut none_encoded = Vec::new_in(alloc);
+        super::encode_metadata(None, &mut none_encoded);
+        assert_eq!(super::decode_metadata(none_encoded.as_slice()), Ok(None));
+
+        // 1. Exact cbindgen invocation: returns full JSON with exit 0 and logs `cargo-metadata\n<hex>`.
+        let cbindgen = super::ask_cargo_metadata(
+            &["metadata", "--all-features", "--format-version", "1", "--manifest-path", "/work/pkg/Cargo.toml"],
+            "/work/pkg",
+            Some(&snapshot),
+            alloc,
+        );
+        assert_eq!((cbindgen.code, cbindgen.answered, cbindgen.stderr.as_str()), (0, true, ""));
+        assert_eq!(cbindgen.stdout.as_str().trim_end(), snapshot.full_json);
+        assert!(cbindgen.subject.as_str().starts_with(super::CARGO_METADATA_PREFIX), "{}", cbindgen.subject.as_str());
+
+        // 2. Relative `--manifest-path Cargo.toml`, `--no-deps`, and matching `--filter-platform`.
+        let no_deps = super::ask_cargo_metadata(
+            &["metadata", "--no-deps", "--format-version=1", "--manifest-path", "Cargo.toml"],
+            "/work/pkg",
+            Some(&snapshot),
+            alloc,
+        );
+        assert_eq!((no_deps.code, no_deps.answered), (0, true));
+        assert_eq!(no_deps.stdout.as_str().trim_end(), snapshot.no_deps_json);
+
+        let filtered = super::ask_cargo_metadata(
+            &["metadata", "--all-features", "--format-version", "1", "--filter-platform", "aarch64-unknown-linux-gnu"],
+            "/work/pkg",
+            Some(&snapshot),
+            alloc,
+        );
+        assert_eq!((filtered.code, filtered.answered), (0, true));
+
+        // 3. Bare `cargo metadata` emits Cargo's `--format-version` warning on stderr.
+        let bare = super::ask_cargo_metadata(&["metadata"], "/work/pkg", Some(&snapshot), alloc);
+        assert_eq!((bare.code, bare.answered), (0, true));
+        assert!(bare.stderr.as_str().contains("--format-version"), "{}", bare.stderr.as_str());
+
+        // 4. Negative controls: unknown flags, bad format version, wrong manifest path, foreign
+        //    platform, and missing metadata snapshot MUST be refused with exit 127.
+        for bad_args in [
+            &["metadata", "--config", "net.offline=true"][..],
+            &["metadata", "-Zunstable-options"][..],
+            &["metadata", "--format-version", "2"][..],
+            &["metadata", "--format-version", "1", "--manifest-path", "/other/Cargo.toml"][..],
+            &["metadata", "--format-version", "1", "--filter-platform", "riscv64gc-unknown-none-elf"][..],
+        ] {
+            let refused = super::ask_cargo_metadata(bad_args, "/work/pkg", Some(&snapshot), alloc);
+            assert_eq!((refused.code, refused.answered), (REFUSED_CODE, false), "must refuse {bad_args:?}");
+        }
+        let no_meta = super::ask_cargo_metadata(&["metadata", "--format-version", "1"], "/work/pkg", None, alloc);
+        assert_eq!((no_meta.code, no_meta.answered), (REFUSED_CODE, false));
     }
 }

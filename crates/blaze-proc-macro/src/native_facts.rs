@@ -25,9 +25,10 @@ use std::sync::Arc;
 
 use blaze_build_script::{
     fact_shim::{
-        self, BIN_DIR, FOLDER_VAR, LOG_DIR, LOG_FILE, PINS_FILE, PROBES_FILE, PROGRAMS, REFUSED_CODE, RUSTC_PROBE_PREFIX,
-        SHIM_NAME,
+        self, BIN_DIR, CARGO_METADATA_PREFIX, FOLDER_VAR, LOG_DIR, LOG_FILE, METADATA_FILE, MetadataSnapshot, PINS_FILE,
+        PROBES_FILE, PROGRAMS, REFUSED_CODE, RUSTC_PROBE_PREFIX, SHIM_NAME,
     },
+    metadata_ask,
     probe::Table,
     probe_ask::{self, Ask, Snippet},
 };
@@ -208,6 +209,23 @@ pub fn prepare_with_probes(
     table: &Table<'_>,
     alloc: Alloc<'_>,
 ) -> Result<ShimRun, NativeFactsError> {
+    prepare_with_probes_and_metadata(shim, work, key_hex, pins, host, table, None, alloc)
+}
+
+/// Like [`prepare_with_probes`], also staging a keyed [`MetadataSnapshot`] into `<folder>/metadata`
+/// so `blaze-fact-shim` answers `cargo metadata` (e.g. `cbindgen` / `cargo_metadata`) from Blaze's
+/// resolved unit graph without spawning host `cargo` (Rule 1, Rule 30).
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_with_probes_and_metadata(
+    shim: &str,
+    work: &str,
+    key_hex: &str,
+    pins: Option<&FactPins>,
+    host: &str,
+    table: &Table<'_>,
+    metadata: Option<&MetadataSnapshot<'_>>,
+    alloc: Alloc<'_>,
+) -> Result<ShimRun, NativeFactsError> {
     let parent = blaze_own::format_in!(alloc, "{work}/facts");
     std::fs::create_dir_all(parent.as_str()).map_err(files(parent.as_str()))?;
     // The child sees this folder on PATH. Keep it stable for a given run key, and hold the
@@ -247,6 +265,10 @@ pub fn prepare_with_probes(
     fact_shim::encode_probes(host, table, &mut probes_bytes);
     let probes_path = blaze_own::format_in!(alloc, "{folder}/{PROBES_FILE}");
     write_file(probes_path.as_str(), probes_bytes.as_slice()).map_err(files(probes_path.as_str()))?;
+    let mut meta_bytes = Vec::new_in(alloc);
+    fact_shim::encode_metadata(metadata, &mut meta_bytes);
+    let meta_path = blaze_own::format_in!(alloc, "{folder}/{METADATA_FILE}");
+    write_file(meta_path.as_str(), meta_bytes.as_slice()).map_err(files(meta_path.as_str()))?;
     let links = PROGRAMS.iter().map(|program| format!("{folder}/{BIN_DIR}/{program}")).collect();
     Ok(ShimRun { shim: snapshot.as_str().to_owned(), bin, log_dir, links, folder, _lease: Arc::new(lease) })
 }
@@ -285,9 +307,9 @@ pub fn reads(run: &ShimRun, pins: Option<&FactPins>, alloc: Alloc<'_>) -> Result
     let mut asked = Asked::default();
     let mut saw_image = false;
     for &(answered, logged) in entries.iter() {
-        if answered && logged.starts_with(RUSTC_PROBE_PREFIX) {
-            // Answered `rustc` try-compile probes are keyed by the command's `Table::id()` in
-            // `KeyInputs::answers` (identical to the Wasm runner); witness the shim image.
+        if answered && (logged.starts_with(RUSTC_PROBE_PREFIX) || logged.starts_with(CARGO_METADATA_PREFIX)) {
+            // Answered `rustc` try-compile probes and `cargo metadata` queries are keyed in
+            // `KeyInputs::answers` (`Table::id()` + metadata snapshot digest); witness the shim image.
             saw_image = true;
             continue;
         }
@@ -324,6 +346,20 @@ pub fn reads(run: &ShimRun, pins: Option<&FactPins>, alloc: Alloc<'_>) -> Result
     asked.refused.sort();
     asked.refused.dedup();
     Ok(asked)
+}
+
+fn current_dir_utf8<'a>(alloc: Alloc<'a>) -> Option<blaze_own::AString<'a>> {
+    let mut buf = [0u8; 4096];
+    // SAFETY: `buf` is a valid writable byte buffer of length `buf.len()`, and `libc::getcwd`
+    // writes a NUL-terminated path into it or returns null on error.
+    let ptr = unsafe { libc::getcwd(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
+    if ptr.is_null() {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0)?;
+    let slice = buf.get(..end)?;
+    let text = core::str::from_utf8(slice).ok()?;
+    Some(String::from_str_in(text, alloc))
 }
 
 /// The shim binary's body: answer `argv` from the run's pins file (the folder in
@@ -376,6 +412,20 @@ pub fn shim_main(heap: &Heap) -> i32 {
             },
         };
         fact_shim::ask_rustc_probe(&args, snippet.as_slice(), probe_host, &Table { rows: probe_rows.as_slice() }, alloc)
+    } else if metadata_ask::is_cargo_metadata(argv0, &args) {
+        let meta_path = folder.join(METADATA_FILE);
+        let meta_bytes = match read_file(&meta_path) {
+            Ok(bytes) => bytes,
+            Err(e) => return say_refused(blaze_own::format_in!(alloc, "`{argv0}`: {}: {e}", meta_path.display()).as_str()),
+        };
+        let meta = match fact_shim::decode_metadata(&meta_bytes) {
+            Ok(decoded) => decoded,
+            Err(e) => return say_refused(blaze_own::format_in!(alloc, "`{argv0}`: {e}").as_str()),
+        };
+        let Some(cwd) = current_dir_utf8(alloc) else {
+            return say_refused(blaze_own::format_in!(alloc, "`{argv0}`: could not read current working directory").as_str());
+        };
+        fact_shim::ask_cargo_metadata(&args, cwd.as_str(), meta.as_ref(), alloc)
     } else {
         fact_shim::ask(argv0, &args, pins.as_ref(), alloc)
     };
@@ -487,6 +537,53 @@ mod rustc_probe_tests {
         drop(f);
         let err = super::read_file_bounded(&huge_file, alloc).expect_err("over-4MiB probe file must be refused");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // `prepare_with_probes_and_metadata` stages `<folder>/metadata`, `reads` accepts answered
+        // `cargo-metadata\n...` entries, and refused `cargo metadata` invocations surface in `refused`.
+        let snap = fact_shim::MetadataSnapshot {
+            manifest_path: "/pkg/Cargo.toml",
+            package_dir: "/pkg",
+            target: "aarch64-unknown-linux-gnu",
+            host: "aarch64-unknown-linux-gnu",
+            full_json: r#"{"packages":[],"version":1,"workspace_root":"/pkg"}"#,
+            no_deps_json: r#"{"packages":[],"resolve":null,"version":1,"workspace_root":"/pkg"}"#,
+            digest: ContentId([0x77; 32]),
+        };
+        let run_meta = super::prepare_with_probes_and_metadata(
+            fake_shim.to_str().expect("utf8"),
+            work.to_str().expect("utf8"),
+            "k2",
+            None,
+            "aarch64-unknown-linux-gnu",
+            &table,
+            Some(&snap),
+            alloc,
+        )
+        .expect("prepare_with_probes_and_metadata");
+        let meta_bytes = std::fs::read(format!("{}/{}", run_meta.folder, super::METADATA_FILE)).expect("read metadata");
+        assert_eq!(fact_shim::decode_metadata(&meta_bytes), Ok(Some(snap)));
+
+        let mut meta_log = Vec::new_in(alloc);
+        let ok_reply = fact_shim::ask_cargo_metadata(
+            &["metadata", "--all-features", "--format-version", "1", "--manifest-path", "/pkg/Cargo.toml"],
+            "/pkg",
+            Some(&snap),
+            alloc,
+        );
+        assert_eq!((ok_reply.code, ok_reply.answered), (0, true));
+        fact_shim::log_entry(&ok_reply, &mut meta_log);
+        std::fs::write(format!("{}/{LOG_FILE}", run_meta.log_dir), meta_log.as_slice()).expect("write ok meta log");
+        let asked_ok = reads(&run_meta, None, alloc).expect("reads accepts answered cargo-metadata");
+        assert!(asked_ok.refused.is_empty());
+        assert_eq!(asked_ok.reads.len(), 1);
+        assert_eq!(asked_ok.reads[0].subject, IMAGE_SUBJECT);
+
+        let bad_reply = fact_shim::ask_cargo_metadata(&["metadata", "--config", "x=1"], "/pkg", Some(&snap), alloc);
+        assert_eq!((bad_reply.code, bad_reply.answered), (fact_shim::REFUSED_CODE, false));
+        fact_shim::log_entry(&bad_reply, &mut meta_log);
+        std::fs::write(format!("{}/{LOG_FILE}", run_meta.log_dir), meta_log.as_slice()).expect("write refused meta log");
+        let asked_refused = reads(&run_meta, None, alloc).expect("reads parses refused cargo-metadata");
+        assert_eq!(asked_refused.refused, ["cargo metadata --config x=1"]);
 
         let _ = std::fs::remove_dir_all(&root);
     }

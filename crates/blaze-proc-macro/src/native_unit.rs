@@ -618,10 +618,37 @@ pub fn native_outputs<'a>(
     let compiler = hex32(native.shelf.rsplit('/').next().unwrap_or("")).ok_or_else(|| NativeUnitError::Shelf { shelf: native.shelf.to_owned() })?;
     let parts = NativeKeyParts { compiler, target: setting.host, sysroot: sysroot_key.as_str(), host_tools: &tool_keys };
     let probe_table = Table { rows: setting.table.as_slice() };
+    // Compute a path-independent metadata snapshot digest using guest mount spellings and fold it
+    // with `probe_table.id()` into `KeyInputs::answers` so `cargo metadata` answers (e.g. cbindgen)
+    // invalidate cached script records whenever the package's unit graph changes (Rule 21, Rule 25).
+    let metadata_digest = {
+        let seen_pkg = root.seen().mount();
+        let seen_ws = if seen_pkg.starts_with("/workspace") { "/workspace" } else { seen_pkg };
+        let guest_spec = blaze_build_script::metadata_ask::MetadataSpec {
+            graph,
+            package: serves,
+            package_dir: seen_pkg,
+            workspace_root: seen_ws,
+            target_dir: "/target",
+        };
+        let full = blaze_build_script::metadata_ask::format_metadata_json(&guest_spec, false, alloc);
+        let no_deps = blaze_build_script::metadata_ask::format_metadata_json(&guest_spec, true, alloc);
+        let mut sha = blaze_sha256::Sha256::new();
+        sha.update(full.as_bytes());
+        sha.update(b"\0");
+        sha.update(no_deps.as_bytes());
+        ContentId(sha.finish())
+    };
+    let answers_id = {
+        let mut sha = blaze_sha256::Sha256::new();
+        sha.update(&probe_table.id().0);
+        sha.update(&metadata_digest.0);
+        ContentId(sha.finish())
+    };
     let inputs = KeyInputs {
         module: module_digest,
         env: &env,
-        answers: probe_table.id(),
+        answers: answers_id,
         c_mode: CMode::Built,
         limits: RunLimits::STANDARD,
         runner: runner_key(Runner::Native { because }, &parts),
@@ -692,7 +719,37 @@ pub fn native_outputs<'a>(
             fallback_shim.as_str()
         }
     };
-    let facts = native_facts::prepare_with_probes(shim, native.work, run_key.as_str(), pins, setting.host, &probe_table, alloc).map_err(facts_error)?;
+    let meta_manifest = blaze_own::format_in!(alloc, "{package_dir}/Cargo.toml");
+    let meta_ws = ws_root_dir.as_deref().unwrap_or(package_dir.as_str());
+    let meta_spec = blaze_build_script::metadata_ask::MetadataSpec {
+        graph,
+        package: serves,
+        package_dir: package_dir.as_str(),
+        workspace_root: meta_ws,
+        target_dir: out_dir.as_str(),
+    };
+    let meta_full_json = blaze_build_script::metadata_ask::format_metadata_json(&meta_spec, false, alloc);
+    let meta_no_deps_json = blaze_build_script::metadata_ask::format_metadata_json(&meta_spec, true, alloc);
+    let metadata_snapshot = blaze_build_script::fact_shim::MetadataSnapshot {
+        manifest_path: meta_manifest.as_str(),
+        package_dir: package_dir.as_str(),
+        target: setting.target,
+        host: setting.host,
+        full_json: meta_full_json.as_str(),
+        no_deps_json: meta_no_deps_json.as_str(),
+        digest: metadata_digest,
+    };
+    let facts = native_facts::prepare_with_probes_and_metadata(
+        shim,
+        native.work,
+        run_key.as_str(),
+        pins,
+        setting.host,
+        &probe_table,
+        Some(&metadata_snapshot),
+        alloc,
+    )
+    .map_err(facts_error)?;
     work_guard.push_dir(blaze_own::format_in!(alloc, "facts/{}", run_key.as_str()));
     work_guard.push_file(blaze_own::format_in!(alloc, "facts/{}.lock", run_key.as_str()));
     // The home's file area: each file the script leaves goes there by digest, renamed, never
@@ -822,6 +879,7 @@ pub fn native_outputs<'a>(
                 pins,
                 host: setting.host,
                 table: &probe_table,
+                metadata: Some(&metadata_snapshot),
                 ran: &ran,
                 asked: &asked,
             },
@@ -981,6 +1039,7 @@ pub struct CertifyInput<'a, 's> {
     pub pins: Option<&'s crate::spawn_route::FactPins>,
     pub host: &'s str,
     pub table: &'s Table<'s>,
+    pub metadata: Option<&'s blaze_build_script::fact_shim::MetadataSnapshot<'s>>,
     pub ran: &'s NativeScriptRun<'a>,
     pub asked: &'s native_facts::Asked,
 }
@@ -1010,7 +1069,17 @@ pub fn certify_member_reads<'a>(
     cert_guard.push_dir(cert_out_rel);
     let cert_facts = match input.shim {
         Some(shim) => {
-            let f = native_facts::prepare_with_probes(shim, input.work, cert_key.as_str(), input.pins, input.host, input.table, alloc).ok()?;
+            let f = native_facts::prepare_with_probes_and_metadata(
+                shim,
+                input.work,
+                cert_key.as_str(),
+                input.pins,
+                input.host,
+                input.table,
+                input.metadata,
+                alloc,
+            )
+            .ok()?;
             cert_guard.push_dir(blaze_own::format_in!(alloc, "facts/{}", cert_key.as_str()));
             cert_guard.push_file(blaze_own::format_in!(alloc, "facts/{}.lock", cert_key.as_str()));
             Some(f)

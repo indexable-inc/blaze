@@ -35,9 +35,11 @@ blaze-toolchain.workspace = true
 blaze-unit-graph.workspace = true
 # toolchain_cut, proc_macro_modules: the paths of the pins in a checkout (pins/README.md).
 blaze-pins.workspace = true
-# proc_macro_modules: served package path checks (`blaze-build-script`) and the one hermetic
-# Seatbelt profile renderer (`blaze-roots::seatbelt`, zero extra third-party deps).
+# proc_macro_modules: served package path checks (`blaze-build-script`), complete Linux host
+# sysroot resolution (`blaze-proc-macro`), and the one hermetic Seatbelt profile renderer
+# (`blaze-roots::seatbelt`, zero extra third-party deps).
 blaze-build-script.workspace = true
+blaze-proc-macro = { workspace = true, features = ["runtime"] }
 blaze-roots.workspace = true
 blaze-manifest = { workspace = true, default-features = false }
 edition.workspace = true
