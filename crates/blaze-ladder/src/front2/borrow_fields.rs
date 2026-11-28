@@ -1401,6 +1401,7 @@ pub(super) enum InstCopyOwned<'a> {
     Yes,
     No,
     IfOutlives(AVec<'a, blaze_flow_lower::CopyOutlives>),
+    Unknown,
 }
 
 enum ImplMatch<'a> {
@@ -1506,12 +1507,15 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
         self.strict_outlives = true;
         self.ensure_owner_clauses(r, owner);
         let mut budget = MOST_INST_DROP_STEPS;
-        let root = self.copy_from_table(body_tys, ty, None, 0, &mut budget)?;
+        let Some(root) = self.copy_from_table(body_tys, ty, None, 0, &mut budget) else {
+            self.strict_outlives = false;
+            return Some(InstCopyOwned::Unknown);
+        };
         let res = match self.prove_trait(r, langs, copy, &[root], Some(&[]), 0, &mut budget) {
             Truth::True => Some(InstCopyOwned::Yes),
             Truth::TrueIfOutlives(obs) => Some(InstCopyOwned::IfOutlives(obs)),
             Truth::False | Truth::OutlivesUnproven if !self.owner_clauses_incomplete => Some(InstCopyOwned::No),
-            Truth::False | Truth::OutlivesUnproven | Truth::Unknown => None,
+            Truth::False | Truth::OutlivesUnproven | Truth::Unknown => Some(InstCopyOwned::Unknown),
         };
         self.strict_outlives = false;
         res
@@ -1549,6 +1553,7 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                                     Some(t) => inst.push(t),
                                     None => {
                                         ok = false;
+                                        self.owner_clauses_incomplete = true;
                                         break;
                                     }
                                 }
@@ -1563,6 +1568,8 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                             {
                                 self.owner_traits.push((trait_, inst, regs));
                             }
+                        } else {
+                            self.owner_clauses_incomplete = true;
                         }
                     }
                     tc::PClause::Projection { trait_, name, args, term } => {
@@ -1574,22 +1581,28 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                                     Some(t) => inst.push(t),
                                     None => {
                                         ok = false;
+                                        self.owner_clauses_incomplete = true;
                                         break;
                                     }
                                 }
                             }
                             let regs = clause_regs(nth);
-                            if ok
-                                && let Some(iterm) = self.copy_from_table(stys, term, None, 0, &mut budget)
-                                && !self.owner_projs.iter().any(|(pt, pn, pa, _, pr)| {
-                                    *pt == trait_
-                                        && *pn == name
-                                        && pa.as_slice() == inst.as_slice()
-                                        && pr.as_deref() == regs.as_deref()
-                                })
-                            {
-                                self.owner_projs.push((trait_, name, inst, iterm, regs));
+                            if ok {
+                                if let Some(iterm) = self.copy_from_table(stys, term, None, 0, &mut budget) {
+                                    if !self.owner_projs.iter().any(|(pt, pn, pa, _, pr)| {
+                                        *pt == trait_
+                                            && *pn == name
+                                            && pa.as_slice() == inst.as_slice()
+                                            && pr.as_deref() == regs.as_deref()
+                                    }) {
+                                        self.owner_projs.push((trait_, name, inst, iterm, regs));
+                                    }
+                                } else {
+                                    self.owner_clauses_incomplete = true;
+                                }
                             }
+                        } else {
+                            self.owner_clauses_incomplete = true;
                         }
                     }
                     _ => {}
@@ -1707,6 +1720,8 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                                 {
                                     self.owner_traits.push((sup, inst, regs));
                                 }
+                            } else {
+                                self.owner_clauses_incomplete = true;
                             }
                         }
                         tc::PClause::Projection { trait_: sup, name, args: sargs, term } => {
@@ -1747,6 +1762,8 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                                         self.owner_clauses_incomplete = true;
                                     }
                                 }
+                            } else {
+                                self.owner_clauses_incomplete = true;
                             }
                         }
                         _ => h.tag(0),
@@ -3508,6 +3525,9 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                     };
                 }
                 Ok(tc::PNode::Adt(..)) => {}
+                Ok(tc::PNode::Param(_)) => {
+                    return if self.strict_outlives { Truth::False } else { Truth::Unknown };
+                }
                 Ok(_) | Err(_) => return Truth::Unknown,
             }
         }

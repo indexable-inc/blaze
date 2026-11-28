@@ -509,7 +509,9 @@ pub trait Facts {
     /// or `impl<'a, T: 'a> Copy for OutlivesToken<'a, T>`).
     /// `Some(InstCopy::Yes)` proves `ty: Copy`; `Some(InstCopy::No)` proves `ty: !Copy`;
     /// `Some(InstCopy::IfOutlives(obs))` proves `ty: Copy` iff every outlives obligation in `obs`
-    /// holds on the place's live origins; `None` falls back to checking every generic argument.
+    /// holds on the place's live origins; `Some(InstCopy::Unknown)` reports an incomplete or
+    /// budget-exhausted proof and refuses the body instead of falling back to derive-style checks;
+    /// `None` falls back to checking every generic argument.
     fn inst_is_copy(&self, _ty: PTy) -> Option<InstCopy<'_>> {
         None
     }
@@ -582,6 +584,9 @@ pub enum InstCopy<'a> {
     /// All non-outlives clauses hold; `Copy` holds iff every obligation holds on the place's live
     /// origins and the body's known outlives bounds.
     IfOutlives(&'a [CopyOutlives]),
+    /// Conditional `Copy` evaluation hit an incomplete fact or solver bound; lowering refuses the
+    /// body with [`Form::Bound`] rather than falling back to derive-style argument checking.
+    Unknown,
 }
 
 /// Which check of a signature's laying refused it ([`Form::SigPositionsUnaligned`]). `input`:
@@ -2030,6 +2035,7 @@ pub fn pty_is_copy<'a, 'c, F: Facts, A: Allocator + Copy, E>(
                         None => match walk.facts.inst_is_copy(t) {
                             Some(InstCopy::Yes) => {}
                             Some(InstCopy::No | InstCopy::IfOutlives(_)) => return set_false(),
+                            Some(InstCopy::Unknown) => return Err(on_err(CopyWalkError::Bound)),
                             None => stack.extend_from_slice(args),
                         },
                         Some(need) if need.len() == args.len() => {
@@ -3955,6 +3961,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                                     return Ok(false);
                                 }
                             }
+                            Some(InstCopy::Unknown) => return self.refuse(Form::Bound, e),
                             None => {
                                 for &(a, ao) in arg_offs.iter() {
                                     stack.push((a, ao));
@@ -7792,6 +7799,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                                     }
                                 }
                             }
+                            Some(InstCopy::Unknown) => return self.refuse(Form::Bound, e),
                             None => stack.extend_from_slice(args),
                         },
                         Some(need) if need.len() == args.len() => {

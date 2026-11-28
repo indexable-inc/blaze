@@ -900,6 +900,37 @@ fn dyn_expect_reassigned_after_use_ok(static_r: Vec<Reader>) {
     let _ = r;
 }
 
+fn dyn_expect_reassigned_in_own_rhs_ok(static_r: Vec<Reader>) {
+    let mut r = static_r;
+    r = {
+        r.push(Box::new(move |link| link.downcast()));
+        Vec::new()
+    };
+    let _ = r;
+}
+
+fn take_fn_ptr_static(_f: fn(&(dyn MyErr + 'static)) -> bool) {}
+
+fn fn_ptr_expect_deep_parens_ok() {
+    take_fn_ptr_static((((((((((((((((((((|link| link.downcast()))))))))))))))))))));
+}
+
+fn dyn_expect_reassigned_in_own_lhs_after_rhs_err(
+    static_r: Vec<Reader>,
+    non_static: Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool + Send + Sync>>,
+) {
+    let mut r = static_r;
+    let mut arr = [0u8; 1];
+    arr[{
+        r.push(Box::new(move |link| link.downcast()));
+        0
+    }] = {
+        r = non_static;
+        1
+    };
+    let _ = arr;
+}
+
 fn dyn_expect_reassigned_in_loop_err(
     static_r: Vec<Reader>,
     non_static: Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool + Send + Sync>>,
@@ -1288,6 +1319,8 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         "dyn_expect_destructured_generic_param_ok",
         "dyn_expect_long_alias_chain_ok",
         "dyn_expect_reassigned_after_use_ok",
+        "dyn_expect_reassigned_in_own_rhs_ok",
+        "fn_ptr_expect_deep_parens_ok",
         "copy_proj_shared_ok",
         "copy_proj_generic_tuple_shared_ok",
         "copy_outlives_static_scalar_ok",
@@ -1327,6 +1360,7 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         "dyn_expect_match_err_elided_err",
         "dyn_expect_destructuring_reassign_err",
         "dyn_expect_reassigned_in_loop_err",
+        "dyn_expect_reassigned_in_own_lhs_after_rhs_err",
     ] {
         let body = find(err_fn);
         let (types, v) = world.check_borrows(body, heap.alloc());

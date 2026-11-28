@@ -455,6 +455,14 @@ fn inst_is_copy_resolves_conditional_copy_when_copy_args_none() {
 
     assert_eq!(run_case(false, Some(crate::InstCopy::Yes)), Ok(Default::default()), "inst_is_copy=Yes makes Ptr Copy even with non-Copy Marker");
     assert!(!run_case(true, Some(crate::InstCopy::No)).expect("checks").is_empty(), "inst_is_copy=No rejects copy even when Marker is Copy");
+    assert!(
+        matches!(run_case(true, Some(crate::InstCopy::Unknown)), Err(crate::Refusal { form: crate::Form::Bound, .. })),
+        "inst_is_copy=Unknown must refuse with Form::Bound instead of falling back to derive-style checking when Marker is Copy"
+    );
+    assert!(
+        matches!(run_case(false, Some(crate::InstCopy::Unknown)), Err(crate::Refusal { form: crate::Form::Bound, .. })),
+        "inst_is_copy=Unknown must refuse with Form::Bound when Marker is not Copy"
+    );
     assert!(!run_case(false, None).expect("checks").is_empty(), "inst_is_copy=None falls back to checking args (non-Copy Marker rejects)");
     assert_eq!(run_case(true, None), Ok(Default::default()), "inst_is_copy=None falls back to checking args (Copy Marker accepts)");
 }

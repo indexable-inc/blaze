@@ -981,7 +981,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
     fn local_closure_fn_ptr_elided(&self, ce: ExprId) -> bool {
         use blaze_typeck::{Pat, Stmt};
         let unwrap_parens = |mut cur: ExprId| -> ExprId {
-            for _ in 0..16 {
+            let max_steps = self.body.exprs.len().saturating_add(1);
+            for _ in 0..max_steps {
                 match self.body.exprs.get(cur.ix()) {
                     Some(&Expr::Paren(inner)) => cur = inner,
                     _ => break,
@@ -1069,7 +1070,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         use blaze_typeck::Def;
 
         let unwrap_parens = |mut cur: ExprId| -> ExprId {
-            for _ in 0..16 {
+            let max_steps = self.body.exprs.len().saturating_add(1);
+            for _ in 0..max_steps {
                 match self.body.exprs.get(cur.ix()) {
                     Some(&Expr::Paren(inner)) => cur = inner,
                     _ => break,
@@ -1907,7 +1909,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     let mut bt = mut_ty;
                     let mut derefs: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
                     let mut elem_step = None;
-                    for _ in 0..8 {
+                    for _ in 0..MOST_POSITIONS {
                         match self.node(bt, e)? {
                             PNode::Array(..) => {
                                 elem_step = Some(DynPathStep::ArrayElem);
@@ -1942,15 +1944,22 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     if let Some(&pat_ty) = self.ck.pat_ty.get(sp.ix()) {
                         let mut bt = pat_ty;
                         let mut derefs: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
-                        for _ in 0..8 {
+                        let mut reached = false;
+                        for _ in 0..MOST_POSITIONS {
                             match self.node(bt, e)? {
-                                PNode::Adt(k, _) if k == adt => break,
+                                PNode::Adt(k, _) if k == adt => {
+                                    reached = true;
+                                    break;
+                                }
                                 PNode::Ref(_, inner) => {
                                     derefs.push(DynPathStep::RefInner);
                                     bt = inner;
                                 }
                                 _ => return Ok(None),
                             }
+                        }
+                        if !reached {
+                            return Ok(None);
                         }
                         if !derefs.is_empty() {
                             Self::replace_path_prefix(path, &derefs, 0);
@@ -2289,10 +2298,20 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         return true;
                     }
                 }
-                Expr::Assign { lhs, rhs } | Expr::AssignOp { lhs, rhs, .. } => {
-                    if skip_assign != Some(parent) && self.assign_lhs_writes_local(lhs, target) {
+                Expr::Assign { lhs, rhs } => {
+                    // In Rust `lhs = rhs` evaluates `rhs` first, then `lhs`, then stores into
+                    // `lhs`. The store to `lhs` itself executes after both operands, so it never
+                    // precedes a use inside `rhs` or `lhs`. When `child == lhs`, `rhs` has
+                    // already executed and may contain writes to `target`.
+                    if lhs == child && self.expr_subtree_writes_local(rhs, target, skip_assign) {
                         return true;
                     }
+                }
+                Expr::AssignOp { lhs, rhs, .. } => {
+                    // The store to `lhs` executes after both operands evaluate, so it never
+                    // precedes a use inside `rhs` or `lhs`. Check the sibling operand's subtree
+                    // conservatively since primitive vs overloaded compound assignment order
+                    // differs.
                     let other = if lhs == child { rhs } else { lhs };
                     if self.expr_subtree_writes_local(other, target, skip_assign) {
                         return true;
@@ -2496,9 +2515,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     // Account for any auto-deref on `base` to reach `adt`.
                     let Ok(mut bt) = self.adjusted_ty(base) else { return Ok(None) };
                     let mut derefs: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
-                    for _ in 0..8 {
+                    let mut reached = false;
+                    for _ in 0..MOST_POSITIONS {
                         match self.node(bt, e)? {
-                            PNode::Adt(k, _) if k == adt => break,
+                            PNode::Adt(k, _) if k == adt => {
+                                reached = true;
+                                break;
+                            }
                             PNode::Ref(_, inner) => {
                                 derefs.push(DynPathStep::RefInner);
                                 bt = inner;
@@ -2510,6 +2533,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                             }
                             _ => return Ok(None),
                         }
+                    }
+                    if !reached {
+                        return Ok(None);
                     }
                     if !derefs.is_empty() {
                         Self::replace_path_prefix(&mut path, &derefs, 0);

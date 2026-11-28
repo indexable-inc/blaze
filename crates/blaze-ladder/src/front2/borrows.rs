@@ -501,6 +501,7 @@ enum InstCopyEntry {
     Yes,
     No,
     IfOutlives(u32, u32),
+    Unknown,
 }
 
 /// The facts of one body, gathered before it is lowered (blaze-flow-lower's [`Facts`]): every
@@ -852,6 +853,7 @@ impl Facts for ReadBy<'_, '_> {
                 let e = s.checked_add(usize::try_from(len).ok()?)?;
                 Some(blaze_flow_lower::InstCopy::IfOutlives(self.facts.inst_copy_outlives.get(s..e)?))
             }
+            InstCopyEntry::Unknown => Some(blaze_flow_lower::InstCopy::Unknown),
         }
     }
     fn drop_args(&self, adt: tc::ItemKey) -> Option<&[bool]> {
@@ -2762,20 +2764,19 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 let ev = eval.get_or_insert_with(|| fields::InstDropEval::new_in(adt_facts.as_ref(), alloc));
                 if let Some(ans) = ev.eval_body_copy(r, langs, owner, body_tys, tc::PTy(pty_id)) {
                     let entry = match ans {
-                        fields::InstCopyOwned::Yes => Some(InstCopyEntry::Yes),
-                        fields::InstCopyOwned::No => Some(InstCopyEntry::No),
+                        fields::InstCopyOwned::Yes => InstCopyEntry::Yes,
+                        fields::InstCopyOwned::No => InstCopyEntry::No,
                         fields::InstCopyOwned::IfOutlives(obs) => {
                             let start = g.inst_copy_outlives.len();
                             g.inst_copy_outlives.extend_from_slice(&obs);
                             match (u32::try_from(start).ok(), u32::try_from(obs.len()).ok()) {
-                                (Some(s), Some(l)) => Some(InstCopyEntry::IfOutlives(s, l)),
-                                _ => None,
+                                (Some(s), Some(l)) => InstCopyEntry::IfOutlives(s, l),
+                                _ => InstCopyEntry::Unknown,
                             }
                         }
+                        fields::InstCopyOwned::Unknown => InstCopyEntry::Unknown,
                     };
-                    if let Some(e) = entry {
-                        g.inst_copy.push((pty_id, e));
-                    }
+                    g.inst_copy.push((pty_id, entry));
                 }
             }
         }
