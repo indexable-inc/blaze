@@ -23,6 +23,7 @@ use crate::{
 
 mod asked;
 mod asked_digest;
+mod assoc_attr_macro;
 mod attr_after_derive;
 mod attr_order;
 mod attr_path_from_expansion;

@@ -84,7 +84,7 @@ use crate::run_parent::{self, CodeRefusal, Codes, Needs, ParentError, RECORDS, W
 pub(crate) type TestMaker<'h> = Maker<'h, crate::run_ids::Runnable, ByKind<crate::engine_body_record::SnapshotTyped<'h>>>;
 use blaze_engine::{SMap, SVec};
 use blaze_engine::code_pool::relay::{self as code_relay, Relay as PoolRelay, RelayError, Reply};
-use blaze_engine::code_pool::{Child, Time, Worker};
+use blaze_engine::code_pool::{Affinity, Child, Time, Worker};
 use blaze_ladder::run::special::{MakerKind, MakerStart};
 use blaze_own::SharedAlloc;
 use crate::store::CommandLent;
@@ -1908,8 +1908,9 @@ impl Refuse for EntryCheck<'_, '_, '_> {
 pub(crate) const CODES: Codes = Codes::Pooled;
 
 /// Upper cap on concurrent `CodePool` compiler workers so per-worker `Maker` memory stays bounded
-/// even on 128-core hosts while scaling parallel JIT compilation across cores.
-const MAX_CODE_WORKERS: usize = 16;
+/// while scaling parallel JIT compilation across 64-core runners (still bounded by `config.plan.width`,
+/// dirty test count, and available pool threads beside the command thread).
+const MAX_CODE_WORKERS: usize = 64;
 
 /// How long one test's ask for its code may wait for a worker's make (rule 18): past it the test
 /// is stopped with [`OneError::CodeLate`] naming the instance. The longest make met on tempo was
@@ -2043,7 +2044,7 @@ impl<'a> CodeRelay<'a> {
     pub(crate) fn ask(&self, child: Child, key: Option<blaze_ladder::code_records::CodeKey>, job: Job<'static>) -> Result<(), OneError> {
         let key = key.map(|key| blaze_engine::code_pool::CodeKey(key.0));
         let suite = job.suite;
-        self.relay.borrow_mut().ask(self.time(), child, key, job).map_err(OneError::Relay)?;
+        self.relay.borrow_mut().ask(self.time(), child, key, Affinity(suite.0), job).map_err(OneError::Relay)?;
         if let Some(slot) = self.child_key.borrow_mut().get_mut(child.0) {
             *slot = key;
         }

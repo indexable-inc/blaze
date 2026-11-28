@@ -799,6 +799,9 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
         }
         let now = self.driver.wall_ns();
         self.core.commit_records_par(batches, records, now, par, &mut self.effects)?;
+        // Stamp write start after pre-write CPU/mmap work (`lay_out_plan_par`, `reused_par`) and
+        // right before submitting the first segment file effects to the driver.
+        self.core.stamp_commit_write_start(self.driver.wall_ns());
         self.run_with_par("committing", batches, records, par)?;
         if auto_folded {
             let _ = self.core.take_sliced();

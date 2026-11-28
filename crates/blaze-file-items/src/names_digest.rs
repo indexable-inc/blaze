@@ -38,10 +38,11 @@
 //! An attribute is taken to be an attribute macro, or to hold one (`cfg_attr`, `unsafe(..)`),
 //! unless its name is [`inert`] (`blaze_surface::builtin_attrs`, the solver's own list) or a `rustc_`
 //! name, or its path starts with a tool of `blaze_surface::tool_attrs::TOOLS`: a name missing from
-//! the list only costs a solve, never an answer. Only entries the solver lowers one by one
-//! (`Lower::item`: the file's, a module's and an extern block's) have an attribute macro called; a
-//! trait's or an impl's member (`Lower::assoc`), a variant and a field have none called, so theirs
-//! do not make the entry whole: a derive or an attribute macro on their owner does.
+//! the list only costs a solve, never an answer. Entries the solver lowers for attribute macros
+//! (`Lower::item`: the file's, a module's and an extern block's; `Lower::assoc`: a trait's and an
+//! impl's members) have attribute macros called with their text; a variant and a field have none
+//! called directly, so theirs do not make the entry whole: a derive or an attribute macro on their
+//! owner does.
 //!
 //! The file's own inner attributes are no entry's: [`file_names_digest`] holds each one's text
 //! but a doc comment's (blaze-scope task/lower.rs `file_attrs`: the root's `register_tool`,
@@ -127,16 +128,14 @@ pub(crate) fn file_names_digest(text: &str, attrs: &[Attr]) -> ContentId {
     hasher.finish()
 }
 
-/// Whether the solver lowers the entries written in an entry of `detail` one by one
-/// (`Lower::item`), where an attribute macro on one is called with its text: a module's and an
-/// extern block's. A trait's and an impl's members go through `Lower::assoc`, which calls none; a
-/// variant's and a field's are not lowered at all. Any other owner is taken as one that does.
+/// Whether the solver calls attribute macros on entries written directly in an entry of `detail`:
+/// modules and extern blocks (`Lower::item`), plus traits and impls (`Lower::assoc`). A struct's,
+/// enum's, union's and variant's children (variants and fields) are not lowered with attribute
+/// macros of their own. Any other owner is taken as one that does.
 const fn lowered_one_by_one(detail: ItemDetail) -> bool {
     !matches!(
         detail,
-        ItemDetail::Trait
-            | ItemDetail::Impl
-            | ItemDetail::Struct
+        ItemDetail::Struct
             | ItemDetail::Enum
             | ItemDetail::Union
             | ItemDetail::Variant { .. }
