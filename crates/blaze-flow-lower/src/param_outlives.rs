@@ -33,11 +33,12 @@
 
 use blaze_flow::Origin;
 use blaze_own::Vec;
-use blaze_typeck::regions::Region;
+use blaze_typeck::region_facts::Outlives;
+use blaze_typeck::regions::{Region, region_arity};
 use blaze_typeck::{ExprId, PNode, PTy};
 use core::alloc::Allocator;
 
-use crate::{CallBounds, Facts, Form, Lower, MOST_POSITIONS, OutlivesType, Plant, Refusal, TyD};
+use crate::{CallBounds, Facts, Form, Lower, MOST_POSITIONS, OutlivesType, Plant, Refusal, SigLife, TyD};
 
 /// The placeholder origin standing for "what the body's type parameter `param` outlives".
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -222,4 +223,173 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         self.param_origs.push(ParamOrigin { origin: o, param: u, certain });
         o
     }
+
+    /// Loads the signature's and impl header's RFC 1214 implied bounds from
+    /// [`Facts::implied_bounds`], clearing `param_all_unsure` so per-parameter outlives checks
+    /// stay certain unless [`Lower::sig_param_bounds`] encounters an unreadable position.
+    pub(crate) fn load_implied_bounds(&mut self) {
+        self.param_all_unsure = false;
+        self.implied_given = false;
+        let facts: &'b F = self.facts;
+        if let Some((params, regions)) = facts.implied_bounds() {
+            for &(long, short) in regions {
+                let (ol, os) = (self.universal(long), self.universal(short));
+                if self.plant != Plant::NoKnown {
+                    self.b.known(ol, os);
+                }
+            }
+            for &(p, r) in params {
+                let o = self.universal(r);
+                self.param_implied.push((p, o));
+            }
+            self.implied_given = true;
+        }
+    }
+
+    /// Loads the body owner's declared outlives clauses:
+    /// - `'a: 'b` (`ParamsView::outlives`) into `known('a, 'b)`, and
+    /// - `T: 'r` (`Outlives::Type` on concrete structural types such as `Self: 'k` where
+    ///   `Self = Run<'a>`, `&'a U: 'k`, `(&'a A, &'b B): 'k`) decomposed into their RFC 1214
+    ///   outlives components (`'a: 'k` into `known` and `U: 'k` into `param_implied`), never
+    ///   descending into projections (`PNode::Alias`), opaques (`PNode::Opaque`), or
+    ///   binder-bound regions (`Region::Late`).
+    pub(crate) fn load_declared_bounds(&mut self, sig: SigLife<'_>) {
+        for &(a, b) in sig.bounds() {
+            let (oa, ob) = (self.universal(a), self.universal(b));
+            if self.plant != Plant::NoKnown {
+                self.b.known(oa, ob);
+            }
+        }
+        let facts: &'b F = self.facts;
+        let regions = facts.regions();
+        let owner = self.body.owner;
+        let (Ok(outs), Ok(views)) = (regions.outlives(owner), regions.clauses(owner)) else {
+            return;
+        };
+        if !outs.iter().any(|o| matches!(o, Outlives::Type { region, .. } if matches!(region, Region::Param(_) | Region::Static))) {
+            return;
+        }
+        let tys = facts.region_tys().unwrap_or(self.tys);
+        let arity = crate::one_call::FactsArity { facts };
+        let mut stack: Vec<(PTy, bool), A> = Vec::new_in(self.alloc);
+        let mut regs: Vec<Region, A> = Vec::new_in(self.alloc);
+        let mut params: Vec<u32, A> = Vec::new_in(self.alloc);
+        for o in outs.iter() {
+            let Outlives::Type { clause, region: target } = *o else { continue };
+            if !matches!(target, Region::Param(_) | Region::Static) {
+                continue;
+            }
+            let Some(cv) = views.iter().find(|c| c.nth == clause) else { continue };
+            regs.clear();
+            params.clear();
+            if !decompose_type_outlives(tys, &arity, cv.col.ty(), cv.col.as_slice(), target, &mut stack, &mut regs, &mut params) {
+                continue;
+            }
+            if regs.is_empty() && params.is_empty() {
+                continue;
+            }
+            let ot = self.universal(target);
+            if self.plant != Plant::NoKnown {
+                for &r in regs.iter() {
+                    let or = self.universal(r);
+                    self.b.known(or, ot);
+                }
+            }
+            for &u in params.iter() {
+                if !self.param_implied.contains(&(u, ot)) {
+                    self.param_implied.push((u, ot));
+                }
+            }
+        }
+    }
+}
+
+/// Decomposes a declared `subject: target` (`PClause::TypeOutlives`) into its RFC 1214 outlives
+/// components: free regions (`Region::Param(_)`, excluding `target`) into `regs` and type
+/// parameters (`PNode::Param(u)`) into `params`.
+///
+/// Walks `root` in the exact pre-order of `RegionCol` (`slots`) so column alignment is verified
+/// (`cursor == slots.len()`) before the caller commits any component. Stops emitting inside
+/// `PNode::Alias` (projections) and `PNode::Opaque` while still advancing `cursor` over their
+/// subtrees, and ignores `Region::Late` bound regions inside `for<..>` binders.
+#[expect(clippy::too_many_arguments, reason = "pre-order region column walk with reusable scratch buffers")]
+fn decompose_type_outlives<F: blaze_typeck::regions::Arity, A: Allocator>(
+    tys: blaze_typeck::PTys<'_>,
+    arity: &F,
+    root: PTy,
+    slots: &[Region],
+    target: Region,
+    stack: &mut Vec<(PTy, bool), A>,
+    regs: &mut Vec<Region, A>,
+    params: &mut Vec<u32, A>,
+) -> bool {
+    stack.clear();
+    stack.push((root, true));
+    let mut cursor = 0usize;
+    let mut steps = 0u32;
+    while let Some((t, emit)) = stack.pop() {
+        steps = steps.saturating_add(1);
+        if steps > MOST_POSITIONS {
+            return false;
+        }
+        let Ok(node) = tys.node(t) else { return false };
+        let Ok(own_u32) = region_arity(t, node, arity) else { return false };
+        let Ok(own) = usize::try_from(own_u32) else { return false };
+        let Some(end) = cursor.checked_add(own) else { return false };
+        let Some(own_slots) = slots.get(cursor..end) else { return false };
+        let child_emit = emit && !matches!(node, PNode::Alias { .. } | PNode::Opaque(..) | PNode::FnDef(..));
+        if child_emit {
+            for &r in own_slots {
+                if matches!(r, Region::Param(_)) && r != target {
+                    regs.push(r);
+                }
+            }
+            if let PNode::Param(u) = node {
+                params.push(u);
+            }
+        }
+        cursor = end;
+        match node {
+            PNode::Tuple(l)
+            | PNode::Record(_, l)
+            | PNode::Union(l)
+            | PNode::Adt(_, l)
+            | PNode::FnDef(_, l)
+            | PNode::FnPtr(l, _)
+            | PNode::Opaque(_, l)
+            | PNode::Alias { args: l, .. }
+            | PNode::Dynamic(l)
+            | PNode::ExTrait(_, l) => {
+                let Ok(xs) = tys.list(l) else { return false };
+                for &c in xs.iter().rev() {
+                    stack.push((c, child_emit));
+                }
+            }
+            PNode::Ref(_, c) | PNode::Ptr(_, c) | PNode::Slice(c) | PNode::Array(c, _) | PNode::Pat(c, _) => {
+                stack.push((c, child_emit));
+            }
+            PNode::ExProj { args, term, .. } => {
+                stack.push((term, child_emit));
+                let Ok(xs) = tys.list(args) else { return false };
+                for &c in xs.iter().rev() {
+                    stack.push((c, child_emit));
+                }
+            }
+            PNode::Infer | PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => return false,
+            PNode::Bool
+            | PNode::Char
+            | PNode::Int(_)
+            | PNode::Uint(_)
+            | PNode::Float(_)
+            | PNode::Str
+            | PNode::Never
+            | PNode::Param(_)
+            | PNode::Error
+            | PNode::ConstValue { .. }
+            | PNode::ConstParam(_)
+            | PNode::ExAuto(_)
+            | PNode::Foreign(_) => {}
+        }
+    }
+    cursor == slots.len()
 }

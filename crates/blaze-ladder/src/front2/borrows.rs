@@ -1576,7 +1576,9 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         {
             let owner_regions = r.store.regions.reader(r.store.work_alloc());
             let owner_views = owner_regions.clauses(owner).ok();
-            let mut read_owner_clauses = false;
+            let mut read_owner_clauses = owner_regions
+                .outlives(owner)
+                .is_ok_and(|os| os.iter().any(|o| matches!(o, tc::region_facts::Outlives::Type { .. })));
             if let Some(head) = r.store.fns.get(&owner)
                 && let super::types::SelfTy::Trait(lib) = head.self_
             {
@@ -2392,6 +2394,9 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             let ik = tc::ItemKey(k);
             if let Ok(sig) = reader.sig(ik) {
                 walk_ty(sig.col.ty());
+                if let Some(out) = sig.written_output {
+                    walk_ty(out.ty());
+                }
             }
             if let Ok(cls) = reader.clauses(ik) {
                 for cv in cls {
@@ -3301,7 +3306,12 @@ fn owner_implied_input<'n, 'a, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner
     let reader = r.store.regions.reader(alloc);
     let tys = r.store.tys.view();
     match reader.sig(owner) {
-        Ok(sig) => input.piece(owner.0, tys, &arity, sig.col.ty(), sig.col.as_slice()),
+        Ok(sig) => {
+            input.piece(owner.0, tys, &arity, sig.col.ty(), sig.col.as_slice());
+            if let Some(out) = sig.written_output {
+                input.piece(owner.0, tys, &arity, out.ty(), out.as_slice());
+            }
+        }
         Err(u) => input.unread(owner.0, u),
     }
     let imp = match r.keys.origin(owner) {
@@ -3757,7 +3767,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
                     cf.map(|cf| (cf.lowered.flow, cf.lowered.params, cf.externals, cf.lowered.coarse))
                 }
                 FlowOf::AsyncBlock(block) => {
-                    blaze_flow_lower::lower_async(&view, done, block, &nested, alloc).map(|la| (la.flow, AVec::new_in(alloc), la.externals, la.coarse))
+                    blaze_flow_lower::lower_async(&view, done, block, &nested, alloc).map(|la| (la.flow, la.params, la.externals, la.coarse))
                 }
                 FlowOf::Owner => continue,
             }

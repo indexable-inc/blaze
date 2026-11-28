@@ -479,7 +479,7 @@ pub fn drop_adt_read(
 /// The detail of a [`FactKind::BorrowHead`] row holding a trait's or opaque's region clauses
 /// (supertrait elaboration and `impl Trait` bounds in `blaze-borrow`).
 pub const CLAUSES_DETAIL: u64 = 11;
-const CLAUSES_DOMAIN: &str = "blaze-ladder front2 borrow clauses v1";
+const CLAUSES_DOMAIN: &str = "blaze-ladder front2 borrow clauses v2";
 
 /// The row of what the borrow check read of item `item`'s region clauses and lifetime count.
 pub fn clauses_read(item: u128, regions: &dyn blaze_flow_lower::RegionFacts) -> Read {
@@ -505,6 +505,13 @@ pub fn clauses_read(item: u128, regions: &dyn blaze_flow_lower::RegionFacts) -> 
                 h.u32(u32::try_from(cv.col.as_slice().len()).unwrap_or(u32::MAX));
                 for &r in cv.col.as_slice() {
                     region(&mut h, r);
+                }
+                match cv.outlives {
+                    Some(r) => {
+                        h.tag(1);
+                        region(&mut h, r);
+                    }
+                    None => h.tag(0),
                 }
             }
         }

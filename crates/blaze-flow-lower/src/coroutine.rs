@@ -104,6 +104,9 @@ pub struct LoweredAsync<A: Allocator + Copy> {
     /// laid by the signature (`async_fn_root`): its rows are made the same way and never read
     /// (its outlives results are the fn's own findings).
     pub externals: Vec<(blaze_flow::Origin, External), A>,
+    /// The placeholders standing for what each of the body's type parameters outlives
+    /// (`param_outlives.rs`, as [`crate::Lowered::params`]).
+    pub params: Vec<crate::ParamOrigin, A>,
     /// The first stricter relation this flow used ([`crate::Lowered::coarse`]): the body is
     /// refused by it only if it has a finding.
     pub coarse: Option<Refusal>,
@@ -182,6 +185,9 @@ pub(crate) fn lower_async_with<A: Allocator + Copy, F: Facts, R: crate::one_call
             Region::Late { .. } => {}
         }
     }
+    for p in l.param_origs.iter() {
+        externals.push((p.origin, External::Param(p.param)));
+    }
     let b = core::mem::replace(&mut l.b, crate::builder::Builder::new(crate::FlowBuilder::new_in(1, 0, alloc)));
     let flow = b.finish().map_err(|_| Refusal { form: Form::Builder, range })?;
     if l.local_ty.len() != flow.locals as usize {
@@ -202,7 +208,8 @@ pub(crate) fn lower_async_with<A: Allocator + Copy, F: Facts, R: crate::one_call
     }
     let point_of = core::mem::replace(&mut l.points, Vec::new_in(alloc));
     let identity = core::mem::replace(&mut l.identity, Vec::new_in(alloc));
-    Ok(LoweredAsync { flow, local_ty, point_of, local_wrap, identity, range, externals, coarse: l.coarse.get() })
+    let params = core::mem::replace(&mut l.param_origs, Vec::new_in(alloc));
+    Ok(LoweredAsync { flow, local_ty, point_of, local_wrap, identity, range, externals, params, coarse: l.coarse.get() })
 }
 
 /// An async block's WITNESS (typeck.md "Witness records", W1): what its state stores, region-
@@ -829,6 +836,9 @@ impl<'b, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'b, 
         if !sig.well_formed() || sig.inputs() as usize != body.params.len() {
             return self.refuse(Form::SigUnaligned, block);
         }
+        // Mirror `Lower::signature`: load the signature's and impl header's RFC 1214 implied
+        // bounds so `&'0 Lock<T>` records `T: '0` and per-parameter outlives checks stay certain.
+        self.load_implied_bounds();
         let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         // The written return type's column over the block's value's own type (`lay_over`); a
         // hidden position is a placeholder of its own below.
@@ -892,23 +902,21 @@ impl<'b, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'b, 
         for l in 0..=rows.len() {
             let (start, _) = self.local_origs[l];
             let t = self.local_ty[l];
+            self.sig_param_bounds(t, start, block)?;
             self.ref_ranges(t, block, &mut ranges)?;
             for j in 0..ranges.len() {
                 let (at, inner) = ranges[j];
                 let outer = self.origs[(start + at) as usize];
                 for k in 1..=inner {
                     let o = self.origs[(start + at + k) as usize];
-                    if o != outer {
+                    if o != outer && self.plant != crate::Plant::NoKnown {
                         self.b.known(o, outer);
                     }
                 }
             }
         }
-        // The declared bounds.
-        for &(a, b) in sig.bounds() {
-            let (oa, ob) = (self.universal(a), self.universal(b));
-            self.b.known(oa, ob);
-        }
+        // The declared bounds (`'a: 'b` and concrete structural `T: 'r` components).
+        self.load_declared_bounds(sig);
         Ok(())
     }
 }
