@@ -916,7 +916,7 @@ impl<'b, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'b, 
             }
         }
         // The declared bounds (`'a: 'b` and concrete structural `T: 'r` components).
-        self.load_declared_bounds(sig);
+        self.load_declared_bounds(sig, block)?;
         Ok(())
     }
 }

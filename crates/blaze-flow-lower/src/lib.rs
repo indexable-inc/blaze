@@ -4444,7 +4444,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             }
         }
         // The declared outlives clauses (`'a: 'b` and concrete structural `T: 'r` components).
-        self.load_declared_bounds(sig);
+        self.load_declared_bounds(sig, root)?;
         self.stats.sig_read = true;
         Ok(())
     }

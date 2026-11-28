@@ -1576,9 +1576,10 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         {
             let owner_regions = r.store.regions.reader(r.store.work_alloc());
             let owner_views = owner_regions.clauses(owner).ok();
-            let mut read_owner_clauses = owner_regions
-                .outlives(owner)
-                .is_ok_and(|os| os.iter().any(|o| matches!(o, tc::region_facts::Outlives::Type { .. })));
+            let mut read_owner_clauses = match owner_regions.outlives(owner) {
+                Ok(os) => os.iter().any(|o| matches!(o, tc::region_facts::Outlives::Type { .. })),
+                Err(_) => true,
+            };
             if let Some(head) = r.store.fns.get(&owner)
                 && let super::types::SelfTy::Trait(lib) = head.self_
             {
