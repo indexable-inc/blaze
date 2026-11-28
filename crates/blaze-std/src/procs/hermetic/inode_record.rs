@@ -581,7 +581,7 @@ impl<'a> DirInodeRecordIo<'a> {
 
     fn sub_cx(&self) -> Result<crate::cx::Cx, Fault> {
         let left = super::remaining_for_cx(self.cx)
-            .map_err(|_| Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 })?;
+            .map_err(|why| Fault::HostStopped { call: "elf inode record context", why })?;
         let world = self.dir.world();
         let deadline = blaze_core::wait::Deadline::after(world.now(), left);
         Ok(self.cx.on_beside(blaze_own::Share::share(world), deadline))
@@ -596,12 +596,12 @@ impl InodeRecordIo for DirInodeRecordIo<'_> {
         let file = match self.dir.open_read(&sub, &rel) {
             Ok(f) => f,
             Err(e) if e.kind == crate::fs::FsKind::NotFound => return Ok(RecordRead::Absent),
-            Err(e) => return Err(super::fs_err_to_fault("open elf inode record", &e)),
+            Err(e) => return Err(super::fs_err_to_fault("open elf inode record", e)),
         };
         let len_u64 = match file.len(&sub) {
             Ok(n) => n,
             Err(e) if e.kind == crate::fs::FsKind::NotFound => return Ok(RecordRead::Absent),
-            Err(e) => return Err(super::fs_err_to_fault("stat elf inode record", &e)),
+            Err(e) => return Err(super::fs_err_to_fault("stat elf inode record", e)),
         };
         let max_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
         if len_u64 > max_u64 {
@@ -625,7 +625,7 @@ impl InodeRecordIo for DirInodeRecordIo<'_> {
             let n = match file.read_into(dst, step_off).wait(&sub) {
                 Ok(n) => n,
                 Err(e) if e.kind == crate::fs::FsKind::NotFound => return Ok(RecordRead::Absent),
-                Err(e) => return Err(super::fs_err_to_fault("read elf inode record", &e)),
+                Err(e) => return Err(super::fs_err_to_fault("read elf inode record", e)),
             };
             if n == 0 {
                 break;
@@ -648,7 +648,7 @@ impl InodeRecordIo for DirInodeRecordIo<'_> {
         self.dir
             .publish(&sub, &rel, crate::fs::Content::bytes(bytes), crate::fs::Durable::Yes)
             .map(|_| ())
-            .map_err(|e| super::fs_err_to_fault("publish elf inode record", &e))
+            .map_err(|e| super::fs_err_to_fault("publish elf inode record", e))
     }
 
     fn write_direct_planted(&self, key_hex: &str, bytes: &[u8]) -> Result<(), Fault> {
@@ -660,7 +660,7 @@ impl InodeRecordIo for DirInodeRecordIo<'_> {
         let file = self
             .dir
             .create(&sub, &rel)
-            .map_err(|e| super::fs_err_to_fault("create elf inode record (planted)", &e))?;
+            .map_err(|e| super::fs_err_to_fault("create elf inode record (planted)", e))?;
         let mid = bytes.len() / 2;
         let first = bytes.get(..mid).unwrap_or(&[]);
         let second = bytes.get(mid..).unwrap_or(&[]);
@@ -670,7 +670,7 @@ impl InodeRecordIo for DirInodeRecordIo<'_> {
         let closed = file.close(&sub, crate::fs::Durable::No).map(|_| ());
         appended
             .and(closed)
-            .map_err(|e| super::fs_err_to_fault("direct write elf inode record (planted)", &e))
+            .map_err(|e| super::fs_err_to_fault("direct write elf inode record (planted)", e))
     }
 
     fn prune_to_cap(&self, max_entries: usize, keep_key: &str) -> Result<(), Fault> {
@@ -678,7 +678,7 @@ impl InodeRecordIo for DirInodeRecordIo<'_> {
         let entries = match self.dir.own_entries(&sub) {
             Ok(e) => e,
             Err(e) if e.kind == crate::fs::FsKind::NotFound => return Ok(()),
-            Err(e) => return Err(super::fs_err_to_fault("list elf inode records for prune", &e)),
+            Err(e) => return Err(super::fs_err_to_fault("list elf inode records for prune", e)),
         };
         let scan_len = entries.len().min(PRUNE_SCAN_MOST);
         let mut live_count = 0usize;
@@ -719,7 +719,7 @@ impl InodeRecordIo for DirInodeRecordIo<'_> {
             match self.dir.remove(&sub, path, crate::fs::Durable::No) {
                 Ok(()) => {}
                 Err(e) if e.kind == crate::fs::FsKind::NotFound => {}
-                Err(e) => return Err(super::fs_err_to_fault("prune elf inode record", &e)),
+                Err(e) => return Err(super::fs_err_to_fault("prune elf inode record", e)),
             }
         }
         Ok(())

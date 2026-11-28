@@ -276,7 +276,7 @@ impl RootReader {
     fn sub_cx(&self, cx: &Cx) -> Result<(Cx, Deadline), Fault> {
         let io = self.io_ref()?;
         let left = remaining_for_cx(cx)
-            .map_err(|_| Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 })?;
+            .map_err(|why| Fault::HostStopped { call: "nix runtime closure", why })?;
         let deadline = Deadline::after(io.now(), left);
         Ok((cx.on_beside(blaze_own::Share::share(io), deadline), deadline))
     }
@@ -297,7 +297,7 @@ impl RootReader {
         let io = self.io_ref()?;
         loop {
             match pending.try_wait() {
-                Ok(res) => return res.map_err(|e| fs_err_to_fault(call, &e)),
+                Ok(res) => return res.map_err(|e| fs_err_to_fault(call, e)),
                 Err(still) => pending = still,
             }
             if cx.cancelled() {
@@ -308,7 +308,10 @@ impl RootReader {
                 ) {
                     self.inner.stalled.store(true, core::sync::atomic::Ordering::Release);
                 }
-                return Err(Fault::Host { call: "nix runtime closure (cancelled)", code: 125 });
+                return Err(Fault::HostStopped {
+                    call,
+                    why: crate::Stopped::Cancelled { span: cx.name() },
+                });
             }
             let now = io.now();
             if deadline.passed(now) {
@@ -318,7 +321,10 @@ impl RootReader {
                 ) {
                     self.inner.stalled.store(true, core::sync::atomic::Ordering::Release);
                 }
-                return Err(Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 });
+                return Err(Fault::HostStopped {
+                    call,
+                    why: crate::Stopped::Deadline { span: cx.name(), at: deadline.get() },
+                });
             }
             let slice = deadline.min(Deadline::after(now, Duration::from_millis(10)));
             let _ = io.poll(slice);
@@ -341,7 +347,7 @@ impl RootReader {
         }
         let rel = Self::fd_rel(fd)?;
         let (open_cx, _) = self.sub_cx(cx)?;
-        let file = self.root_ref()?.open_read(&open_cx, &rel).map_err(|e| fs_err_to_fault(call, &e))?;
+        let file = self.root_ref()?.open_read(&open_cx, &rel).map_err(|e| fs_err_to_fault(call, e))?;
         let mut filled = 0usize;
         while filled < out.len() {
             let step_off = u64::try_from(filled)
@@ -372,7 +378,7 @@ impl RootReader {
     ) -> Result<u64, Fault> {
         let rel = Self::fd_rel(fd)?;
         let (open_cx, _) = self.sub_cx(cx)?;
-        let file = self.root_ref()?.open_read(&open_cx, &rel).map_err(|e| fs_err_to_fault(call, &e))?;
+        let file = self.root_ref()?.open_read(&open_cx, &rel).map_err(|e| fs_err_to_fault(call, e))?;
         let mut buf = [0u8; 64 << 10];
         let mut offset = 0u64;
         loop {
@@ -391,15 +397,14 @@ impl RootReader {
     }
 }
 
-pub(super) fn fs_err_to_fault(call: &'static str, err: &crate::fs::FsError) -> Fault {
-    let code = match &err.kind {
-        crate::fs::FsKind::Stopped(_) => 110,
-        crate::fs::FsKind::NotFound => 2,
-        crate::fs::FsKind::IsADirectory => 21,
-        crate::fs::FsKind::NotADirectory => 20,
-        _ => 5,
-    };
-    Fault::Host { call, code }
+pub(super) fn fs_err_to_fault(call: &'static str, err: crate::fs::FsError) -> Fault {
+    match err.kind {
+        crate::fs::FsKind::Stopped(why) => Fault::HostStopped { call, why },
+        crate::fs::FsKind::NotFound => Fault::Host { call, code: 2 },
+        crate::fs::FsKind::IsADirectory => Fault::Host { call, code: 21 },
+        crate::fs::FsKind::NotADirectory => Fault::Host { call, code: 20 },
+        _ => Fault::Host { call, code: 5 },
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1433,6 +1438,10 @@ pub enum Fault {
     Files(FilesError),
     /// A host call failed (rule 3: named, never retried).
     Host { call: &'static str, code: u16 },
+    /// A host wait or allocation stopped before completing (rule 18 & rule 19: preserves the exact
+    /// [`crate::Stopped`] reason — deadline, cancellation, stall, or OOM — instead of collapsing
+    /// into an opaque errno).
+    HostStopped { call: &'static str, why: crate::Stopped },
     /// A start or a wait of blaze's linked child failed.
     Run(super::RunError),
     OutOfMemory,
@@ -1462,7 +1471,12 @@ impl Fault {
             }
             Fault::EnvSpelling { .. } | Fault::EnvNotSorted { .. } => Rule::DeterministicOutput,
             Fault::ClockNotInEnv => Rule::NothingAmbient,
-            Fault::StepsNotMetered | Fault::Stopped(_) | Fault::PlanOver { .. } | Fault::OutputsOver { .. } | Fault::ReadListFull(_) => {
+            Fault::StepsNotMetered
+            | Fault::Stopped(_)
+            | Fault::HostStopped { .. }
+            | Fault::PlanOver { .. }
+            | Fault::OutputsOver { .. }
+            | Fault::ReadListFull(_) => {
                 Rule::BoundedProgress
             }
             Fault::ReadUnmounted(_) | Fault::ReadOutside(_) | Fault::Report(_) => Rule::KeysCoverEveryInput,

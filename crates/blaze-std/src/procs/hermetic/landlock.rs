@@ -252,7 +252,7 @@ fn now_sec_for_cx(cx: Option<&Cx>) -> i64 {
 fn check_nix_cx(cx: Option<&Cx>) -> Result<(), Fault> {
     if let Some(cx) = cx {
         super::remaining_for_cx(cx)
-            .map_err(|_| Fault::Host { call: "nix runtime closure (deadline/stopped)", code: 110 })?;
+            .map_err(|why| Fault::HostStopped { call: "nix runtime closure", why })?;
     }
     Ok(())
 }
