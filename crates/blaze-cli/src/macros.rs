@@ -261,7 +261,7 @@ pub(crate) fn list(
         // package that is no member has no folder here and is named as not identified.
         let identity = identify(lock.lock, &locked, &folders, &decoded.graph, unit, |id| Ok(place.member_files(id)), scratch).map_err(MacrosError::Procs)?;
         let identity = match (wasm_graph, identity) {
-            (Some(wg), Ok(id)) => Ok(id.with_wasm_features(lock.lock, wg, unit.package, |dep_id| place.member_files(dep_id), scratch)),
+            (Some(wg), Ok(id)) => id.with_wasm_features(lock.lock, wg, unit.package, |dep_id| place.member_files(dep_id), scratch),
             (_, other) => other,
         };
         let planned_entry = u32::try_from(idx).ok().and_then(|uid| {

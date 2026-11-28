@@ -1509,7 +1509,12 @@ fn ensure_proc_macro_unit(
     }, heap.alloc())
     .map_err(|e| std::format!("identifying proc-macro dep {} {}: {e}", unit.name.as_str(), unit.version.as_str()))?
     .map_err(|e| std::format!("proc-macro dep {} {} not identified: {e}", unit.name.as_str(), unit.version.as_str()))?
-    .with_wasm_features(lock, graph, unit.package, |dep_id| path_pkg_files_digest(checkout, members, dep_id), heap.alloc());
+    .with_wasm_features(lock, graph, unit.package, |dep_id| path_pkg_files_digest(checkout, members, dep_id), heap.alloc())
+    .map_err(|e| {
+        let mut msg = blaze_own::String::new_in(heap.alloc());
+        let _ = write!(msg, "proc-macro dep {} {} wasm64 features not identified: {e}", unit.name.as_str(), unit.version.as_str());
+        SelfCompileError::Failed(msg.as_str().into())
+    })?;
     let (identity, frozen_probes) = if let Some(shared) = dep_probes.shared {
         let has_dep_scripts = unit_has_dep_build_scripts(graph, Some(graph), pm_id, true).map_err(|e| {
             let mut msg = blaze_own::String::new_in(heap.alloc());
@@ -6193,6 +6198,7 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         .expect("identify")
         .expect("identified")
         .with_wasm_features(lock.lock, &graph, graph.units[2].package, |_| None::<&str>, heap.alloc())
+        .expect("wasm features")
         .with_dep_probes(live_hex.as_str());
         let (mod_key, id_text) = identity_b.with_id(|id| {
             (

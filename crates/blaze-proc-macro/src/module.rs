@@ -66,6 +66,9 @@ pub enum ClosureError {
     NotLocked { name: String, version: String },
     /// A path package in the closure: its sources are pinned by nothing in the lock.
     Unpinned { name: String, version: String },
+    /// The resolved `wasm64-blaze-wasip1` unit graph has no `ProcMacro` unit matching this
+    /// package and exact feature set.
+    WasmRootMissing { name: String, version: String },
 }
 
 impl std::fmt::Display for ClosureError {
@@ -74,6 +77,9 @@ impl std::fmt::Display for ClosureError {
             ClosureError::NotLocked { name, version } => write!(f, "the lock has no package {name} {version}"),
             ClosureError::Unpinned { name, version } => {
                 write!(f, "{name} {version} is a path package under a proc-macro crate: the lock pins nothing of its sources")
+            }
+            ClosureError::WasmRootMissing { name, version } => {
+                write!(f, "{name} {version}: no matching ProcMacro unit with exact features in the wasm64 unit graph")
             }
         }
     }
@@ -476,8 +482,12 @@ pub const MODULE_HEADER: &str = "blaze proc-macro module wasm64 11";
 /// Folds the resolved `wasm64-blaze-wasip1` dependency closure's unified feature sets (bound to
 /// each package's source pin — registry checksum/source, git commit+URL, or path files digest)
 /// into a proc-macro crate's `deps` digest so enabling, removing, or swapping features across
-/// dependencies (including same-name/same-version packages from different sources) invalidates
-/// the module key (rule 21).
+/// dependencies (including same-name/same-version packages from different sources and dependency
+/// build-script closures) invalidates the module key (rule 21).
+///
+/// Requires an exact `(package, UnitKind::ProcMacro, features)` match in `wasm_graph` (returning
+/// [`ClosureError::WasmRootMissing`] otherwise) and refuses any reachable `LockSource::Path`
+/// dependency whose digest cannot be supplied ([`ClosureError::Unpinned`], rule 3).
 pub fn deps_with_wasm_features<S: AsRef<str>, D: AsRef<str>, A: core::alloc::Allocator + Copy>(
     lock_deps: &str,
     lock: &Lock<'_>,
@@ -486,7 +496,7 @@ pub fn deps_with_wasm_features<S: AsRef<str>, D: AsRef<str>, A: core::alloc::All
     features: &[S],
     mut path_files: impl FnMut(blaze_manifest::lock::LockId) -> Option<D>,
     alloc: A,
-) -> blaze_own::String<A> {
+) -> Result<blaze_own::String<A>, ClosureError> {
     use core::fmt::Write as _;
     let mut want_feats = blaze_own::Vec::with_capacity_in(features.len(), alloc);
     for f in features {
@@ -503,93 +513,124 @@ pub fn deps_with_wasm_features<S: AsRef<str>, D: AsRef<str>, A: core::alloc::All
         got.dedup();
         got.as_slice() == want_feats.as_slice()
     };
-    let root_idx = wasm_graph
+    let Some(root_idx) = wasm_graph
         .units
         .iter()
         .position(|u| u.package == package && u.kind == blaze_unit_graph::UnitKind::ProcMacro && feats_match(u))
-        .or_else(|| {
-            wasm_graph
-                .units
-                .iter()
-                .position(|u| u.package == package && u.kind == blaze_unit_graph::UnitKind::ProcMacro)
+    else {
+        let root_pkg = lock.package(package);
+        let mut version = blaze_own::String::new_in(alloc);
+        let _ = write!(version, "{}", root_pkg.version);
+        return Err(ClosureError::WasmRootMissing {
+            name: root_pkg.name.as_str().to_owned(),
+            version: version.as_str().to_owned(),
         });
-    let mut rows = blaze_own::Vec::<blaze_own::String<A>, A>::new_in(alloc);
-    if let Some(root_idx) = root_idx {
-        let mut visited = blaze_own::Vec::with_capacity_in(wasm_graph.units.len(), alloc);
-        visited.resize(wasm_graph.units.len(), false);
-        if let Some(slot) = visited.get_mut(root_idx) {
+    };
+    let mut visited = blaze_own::Vec::with_capacity_in(wasm_graph.units.len(), alloc);
+    visited.resize(wasm_graph.units.len(), false);
+    let mut stack = blaze_own::Vec::new_in(alloc);
+    let push_deps = |u: &blaze_unit_graph::Unit<'_>,
+                     visited: &mut blaze_own::Vec<bool, A>,
+                     stack: &mut blaze_own::Vec<usize, A>| {
+        for dep in u.deps.iter() {
+            let didx = dep.unit.index();
+            if wasm_graph
+                .units
+                .get(didx)
+                .is_some_and(|du| matches!(du.kind, blaze_unit_graph::UnitKind::Lib | blaze_unit_graph::UnitKind::ProcMacro))
+                && let Some(slot) = visited.get_mut(didx)
+                && !*slot
+            {
+                *slot = true;
+                stack.push(didx);
+            }
+        }
+    };
+    let push_build_script = |u: &blaze_unit_graph::Unit<'_>,
+                             visited: &mut blaze_own::Vec<bool, A>,
+                             stack: &mut blaze_own::Vec<usize, A>| {
+        if let Some(bs_id) = u.build_script
+            && let Some(slot) = visited.get_mut(bs_id.index())
+            && !*slot
+        {
             *slot = true;
-        }
-        let mut stack = blaze_own::Vec::new_in(alloc);
-        if let Some(root_u) = wasm_graph.units.get(root_idx) {
-            for dep in root_u.deps.iter() {
-                let idx = dep.unit.index();
-                if wasm_graph
-                    .units
-                    .get(idx)
-                    .is_some_and(|du| matches!(du.kind, blaze_unit_graph::UnitKind::Lib | blaze_unit_graph::UnitKind::ProcMacro))
-                    && let Some(slot) = visited.get_mut(idx)
-                    && !*slot
-                {
-                    *slot = true;
-                    stack.push(idx);
-                }
+            if let Some(bs_unit) = wasm_graph.units.get(bs_id.index()) {
+                push_deps(bs_unit, visited, stack);
             }
         }
-        while let Some(idx) = stack.pop() {
-            let Some(u) = wasm_graph.units.get(idx) else { continue };
-            for dep in u.deps.iter() {
-                let didx = dep.unit.index();
-                if wasm_graph
-                    .units
-                    .get(didx)
-                    .is_some_and(|du| matches!(du.kind, blaze_unit_graph::UnitKind::Lib | blaze_unit_graph::UnitKind::ProcMacro))
-                    && let Some(slot) = visited.get_mut(didx)
-                    && !*slot
-                {
-                    *slot = true;
-                    stack.push(didx);
-                }
+    };
+    if let Some(slot) = visited.get_mut(root_idx) {
+        *slot = true;
+    }
+    if let Some(root_u) = wasm_graph.units.get(root_idx) {
+        push_deps(root_u, &mut visited, &mut stack);
+        push_build_script(root_u, &mut visited, &mut stack);
+    }
+    let mut path_cache: blaze_own::Vec<Option<blaze_own::String<A>>, A> =
+        blaze_own::Vec::with_capacity_in(lock.packages.len(), alloc);
+    for _ in 0..lock.packages.len() {
+        path_cache.push(None);
+    }
+    let mut rows = blaze_own::Vec::<blaze_own::String<A>, A>::new_in(alloc);
+    while let Some(idx) = stack.pop() {
+        let Some(u) = wasm_graph.units.get(idx) else { continue };
+        push_deps(u, &mut visited, &mut stack);
+        push_build_script(u, &mut visited, &mut stack);
+        let mut ufeats = blaze_own::Vec::with_capacity_in(u.features.len(), alloc);
+        for f in u.features.iter() {
+            ufeats.push(f.as_str());
+        }
+        ufeats.sort_unstable();
+        ufeats.dedup();
+        let kind_word = match u.kind {
+            blaze_unit_graph::UnitKind::ProcMacro => "proc-macro",
+            _ => "lib",
+        };
+        let pkg = lock.package(u.package);
+        let mut row = blaze_own::String::new_in(alloc);
+        let _ = write!(row, "{} {} {} ", u.name.as_str(), u.version.as_str(), kind_word);
+        match (&pkg.checksum, &pkg.source) {
+            (Checksum::Sha256(sum), _) => {
+                let _ = write!(row, "checksum:{} {}", sum.as_str(), pkg.source_text.as_str());
             }
-            let mut ufeats = blaze_own::Vec::with_capacity_in(u.features.len(), alloc);
-            for f in u.features.iter() {
-                ufeats.push(f.as_str());
-            }
-            ufeats.sort_unstable();
-            ufeats.dedup();
-            let kind_word = match u.kind {
-                blaze_unit_graph::UnitKind::ProcMacro => "proc-macro",
-                _ => "lib",
-            };
-            let pkg = lock.package(u.package);
-            let mut row = blaze_own::String::new_in(alloc);
-            let _ = write!(row, "{} {} {} ", u.name.as_str(), u.version.as_str(), kind_word);
-            match (&pkg.checksum, &pkg.source) {
-                (Checksum::Sha256(sum), _) => {
-                    let _ = write!(row, "checksum:{} {}", sum.as_str(), pkg.source_text.as_str());
-                }
-                (Checksum::Absent, LockSource::Path) => match path_files(u.package) {
+            (Checksum::Absent, LockSource::Path) => {
+                let cached = match path_cache.get_mut(u.package.index()) {
+                    Some(Some(hex)) => Some(hex.as_str()),
+                    Some(slot @ None) => match path_files(u.package) {
+                        Some(hex) => Some(slot.insert(blaze_own::String::from_str_in(hex.as_ref(), alloc)).as_str()),
+                        None => None,
+                    },
+                    None => None,
+                };
+                match cached {
                     Some(hex) => {
-                        let _ = write!(row, "files:{}", hex.as_ref());
+                        let _ = write!(row, "files:{hex}");
                     }
-                    None => row.push_str("path:unpinned"),
-                },
-                (Checksum::Absent, LockSource::Git { commit, .. }) => {
-                    let _ = write!(row, "git:{} {}", commit.as_str(), pkg.source_text.as_str());
-                }
-                (Checksum::Absent, LockSource::Registry { .. }) => {
-                    let _ = write!(row, "source:{}", pkg.source_text.as_str());
+                    None => {
+                        let mut version = blaze_own::String::new_in(alloc);
+                        let _ = write!(version, "{}", pkg.version);
+                        return Err(ClosureError::Unpinned {
+                            name: pkg.name.as_str().to_owned(),
+                            version: version.as_str().to_owned(),
+                        });
+                    }
                 }
             }
-            row.push(' ');
-            for (i, f) in ufeats.iter().enumerate() {
-                if i > 0 {
-                    row.push(',');
-                }
-                row.push_str(f);
+            (Checksum::Absent, LockSource::Git { commit, .. }) => {
+                let _ = write!(row, "git:{} {}", commit.as_str(), pkg.source_text.as_str());
             }
-            rows.push(row);
+            (Checksum::Absent, LockSource::Registry { .. }) => {
+                let _ = write!(row, "source:{}", pkg.source_text.as_str());
+            }
         }
+        row.push(' ');
+        for (i, f) in ufeats.iter().enumerate() {
+            if i > 0 {
+                row.push(',');
+            }
+            row.push_str(f);
+        }
+        rows.push(row);
     }
     rows.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
     rows.dedup_by(|a, b| a.as_str() == b.as_str());
@@ -607,7 +648,7 @@ pub fn deps_with_wasm_features<S: AsRef<str>, D: AsRef<str>, A: core::alloc::All
     for byte in digest {
         let _ = write!(out, "{byte:02x}");
     }
-    out
+    Ok(out)
 }
 
 /// The crate's identity as text: what the module key is the digest of.
@@ -995,8 +1036,8 @@ mod header_tests {
 
         let wg_on = mk_wasm_graph(&["extra_wasi"]);
         let wg_off = mk_wasm_graph(&[]);
-        let d_on = deps_with_wasm_features("same-lock-closure", &lock, &wg_on, LockId(0), &[] as &[&str], |_| None::<&str>, alloc);
-        let d_off = deps_with_wasm_features("same-lock-closure", &lock, &wg_off, LockId(0), &[] as &[&str], |_| None::<&str>, alloc);
+        let d_on = deps_with_wasm_features("same-lock-closure", &lock, &wg_on, LockId(0), &[] as &[&str], |_| None::<&str>, alloc).expect("d_on");
+        let d_off = deps_with_wasm_features("same-lock-closure", &lock, &wg_off, LockId(0), &[] as &[&str], |_| None::<&str>, alloc).expect("d_off");
         assert_ne!(d_on.as_str(), d_off.as_str(), "proc-macro deps digest must change when a WASI-only dep feature toggles");
     }
 
@@ -1078,12 +1119,98 @@ mod header_tests {
 
         let wg_ab = mk_wasm_graph(&["feat_a"], &["feat_b"]);
         let wg_ba = mk_wasm_graph(&["feat_b"], &["feat_a"]);
-        let d_ab = deps_with_wasm_features("same-lock-closure", &lock, &wg_ab, LockId(0), &[] as &[&str], |_| None::<&str>, alloc);
-        let d_ba = deps_with_wasm_features("same-lock-closure", &lock, &wg_ba, LockId(0), &[] as &[&str], |_| None::<&str>, alloc);
+        let d_ab = deps_with_wasm_features("same-lock-closure", &lock, &wg_ab, LockId(0), &[] as &[&str], |_| None::<&str>, alloc).expect("d_ab");
+        let d_ba = deps_with_wasm_features("same-lock-closure", &lock, &wg_ba, LockId(0), &[] as &[&str], |_| None::<&str>, alloc).expect("d_ba");
         assert_ne!(
             d_ab.as_str(),
             d_ba.as_str(),
             "swapping features A and B between two same-name/version packages from different sources must change the digest"
+        );
+    }
+
+    #[test]
+    fn deps_with_wasm_features_rejects_mismatched_root_traverses_dep_build_scripts_and_refuses_unpinned_paths() {
+        use blaze_manifest::lock::LockId;
+        use blaze_own::Vec as OwnVec;
+        use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Packages:
+        //   0: demo_pm (proc-macro)
+        //   1: dep_lib (registry lib with a build.rs)
+        //   2: wasi_bs_helper (WASI-only path build-dependency of dep_lib's build.rs)
+        let lock_text = "version = 4\n\n\
+            [[package]]\nname = \"demo_pm\"\nversion = \"0.1.0\"\ndependencies = [\"dep_lib\"]\n\n\
+            [[package]]\nname = \"dep_lib\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"1111111111111111111111111111111111111111111111111111111111111111\"\ndependencies = [\"wasi_bs_helper\"]\n\n\
+            [[package]]\nname = \"wasi_bs_helper\"\nversion = \"0.1.0\"\n";
+        let lock = Lock::read(lock_text.as_bytes(), alloc).expect("lock");
+
+        let mk_unit = |pkg: u32, name: &str, kind: UnitKind<'static>, feats: &[&str], deps: &[(&str, u32)], bs: Option<u32>| {
+            let mut d = OwnVec::new_in(alloc);
+            for &(dn, du) in deps {
+                d.push(UnitDep { name: Text::from_str_in(dn, alloc), unit: UnitId(du) });
+            }
+            let mut f = OwnVec::new_in(alloc);
+            for &feat in feats {
+                f.push(Text::from_str_in(feat, alloc));
+            }
+            let root = if kind == UnitKind::BuildScript { "build.rs" } else { "src/lib.rs" };
+            Unit {
+                package: LockId(pkg),
+                name: Text::from_str_in(name, alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in(name, alloc),
+                root: Text::from_str_in(root, alloc),
+                features: f,
+                cfg: OwnVec::new_in(alloc),
+                deps: d,
+                build_script: bs.map(UnitId),
+                links: None,
+            }
+        };
+
+        // wasm_graph:
+        //   0: demo_pm (ProcMacro, features=["feat_a"]) -> [1 (dep_lib)]
+        //   1: dep_lib (Lib, build_script=Some(2))
+        //   2: dep_lib (BuildScript) -> [3 (wasi_bs_helper)]
+        //   3: wasi_bs_helper (Lib, path)
+        let mut units = OwnVec::new_in(alloc);
+        units.push(mk_unit(0, "demo_pm", UnitKind::ProcMacro, &["feat_a"], &[("dep_lib", 1)], None));
+        units.push(mk_unit(1, "dep_lib", UnitKind::Lib, &[], &[], Some(2)));
+        units.push(mk_unit(1, "dep_lib", UnitKind::BuildScript, &[], &[("wasi_bs_helper", 3)], None));
+        units.push(mk_unit(2, "wasi_bs_helper", UnitKind::Lib, &[], &[], None));
+        let wg = UnitGraph { units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        // 1. Mismatched feature set (asking for ["feat_b"] when wasm_graph only has ["feat_a"])
+        //    must return `Err(ClosureError::WasmRootMissing)` instead of folding another variant.
+        let err_mismatch = deps_with_wasm_features("base", &lock, &wg, LockId(0), &["feat_b"], |_| Some("helper-v1"), alloc)
+            .expect_err("mismatched proc-macro features must be rejected");
+        assert_eq!(
+            err_mismatch,
+            ClosureError::WasmRootMissing { name: "demo_pm".to_owned(), version: "0.1.0".to_owned() }
+        );
+
+        // 2. Reachable dep's `build_script` WASI-only path build-dep MUST enter and invalidate the key.
+        let d_v1 = deps_with_wasm_features("base", &lock, &wg, LockId(0), &["feat_a"], |id| (id == LockId(2)).then_some("helper-v1"), alloc)
+            .expect("d_v1");
+        let d_v2 = deps_with_wasm_features("base", &lock, &wg, LockId(0), &["feat_a"], |id| (id == LockId(2)).then_some("helper-v2"), alloc)
+            .expect("d_v2");
+        assert_ne!(
+            d_v1.as_str(),
+            d_v2.as_str(),
+            "editing a dependency build-script's WASI-only path helper must move the proc-macro key"
+        );
+
+        // 3. Unpinned/missing digest for a reachable path dependency must return `Err(ClosureError::Unpinned)`
+        //    instead of silently succeeding with `"path:unpinned"`.
+        let err_unpinned = deps_with_wasm_features("base", &lock, &wg, LockId(0), &["feat_a"], |_| None::<&str>, alloc)
+            .expect_err("missing digest for reachable path dep must be refused");
+        assert_eq!(
+            err_unpinned,
+            ClosureError::Unpinned { name: "wasi_bs_helper".to_owned(), version: "0.1.0".to_owned() }
         );
     }
 

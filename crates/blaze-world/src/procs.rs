@@ -77,7 +77,9 @@ impl MacroIdentity {
     /// Folds the resolved `wasm64-blaze-wasip1` dependency closure's unified features (bound to
     /// each package's source pin) into this identity's `deps` digest so enabling, removing, or
     /// swapping features across dependencies (including same-name/same-version packages from
-    /// different sources) invalidates the proc-macro module key (rule 21).
+    /// different sources and dependency build-scripts) invalidates the proc-macro module key
+    /// (rule 21). Refuses mismatched `wasm_graph` roots and unpinned reachable path dependencies
+    /// with [`Unidentified::Closure`].
     pub fn with_wasm_features<D: AsRef<str>, A: core::alloc::Allocator + Copy>(
         mut self,
         lock: &Lock<'_>,
@@ -85,11 +87,12 @@ impl MacroIdentity {
         package: LockId,
         path_files: impl FnMut(LockId) -> Option<D>,
         alloc: A,
-    ) -> Self {
-        let folded = blaze_proc_macro::module::deps_with_wasm_features(&self.deps, lock, wasm_graph, package, &self.features, path_files, alloc);
+    ) -> Result<Self, Unidentified> {
+        let folded = blaze_proc_macro::module::deps_with_wasm_features(&self.deps, lock, wasm_graph, package, &self.features, path_files, alloc)
+            .map_err(Unidentified::Closure)?;
         self.deps.clear();
         self.deps.push_str(folded.as_str());
-        self
+        Ok(self)
     }
 
     /// Folds the 64-hex digest of dependency build-script probe/pin inputs into `self.deps`
