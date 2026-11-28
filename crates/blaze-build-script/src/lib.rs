@@ -76,6 +76,8 @@ mod git_tests;
 #[cfg(test)]
 mod metadata_ask_tests;
 #[cfg(test)]
+mod native_tests;
+#[cfg(test)]
 mod probe_ask_tests;
 #[cfg(test)]
 mod probe_check_tests;

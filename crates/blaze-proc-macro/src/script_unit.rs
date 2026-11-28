@@ -827,6 +827,22 @@ pub fn prepare_viewing_on<'a>(
     Ok(Prepared { loaded, script, env })
 }
 
+/// Reads the UTF-8 source text of a build script's root file (`unit.root`, package-relative) from
+/// `tree` under `root` for pre-run Tier-2 native placement (`placed_in_store_with_source`).
+pub fn script_source_in_tree<'a>(tree: &Tree, root: &ScriptRoot, unit_root: &str, alloc: Alloc<'a>) -> Option<blaze_own::AString<'a>> {
+    let script_rel = unit_root.trim_start_matches("./");
+    let bytes = match root.seen() {
+        blaze_expand::seen::SeenRoot::Package => tree.file(script_rel)?,
+        blaze_expand::seen::SeenRoot::Member { dir } if dir.is_empty() => tree.file(script_rel)?,
+        blaze_expand::seen::SeenRoot::Member { dir } => {
+            let full = blaze_own::format_in!(alloc, "{dir}/{script_rel}");
+            tree.file(full.as_str())?
+        }
+    };
+    let text = core::str::from_utf8(&bytes).ok()?;
+    Some(blaze_own::String::from_str_in(text, alloc))
+}
+
 /// `script`'s outputs, run as wasm, or native when [`placed`] says so for the setting's mode
 /// (D65, D69). The choice is made here, before
 /// anything runs, and is in the run's key; a failure either way is returned, never tried the
@@ -846,7 +862,16 @@ pub fn outputs<'a>(
     if unit.kind != UnitKind::BuildScript {
         return Err(UnitScriptError::NotAScript { unit: script });
     }
-    match crate::native_unit::placed_in_store(setting.store, graph, script, setting.mode, setting.host, alloc) {
+    let script_source = script_source_in_tree(&tree, &root, unit.root.as_str(), alloc);
+    match crate::native_unit::placed_in_store_with_source(
+        setting.store,
+        graph,
+        script,
+        setting.mode,
+        setting.host,
+        script_source.as_ref().map(|s| s.as_str()),
+        alloc,
+    ) {
         Runner::Wasm => {
             let prepared = prepare(runtime, setting, graph, script, tree, root, deps, alloc)?;
             runtime.run(&prepared.loaded, prepared.script, &prepared.env, alloc).map_err(UnitScriptError::Script)
@@ -899,7 +924,16 @@ pub fn outputs_viewing_on<'a>(
     if unit.kind != UnitKind::BuildScript {
         return Err(UnitScriptError::NotAScript { unit: script });
     }
-    match crate::native_unit::placed_in_store(setting.store, graph, script, setting.mode, setting.host, alloc) {
+    let script_source = script_source_in_tree(&tree, &root, unit.root.as_str(), alloc);
+    match crate::native_unit::placed_in_store_with_source(
+        setting.store,
+        graph,
+        script,
+        setting.mode,
+        setting.host,
+        script_source.as_ref().map(|s| s.as_str()),
+        alloc,
+    ) {
         Runner::Wasm => {
             let file_area = setting.store.join(blaze_build_script::outputs::FILE_AREA);
             let viewed = dep_mount::view_with_area(&tree, Some(&file_area), producers, deps, alloc)

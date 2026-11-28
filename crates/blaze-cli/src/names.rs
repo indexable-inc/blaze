@@ -1870,9 +1870,27 @@ fn make_world<'f>(
         script_units(world.crates.iter().map(|krate| krate.origin), |unit| graph.units[unit.index()].build_script),
         graph.units.len(),
         &script_scratch,
-        |script_id| {
-            let ran_as = crate::scripts::placement(Some(home), graph, script_id, heap);
+        |at, script_id| {
             let script = &graph.units[script_id.index()];
+            let base_ran_as = crate::scripts::placement(Some(home), graph, script_id, None, heap);
+            let ran_as = if base_ran_as == crate::scripts::RanAs::Native {
+                base_ran_as
+            } else {
+                let shown_from = world.crates.get(at).map(|krate| krate.input.shown_from).unwrap_or("");
+                let script_source = read_script_source_in_world(
+                    &span_cx,
+                    &reader.root,
+                    &env.fs,
+                    world.texts.packs(),
+                    lazy_trees,
+                    shown_from,
+                    script.root.as_str(),
+                    &io_scratch,
+                );
+                let placed = crate::scripts::placement(Some(home), graph, script_id, script_source, heap);
+                io_scratch.reset();
+                placed
+            };
             let features: &'static [&'static str] = {
                 let mut feat_buf: blaze_own::Vec<&'static str, &Frame> =
                     blaze_own::Vec::with_capacity_in(script.features.len(), &io_scratch);
@@ -1949,14 +1967,53 @@ struct ComputedScript {
     deps: Option<&'static str>,
 }
 
-/// Evaluates `compute(script_id)` at most once per unique `script_id` across all crate targets
-/// (`lib`, `bin`, `tests/*`, `benches/*`) that share that build-script unit, delivering each
-/// `(crate_at, script_id, computed)` to `emit`.
+/// Reads a build script's root file (`script_root`, package-relative) from either the checkout
+/// (`tree == 0`), an already-opened pack (`packs[tree - 1]`), or an on-demand lazy pack
+/// (`lazy_trees`), allocating only in `scratch`.
+#[expect(clippy::too_many_arguments, reason = "world source reader over checkout, fs, packs, lazy_trees, shown_from, root, and scratch")]
+fn read_script_source_in_world<'s>(
+    cx: &Cx,
+    checkout: &Dir<ReadOnly>,
+    fs: &bstd::fs::Fs,
+    packs: &[PackView<'s>],
+    lazy_trees: Option<&'s crate::body_types::SyncLazyTrees<'s>>,
+    shown_from: &str,
+    script_root: &str,
+    scratch: &'s Frame,
+) -> Option<&'s str> {
+    let rest = shown_from.strip_prefix('/')?;
+    let (tree_str, dir_part) = rest.split_once('/')?;
+    let tree_k: usize = tree_str.parse().ok()?;
+    let dir = dir_part.trim_end_matches('/');
+    let rel = script_root.trim_start_matches("./");
+    let full = if dir.is_empty() {
+        blaze_own::String::from_str_in(rel, scratch)
+    } else {
+        bstd::mem::format_in!(scratch, "{dir}/{rel}")
+    };
+    if tree_k == 0 {
+        let path = Path::new(full.as_str()).ok()?;
+        let mut bytes = Bytes::new_in(scratch, "script source for Tier-2 placement");
+        checkout.read_all(cx, &path, &mut bytes).ok()?;
+        let text = core::str::from_utf8(bytes.as_slice()).ok()?;
+        Some(scratch.alloc_str(text))
+    } else if let Some(lazy) = lazy_trees {
+        lazy.read_str(cx, fs, scratch, tree_k, full.as_str())
+    } else {
+        let view = packs.get(tree_k.checked_sub(1)?)?;
+        let bytes = view.read_slice(full.as_str(), scratch).ok().flatten()?;
+        core::str::from_utf8(bytes).ok()
+    }
+}
+
+/// Evaluates `compute(crate_at, script_id)` at most once per unique `script_id` across all crate
+/// targets (`lib`, `bin`, `tests/*`, `benches/*`) that share that build-script unit, delivering
+/// each `(crate_at, script_id, computed)` to `emit`.
 fn collect_dedup_script_units<T: Copy, E>(
     entries: impl IntoIterator<Item = (usize, blaze_unit_graph::UnitId)>,
     unit_count: usize,
     scratch: &Frame,
-    mut compute: impl FnMut(blaze_unit_graph::UnitId) -> Result<T, E>,
+    mut compute: impl FnMut(usize, blaze_unit_graph::UnitId) -> Result<T, E>,
     mut emit: impl FnMut(usize, blaze_unit_graph::UnitId, T),
 ) -> Result<(), E> {
     let mut cache: blaze_own::Vec<Option<T>, &Frame> = blaze_own::Vec::with_capacity_in(unit_count, scratch);
@@ -1968,12 +2025,12 @@ fn collect_dedup_script_units<T: Copy, E>(
             Some(slot) => match *slot {
                 Some(cached) => cached,
                 None => {
-                    let computed = compute(script_id)?;
+                    let computed = compute(at, script_id)?;
                     *slot = Some(computed);
                     computed
                 }
             },
-            None => compute(script_id)?,
+            None => compute(at, script_id)?,
         };
         emit(at, script_id, value);
     }
@@ -2421,7 +2478,7 @@ mod unresolved_tests {
             entries,
             8,
             &scratch,
-            |script_id| -> Result<u32, ()> {
+            |_at, script_id| -> Result<u32, ()> {
                 compute_calls.push(script_id);
                 Ok(script_id.0 * 10)
             },

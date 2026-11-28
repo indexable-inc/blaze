@@ -54,7 +54,7 @@ use blaze_drive::{Input, Kind, Name, Task, Want};
 use blaze_ids::ContentId;
 use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::{AVec, Alloc, Erased};
-use blaze_proc_macro::native_unit::{NativeSetting, placed};
+use blaze_proc_macro::native_unit::{NativeSetting, placed_in_store_with_source, placed_with_source};
 use blaze_proc_macro::script::ScriptRuntime;
 use blaze_proc_macro::script_sandbox::{ScriptRoot, Tree, dir_tree, mem_tree_with_submodules};
 use blaze_proc_macro::script_unit::{self, Setting, links_closure};
@@ -109,15 +109,56 @@ pub(crate) fn run_is_public(crate_public: bool, ran_as: RanAs) -> bool {
     crate_public && ran_as == RanAs::Wasm
 }
 
-/// How the run of build-script unit `script` is placed: D112 / D175 zero-Wasm choice point,
+/// How the run of build-script unit `script` is placed: D112 / D175 / Tier-2 pre-run choice point,
 /// made before anything runs; the same function the job asks (`job`), so the key and the run agree.
-pub(crate) fn placement(home: Option<&str>, graph: &UnitGraph<'_>, script: UnitId, alloc: Alloc<'_>) -> RanAs {
+pub(crate) fn placement(
+    home: Option<&str>,
+    graph: &UnitGraph<'_>,
+    script: UnitId,
+    script_source: Option<&str>,
+    alloc: Alloc<'_>,
+) -> RanAs {
     match home {
         Some(home) => {
             let store = Path::new(home).join(STORE_UNDER_HOME);
-            RanAs::of(&blaze_proc_macro::native_unit::placed_in_store(&store, graph, script, MODE, crate::graph::TRIPLE, alloc))
+            RanAs::of(&placed_in_store_with_source(&store, graph, script, MODE, crate::graph::TRIPLE, script_source, alloc))
         }
-        None => RanAs::of(&placed(graph, script, MODE, alloc)),
+        None => RanAs::of(&placed_with_source(graph, script, MODE, script_source, alloc)),
+    }
+}
+
+/// Reads the UTF-8 source text of a build script's root file (`script_root`, package-relative)
+/// from `files` into `scratch` without global heap allocation, for pre-run Tier-2 placement.
+fn read_script_source_in_files<'s>(
+    cx: &Cx,
+    checkout: &Dir<bstd::fs::ReadOnly>,
+    files: &Files<'s>,
+    script_root: &str,
+    scratch: &'s Frame,
+) -> Option<&'s str> {
+    let rel = script_root.trim_start_matches("./");
+    match files {
+        Files::Member { dir } | Files::External { dir } => {
+            let full = if dir.is_empty() {
+                blaze_own::String::from_str_in(rel, scratch)
+            } else {
+                bstd::mem::format_in!(scratch, "{dir}/{rel}")
+            };
+            let path = bstd::path::Path::new(full.as_str()).ok()?;
+            let mut bytes = bstd::mem::Bytes::new_in(scratch, "script source for Tier-2 placement");
+            checkout.read_all(cx, &path, &mut bytes).ok()?;
+            let text = core::str::from_utf8(bytes.as_slice()).ok()?;
+            Some(scratch.alloc_str(text))
+        }
+        Files::Pack { view, dir, .. } => {
+            let full = if dir.is_empty() {
+                blaze_own::String::from_str_in(rel, scratch)
+            } else {
+                bstd::mem::format_in!(scratch, "{dir}/{rel}")
+            };
+            let bytes = view.read_slice(full.as_str(), scratch).ok().flatten()?;
+            core::str::from_utf8(bytes).ok()
+        }
     }
 }
 
@@ -1542,20 +1583,24 @@ pub(crate) fn job<'f: 'j, 'j>(
         Ok(shared) => shared,
         Err(words) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{words}")), hole: true }),
     };
+    let mut io_scratch = match bstd::mem::Frame::new(bstd::mem::Tag::Other) {
+        Ok(scratch) => scratch,
+        Err(error) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{error}")), hole: true }),
+    };
     let ran_as = {
+        let script_source = read_script_source_in_files(&cx, &root.read_only(), &files, unit.root.as_str(), &io_scratch);
         let erased = blaze_own::Erased::new(frame);
-        RanAs::of(&blaze_proc_macro::native_unit::placed_in_store(
+        let placed = RanAs::of(&placed_in_store_with_source(
             &shared.store,
             graph,
             script,
             MODE,
             crate::graph::TRIPLE,
+            script_source,
             erased.handle(),
-        ))
-    };
-    let mut io_scratch = match bstd::mem::Frame::new(bstd::mem::Tag::Other) {
-        Ok(scratch) => scratch,
-        Err(error) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{error}")), hole: true }),
+        ));
+        io_scratch.reset();
+        placed
     };
     let dep_files = &mut scripts.dep_files;
     let deps_digest = match blaze_proc_macro::script_unit::script_deps_digest_with(
@@ -1735,9 +1780,18 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
         Ok(served) => served,
         Err(ran) => return ran,
     };
-    // The one choice point (D112 / D175 zero-Wasm), before anything runs: a script placed native
-    // needs the command's native setting, or fails naming why it has none.
-    let runner = blaze_proc_macro::native_unit::placed_in_store(&shared.store, graph, job.script, MODE, crate::graph::TRIPLE, alloc);
+    // The one choice point (D112 / D175 / Tier-2 pre-run), before anything runs: a script placed
+    // native needs the command's native setting, or fails naming why it has none.
+    let script_source = script_unit::script_source_in_tree(&tree, &root, unit.root.as_str(), alloc);
+    let runner = placed_in_store_with_source(
+        &shared.store,
+        graph,
+        job.script,
+        MODE,
+        crate::graph::TRIPLE,
+        script_source.as_ref().map(|s| s.as_str()),
+        alloc,
+    );
     let ran_as = RanAs::of(&runner);
     let native = match (runner, &shared.native) {
         // No SDK: a function of the run's key, which holds "no SDK" ([`Shared::no_sdk`]), so

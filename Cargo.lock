@@ -462,6 +462,7 @@ dependencies = [
  "blaze-spawn",
  "blaze-surface",
  "blaze-unit-graph",
+ "edition",
 ]
 
 [[package]]

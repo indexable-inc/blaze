@@ -1,0 +1,329 @@
+//! Tests for deterministic pre-run Tier-2 native build-script classification
+//! (`crate::native::NO_WASM_CLASS`, `source_requires_native`, `placement_with_source`).
+
+use blaze_manifest::lock::LockId;
+use blaze_own::{AVec, Alloc};
+use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
+use edition::PackageEdition;
+
+use crate::native::{
+    Closure, NO_WASM_CLASS, NativeSourceReason, Runner, closure, placement_with_source,
+    source_requires_native,
+};
+use crate::toolchain::Mode;
+
+fn t(s: &str) -> Text<'static> {
+    Text::from_str_in(s, Alloc::global())
+}
+
+fn unit(name: &str, kind: UnitKind<'static>, deps: &[u32]) -> Unit<'static> {
+    let mut d = AVec::new_in(Alloc::global());
+    for u in deps {
+        d.push(UnitDep { name: t("dep"), unit: UnitId(*u) });
+    }
+    Unit {
+        package: LockId(0),
+        name: t(name),
+        version: t("1.0.0"),
+        kind,
+        for_host: true,
+        feature_side: blaze_unit_graph::HostFeatureSide::Target,
+        edition: PackageEdition::of_manifest("2021").expect("an edition"),
+        crate_name: t(name),
+        root: t("build.rs"),
+        features: AVec::new_in(Alloc::global()),
+        cfg: AVec::new_in(Alloc::global()),
+        deps: d,
+        build_script: None,
+        links: None,
+    }
+}
+
+#[test]
+fn no_wasm_class_is_sorted_and_covers_protobuf_codegen_deps() {
+    assert!(NO_WASM_CLASS.is_sorted(), "NO_WASM_CLASS must stay sorted for binary_search");
+    for expected in [
+        "bindgen",
+        "clang-sys",
+        "libloading",
+        "prost-build",
+        "protobuf-build",
+        "protoc-bin-vendored",
+        "tonic-build",
+        "tonic-prost-build",
+    ] {
+        assert!(
+            NO_WASM_CLASS.binary_search(&expected).is_ok(),
+            "NO_WASM_CLASS missing {expected}"
+        );
+    }
+}
+
+#[test]
+fn raft_proto_and_codex_code_mode_protocol_closures_place_native_in_every_mode() {
+    let alloc = Alloc::global();
+    let mut units = AVec::new_in(alloc);
+    // 0: raft-proto build.rs -> protobuf-build (1) -> prost-build (2)
+    units.push(unit("raft-proto", UnitKind::BuildScript, &[1]));
+    units.push(unit("protobuf-build", UnitKind::Lib, &[2]));
+    units.push(unit("prost-build", UnitKind::Lib, &[]));
+    // 3: codex-code-mode-protocol build.rs -> tonic-prost-build (4), protoc-bin-vendored (5)
+    units.push(unit("codex-code-mode-protocol", UnitKind::BuildScript, &[4, 5]));
+    units.push(unit("tonic-prost-build", UnitKind::Lib, &[6]));
+    units.push(unit("protoc-bin-vendored", UnitKind::Lib, &[]));
+    units.push(unit("tonic-build", UnitKind::Lib, &[]));
+    // 7: pure build.rs with 0 build-deps
+    units.push(unit("pure", UnitKind::BuildScript, &[]));
+    let graph = UnitGraph {
+        units,
+        resolver: Resolver::V3,
+        meta: AVec::new_in(alloc),
+        left_out: AVec::new_in(alloc),
+    };
+
+    let raft = closure(&graph, UnitId(0), alloc);
+    assert_eq!(raft.no_wasm, Some(UnitId(1)));
+    let codex = closure(&graph, UnitId(3), alloc);
+    assert_eq!(codex.no_wasm, Some(UnitId(4)));
+    let pure = closure(&graph, UnitId(7), alloc);
+    assert_eq!(pure, Closure { runner: Runner::Wasm, no_wasm: None });
+
+    for mode in [Mode::Check, Mode::Build, Mode::Run] {
+        assert_eq!(
+            placement_with_source(raft, mode, "raft-proto", UnitId(0), None),
+            Runner::Native { because: UnitId(1) },
+            "raft-proto {mode:?}"
+        );
+        assert_eq!(
+            placement_with_source(codex, mode, "codex-code-mode-protocol", UnitId(3), None),
+            Runner::Native { because: UnitId(4) },
+            "codex-code-mode-protocol {mode:?}"
+        );
+        assert_eq!(
+            placement_with_source(pure, mode, "pure", UnitId(7), Some("fn main() {}")),
+            Runner::Wasm,
+            "pure {mode:?}"
+        );
+    }
+}
+
+#[test]
+fn kvm_ioctls_host_os_std_and_unsafe_extern_c_classify_native() {
+    let kvm_ioctls = r#"
+        fn main() {
+            if std::path::Path::new("/dev/sev").exists() && kvm_supports_memory_encrypt() {
+                println!("cargo:rustc-cfg=has_sev");
+            }
+        }
+        fn kvm_supports_memory_encrypt() -> bool {
+            use std::os::unix::io::AsRawFd;
+            let Ok(kvm) = std::fs::File::open("/dev/kvm") else { return false; };
+            unsafe extern "C" {
+                fn ioctl(fd: std::ffi::c_int, request: std::ffi::c_ulong, ...) -> std::ffi::c_int;
+            }
+            unsafe { ioctl(kvm.as_raw_fd(), 0xAE03, 120) > 0 }
+        }
+    "#;
+    assert_eq!(source_requires_native(kvm_ioctls), Some(NativeSourceReason::HostOsStd));
+
+    let extern_only = r#"
+        fn main() {
+            extern "C" {
+                fn access(path: *const i8, mode: i32) -> i32;
+            }
+        }
+    "#;
+    assert_eq!(source_requires_native(extern_only), Some(NativeSourceReason::ExternC));
+
+    let unsafe_extern_system = r#"
+        unsafe extern "system" {
+            fn GetVersion() -> u32;
+        }
+        fn main() {}
+    "#;
+    assert_eq!(source_requires_native(unsafe_extern_system), Some(NativeSourceReason::ExternC));
+
+    let global_std_os_fd = r#"
+        fn main() {
+            let _ = ::std::os::fd::AsRawFd::as_raw_fd;
+        }
+    "#;
+    assert_eq!(source_requires_native(global_std_os_fd), Some(NativeSourceReason::HostOsStd));
+
+    let grouped_std_os = r#"
+        use std::os::{unix::io::AsRawFd};
+        fn main() {}
+    "#;
+    assert_eq!(source_requires_native(grouped_std_os), Some(NativeSourceReason::HostOsStd));
+
+    let wasm_closure = Closure { runner: Runner::Wasm, no_wasm: None };
+    for mode in [Mode::Check, Mode::Build, Mode::Run] {
+        assert_eq!(
+            placement_with_source(wasm_closure, mode, "kvm-ioctls", UnitId(9), Some(kvm_ioctls)),
+            Runner::Native { because: UnitId(9) }
+        );
+    }
+}
+
+#[test]
+fn rustler_host_family_cfg_classifies_native() {
+    let rustler = r#"
+        fn main() {
+            let target_family_or_current =
+                std::env::var("CARGO_CFG_TARGET_FAMILY").unwrap_or_else(|_| std::env::consts::FAMILY.to_string());
+            let target_family = if target_family_or_current == "windows" {
+                "win"
+            } else if cfg!(target_family = "unix") {
+                "unix"
+            } else {
+                panic!("Unsupported Operational System Family")
+            };
+            let _ = target_family;
+        }
+    "#;
+    assert_eq!(source_requires_native(rustler), Some(NativeSourceReason::HostFamilyCfg));
+    assert_eq!(
+        source_requires_native("fn main() { if cfg!(unix) { println!(\"unix\"); } }"),
+        Some(NativeSourceReason::HostFamilyCfg)
+    );
+    assert_eq!(
+        source_requires_native("fn main() { if cfg!(all(target_family = \"unix\", feature = \"x\")) {} }"),
+        Some(NativeSourceReason::HostFamilyCfg)
+    );
+
+    let wasm_closure = Closure { runner: Runner::Wasm, no_wasm: None };
+    assert_eq!(
+        placement_with_source(wasm_closure, Mode::Check, "rustler", UnitId(4), Some(rustler)),
+        Runner::Native { because: UnitId(4) }
+    );
+}
+
+#[test]
+fn negative_controls_stay_wasm() {
+    // 1. Guarded std::os::unix import (single statement).
+    let guarded_use = r#"
+        #[cfg(unix)]
+        use std::os::unix::io::AsRawFd;
+        fn main() {}
+    "#;
+    assert_eq!(source_requires_native(guarded_use), None);
+
+    // 2. Real psm-0.1.32 pattern: #[cfg(unix)] let (...) = { use std::os::unix::fs::MetadataExt; ... };
+    let psm_guarded_let = r#"
+        fn main() {
+            #[cfg(unix)]
+            let (uid, gid, perms) = {
+                use std::os::unix::fs::MetadataExt;
+                (0u32, 0u32, 0u32)
+            };
+            println!("cargo:rerun-if-changed=build.rs");
+        }
+    "#;
+    assert_eq!(source_requires_native(psm_guarded_let), None);
+
+    // 3. Guarded extern "C" block (target_os, not(target_family = "wasm"), all(unix, ...)).
+    let guarded_extern = r#"
+        #[cfg(target_os = "linux")]
+        extern "C" {
+            fn foo();
+        }
+        #[cfg(not(target_family = "wasm"))]
+        unsafe extern "C" {
+            fn bar();
+        }
+        #[cfg(all(unix, feature = "extra"))]
+        fn helper() {
+            use std::os::macos::fs::MetadataExt;
+            extern "C" { fn baz(); }
+        }
+        fn main() {}
+    "#;
+    assert_eq!(source_requires_native(guarded_extern), None);
+
+    // 4. Inner #![cfg(unix)] inside a submodule.
+    let inner_cfg_mod = r#"
+        mod unix_only {
+            #![cfg(unix)]
+            use std::os::unix::io::AsRawFd;
+            extern "C" { fn close(fd: i32) -> i32; }
+        }
+        fn main() {}
+    "#;
+    assert_eq!(source_requires_native(inner_cfg_mod), None);
+
+    // 5. CARGO_CFG_TARGET_FAMILY env check and dtolnay's cfg!(target_os = "linux") cleanup check
+    //    (anyhow, proc-macro2, thiserror) MUST stay Wasm.
+    let env_and_dtolnay_linux_check = r#"
+        fn main() {
+            let fam = std::env::var("CARGO_CFG_TARGET_FAMILY").unwrap_or_default();
+            if fam == "unix" {
+                println!("cargo:rustc-cfg=is_unix");
+            }
+            if cfg!(target_os = "linux") || cfg!(windows) || cfg!(any(unix, target_os = "wasi")) {
+                println!("ok");
+            }
+        }
+    "#;
+    assert_eq!(source_requires_native(env_and_dtolnay_linux_check), None);
+
+    // 6. Comments (line + nested block comments) and string / raw-string / byte-string / char literals
+    //    (including libsqlite3-sys's raw_line(r#"extern "C" { ... "#)).
+    let comments_and_strings = r####"
+        // use std::os::unix::io::AsRawFd;
+        // extern "C" { fn ioctl(); }
+        /* outer /* nested */ use std::os::linux::fs::MetadataExt; extern "C" { fn x(); } */
+        fn main() {
+            let a = "use std::os::unix::io::AsRawFd; extern \"C\" { fn foo(); }";
+            let b = r#"extern "C" { pub fn sqlite3_auto_extension(); } std::os::unix::io::AsRawFd"#;
+            let c = br##"cfg!(target_family = "unix") std::os::fd::AsRawFd"##;
+            let d = 'a';
+            let e = '\'';
+            let f: &'static str = "cfg!(unix)";
+            let _ = (a, b, c, d, e, f);
+        }
+    "####;
+    assert_eq!(source_requires_native(comments_and_strings), None);
+
+    // 7. `extern "C" fn` signatures and `extern crate` are NOT extern blocks.
+    let extern_fn_and_crate = r#"
+        extern crate core;
+        type Cb = unsafe extern "C" fn(i32) -> i32;
+        pub extern "C" fn exported(x: i32) -> i32 { x }
+        fn main() {
+            let _: Cb = exported;
+        }
+    "#;
+    assert_eq!(source_requires_native(extern_fn_and_crate), None);
+
+    // 8. Guard on one item does NOT leak to the next item!
+    let guard_does_not_leak = r#"
+        #[cfg(unix)]
+        use std::os::unix::io::AsRawFd;
+        use std::os::linux::fs::MetadataExt;
+        fn main() {}
+    "#;
+    assert_eq!(source_requires_native(guard_does_not_leak), Some(NativeSourceReason::HostOsStd));
+
+    let fn_guard_does_not_leak = r#"
+        #[cfg(unix)]
+        fn guarded() {
+            use std::os::unix::io::AsRawFd;
+        }
+        fn unguarded() {
+            extern "C" { fn foo(); }
+        }
+        fn main() {}
+    "#;
+    assert_eq!(source_requires_native(fn_guard_does_not_leak), Some(NativeSourceReason::ExternC));
+
+    // 9. #[cfg(not(windows))] is TRUE on WASI, so host-OS std inside it is NOT guarded against WASI.
+    let not_windows_active_on_wasi = r#"
+        #[cfg(not(windows))]
+        use std::os::unix::io::AsRawFd;
+        fn main() {}
+    "#;
+    assert_eq!(
+        source_requires_native(not_windows_active_on_wasi),
+        Some(NativeSourceReason::HostOsStd)
+    );
+}

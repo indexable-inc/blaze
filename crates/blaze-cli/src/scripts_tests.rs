@@ -208,3 +208,86 @@ fn scripts_no_sdk_refusal_names_both_attempts() {
     assert!(words.contains("export SDKROOT="), "{words}");
     println!("refusal names both");
 }
+
+/// Placement parity across `blaze-proc-macro::native_unit::placed_in_store_with_source`,
+/// `blaze-proc-macro::script_unit::script_source_in_tree`, and `blaze-cli::scripts::placement`
+/// (Rule 30 single source of truth): every call site agrees on protobuf codegen closures
+/// (`raft-proto`, `codex-code-mode-protocol`), host-OS source (`kvm-ioctls`, `rustler`), and
+/// pure-Rust negative controls (`psm`, `anyhow`, `libsqlite3-sys` raw string).
+#[test]
+fn scripts_placement_parity_with_proc_macro_and_tree_source() {
+    use blaze_proc_macro::native_unit::placed_in_store_with_source;
+    use blaze_proc_macro::script_sandbox::{ScriptRoot, mem_tree_with_submodules};
+    use blaze_proc_macro::script_unit::script_source_in_tree;
+
+    use super::{MODE, RanAs, placement};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut units = AVec::new_in(alloc.clone());
+    // 0: kvm-ioctls (0 build-deps, host-OS std + unsafe extern "C" in build.rs)
+    units.push(unit(0, "kvm-ioctls", UnitKind::BuildScript, &[], None, None));
+    // 1: rustler (0 build-deps, cfg!(target_family = "unix") in build.rs)
+    units.push(unit(1, "rustler", UnitKind::BuildScript, &[], None, None));
+    // 2: raft-proto -> protobuf-build (3)
+    units.push(unit(2, "raft-proto", UnitKind::BuildScript, &[3], None, None));
+    units.push(unit(3, "protobuf-build", UnitKind::Lib, &[], None, None));
+    // 4: pure crate (0 build-deps, guarded #[cfg(unix)] / raw string / dtolnay linux check)
+    units.push(unit(4, "pure-crate", UnitKind::BuildScript, &[], None, None));
+    for id in [0usize, 1, 2, 4] {
+        units[id].root = t("build.rs");
+    }
+    let graph = UnitGraph { units, resolver: Resolver::V3, meta: AVec::new_in(alloc.clone()), left_out: AVec::new_in(alloc.clone()) };
+
+    let empty_home = "/nonexistent-blaze-t2-parity-home";
+    let empty_store = std::path::Path::new(empty_home).join(super::STORE_UNDER_HOME);
+
+    let cases: &[(UnitId, &str, RanAs)] = &[
+        (
+            UnitId(0),
+            "fn f() { use std::os::unix::io::AsRawFd; unsafe extern \"C\" { fn ioctl(); } }",
+            RanAs::Native,
+        ),
+        (
+            UnitId(1),
+            "fn main() { if cfg!(target_family = \"unix\") {} else { panic!(); } }",
+            RanAs::Native,
+        ),
+        (UnitId(2), "fn main() {}", RanAs::Native),
+        (
+            UnitId(4),
+            "#[cfg(unix)] let x = { use std::os::unix::fs::MetadataExt; 1 }; fn main() { let _ = r#\"extern \"C\" {\"#; if cfg!(target_os = \"linux\") {} }",
+            RanAs::Wasm,
+        ),
+    ];
+
+    for &(script_id, src, expected) in cases {
+        let tree = mem_tree_with_submodules([("build.rs", src.as_bytes())], [], "", None);
+        let root = ScriptRoot::package();
+        let read_src = script_source_in_tree(&tree, &root, "build.rs", alloc.clone()).expect("build.rs in mem tree");
+        assert_eq!(read_src.as_str(), src);
+
+        let via_cli = placement(Some(empty_home), &graph, script_id, Some(read_src.as_str()), alloc.clone());
+        let via_proc_macro = RanAs::of(&placed_in_store_with_source(
+            &empty_store,
+            &graph,
+            script_id,
+            MODE,
+            crate::graph::TRIPLE,
+            Some(read_src.as_str()),
+            alloc.clone(),
+        ));
+        assert_eq!(via_cli, expected, "cli placement mismatch for {:?}", script_id);
+        assert_eq!(via_proc_macro, expected, "proc_macro placement mismatch for {:?}", script_id);
+        assert_eq!(via_cli, via_proc_macro, "cli and proc_macro placement drifted for {:?}", script_id);
+    }
+
+    // Rule 21 check: editing build.rs changes RanAs -> changes both ScriptModule subject and Script part source.
+    let wasm_subj = crate::script_modules::subject(RanAs::Wasm, "kvm-ioctls", "0.24.0", &[], Some("aaa"), None);
+    let native_subj = crate::script_modules::subject(RanAs::Native, "kvm-ioctls", "0.24.0", &[], Some("bbb"), None);
+    assert_ne!(wasm_subj, native_subj, "Wasm vs Native ScriptModule subjects must differ (rule 21)");
+    let id_a = blaze_ids::ContentId([1; 32]);
+    let id_b = blaze_ids::ContentId([2; 32]);
+    let wasm_part = super::parts([(id_a, id_b, RanAs::Wasm)].into_iter(), None)[0].1;
+    let native_part = super::parts([(id_a, id_b, RanAs::Native)].into_iter(), None)[0].1;
+    assert_ne!(wasm_part, native_part, "Wasm vs Native Script part keys must differ (rule 21)");
+}

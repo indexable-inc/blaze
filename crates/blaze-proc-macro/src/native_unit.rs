@@ -55,7 +55,28 @@ pub use blaze_build_script::toolchain::MACOS_MIN;
 /// [`NativeSetting`] (made once by [`crate::native_setting::command_native_setting`]) or is
 /// refused by name ([`NativeUnitError::NoNativeSetting`]); it is never tried as wasm (rule 3).
 pub fn placed(graph: &UnitGraph<'_>, script: UnitId, mode: Mode, alloc: Alloc<'_>) -> Runner {
-    toolchain::placement(native::closure(graph, script, alloc), mode, graph.units[script.index()].name.as_str())
+    placed_with_source(graph, script, mode, None, alloc)
+}
+
+/// Like [`placed`], also inspecting `script_source` (when `Some`) via
+/// [`native::placement_with_source`] so build scripts with 0 build-dependencies that reference
+/// host-OS `std::os::*`, `extern "C" { ... }` blocks, or `cfg!(target_family = "unix")` are
+/// deterministically placed on [`Runner::Native`] before compilation or execution (rules 3, 30, 54).
+pub fn placed_with_source(
+    graph: &UnitGraph<'_>,
+    script: UnitId,
+    mode: Mode,
+    script_source: Option<&str>,
+    alloc: Alloc<'_>,
+) -> Runner {
+    let package = graph.units.get(script.index()).map_or("", |u| u.name.as_str());
+    native::placement_with_source(
+        native::closure(graph, script, alloc),
+        mode,
+        package,
+        script,
+        script_source,
+    )
 }
 
 /// Like [`placed`], but honors the D175 zero-Wasm fast path: whenever `store` holds a native
@@ -70,7 +91,21 @@ pub fn placed_in_store(
     host: &str,
     alloc: Alloc<'_>,
 ) -> Runner {
-    let base = placed(graph, script, mode, alloc);
+    placed_in_store_with_source(store, graph, script, mode, host, None, alloc)
+}
+
+/// Like [`placed_in_store`], also honoring deterministic pre-run source classification via
+/// [`placed_with_source`] (rules 3, 30, 54).
+pub fn placed_in_store_with_source(
+    store: &Path,
+    graph: &UnitGraph<'_>,
+    script: UnitId,
+    mode: Mode,
+    host: &str,
+    script_source: Option<&str>,
+    alloc: Alloc<'_>,
+) -> Runner {
+    let base = placed_with_source(graph, script, mode, script_source, alloc);
     if matches!(base, Runner::Native { .. }) {
         return base;
     }
@@ -1111,6 +1146,55 @@ mod tests {
         assert_eq!(sdk_version(r#"{"CanonicalName":"macosx27.2","Version":"27.2"}"#), Some("27.2"));
         assert_eq!(sdk_version("{\n  \"Version\" : \"15.0\",\n}"), Some("15.0"));
         assert_eq!(sdk_version(r#"{"CanonicalName":"macosx"}"#), None);
+    }
+
+    #[test]
+    fn placed_with_source_and_store_classify_protobuf_and_host_os_sources_deterministically() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut units = AVec::new_in(alloc);
+        units.push(unit("kvm-ioctls", UnitKind::BuildScript, &[], None)); // 0
+        units.push(unit("rustler", UnitKind::BuildScript, &[], None)); // 1
+        units.push(unit("raft-proto", UnitKind::BuildScript, &[3], None)); // 2
+        units.push(unit("protobuf-build", UnitKind::Lib, &[4], None)); // 3
+        units.push(unit("prost-build", UnitKind::Lib, &[], None)); // 4
+        units.push(unit("codex-code-mode-protocol", UnitKind::BuildScript, &[6, 7], None)); // 5
+        units.push(unit("tonic-prost-build", UnitKind::Lib, &[8], None)); // 6
+        units.push(unit("protoc-bin-vendored", UnitKind::Lib, &[], None)); // 7
+        units.push(unit("tonic-build", UnitKind::Lib, &[], None)); // 8
+        let graph = UnitGraph { units, resolver: Resolver::V3, meta: AVec::new_in(alloc), left_out: AVec::new_in(alloc) };
+
+        let empty_store = std::path::Path::new("/nonexistent-blaze-t2-empty-store");
+        let host = "aarch64-unknown-linux-gnu";
+        let kvm_src = "fn f() { use std::os::unix::io::AsRawFd; unsafe extern \"C\" { fn ioctl(); } }";
+        let rustler_src = "fn main() { if cfg!(target_family = \"unix\") {} }";
+        let guarded_src = "#[cfg(unix)] use std::os::unix::io::AsRawFd; fn main() {}";
+
+        for mode in [Mode::Check, Mode::Build, Mode::Run] {
+            assert_eq!(
+                super::placed_with_source(&graph, UnitId(0), mode, Some(kvm_src), alloc),
+                Runner::Native { because: UnitId(0) }
+            );
+            assert_eq!(
+                super::placed_in_store_with_source(empty_store, &graph, UnitId(0), mode, host, Some(kvm_src), alloc),
+                Runner::Native { because: UnitId(0) }
+            );
+            assert_eq!(
+                super::placed_in_store_with_source(empty_store, &graph, UnitId(0), mode, host, Some(guarded_src), alloc),
+                Runner::Wasm
+            );
+            assert_eq!(
+                super::placed_in_store_with_source(empty_store, &graph, UnitId(1), mode, host, Some(rustler_src), alloc),
+                Runner::Native { because: UnitId(1) }
+            );
+            assert_eq!(
+                super::placed_in_store_with_source(empty_store, &graph, UnitId(2), mode, host, None, alloc),
+                Runner::Native { because: UnitId(3) }
+            );
+            assert_eq!(
+                super::placed_in_store_with_source(empty_store, &graph, UnitId(5), mode, host, None, alloc),
+                Runner::Native { because: UnitId(6) }
+            );
+        }
     }
 
     #[test]

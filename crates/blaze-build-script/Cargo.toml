@@ -44,6 +44,7 @@ blaze-sim.workspace = true
 blaze-manifest = { workspace = true, default-features = false }
 # The census reads sources from the fetch store's records (`PackView`), never cargo's caches.
 blaze-fetch.workspace = true
+edition.workspace = true
 
 [lints]
 workspace = true
