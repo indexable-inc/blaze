@@ -85,6 +85,8 @@ fn kind(routed: &Route<'_>) -> &'static str {
         Route::Fact(Fact::SwVers { .. }) => "fact sw_vers",
         Route::Fact(Fact::CompilerVersion { .. }) => "fact compiler",
         Route::Fact(Fact::CcProbe { .. }) => "fact probe",
+        Route::Fact(Fact::RustcVersion { .. }) => "fact rustc",
+        Route::Fact(Fact::CargoVersion) => "fact cargo",
         Route::Deferred => "deferred",
         Route::Executor => "executor",
         Route::Refused => "refused",

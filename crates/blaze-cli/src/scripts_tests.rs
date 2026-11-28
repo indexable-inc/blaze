@@ -169,7 +169,7 @@ fn scripts_a_native_runs_key_holds_the_sdks_version_not_its_folder() {
     use blaze_apple_sdk::{Sdk, Unread, XcrunFailed, resolve};
     use blaze_ids::ContentId;
 
-    use super::{RanAs, parts};
+    use super::{NativeSysrootId, RanAs, parts};
 
     let sdk = |folder: &'static str, settings: &'static str, build: &'static str| -> Sdk<'static> {
         resolve(
@@ -185,7 +185,9 @@ fn scripts_a_native_runs_key_holds_the_sdks_version_not_its_folder() {
     let tools = sdk("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", r#"{"Version":"27.2"}"#, b118);
     let older = sdk("/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk", r#"{"Version":"26.5"}"#, "<key>ProductBuildVersion</key><string>25F70</string>");
     let beta = sdk("/Library/Developer/CommandLineTools/SDKs/MacOSX27.2.sdk", r#"{"Version":"27.2"}"#, "<key>ProductBuildVersion</key><string>26B5044k</string>");
-    let key = |ran_as: RanAs, sdk: Option<&Sdk<'_>>| parts([(ContentId([1; 32]), ContentId([2; 32]), ran_as)].into_iter(), sdk.map(|sdk| sdk.identity()))[0].1;
+    let key = |ran_as: RanAs, sdk: Option<&Sdk<'_>>| {
+        parts([(ContentId([1; 32]), ContentId([2; 32]), ran_as)].into_iter(), sdk.map(|sdk| NativeSysrootId::Macos(sdk.identity())))[0].1
+    };
 
     assert_eq!(key(RanAs::Native, Some(&xcode)), key(RanAs::Native, Some(&tools)), "one SDK version in two folders keyed two native runs");
     assert_ne!(key(RanAs::Native, Some(&xcode)), key(RanAs::Native, Some(&older)), "two SDK versions keyed one native run");
@@ -194,6 +196,63 @@ fn scripts_a_native_runs_key_holds_the_sdks_version_not_its_folder() {
     assert_eq!(key(RanAs::Wasm, Some(&xcode)), key(RanAs::Wasm, Some(&older)), "a wasm run's key moved with the SDK");
     assert_eq!(key(RanAs::Wasm, Some(&xcode)), key(RanAs::Wasm, None), "a wasm run's key moved with the SDK's presence");
     println!("sdk keyed by version");
+}
+
+/// Linux `NativeSysrootId::LinuxHost` keys native `Script` tasks by the 32-byte sysroot content
+/// digest (Rule 21), moves when `sdk_version` changes, distinguishes missing Linux sysroot
+/// (`None`) cleanly, and leaves `RanAs::Wasm` keys untouched.
+#[test]
+fn scripts_linux_native_sysroot_id_moves_key_and_handles_missing_sysroot() {
+    use blaze_ids::ContentId;
+    use bstd::io::{Io, Limits, SimWorld};
+
+    use super::{NativeSysrootId, RanAs, parts, sdk_identity};
+    use crate::fetch::FetchEnv;
+    use crate::sdk::{LinuxHostSysroot, ResolvedLinuxHost};
+
+    let linux_a = NativeSysrootId::LinuxHost([0x11; 32]);
+    let linux_b = NativeSysrootId::LinuxHost([0x22; 32]);
+    let key = |ran_as: RanAs, sdk: Option<NativeSysrootId>| {
+        parts([(ContentId([1; 32]), ContentId([2; 32]), ran_as)].into_iter(), sdk)[0].1
+    };
+
+    assert_ne!(key(RanAs::Native, Some(linux_a)), key(RanAs::Native, Some(linux_b)), "changing Linux sdk_version must move the native Script key");
+    assert_ne!(key(RanAs::Native, Some(linux_a)), key(RanAs::Native, None), "missing Linux sysroot must key distinctly from a resolved Linux sysroot");
+    assert_eq!(key(RanAs::Wasm, Some(linux_a)), key(RanAs::Wasm, Some(linux_b)), "wasm Script key must not move with Linux sysroot digest");
+    assert_eq!(key(RanAs::Wasm, Some(linux_a)), key(RanAs::Wasm, None), "wasm Script key must not move when Linux sysroot is absent");
+
+    let io = Io::simulated(SimWorld::new(7, Limits::USUAL));
+    let mut env = FetchEnv {
+        clock: io.need_clock().expect("sim clock"),
+        checkout: "",
+        served: crate::engine_script_reads::Served::Simulated,
+        cert_file: None,
+        cert_dir: None,
+        rustflags: blaze_manifest::rustflags::RustflagsEnv::default(),
+        home: Some("/h"),
+        cargo_home: None,
+        start: None,
+        toolchain: blaze_toolchain::PINNED,
+        fs: io.need_fs().expect("sim fs"),
+        sdk: crate::sdk::NONE_IN_TESTS,
+        linux_sysroot: Ok(None),
+        exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
+        lan_peer: crate::fetch::LanPeerConfig::DISABLED,
+        heap: blaze_own::testing::heap(),
+    };
+    assert_eq!(sdk_identity(&env), None, "cleanly absent Linux sysroot yields None");
+    env.linux_sysroot = Err("broken nix-support/libc-cflags");
+    assert_eq!(sdk_identity(&env), None, "failed Linux sysroot probe yields None");
+    env.linux_sysroot = Ok(Some(ResolvedLinuxHost {
+        sysroot: LinuxHostSysroot {
+            dir: "/nix/store/abc-glibc-dev",
+            lib_dir: Some("/nix/store/def-glibc/lib"),
+            dynamic_linker: Some("/nix/store/def-glibc/lib/ld-linux-aarch64.so.1"),
+            rpaths: &[],
+        },
+        id: [0x11; 32],
+    }));
+    assert_eq!(sdk_identity(&env), Some(linux_a), "resolved Linux host sysroot yields NativeSysrootId::LinuxHost");
 }
 
 /// The refusal a native script fails with when the command has no SDK is the resolution's own

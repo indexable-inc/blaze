@@ -73,7 +73,7 @@ use crate::work::Record;
 #[cfg(test)]
 #[path = "scripts_tests.rs"]
 mod tests;
-const SOURCE_DOMAIN: &str = "blaze-cli script unit source 1";
+const SOURCE_DOMAIN: &str = "blaze-cli script unit source 2";
 /// The out: the outputs record's bytes ("1": `bzbsout4`, blaze-build-script's form).
 const OUT_DOMAIN: &str = "blaze-cli script outputs out 1";
 /// The rule a refusal of this task names.
@@ -191,25 +191,62 @@ pub(crate) fn name_of(graph: &UnitGraph<'_>, script: UnitId, side: Side, alloc: 
     subject(graph, script, side, alloc).map(|subject| Name::new(Kind::Script, subject))
 }
 
-/// The identity of the command's macOS SDK (blaze-apple-sdk `Sdk::identity`: its version and
-/// build, never its folder), which a native run's key holds; `None` when the command has none,
-/// and then a native run fails naming why ([`run`]).
-pub(crate) fn sdk_identity(env: &FetchEnv<'_>) -> Option<blaze_apple_sdk::SdkId> {
-    env.sdk.ok().map(|sdk| sdk.identity())
+/// Platform-neutral target C library sysroot identity hashed into a native `Script` task's
+/// source key (Rule 21): never a host folder path (Rule 25).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NativeSysrootId {
+    /// macOS SDK version + build identity (`blaze-apple-sdk`).
+    Macos(blaze_apple_sdk::SdkId),
+    /// Linux host sysroot content SHA-256 (`include/features.h` on FHS `/usr`, or the full
+    /// NixOS split header/lib/rpath/dynamic-linker content tree).
+    LinuxHost([u8; 32]),
 }
 
-/// What a run's key holds of the macOS SDK (rule 21): a native run's compiles and links are
-/// made against it, so its identity ([`sdk_identity`]; a marker for none); a wasm run reads no
-/// SDK, so nothing, and its key moves with no SDK change.
-fn sdk_bytes(ran_as: RanAs, sdk: Option<blaze_apple_sdk::SdkId>) -> ([u8; 1 + blaze_apple_sdk::SdkId::KEY_LEN], usize) {
-    let mut out = [0; 1 + blaze_apple_sdk::SdkId::KEY_LEN];
+/// The identity of the command's target C library sysroot (macOS `SdkId` or Linux host sysroot
+/// content SHA-256, never its folder), which a native run's key holds; `None` when the command
+/// has none, and then a native run fails naming why ([`run`]).
+pub(crate) fn sdk_identity(env: &FetchEnv<'_>) -> Option<NativeSysrootId> {
+    if let Ok(sdk) = env.sdk {
+        return Some(NativeSysrootId::Macos(sdk.identity()));
+    }
+    if let Ok(Some(linux)) = env.linux_sysroot {
+        return Some(NativeSysrootId::LinuxHost(linux.id));
+    }
+    None
+}
+
+const MAX_SDK_KEY_LEN: usize = if blaze_apple_sdk::SdkId::KEY_LEN > 32 {
+    blaze_apple_sdk::SdkId::KEY_LEN
+} else {
+    32
+};
+
+/// What a run's key holds of the target C library sysroot (rule 21): a native run's compiles and
+/// links are made against it, so its identity ([`sdk_identity`]; a marker for none); a wasm run
+/// reads no SDK/sysroot, so nothing, and its key moves with no SDK change.
+fn sdk_bytes(ran_as: RanAs, sdk: Option<NativeSysrootId>) -> ([u8; 1 + MAX_SDK_KEY_LEN], usize) {
+    let mut out = [0; 1 + MAX_SDK_KEY_LEN];
     match (ran_as, sdk) {
         (RanAs::Wasm, _) => (out, 0),
         (RanAs::Native, None) => (out, 1),
-        (RanAs::Native, Some(id)) => {
-            out[0] = 1;
-            out[1..].copy_from_slice(&id.key());
-            (out, out.len())
+        (RanAs::Native, Some(NativeSysrootId::Macos(id))) => {
+            if let Some(tag) = out.first_mut() {
+                *tag = 1;
+            }
+            let key = id.key();
+            if let Some(dst) = out.get_mut(1..1 + key.len()) {
+                dst.copy_from_slice(&key);
+            }
+            (out, 1 + key.len())
+        }
+        (RanAs::Native, Some(NativeSysrootId::LinuxHost(digest))) => {
+            if let Some(tag) = out.first_mut() {
+                *tag = 2;
+            }
+            if let Some(dst) = out.get_mut(1..33) {
+                dst.copy_from_slice(&digest);
+            }
+            (out, 33)
         }
     }
 }
@@ -230,9 +267,9 @@ pub(crate) fn deps_wasm_graph<'g>(
 
 /// The `Script` parts of a world whose crates read the runs `keys` (`Names::script_keys`: each
 /// run's subject and its reading crate's world key, named with the crates' `CrateScope` parts),
-/// for a command whose macOS SDK is `sdk` ([`sdk_identity`]): one a subject, sorted and without
-/// repeats (two crates of one subject read one run, and have one crate key: ruling D115 (3)).
-pub(crate) fn parts(keys: impl Iterator<Item = (ContentId, ContentId, RanAs)>, sdk: Option<blaze_apple_sdk::SdkId>) -> std::vec::Vec<(Name, ContentId), Global> {
+/// for a command whose target sysroot is `sdk` ([`sdk_identity`]): one a subject, sorted and
+/// without repeats (two crates of one subject read one run, and have one crate key: ruling D115 (3)).
+pub(crate) fn parts(keys: impl Iterator<Item = (ContentId, ContentId, RanAs)>, sdk: Option<NativeSysrootId>) -> std::vec::Vec<(Name, ContentId), Global> {
     let mut parts = std::vec::Vec::new_in(Global);
     // Piece 2c (ruling D115 (5), (c)): no module listing in a run's source. Its module is a
     // read (script_modules.rs); its crate's world key holds the package's identity and its
@@ -608,15 +645,52 @@ impl<'f> Scripts<'f> {
         // the jobserver made) is opened by the one setup both this command and the census's
         // exporter call (blaze-world `script_setting::ScriptSetup`, rule 30).
         let shim = env.exe_dir.map(|dir| std::format!("{dir}/{}", blaze_build_script::fact_shim::SHIM_NAME));
-        let native_opts = match env.sdk {
-            Err(refused) => Err(said(frame, format_args!("{refused}"))),
-            Ok(sdk) => match blaze_proc_macro::native_setting::command_native_setting(home, sdk.folder(), NATIVE_WORK, host, alloc.clone()) {
-                Err(error) => Err(said(frame, format_args!("the native runner's setting (D112): {error}"))),
-                Ok(owned) => match (&shim, core::num::NonZeroU32::new(workers)) {
-                    (Err(why), _) => Err(said(frame, format_args!("the native runner's fact shim (D112, N7): {why}"))),
-                    (_, None) => Err(said(frame, format_args!("the command's worker count is 0: the native runner's jobserver needs at least one (scripts.rs)"))),
-                    (Ok(shim), Some(workers)) => Ok(blaze_proc_macro::native_setting::NativeRunOpts { setting: owned, shim: shim.as_str(), workers }),
-                },
+        let owned_setting = match blaze_proc_macro::native_setting::host_sysroot(host) {
+            Ok(blaze_build_script::toolchain::Sysroot::MacosSdk) => match env.sdk {
+                Err(refused) => Err(said(frame, format_args!("{refused}"))),
+                Ok(sdk) => blaze_proc_macro::native_setting::command_native_setting(home, sdk.folder(), NATIVE_WORK, host, alloc)
+                    .map_err(|error| said(frame, format_args!("the native runner's setting (D112): {error}"))),
+            },
+            Ok(blaze_build_script::toolchain::Sysroot::LinuxHost) => match env.linux_sysroot {
+                Err(why) => Err(said(frame, format_args!("{why}"))),
+                Ok(Some(resolved)) => {
+                    let link = blaze_proc_macro::native_setting::LinuxLinkInputs {
+                        lib_dir: resolved.sysroot.lib_dir,
+                        dynamic_linker: resolved.sysroot.dynamic_linker,
+                        rpaths: resolved.sysroot.rpaths,
+                    };
+                    blaze_proc_macro::native_setting::command_native_setting_with_link(
+                        home,
+                        resolved.sysroot.dir,
+                        link,
+                        NATIVE_WORK,
+                        host,
+                        alloc,
+                    )
+                    .map_err(|error| said(frame, format_args!("the native runner's setting (D112): {error}")))
+                }
+                Ok(None) => blaze_proc_macro::native_setting::command_native_setting_with_link(
+                    home,
+                    blaze_build_script::toolchain::LINUX_HOST_SYSROOT_DIR,
+                    blaze_proc_macro::native_setting::LinuxLinkInputs::default(),
+                    NATIVE_WORK,
+                    host,
+                    alloc,
+                )
+                .map_err(|error| said(frame, format_args!("the native runner's setting (D112): {error}"))),
+            },
+            Ok(blaze_build_script::toolchain::Sysroot::Pinned { .. }) => Err(said(
+                frame,
+                format_args!("the native runner's setting (D112): {host}'s pinned sysroot is not built yet"),
+            )),
+            Err(error) => Err(said(frame, format_args!("the native runner's setting (D112): {error}"))),
+        };
+        let native_opts = match owned_setting {
+            Err(why) => Err(why),
+            Ok(owned) => match (&shim, core::num::NonZeroU32::new(workers)) {
+                (Err(why), _) => Err(said(frame, format_args!("the native runner's fact shim (D112, N7): {why}"))),
+                (_, None) => Err(said(frame, format_args!("the command's worker count is 0: the native runner's jobserver needs at least one (scripts.rs)"))),
+                (Ok(shim), Some(workers)) => Ok(blaze_proc_macro::native_setting::NativeRunOpts { setting: owned, shim: shim.as_str(), workers }),
             },
         };
         let spawn_snapshot = match probes.spawn_setting_snapshot(cx) {
@@ -647,7 +721,7 @@ impl<'f> Scripts<'f> {
         // The edge's resolved root, copied into the frame the shared state lives in: never
         // resolved again here.
         let checkout = env.served.within(frame);
-        let no_sdk = env.sdk.is_err();
+        let no_sdk = sdk_identity(env).is_none();
         let c_probes = match probes.c_probes(cx) {
             Ok(Some(c_probes)) => c_probes,
             Ok(None) => return Err(SetupError::NoHome),
@@ -2063,6 +2137,7 @@ mod shared_command_probes_dst {
             toolchain: blaze_toolchain::PINNED,
             fs: io.need_fs().expect("sim fs"),
             sdk: crate::sdk::NONE_IN_TESTS,
+            linux_sysroot: Ok(None),
             exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
             lan_peer: crate::fetch::LanPeerConfig::DISABLED,
             heap: blaze_own::testing::heap(),

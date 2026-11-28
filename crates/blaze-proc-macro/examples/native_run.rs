@@ -146,7 +146,10 @@ fn main() -> ExitCode {
     for (pass, package_dir, out_dir) in [("A", pkg_a, out_a), ("B", pkg_b, out_b)] {
         let c = CInputs {
             shelf: Shelf { dir: shelf, clang_major: blaze_build_script::toolchain::clang_major(blaze_pins::CLANG_JSON).unwrap_or_else(|e| panic!("{e}")) },
+            sysroot_kind: blaze_build_script::toolchain::Sysroot::MacosSdk,
             sysroot: sdk,
+            sysroot_extra_reads: &[],
+            linux_clang_cfg: None,
             out_dir,
             package: package_dir,
             seen: blaze_expand::seen::SeenRoot::Package,

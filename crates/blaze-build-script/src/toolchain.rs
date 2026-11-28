@@ -12,7 +12,7 @@
 
 use blaze_expand::seen::SeenRoot;
 use blaze_ids::{ContentId, Hasher};
-use blaze_own::{AString, AVec, Alloc, String, Vec};
+use blaze_own::{AString, AVec, Alloc, CloneIn as _, String, Vec};
 
 use crate::native::Runner;
 
@@ -530,19 +530,146 @@ pub fn shelf_missing_for(sysroot: Sysroot, mut present: impl FnMut(&str) -> bool
     shelf_members_for(sysroot).iter().copied().find(|member| !present(*member))
 }
 
+/// Link inputs written into a Linux Clang config file (`--config=<path>`) by
+/// [`format_linux_clang_cfg`] for Linux native scripts and process trees.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct LinuxClangLink<'s> {
+    pub lib_dir: Option<&'s str>,
+    pub dynamic_linker: Option<&'s str>,
+    pub rpaths: &'s [&'s str],
+    pub ld_lld: Option<&'s str>,
+}
+
+/// The `--sysroot=` prefix for a `Sysroot::LinuxHost` header root: strips trailing `/usr` for
+/// FHS roots so `/usr` -> `/` and `/some/root/usr` -> `/some/root`, while keeping flat NixOS
+/// roots (`/nix/store/...-glibc-dev`) intact so Clang searches `<sdk>/include`.
+pub fn linux_sysroot_prefix(sdk: &str) -> &str {
+    match sdk.strip_suffix("/usr") {
+        Some("") => "/",
+        Some(parent) => parent,
+        None => sdk,
+    }
+}
+
+/// Appends `text` as a double-quoted Clang config-file token (escaping `\` and `"`), followed by
+/// a newline.
+fn push_cfg_quoted<'a>(out: &mut AString<'a>, text: &str) {
+    out.push('"');
+    for ch in text.chars() {
+        if ch == '\\' || ch == '"' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out.push('\n');
+}
+
+/// Formats a Clang config file (`--config=<path>`) for `Sysroot::LinuxHost` (shared by both
+/// native build scripts and deferred C process trees, Rule 30):
+/// - `-resource-dir <shelf>/lib/clang/<major>` (required under Linux Landlock where
+///   `/proc/self/exe` is outside the roots);
+/// - `--sysroot=<prefix>` (via [`linux_sysroot_prefix`]);
+/// - `-ffile-prefix-map=<host>=<guest>` for every `(guest, host)` pair in `shown` so debug info
+///   stays free of host folders (rule 25, rule 54);
+/// - When `link.lib_dir` is `Some(lib_dir)` (NixOS split glibc runtime), link flags
+///   (`-B<lib_dir>`, `-L<lib_dir>`, `-Wl,-rpath,<lib_dir>`, preserved `-Wl,-rpath,<extra>`,
+///   `-Wl,--dynamic-linker=<dyn>`, `-fuse-ld=<ld_lld>`, `-rtlib=compiler-rt`, `--unwindlib=none`);
+/// - `-Wno-unused-command-line-argument` so link-only options in the config never warn on `-c`.
+pub fn format_linux_clang_cfg<'a>(
+    sdk: &str,
+    link: LinuxClangLink<'_>,
+    shown: &[(&str, &str)],
+    shelf: Shelf<'_>,
+    alloc: Alloc<'a>,
+) -> AString<'a> {
+    let mut cfg: AString<'a> = String::new_in(alloc);
+
+    cfg.push_str("-resource-dir\n");
+    let resource_dir = shelf.resource_dir(alloc);
+    push_cfg_quoted(&mut cfg, resource_dir.as_str());
+
+    let mut sysroot_arg = String::from_str_in("--sysroot=", alloc);
+    sysroot_arg.push_str(linux_sysroot_prefix(sdk));
+    push_cfg_quoted(&mut cfg, sysroot_arg.as_str());
+
+    for (guest, host) in shown.iter() {
+        let mut map = String::from_str_in("-ffile-prefix-map=", alloc);
+        map.push_str(host);
+        map.push('=');
+        map.push_str(guest);
+        push_cfg_quoted(&mut cfg, map.as_str());
+    }
+
+    if let Some(lib_dir) = link.lib_dir {
+        let mut b_flag = String::from_str_in("-B", alloc);
+        b_flag.push_str(lib_dir);
+        push_cfg_quoted(&mut cfg, b_flag.as_str());
+
+        let mut l_flag = String::from_str_in("-L", alloc);
+        l_flag.push_str(lib_dir);
+        push_cfg_quoted(&mut cfg, l_flag.as_str());
+
+        let mut rpath_flag = String::from_str_in("-Wl,-rpath,", alloc);
+        rpath_flag.push_str(lib_dir);
+        push_cfg_quoted(&mut cfg, rpath_flag.as_str());
+
+        for extra_rpath in link.rpaths {
+            if *extra_rpath != lib_dir {
+                let mut extra_flag = String::from_str_in("-Wl,-rpath,", alloc);
+                extra_flag.push_str(extra_rpath);
+                push_cfg_quoted(&mut cfg, extra_flag.as_str());
+            }
+        }
+        if let Some(dyn_linker) = link.dynamic_linker {
+            let mut dyn_flag = String::from_str_in("-Wl,--dynamic-linker=", alloc);
+            dyn_flag.push_str(dyn_linker);
+            push_cfg_quoted(&mut cfg, dyn_flag.as_str());
+        }
+        if let Some(ld_lld) = link.ld_lld {
+            let mut ld_flag = String::from_str_in("-fuse-ld=", alloc);
+            ld_flag.push_str(ld_lld);
+            push_cfg_quoted(&mut cfg, ld_flag.as_str());
+        }
+        cfg.push_str("-rtlib=compiler-rt\n");
+        cfg.push_str("--unwindlib=none\n");
+    }
+
+    cfg.push_str("-Wno-unused-command-line-argument\n");
+    cfg
+}
+
+/// Formats the base `CCC_OVERRIDE_OPTIONS` value for loading a staged Linux Clang config file
+/// (`--config=<cfg_path>`) before per-invocation flags and rewriting any per-invocation
+/// `-isysroot` to `--sysroot` (Rule 30: shared by native scripts and process trees).
+pub fn linux_clang_override_options<'a>(cfg_path: &str, alloc: Alloc<'a>) -> AString<'a> {
+    let mut override_val = String::from_str_in("#^--config=", alloc);
+    override_val.push_str(cfg_path);
+    override_val.push_str(" s/^-isysroot$/--sysroot/ s/^-isysroot(.+)/--sysroot=\\1/");
+    override_val
+}
+
 /// What a native script's C environment is made from.
 #[derive(Clone, Copy, Debug)]
 pub struct CInputs<'c> {
     pub shelf: Shelf<'c>,
-    /// The macOS SDK folder (resolved once outside the sandbox), or a pinned sysroot's.
+    /// Which sysroot model clang uses (`MacosSdk` vs `LinuxHost`).
+    pub sysroot_kind: Sysroot,
+    /// The macOS SDK folder (resolved once outside the sandbox), or a Linux host/pinned sysroot.
     pub sysroot: &'c str,
+    /// Optional extra read-only Linux sysroot roots (`sdk_extra`, `sdk_lib`, `sdk_rpaths`,
+    /// dynamic-linker parent dir) mounted read-only alongside `sysroot` under Landlock.
+    pub sysroot_extra_reads: &'c [&'c str],
+    /// Optional Linux Clang config file (`--config=<path>`) staged outside `OUT_DIR` and applied
+    /// via `CCC_OVERRIDE_OPTIONS` when `sysroot_kind == Sysroot::LinuxHost`.
+    pub linux_clang_cfg: Option<&'c str>,
     /// The script's `OUT_DIR` and package folder, as the process sees them.
     pub out_dir: &'c str,
     pub package: &'c str,
     /// What the script sees as its root: `package` (the served tree's real folder) is mapped to
     /// its `mount()`, the same path the script was told (D96).
     pub seen: SeenRoot<'c>,
-    /// The deployment target the record is keyed by.
+    /// The deployment target the record is keyed by (macOS only).
     pub macos_min: &'c str,
 }
 
@@ -554,11 +681,12 @@ pub const MACOS_MIN: &str = "11.0";
 
 /// The variables a native script runs with so that `cc` and `bindgen` find only the pinned
 /// toolchain and the granted headers, never by searching the machine's `PATH` (which is empty):
-/// `CC`, `CXX`, `AR`, `CFLAGS`, `CXXFLAGS`, `SDKROOT` (so `cc` asks no `xcrun`),
-/// `LIBCLANG_PATH`, `BINDGEN_EXTRA_CLANG_ARGS`, `MACOSX_DEPLOYMENT_TARGET`, `SOURCE_DATE_EPOCH`.
-/// The flags make the outputs the same bytes from any folder (rule 25): `OUT_DIR` and the
-/// package are mapped, the debug folder is `.`; `-MD` leaves each object's header list beside
-/// it ([`depfile_reads`]), which the runner reads into the read list and removes. Sorted.
+/// - On [`Sysroot::MacosSdk`]: `AR`, `BINDGEN_EXTRA_CLANG_ARGS`, `CC`, `CFLAGS`, `CXX`,
+///   `CXXFLAGS`, `LIBCLANG_PATH`, `MACOSX_DEPLOYMENT_TARGET`, `SDKROOT`, `SOURCE_DATE_EPOCH`.
+/// - On [`Sysroot::LinuxHost`] / [`Sysroot::Pinned`]: omits macOS-only `SDKROOT`,
+///   `MACOSX_DEPLOYMENT_TARGET`, and `-isysroot`; sets `CCC_OVERRIDE_OPTIONS` when
+///   `c.linux_clang_cfg` is provided so `CFLAGS`/`CXXFLAGS`/`LDFLAGS` stay free of host paths.
+/// Sorted by variable name.
 pub fn c_env<'a>(c: &CInputs<'_>, alloc: Alloc<'a>) -> AVec<'a, (AString<'a>, AString<'a>)> {
     let text = |parts: &[&str]| {
         let mut out: AString<'a> = String::new_in(alloc);
@@ -568,31 +696,53 @@ pub fn c_env<'a>(c: &CInputs<'_>, alloc: Alloc<'a>) -> AVec<'a, (AString<'a>, AS
         out
     };
     let [clang, clangxx, ar] = c.shelf.programs(alloc);
-    let flags = text(&[
-        "-isysroot ",
-        c.sysroot,
-        " -ffile-prefix-map=",
-        c.out_dir,
-        "=/out -ffile-prefix-map=",
-        c.package,
-        "=",
-        c.seen.mount(),
-        " -fdebug-compilation-dir=. -MD -Wno-unused-command-line-argument",
-    ]);
+    let resource_dir = c.shelf.resource_dir(alloc);
     let mut env: AVec<'a, (AString<'a>, AString<'a>)> = Vec::new_in(alloc);
     let mut put = |k: &str, v: AString<'a>| env.push((text(&[k]), v));
-    put("AR", ar);
-    // D112 N5: libclang in the script's process finds no builtin headers by itself.
-    let resource_dir = c.shelf.resource_dir(alloc);
-    put("BINDGEN_EXTRA_CLANG_ARGS", text(&["-isysroot ", c.sysroot, " -resource-dir ", resource_dir.as_str()]));
-    put("CC", clang);
-    put("CFLAGS", flags.clone());
-    put("CXX", clangxx);
-    put("CXXFLAGS", flags);
-    put("LIBCLANG_PATH", text(&[c.shelf.dir, "/lib"]));
-    put("MACOSX_DEPLOYMENT_TARGET", text(&[c.macos_min]));
-    put("SDKROOT", text(&[c.sysroot]));
-    put("SOURCE_DATE_EPOCH", text(&["0"]));
+    match c.sysroot_kind {
+        Sysroot::MacosSdk => {
+            let flags = text(&[
+                "-isysroot ",
+                c.sysroot,
+                " -ffile-prefix-map=",
+                c.out_dir,
+                "=/out -ffile-prefix-map=",
+                c.package,
+                "=",
+                c.seen.mount(),
+                " -fdebug-compilation-dir=. -MD -Wno-unused-command-line-argument",
+            ]);
+            put("AR", ar);
+            // D112 N5: libclang in the script's process finds no builtin headers by itself.
+            put("BINDGEN_EXTRA_CLANG_ARGS", text(&["-isysroot ", c.sysroot, " -resource-dir ", resource_dir.as_str()]));
+            put("CC", clang);
+            put("CFLAGS", flags.clone_in(alloc));
+            put("CXX", clangxx);
+            put("CXXFLAGS", flags);
+            put("LIBCLANG_PATH", text(&[c.shelf.dir, "/lib"]));
+            put("MACOSX_DEPLOYMENT_TARGET", text(&[c.macos_min]));
+            put("SDKROOT", text(&[c.sysroot]));
+            put("SOURCE_DATE_EPOCH", text(&["0"]));
+        }
+        Sysroot::LinuxHost | Sysroot::Pinned { .. } => {
+            // Keep `CFLAGS`/`CXXFLAGS` 100% host-path-free on Linux: sysroot, `-resource-dir`,
+            // `-ffile-prefix-map`, and split NixOS link flags live in `c.linux_clang_cfg` applied
+            // via `CCC_OVERRIDE_OPTIONS` (Rule 25, Rule 30).
+            let flags = text(&["-fdebug-compilation-dir=. -MD -Wno-unused-command-line-argument"]);
+            let sysroot_prefix = linux_sysroot_prefix(c.sysroot);
+            put("AR", ar);
+            put("BINDGEN_EXTRA_CLANG_ARGS", text(&["--sysroot=", sysroot_prefix, " -resource-dir ", resource_dir.as_str()]));
+            put("CC", clang);
+            if let Some(cfg_path) = c.linux_clang_cfg {
+                put("CCC_OVERRIDE_OPTIONS", linux_clang_override_options(cfg_path, alloc));
+            }
+            put("CFLAGS", flags.clone_in(alloc));
+            put("CXX", clangxx);
+            put("CXXFLAGS", flags);
+            put("LIBCLANG_PATH", text(&[c.shelf.dir, "/lib"]));
+            put("SOURCE_DATE_EPOCH", text(&["0"]));
+        }
+    }
     env
 }
 

@@ -28,7 +28,7 @@ use blaze_build_script::{
     key::RunLimits,
     host_tools::{self, HostTool},
     outputs::{FileLimits, FileMode, Outputs},
-    toolchain::{CInputs, c_env, depfile_reads, headers_digest, map_paths},
+    toolchain::{CInputs, Sysroot, c_env, depfile_reads, headers_digest, map_paths},
 };
 use blaze_core::wait::Deadline;
 use blaze_ids::ContentId;
@@ -715,33 +715,6 @@ impl RootFiles for OutDir<'_> {
     }
 }
 
-/// Resolves and caches the pinned nightly toolchain's canonical `(sysroot, rustc_bin)` once so
-/// native build scripts (`serde_core`, `serde_json`, `thiserror`, `libc`, `autocfg`, etc.) can
-/// invoke the pinned `rustc` inside `bstd::procs::hermetic` read-only confinement with zero ambient paths.
-fn pinned_rustc_paths() -> Option<&'static (std::string::String, std::string::String)> {
-    static CACHE: std::sync::OnceLock<Option<(std::string::String, std::string::String)>> = std::sync::OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            for args in [
-                &[format!("+{}", blaze_pins::TOOLCHAIN), "--print".to_owned(), "sysroot".to_owned()][..],
-                &["--print".to_owned(), "sysroot".to_owned()][..],
-            ] {
-                if let Ok(out) = std::process::Command::new("rustc").args(args).output() {
-                    if out.status.success() {
-                        let raw = std::string::String::from_utf8_lossy(&out.stdout).trim().to_owned();
-                        let Ok(sysroot) = std::fs::canonicalize(&raw) else { continue };
-                        let Ok(rustc_bin) = std::fs::canonicalize(sysroot.join("bin/rustc")) else { continue };
-                        if let (Some(sr), Some(rb)) = (sysroot.to_str(), rustc_bin.to_str()) {
-                            return Some((sr.to_owned(), rb.to_owned()));
-                        }
-                    }
-                }
-            }
-            None
-        })
-        .as_ref()
-}
-
 /// Resolves and caches the real macOS `dsymutil` binary (never the `/usr/bin/dsymutil` xcrun shim)
 /// so `configure` scripts that compile+link `conftest.c` with `-g` succeed under hermetic confinement.
 fn pinned_dsymutil_paths() -> Option<&'static (std::string::String, std::string::String)> {
@@ -791,17 +764,25 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         _ => blaze_build_script::Jobs::One,
     };
     let run_env = script.env.for_run(jobs, alloc);
-    let pinned_rustc = pinned_rustc_paths();
+    let shim_rustc: Option<AString<'a>> = script.facts.map(|facts| blaze_own::format_in!(alloc, "{}/rustc", facts.bin));
+    let shim_cargo: Option<AString<'a>> = script.facts.map(|facts| blaze_own::format_in!(alloc, "{}/cargo", facts.bin));
     let mut vars: AVec<'a, (&str, &str)> = Vec::new_in(alloc);
     for (name, value) in run_env.vars.iter() {
         let value = match name.as_str() {
             "OUT_DIR" => c.out_dir,
             "CARGO_MANIFEST_DIR" => c.package,
             "CARGO_MANIFEST_PATH" => manifest.as_str(),
-            "RUSTC" => pinned_rustc.map(|(_, rb)| rb.as_str()).unwrap_or(value.as_str()),
+            "RUSTC" => shim_rustc.as_deref().unwrap_or(value.as_str()),
+            "CARGO" => shim_cargo.as_deref().unwrap_or(value.as_str()),
             _ => value.as_str(),
         };
         vars.push((name.as_str(), value));
+    }
+    if let Some(rustc_path) = shim_rustc.as_deref() {
+        vars.push(("RUSTC", rustc_path));
+    }
+    if let Some(cargo_path) = shim_cargo.as_deref() {
+        vars.push(("CARGO", cargo_path));
     }
     let toolchain = c_env(c, alloc);
     let mut cleaned_flags: AVec<'a, AString<'a>> = Vec::new_in(alloc);
@@ -869,10 +850,14 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
     }
 
     // D112: a script granted a tool that runs what the script built under OUT_DIR (sh running
-    // configure's test programs) links those programs: the pinned linker too (the shelf's
-    // clang.cfg says `-fuse-ld=lld`; clang starts `ld64.lld`, a link to `lld`), and it may start
-    // what is under OUT_DIR. Every other script is granted neither.
-    let linker: &[&str] = if runs_out_dir { &["bin/ld64.lld", "bin/ld.lld", "bin/lld"] } else { &[] };
+    // configure's test programs) or linking against a split Linux libc root needs the pinned
+    // linker (`lld`/`ld.lld`/`ld64.lld`); only `runs_out_dir` may start what is under OUT_DIR.
+    let linux_cfg_dir: Option<&str> = c.linux_clang_cfg.and_then(|cfg| cfg.rsplit_once('/').map(|(dir, _)| dir)).filter(|dir| !dir.is_empty());
+    let staged_ld_lld: Option<AString<'a>> = linux_cfg_dir
+        .map(|dir| blaze_own::format_in!(alloc, "{dir}/ld.lld"))
+        .filter(|path| Path::new(path.as_str()).exists());
+    let needs_linker = runs_out_dir || (c.sysroot_kind == Sysroot::LinuxHost && (staged_ld_lld.is_some() || !c.sysroot_extra_reads.is_empty()));
+    let linker: &[&str] = if needs_linker { &["bin/ld64.lld", "bin/ld.lld", "bin/lld"] } else { &[] };
     let mut exec: AVec<'a, AString<'a>> = Vec::new_in(alloc);
     for name in ["bin/clang-23", "bin/clang", "bin/clang++", "bin/llvm-ar"].iter().chain(linker) {
         let mut path: AString<'a> = String::from_str_in(c.shelf.dir, alloc);
@@ -899,10 +884,8 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         for path in exec.iter() {
             out.push(path.as_str());
         }
-        // Pinned nightly `rustc` binary so native Rust build scripts (`autocfg`, `serde_core`,
-        // `thiserror`, `libc`, etc.) can probe the pinned compiler hermetically.
-        if let Some((_, rustc_bin)) = pinned_rustc {
-            out.push(rustc_bin.as_str());
+        if let Some(ld_lld) = staged_ld_lld.as_deref() {
+            out.push(ld_lld);
         }
         if let Some((_, dsym_bin)) = dsymutil {
             out.push(dsym_bin.as_str());
@@ -913,7 +896,7 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         if runs_out_dir && Path::new("/usr/bin/cmp").is_file() {
             out.push("/usr/bin/cmp");
         }
-        // The fact shim (N7), started through its links.
+        // The fact shim (N7), started through its links (`rustc`, `cargo`, `pkg-config`, `sw_vers`).
         if let Some(facts) = script.facts {
             out.push(facts.shim.as_str());
             for link in facts.links.iter() {
@@ -927,8 +910,11 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         reads.push(c.package);
     }
     reads.extend_from_slice(&[c.shelf.dir, c.sysroot]);
-    if let Some((sysroot_dir, _)) = pinned_rustc {
-        reads.push(sysroot_dir.as_str());
+    // Linux Landlock split sysroot roots (`sdk_extra`, `sdk_lib`, `sdk_rpaths`, dynamic linker
+    // parent dir) and staged `clang.cfg` folder (deduplicated below in `spellings`).
+    reads.extend_from_slice(c.sysroot_extra_reads);
+    if let Some(cfg_dir) = linux_cfg_dir {
+        reads.push(cfg_dir);
     }
     if let Some((dsym_dir, _)) = dsymutil {
         reads.push(dsym_dir.as_str());
@@ -1130,7 +1116,12 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         for path in read.iter() {
             if let Some(under) = path.strip_prefix(sysroot_prefix.as_str()) {
                 headers.push((under.to_owned(), [0; 32]));
-            } else if path.starts_with('/') && !path.starts_with(c.package) && !path.starts_with(c.out_dir) && !path.starts_with(c.shelf.dir) {
+            } else if path.starts_with('/')
+                && !path.starts_with(c.package)
+                && !path.starts_with(c.out_dir)
+                && !path.starts_with(c.shelf.dir)
+                && !c.sysroot_extra_reads.iter().any(|extra| path.starts_with(extra))
+            {
                 other_reads += 1;
             }
         }

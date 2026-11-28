@@ -331,6 +331,41 @@ fn linux_host_native_setting_accepts_linux_shelf_and_features_h() {
         .unwrap_or_else(|e| panic!("{e}"));
         assert_ne!(with_lib_a.sdk_version.as_str(), with_lib_b.sdk_version.as_str());
 
+        // `OwnedNativeSetting::setting` and `NativeRun::setting` must preserve ALL Linux/NixOS
+        // fields (`sdk_extra`, `sdk_lib`, `sdk_dynamic_linker`, `sdk_rpaths`, `sdk_version`,
+        // `sysroot`) rather than dropping them when lending `NativeSetting`.
+        let dyn_loader = libc_lib.join("ld-linux-aarch64.so.1");
+        fs::write(&dyn_loader, b"ldso").expect("ldso");
+        let extra_rpath = home.join("extra-rt/lib");
+        fs::create_dir_all(&extra_rpath).expect("extra rpath");
+        fs::write(extra_rpath.join("libfoo.so"), b"foo").expect("libfoo.so");
+        let extra_rpaths = [extra_rpath.to_str().expect("utf8 rpath")];
+        let full_owned = crate::native_setting::command_native_setting_with_link(
+            home_s,
+            sdk_s,
+            crate::native_setting::LinuxLinkInputs {
+                lib_dir: Some(libc_lib_s),
+                dynamic_linker: Some(dyn_loader.to_str().expect("utf8 dyn")),
+                rpaths: &extra_rpaths,
+            },
+            "test",
+            LINUX_HOST,
+            alloc,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let jobs = jobserver(&full_owned);
+        let lent = full_owned.setting(&jobs);
+        assert_eq!(lent.sysroot, Sysroot::LinuxHost);
+        assert_eq!(lent.sdk_version, full_owned.sdk_version.as_str());
+        assert_eq!(lent.sdk_extra, expected_extra.to_str());
+        assert_eq!(lent.sdk_lib, expected_lib.to_str());
+        let expected_dyn = fs::canonicalize(&dyn_loader).expect("canon dyn");
+        assert_eq!(lent.sdk_dynamic_linker, expected_dyn.to_str());
+        let expected_rpath = fs::canonicalize(&extra_rpath).expect("canon rpath");
+        let lent_rpaths: std::vec::Vec<&str> = lent.sdk_rpaths.iter().collect();
+        assert_eq!(lent_rpaths, [expected_rpath.to_str().expect("utf8")]);
+        jobs.end().unwrap_or_else(|e| panic!("{e}"));
+
         // Negative control: a symlink loop on `<sdk>/include/linux` propagates `NoSdk` naming
         // `include/linux` instead of silently dropping `sdk_extra`.
         let broken_sdk = home.join("glibc-broken");

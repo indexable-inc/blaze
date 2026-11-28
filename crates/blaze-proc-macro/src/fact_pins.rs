@@ -219,7 +219,7 @@ fn fact_now_pinned(subject: &str, pins: Option<&FactPins>, alloc: Alloc<'_>) -> 
     }
     let mut lines = subject.split('\n');
     let head = lines.next().unwrap_or("");
-    if !matches!(head, "pkg-config" | "sw_vers" | "cc-version") {
+    if !matches!(head, "pkg-config" | "sw_vers" | "cc-version" | "rustc" | "cargo") {
         return FactNow::NotAFact;
     }
     let Some(pins) = pins else { return FactNow::NoPins };

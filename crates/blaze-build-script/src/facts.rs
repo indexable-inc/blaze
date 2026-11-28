@@ -36,6 +36,12 @@ pub enum Fact<'s> {
     /// pins/answers/clang.json by the caller (it needs `OUT_DIR`'s files and the spawn's
     /// environment), never from [`Pins`].
     CcProbe { program: &'s str, args: &'s [&'s str] },
+    /// `rustc` version query (`-V`, `--version`, `-vV`, `--version --verbose`, ...): answered
+    /// from [`crate::probe::version`], never by running host `rustc` (rule 1).
+    RustcVersion { verbose: bool },
+    /// `cargo` version query (`-V`, `--version`, `version`): answered from
+    /// [`crate::probe::cargo_version`], never by running host `cargo`.
+    CargoVersion,
 }
 
 /// The pinned values a fact is answered from; the caller passes them (the clang pin row and
@@ -122,6 +128,76 @@ fn name_of(program: &str) -> &str {
     program.rsplit('/').next().unwrap_or(program)
 }
 
+/// Recognizes pure `rustc` version queries (`-V`, `--version`, `-vV`, `-Vv`, `--version --verbose`,
+/// etc.); returns `Some(verbose)` for version queries and `None` for any try-compile, `--print`,
+/// or unknown invocation so the fact shim refuses them loudly (rule 1, rule 3).
+fn rustc_version_args(args: &[&str]) -> Option<bool> {
+    match args {
+        ["-V"] | ["--version"] => Some(false),
+        ["-vV"]
+        | ["-Vv"]
+        | ["--version", "--verbose"]
+        | ["--verbose", "--version"]
+        | ["-V", "-v"]
+        | ["-v", "-V"]
+        | ["-V", "--verbose"]
+        | ["--verbose", "-V"]
+        | ["--version", "-v"]
+        | ["-v", "--version"] => Some(true),
+        _ => None,
+    }
+}
+
+/// Derives the Rust host triple for `rustc -vV`'s `host:` line from `pins.clang_version_text`'s
+/// `Target:` line (falling back to the compile-time target triple when absent).
+fn rustc_host_from_pins<'p>(pins: &'p Pins<'p>) -> &'p str {
+    for line in pins.clang_version_text.lines() {
+        if let Some(target) = line.strip_prefix("Target:") {
+            let trimmed = target.trim();
+            if trimmed.starts_with("arm64-apple-darwin") || trimmed.starts_with("aarch64-apple-darwin") {
+                return "aarch64-apple-darwin";
+            }
+            if trimmed.starts_with("x86_64-apple-darwin") {
+                return "x86_64-apple-darwin";
+            }
+            if trimmed.starts_with("aarch64-unknown-linux-gnu") {
+                return "aarch64-unknown-linux-gnu";
+            }
+            if trimmed.starts_with("x86_64-unknown-linux-gnu") {
+                return "x86_64-unknown-linux-gnu";
+            }
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+    }
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        "aarch64-apple-darwin"
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+    {
+        "x86_64-apple-darwin"
+    }
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    {
+        "aarch64-unknown-linux-gnu"
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    {
+        "x86_64-unknown-linux-gnu"
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_os = "macos"),
+        all(target_arch = "x86_64", target_os = "macos"),
+        all(target_arch = "aarch64", target_os = "linux"),
+        all(target_arch = "x86_64", target_os = "linux"),
+    )))]
+    {
+        "unknown-unknown-unknown"
+    }
+}
+
 /// Reads a spawn as a derived fact, or `None` when it is not one.
 pub fn question<'s>(program: &'s str, args: &'s [&'s str]) -> Option<Fact<'s>> {
     let name = name_of(program);
@@ -133,6 +209,12 @@ pub fn question<'s>(program: &'s str, args: &'s [&'s str]) -> Option<Fact<'s>> {
             [one] if SW_VERS_OPTIONS.contains(one) => Some(Fact::SwVers { args }),
             _ => None,
         };
+    }
+    if name == "rustc" {
+        return rustc_version_args(args).map(|verbose| Fact::RustcVersion { verbose });
+    }
+    if probe::is_cargo_version(name, args) {
+        return Some(Fact::CargoVersion);
     }
     if crate::c_tasks_probe::is_probe(program, args) {
         return Some(Fact::CcProbe { program, args });
@@ -336,6 +418,16 @@ pub fn answer<'a>(fact: &Fact<'_>, pins: &Pins<'_>, alloc: Alloc<'a>) -> Result<
             Ok(FactAnswer { code: 0, stdout, stderr: String::new_in(alloc) })
         }
         Fact::CcProbe { .. } => Err(FactRefused::TableProbe),
+        Fact::RustcVersion { verbose } => Ok(FactAnswer {
+            code: 0,
+            stdout: probe::version(verbose, rustc_host_from_pins(pins), alloc),
+            stderr: String::new_in(alloc),
+        }),
+        Fact::CargoVersion => Ok(FactAnswer {
+            code: 0,
+            stdout: probe::cargo_version(alloc),
+            stderr: String::new_in(alloc),
+        }),
     }
 }
 
@@ -456,6 +548,12 @@ pub fn subject<'a>(fact: &Fact<'_>, alloc: Alloc<'a>) -> AString<'a> {
                 out.push('\n');
                 out.push_str(arg);
             }
+        }
+        Fact::RustcVersion { verbose } => {
+            out.push_str(if verbose { "rustc\n--version\n--verbose" } else { "rustc\n--version" });
+        }
+        Fact::CargoVersion => {
+            out.push_str("cargo\n--version");
         }
     }
     out

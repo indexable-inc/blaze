@@ -145,7 +145,14 @@ fn run_once(name: &str, resolved: bool) -> Result<std::vec::Vec<(std::string::St
     let env = Env { vars };
     let c = CInputs {
         shelf: Shelf { dir: &shelf, clang_major: "23" },
+        sysroot_kind: if cfg!(target_os = "macos") {
+            blaze_build_script::toolchain::Sysroot::MacosSdk
+        } else {
+            blaze_build_script::toolchain::Sysroot::LinuxHost
+        },
         sysroot: &sdk,
+        sysroot_extra_reads: &[],
+        linux_clang_cfg: None,
         out_dir: &out,
         package: &package,
         seen: blaze_expand::seen::SeenRoot::Package,

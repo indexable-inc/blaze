@@ -932,6 +932,34 @@ pub(crate) struct LinuxHostSysroot<'f> {
     pub(crate) rpaths: &'f [&'f str],
 }
 
+/// Resolved Linux host sysroot together with its 32-byte content identity (`sdk_version` SHA-256)
+/// computed once at the command's edge for `Script` task keys (Rule 21, Rule 75).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ResolvedLinuxHost<'f> {
+    pub(crate) sysroot: LinuxHostSysroot<'f>,
+    pub(crate) id: [u8; 32],
+}
+
+/// Computes the 32-byte content digest (`sdk_version` SHA-256) of a resolved [`LinuxHostSysroot`],
+/// returning `Err` naming the broken host path if validation or hashing fails.
+pub(crate) fn linux_host_with_id<'f>(
+    resolved: Result<Option<LinuxHostSysroot<'f>>, LinuxSysrootError<'f>>,
+    alloc: blaze_own::Alloc<'_>,
+    frame: &'f Frame,
+) -> Result<Option<ResolvedLinuxHost<'f>>, &'f str> {
+    let Some(sysroot) = resolved.map_err(|err| held(frame, format_args!("{err}")))? else {
+        return Ok(None);
+    };
+    let link = blaze_proc_macro::native_setting::LinuxLinkInputs {
+        lib_dir: sysroot.lib_dir,
+        dynamic_linker: sysroot.dynamic_linker,
+        rpaths: sysroot.rpaths,
+    };
+    let keyed = blaze_proc_macro::native_setting::resolve_linux_sysroot(sysroot.dir, link, alloc)
+        .map_err(|err| held(frame, format_args!("{err}")))?;
+    Ok(Some(ResolvedLinuxHost { sysroot, id: keyed.sdk_digest }))
+}
+
 /// Why Linux host sysroot discovery failed on a concrete host path (rule 3, rule 19):
 /// clean absence (`ENOENT`/`ENOTDIR`) is represented as `Ok(None)`, whereas permission errors,
 /// I/O errors, non-UTF-8 wrapper files, and symlink loops stop discovery immediately naming the

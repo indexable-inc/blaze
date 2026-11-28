@@ -82,7 +82,10 @@ fn bindgen_is_told_the_shelf_resource_dir() {
     let shelf = "/h/.blaze/v2/toolchain/clang/5d3179db";
     let c = CInputs {
         shelf: Shelf { dir: shelf, clang_major: major },
+        sysroot_kind: Sysroot::MacosSdk,
         sysroot: "/sdk",
+        sysroot_extra_reads: &[],
+        linux_clang_cfg: None,
         out_dir: "/o",
         package: "/p",
         seen: blaze_expand::seen::SeenRoot::Package,
@@ -94,6 +97,62 @@ fn bindgen_is_told_the_shelf_resource_dir() {
     assert_eq!(clang_major("{\"version\": \"x.1\"}"), Err(PinError::NoVersion));
     assert_eq!(clang_major("{\"version\": \"23\"}"), Err(PinError::NoVersion));
     assert_eq!(clang_major("{}"), Err(PinError::NoVersion));
+}
+
+#[test]
+fn c_env_linux_omits_macos_flags_and_sets_ccc_override_options() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let shelf = "/h/.blaze/v2/toolchain/clang/9b27cf26";
+    let cfg = "/h/.blaze/v2/native-work/blaze/cfg/k/clang.cfg";
+    let c = CInputs {
+        shelf: Shelf { dir: shelf, clang_major: "23" },
+        sysroot_kind: Sysroot::LinuxHost,
+        sysroot: "/nix/store/abc-glibc-dev",
+        sysroot_extra_reads: &["/nix/store/def-linux-headers"],
+        linux_clang_cfg: Some(cfg),
+        out_dir: "/h/work/out/k",
+        package: "/h/work/pkg/k",
+        seen: blaze_expand::seen::SeenRoot::Package,
+        macos_min: "11.0",
+    };
+    let env = c_env(&c, alloc);
+    let keys: std::vec::Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+    assert!(keys.is_sorted(), "c_env must remain sorted: {keys:?}");
+    let get = |name: &str| env.iter().find(|(k, _)| k.as_str() == name).map(|(_, v)| v.as_str());
+    assert_eq!(get("SDKROOT"), None, "Linux c_env must not emit macOS SDKROOT");
+    assert_eq!(get("MACOSX_DEPLOYMENT_TARGET"), None, "Linux c_env must not emit MACOSX_DEPLOYMENT_TARGET");
+    assert_eq!(
+        get("CCC_OVERRIDE_OPTIONS"),
+        Some("#^--config=/h/.blaze/v2/native-work/blaze/cfg/k/clang.cfg s/^-isysroot$/--sysroot/ s/^-isysroot(.+)/--sysroot=\\1/")
+    );
+    assert_eq!(
+        get("BINDGEN_EXTRA_CLANG_ARGS"),
+        Some("--sysroot=/nix/store/abc-glibc-dev -resource-dir /h/.blaze/v2/toolchain/clang/9b27cf26/lib/clang/23")
+    );
+    let cflags = get("CFLAGS").expect("CFLAGS");
+    assert!(!cflags.contains("-isysroot"), "Linux CFLAGS must not contain -isysroot: {cflags}");
+    assert!(!cflags.contains("/nix/store"), "Linux CFLAGS must be host-path-free: {cflags}");
+    assert!(!cflags.contains("/h/work"), "Linux CFLAGS must be host-path-free: {cflags}");
+    assert_eq!(cflags, get("CXXFLAGS").expect("CXXFLAGS"));
+
+    // FHS `/usr` sysroot strips `/usr` -> `--sysroot=/` and omits `CCC_OVERRIDE_OPTIONS` when no cfg staged.
+    let fhs = CInputs { sysroot: "/usr", linux_clang_cfg: None, ..c };
+    let fhs_env = c_env(&fhs, alloc);
+    let fhs_get = |name: &str| fhs_env.iter().find(|(k, _)| k.as_str() == name).map(|(_, v)| v.as_str());
+    assert_eq!(fhs_get("CCC_OVERRIDE_OPTIONS"), None);
+    assert_eq!(
+        fhs_get("BINDGEN_EXTRA_CLANG_ARGS"),
+        Some("--sysroot=/ -resource-dir /h/.blaze/v2/toolchain/clang/9b27cf26/lib/clang/23")
+    );
+
+    // Control: `Sysroot::MacosSdk` preserves macOS flags and `SDKROOT`/`MACOSX_DEPLOYMENT_TARGET`.
+    let mac = CInputs { sysroot_kind: Sysroot::MacosSdk, sysroot: "/sdk", linux_clang_cfg: None, ..c };
+    let mac_env = c_env(&mac, alloc);
+    let mac_get = |name: &str| mac_env.iter().find(|(k, _)| k.as_str() == name).map(|(_, v)| v.as_str());
+    assert_eq!(mac_get("SDKROOT"), Some("/sdk"));
+    assert_eq!(mac_get("MACOSX_DEPLOYMENT_TARGET"), Some("11.0"));
+    assert_eq!(mac_get("CCC_OVERRIDE_OPTIONS"), None);
+    assert!(mac_get("CFLAGS").expect("CFLAGS").contains("-isysroot /sdk"));
 }
 
 /// D69 (3): native for build and run; check keeps wasm but for the five that give nothing so.

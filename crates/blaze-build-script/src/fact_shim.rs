@@ -34,7 +34,7 @@ use blaze_own::{AString, AVec, Alloc, String, Vec};
 use crate::facts::{self, Pins};
 
 /// The programs the shim answers as, by `argv[0]`'s last component. Sorted.
-pub const PROGRAMS: [&str; 3] = ["pkg-config", "pkgconf", "sw_vers"];
+pub const PROGRAMS: [&str; 5] = ["cargo", "pkg-config", "pkgconf", "rustc", "sw_vers"];
 
 /// The shim binary's file name.
 pub const SHIM_NAME: &str = "blaze-fact-shim";
@@ -279,7 +279,7 @@ mod tests {
 
     /// The shim's programs are the facts table's own: each is read as a question by
     /// `facts::question` in some form, and no C compiler is among them. Prints "shim programs:
-    /// pkg-config pkgconf sw_vers".
+    /// cargo pkg-config pkgconf rustc sw_vers".
     #[test]
     fn every_shim_program_is_a_facts_row() {
         assert!(PROGRAMS.is_sorted());
@@ -291,5 +291,64 @@ mod tests {
             assert!(!PROGRAMS.contains(&compiler));
         }
         println!("shim programs: {}", PROGRAMS.join(" "));
+    }
+
+    /// Rule 1 (`no-rustc`): `blaze-fact-shim` answers `rustc -V` / `--version` / `-vV` and
+    /// `cargo -V` / `--version` strictly from the pinned toolchain constants (never host `rustc`),
+    /// and refuses try-compiles or unknown invocations with exit 127 naming them.
+    #[test]
+    fn rustc_and_cargo_version_probes_are_answered_and_compiles_refused() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let linux_pins = Pins {
+            clang_version_text: "clang version 23.1.4\nTarget: aarch64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /usr/bin\n",
+            macos_product_version: "",
+            macos_build_version: "",
+        };
+
+        // Short `rustc -V` and `rustc --version` match `probe::version(false, ...)`.
+        let expected_short = crate::probe::version(false, "", alloc);
+        for args in [&["-V"][..], &["--version"][..]] {
+            let reply = ask("/run/bin/rustc", args, Some(&linux_pins), alloc);
+            assert_eq!((reply.code, reply.answered, reply.stderr.as_str()), (0, true, ""), "{args:?}");
+            assert_eq!(reply.stdout.as_str(), expected_short.as_str(), "{args:?}");
+            assert_eq!(reply.subject.as_str(), "rustc\n--version");
+        }
+
+        // Verbose `rustc -vV` and `--version --verbose` include the host triple from the pins.
+        let expected_linux_v = crate::probe::version(true, "aarch64-unknown-linux-gnu", alloc);
+        for args in [&["-vV"][..], &["--version", "--verbose"][..]] {
+            let reply = ask("rustc", args, Some(&linux_pins), alloc);
+            assert_eq!((reply.code, reply.answered, reply.stderr.as_str()), (0, true, ""), "{args:?}");
+            assert_eq!(reply.stdout.as_str(), expected_linux_v.as_str(), "{args:?}");
+            assert_eq!(reply.subject.as_str(), "rustc\n--version\n--verbose");
+        }
+        let mac_v = ask("rustc", &["-vV"], Some(&PINS), alloc);
+        assert_eq!(mac_v.code, 0);
+        assert!(mac_v.stdout.as_str().contains("host: aarch64-apple-darwin\n"), "{}", mac_v.stdout.as_str());
+
+        // `cargo -V`, `--version`, and `version` match `probe::cargo_version`.
+        let expected_cargo = crate::probe::cargo_version(alloc);
+        for args in [&["-V"][..], &["--version"][..], &["version"][..]] {
+            let reply = ask("/run/bin/cargo", args, Some(&linux_pins), alloc);
+            assert_eq!((reply.code, reply.answered, reply.stderr.as_str()), (0, true, ""), "{args:?}");
+            assert_eq!(reply.stdout.as_str(), expected_cargo.as_str(), "{args:?}");
+            assert_eq!(reply.subject.as_str(), "cargo\n--version");
+        }
+
+        // Try-compile and unknown invocations MUST be refused with exit 127 naming them.
+        let compile = ask("rustc", &["--crate-type", "lib", "foo.rs"], Some(&linux_pins), alloc);
+        assert_eq!((compile.code, compile.answered, compile.stdout.as_str()), (REFUSED_CODE, false, ""));
+        assert!(
+            compile.stderr.as_str().contains("`rustc --crate-type lib foo.rs` refused"),
+            "{}",
+            compile.stderr.as_str()
+        );
+        let stdin_compile = ask("rustc", &["--crate-type=rlib", "-"], Some(&linux_pins), alloc);
+        assert_eq!((stdin_compile.code, stdin_compile.answered), (REFUSED_CODE, false));
+        let print_cfg = ask("rustc", &["--print", "cfg"], Some(&linux_pins), alloc);
+        assert_eq!((print_cfg.code, print_cfg.answered), (REFUSED_CODE, false));
+        let cargo_build = ask("cargo", &["build"], Some(&linux_pins), alloc);
+        assert_eq!((cargo_build.code, cargo_build.answered), (REFUSED_CODE, false));
+        assert!(cargo_build.stderr.as_str().contains("`cargo build` refused"), "{}", cargo_build.stderr.as_str());
     }
 }

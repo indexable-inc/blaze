@@ -103,15 +103,43 @@ pub fn placed_in_store(
     base
 }
 
-/// What a command gives its native scripts. Every path absolute and canonical (Seatbelt matches
-/// resolved paths).
+/// Zero-allocation, `Copy + Send + Sync` view over NUL-separated Linux runtime library search
+/// directories (`-rpath`) preserved from Nix wrapper metadata.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rpaths<'s>(pub(crate) &'s str);
+
+impl<'s> Rpaths<'s> {
+    /// Iterates each non-empty canonical rpath directory in order.
+    pub fn iter(self) -> impl Iterator<Item = &'s str> {
+        self.0.split('\0').filter(|s| !s.is_empty())
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// What a command gives its native scripts. Every path absolute and canonical (Seatbelt and
+/// Landlock match resolved paths).
 #[derive(Clone, Copy, Debug)]
 pub struct NativeSetting<'s> {
     /// The unpacked pin, `<home>/.blaze/v2/toolchain/clang/<sha256 hex>`: its name is the
     /// compiler's digest in the key.
     pub shelf: &'s str,
-    /// The macOS SDK folder, resolved once by the command.
+    /// The macOS SDK or Linux host sysroot folder, resolved once by the command.
     pub sdk: &'s str,
+    /// Optional extra read-only root for split Linux kernel headers (NixOS `linux-headers`).
+    pub sdk_extra: Option<&'s str>,
+    /// Optional split Linux libc runtime library directory (NixOS `<glibc>/lib`).
+    pub sdk_lib: Option<&'s str>,
+    /// Optional resolved ELF dynamic linker path (NixOS `ld-linux-*.so.*`).
+    pub sdk_dynamic_linker: Option<&'s str>,
+    /// Optional extra runtime library search directories (`-rpath`) preserved from Nix wrappers.
+    pub sdk_rpaths: Rpaths<'s>,
+    /// The SDK's `Version` (macOS) or complete Linux host sysroot SHA-256 hex (Rule 21).
+    pub sdk_version: &'s str,
+    /// Which sysroot model `pins/clang.json` selected for the host.
+    pub sysroot: Sysroot,
     /// A folder of the command's own where packages held in records are written out and each
     /// run's `OUT_DIR` is made (`pkg/<key>`, `out/<key>`).
     pub work: &'s str,
@@ -439,8 +467,8 @@ pub fn native_outputs<'a>(
     }
 
     // The key: the compiler by its shelf digest, the SDK by its version (D69), the tools.
-    let sysroot_key = match toolchain::sysroot(CLANG_JSON, setting.host) {
-        Ok(Sysroot::MacosSdk) => {
+    let sysroot_key = match native.sysroot {
+        Sysroot::MacosSdk => {
             let text = |file: &str| -> Result<String, NativeUnitError> {
                 String::from_utf8(read_file(native.sdk, file)?).map_err(|_| NativeUnitError::Read { path: format!("{}/{file}", native.sdk), why: "it is not UTF-8".to_owned() })
             };
@@ -448,13 +476,12 @@ pub fn native_outputs<'a>(
             let (_, id) = blaze_apple_sdk::identity_of(&settings, &built).map_err(|why| NativeUnitError::Read { path: native.sdk.to_owned(), why: format!("{why}, which a native script's key holds (D69)") })?;
             blaze_own::format_in!(alloc, "macos-sdk {id}")
         }
-        Ok(Sysroot::LinuxHost) => {
-            let bytes = read_file(native.sdk, toolchain::LINUX_HOST_SYSROOT_MARKER)?;
-            let digest = hex(&blaze_sha256::digest(&bytes));
-            blaze_own::format_in!(alloc, "linux-host {digest}")
+        Sysroot::LinuxHost => {
+            // `OwnedNativeSetting::sdk_version` covers `include/features.h` (FHS `/usr`) or the
+            // full NixOS split header/lib/rpath/dynamic-linker content tree (Rule 21).
+            blaze_own::format_in!(alloc, "linux-host {}", native.sdk_version)
         }
-        Ok(Sysroot::Pinned { .. }) => return Err(pin(format!("{}: {}'s pinned sysroot is not fetched yet (D69)", CLANG_PATH, setting.host))),
-        Err(error) => return Err(pin(error.to_string())),
+        Sysroot::Pinned { .. } => return Err(pin(format!("{}: {}'s pinned sysroot is not fetched yet (D69)", CLANG_PATH, setting.host))),
     };
     let compiler = hex32(native.shelf.rsplit('/').next().unwrap_or("")).ok_or_else(|| NativeUnitError::Shelf { shelf: native.shelf.to_owned() })?;
     let parts = NativeKeyParts { compiler, target: setting.host, sysroot: sysroot_key.as_str(), host_tools: &tool_keys };
@@ -519,7 +546,6 @@ pub fn native_outputs<'a>(
     let out_dir = fresh_folder(native.work, out_rel.as_str(), &[], &pkg(), alloc)?;
     work_guard.push_dir(out_rel);
     let clang_major = toolchain::clang_major(CLANG_JSON).map_err(|e| pin(e.to_string()))?;
-    let c = CInputs { shelf: Shelf { dir: native.shelf, clang_major }, sysroot: native.sdk, out_dir: &out_dir, package: &package_dir, seen: root.seen(), macos_min: MACOS_MIN };
     // N7: the fact shim the command placed in its work folder, and this run's facts folder.
     // A native run's probes are answered from the pins through the fact shim; the questions
     // asked become reads in the wasm path's fact form (native_facts::reads).
@@ -566,6 +592,106 @@ pub fn native_outputs<'a>(
     for (real, shown) in laid.shown.iter() {
         dep_shown.push((real.as_str(), shown.as_str()));
     }
+    // Linux Landlock extra sysroot roots (NixOS split kernel headers, libc runtime lib dir,
+    // preserved rpaths, and dynamic-linker parent directory) + staged `clang.cfg` (Rule 25, Rule 30).
+    let mut sysroot_extra_reads: AVec<'a, &str> = Vec::new_in(alloc);
+    if native.sysroot == Sysroot::LinuxHost {
+        if let Some(extra) = native.sdk_extra {
+            sysroot_extra_reads.push(extra);
+        }
+        if let Some(lib) = native.sdk_lib {
+            sysroot_extra_reads.push(lib);
+        }
+        for rpath in native.sdk_rpaths.iter() {
+            sysroot_extra_reads.push(rpath);
+        }
+        if let Some(dyn_linker) = native.sdk_dynamic_linker
+            && let Some((parent, _)) = dyn_linker.rsplit_once('/')
+            && !parent.is_empty()
+        {
+            sysroot_extra_reads.push(parent);
+        }
+    }
+    let shelf = Shelf { dir: native.shelf, clang_major };
+    let linux_clang_cfg: Option<AString<'a>> = if native.sysroot == Sysroot::LinuxHost {
+        let cfg_rel = blaze_own::format_in!(alloc, "cfg/{}", run_key.as_str());
+        let cfg_dir = fresh_folder(native.work, cfg_rel.as_str(), &[], &pkg(), alloc)?;
+        work_guard.push_dir(cfg_rel);
+        let stage_cfg = || -> Result<AString<'a>, AString<'a>> {
+            let ld_lld_path: Option<AString<'a>> = if native.sdk_lib.is_some() {
+                let shelf_ld = blaze_own::format_in!(alloc, "{}/bin/ld.lld", native.shelf);
+                if Path::new(shelf_ld.as_str()).exists() {
+                    Some(shelf_ld)
+                } else {
+                    let shelf_lld = blaze_own::format_in!(alloc, "{}/bin/lld", native.shelf);
+                    let staged_ld = blaze_own::format_in!(alloc, "{cfg_dir}/ld.lld");
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(shelf_lld.as_str(), staged_ld.as_str())
+                        .map_err(|e| blaze_own::format_in!(alloc, "could not link ld.lld: {e}"))?;
+                    Some(staged_ld)
+                }
+            } else {
+                None
+            };
+            let mut rpath_strs: AVec<'a, &str> = Vec::new_in(alloc);
+            for rpath in native.sdk_rpaths.iter() {
+                rpath_strs.push(rpath);
+            }
+            let mut shown_maps: AVec<'a, (&str, &str)> = Vec::new_in(alloc);
+            shown_maps.push(("/out", out_dir.as_str()));
+            shown_maps.push((root.seen().mount(), package_dir.as_str()));
+            for (real, shown) in dep_shown.iter() {
+                shown_maps.push((*shown, *real));
+            }
+            shown_maps.push(("/sdk", native.sdk));
+            if let Some(extra) = native.sdk_extra {
+                shown_maps.push(("/sdk-headers", extra));
+            }
+            if let Some(lib) = native.sdk_lib {
+                shown_maps.push(("/sdk-lib", lib));
+            }
+            for rpath in rpath_strs.iter() {
+                shown_maps.push(("/sdk-rpath", *rpath));
+            }
+            shown_maps.push(("/toolchain/clang", native.shelf));
+            let cfg_path = blaze_own::format_in!(alloc, "{cfg_dir}/clang.cfg");
+            if cfg_path.as_str().bytes().any(|b| b.is_ascii_whitespace()) {
+                return Err(OwnString::from_str_in("native script clang config path contains whitespace", alloc));
+            }
+            let link = toolchain::LinuxClangLink {
+                lib_dir: native.sdk_lib,
+                dynamic_linker: native.sdk_dynamic_linker,
+                rpaths: rpath_strs.as_slice(),
+                ld_lld: ld_lld_path.as_deref(),
+            };
+            let cfg_text = toolchain::format_linux_clang_cfg(native.sdk, link, &shown_maps, shelf, alloc);
+            let cfg_rel_file = blaze_own::format_in!(alloc, "cfg/{}/clang.cfg", run_key.as_str());
+            let (io, work_root) = native_world(Path::new(native.work)).map_err(|e| blaze_own::format_in!(alloc, "{e}"))?;
+            let cx = io.cx(WORK_TREE_DEADLINE, TASK_FRAME).map_err(|_| OwnString::from_str_in("its world stopped", alloc))?;
+            let path = bstd::path::Path::new(cfg_rel_file.as_str()).map_err(|_| OwnString::from_str_in("clang.cfg: not a relative path", alloc))?;
+            let file = work_root.create(&cx, &path).map_err(|e| blaze_own::format_in!(alloc, "clang.cfg: {e}"))?;
+            file.write_at(&cx, 0, cfg_text.as_bytes(), Durable::No).map_err(|e| blaze_own::format_in!(alloc, "clang.cfg: {e}"))?;
+            file.close(&cx, Durable::No).map_err(|e| blaze_own::format_in!(alloc, "clang.cfg: {e}"))?;
+            Ok(cfg_path)
+        };
+        match stage_cfg() {
+            Ok(cfg_path) => Some(cfg_path),
+            Err(why) => return Err(NativeUnitError::Files { package: pkg(), folder: cfg_dir, why: why.as_str().to_owned() }),
+        }
+    } else {
+        None
+    };
+    let c = CInputs {
+        shelf,
+        sysroot_kind: native.sysroot,
+        sysroot: native.sdk,
+        sysroot_extra_reads: sysroot_extra_reads.as_slice(),
+        linux_clang_cfg: linux_clang_cfg.as_deref(),
+        out_dir: &out_dir,
+        package: &package_dir,
+        seen: root.seen(),
+        macos_min: MACOS_MIN,
+    };
     let run = NativeScript {
         key: base,
         files: &area,
