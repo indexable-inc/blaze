@@ -18,6 +18,8 @@
 //! `<store>/proc-macro/compiled/<code key>` and its `.seal`, keyed by the wasm's digest and the
 //! runtime ([`COMPILED_DIR`]; `host.rs`, "Compiled records").
 
+use std::fs::{File, read, read_dir};
+use std::io::{Error as IoError, ErrorKind, Read as _};
 use std::path::{Path, PathBuf};
 
 use blaze_build_script::served::{InPackage, in_package};
@@ -270,14 +272,21 @@ impl FilesHasher {
         Self { hasher: blaze_sha256::Sha256::new() }
     }
 
-    /// Feeds one regular file entry. Callers must pass entries in ascending byte order of `path`
-    /// to match [`files_digest`].
-    pub fn update_file(&mut self, path: &str, bytes: &[u8]) {
-        self.hasher.update(path.as_bytes());
+    /// Feeds one regular file entry by its raw `/`-separated relative path bytes. Callers must
+    /// pass entries in ascending byte order of `path_bytes` to match [`package_files_digest_in`]
+    /// and [`files_digest`].
+    pub fn update_file_bytes(&mut self, path_bytes: &[u8], bytes: &[u8]) {
+        self.hasher.update(path_bytes);
         self.hasher.update(&[0]);
         let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         self.hasher.update(&len.to_le_bytes());
         self.hasher.update(bytes);
+    }
+
+    /// Feeds one regular file entry. Callers must pass entries in ascending byte order of `path`
+    /// to match [`files_digest`].
+    pub fn update_file(&mut self, path: &str, bytes: &[u8]) {
+        self.update_file_bytes(path.as_bytes(), bytes);
     }
 
     pub fn finish(self) -> [u8; 32] {
@@ -310,29 +319,91 @@ pub fn files_digest(files: &mut [(String, Vec<u8>)]) -> String {
     hex(&hasher.finish())
 }
 
-/// The files of the package at `dir` that [`files_digest`] covers, by their paths relative to
-/// it (`/`-separated): each entry `served::in_package` takes. Walked with a stack of folders.
-pub fn package_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, ModuleError> {
-    let io = |path: &Path, error: std::io::Error| ModuleError::Io { path: path.to_owned(), error };
-    let mut out = Vec::new();
-    let mut folders = vec![(dir.to_owned(), String::new())];
-    while let Some((folder, relative)) = folders.pop() {
-        for entry in std::fs::read_dir(&folder).map_err(|e| io(&folder, e))? {
+/// Walks `dir` by the one package rule (`served::in_package`), collecting `(raw_rel_bytes, full_path)`
+/// for every regular file and sorting strictly by ascending `raw_rel_bytes` (`/`-separated raw
+/// encoded OS filename bytes, never lossy UTF-8) so ordering is unique and filesystem-independent.
+fn walk_package_entries<'f>(
+    dir: &Path,
+    frame: &'f bstd::mem::Frame,
+) -> Result<blaze_own::Vec<(blaze_own::Vec<u8, &'f bstd::mem::Frame>, PathBuf), &'f bstd::mem::Frame>, ModuleError> {
+    let io = |path: &Path, error: IoError| ModuleError::Io { path: path.to_owned(), error };
+    let mut files: blaze_own::Vec<(blaze_own::Vec<u8, &'f bstd::mem::Frame>, PathBuf), &'f bstd::mem::Frame> =
+        blaze_own::Vec::new_in(frame);
+    let mut folders: blaze_own::Vec<(blaze_own::Vec<u8, &'f bstd::mem::Frame>, PathBuf), &'f bstd::mem::Frame> =
+        blaze_own::Vec::new_in(frame);
+    folders.push((blaze_own::Vec::new_in(frame), dir.to_path_buf()));
+    while let Some((relative, folder)) = folders.pop() {
+        for entry in read_dir(&folder).map_err(|e| io(&folder, e))? {
             let entry = entry.map_err(|e| io(&folder, e))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
+            let file_name = entry.file_name();
+            let raw_name = file_name.as_encoded_bytes();
             let path = entry.path();
             let kind = entry.file_type().map_err(|e| io(&path, e))?;
             let place = if relative.is_empty() { InPackage::Root } else { InPackage::Beneath };
-            if !in_package(entry.file_name().as_encoded_bytes(), kind.is_dir(), place) {
+            if !in_package(raw_name, kind.is_dir(), place) {
                 continue;
             }
-            let at = if relative.is_empty() { name.clone() } else { format!("{relative}/{name}") };
+            let mut at = blaze_own::Vec::with_capacity_in(relative.len() + usize::from(!relative.is_empty()) + raw_name.len(), frame);
+            if !relative.is_empty() {
+                at.extend_from_slice(relative.as_slice());
+                at.push(b'/');
+            }
+            at.extend_from_slice(raw_name);
             if kind.is_dir() {
-                folders.push((path, at));
+                folders.push((at, path));
             } else if kind.is_file() {
-                out.push((at, std::fs::read(&path).map_err(|e| io(&path, e))?));
+                files.push((at, path));
             }
         }
+    }
+    files.sort_unstable_by(|a, b| a.0.as_slice().cmp(b.0.as_slice()));
+    Ok(files)
+}
+
+/// Computes the canonical package-wide files digest directly from `dir`, streaming one file at a
+/// time into [`FilesHasher`] in strict ascending byte order of raw `/`-separated relative paths
+/// (`as_encoded_bytes()`, bit-for-bit identical to [`files_digest`] for UTF-8 paths and uniquely
+/// ordered for distinct non-UTF-8 Unix filenames). Allocates the returned 64-byte hex digest in
+/// `alloc` with zero whole-package global heap buffers.
+pub fn package_files_digest_in<A: core::alloc::Allocator>(dir: &Path, alloc: A) -> Result<blaze_own::String<A>, ModuleError> {
+    let io = |path: &Path, error: IoError| ModuleError::Io { path: path.to_owned(), error };
+    let frame = bstd::mem::Frame::new(bstd::mem::Tag::Other)
+        .map_err(|e| io(dir, IoError::other(format!("allocating package_files_digest_in frame: {e:?}"))))?;
+    let files = walk_package_entries(dir, &frame)?;
+    let mut hasher = FilesHasher::new();
+    let mut buf: blaze_own::Vec<u8, &bstd::mem::Frame> = blaze_own::Vec::new_in(&frame);
+    let mut chunk = [0u8; 16 * 1024];
+    for (rel_bytes, full_path) in files.iter() {
+        buf.clear();
+        let mut file = File::open(full_path).map_err(|e| io(full_path, e))?;
+        loop {
+            match file.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Some(slice) = chunk.get(..n) {
+                        buf.extend_from_slice(slice);
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(io(full_path, e)),
+            }
+        }
+        hasher.update_file_bytes(rel_bytes.as_slice(), buf.as_slice());
+    }
+    Ok(hasher.finish_hex_in(alloc))
+}
+
+/// The files of the package at `dir` that [`files_digest`] covers, by their paths relative to
+/// it (`/`-separated): each entry `served::in_package` takes. Walked with a stack of folders.
+pub fn package_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, ModuleError> {
+    let io = |path: &Path, error: IoError| ModuleError::Io { path: path.to_owned(), error };
+    let frame = bstd::mem::Frame::new(bstd::mem::Tag::Other)
+        .map_err(|e| io(dir, IoError::other(format!("allocating package_files frame: {e:?}"))))?;
+    let files = walk_package_entries(dir, &frame)?;
+    let mut out = Vec::with_capacity(files.len());
+    for (rel_bytes, path) in files.iter() {
+        let at = String::from_utf8_lossy(rel_bytes.as_slice()).into_owned();
+        out.push((at, read(path).map_err(|e| io(path, e))?));
     }
     Ok(out)
 }
@@ -1012,14 +1083,45 @@ mod header_tests {
         let mut collected = package_files(&dir).expect("package_files");
         assert_eq!(files_digest(&mut collected), oracle);
 
-        // `FilesHasher::finish_hex_in` must match oracle as well.
+        // `FilesHasher::finish_hex_in` and `package_files_digest_in` must match oracle as well.
         let alloc = blaze_own::testing::heap().alloc();
         let mut hasher = FilesHasher::new();
         for (path, bytes) in &expected_entries {
             hasher.update_file(path, bytes);
         }
         assert_eq!(hasher.finish_hex_in(alloc).as_str(), oracle);
+        assert_eq!(package_files_digest_in(&dir, alloc).expect("package_files_digest_in").as_str(), oracle);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_files_digest_in_orders_colliding_non_utf8_paths_canonically() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = std::env::temp_dir().join(format!("blaze-module-non-utf8-order-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // Both filenames collapse to `bad_\u{FFFD}.rs` under `to_string_lossy()`, so raw byte
+        // ordering (`0xfe < 0xff`) must distinguish and order them deterministically.
+        std::fs::write(dir.join(OsStr::from_bytes(b"bad_\xff.rs")), b"ff-bytes").expect("write ff");
+        std::fs::write(dir.join(OsStr::from_bytes(b"bad_\xfe.rs")), b"fe-bytes").expect("write fe");
+
+        let mut wire = Vec::new();
+        for (rel, bytes) in [(&b"bad_\xfe.rs"[..], &b"fe-bytes"[..]), (&b"bad_\xff.rs"[..], &b"ff-bytes"[..])] {
+            wire.extend_from_slice(rel);
+            wire.push(0);
+            wire.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            wire.extend_from_slice(bytes);
+        }
+        let oracle = sha256_hex(&wire);
+        let alloc = blaze_own::testing::heap().alloc();
+        assert_eq!(
+            package_files_digest_in(&dir, alloc).expect("digest").as_str(),
+            oracle,
+            "package_files_digest_in must sort and hash colliding non-UTF-8 names by raw relative bytes"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

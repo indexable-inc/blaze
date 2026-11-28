@@ -1209,8 +1209,6 @@ fn path_pkg_files_digest(
     members: &[(LockId, &str, blaze_world::PathKind)],
     pkg_id: LockId,
 ) -> Option<std::string::String> {
-    use blaze_build_script::served::{InPackage, in_package};
-    use std::io::Read as _;
     let (_, dir, _) = members.iter().find(|(id, _, _)| *id == pkg_id)?;
     let pkg_dir = if dir.is_empty() {
         checkout.path().to_path_buf()
@@ -1218,63 +1216,7 @@ fn path_pkg_files_digest(
         checkout.path().join(dir)
     };
     let scratch = Frame::new(Tag::Other).ok()?;
-    let mut files: blaze_own::Vec<(blaze_own::String<&Frame>, PathBuf), &Frame> = blaze_own::Vec::new_in(&scratch);
-    let mut folders: blaze_own::Vec<(blaze_own::String<&Frame>, PathBuf), &Frame> = blaze_own::Vec::new_in(&scratch);
-    folders.push((blaze_own::String::new_in(&scratch), pkg_dir));
-    while let Some((rel, folder)) = folders.pop() {
-        let entries = std::fs::read_dir(&folder).ok()?;
-        let place = if rel.is_empty() { InPackage::Root } else { InPackage::Beneath };
-        for entry in entries {
-            let entry = entry.ok()?;
-            let file_name = entry.file_name();
-            let full_path = entry.path();
-            let kind = entry.file_type().ok()?;
-            if !in_package(file_name.as_encoded_bytes(), kind.is_dir(), place) {
-                continue;
-            }
-            let name = file_name.to_string_lossy();
-            let at = if rel.is_empty() {
-                blaze_own::String::from_str_in(name.as_ref(), &scratch)
-            } else {
-                let mut s = blaze_own::String::with_capacity_in(rel.len() + 1 + name.len(), &scratch);
-                s.push_str(rel.as_str());
-                s.push('/');
-                s.push_str(name.as_ref());
-                s
-            };
-            if kind.is_dir() {
-                folders.push((at, full_path));
-            } else if kind.is_file() {
-                files.push((at, full_path));
-            }
-        }
-    }
-    files.sort_unstable_by(|a, b| {
-        a.0.as_bytes()
-            .cmp(b.0.as_bytes())
-            .then_with(|| a.1.as_os_str().as_encoded_bytes().cmp(b.1.as_os_str().as_encoded_bytes()))
-    });
-    let mut hasher = blaze_proc_macro::module::FilesHasher::new();
-    let mut buf: blaze_own::Vec<u8, &Frame> = blaze_own::Vec::new_in(&scratch);
-    let mut chunk = [0u8; 16 * 1024];
-    for (rel, full_path) in files.iter() {
-        buf.clear();
-        let mut file = std::fs::File::open(full_path).ok()?;
-        loop {
-            match file.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if let Some(slice) = chunk.get(..n) {
-                        buf.extend_from_slice(slice);
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => return None,
-            }
-        }
-        hasher.update_file(rel.as_str(), buf.as_slice());
-    }
-    let hex = hasher.finish_hex_in(&scratch);
+    let hex = blaze_proc_macro::module::package_files_digest_in(&pkg_dir, &scratch).ok()?;
     Some(std::string::String::from(hex.as_str()))
 }
 
@@ -1561,9 +1503,9 @@ fn ensure_proc_macro_unit(
         } else {
             checkout.path().join(dir)
         };
-        let mut files = blaze_proc_macro::module::package_files(&pkg_dir)
+        let digest = blaze_proc_macro::module::package_files_digest_in(&pkg_dir, heap.alloc())
             .map_err(|e| blaze_world::procs::ProcsError::Files { at: pkg_dir, error: e })?;
-        Ok(Some(blaze_proc_macro::module::files_digest(&mut files)))
+        Ok(Some(digest))
     }, heap.alloc())
     .map_err(|e| std::format!("identifying proc-macro dep {} {}: {e}", unit.name.as_str(), unit.version.as_str()))?
     .map_err(|e| std::format!("proc-macro dep {} {} not identified: {e}", unit.name.as_str(), unit.version.as_str()))?
@@ -6520,10 +6462,14 @@ pub fn pkg_version(_input: TokenStream) -> TokenStream {\n\
         let pkg_dir = tmp.join("dep");
         let bad_dir = pkg_dir.join(OsStr::from_bytes(b"dir_\xfe"));
         std::fs::create_dir_all(&bad_dir).expect("mkdir bad_dir");
-        let bad_file = pkg_dir.join(OsStr::from_bytes(b"file_\xff.txt"));
+        // Two distinct non-UTF-8 filenames that collapse to the same `to_string_lossy()` label
+        // (`bad_\u{FFFD}.rs`), plus a nested non-UTF-8 directory/file.
+        let bad_fe = pkg_dir.join(OsStr::from_bytes(b"bad_\xfe.rs"));
+        let bad_ff = pkg_dir.join(OsStr::from_bytes(b"bad_\xff.rs"));
         let nested_file = bad_dir.join(OsStr::from_bytes(b"inner_\xfd.rs"));
         std::fs::write(pkg_dir.join("Cargo.toml"), b"[package]\nname = \"dep\"\n").expect("Cargo.toml");
-        std::fs::write(&bad_file, b"v1-non-utf8-root").expect("write bad_file");
+        std::fs::write(&bad_ff, b"v1-non-utf8-ff").expect("write bad_ff");
+        std::fs::write(&bad_fe, b"v1-non-utf8-fe").expect("write bad_fe");
         std::fs::write(&nested_file, b"v1-non-utf8-nested").expect("write nested_file");
 
         let checkout = blaze_proc_macro::script_sandbox::RealRoot::resolve(&tmp).expect("RealRoot");
@@ -6531,13 +6477,29 @@ pub fn pkg_version(_input: TokenStream) -> TokenStream {\n\
 
         let got_v1 = path_pkg_files_digest(&checkout, &members, LockId(0))
             .expect("non-UTF-8 file/dir must still hash cleanly instead of returning None");
-        let mut oracle_files = blaze_proc_macro::module::package_files(&pkg_dir).expect("package_files");
-        let want_v1 = blaze_proc_macro::module::files_digest(&mut oracle_files);
-        assert_eq!(got_v1, want_v1, "streaming path_pkg_files_digest must match package_files+files_digest bit-for-bit");
+        let alloc = blaze_own::testing::heap().alloc();
+        let mod_v1 = blaze_proc_macro::module::package_files_digest_in(&pkg_dir, alloc)
+            .expect("package_files_digest_in");
+        assert_eq!(got_v1.as_str(), mod_v1.as_str(), "wasm64_compile must match blaze_proc_macro::module::package_files_digest_in");
 
-        std::fs::write(&bad_file, b"v2-non-utf8-root").expect("update bad_file");
+        // Exact raw relative-path wire oracle (sorted strictly by raw encoded bytes).
+        let mut wire = std::vec::Vec::new();
+        for (rel, bytes) in [
+            (&b"Cargo.toml"[..], &b"[package]\nname = \"dep\"\n"[..]),
+            (&b"bad_\xfe.rs"[..], &b"v1-non-utf8-fe"[..]),
+            (&b"bad_\xff.rs"[..], &b"v1-non-utf8-ff"[..]),
+            (&b"dir_\xfe/inner_\xfd.rs"[..], &b"v1-non-utf8-nested"[..]),
+        ] {
+            wire.extend_from_slice(rel);
+            wire.push(0);
+            wire.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            wire.extend_from_slice(bytes);
+        }
+        assert_eq!(got_v1, blaze_proc_macro::module::sha256_hex(&wire));
+
+        std::fs::write(&bad_ff, b"v2-non-utf8-ff").expect("update bad_ff");
         let got_v2 = path_pkg_files_digest(&checkout, &members, LockId(0)).expect("digest v2");
-        assert_ne!(got_v1, got_v2, "editing a non-UTF-8 file must invalidate path_pkg_files_digest");
+        assert_ne!(got_v1, got_v2, "editing either colliding non-UTF-8 file must invalidate path_pkg_files_digest");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

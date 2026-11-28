@@ -62,7 +62,7 @@ blaze-native	1
 blaze-new	7
 blaze-own	93
 blaze-pg	2
-blaze-proc-macro	82
+blaze-proc-macro	81
 blaze-producers	13
 blaze-protocol	10
 blaze-radix	5

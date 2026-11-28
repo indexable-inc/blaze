@@ -301,8 +301,9 @@ pub fn register_macro_crates<'u, A: core::alloc::Allocator + Copy>(
         let path_files = |id| match path_dir(id) {
             None => Ok(None),
             Some(dir) => {
-                let mut listed = blaze_proc_macro::module::package_files(&dir).map_err(|error| ProcsError::Files { at: dir.clone(), error })?;
-                Ok(Some(blaze_proc_macro::module::files_digest(&mut listed)))
+                let hex = blaze_proc_macro::module::package_files_digest_in(&dir, alloc)
+                    .map_err(|error| ProcsError::Files { at: dir.clone(), error })?;
+                Ok(Some(hex))
             }
         };
         let identity = match identify(lock, &locked, &git_folders, graph, unit, path_files, alloc)? {
