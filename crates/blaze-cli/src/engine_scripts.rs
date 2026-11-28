@@ -908,7 +908,7 @@ pub(crate) fn plan_dep_probe_tags_at<'f>(
     // the graph sections from the store (without making `NamesWorld` or opening toolchain shelves).
     // Propagate any `BackRefused` error cleanly instead of silently planning with empty probe tags.
     let decode_frame = if world.made().is_none() {
-        Some(Frame::with_reserve(8 << 20, bstd::mem::Tag::Other).map_err(|_| CliError::Text {
+        Some(Frame::with_reserve(64 << 20, bstd::mem::Tag::Other).map_err(|_| CliError::Text {
             what: "failed to reserve frame for MacroModule dep-probe planning",
         })?)
     } else {
