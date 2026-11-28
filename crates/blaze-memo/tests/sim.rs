@@ -313,16 +313,18 @@ enum Ask {
     Total(u32, u32),
     Ring(u32, u32),
     Reach(u32, u32),
+    ReachSelfFirst(u32, u32),
     Record(u32, u32),
 }
 
 fn draw(tape: &Tape) -> Ask {
     let c = 1 + tape.below(u64::from(CRATES), "ask crate") as u32;
-    match tape.below(5, "ask") {
+    match tape.below(6, "ask") {
         0 => Ask::Value(c, tape.index(LEAVES, "leaf")),
         1 => Ask::Total(c, tape.below(u64::from(DEPTH) + 1, "total depth") as u32),
         2 => Ask::Ring(c, tape.below(u64::from(RING), "ring member") as u32),
         3 => Ask::Reach(c, tape.below(LEAVES as u64, "reach from") as u32),
+        4 => Ask::ReachSelfFirst(c, tape.below(LEAVES as u64, "reach from, self first") as u32),
         _ => Ask::Record(c, tape.below(u64::from(DEPTH) + 1, "record depth") as u32),
     }
 }
@@ -336,6 +338,7 @@ fn ask(db: &SimDb<'_>, world: &World, model: &Model<'_>, ask: Ask) -> Result<(),
         Ask::Total(c, d) => (common::total(db, world.krate(c), d), model.total(c, d)),
         Ask::Ring(c, at) => (common::ring(db, world.krate(c), at), model.ring(at)),
         Ask::Reach(c, n) => (common::reach(db, world.krate(c), n), model.reach(c, n)),
+        Ask::ReachSelfFirst(c, n) => (common::reach_self_first(db, world.krate(c), n), model.reach(c, n)),
         Ask::Record(c, d) => {
             let (got, rows) = record(db.memo, || common::total(db, world.krate(c), d))
                 .map_err(|it| it.to_string())?;
@@ -606,6 +609,14 @@ fn the_oracle_catches_a_hit_that_does_not_replay() {
 #[test]
 fn the_oracle_catches_a_check_on_a_hit() {
     caught(Plant::HitChecks, "checks on hits");
+}
+
+/// A member that reaches itself before its cycle's head and finds no last round's value in
+/// its own book starts each round from the initial value: a member whose value differs from it
+/// moves every round, and its head panics past `MAX_ROUNDS`, naming it.
+#[test]
+fn the_oracle_catches_a_member_restarted_from_its_initial_value() {
+    caught(Plant::ReenterOwnBookOnly, "did not settle");
 }
 
 /// A fixpoint member whose flight is let go when its run returns is run again by another task

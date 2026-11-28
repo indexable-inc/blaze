@@ -89,6 +89,18 @@ pub fn reach(db: &dyn Db, krate: Crate, node: u32) -> u64 {
     own | reach(db, krate, (node + 1) % n) | reach(db, krate, (node * 2) % n)
 }
 
+/// [`reach`] with its edges asked the other way round: the doubling edge first, so node 0 asks
+/// itself before anything else, and as a member of a cycle entered elsewhere it reaches itself
+/// before it reaches that cycle's head. Its value is [`reach`]'s.
+#[blaze_memo::tracked(returns(copy), cycle_initial = |_db, _krate, _node| 0)]
+pub fn reach_self_first(db: &dyn Db, krate: Crate, node: u32) -> u64 {
+    db.pause();
+    let leaves = krate.leaves(db);
+    let n = leaves.len() as u32;
+    let own = if value(db, leaves[node as usize]) % 2 == 1 { 1 << node } else { 0 };
+    own | reach_self_first(db, krate, (node * 2) % n) | reach_self_first(db, krate, (node + 1) % n)
+}
+
 /// The dependencies of crate `c`.
 pub fn deps_of(c: u32) -> Vec<u32> {
     (c.saturating_sub(2).max(1)..c).collect()

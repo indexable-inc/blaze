@@ -813,6 +813,7 @@ pub(crate) fn innermost_name() -> Option<String> {
 /// Where `key` is on no run of this task (the flight said it was), or where a run in the cycle
 /// declared no recovery: the cycle's path is the message.
 pub(crate) fn reenter(
+    memo: &Memo,
     kind: &'static Kind,
     hash: u64,
     key: *const (),
@@ -860,10 +861,35 @@ pub(crate) fn reenter(
     }
     crate::counts::cycle();
     if found.provisional.get().is_null() {
-        let last = last_of(head_ref, kind, hash, key);
+        let mut last = last_of(head_ref, kind, hash, key);
+        if last.is_null() && memo.plant() != Plant::ReenterOwnBookOnly {
+            last = last_below(found, kind, hash, key);
+        }
         found.provisional.set(if last.is_null() { make() } else { last });
     }
     found.provisional.get()
+}
+
+/// The value `kind`'s run for `key` had at the end of the last round of a cycle whose head is
+/// below `found` on this task's stack, null when none has one.
+///
+/// A run that reaches itself before it reaches such a head (a struct whose first field names
+/// itself, and a later field the head) heads a cycle of its own at that moment, and that run's
+/// book is new each round. The run joins the head's cycle later in the same round, and as a
+/// member its value goes into the head's book ([`member_done`]): that is its last round's value.
+/// Its own reentry reads it from there, as one that joined first does through [`last_of`].
+fn last_below(found: &Run, kind: &'static Kind, hash: u64, key: *const ()) -> *const () {
+    // SAFETY: an outer run is below on the same stack.
+    let mut at = unsafe { found.outer.as_ref() };
+    while let Some(run) = at {
+        let last = last_of(run, kind, hash, key);
+        if !last.is_null() {
+            return last;
+        }
+        // SAFETY: as above.
+        at = unsafe { run.outer.as_ref() };
+    }
+    ptr::null()
 }
 
 /// Makes `run` a member of `head`'s cycle unless it is one of an outer head's already.

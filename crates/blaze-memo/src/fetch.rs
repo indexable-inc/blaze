@@ -234,7 +234,7 @@ pub fn fetch<'db, Q: Query>(
                 }
             }
             Flown::Mine => {
-                let value = task::reenter(Q::KIND, hash, key_ptr, || {
+                let value = task::reenter(memo, Q::KIND, hash, key_ptr, || {
                     let value = match recovery {
                         Recovery::Result(fallback) => in_frame::<Q, _>(|| fallback()),
                         Recovery::Fixpoint { initial, .. } => in_frame::<Q, _>(|| initial()),

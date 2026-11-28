@@ -183,6 +183,11 @@ pub enum Plant {
     /// unset), not in `Slot::borrow`: that is given the borrowed arena's id alone, neither its
     /// seal nor the session's plant.
     SealedSkipsBorrow,
+    /// A run that reaches itself before it reaches its cycle's head looks for its last round's
+    /// value only in its own book, which is new each round (`task::reenter`): it starts every
+    /// round from the initial value, and a member whose value differs from it is counted as
+    /// moved in every round, so its head never settles.
+    ReenterOwnBookOnly,
 }
 
 /// What every snapshot of a session shares.
