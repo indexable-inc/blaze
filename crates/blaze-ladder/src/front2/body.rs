@@ -1964,7 +1964,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             // Every word's mark is in the lowered record (`View::mark_of_path`): an expansion's
             // lowered into the body, and the item's own when a macro wrote it
             // (`lower_body_expanding_marked`), so the builder needs no second copy of them.
-            builder: Builder { resolver: Paths { names }, heads: &store.maps, marks: None, owner: None, owner_key: Some(owner), expanded: None },
+            builder: Builder { resolver: Paths { names }, heads: &store.maps, marks: None, owner: None, owner_key: Some(owner), expanded: None, expanded_marks: None },
             // A written type's first segment is asked of the blocks' named imports first
             // (super::block_type_uses): a block holding only `use`s is no module to read at.
             env: Env {
