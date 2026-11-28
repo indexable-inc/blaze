@@ -92,6 +92,56 @@ fn direct_and_transitive_capability_in_sans_io_is_rejected() {
 }
 
 #[test]
+fn two_tier_handle_tokens_are_allowed_in_sans_io_but_cannot_smuggle_capabilities() {
+    let mut fx = Fx::new();
+    let u32_ = fx.u32();
+
+    // #[blaze::capability] struct Io { fd: u32 }
+    let cap_io = fx.strukt("Io", 0, &[("fd", u32_)]);
+    fx.set_attrs(cap_io, TypeAttrs(TypeAttrs::CAPABILITY));
+    let cap_io_ty = fx.adt(cap_io, &[]);
+
+    // #[blaze::handle] struct FileHandle { slot: u32, gen: u32 } — pure generational token.
+    let good_handle = fx.strukt("FileHandle", 0, &[("slot", u32_), ("gen", u32_)]);
+    fx.set_attrs(good_handle, TypeAttrs(TypeAttrs::HANDLE));
+    let good_handle_ty = fx.adt(good_handle, &[]);
+
+    // #[blaze::sans_io] struct FetchState { file: FileHandle, offset: u32 } — ALLOWED!
+    let machine_state = fx.strukt("FetchState", 0, &[("file", good_handle_ty), ("offset", u32_)]);
+    fx.set_attrs(machine_state, TypeAttrs(TypeAttrs::SANS_IO));
+
+    // #[blaze::handle] struct SmugglingHandle { slot: u32, io: Io } — REJECTED!
+    let bad_handle = fx.strukt("SmugglingHandle", 0, &[("slot", u32_), ("io", cap_io_ty)]);
+    fx.set_attrs(bad_handle, TypeAttrs(TypeAttrs::HANDLE));
+    let bad_handle_ty = fx.adt(bad_handle, &[]);
+
+    // #[blaze::sans_io] struct LeakyState { h: SmugglingHandle } — transitively REJECTED!
+    let leaky_state = fx.strukt("LeakyState", 0, &[("h", bad_handle_ty)]);
+    fx.set_attrs(leaky_state, TypeAttrs(TypeAttrs::SANS_IO));
+
+    fx.finish();
+
+    // 1. Clean handle itself and sans-IO state holding it both pass.
+    assert!(check_adt_capabilities(&fx, good_handle, alloc()).expect("good_handle").is_empty());
+    assert!(check_adt_capabilities(&fx, machine_state, alloc()).expect("machine_state").is_empty());
+
+    // 2. A `#[blaze::handle]` trying to store an executing capability is caught directly.
+    let fh = check_adt_capabilities(&fx, bad_handle, alloc()).expect("bad_handle");
+    assert_eq!(fh.len(), 1);
+    assert_eq!(fh[0].adt, bad_handle);
+    assert_eq!(fh[0].capability, cap_io);
+    assert_eq!(fh[0].field, Name::of("io"));
+
+    // 3. A `#![blaze::sans_io]` state holding the smuggling handle is also caught with full path.
+    let fs = check_adt_capabilities(&fx, leaky_state, alloc()).expect("leaky_state");
+    assert_eq!(fs.len(), 1);
+    assert_eq!(fs[0].adt, leaky_state);
+    assert_eq!(fs[0].capability, cap_io);
+    assert_eq!(fs[0].via_adt, Some(bad_handle));
+    assert_eq!(names_of(&fs[0].path), vec![Name::of("h"), Name::of("io")]);
+}
+
+#[test]
 fn borrowed_generic_enum_tuple_and_array_capabilities_are_rejected() {
     let mut fx = Fx::new();
     let u32_ = fx.u32();

@@ -5,23 +5,25 @@
 //! `fn()` pointers, closures, and `dyn Fn` trait objects carry exact effect sets and support
 //! higher-order effect polymorphism without degrading to "may do anything".
 //!
-//! - [`EffectSet`]: 4-bit exact bitset (`PANIC | ALLOC | BLOCK | DIVERGE`), packed into bits
-//!   `10..15` of [`crate::FnHeader`] with zero size or ABI overhead (`FnHeader::RUST` stays `0`).
-//! - **Effect subtyping**: `e1 ⊆ e2` lets a purer `fn() expect()` coerce to `fn() expect(alloc)`,
-//!   and rejects passing an allocating callback where `expect()` is required.
+//! - [`EffectSet`]: 5-bit exact bitset (`PANIC | ALLOC | BLOCK | DIVERGE | SUSPEND`), packed into
+//!   bits `10..=15` of [`crate::FnHeader`] with zero size or ABI overhead (`FnHeader::RUST` stays `0`).
+//! - **Effect subtyping**: `e1 ⊆ e2` lets a purer `fn() expect()` coerce to `fn() expect(alloc)` or
+//!   `fn() expect(suspend)`, and rejects passing a suspending or allocating callback where `expect()`
+//!   is required.
 //! - **Effect polymorphism**: [`EffectRow`] models `expect(base | e)` on higher-order functions
-//!   and trait methods (`fn map<F: Fn(A) -> B expect(e)>(f: F) expect(e)`).
+//!   and trait methods (`fn map<F: Fn(A) -> B expect(e)>(f: F) expect(e)`), removing `sync`/`async`
+//!   function coloring across `bstd`.
 
 use core::fmt;
 
 use crate::tys::FnHeader;
 
-/// 4-bit exact effect set for Blaze functions, fn pointers, and `dyn Fn` trait objects.
+/// 5-bit exact effect set for Blaze functions, fn pointers, and `dyn Fn` trait objects.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Debug)]
 pub struct EffectSet(u8);
 
 impl EffectSet {
-    /// No effects (`expect()`): pure, non-panicking, non-allocating, non-blocking, terminating.
+    /// No effects (`expect()`): pure, non-panicking, non-allocating, non-blocking, terminating, non-suspending.
     pub const PURE: EffectSet = EffectSet(0);
     /// May panic or abort (`panic`).
     pub const PANIC: EffectSet = EffectSet(1 << 0);
@@ -31,28 +33,31 @@ impl EffectSet {
     pub const BLOCK: EffectSet = EffectSet(1 << 2);
     /// May not return: unbounded loop or recursion (`diverge`).
     pub const DIVERGE: EffectSet = EffectSet(1 << 3);
+    /// May suspend to a lexical algebraic effect handler / sans-IO driver (`suspend`).
+    pub const SUSPEND: EffectSet = EffectSet(1 << 4);
     /// Unconstrained ("may do anything": unmarked Rust code / foreign FFI).
-    pub const ALL: EffectSet = EffectSet(0b1111);
+    pub const ALL: EffectSet = EffectSet(0b1_1111);
 
-    /// Constructs an [`EffectSet`] from its 4 low bits.
+    /// Constructs an [`EffectSet`] from its 5 low bits.
     #[inline]
     pub const fn from_bits(bits: u8) -> EffectSet {
-        EffectSet(bits & 0b1111)
+        EffectSet(bits & 0b1_1111)
     }
 
-    /// Raw 4-bit mask (`0..=15`).
+    /// Raw 5-bit mask (`0..=31`).
     #[inline]
     pub const fn bits(self) -> u8 {
         self.0
     }
 
-    /// Parses one Blaze effect keyword (`"panic"`, `"alloc"`, `"block"`, `"diverge"`).
+    /// Parses one Blaze effect keyword (`"panic"`, `"alloc"`, `"block"`, `"diverge"`, `"suspend"`).
     pub fn from_word(word: &str) -> Option<EffectSet> {
         match word {
             "panic" => Some(Self::PANIC),
             "alloc" => Some(Self::ALLOC),
             "block" => Some(Self::BLOCK),
             "diverge" => Some(Self::DIVERGE),
+            "suspend" => Some(Self::SUSPEND),
             _ => None,
         }
     }
@@ -96,23 +101,39 @@ impl EffectSet {
 
     /// Canonical static text spelling of this effect list (`expect()`, `expect(panic, alloc)`, ...).
     pub const fn canonical_label(self) -> &'static str {
-        match self.0 & 0b1111 {
-            0b0000 => "expect()",
-            0b0001 => "expect(panic)",
-            0b0010 => "expect(alloc)",
-            0b0011 => "expect(panic, alloc)",
-            0b0100 => "expect(block)",
-            0b0101 => "expect(panic, block)",
-            0b0110 => "expect(alloc, block)",
-            0b0111 => "expect(panic, alloc, block)",
-            0b1000 => "expect(diverge)",
-            0b1001 => "expect(panic, diverge)",
-            0b1010 => "expect(alloc, diverge)",
-            0b1011 => "expect(panic, alloc, diverge)",
-            0b1100 => "expect(block, diverge)",
-            0b1101 => "expect(panic, block, diverge)",
-            0b1110 => "expect(alloc, block, diverge)",
-            _ => "expect(panic, alloc, block, diverge)",
+        match self.0 & 0b1_1111 {
+            0b0_0000 => "expect()",
+            0b0_0001 => "expect(panic)",
+            0b0_0010 => "expect(alloc)",
+            0b0_0011 => "expect(panic, alloc)",
+            0b0_0100 => "expect(block)",
+            0b0_0101 => "expect(panic, block)",
+            0b0_0110 => "expect(alloc, block)",
+            0b0_0111 => "expect(panic, alloc, block)",
+            0b0_1000 => "expect(diverge)",
+            0b0_1001 => "expect(panic, diverge)",
+            0b0_1010 => "expect(alloc, diverge)",
+            0b0_1011 => "expect(panic, alloc, diverge)",
+            0b0_1100 => "expect(block, diverge)",
+            0b0_1101 => "expect(panic, block, diverge)",
+            0b0_1110 => "expect(alloc, block, diverge)",
+            0b0_1111 => "expect(panic, alloc, block, diverge)",
+            0b1_0000 => "expect(suspend)",
+            0b1_0001 => "expect(panic, suspend)",
+            0b1_0010 => "expect(alloc, suspend)",
+            0b1_0011 => "expect(panic, alloc, suspend)",
+            0b1_0100 => "expect(block, suspend)",
+            0b1_0101 => "expect(panic, block, suspend)",
+            0b1_0110 => "expect(alloc, block, suspend)",
+            0b1_0111 => "expect(panic, alloc, block, suspend)",
+            0b1_1000 => "expect(diverge, suspend)",
+            0b1_1001 => "expect(panic, diverge, suspend)",
+            0b1_1010 => "expect(alloc, diverge, suspend)",
+            0b1_1011 => "expect(panic, alloc, diverge, suspend)",
+            0b1_1100 => "expect(block, diverge, suspend)",
+            0b1_1101 => "expect(panic, block, diverge, suspend)",
+            0b1_1110 => "expect(alloc, block, diverge, suspend)",
+            _ => "expect(panic, alloc, block, diverge, suspend)",
         }
     }
 }
@@ -374,5 +395,39 @@ mod tests {
         out.0.clear();
         print(&cx.tys, alloc_fn.node(), &mut DefaultNames, &mut out);
         assert_eq!(out.0.as_str(), "fn(u32) -> u32 expect(alloc)");
+
+        let suspend_fn = cx.tys.fn_ptr(sig, FnHeader::RUST.with_effects(EffectSet::SUSPEND));
+        out.0.clear();
+        print(&cx.tys, suspend_fn.node(), &mut DefaultNames, &mut out);
+        assert_eq!(out.0.as_str(), "fn(u32) -> u32 expect(suspend)");
+    }
+
+    #[test]
+    fn suspend_effect_packs_into_fn_header_bit_15_and_enforces_subtyping() {
+        assert_eq!(EffectSet::from_word("suspend"), Some(EffectSet::SUSPEND));
+        let h = FnHeader::new(7, false, true, 0xBEEF).with_effects(EffectSet::SUSPEND);
+        assert_eq!(h.abi(), 7);
+        assert!(!h.is_unsafe());
+        assert!(h.c_variadic());
+        assert_eq!(h.bound_vars(), 0xBEEF, "bit 15 must not clobber bound_vars in bits 16..31");
+        assert_eq!(h.declared_effects(), Some(EffectSet::SUSPEND));
+
+        let pure_fn = FnHeader::RUST.with_effects(EffectSet::PURE);
+        let suspend_fn = FnHeader::RUST.with_effects(EffectSet::SUSPEND);
+        let alloc_suspend = FnHeader::RUST.with_effects(EffectSet::ALLOC.union(EffectSet::SUSPEND));
+        assert!(fn_ptr_coerces(pure_fn, suspend_fn).is_ok());
+        assert!(fn_ptr_coerces(suspend_fn, alloc_suspend).is_ok());
+        assert!(fn_ptr_coerces(suspend_fn, FnHeader::RUST).is_ok());
+        assert_eq!(
+            fn_ptr_coerces(suspend_fn, pure_fn).unwrap_err(),
+            EffectError::FnPtrEffectMismatch { expected: EffectSet::PURE, found: EffectSet::SUSPEND }
+        );
+
+        let e = EffectVar(1);
+        let map_row = EffectRow::poly(EffectSet::ALLOC, e);
+        assert_eq!(
+            map_row.instantiate(e, EffectSet::SUSPEND),
+            EffectRow::Concrete(EffectSet::ALLOC.union(EffectSet::SUSPEND))
+        );
     }
 }

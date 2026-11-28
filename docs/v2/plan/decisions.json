@@ -1762,6 +1762,14 @@
    "recommended": "Each deleted crate is in git at 50dac12595; a doc that cited one says what is true now and points there. Other unreached members are listed for a decision of their own, not deleted.",
    "why": "An audit found these crates built and called by nothing: they cost ratchet rows, docs that called them built, and readers' time, and no command used them.",
    "state": "decided by the owner 2026-11-27"
+  },
+  {
+   "id": "D234",
+   "date": "2026-11-27",
+   "decision": "Proper sans-IO for bstd (docs/v2/plan/design/sans-io-machines.md). Logic returns a typed request and is resumed with that request's answer; only a driver performs requests. An explicit state machine is one type per state with an ordinary impl whose signature carries what it asks (`type Asks`) and every state it may go to (`type Next = A | B | Fail<E>`); no macro, no new syntax; a state reaches every declared target and only those, is resumed only with its request's answer, and is consumed by its transition. Open resources are handles (slot, generation), private to a linear capability; closing is a request, never a `Drop`. Capability methods build a request and never wait; `cx.run` performs one from driver code; `drive` is the one loop. A direct-style function may be compiled into a machine, under the rule that it holds no borrow of its own local across a suspension point; explicit machines are the default for anything with branching, retries, timeouts or several inputs. Every tradeoff is weighed for a model writing and reading the code, not a person.",
+   "recommended": "The id skips D219 to D233, which are taken on the branch dedup-1127 and reach main as its pieces merge.",
+   "why": "bstd's calls wait for their completion, so their callers are blocked on IO and are not sans-IO cores: 232 public call-and-wait functions, 6 of bstd's 318 files marked sans-IO, and direct IO inside logic across the crates that do IO (2026-11-27 counts). `async` was rejected: an ambient reactor, `Pin`, and states and edges that no signature shows.",
+   "state": "decided by the owner 2026-11-27; the plan is written, the interface crate and typed requests are being written on dedup-1127"
   }
  ]
 }

@@ -72,10 +72,10 @@ const fn known(name: &'static str, planned: Stage) -> KnownAttr {
 
 /// Every `blaze::` attribute this build knows, sorted by name: the extensions ledger's section 3
 /// (2026-11-16), every one known and unchecked today but `args` (rule 83, 2026-11-17),
-/// `capability` (sans-IO capability firewall, 2026-11-27), and `cost` (checked complexity
-/// contracts, 2026-11-27). A stage that starts to check one, or the verdict that removes one,
-/// changes its `state` here and nowhere else.
-pub const KNOWN: [KnownAttr; 54] = {
+/// `capability` and `handle` (two-tier sans-IO firewall, 2026-11-27), and `cost` (checked
+/// complexity contracts, 2026-11-27). A stage that starts to check one, or the verdict that
+/// removes one, changes its `state` here and nowhere else.
+pub const KNOWN: [KnownAttr; 55] = {
     use Stage::*;
     [
         known("answers_request", Effects),
@@ -108,6 +108,10 @@ pub const KNOWN: [KnownAttr; 54] = {
         known("effects", Effects),
         known("error_unions", Syntax),
         known("expect", Effects),
+        // Inert generational handle token (`#[blaze::handle]` on ADTs): allowed inside
+        // `#![blaze::sans_io]` ADTs and checked by `capability-in-sans-io` to store no
+        // `#[blaze::capability]` fields (blaze-typeck rules/capability.rs, `AdtRow::handle`).
+        KnownAttr { name: "handle", state: State::Checked(Ownership), planned: Ownership },
         known("handles", Ownership),
         known("holds", Ownership),
         known("invariant", Proofs),

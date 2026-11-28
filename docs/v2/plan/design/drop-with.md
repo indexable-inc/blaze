@@ -200,14 +200,24 @@ In every case:
 already check whether a type transitively owns or borrows a capability. `#[blaze::capability]`
 promotes that check into a compiler-enforced boundary for sans-IO data:
 
-1. **Marked capabilities:** `Alloc`, `SharedAlloc`, `Bump`, `BrandedAlloc`, `BrandedBump`, `Fs`,
-   `Dir`, `Net`, `Clock`, `Rng`, `Env`, `Io`, `GpuDevice`, and `Mutex` / `RankedLock` carry
-   `#[blaze::capability]` (and implement `bstd::own::Capability`).
+1. **Two-tier split — executing capabilities vs inert handles:**
+   - **`#[blaze::capability]`** (executing/ambient authority): `Alloc`, `SharedAlloc`, `Bump`,
+     `BrandedAlloc`, `BrandedBump`, `Io`, `Cx`, `Fs`, `Net`, `Clock`, `Rng`, `Env`, `GpuDevice`,
+     and `Mutex` / `RankedLock` carry `#[blaze::capability]` (and implement `bstd::own::Capability`).
+     They cannot be stored in `#![blaze::sans_io]` ADTs.
+   - **`#[blaze::handle]`** (inert generational request-builder tokens,
+     [sans-io-machines.md](sans-io-machines.md)): `Handle<'io, K>`, `File<'io, Mode>`,
+     `Dir<'io, Mode>`, `Conn<'io>`, `Child<'io>`, `Lock<'io>`, etc. carry `#[blaze::handle]`. They
+     hold only an 8-byte `(slot, NonZeroU32 gen)` plus phantom brand/typestate and can only build
+     inert `Request` values with zero executing authority. They **are** allowed inside
+     `#![blaze::sans_io]` state structs, while `#[blaze::handle]` definitions themselves are
+     checked to store zero `#[blaze::capability]` fields.
 2. **Non-storable in `#![blaze::sans_io]`:** any `struct` or `enum` defined inside a
-   `#![blaze::sans_io]` crate/module (or marked `#[blaze::sans_io]`) is checked by the front end's
-   ownership walk to satisfy `NoCapability`: no field may transitively own or borrow a
-   `#[blaze::capability]` type. Violations are compile errors naming the exact field path
-   (e.g., `ParserState.scratch: BrandedAlloc<'id, Frame>`).
+   `#![blaze::sans_io]` crate/module (or marked `#[blaze::sans_io]`), as well as any
+   `#[blaze::handle]` definition, is checked by the front end's ownership walk to satisfy
+   `NoCapability`: no field may transitively own or borrow a `#[blaze::capability]` type.
+   Violations are compile errors naming the exact field path (e.g.,
+   `ParserState.scratch: BrandedAlloc<'id, Frame>`).
 3. **Why this pairs with `FrameVec` / `UnmanagedVec`:** pure sans-IO state machines cannot smuggle
    an allocator, filesystem, clock, or lock inside their data structs. Instead, their structs store
    compact 12/16-byte `FrameVec<'id, T, I>` / `UnmanagedVec<'id, T, I>` fields (which contain only

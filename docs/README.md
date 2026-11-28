@@ -47,6 +47,7 @@ How blaze is now. Kept true: CI checks their links, paths and settings against t
 
 Designs not (fully) built, newest first.
 
+- [v2/plan/design/sans-io-machines.md](v2/plan/design/sans-io-machines.md) (2026-11-27): "Proper sans-IO for bstd: logic returns typed requests and is resumed with their answers; explicit state machines with their edges in each state's signature (`type Asks`, `type Next = A | B | Fail<E>`), handles in place of names, capability methods that build a request and never wait, one driver loop, and the order in which bstd and the IO-doing crates move."
 - [v2/plan/design/drop-with.md](v2/plan/design/drop-with.md) (2026-11-27): "Contextual teardown (`DropWith<C>`) on `#[blaze::linear]` types resolved by unique invariant-branded scope bindings, comptime composite derivation, hardware-floor 16-byte unmanaged `FrameVec`/`UnmanagedVec` parameterized by `I: LenIdx = u32` (`u16`/`u32`/`usize`), generalization to GPU/slab/IO handles, and the `#[blaze::capability]` firewall for `#![blaze::sans_io]` data."
 - [v2/plan/third-party.md](v2/plan/third-party.md) (2026-11-26): What replaces each third-party package a workspace crate still names directly, and the hard ones with their options; the counts and the order are the gate's ratchets (scripts/src/bin/thirdparty.rs) and end-state.md's D180.
 - [v2/plan/bounds.md](v2/plan/bounds.md) (2026-11-26): Every speed-of-light bound blaze is held to, one machine-read block each, read by harness/v2/bounds.py; no program measures the two kept today, so neither is held yet.
