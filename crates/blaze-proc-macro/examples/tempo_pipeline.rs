@@ -51,7 +51,7 @@ use blaze_own::Alloc;
 use blaze_proc_macro::{
     hook::{Finding, ProcCx, ProcMacros, Reached, crate_key},
     host::{Limits, Runtime},
-    module::{Source, files_digest, package_files},
+    module::{Source, package_files_digest_in},
     sandbox::Package,
 };
 use blaze_surface::Edition;
@@ -697,8 +697,8 @@ fn main() {
         let git = git_of(store, name, version);
         let source = if lock[package].path {
             let dir = package_dir(checkout, name).expect("the path crate's folder");
-            digest = files_digest(&mut package_files(&dir).expect("its files"));
-            Source::Path { files_sha256: &digest }
+            digest = package_files_digest_in(&dir, blaze_own::testing::heap().alloc()).expect("its files");
+            Source::Path { files_sha256: digest.as_str() }
         } else if let Some((commit, path)) = &git {
             Source::Git { commit, path }
         } else {

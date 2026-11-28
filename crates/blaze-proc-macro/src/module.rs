@@ -19,7 +19,7 @@
 //! runtime ([`COMPILED_DIR`]; `host.rs`, "Compiled records").
 
 use std::fs::{File, read, read_dir};
-use std::io::{Error as IoError, ErrorKind, Read as _};
+use std::io::{Error as IoError, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use blaze_build_script::served::{InPackage, in_package};
@@ -272,15 +272,27 @@ impl FilesHasher {
         Self { hasher: blaze_sha256::Sha256::new() }
     }
 
+    /// Starts streaming one regular file entry with its raw `/`-separated relative path bytes and
+    /// declared byte length. Callers must follow with [`Self::update_chunk`] calls totaling
+    /// exactly `len` bytes.
+    pub fn begin_file(&mut self, path_bytes: &[u8], len: u64) {
+        self.hasher.update(path_bytes);
+        self.hasher.update(&[0]);
+        self.hasher.update(&len.to_le_bytes());
+    }
+
+    /// Streams a chunk of bytes for the file started with [`Self::begin_file`].
+    pub fn update_chunk(&mut self, chunk: &[u8]) {
+        self.hasher.update(chunk);
+    }
+
     /// Feeds one regular file entry by its raw `/`-separated relative path bytes. Callers must
     /// pass entries in ascending byte order of `path_bytes` to match [`package_files_digest_in`]
     /// and [`files_digest`].
     pub fn update_file_bytes(&mut self, path_bytes: &[u8], bytes: &[u8]) {
-        self.hasher.update(path_bytes);
-        self.hasher.update(&[0]);
         let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        self.hasher.update(&len.to_le_bytes());
-        self.hasher.update(bytes);
+        self.begin_file(path_bytes, len);
+        self.update_chunk(bytes);
     }
 
     /// Feeds one regular file entry. Callers must pass entries in ascending byte order of `path`
@@ -360,41 +372,70 @@ fn walk_package_entries<'f>(
     Ok(files)
 }
 
+/// Streams one regular file from `reader` directly into `hasher` in fixed `chunk`-sized pieces
+/// without retaining the file's full contents in memory, verifying that the observed byte count
+/// matches `expected_len` (Rule 3: never hash a concurrent grow/shrink under a stale length).
+fn stream_file_into_hasher(
+    hasher: &mut FilesHasher,
+    rel_bytes: &[u8],
+    reader: &mut impl Read,
+    expected_len: u64,
+    chunk: &mut [u8],
+) -> Result<(), IoError> {
+    hasher.begin_file(rel_bytes, expected_len);
+    let mut total: u64 = 0;
+    loop {
+        match reader.read(chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let Some(slice) = chunk.get(..n) else { break };
+                total = total.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+                if total > expected_len {
+                    return Err(IoError::new(
+                        ErrorKind::InvalidData,
+                        "file grew while streaming package files digest",
+                    ));
+                }
+                hasher.update_chunk(slice);
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    if total != expected_len {
+        return Err(IoError::new(
+            ErrorKind::UnexpectedEof,
+            "file shrank while streaming package files digest",
+        ));
+    }
+    Ok(())
+}
+
 /// Computes the canonical package-wide files digest directly from `dir`, streaming one file at a
-/// time into [`FilesHasher`] in strict ascending byte order of raw `/`-separated relative paths
-/// (`as_encoded_bytes()`, bit-for-bit identical to [`files_digest`] for UTF-8 paths and uniquely
-/// ordered for distinct non-UTF-8 Unix filenames). Allocates the returned 64-byte hex digest in
-/// `alloc` with zero whole-package global heap buffers.
+/// time in bounded 64 KiB chunks into [`FilesHasher`] in strict ascending byte order of raw
+/// `/`-separated relative paths (`as_encoded_bytes()`, bit-for-bit identical to [`files_digest`]
+/// for UTF-8 paths and uniquely ordered for distinct non-UTF-8 Unix filenames). Allocates the
+/// returned 64-byte hex digest in `alloc` with zero per-file heap or frame buffering.
 pub fn package_files_digest_in<A: core::alloc::Allocator>(dir: &Path, alloc: A) -> Result<blaze_own::String<A>, ModuleError> {
     let io = |path: &Path, error: IoError| ModuleError::Io { path: path.to_owned(), error };
     let frame = bstd::mem::Frame::new(bstd::mem::Tag::Other)
         .map_err(|e| io(dir, IoError::other(format!("allocating package_files_digest_in frame: {e:?}"))))?;
     let files = walk_package_entries(dir, &frame)?;
     let mut hasher = FilesHasher::new();
-    let mut buf: blaze_own::Vec<u8, &bstd::mem::Frame> = blaze_own::Vec::new_in(&frame);
-    let mut chunk = [0u8; 16 * 1024];
+    let mut chunk = [0u8; 64 * 1024];
     for (rel_bytes, full_path) in files.iter() {
-        buf.clear();
         let mut file = File::open(full_path).map_err(|e| io(full_path, e))?;
-        loop {
-            match file.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if let Some(slice) = chunk.get(..n) {
-                        buf.extend_from_slice(slice);
-                    }
-                }
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => return Err(io(full_path, e)),
-            }
-        }
-        hasher.update_file_bytes(rel_bytes.as_slice(), buf.as_slice());
+        let expected_len = file.metadata().map_err(|e| io(full_path, e))?.len();
+        stream_file_into_hasher(&mut hasher, rel_bytes.as_slice(), &mut file, expected_len, &mut chunk)
+            .map_err(|e| io(full_path, e))?;
     }
     Ok(hasher.finish_hex_in(alloc))
 }
 
-/// The files of the package at `dir` that [`files_digest`] covers, by their paths relative to
-/// it (`/`-separated): each entry `served::in_package` takes. Walked with a stack of folders.
+/// The files of the package at `dir` that [`files_digest`] covers, by their UTF-8 paths relative
+/// to it (`/`-separated): each entry `served::in_package` takes. Fails cleanly on non-UTF-8
+/// filenames instead of corrupting them lossily; callers computing a package's digest should use
+/// [`package_files_digest_in`] directly.
 pub fn package_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, ModuleError> {
     let io = |path: &Path, error: IoError| ModuleError::Io { path: path.to_owned(), error };
     let frame = bstd::mem::Frame::new(bstd::mem::Tag::Other)
@@ -402,7 +443,9 @@ pub fn package_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, ModuleError> 
     let files = walk_package_entries(dir, &frame)?;
     let mut out = Vec::with_capacity(files.len());
     for (rel_bytes, path) in files.iter() {
-        let at = String::from_utf8_lossy(rel_bytes.as_slice()).into_owned();
+        let at = core::str::from_utf8(rel_bytes.as_slice())
+            .map(str::to_owned)
+            .map_err(|_| io(path, IoError::new(ErrorKind::InvalidData, "non-UTF-8 path in package_files; use package_files_digest_in")))?;
         out.push((at, read(path).map_err(|e| io(path, e))?));
     }
     Ok(out)
@@ -1122,6 +1165,36 @@ mod header_tests {
             oracle,
             "package_files_digest_in must sort and hash colliding non-UTF-8 names by raw relative bytes"
         );
+        // Legacy UTF-8 `package_files` refuses non-UTF-8 names loudly instead of corrupting them lossily.
+        assert!(package_files(&dir).is_err(), "package_files must refuse non-UTF-8 paths instead of lossy replacement");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chunked_file_streaming_matches_update_file_bytes_and_detects_size_mismatch() {
+        let payload: Vec<u8> = (0..200_000usize).map(|i| (i.wrapping_mul(31) & 0xff) as u8).collect();
+        let mut expected = FilesHasher::new();
+        expected.update_file_bytes(b"assets/large.bin", &payload);
+
+        let mut streamed = FilesHasher::new();
+        let mut small_chunk = [0u8; 4096];
+        let mut cursor = std::io::Cursor::new(&payload);
+        stream_file_into_hasher(&mut streamed, b"assets/large.bin", &mut cursor, payload.len() as u64, &mut small_chunk)
+            .expect("chunked streaming must succeed when observed length matches expected_len");
+        assert_eq!(streamed.finish(), expected.finish(), "chunked streaming digest must match update_file_bytes bit-for-bit");
+
+        // Negative control 1: file grew beyond declared metadata length.
+        let mut grew = FilesHasher::new();
+        let mut cur_grew = std::io::Cursor::new(&payload);
+        let err_grew = stream_file_into_hasher(&mut grew, b"assets/large.bin", &mut cur_grew, (payload.len() - 1) as u64, &mut small_chunk)
+            .expect_err("file growth beyond expected_len must fail");
+        assert_eq!(err_grew.kind(), ErrorKind::InvalidData);
+
+        // Negative control 2: file shrank below declared metadata length.
+        let mut shrank = FilesHasher::new();
+        let mut cur_shrank = std::io::Cursor::new(&payload);
+        let err_shrank = stream_file_into_hasher(&mut shrank, b"assets/large.bin", &mut cur_shrank, (payload.len() + 1) as u64, &mut small_chunk)
+            .expect_err("file shrink below expected_len must fail");
+        assert_eq!(err_shrank.kind(), ErrorKind::UnexpectedEof);
     }
 }

@@ -428,11 +428,18 @@ pub fn script_deps_digest_with<S: AsRef<str>, A: core::alloc::Allocator>(
             (Checksum::Sha256(sum), _) => {
                 let _ = write!(row, "checksum:{}", sum.as_str());
             }
-            // Never read checkout files for lock-only path entries (which include normal and dev
-            // dependencies outside `active_graph`): their files are not in `UnitGraph`'s key
-            // (rule 21). Actual build-dep path packages are already hashed in `lines` above.
+            // When `wasm_graph` was supplied for a wasm script but lacked an exact side-and-feature
+            // match, pin lock-reachable path dependencies by their actual file contents so WASI-only
+            // path build-dependencies absent from the host graph still invalidate the digest
+            // (rule 21). When `wasm_graph` is `None` (native build scripts or minimal toolchains),
+            // never read checkout files for lock-only path entries outside `active_graph` because
+            // `Cargo.lock` mixes normal/dev deps not in `UnitGraph`'s key (prevents `TwoValues`).
             (Checksum::Absent, LockSource::Path) => {
-                row.push_str("path:lock");
+                if wasm_graph.is_some() {
+                    write_path_pin(&mut row, pkg_id);
+                } else {
+                    row.push_str("path:lock");
+                }
             }
             (Checksum::Absent, LockSource::Git { commit, .. }) => {
                 let _ = write!(row, "git:{}", commit.as_str());
@@ -1817,9 +1824,10 @@ mod tests {
         let mk_lock = |reg_sum: &str| {
             format!(
                 "version = 4\n\n\
-                 [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"host_dep\", \"reg_dep\"]\n\n\
+                 [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"host_dep\", \"reg_dep\", \"wasi_only_path\"]\n\n\
                  [[package]]\nname = \"host_dep\"\nversion = \"0.1.0\"\n\n\
-                 [[package]]\nname = \"reg_dep\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{reg_sum}\"\n"
+                 [[package]]\nname = \"reg_dep\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{reg_sum}\"\n\n\
+                 [[package]]\nname = \"wasi_only_path\"\nversion = \"0.1.0\"\n"
             )
         };
         let lock_a_txt = mk_lock("1111111111111111111111111111111111111111111111111111111111111111");
@@ -1882,17 +1890,21 @@ mod tests {
         assert_ne!(fallback_v1, fallback_v2);
 
         for (label, wg) in [("wrong features", &wg_wrong_feats), ("wrong side", &wg_wrong_side)] {
-            let d1 = super::script_deps_digest(&host_graph, Some(wg), &lock_a, UnitId(0), |id| (id == LockId(1)).then(|| "h-v1".to_owned()))
+            let run_wg = |lock: &Lock<'_>, host_hex: &str, wasi_hex: &str| {
+                super::script_deps_digest(&host_graph, Some(wg), lock, UnitId(0), |id| match id {
+                    LockId(1) => Some(host_hex.to_owned()),
+                    LockId(3) => Some(wasi_hex.to_owned()),
+                    _ => None,
+                })
                 .expect("ok")
-                .expect("mismatched wasm root must not return None");
-            let d2 = super::script_deps_digest(&host_graph, Some(wg), &lock_a, UnitId(0), |id| (id == LockId(1)).then(|| "h-v2".to_owned()))
-                .expect("ok")
-                .expect("mismatched wasm root v2");
-            let d_lock_b = super::script_deps_digest(&host_graph, Some(wg), &lock_b, UnitId(0), |id| (id == LockId(1)).then(|| "h-v1".to_owned()))
-                .expect("ok")
-                .expect("mismatched wasm root lock_b");
-            assert_eq!(d1, fallback_v1, "{label}: must fall back identically to wasm_graph=None");
-            assert_ne!(d1, d2, "{label}: must still cover host path build-dep");
+                .expect("mismatched wasm root must not return None")
+            };
+            let d1 = run_wg(&lock_a, "h-v1", "w-v1");
+            let d_host_edit = run_wg(&lock_a, "h-v2", "w-v1");
+            let d_wasi_path_edit = run_wg(&lock_a, "h-v1", "w-v2");
+            let d_lock_b = run_wg(&lock_b, "h-v1", "w-v1");
+            assert_ne!(d1, d_host_edit, "{label}: must still cover host path build-dep");
+            assert_ne!(d1, d_wasi_path_edit, "{label}: must pin WASI-only lock path build-dep by its actual contents");
             assert_ne!(d1, d_lock_b, "{label}: must still cover lock-pinned dep in fallback mode");
         }
     }

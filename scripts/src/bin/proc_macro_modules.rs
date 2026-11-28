@@ -1265,13 +1265,38 @@ fn files_digest(dir: &Path) -> Result<String, Failure> {
     }
     files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut hasher = blaze_sha256::Sha256::new();
+    let mut chunk = [0u8; 64 * 1024];
     for (rel_bytes, path) in &files {
-        let bytes = std::fs::read(path).map_err(io(path))?;
+        let mut file = std::fs::File::open(path).map_err(io(path))?;
+        let expected_len = file.metadata().map_err(io(path))?.len();
         hasher.update(rel_bytes);
         hasher.update(&[0]);
-        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        hasher.update(&len.to_le_bytes());
-        hasher.update(&bytes);
+        hasher.update(&expected_len.to_le_bytes());
+        let mut total: u64 = 0;
+        loop {
+            match std::io::Read::read(&mut file, &mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let Some(slice) = chunk.get(..n) else { break };
+                    total = total.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+                    if total > expected_len {
+                        return Err(io(path)(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "file grew while streaming files_digest",
+                        )));
+                    }
+                    hasher.update(slice);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(io(path)(e)),
+            }
+        }
+        if total != expected_len {
+            return Err(io(path)(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "file shrank while streaming files_digest",
+            )));
+        }
     }
     Ok(hex(&hasher.finish()))
 }

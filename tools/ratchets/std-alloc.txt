@@ -80,7 +80,7 @@ blaze-own	67	0	29	38
 blaze-parquet	0	0	2	0
 blaze-pg	0	0	7	39
 blaze-preview	0	0	0	1
-blaze-proc-macro	518	1	0	998
+blaze-proc-macro	518	1	0	996
 blaze-protocol	27	1	1	157
 blaze-queue	0	0	3	0
 blaze-radix	2	1	1	23

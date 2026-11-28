@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use blaze_proc_macro::{
-    module::{CrateId, LockedPackages, ModuleRecord, Source, files_digest, package_files, read_module},
+    module::{CrateId, LockedPackages, ModuleRecord, Source, package_files_digest_in, read_module},
     record::{DirStore, native_world},
     sandbox::{Files, Package},
 };
@@ -21,8 +21,9 @@ pub fn modules(store: &Path, checkout: &Path) -> Vec<ModuleRecord> {
     let mut out = Vec::new();
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(store.join("proc-macro/modules")).expect("the module store").flatten().map(|it| it.path()).collect();
     dirs.sort();
+    let alloc = blaze_own::testing::heap().alloc();
     let lock_text = std::fs::read(checkout.join("Cargo.lock")).expect("the checkout's lock");
-    let lock = blaze_manifest::lock::Lock::read(&lock_text, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the checkout's Cargo.lock: {e}"));
+    let lock = blaze_manifest::lock::Lock::read(&lock_text, alloc).unwrap_or_else(|e| panic!("the checkout's Cargo.lock: {e}"));
     let locked = LockedPackages::of(&lock);
     for dir in dirs {
         let identity = std::fs::read_to_string(dir.join("identity")).expect("a module's identity");
@@ -33,14 +34,14 @@ pub fn modules(store: &Path, checkout: &Path) -> Vec<ModuleRecord> {
         // A path package's digest is computed here from the checkout as it is, never taken from
         // the identity: an edit to the macro crate reads as a missing module.
         let digest = if files.is_empty() {
-            String::new()
+            blaze_own::String::new_in(alloc)
         } else {
             let dir = package_dir(checkout, &name).expect("the path package in the checkout");
-            files_digest(&mut package_files(&dir).expect("the path package's files"))
+            package_files_digest_in(&dir, alloc).expect("the path package's files")
         };
         let (commit, path) = git.split_once(' ').unwrap_or(("", ""));
         let source = if !files.is_empty() {
-            Source::Path { files_sha256: &digest }
+            Source::Path { files_sha256: digest.as_str() }
         } else if !git.is_empty() {
             Source::Git { commit, path }
         } else {
