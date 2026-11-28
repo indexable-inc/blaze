@@ -336,8 +336,11 @@ fn fit(view: &View<'_, '_>, def: Def<'_>, loc: Loc, under: Under, glued: &mut Op
         Loc::Close(_) => taken(under.closed),
         Loc::Literal(lhs) => taken(match token.map(|at| view.kind(at)) {
             Some(TokenKind::Literal { kind, .. }) => {
-                matches!(def.kind(lhs), TokenKind::Literal { kind: k, .. } if k == kind)
-                    && view.bytes(src.at) == def.bytes(lhs)
+                matches!(
+                    def.kind(lhs),
+                    TokenKind::Literal { kind: k, .. }
+                        if k.without_doc_provenance() == kind.without_doc_provenance()
+                ) && view.bytes(src.at) == def.bytes(lhs)
             }
             _ => false,
         }),

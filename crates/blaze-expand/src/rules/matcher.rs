@@ -662,8 +662,11 @@ fn match_loop_inner<'f>(
             Loc::Literal(lhs) => {
                 match token.map(|at| view.kind(at)) {
                     Some(TokenKind::Literal { kind, .. })
-                        if matches!(def.kind(lhs), TokenKind::Literal { kind: k, .. } if k == kind)
-                            && view.bytes(src.at) == def.bytes(lhs) =>
+                        if matches!(
+                            def.kind(lhs),
+                            TokenKind::Literal { kind: k, .. }
+                                if k.without_doc_provenance() == kind.without_doc_provenance()
+                        ) && view.bytes(src.at) == def.bytes(lhs) =>
                     {
                         item.dot += 1;
                     }
@@ -1069,7 +1072,9 @@ pub(super) fn expect_separator(view: &View<'_, '_>, def: super::Def<'_>, src: Le
         Sep::Literal(lhs) => expect_literal(view, &mut fork).is_some_and(|at| {
             view.bytes(at) == def.bytes(lhs)
                 && match (view.kind(at), def.kind(lhs)) {
-                    (TokenKind::Literal { kind: a, .. }, TokenKind::Literal { kind: b, .. }) => a == b,
+                    (TokenKind::Literal { kind: a, .. }, TokenKind::Literal { kind: b, .. }) => {
+                        a.without_doc_provenance() == b.without_doc_provenance()
+                    }
                     (TokenKind::Ident { .. }, _) => true,
                     _ => false,
                 }

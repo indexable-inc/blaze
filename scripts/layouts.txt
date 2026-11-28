@@ -101,12 +101,13 @@ crates/blaze-engine/src/pages.rs	RADIX_SHARD_MAGIC	none
 crates/blaze-engine/src/pages.rs	ROOT_MAGIC	test previous_root_magic_ber4_is_rejected
 crates/blaze-engine/src/pages.rs	SUMMARY_MAGIC	none
 crates/blaze-engine/src/pages/headers.rs	MAGIC	none
-crates/blaze-expand/src/kept_set.rs	MAGIC	none
+crates/blaze-expand/src/kept_set.rs	MAGIC	test previous_kept_set_magic_v4_is_refused
 crates/blaze-expand/src/kept_set.rs	MAGIC_V1	none
 crates/blaze-expand/src/kept_set.rs	MAGIC_V2	none
 crates/blaze-expand/src/kept_set.rs	MAGIC_V3	none
-crates/blaze-expand/src/record.rs	EXPANSION_SCHEMA	none
-crates/blaze-expand/src/record.rs	STREAM_SCHEMA	none
+crates/blaze-expand/src/kept_set.rs	MAGIC_V4	test previous_kept_set_magic_v4_is_refused
+crates/blaze-expand/src/record.rs	EXPANSION_SCHEMA	test previous_expansion_schema_4_is_refused
+crates/blaze-expand/src/record.rs	STREAM_SCHEMA	test previous_stream_schema_2_is_refused
 crates/blaze-export/src/macho.rs	LC_BUILD_VERSION	none
 crates/blaze-export/src/macho.rs	MH_MAGIC_64	none
 crates/blaze-export/src/native_dylib.rs	DYLIB_VERSION	none
@@ -169,7 +170,7 @@ crates/blaze-lir/src/pgo.rs	PGO_VERSION	none
 crates/blaze-lir/src/simplify/mach_egraph.rs	CACHE_MAGIC	none
 crates/blaze-lir/src/simplify/mach_egraph.rs	CACHE_VERSION	none
 crates/blaze-lower/src/form.rs	ROW_FORMAT	none
-crates/blaze-macro-run/src/call.rs	FORMAT	none
+crates/blaze-macro-run/src/call.rs	FORMAT	test previous_format_1_is_refused
 crates/blaze-manifest/src/metadata.rs	VERSION	not persisted: cargo metadata's output, not blaze's
 crates/blaze-native/src/descriptor.rs	MAGIC	none
 crates/blaze-native/src/descriptor.rs	MAGIC_BNL1	none

@@ -2906,3 +2906,266 @@ fn recursive_macro_rules_text_mark_preserves_distinct_local_hygiene() {
     assert_eq!(h_relex_let, m_let.local_hygiene());
     assert_ne!(h_relex_param, h_relex_let);
 }
+
+#[test]
+fn doc_comment_desugars_to_str_raw_with_minimal_hashes() {
+    // Doc-comment provenance on `LitKind` must add 0 bytes to `LitKind`, `TokenKind`, and `Token`.
+    assert_eq!(core::mem::size_of::<LitKind>(), 2);
+    assert_eq!(core::mem::size_of::<TokenKind>(), 8);
+    assert_eq!(core::mem::size_of::<blaze_expand::Token>(), 20);
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let assert_doc_lit = |src: &str, inner: bool, want_kind: LitKind, want_body: Option<&str>| {
+        let stream = lex(src, Edition::E2021, alloc).expect("doc comment lexes");
+        let idx = if inner { 5 } else { 4 };
+        let tok = stream.tokens()[idx];
+        let TokenKind::Literal { kind, suffix_len, .. } = tok.kind else {
+            panic!("expected literal at token {idx} for `{src:?}`, got {:?}", tok.kind);
+        };
+        assert_eq!((kind, suffix_len), (want_kind, 0), "literal kind for `{src:?}`");
+        if let Some(body) = want_body {
+            assert_eq!(stream.text_at(idx), body, "literal body for `{src:?}`");
+        }
+        // Every desugared doc comment must round-trip through source rendering back to the exact
+        // same raw/cooked literal kind (without doc provenance) and body text.
+        let mut rendered = blaze_own::AString::new_in(alloc);
+        blaze_expand::write_tokens(&stream, &mut rendered);
+        let relexed = lex(rendered.as_str(), Edition::E2021, alloc).expect("rendered doc comment re-lexes");
+        assert_eq!(relexed.tokens().len(), stream.tokens().len(), "round-trip token count for `{src:?}`");
+        let TokenKind::Literal { kind: rk, suffix_len: rsl, .. } = relexed.tokens()[idx].kind else {
+            panic!("expected literal after round-trip for `{src:?}`");
+        };
+        assert_eq!((rk, rsl), (kind.without_doc_provenance(), 0), "round-trip literal kind for `{src:?}`");
+        assert_eq!(relexed.text_at(idx), stream.text_at(idx), "round-trip literal body for `{src:?}`");
+    };
+
+    assert_doc_lit("/// attr\n", false, LitKind::DocStrRaw(0), Some(" attr"));
+    assert_doc_lit("///\n", false, LitKind::DocStrRaw(0), Some(""));
+    assert_doc_lit("//! inner\n", true, LitKind::DocStrRaw(0), Some(" inner"));
+    assert_doc_lit("/** block */", false, LitKind::DocStrRaw(0), Some(" block "));
+    assert_doc_lit("/*! inner block */", true, LitKind::DocStrRaw(0), Some(" inner block "));
+    assert_doc_lit("/// has \"quote\"\n", false, LitKind::DocStrRaw(1), Some(" has \"quote\""));
+    assert_doc_lit("/// trailing \"\n", false, LitKind::DocStrRaw(1), Some(" trailing \""));
+    assert_doc_lit("/// has \"#\n", false, LitKind::DocStrRaw(2), Some(" has \"#"));
+    assert_doc_lit("/// a\"###b\n", false, LitKind::DocStrRaw(4), Some(" a\"###b"));
+    assert_doc_lit("/// \"\"#\n", false, LitKind::DocStrRaw(2), Some(" \"\"#"));
+    assert_doc_lit("/// has \\n backslash\n", false, LitKind::DocStrRaw(0), Some(" has \\n backslash"));
+    assert_doc_lit("/** a\r\nb */", false, LitKind::DocStrRaw(0), Some(" a\nb "));
+
+    // 254 hashes after `"` needs 255 hashes (the u8 maximum for raw strings); 255+ hashes after `"`
+    // saturates at `DocStrRaw(255)` (preserving the raw literal kind, matching `rustc_ast/src/tokenstream.rs`).
+    let mut hashes_254 = blaze_own::AString::new_in(alloc);
+    hashes_254.push_str("/// \"");
+    for _ in 0..254 {
+        hashes_254.push('#');
+    }
+    hashes_254.push('\n');
+    let mut want_254 = blaze_own::AString::new_in(alloc);
+    want_254.push_str(" \"");
+    for _ in 0..254 {
+        want_254.push('#');
+    }
+    assert_doc_lit(hashes_254.as_str(), false, LitKind::DocStrRaw(255), Some(want_254.as_str()));
+
+    for n in [255usize, 256] {
+        let mut src = blaze_own::AString::new_in(alloc);
+        src.push_str("/// \"");
+        for _ in 0..n {
+            src.push('#');
+        }
+        src.push('\n');
+        let mut want = blaze_own::AString::new_in(alloc);
+        want.push_str(" \"");
+        for _ in 0..n {
+            want.push('#');
+        }
+        let stream = lex(src.as_str(), Edition::E2021, alloc).expect("255+ hashes doc lexes");
+        let tok = stream.tokens()[4];
+        assert_eq!(
+            tok.kind,
+            TokenKind::Literal { kind: LitKind::DocStrRaw(255), suffix_len: 0, spacing: Spacing::Alone },
+            "{n} hashes after `\"` must saturate at DocStrRaw(255)"
+        );
+        assert_eq!(stream.text_at(4), want.as_str());
+        // Forwarding through `macro_rules!` must preserve raw `StrRaw(255)`, never cooked `Str`.
+        let forward = rules("($($t:tt)*) => { $($t)* };", 1);
+        let forwarded = call_fn(&forward, src.as_str(), &TestCx::new());
+        assert_eq!(
+            forwarded.tokens.tokens()[4].kind,
+            TokenKind::Literal { kind: LitKind::StrRaw(255), suffix_len: 0, spacing: Spacing::Alone },
+            "forwarded {n}-hash doc comment must remain StrRaw(255)"
+        );
+        assert_eq!(forwarded.tokens.text_at(4), want.as_str());
+
+        // Final textual rendering (`write_tokens`) must still produce valid, lexable Rust source
+        // whose string literal decodes back to the exact original doc body (falling back to a
+        // cooked escaped string literal because `"` + 255 `#`s cannot fit in a raw string).
+        let mut rendered = blaze_own::AString::new_in(alloc);
+        blaze_expand::write_tokens(&forwarded.tokens, &mut rendered);
+        let relexed = lex(rendered.as_str(), Edition::E2021, alloc).expect("rendered saturated doc comment lexes");
+        let mut decoded = blaze_own::AString::new_in(alloc);
+        blaze_expand::write_token(&relexed, &relexed.tokens()[4], &mut decoded);
+        let mut value = blaze_own::AString::new_in(alloc);
+        assert!(blaze_expand::decode_str_literal(decoded.as_str(), |ch| value.push(ch)), "rendered literal decodes");
+        assert_eq!(value.as_str(), want.as_str());
+    }
+
+    // Bare `\r` (not followed by `\n`) in a doc comment is refused by the lexer, matching rustc.
+    assert!(lex("/** bare\rcr */", Edition::E2021, alloc).is_err());
+}
+
+#[test]
+fn previous_expansion_schema_4_is_refused() {
+    use blaze_format::{Part, Record, Slice, Writer, WriterOpts, schema_of};
+    let alloc = blaze_own::testing::heap().alloc();
+    let v4 = schema_of(&[
+        Part::Str("blaze-expand Expansion"),
+        Part::U64(4),
+        Part::Schema(<[Slice<u8>; 15] as Record>::SCHEMA),
+    ]);
+    assert_ne!(v4, blaze_expand::EXPANSION_SCHEMA);
+    let mut w = Writer::new(WriterOpts { schema: v4, alloc, capacity: None });
+    let root: [Slice<u8>; 15] = [Slice::EMPTY; 15];
+    let at = w.push(&root);
+    let bytes = w.finish(at);
+    let aligned = Aligned::copy_from(&bytes);
+    assert!(matches!(Expansion::<'static>::read_record(&aligned, alloc), Err(blaze_expand::RecordError::Format(_))));
+}
+
+#[test]
+fn previous_stream_schema_2_is_refused() {
+    use blaze_format::{Part, Record, Slice, Writer, WriterOpts, schema_of};
+    let alloc = blaze_own::testing::heap().alloc();
+    let v2 = schema_of(&[
+        Part::Str("blaze-expand TokenStream"),
+        Part::U64(2),
+        Part::Schema(<[Slice<u8>; 14] as Record>::SCHEMA),
+    ]);
+    assert_ne!(v2, blaze_expand::STREAM_SCHEMA);
+    let mut w = Writer::new(WriterOpts { schema: v2, alloc, capacity: None });
+    let root: [Slice<u8>; 14] = [Slice::EMPTY; 14];
+    let at = w.push(&root);
+    let bytes = w.finish(at);
+    let aligned = Aligned::copy_from(&bytes);
+    assert!(matches!(TokenStream::read_record(&aligned, alloc), Err(blaze_expand::RecordError::Format(_))));
+}
+
+/// Exact `ctor-1.0.13` pattern (`__parse_feature_input!` in `ctor-1.0.13/src/macros/features.rs`):
+/// doc comments desugar to `#[doc = r"..."]` (`LitKind::StrRaw(n)`), so `#[doc = r" attr"]`,
+/// `#[doc = r" crate"]`, `#[doc = r#" has "quote""#]`, and `#[doc = $s:literal]` all match as in
+/// rustc, while mismatched text, leading spaces, hash counts, and cooked `LitKind::Str` do not.
+#[test]
+fn doc_comment_matches_raw_doc_attr_in_macro_rules() {
+    let cx = TestCx::new();
+
+    // ctor-1.0.13 optional `/// crate` and `/// attr` sections followed by `$doc:literal`.
+    let ctor_def = rules(
+        "(
+            $( #[doc = r\" crate\"] $( #[doc = $doc_crate:literal] )* )?
+            feature: $feat:literal;
+            $( #[doc = r\" attr\"] $( #[doc = $doc_attr:literal] )* )?
+            attr: $attr:ident;
+        ) => {
+            const FEAT: &str = $feat;
+            const ATTR_DOCS: &[&str] = &[ $( $( $doc_attr ),* )? ];
+            const CRATE_DOCS: &[&str] = &[ $( $( $doc_crate ),* )? ];
+            struct $attr;
+        }",
+        1,
+    );
+    let exp = call_fn(
+        &ctor_def,
+        "/// crate\n/// crate doc\nfeature: \"my_feat\";\n/// attr\n/// attr doc 1\n/// attr doc 2\nattr: MyAttr;",
+        &cx,
+    );
+    assert!(exp.diagnostics.is_empty(), "{:?}", exp.diagnostics);
+    assert_eq!(exp.arm, Some(0));
+    assert!(show(&exp.tokens).contains("struct MyAttr ;"), "got: {}", show(&exp.tokens));
+
+    // Quotes, hashes, inner doc comments, `:literal`, and `:expr` capture.
+    let raw_match = rules(
+        "(#[doc = r#\" has \"quote\"\"#]) => { const Q: i32 = 1; };
+         (#[doc = r##\" has \"#\"##]) => { const H: i32 = 2; };
+         (#![doc = r\" inner\"]) => { const I: i32 = 3; };
+         (#[doc = $s:literal]) => { const L: &str = $s; };",
+        1,
+    );
+    let q = call_fn(&raw_match, "/// has \"quote\"\n", &cx);
+    assert_eq!((q.arm, q.diagnostics.is_empty()), (Some(0), true));
+    let h = call_fn(&raw_match, "/// has \"#\n", &cx);
+    assert_eq!((h.arm, h.diagnostics.is_empty()), (Some(1), true));
+    let inner = call_fn(&raw_match, "//! inner\n", &cx);
+    assert_eq!((inner.arm, inner.diagnostics.is_empty()), (Some(2), true));
+    let fallback = call_fn(&raw_match, "/// other\n", &cx);
+    assert_eq!((fallback.arm, fallback.diagnostics.is_empty()), (Some(3), true));
+
+    // Explicit `#[doc = " attr"]` matches explicit cooked string, NOT `/// attr` (rustc semantics).
+    let cooked_def = rules("(#[doc = \" attr\"]) => { const COOKED: i32 = 1; };", 1);
+    let cooked_ok = call_fn(&cooked_def, "#[doc = \" attr\"]", &cx);
+    assert_eq!((cooked_ok.arm, cooked_ok.diagnostics.is_empty()), (Some(0), true));
+    let cooked_doc = call_fn(&cooked_def, "/// attr\n", &cx);
+    assert_eq!(cooked_doc.arm, None, "cooked #[doc = \" attr\"] must not match /// attr");
+
+    // Negative controls for `#[doc = r" attr"]` and hash-count strictness.
+    let attr_def = rules("(#[doc = r\" attr\"]) => { const OK: i32 = 1; };", 1);
+    assert_eq!(call_fn(&attr_def, "/// attr\n", &cx).arm, Some(0));
+    assert_eq!(call_fn(&attr_def, "/// other\n", &cx).arm, None, "different doc text must not match");
+    assert_eq!(call_fn(&attr_def, "///attr\n", &cx).arm, None, "missing leading space must not match");
+    assert_eq!(call_fn(&attr_def, "", &cx).arm, None, "explicit #[doc = r\" attr\"] must not match empty");
+
+    let hash_strict = rules("(#[doc = r#\" attr\"#]) => { const OK: i32 = 1; };", 1);
+    assert_eq!(call_fn(&hash_strict, "/// attr\n", &cx).arm, None, "StrRaw(1) must not match StrRaw(0)");
+}
+
+#[test]
+fn doc_comment_in_matcher_still_ignored_for_all_doc_forms() {
+    let cx = TestCx::new();
+    let def = rules(
+        "(
+            /// line doc in matcher
+            //! inner doc in matcher
+            /** block doc in matcher */
+            /*! inner block doc in matcher */
+            $x:ident
+        ) => { fn $x() {} }",
+        1,
+    );
+    let ok = call_fn(&def, "hello", &cx);
+    assert_eq!(show(&ok.tokens), "fn hello ( ) { }", "{:?}", ok.diagnostics);
+    let with_doc = call_fn(&def, "/// line doc in matcher\nhello", &cx);
+    assert_eq!(with_doc.arm, None, "a doc comment written in a matcher must not match a doc comment in the call");
+
+    // Explicitly spaced `# [ doc = r" attr" ]`, `# [ doc = " attr" ]`, and `# ! [ doc = r" attr" ]`
+    // in a matcher are NOT doc comments: they stay real matcher tokens (Codex P2 regression test).
+    let spaced_raw = rules("(# [ doc = r\" attr\" ] $x:ident) => { fn $x() {} };", 1);
+    assert_eq!(call_fn(&spaced_raw, "/// attr\nfoo", &cx).arm, Some(0));
+    assert_eq!(call_fn(&spaced_raw, "#[doc = r\" attr\"] foo", &cx).arm, Some(0));
+    assert_eq!(call_fn(&spaced_raw, "foo", &cx).arm, None, "explicit spaced #[doc = r\" attr\"] must not be skipped");
+
+    let spaced_cooked = rules("(# [ doc = \" attr\" ] $x:ident) => { fn $x() {} };", 1);
+    assert_eq!(call_fn(&spaced_cooked, "#[doc = \" attr\"] foo", &cx).arm, Some(0));
+    assert_eq!(call_fn(&spaced_cooked, "/// attr\nfoo", &cx).arm, None);
+    assert_eq!(call_fn(&spaced_cooked, "foo", &cx).arm, None, "explicit spaced #[doc = \" attr\"] must not be skipped");
+
+    let spaced_inner = rules("(# ! [ doc = r\" inner\" ] $x:ident) => { fn $x() {} };", 1);
+    assert_eq!(call_fn(&spaced_inner, "//! inner\nfoo", &cx).arm, Some(0));
+    assert_eq!(call_fn(&spaced_inner, "foo", &cx).arm, None, "explicit spaced #![doc = r\" inner\"] must not be skipped");
+
+    // Forwarding a doc comment through `macro_rules!` strips doc provenance at the declarative
+    // input boundary (`LitKind::StrRaw`), whereas a `///` written directly in a template keeps
+    // `LitKind::DocStrRaw` (matching rustc).
+    let forward = rules("($($t:tt)*) => { $($t)* };", 1);
+    let forwarded = call_fn(&forward, "/// forwarded\n", &cx);
+    assert!(
+        matches!(forwarded.tokens.tokens()[4].kind, TokenKind::Literal { kind: LitKind::StrRaw(0), .. }),
+        "forwarded doc comment should become plain StrRaw(0), got {:?}",
+        forwarded.tokens.tokens()[4].kind
+    );
+    let from_template = rules("() => { /// templated\n };", 1);
+    let templated = call_fn(&from_template, "", &cx);
+    assert!(
+        matches!(templated.tokens.tokens()[4].kind, TokenKind::Literal { kind: LitKind::DocStrRaw(0), .. }),
+        "template doc comment should keep DocStrRaw(0), got {:?}",
+        templated.tokens.tokens()[4].kind
+    );
+}

@@ -181,6 +181,16 @@ fn two_values_under_one_key_and_a_cut_set_are_refused() {
     assert_eq!(KeptSet::open(&other).err(), Some(KeptError::OldForm));
 }
 
+#[test]
+fn previous_kept_set_magic_v4_is_refused() {
+    let made = entries();
+    let set = write_set(&mut sources(&made), blaze_own::testing::heap().alloc()).expect("a set");
+    assert_eq!(&set[..8], b"BZXSET5\0");
+    let mut old = set.to_vec();
+    old[..8].copy_from_slice(b"BZXSET4\0");
+    assert_eq!(KeptSet::open(&old).err(), Some(KeptError::OldForm));
+}
+
 /// Every input `call_key` names moves it (rule 21): the definition's tokens, crate (what
 /// `$crate` names), def-site module, edition, export and `local_inner_macros`; the call's
 /// shape, edition, panic edition and input tokens. What is not an input does not: a comment or

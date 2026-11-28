@@ -947,12 +947,15 @@ impl<'d, 'f> Compiler<'_, 'd, 'f> {
         }
     }
 
-    /// BLAZE'S RULE (the Reference is silent; konst 0.2.20's `__declare_string_cmp_fns!` needs
-    /// it): a doc attribute in a matcher, `#[doc = "..."]` or `#![doc = "..."]` with a string
-    /// literal (what a `///` or `//!` comment lexes to: the Reference, "Comments", "Doc comments
-    /// are interpreted as a special syntax for attributes"), matches nothing: it is a comment on
-    /// the matcher, not tokens the call must write. Gives the cursor after it, `None` when `c`
-    /// starts no such attribute. A `$` fragment inside the brackets is not one: it binds.
+    /// A doc comment (`///`, `//!`, `/** */`, `/*! */`) written directly in a matcher matches
+    /// nothing (konst 0.2.20's `__declare_string_cmp_fns!`), whereas an explicit
+    /// `#[doc = r" attr"]` or `#[doc = "..."]` attribute — regardless of whitespace such as
+    /// `# [ doc = r" attr" ]` — is real matcher tokens (ctor 1.0.13's `__parse_feature_input!`).
+    ///
+    /// `tokens::doc_comment` marks desugared doc comments with `LitKind::DocStrRaw(_)`; explicit
+    /// attributes always lex to `LitKind::StrRaw(_)` / `LitKind::Str`. Gives the cursor after a
+    /// desugared doc comment, `None` for an explicit attribute or anything else. A `$` fragment
+    /// inside the brackets is not one: it binds.
     fn doc_attr_end(&self, c: Cur<'f>) -> Option<Cur<'f>> {
         let mut at = c;
         if !self.expect_char(&mut at, &['#']) {
@@ -967,7 +970,11 @@ impl<'d, 'f> Compiler<'_, 'd, 'f> {
         let (_, mut inside) = self.expect_group(&mut at)?;
         let doc = self.expect_ident(&mut inside, false).is_some_and(|tok| self.def.text(tok) == "doc");
         let eq = doc && self.expect_char(&mut inside, &['=']);
-        let lit = eq && matches!(self.next(&mut inside).map(|tok| self.def.kind(tok)), Some(TokenKind::Literal { kind: LitKind::Str, .. }));
+        let lit = eq
+            && matches!(
+                self.next(&mut inside).map(|tok| self.def.kind(tok)),
+                Some(TokenKind::Literal { kind: LitKind::DocStrRaw(_), .. })
+            );
         (lit && inside.is_empty()).then_some(at)
     }
 
@@ -1320,7 +1327,7 @@ pub(crate) fn write_literal(
         LitKind::Str => ("", 0, "\""),
         LitKind::ByteStr => ("b", 0, "\""),
         LitKind::CStr => ("c", 0, "\""),
-        LitKind::StrRaw(hashes) => ("r", hashes, "\""),
+        LitKind::StrRaw(hashes) | LitKind::DocStrRaw(hashes) => ("r", hashes, "\""),
         LitKind::ByteStrRaw(hashes) => ("br", hashes, "\""),
         LitKind::CStrRaw(hashes) => ("cr", hashes, "\""),
     };

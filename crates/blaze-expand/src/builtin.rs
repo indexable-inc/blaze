@@ -892,7 +892,7 @@ fn format_args(
         };
         match args.atom(first.clone()) {
             Atom::Lit {
-                kind: kind @ (LitKind::Str | LitKind::StrRaw(_)),
+                kind: kind @ (LitKind::Str | LitKind::StrRaw(_) | LitKind::DocStrRaw(_)),
                 text,
                 suffix_len: 0,
                 negative: false,

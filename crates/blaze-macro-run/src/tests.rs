@@ -549,11 +549,101 @@ fn text_is_lexed_by_the_host_never_trusted() {
     let close = TokenKind::Close(Delim::Paren);
     let why = hostile(call, &call_bytes, &outcome_of(&[(close, MADE, "")], None));
     assert!(matches!(why, Why::Outcome(OutcomeError::Unbalanced { at: 0 })), "{why:?}");
-    for garbage in [&b""[..], b"\x01\x09", b"\x02\x01", b"garbage"] {
+    for garbage in [&b""[..], b"\x01\x09", b"\x02\x09", b"\x03\x01", b"garbage"] {
         let why = hostile(call, &call_bytes, garbage);
         assert_eq!(why.rule(), 3);
         assert!(matches!(why, Why::Outcome(OutcomeError::Malformed(_))), "{why:?}");
     }
+}
+
+#[test]
+fn previous_format_1_is_refused() {
+    let input = item("struct S ;");
+    let call = derive(&input);
+    let mut call_bytes = encoded(&call);
+    assert_eq!(call_bytes[0], crate::call::FORMAT);
+    call_bytes[0] = 1;
+    assert_eq!(crate::call::CallView::read(&call_bytes).err(), Some(Malformed::Tag(Field::Version, 1)));
+
+    let valid_call = encoded(&call);
+    let mut outcome = outcome_of(&[(IDENT, MADE, "x")], None);
+    outcome[0] = 1;
+    let why = hostile(call, &valid_call, &outcome);
+    assert!(matches!(why, Why::Outcome(OutcomeError::Malformed(Malformed::Tag(Field::Version, 1)))), "{why:?}");
+}
+
+#[test]
+fn outcome_rejects_doc_provenance_literal_tag_even_matching_input_origin() {
+    // Input has a `/// doc` comment whose token 4 is `LitKind::DocStrRaw(0)` with text `" doc"`.
+    // A hostile macro process returning tag 11 (`DocStrRaw`) with the matching `TokenOrigin::Input(4)`
+    // and exact text `" doc"` must still be rejected at outcome decoding (never bypassing `relex` via
+    // `Checking::copied`).
+    let input = item("/// doc\nstruct S;");
+    assert!(matches!(input.tokens()[4].kind, TokenKind::Literal { kind: LitKind::DocStrRaw(0), .. }));
+    let call = derive(&input);
+    let call_bytes = encoded(&call);
+    let doc_lit = TokenKind::Literal { kind: LitKind::DocStrRaw(0), suffix_len: 0, spacing: Spacing::Alone };
+    let forged = outcome_of(&[(doc_lit, TokenOrigin::Input(4), " doc")], None);
+    let why = hostile(call, &call_bytes, &forged);
+    assert!(matches!(why, Why::Outcome(OutcomeError::Malformed(Malformed::Tag(Field::LitKind, 11)))), "{why:?}");
+
+    // Control: a legitimate session importing `/// hello "world"` converts it to cooked `LitKind::Str`
+    // (`" hello \"world\""`) inside the macro server and returns cleanly.
+    let doc_input = item("/// hello \"world\"\nstruct S;");
+    let doc_call = derive(&doc_input);
+    let doc_bytes = encoded(&doc_call);
+    with_grants(&doc_bytes, |grants| {
+        let (mut link, run) = Link::start(doc_call, &doc_bytes, grants, 0);
+        link.returned(&output(Some(item_handle(&run))));
+        let done = link.finish().expect("legitimate doc-comment round-trip succeeds");
+        assert!(
+            matches!(done.produced.tokens.tokens()[4].kind, TokenKind::Literal { kind: LitKind::Str, suffix_len: 0, .. }),
+            "proc-macro server must import doc comments as cooked LitKind::Str, got {:?}",
+            done.produced.tokens.tokens()[4].kind
+        );
+        assert_eq!(done.produced.tokens.text_at(4), " hello \\\"world\\\"");
+    });
+}
+
+#[test]
+fn respanned_saturated_raw_doc_literal_is_accepted_while_forged_one_is_refused() {
+    let mut body = blaze_own::AString::new_in(alloc());
+    body.push_str(" \"");
+    for _ in 0..255 {
+        body.push('#');
+    }
+    let sat_kind = TokenKind::Literal { kind: LitKind::StrRaw(u8::MAX), suffix_len: 0, spacing: Spacing::Alone };
+
+    // Positive: a 255-hash doc comment forwarded through `macro_rules!` arrives as `StrRaw(255)`;
+    // if the proc macro changes its span to `Span::call_site()` (`MADE`) and returns it, outcome
+    // validation accepts it and preserves `StrRaw(255)`.
+    let mut input = TokenStream::new_in(alloc());
+    input.push(sat_kind, body.as_str(), blaze_expand::Ctx::root(Edition::E2021)).unwrap();
+    let call = derive(&input);
+    let call_bytes = encoded(&call);
+    let respanned = outcome_of(&[(sat_kind, MADE, body.as_str())], None);
+    with_grants(&call_bytes, |grants| {
+        let mut host = MacroHost::new(MacroHostOpts { program: &PROGRAM, call, file: Some(FILE), grants, alloc: alloc(), scratch: alloc(), .. }).unwrap();
+        let mut guest = Guest::new(GuestOpts { alloc: alloc(), .. });
+        guest.call(&SysCall::Hello { protocol: PROTOCOL }).unwrap();
+        let Some(GuestEffect::Send { frame }) = guest.next_effect() else { panic!("no hello") };
+        let answer = to_host(&mut host, 0, frame).unwrap();
+        guest.step(Nanos(0), GuestEvent::Frame(&answer)).unwrap();
+        guest.call(&SysCall::Return { output: &respanned }).unwrap();
+        let Some(GuestEffect::Send { frame }) = guest.next_effect() else { panic!("no return") };
+        assert!(to_host(&mut host, 0, frame).is_none());
+        let done = host.finish().expect("respanned saturated raw literal from input must be accepted");
+        assert_eq!(done.produced.tokens.tokens()[0].kind, sat_kind);
+        assert_eq!(done.produced.tokens.text_at(0), body.as_str());
+    });
+
+    // Negative control: forging an unlexable saturated `StrRaw(255)` that was NOT in the call's
+    // input is still rejected as `NotAToken`.
+    let plain = item("struct S;");
+    let plain_call = derive(&plain);
+    let plain_bytes = encoded(&plain_call);
+    let why = hostile(plain_call, &plain_bytes, &respanned);
+    assert!(matches!(why, Why::Outcome(OutcomeError::NotAToken { at: 0 })), "{why:?}");
 }
 
 #[test]

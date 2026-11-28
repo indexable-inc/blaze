@@ -25,7 +25,9 @@ use crate::bridge::{Field, Malformed, Reader, Writer, index};
 
 /// The version of the call's and the outcome's bytes: a process built for another is refused by
 /// its first byte.
-pub const FORMAT: u8 = 1;
+/// - 2: call inputs may carry doc-comment provenance (`LitKind::DocStrRaw`, tag 11); outcomes
+///   still refuse internal doc-provenance tags.
+pub const FORMAT: u8 = 2;
 
 /// A macro of a program: its index in the crate's `#[rustc_proc_macro_decls]` static, which is
 /// the order the harness lists the crate's macros in (rustc_builtin_macros proc_macro_harness.rs
@@ -269,6 +271,16 @@ pub(crate) fn put_kind(w: &mut Writer<'_, '_>, kind: TokenKind) {
 }
 
 pub(crate) fn read_kind(r: &mut Reader<'_>) -> Result<TokenKind, Malformed> {
+    read_kind_with(r, true)
+}
+
+/// Like [`read_kind`], for macro outcomes: refuses internal-only doc-comment provenance tags
+/// (`LitKind::DocStrRaw`) that the `proc_macro` API never exposes.
+pub(crate) fn read_outcome_kind(r: &mut Reader<'_>) -> Result<TokenKind, Malformed> {
+    read_kind_with(r, false)
+}
+
+fn read_kind_with(r: &mut Reader<'_>, allow_doc: bool) -> Result<TokenKind, Malformed> {
     Ok(match r.tag(Field::TokenKind)? {
         0 => TokenKind::Open(delim_of(r.tag(Field::Delimiter)?)?),
         1 => TokenKind::Close(delim_of(r.tag(Field::Delimiter)?)?),
@@ -282,7 +294,7 @@ pub(crate) fn read_kind(r: &mut Reader<'_>) -> Result<TokenKind, Malformed> {
             TokenKind::Punct { char, spacing: spacing_of(r.tag(Field::Spacing)?)? }
         }
         4 => {
-            let kind = lit_read(r)?;
+            let kind = lit_read_with(r, allow_doc)?;
             let suffix_len = r.u32()?;
             TokenKind::Literal { kind, suffix_len, spacing: spacing_of(r.tag(Field::Spacing)?)? }
         }
@@ -381,10 +393,18 @@ pub(crate) fn lit_write(w: &mut Writer<'_, '_>, kind: LitKind) {
             w.u8(n);
         }
         LitKind::Err => w.u8(10),
+        LitKind::DocStrRaw(n) => {
+            w.u8(11);
+            w.u8(n);
+        }
     }
 }
 
 pub(crate) fn lit_read(r: &mut Reader<'_>) -> Result<LitKind, Malformed> {
+    lit_read_with(r, false)
+}
+
+fn lit_read_with(r: &mut Reader<'_>, allow_doc: bool) -> Result<LitKind, Malformed> {
     Ok(match r.tag(Field::LitKind)? {
         0 => LitKind::Byte,
         1 => LitKind::Char,
@@ -397,6 +417,7 @@ pub(crate) fn lit_read(r: &mut Reader<'_>) -> Result<LitKind, Malformed> {
         8 => LitKind::CStr,
         9 => LitKind::CStrRaw(r.u8()?),
         10 => LitKind::Err,
+        11 if allow_doc => LitKind::DocStrRaw(r.u8()?),
         other => return Err(Malformed::Tag(Field::LitKind, other)),
     })
 }

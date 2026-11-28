@@ -97,6 +97,18 @@ pub(super) fn written(kind: TokenKind) -> TokenKind {
     }
 }
 
+/// A call-input token written by a declarative macro: like [`written`], and strips doc-comment
+/// provenance (`DocStrRaw(n)` -> `StrRaw(n)`, `DocStr` -> `Str`), matching rustc's
+/// `desugar_doc_comments` at the declarative-macro input boundary.
+pub(super) fn written_input(kind: TokenKind) -> TokenKind {
+    match written(kind) {
+        TokenKind::Literal { kind, suffix_len, spacing } => {
+            TokenKind::Literal { kind: kind.without_doc_provenance(), suffix_len, spacing }
+        }
+        other => other,
+    }
+}
+
 /// Whether a written token from `a` is `JointHidden` with the token from `b` written after it:
 /// both from the call's input (`Input` or `AttrArgs`), `b` right after `a` there, `a` not `Alone`
 /// in it, and both of one edition. Tokens from a macro definition's RHS template (`Def` / `Params`)
@@ -175,7 +187,7 @@ pub(super) fn copy_frags(
                     ctx
                 }
             };
-            let kind = written(view.kind(at));
+            let kind = written_input(view.kind(at));
             out.push_whole_ctx(kind, view.whole(at), origin, ctx)?;
             prev = match kind {
                 TokenKind::Ident { .. }

@@ -36,7 +36,7 @@ use blaze_expand::{
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::bridge::{Field, Malformed, Reader, Writer, index, wide};
-use crate::call::{FORMAT, has_text, put_kind, put_origin, read_kind, read_origin};
+use crate::call::{FORMAT, has_text, put_kind, put_origin, read_origin, read_outcome_kind};
 use crate::server::{ServerError, is_punct, level_of, write_literal};
 
 const EXPANDED: u8 = 0;
@@ -237,6 +237,23 @@ impl Checking<'_, '_> {
         };
         stream.tokens().get(wide(at)).is_some_and(|token| same_kind(token.kind, kind) && stream.text_of(token) == text)
     }
+
+    /// Whether an unrenderable saturated raw string (`LitKind::StrRaw(255)` with
+    /// `!raw_str_fits(255, text)`) appeared in this call's input or attribute arguments: a
+    /// 255-`#` doc comment forwarded through `macro_rules!` arrives as `StrRaw(255)` and a
+    /// procedural macro may legitimately respan it with `Literal::set_span(...)`.
+    fn saturated_raw_from_input(&self, kind: TokenKind, text: &str) -> bool {
+        let TokenKind::Literal { kind: LitKind::StrRaw(u8::MAX), suffix_len: 0, .. } = kind else {
+            return false;
+        };
+        if blaze_expand::raw_str_fits(u8::MAX, text) {
+            return false;
+        }
+        let has = |stream: &TokenStream<'_>| {
+            stream.tokens().iter().any(|token| same_kind(token.kind, kind) && stream.text_of(token) == text)
+        };
+        has(self.input) || self.attr.is_some_and(has)
+    }
 }
 
 /// An outcome, read and checked.
@@ -285,7 +302,7 @@ pub(crate) fn decode<'a>(
     let mut text_total = 0usize;
     for at in 0..count {
         let at = index(at);
-        let kind = read_kind(&mut r).map_err(m)?;
+        let kind = read_outcome_kind(&mut r).map_err(m)?;
         let origin = read_origin(&mut r).map_err(m)?;
         let text = if has_text(kind) { r.str().map_err(m)? } else { "" };
         if !check.allowed(origin) {
@@ -308,7 +325,7 @@ pub(crate) fn decode<'a>(
                 }
             }
             TokenKind::Ident { .. } | TokenKind::Literal { .. } => {
-                if !check.copied(kind, text, origin) {
+                if !check.copied(kind, text, origin) && !check.saturated_raw_from_input(kind, text) {
                     if !printed.is_empty() {
                         printed.push(b' ');
                     }
