@@ -14,7 +14,9 @@
 use core::{fmt, num::NonZeroU32, time::Duration};
 
 use blaze_h1::{ContentRange, Range};
-use blaze_machine::{CancelAction, Machine, RaceOutcome, Request as MachineRequest, Stopped, Turn};
+use blaze_machine::{
+    CancelAction, Machine, RaceOutcome, RecordableRequest, Request as MachineRequest, Stopped, Turn,
+};
 use blaze_own::{Alloc, AllocFailure, Vec};
 
 use super::Method;
@@ -86,7 +88,7 @@ pub enum HttpStepReq {
 /// Typed step answer delivered to [`HttpExchangeMachine::resume`].
 ///
 /// `'s` borrows driver-owned scratch bytes for one receive step with zero extra copy.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum HttpStepAns<'s> {
     /// Outcome of [`HttpStepReq::Send`]: bytes written (may be short), transport error, or
     /// `RaceOutcome::Second(())` when the send timed out.
@@ -94,12 +96,64 @@ pub enum HttpStepAns<'s> {
     /// Outcome of [`HttpStepReq::RecvWithTimeout`]: `First(Ok(chunk))` (`chunk.is_empty()` = peer
     /// EOF), `First(Err(err))` on read failure, or `Second(())` on receive timeout.
     RecvOrTimeout(RaceOutcome<Result<&'s [u8], TransportError>, ()>),
+    /// Owned receive outcome replayed from a recorded [`HttpRecordedAns`] transcript without
+    /// borrowing driver scratch.
+    RecvOwned(RaceOutcome<Result<blaze_bytes::Bytes, TransportError>, ()>),
     /// Outcome of [`HttpStepReq::Close`].
     Closed(Result<(), TransportError>),
 }
 
 impl MachineRequest for HttpStepReq {
     type Answer<'s> = HttpStepAns<'s>;
+}
+
+/// Owned recorded form of [`HttpStepAns`] captured by [`blaze_machine::RecordHandler`] and
+/// replayed deterministically through [`blaze_machine::Script`] with zero IO.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum HttpRecordedAns {
+    /// Recorded outcome of [`HttpStepReq::Send`].
+    Sent(RaceOutcome<Result<usize, TransportError>, ()>),
+    /// Recorded outcome of [`HttpStepReq::RecvWithTimeout`], retaining any received bytes in
+    /// [`blaze_bytes::Bytes`].
+    RecvOrTimeout(RaceOutcome<Result<blaze_bytes::Bytes, TransportError>, ()>),
+    /// Recorded outcome of [`HttpStepReq::Close`].
+    Closed(Result<(), TransportError>),
+}
+
+impl<'s> From<HttpRecordedAns> for HttpStepAns<'s> {
+    #[inline]
+    fn from(ans: HttpRecordedAns) -> Self {
+        match ans {
+            HttpRecordedAns::Sent(r) => HttpStepAns::Sent(r),
+            HttpRecordedAns::RecvOrTimeout(r) => HttpStepAns::RecvOwned(r),
+            HttpRecordedAns::Closed(r) => HttpStepAns::Closed(r),
+        }
+    }
+}
+
+impl RecordableRequest for HttpStepReq {
+    type Recorded = HttpRecordedAns;
+
+    fn record_answer(answer: &Self::Answer<'_>) -> Self::Recorded {
+        match answer {
+            HttpStepAns::Sent(r) => HttpRecordedAns::Sent(*r),
+            HttpStepAns::RecvOrTimeout(r) => {
+                let recorded = match r {
+                    RaceOutcome::First(Ok(bytes)) if bytes.is_empty() => {
+                        RaceOutcome::First(Ok(blaze_bytes::Bytes::from_static(b"")))
+                    }
+                    RaceOutcome::First(Ok(bytes)) => RaceOutcome::First(Ok(
+                        blaze_bytes::Bytes::copy_kept(blaze_mem::Tag::Io, bytes),
+                    )),
+                    RaceOutcome::First(Err(err)) => RaceOutcome::First(Err(*err)),
+                    RaceOutcome::Second(()) => RaceOutcome::Second(()),
+                };
+                HttpRecordedAns::RecvOrTimeout(recorded)
+            }
+            HttpStepAns::RecvOwned(r) => HttpRecordedAns::RecvOrTimeout(r.clone()),
+            HttpStepAns::Closed(r) => HttpRecordedAns::Closed(*r),
+        }
+    }
 }
 
 /// Static-borrowed answer helper for driving [`HttpExchangeMachine`] with
@@ -401,6 +455,112 @@ impl<'a> HttpExchangeMachine<'a> {
             }
         }
     }
+
+    fn handle_recv(
+        mut active: Active<'a>,
+        reads: usize,
+        mut checked_range: bool,
+        mut range_out: Option<ContentRange>,
+        outcome: RaceOutcome<Result<&[u8], TransportError>, ()>,
+    ) -> Turn<Self, HttpStepReq, HttpExchangeOut<'a>, HttpExchangeError> {
+        match outcome {
+            RaceOutcome::Second(()) => Self::close_with_err(
+                active.conn,
+                HttpExchangeError::Silent { waited: active.wait_most },
+                active.plant,
+            ),
+            RaceOutcome::First(Err(err)) => Self::close_with_err(
+                active.conn,
+                HttpExchangeError::Transport(err),
+                active.plant,
+            ),
+            RaceOutcome::First(Ok(chunk)) => {
+                let next_reads = reads + 1;
+                if chunk.is_empty() {
+                    return match active.parser.closed() {
+                        Ok(()) => Self::close_with_ok(active, range_out),
+                        Err(err) => Self::close_with_err(
+                            active.conn,
+                            HttpExchangeError::Protocol(err),
+                            active.plant,
+                        ),
+                    };
+                }
+
+                let fed = active.parser.feed(chunk, &mut active.body);
+                let head_over = matches!(
+                    &fed,
+                    Err(blaze_h1::Error { why: blaze_h1::Why::BodyOver { .. }, .. })
+                );
+                if !checked_range && (active.parser.has_head() || head_over) {
+                    checked_range = true;
+                    if let Some(asked) = active.range
+                        && !blaze_h1::is_redirect(active.parser.status())
+                    {
+                        match active.parser.ranged(asked) {
+                            Ok(cr) => range_out = Some(cr),
+                            Err(err) => {
+                                return Self::close_with_err(
+                                    active.conn,
+                                    HttpExchangeError::Protocol(err),
+                                    active.plant,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                match fed {
+                    Err(err) => {
+                        let mapped = match err.why {
+                            blaze_h1::Why::BodyOver { .. } => {
+                                HttpExchangeError::TooBig { most: active.most_body as usize }
+                            }
+                            _ => HttpExchangeError::Protocol(err),
+                        };
+                        Self::close_with_err(active.conn, mapped, active.plant)
+                    }
+                    Ok(fed) => {
+                        if fed.consumed < chunk.len() {
+                            let err = blaze_h1::Error {
+                                at: active.parser.body_len(),
+                                why: blaze_h1::Why::AfterEnd,
+                            };
+                            return Self::close_with_err(
+                                active.conn,
+                                HttpExchangeError::Protocol(err),
+                                active.plant,
+                            );
+                        }
+                        if fed.done {
+                            Self::close_with_ok(active, range_out)
+                        } else if next_reads >= active.reads_most {
+                            Self::close_with_err(
+                                active.conn,
+                                HttpExchangeError::Unending { reads: active.reads_most },
+                                active.plant,
+                            )
+                        } else {
+                            let req = HttpStepReq::RecvWithTimeout {
+                                conn: active.conn,
+                                max_bytes: active.recv_chunk,
+                                timeout: active.wait_most,
+                            };
+                            Turn::Ask {
+                                request: req,
+                                next: HttpExchangeMachine::Receiving {
+                                    active,
+                                    reads: next_reads,
+                                    checked_range,
+                                    range_out,
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl<'a> Machine for HttpExchangeMachine<'a> {
@@ -500,105 +660,21 @@ impl<'a> Machine for HttpExchangeMachine<'a> {
             }
 
             (
-                HttpExchangeMachine::Receiving { mut active, reads, mut checked_range, mut range_out },
+                HttpExchangeMachine::Receiving { active, reads, checked_range, range_out },
                 HttpStepAns::RecvOrTimeout(outcome),
-            ) => match outcome {
-                RaceOutcome::Second(()) => Self::close_with_err(
-                    active.conn,
-                    HttpExchangeError::Silent { waited: active.wait_most },
-                    active.plant,
-                ),
-                RaceOutcome::First(Err(err)) => Self::close_with_err(
-                    active.conn,
-                    HttpExchangeError::Transport(err),
-                    active.plant,
-                ),
-                RaceOutcome::First(Ok(chunk)) => {
-                    let next_reads = reads + 1;
-                    if chunk.is_empty() {
-                        return match active.parser.closed() {
-                            Ok(()) => Self::close_with_ok(active, range_out),
-                            Err(err) => Self::close_with_err(
-                                active.conn,
-                                HttpExchangeError::Protocol(err),
-                                active.plant,
-                            ),
-                        };
-                    }
+            ) => Self::handle_recv(active, reads, checked_range, range_out, outcome),
 
-                    let fed = active.parser.feed(chunk, &mut active.body);
-                    let head_over = matches!(
-                        &fed,
-                        Err(blaze_h1::Error { why: blaze_h1::Why::BodyOver { .. }, .. })
-                    );
-                    if !checked_range && (active.parser.has_head() || head_over) {
-                        checked_range = true;
-                        if let Some(asked) = active.range
-                            && !blaze_h1::is_redirect(active.parser.status())
-                        {
-                            match active.parser.ranged(asked) {
-                                Ok(cr) => range_out = Some(cr),
-                                Err(err) => {
-                                    return Self::close_with_err(
-                                        active.conn,
-                                        HttpExchangeError::Protocol(err),
-                                        active.plant,
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    match fed {
-                        Err(err) => {
-                            let mapped = match err.why {
-                                blaze_h1::Why::BodyOver { .. } => {
-                                    HttpExchangeError::TooBig { most: active.most_body as usize }
-                                }
-                                _ => HttpExchangeError::Protocol(err),
-                            };
-                            Self::close_with_err(active.conn, mapped, active.plant)
-                        }
-                        Ok(fed) => {
-                            if fed.consumed < chunk.len() {
-                                let err = blaze_h1::Error {
-                                    at: active.parser.body_len(),
-                                    why: blaze_h1::Why::AfterEnd,
-                                };
-                                return Self::close_with_err(
-                                    active.conn,
-                                    HttpExchangeError::Protocol(err),
-                                    active.plant,
-                                );
-                            }
-                            if fed.done {
-                                Self::close_with_ok(active, range_out)
-                            } else if next_reads >= active.reads_most {
-                                Self::close_with_err(
-                                    active.conn,
-                                    HttpExchangeError::Unending { reads: active.reads_most },
-                                    active.plant,
-                                )
-                            } else {
-                                let req = HttpStepReq::RecvWithTimeout {
-                                    conn: active.conn,
-                                    max_bytes: active.recv_chunk,
-                                    timeout: active.wait_most,
-                                };
-                                Turn::Ask {
-                                    request: req,
-                                    next: HttpExchangeMachine::Receiving {
-                                        active,
-                                        reads: next_reads,
-                                        checked_range,
-                                        range_out,
-                                    },
-                                }
-                            }
-                        }
-                    }
-                }
-            },
+            (
+                HttpExchangeMachine::Receiving { active, reads, checked_range, range_out },
+                HttpStepAns::RecvOwned(outcome),
+            ) => {
+                let borrowed = match &outcome {
+                    RaceOutcome::First(Ok(bytes)) => RaceOutcome::First(Ok(bytes.as_ref())),
+                    RaceOutcome::First(Err(err)) => RaceOutcome::First(Err(*err)),
+                    RaceOutcome::Second(()) => RaceOutcome::Second(()),
+                };
+                Self::handle_recv(active, reads, checked_range, range_out, borrowed)
+            }
 
             (HttpExchangeMachine::Closing { outcome }, HttpStepAns::Closed(close_res)) => {
                 match (outcome, close_res) {
@@ -1081,5 +1157,152 @@ mod tests {
             "expected TooBig(10), got {res:?}"
         );
         assert_eq!(big_script.finish(), Ok(()));
+    }
+
+    /// Records a split chunked HTTP/1.1 exchange through `RecordHandler` (over a handler reusing a
+    /// non-`'static` scratch buffer), replays it deterministically via `RecordHandler::into_script`,
+    /// and verifies `emit_script_source`.
+    #[test]
+    fn http_exchange_machine_records_and_replays_via_record_handler() {
+        use blaze_machine::{Handler, Perform, RecordHandler, TranscriptEntry};
+        use blaze_own::FixedString;
+
+        struct ChunkedScratchHandler {
+            chunks: [&'static [u8]; 4],
+            next_chunk: usize,
+            scratch: [u8; 128],
+        }
+
+        impl Handler<HttpStepReq> for ChunkedScratchHandler {
+            type Error = ();
+
+            fn perform<Out>(
+                &mut self,
+                request: HttpStepReq,
+                deliver: impl FnOnce(Perform<HttpStepAns<'_>>) -> Out,
+            ) -> Result<Out, Self::Error> {
+                match request {
+                    HttpStepReq::Send { len, .. } => {
+                        let written = len.min(14);
+                        Ok(deliver(Perform::Answered(HttpStepAns::Sent(RaceOutcome::First(Ok(
+                            written,
+                        ))))))
+                    }
+                    HttpStepReq::RecvWithTimeout { .. } => {
+                        let chunk = if self.next_chunk < self.chunks.len() {
+                            let c = self.chunks[self.next_chunk];
+                            self.next_chunk += 1;
+                            c
+                        } else {
+                            b""
+                        };
+                        let n = chunk.len();
+                        self.scratch[..n].copy_from_slice(chunk);
+                        Ok(deliver(Perform::Answered(HttpStepAns::RecvOrTimeout(
+                            RaceOutcome::First(Ok(&self.scratch[..n])),
+                        ))))
+                    }
+                    HttpStepReq::Close { .. } => {
+                        Ok(deliver(Perform::Answered(HttpStepAns::Closed(Ok(())))))
+                    }
+                }
+            }
+        }
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let conn = test_conn();
+        let head = sample_head();
+
+        let make_machine = || {
+            let (_wire, machine) = HttpExchangeMachine::for_request(
+                &head,
+                b"",
+                HttpExchangeOpts {
+                    conn,
+                    method: Method::Get,
+                    range: None,
+                    body_most: 64 << 10,
+                    reads_most: 16,
+                    wait_most: TIMEOUT,
+                    recv_chunk: CHUNK,
+                    alloc,
+                    plant: HttpExchangePlant::None,
+                },
+            )
+            .expect("encode request");
+            machine
+        };
+
+        let mut live = ChunkedScratchHandler {
+            chunks: [
+                b"HTTP/1.1 200 OK\r\nTransfer-En",
+                b"coding: chunked\r\nX-Recorded: yes\r\n\r\n6\r\nrec",
+                b"ord\r\n8\r\n-replay!\r\n",
+                b"0\r\n\r\n",
+            ],
+            next_chunk: 0,
+            scratch: [0u8; 128],
+        };
+
+        let io = Io::simulated(SimWorld::new(29, Limits::USUAL));
+        let cx = io.cx(Duration::from_secs(10), TASK_FRAME).expect("root cx");
+
+        let mut recorder = RecordHandler::new_in(&mut live, alloc);
+        let live_out = cx
+            .drive_machine(
+                "bstd.requests.record",
+                &mut recorder,
+                &mut (),
+                make_machine(),
+                DriveOpts { max_steps: 24 },
+            )
+            .expect("recorded chunked exchange succeeds");
+
+        assert_eq!(live_out.status, 200);
+        assert_eq!(live_out.body.as_slice(), b"record-replay!");
+        assert_eq!(live_out.range, None);
+        assert!(recorder.len() >= 6, "expected multi-step recorded transcript, got {}", recorder.len());
+        assert!(matches!(
+            recorder.entries().first(),
+            Some(TranscriptEntry::Answered {
+                req: HttpStepReq::Send { offset: 0, .. },
+                ans: HttpRecordedAns::Sent(RaceOutcome::First(Ok(_))),
+            })
+        ));
+        assert!(matches!(
+            recorder.entries().last(),
+            Some(TranscriptEntry::Answered {
+                req: HttpStepReq::Close { conn: c },
+                ans: HttpRecordedAns::Closed(Ok(())),
+            }) if *c == conn
+        ));
+
+        // Replay deterministically via zero-IO `Script` built from the recorded transcript.
+        let mut replay = recorder.into_script(alloc);
+        let replay_out = cx
+            .drive_machine(
+                "bstd.requests.replay",
+                &mut replay,
+                &mut (),
+                make_machine(),
+                DriveOpts { max_steps: 24 },
+            )
+            .expect("replayed chunked exchange succeeds");
+
+        assert_eq!(replay_out.status, live_out.status);
+        assert_eq!(replay_out.body.as_slice(), live_out.body.as_slice());
+        assert_eq!(replay_out.range, live_out.range);
+        assert_eq!(replay.finish(), Ok(()));
+
+        // Emit valid Rust `Script` source reproducing the transcript.
+        let mut src = FixedString::<4096>::new();
+        assert_eq!(recorder.emit_script_source(&mut src), Ok(()));
+        let text = src.text().expect("recorded script source fits in 4096 bytes");
+        assert!(text.contains("let mut script = Script::new_in(alloc);"), "missing header:\n{text}");
+        assert!(text.contains("script.expect_answer("), "missing expect_answer:\n{text}");
+        assert!(text.contains("Send {"), "missing Send request:\n{text}");
+        assert!(text.contains("RecvWithTimeout {"), "missing RecvWithTimeout request:\n{text}");
+        assert!(text.contains("Close {"), "missing Close request:\n{text}");
+        assert!(text.contains("RecvOrTimeout("), "missing RecvOrTimeout answer:\n{text}");
     }
 }

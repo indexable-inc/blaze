@@ -2403,22 +2403,7 @@ impl Sim {
         if !matches!(effect, Effect::Timer { .. } | Effect::ReadMany { .. })
             && self.rng.one_in(u64::from(self.faults.fail_one_in))
         {
-            if let Some(spawn) = spawn {
-                self.spawns.remove_id(spawn);
-            }
-            if let Effect::Append { file, mut bytes, .. } = effect {
-                let torn = self.rng.below(bytes.len() as u64) as usize;
-                bytes.truncate(torn);
-                // Opened, and so made, before the write failed.
-                self.made(&file);
-                file_mut(&mut self.files, &file).push_op(Op::Append(bytes));
-                if torn > 0 {
-                    self.changed(&file);
-                }
-            } else if let Effect::WriteFrom { file, at, from, cache, .. } = effect {
-                self.land_some(&file, at, &from, cache);
-            }
-            return self.fail(tag);
+            return self.complete_injected_fault(effect, tag, spawn);
         }
         let effect = match self.take_room(effect) {
             Ok(effect) => effect,
@@ -2426,6 +2411,117 @@ impl Sim {
         };
         let changed = crate::threads::changes(&effect);
         let done = match effect {
+            Effect::ReadAll { .. }
+            | Effect::Read { .. }
+            | Effect::ReadLink { .. }
+            | Effect::ReadInto { .. }
+            | Effect::ReadMany { .. }
+            | Effect::Prewarm { .. }
+            | Effect::Map { .. } => self.complete_fs_read(effect),
+
+            Effect::WriteFrom { .. }
+            | Effect::Append { .. }
+            | Effect::Truncate { .. }
+            | Effect::MapWrite { .. }
+            | Effect::Write { .. }
+            | Effect::WriteUnsynced { .. }
+            | Effect::WriteAt { .. } => self.complete_fs_write(effect),
+
+            Effect::Sync { .. }
+            | Effect::Barrier { .. }
+            | Effect::WriteBack { .. }
+            | Effect::SyncDir { .. } => self.complete_fs_sync(effect, covers),
+
+            Effect::RenameUnsynced { .. }
+            | Effect::Rename { .. }
+            | Effect::Seal { .. }
+            | Effect::Mode { .. }
+            | Effect::Times { .. }
+            | Effect::Remove { .. }
+            | Effect::MakeDir { .. }
+            | Effect::RemoveDir { .. } => self.complete_fs_rename_and_attrs(effect),
+
+            Effect::CopyData { .. } | Effect::Clone { .. } | Effect::Link { .. } => {
+                self.complete_fs_copy_and_link(effect)
+            }
+
+            Effect::Stat { .. }
+            | Effect::Lstat { .. }
+            | Effect::List { .. }
+            | Effect::Private { .. }
+            | Effect::Stamp { .. }
+            | Effect::Entries { .. }
+            | Effect::Lock { .. }
+            | Effect::Ancestors { .. }
+            | Effect::Above { .. }
+            | Effect::Timer { .. }
+            | Effect::Spawn { .. } => self.complete_fs_meta_and_misc(effect, spawn),
+
+            Effect::Watch { .. }
+            | Effect::Journal { .. }
+            | Effect::Unwatch { .. }
+            | Effect::Flush { .. }
+            | Effect::Kill { .. }
+            | Effect::Listen { .. }
+            | Effect::Unlisten { .. }
+            | Effect::Connect { .. }
+            | Effect::Recv { .. }
+            | Effect::Send { .. }
+            | Effect::Hangup { .. }
+            | Effect::Pressure { .. }
+            | Effect::Unlock { .. }
+            | Effect::Bind { .. }
+            | Effect::SendTo { .. }
+            | Effect::RecvFrom { .. }
+            | Effect::Unbind { .. }
+            | Effect::Resolve { .. }
+            | Effect::ReadStdin { .. }
+            | Effect::WriteOut { .. }
+            | Effect::Now { .. }
+            | Effect::Random { .. }
+            | Effect::Roots { .. } => {
+                unreachable!(
+                    "watches, kills, sockets, unlocks and the host's effects are not pending \
+                     effects"
+                )
+            }
+        };
+        // The names this effect changed: their kept descriptors close, as the real drivers'
+        // do once the effect is done (`threads::run`).
+        for name in changed.iter().flatten() {
+            self.descriptors.forget(name);
+        }
+        Completion { tag, done }
+    }
+
+    #[inline(never)]
+    fn complete_injected_fault(
+        &mut self,
+        effect: Effect,
+        tag: Tag,
+        spawn: Option<Id<Spawning>>,
+    ) -> Completion {
+        if let Some(spawn) = spawn {
+            self.spawns.remove_id(spawn);
+        }
+        if let Effect::Append { file, mut bytes, .. } = effect {
+            let torn = self.rng.below(bytes.len() as u64) as usize;
+            bytes.truncate(torn);
+            // Opened, and so made, before the write failed.
+            self.made(&file);
+            file_mut(&mut self.files, &file).push_op(Op::Append(bytes));
+            if torn > 0 {
+                self.changed(&file);
+            }
+        } else if let Effect::WriteFrom { file, at, from, cache, .. } = effect {
+            self.land_some(&file, at, &from, cache);
+        }
+        self.fail(tag)
+    }
+
+    #[inline(never)]
+    fn complete_fs_read(&mut self, effect: Effect) -> Done {
+        match effect {
             Effect::ReadAll { file, .. } => match self.read(&file, 0, usize::MAX) {
                 Ok(bytes) => {
                     self.bytes_read += bytes.len() as u64;
@@ -2477,6 +2573,52 @@ impl Sim {
                 }
                 Done::ReadMany(parts)
             }
+            // A hint to the page cache, which the simulation has none of: the file to read
+            // ahead in is there (one it is like that is not holds nothing), and nothing of
+            // either changes. What the order of it is to the rename
+            // that follows is the asker's to hold (`blaze_cas::publish::Writing`).
+            Effect::Prewarm { like, file, .. } => {
+                let _ = like;
+                match self.files.contains_key(&file) {
+                    true => Done::Prewarmed { bytes: 0 },
+                    // alloc: an error's message.
+                    false => Done::Failed(IoError(format!("{file}: no such file"))),
+                }
+            }
+            Effect::Map { file, extent, .. } => {
+                let bytes = self.contents(&file);
+                let range = match extent {
+                    crate::Extent::Whole => Ok(&bytes[..]),
+                    // As a driver maps a range: inside the file, or refused naming it.
+                    crate::Extent::Range { at, len } => at
+                        .checked_add(len)
+                        .filter(|end| *end <= bytes.len() as u64)
+                        .map(|end| &bytes[at as usize..end as usize])
+                        .ok_or_else(|| {
+                            // alloc: an error's message.
+                            IoError(format!(
+                                "{file}: a mapping of {len} bytes at {at} runs past the file's \
+                                 end at {}: a range is mapped only inside the file",
+                                bytes.len()
+                            ))
+                        }),
+                };
+                match range {
+                    Ok(range) => {
+                        self.bytes_read += range.len() as u64;
+                        // alloc: the mapping, which the completion carries.
+                        Done::Mapped(crate::Mapping::copy(range))
+                    }
+                    Err(why) => Done::Failed(why),
+                }
+            }
+            _ => unreachable!("dispatched by Sim::complete"),
+        }
+    }
+
+    #[inline(never)]
+    fn complete_fs_write(&mut self, effect: Effect) -> Done {
+        match effect {
             Effect::WriteFrom { file, at, from, cache, .. } => {
                 match Sim::bytes_of(&from, &file, at, cache) {
                     Err(why) => Done::Failed(why),
@@ -2498,60 +2640,6 @@ impl Sim {
                 file_mut(&mut self.files, &file).push_op(Op::Append(bytes));
                 self.changed(&file);
                 Done::Appended
-            }
-            // The file's bytes made durable (`fsync`; `F_FULLFSYNC` on Apple's systems), never
-            // its name: that is its directory's sync.
-            Effect::Sync { file, .. } => {
-                let less = self.planted(host::Plant::SyncCoversLess);
-                // The planted bug: the loose rule, a file's sync keeping its name too.
-                if self.planted(host::Plant::FileSyncKeepsName) {
-                    self.names.retain(|change| !change.named.touches(&file));
-                }
-                self.made(&file);
-                let sim = self.files.entry(file).or_default();
-                // The planted bug: one change fewer made durable than the sync covered.
-                let covers = match less && covers.min(sim.ops.len()) > 0 {
-                    true => covers.min(sim.ops.len()) - 1,
-                    false => covers,
-                };
-                sim.sync(covers);
-                self.flushed();
-                Done::Synced
-            }
-            // Ordered, not durable: what it covers is written before whatever is written
-            // from now on, so a crash that keeps any of that keeps this (`Sim::crash`), and a
-            // sync of anything that completes after this makes it durable (`Sim::flushed`).
-            // It covers what was written when it was asked, as a sync does.
-            Effect::Barrier { file, .. } => {
-                self.stamp_epochs();
-                let epoch = self.epoch;
-                self.made(&file);
-                let sim = self.files.entry(file).or_default();
-                let covered = covers.min(sim.ops.len());
-                if covered > 0 {
-                    sim.barriers.push((covered, epoch));
-                }
-                // Written out, as a write-back's: the file is clean as far as it covers.
-                sim.back = sim.back.max(covered);
-                self.epoch += 1;
-                Done::Ordered
-            }
-            // Written out, not durable: the file is clean, and a crash tears it as before.
-            // It covers what was written when it was asked, as a sync does.
-            Effect::WriteBack { file, .. } => match self.files.get_mut(&file) {
-                Some(sim) => {
-                    sim.back = sim.back.max(covers.min(sim.ops.len()));
-                    Done::WrittenBack
-                }
-                // alloc: an error's message.
-                None => Done::Failed(IoError(format!("{file}: no such file"))),
-            },
-            // The directory's names made durable (`fsync` of the directory; `F_FULLFSYNC` on
-            // Apple's systems, which also flushes the drive's cache).
-            Effect::SyncDir { dir, .. } => {
-                self.sync_names(dir.name().map_or("", FileName::as_str));
-                self.flushed();
-                Done::Synced
             }
             Effect::Truncate { file, len, .. } => {
                 self.made(&file);
@@ -2630,6 +2718,74 @@ impl Sim {
                 // alloc: an error's message.
                 None => Done::Failed(IoError(format!("{file}: no such file"))),
             },
+            _ => unreachable!("dispatched by Sim::complete"),
+        }
+    }
+
+    #[inline(never)]
+    fn complete_fs_sync(&mut self, effect: Effect, covers: usize) -> Done {
+        match effect {
+            // The file's bytes made durable (`fsync`; `F_FULLFSYNC` on Apple's systems), never
+            // its name: that is its directory's sync.
+            Effect::Sync { file, .. } => {
+                let less = self.planted(host::Plant::SyncCoversLess);
+                // The planted bug: the loose rule, a file's sync keeping its name too.
+                if self.planted(host::Plant::FileSyncKeepsName) {
+                    self.names.retain(|change| !change.named.touches(&file));
+                }
+                self.made(&file);
+                let sim = self.files.entry(file).or_default();
+                // The planted bug: one change fewer made durable than the sync covered.
+                let covers = match less && covers.min(sim.ops.len()) > 0 {
+                    true => covers.min(sim.ops.len()) - 1,
+                    false => covers,
+                };
+                sim.sync(covers);
+                self.flushed();
+                Done::Synced
+            }
+            // Ordered, not durable: what it covers is written before whatever is written
+            // from now on, so a crash that keeps any of that keeps this (`Sim::crash`), and a
+            // sync of anything that completes after this makes it durable (`Sim::flushed`).
+            // It covers what was written when it was asked, as a sync does.
+            Effect::Barrier { file, .. } => {
+                self.stamp_epochs();
+                let epoch = self.epoch;
+                self.made(&file);
+                let sim = self.files.entry(file).or_default();
+                let covered = covers.min(sim.ops.len());
+                if covered > 0 {
+                    sim.barriers.push((covered, epoch));
+                }
+                // Written out, as a write-back's: the file is clean as far as it covers.
+                sim.back = sim.back.max(covered);
+                self.epoch += 1;
+                Done::Ordered
+            }
+            // Written out, not durable: the file is clean, and a crash tears it as before.
+            // It covers what was written when it was asked, as a sync does.
+            Effect::WriteBack { file, .. } => match self.files.get_mut(&file) {
+                Some(sim) => {
+                    sim.back = sim.back.max(covers.min(sim.ops.len()));
+                    Done::WrittenBack
+                }
+                // alloc: an error's message.
+                None => Done::Failed(IoError(format!("{file}: no such file"))),
+            },
+            // The directory's names made durable (`fsync` of the directory; `F_FULLFSYNC` on
+            // Apple's systems, which also flushes the drive's cache).
+            Effect::SyncDir { dir, .. } => {
+                self.sync_names(dir.name().map_or("", FileName::as_str));
+                self.flushed();
+                Done::Synced
+            }
+            _ => unreachable!("dispatched by Sim::complete"),
+        }
+    }
+
+    #[inline(never)]
+    fn complete_fs_rename_and_attrs(&mut self, effect: Effect) -> Done {
+        match effect {
             // As a rename, but the new name is not on the disk: a crash may put the file back
             // under `from` and what `to` held back under `to`.
             Effect::RenameUnsynced { from, to, .. } => match self.files.remove(&from) {
@@ -2702,18 +2858,25 @@ impl Sim {
                     false => Done::Failed(IoError(format!("{file}: no such file or directory"))),
                 }
             }
-            // A hint to the page cache, which the simulation has none of: the file to read
-            // ahead in is there (one it is like that is not holds nothing), and nothing of
-            // either changes. What the order of it is to the rename
-            // that follows is the asker's to hold (`blaze_cas::publish::Writing`).
-            Effect::Prewarm { like, file, .. } => {
-                let _ = like;
-                match self.files.contains_key(&file) {
-                    true => Done::Prewarmed { bytes: 0 },
-                    // alloc: an error's message.
-                    false => Done::Failed(IoError(format!("{file}: no such file"))),
+            Effect::Remove { file, .. } if self.is_dir(&file) => self.remove_made(&file),
+            Effect::Remove { file, .. } => {
+                if let Some(was) = self.files.remove(&file) {
+                    // clone: the log's own name of the file, a refcount.
+                    self.named(Named::Gone { file: file.share(), was });
+                    self.unlink_locks(&file);
+                    self.changed(&file);
                 }
+                Done::Removed
             }
+            Effect::MakeDir { dir, .. } => self.make_dir(dir),
+            Effect::RemoveDir { dir, .. } => self.remove_dir(&dir),
+            _ => unreachable!("dispatched by Sim::complete"),
+        }
+    }
+
+    #[inline(never)]
+    fn complete_fs_copy_and_link(&mut self, effect: Effect) -> Done {
+        match effect {
             Effect::CopyData { from, .. } if !self.files.contains_key(&from) => {
                 // alloc: an error's message.
                 Done::Failed(IoError(format!("{from}: no such file")))
@@ -2786,6 +2949,13 @@ impl Sim {
                 self.changed(&to);
                 Done::Linked
             }
+            _ => unreachable!("dispatched by Sim::complete"),
+        }
+    }
+
+    #[inline(never)]
+    fn complete_fs_meta_and_misc(&mut self, effect: Effect, spawn: Option<Id<Spawning>>) -> Done {
+        match effect {
             // A stat follows a link as `stat(2)` does: what it leads to, or not there where it
             // dangles (the suite's `a_link_is_followed_by_stat_alone`, `conform/fs.rs`; until
             // 2026-11-20 the simulated disk followed none, so a stat of a link saw the link's
@@ -2841,19 +3011,7 @@ impl Sim {
                 // alloc: an error's message.
                 None => Done::Failed(IoError(format!("{dir}: no such directory"))),
             },
-            Effect::Remove { file, .. } if self.is_dir(&file) => self.remove_made(&file),
-            Effect::Remove { file, .. } => {
-                if let Some(was) = self.files.remove(&file) {
-                    // clone: the log's own name of the file, a refcount.
-                    self.named(Named::Gone { file: file.share(), was });
-                    self.unlink_locks(&file);
-                    self.changed(&file);
-                }
-                Done::Removed
-            }
             Effect::Lock { file, mode, tag } => self.lock(&file, mode, tag),
-            Effect::MakeDir { dir, .. } => self.make_dir(dir),
-            Effect::RemoveDir { dir, .. } => self.remove_dir(&dir),
             Effect::Ancestors { most, .. } => Done::Ancestors(crate::Ancestors::answered(
                 // clone: the answer's names, refcounts.
                 self.above.iter().map(|it| it.toward.clone()).collect(),
@@ -2861,73 +3019,13 @@ impl Sim {
             )),
             Effect::Above { op, name, .. } => self.read_above(op, &name),
             Effect::Timer { .. } => Done::Fired,
-            Effect::Map { file, extent, .. } => {
-                let bytes = self.contents(&file);
-                let range = match extent {
-                    crate::Extent::Whole => Ok(&bytes[..]),
-                    // As a driver maps a range: inside the file, or refused naming it.
-                    crate::Extent::Range { at, len } => at
-                        .checked_add(len)
-                        .filter(|end| *end <= bytes.len() as u64)
-                        .map(|end| &bytes[at as usize..end as usize])
-                        .ok_or_else(|| {
-                            // alloc: an error's message.
-                            IoError(format!(
-                                "{file}: a mapping of {len} bytes at {at} runs past the file's \
-                                 end at {}: a range is mapped only inside the file",
-                                bytes.len()
-                            ))
-                        }),
-                };
-                match range {
-                    Ok(range) => {
-                        self.bytes_read += range.len() as u64;
-                        // alloc: the mapping, which the completion carries.
-                        Done::Mapped(crate::Mapping::copy(range))
-                    }
-                    Err(why) => Done::Failed(why),
-                }
-            }
             Effect::Spawn { .. } => match spawn.and_then(|id| self.spawns.remove_id(id)) {
                 // alloc: the exit, which the completion carries.
                 Some((_, spawning)) => Done::Exited(Box::new(spawning.exit)),
                 None => unreachable!("a spawn in flight has its run"),
             },
-            Effect::Watch { .. }
-            | Effect::Journal { .. }
-            | Effect::Unwatch { .. }
-            | Effect::Flush { .. }
-            | Effect::Kill { .. }
-            | Effect::Listen { .. }
-            | Effect::Unlisten { .. }
-            | Effect::Connect { .. }
-            | Effect::Recv { .. }
-            | Effect::Send { .. }
-            | Effect::Hangup { .. }
-            | Effect::Pressure { .. }
-            | Effect::Unlock { .. }
-            | Effect::Bind { .. }
-            | Effect::SendTo { .. }
-            | Effect::RecvFrom { .. }
-            | Effect::Unbind { .. }
-            | Effect::Resolve { .. }
-            | Effect::ReadStdin { .. }
-            | Effect::WriteOut { .. }
-            | Effect::Now { .. }
-            | Effect::Random { .. }
-            | Effect::Roots { .. } => {
-                unreachable!(
-                    "watches, kills, sockets, unlocks and the host's effects are not pending \
-                     effects"
-                )
-            }
-        };
-        // The names this effect changed: their kept descriptors close, as the real drivers'
-        // do once the effect is done (`threads::run`).
-        for name in changed.iter().flatten() {
-            self.descriptors.forget(name);
+            _ => unreachable!("dispatched by Sim::complete"),
         }
-        Completion { tag, done }
     }
 
     fn watch(&mut self, tag: Tag, dir: crate::DirName, journal: bool) -> Id<Watching> {
@@ -3014,6 +3112,754 @@ impl Sim {
     }
 }
 
+impl Sim {
+    #[inline(never)]
+    fn submit_one(&mut self, effect: Effect) {
+        match effect {
+            Effect::Watch { .. }
+            | Effect::Journal { .. }
+            | Effect::Pressure { .. }
+            | Effect::Unwatch { .. }
+            | Effect::Flush { .. }
+            | Effect::Unlock { .. } => self.submit_watch_and_misc(effect),
+
+            Effect::Kill { .. } | Effect::Spawn { .. } => self.submit_proc(effect),
+
+            Effect::Listen { .. }
+            | Effect::Unlisten { .. }
+            | Effect::Connect { .. }
+            | Effect::Recv { .. }
+            | Effect::Send { .. }
+            | Effect::Hangup { .. } => self.submit_net(effect),
+
+            Effect::Bind { .. }
+            | Effect::SendTo { .. }
+            | Effect::RecvFrom { .. }
+            | Effect::Unbind { .. }
+            | Effect::Resolve { .. }
+            | Effect::ReadStdin { .. }
+            | Effect::WriteOut { .. }
+            | Effect::Now { .. }
+            | Effect::Random { .. }
+            | Effect::Roots { .. } => self.hosted(effect),
+
+            other => self.submit_fs(other),
+        }
+    }
+
+    #[inline(never)]
+    fn submit_watch_and_misc(&mut self, effect: Effect) {
+        match effect {
+            Effect::Watch { dir, tag } => {
+                self.watch(tag, crate::DirName::Named(dir), false);
+            }
+            Effect::Journal { dir, since, tag } => {
+                let parts = 1 + self.rng.below(3);
+                let batches = self.disk.history(&dir, &since, parts);
+                let id = self.watch(tag, dir, true);
+                for batch in batches {
+                    // alloc: the batch's payload.
+                    self.tell(tag, Done::Journaled(Box::new(batch)), Of::Change(id));
+                }
+            }
+            Effect::Pressure { tag } => match self.pressures.contains(&tag) {
+                // alloc: an error's message.
+                true => self.tell(
+                    tag,
+                    Done::Failed(IoError(format!(
+                        "memory pressure is watched as {tag:?} already"
+                    ))),
+                    Of::Op,
+                ),
+                // alloc: none past the most watched at once.
+                false => self.pressures.push(tag),
+            },
+            // A watch of memory pressure ends after every pressure told it.
+            Effect::Unwatch { tag } if self.pressures.contains(&tag) => {
+                self.pressures.retain(|&it| it != tag);
+                self.tell_after(tag, tag, Done::Unwatched, Of::Op);
+            }
+            Effect::Unwatch { tag } => {
+                let ended = match self.watches.get_mut(tag) {
+                    Some(watch) if !watch.ending => {
+                        watch.ending = true;
+                        true
+                    }
+                    _ => false,
+                };
+                let (done, of) = match self.watches.id(tag) {
+                    Some(id) if ended => {
+                        self.ending += 1;
+                        (Done::Unwatched, Of::End(id))
+                    }
+                    // alloc: an error's message.
+                    _ => (
+                        Done::Failed(IoError(format!("nothing is watched as {tag:?}"))),
+                        Of::Op,
+                    ),
+                };
+                // A change told before the end is heard before it.
+                self.tell_after(tag, tag, done, of);
+            }
+            Effect::Flush { watch, tag } => {
+                let done = match self.watches.get(watch).is_some_and(|it| !it.ending) {
+                    // alloc: an error path.
+                    false => Done::Failed(IoError(format!("nothing is watched as {watch:?}"))),
+                    true if self.rng.one_in(u64::from(self.faults.fail_one_in)) => {
+                        self.fail(tag).done
+                    }
+                    true => Done::Flushed,
+                };
+                // Every change of the watch told by now is heard first.
+                self.tell_after(watch, tag, done, Of::Flush(watch));
+            }
+            // A real unlock cannot fail, so none is injected to.
+            Effect::Unlock { lock, tag } => {
+                let done = match self.unlock(lock) {
+                    true => Done::Unlocked,
+                    // alloc: an error's message.
+                    false => Done::Failed(IoError(format!(
+                        "unlock of lock {}: it holds no lock",
+                        lock.0
+                    ))),
+                };
+                self.tell(tag, done, Of::Op);
+            }
+            _ => unreachable!("dispatched by Sim::submit_one"),
+        }
+    }
+
+    #[inline(never)]
+    fn submit_proc(&mut self, effect: Effect) {
+        match effect {
+            Effect::Kill { tag } => {
+                if let Some(spawning) = self.spawns.get_mut(tag)
+                    && let Some(handle) = spawning.pending
+                    && let Some(ready) = self.pending.deadline(handle)
+                {
+                    let delay = latency(&mut self.rng, &self.faults);
+                    spawning.exit.code = None;
+                    spawning.exit.signal = Some(KILLED);
+                    let sooner = wheel::ticks(self.now).saturating_add(wheel::ticks(delay));
+                    if sooner < ready {
+                        let pending = self.pending.cancel(handle).expect("in the wheel");
+                        spawning.pending = Some(self.pending.insert(sooner, pending));
+                    }
+                }
+            }
+            Effect::Spawn { ref command, tag } => match self.run(command) {
+                Ok(ran) => {
+                    let after = ran.takes.saturating_add(self.delay());
+                    let ready = wheel::ticks(self.now).saturating_add(wheel::ticks(after));
+                    let (id, _) =
+                        self.spawns.insert(tag, Spawning { exit: ran.exit, pending: None });
+                    let pending = self
+                        .pending
+                        .insert(ready, Pending { effect, covers: 0, spawn: Some(id) });
+                    if let Some((_, spawning)) = self.spawns.by_id_mut(id) {
+                        spawning.pending = Some(pending);
+                    }
+                }
+                Err(why) => {
+                    self.tell(tag, Done::Failed(why), Of::Op);
+                }
+            },
+            _ => unreachable!("dispatched by Sim::submit_one"),
+        }
+    }
+
+    #[inline(never)]
+    fn submit_net(&mut self, effect: Effect) {
+        match effect {
+            Effect::Listen { at, options, tag } => {
+                let side = crate::sockopt::Side::Listen;
+                if let Err(refused) =
+                    crate::sockopt::check_tcp(options.get(), side, crate::sockopt::Platform::Simulated)
+                {
+                    // alloc: an error's message.
+                    self.tell(tag, Done::Failed(IoError(format!("listening at {at:?}: {refused}"))), Of::Op);
+                    return;
+                }
+                let at = match at {
+                    Address::Inherited { at, .. } => Address::Unix(at),
+                    at => at,
+                };
+                match self.listening_at(&at) {
+                    Some(_) => self.tell(
+                        tag,
+                        // alloc: an error's message.
+                        Done::Failed(IoError(format!("{at:?}: another listen has it"))),
+                        Of::Op,
+                    ),
+                    None if self.rng.one_in(u64::from(self.faults.fail_one_in)) => {
+                        let done = self.fail(tag).done;
+                        self.tell(tag, done, Of::Op);
+                    }
+                    None => _ = self.listens.insert(tag, at),
+                }
+            }
+            Effect::Unlisten { tag } => {
+                let done = match self.listens.remove(tag) {
+                    Some(_) => Done::Unlistened,
+                    // alloc: an error's message.
+                    None => Done::Failed(IoError(format!("nothing is listened on as {tag:?}"))),
+                };
+                self.tell(tag, done, Of::Op);
+            }
+            Effect::Connect { at, options, tag } => {
+                let side = crate::sockopt::Side::Connect;
+                if let Err(refused) =
+                    crate::sockopt::check_tcp(options.get(), side, crate::sockopt::Platform::Simulated)
+                {
+                    // alloc: an error's message.
+                    self.tell(tag, Done::Failed(IoError(format!("connecting to {at:?}: {refused}"))), Of::Op);
+                    return;
+                }
+                let done = match self.listening_at(&at) {
+                    _ if self.rng.one_in(u64::from(self.faults.fail_one_in)) => {
+                        self.fail(tag).done
+                    }
+                    // alloc: an error's message.
+                    None => Done::Failed(IoError(format!(
+                        "{at:?}: nothing listens there: connection refused"
+                    ))),
+                    Some(listen) => {
+                        let mine = self.new_end(None);
+                        let theirs = self.new_end(Some(end_of(mine)));
+                        self.ends.get_mut(end_of(mine)).expect("just made").peer =
+                            Some(end_of(theirs));
+                        self.tell(listen, Done::Accepted { conn: theirs }, Of::Op);
+                        Done::Connected { conn: mine }
+                    }
+                };
+                self.tell(tag, done, Of::Op);
+            }
+            Effect::Recv { conn, most, into, tag } => {
+                let end = end_of(conn);
+                match self.ends.get(end).is_some_and(|it| !it.closed) {
+                    true => {
+                        self.receiving.push(Receiving { tag, end, most, into });
+                        self.wake();
+                    }
+                    false => self.tell(
+                        tag,
+                        Done::unread(into, format_args!("no connection {conn:?}")),
+                        Of::Op,
+                    ),
+                }
+            }
+            Effect::Send { conn, mut bytes, tag } => {
+                let end = end_of(conn);
+                if self
+                    .ends
+                    .get(end)
+                    .is_some_and(|it| it.holds_sends && !it.closed && !it.peer_closed)
+                {
+                    self.held_sends.push((conn, tag, bytes));
+                    return;
+                }
+                let done =
+                    match self.ends.get(end).map(|it| (it.closed, it.peer_closed, it.peer)) {
+                        None | Some((true, _, _)) => {
+                            Done::unsent(bytes, format_args!("no connection {conn:?}"))
+                        }
+                        Some((_, true, _)) => Done::unsent(
+                            bytes,
+                            format_args!("{conn:?}: the connection is hung up: broken pipe"),
+                        ),
+                        Some((_, _, None)) => {
+                            let it = self.ends.get_mut(end).expect("looked up");
+                            it.outbox.extend_from_slice(&bytes);
+                            bytes.clear();
+                            Done::Sent(bytes)
+                        }
+                        Some((_, _, Some(peer))) => {
+                            if let Some(peer) = self.ends.get_mut(peer) {
+                                peer.inbox.extend_from_slice(&bytes);
+                            }
+                            bytes.clear();
+                            Done::Sent(bytes)
+                        }
+                    };
+                self.tell(tag, done, Of::Op);
+                self.wake();
+            }
+            Effect::Hangup { conn, tag } => {
+                let end = end_of(conn);
+                let hung = match self.ends.get_mut(end) {
+                    Some(it) if !it.closed => {
+                        it.closed = true;
+                        Some((it.peer, it.peer_closed))
+                    }
+                    _ => None,
+                };
+                self.let_go_sends(conn);
+                let done = match hung {
+                    Some((peer, peer_closed)) => {
+                        if let Some(it) = peer.and_then(|peer| self.ends.get_mut(peer)) {
+                            it.peer_closed = true;
+                        }
+                        // An end of the simulation's own, or one the peer outside hung up
+                        // too, is named by nothing now; one the peer outside may still
+                        // read from is kept for it.
+                        if peer.is_some() || peer_closed {
+                            self.ends.remove(end);
+                        }
+                        Done::HungUp
+                    }
+                    // alloc: an error's message.
+                    None => Done::Failed(IoError(format!("no connection {conn:?}"))),
+                };
+                self.wake();
+                self.tell(tag, done, Of::Op);
+            }
+            _ => unreachable!("dispatched by Sim::submit_one"),
+        }
+    }
+
+    #[inline(never)]
+    fn submit_fs(&mut self, effect: Effect) {
+        // The kernel may write a read's span from now until it completes.
+        Sim::scribble(&effect);
+        let held = match (&effect, &self.hold_reads) {
+            (Effect::ReadInto { file, .. }, Some(dir)) => file.is_under(dir),
+            (Effect::ReadMany { parts, .. }, Some(dir)) => {
+                parts.iter().any(|part| part.file.is_under(dir))
+            }
+            _ => false,
+        };
+        if held {
+            self.held_reads.push(effect);
+            return;
+        }
+        let delay = match (&effect, &self.slow) {
+            (Effect::Timer { after, .. }, _) => *after,
+            (
+                Effect::Sync { file, .. }
+                | Effect::Barrier { file, .. }
+                | Effect::WriteBack { file, .. }
+                | Effect::Write { file, .. }
+                | Effect::WriteUnsynced { file, .. }
+                | Effect::WriteAt { file, .. }
+                | Effect::WriteFrom { file, .. }
+                | Effect::Truncate { file, .. },
+                Some((dir, by)),
+            ) if file.is_under(dir) => *by,
+            _ => self.delay(),
+        };
+        if let (
+            Effect::Sync { file, .. }
+            | Effect::Barrier { file, .. }
+            | Effect::WriteBack { file, .. },
+            Some(dir),
+        ) = (&effect, &self.hold_syncs)
+            && file.is_under(dir)
+        {
+            let covers = self.files.get(file).map_or(0, |it| it.ops.len());
+            self.held.push((effect, covers));
+            return;
+        }
+        if let (Effect::List { dir, tag }, Some(held)) = (&effect, &self.hold_lists)
+            && dir.name() == Some(held)
+        {
+            // clone: the held list keeps its directory's name
+            self.held_lists.push((dir.share(), *tag));
+            return;
+        }
+        // A directory the user may not read fails both listings: names alone, and names
+        // with stamps (bstd's `Dir::facts_of` lists folders by the second).
+        if let (Effect::List { dir, tag } | Effect::Entries { dir, tag }, Some((failing, left))) =
+            (&effect, &mut self.fail_lists)
+            && dir.name() == Some(&*failing)
+            && *left > 0
+        {
+            *left -= 1;
+            // alloc: an error's message.
+            let done = Done::Failed(IoError(format!("{dir}: Permission denied (os error 13)")));
+            let tag = *tag;
+            self.tell(tag, done, Of::Op);
+            return;
+        }
+        if let (
+            Effect::Sync { file, tag }
+            | Effect::Barrier { file, tag }
+            | Effect::WriteBack { file, tag },
+            Some(dir),
+        ) = (&effect, &self.fail_syncs)
+            && file.is_under(dir)
+        {
+            // alloc: an error's message.
+            let done =
+                Done::Failed(IoError(format!("{file}: Input/output error (os error 5)")));
+            let tag = *tag;
+            self.tell(tag, done, Of::Op);
+            return;
+        }
+        let covers = match &effect {
+            Effect::Sync { file, .. }
+            | Effect::Barrier { file, .. }
+            | Effect::WriteBack { file, .. } => {
+                self.files.get(file).map_or(0, |it| it.ops.len())
+            }
+            _ => 0,
+        };
+        self.pend(delay, effect, covers);
+    }
+
+    // -----------------------------------------------------------------------
+    // Direct zero-`Effect`/`Done` filesystem operations for `DirectFsBackend`
+    // -----------------------------------------------------------------------
+
+    fn direct_cannot_make(
+        &self,
+        path: &FileName,
+        rename_from: Option<&FileName>,
+    ) -> Result<(), crate::request::FsError> {
+        if self.is_dir(path) {
+            return Err(crate::request::FsError::Io {
+                path: Some(path.clone()),
+                message: format!("{path} {}", host::IS_A_DIRECTORY),
+            });
+        }
+        if let Some(above) = self.file_above(path) {
+            return Err(crate::request::FsError::Io {
+                path: Some(path.clone()),
+                message: format!("{path}: {above} {}", host::NOT_A_DIRECTORY),
+            });
+        }
+        if !self.files.contains_key(path)
+            && let Some(other) = self.folds_onto(path)
+            && rename_from != Some(other)
+        {
+            return Err(crate::request::FsError::Io {
+                path: Some(path.clone()),
+                message: format!("{path}: {other} {}", host::ONE_NAME_FOLDED),
+            });
+        }
+        Ok(())
+    }
+
+    fn direct_check_writable(&self, path: &FileName) -> Result<(), crate::request::FsError> {
+        if let Some(sim) = self.files.get(path)
+            && !sim.link
+            && sim.mode & OWNER_WRITES == 0
+        {
+            return Err(crate::request::FsError::Io {
+                path: Some(path.clone()),
+                message: format!("{path}: {PERMISSION_DENIED}"),
+            });
+        }
+        Ok(())
+    }
+
+    fn direct_check_fault(
+        &mut self,
+        path: Option<&FileName>,
+    ) -> Result<(), crate::request::FsError> {
+        if self.rng.one_in(u64::from(self.faults.fail_one_in)) {
+            seeds::injected(self);
+            return Err(crate::request::FsError::Io {
+                path: path.cloned(),
+                message: FAULT.into(),
+            });
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub(crate) fn direct_open_write(
+        &mut self,
+        path: &FileName,
+        create: bool,
+        truncate: bool,
+    ) -> Result<(), crate::request::FsError> {
+        self.fold_drawn();
+        self.direct_check_writable(path)?;
+        if self.is_dir(path) {
+            return Err(crate::request::FsError::Io {
+                path: Some(path.clone()),
+                message: format!("{path} {}", host::IS_A_DIRECTORY),
+            });
+        }
+        if let Some(above) = self.file_above(path) {
+            return Err(crate::request::FsError::Io {
+                path: Some(path.clone()),
+                message: format!("{path}: {above} {}", host::NOT_A_DIRECTORY),
+            });
+        }
+        let exists = self.files.contains_key(path);
+        if !exists {
+            if !create {
+                return Err(crate::request::FsError::NotFound { path: path.clone() });
+            }
+            if let Some(other) = self.folds_onto(path) {
+                return Err(crate::request::FsError::Io {
+                    path: Some(path.clone()),
+                    message: format!("{path}: {other} {}", host::ONE_NAME_FOLDED),
+                });
+            }
+        }
+        self.direct_check_fault(Some(path))?;
+        if exists {
+            if truncate {
+                self.files.get_mut(path).expect("checked above").push_op(Op::Cut(0));
+                self.changed(path);
+                self.descriptors.forget(path);
+            }
+        } else {
+            self.made(path);
+            let _ = file_mut(&mut self.files, path);
+            self.changed(path);
+            self.descriptors.forget(path);
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub(crate) fn direct_open_read(
+        &mut self,
+        path: &FileName,
+    ) -> Result<(), crate::request::FsError> {
+        self.fold_drawn();
+        if let Some(above) = self.file_above(path) {
+            return Err(crate::request::FsError::Io {
+                path: Some(path.clone()),
+                message: format!("{path}: {above} {}", host::NOT_A_DIRECTORY),
+            });
+        }
+        let followed = self
+            .followed(path)
+            .map_err(|e| crate::request::FsError::Io { path: Some(path.clone()), message: e.0 })?;
+        self.direct_check_fault(Some(path))?;
+        let target = followed.as_ref().unwrap_or(path);
+        if self.files.contains_key(target) {
+            Ok(())
+        } else if self.is_dir(target) {
+            Err(crate::request::FsError::Io {
+                path: Some(path.clone()),
+                message: format!("{path} {}", host::IS_A_DIRECTORY),
+            })
+        } else {
+            Err(crate::request::FsError::NotFound { path: path.clone() })
+        }
+    }
+
+    #[inline(never)]
+    pub(crate) fn direct_read_at(
+        &mut self,
+        path: &FileName,
+        at: u64,
+        dst: &mut [u8],
+    ) -> Result<usize, crate::request::FsError> {
+        self.fold_drawn();
+        let followed = self
+            .followed(path)
+            .map_err(|e| crate::request::FsError::Io { path: Some(path.clone()), message: e.0 })?;
+        self.direct_check_fault(Some(path))?;
+        let target = followed.as_ref().unwrap_or(path);
+        if !self.files.contains_key(target) {
+            return Err(crate::request::FsError::NotFound { path: path.clone() });
+        }
+        if Sim::drawn(&mut self.rng, &self.fail_reads, target) {
+            return Err(crate::request::FsError::Io {
+                path: Some(path.clone()),
+                message: format!("{target}: Input/output error (os error 5)"),
+            });
+        }
+        let sim = self.files.get(target).expect("checked above");
+        let bytes: &[u8] = match sim.ops.is_empty() {
+            true => &sim.durable,
+            false => {
+                self.scratch.clear();
+                self.scratch.extend_from_slice(&sim.durable);
+                for op in &sim.ops {
+                    op.apply(&mut self.scratch);
+                }
+                &self.scratch
+            }
+        };
+        let start = usize::try_from(at).unwrap_or(usize::MAX).min(bytes.len());
+        let avail = bytes.len() - start;
+        let mut n = avail.min(dst.len());
+        if n > 1 && Sim::drawn(&mut self.rng, &self.short_reads, target) {
+            let span = u64::try_from(n - 1).unwrap_or(1);
+            n = usize::try_from(self.rng.below(span)).unwrap_or(0) + 1;
+        }
+        dst[..n].copy_from_slice(&bytes[start..start + n]);
+        self.bytes_read += n as u64;
+        Ok(n)
+    }
+
+    #[inline(never)]
+    pub(crate) fn direct_write_at(
+        &mut self,
+        path: &FileName,
+        at: u64,
+        src: &[u8],
+    ) -> Result<(), crate::request::FsError> {
+        self.fold_drawn();
+        self.direct_check_writable(path)?;
+        if !self.files.contains_key(path) {
+            return Err(crate::request::FsError::NotFound { path: path.clone() });
+        }
+        if self.rng.one_in(u64::from(self.faults.fail_one_in)) {
+            let landed = some_sectors(at, src, &mut self.rng);
+            if !landed.is_empty() {
+                let sim = self.files.get_mut(path).expect("checked above");
+                for op in landed {
+                    let op = match op {
+                        Op::At(off, sector) => Op::Sectors(off, sector),
+                        op => op,
+                    };
+                    sim.push_op(op);
+                }
+                self.changed(path);
+                self.descriptors.forget(path);
+            }
+            seeds::injected(self);
+            return Err(crate::request::FsError::Io {
+                path: Some(path.clone()),
+                message: FAULT.into(),
+            });
+        }
+        let mut out_of_space_fits = None;
+        if let Some((dir, room)) = &mut self.room
+            && path.is_under(dir)
+        {
+            let len = src.len() as u64;
+            if len <= *room {
+                *room -= len;
+            } else {
+                out_of_space_fits = Some(*room as usize);
+                *room = 0;
+            }
+        }
+        if let Some(fits) = out_of_space_fits {
+            if fits >= SECTOR {
+                let landed_len = (fits / SECTOR) * SECTOR;
+                let sim = self.files.get_mut(path).expect("checked above");
+                sim.push_op(Op::Sectors(at, src[..landed_len].to_vec()));
+                self.changed(path);
+                self.descriptors.forget(path);
+            }
+            return Err(crate::request::FsError::NoSpace { path: path.clone() });
+        }
+        let sim = self.files.get_mut(path).expect("checked above");
+        self.bytes_written += src.len() as u64;
+        sim.push_op(Op::Sectors(at, src.to_vec()));
+        self.changed(path);
+        self.descriptors.forget(path);
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub(crate) fn direct_flush(
+        &mut self,
+        path: &FileName,
+    ) -> Result<(), crate::request::FsError> {
+        self.fold_drawn();
+        self.direct_cannot_make(path, None)?;
+        if self.fail_syncs.as_ref().is_some_and(|dir| path.is_under(dir)) {
+            return Err(crate::request::FsError::Io {
+                path: Some(path.clone()),
+                message: format!("{path}: Input/output error (os error 5)"),
+            });
+        }
+        self.direct_check_fault(Some(path))?;
+        let less = self.planted(host::Plant::SyncCoversLess);
+        if self.planted(host::Plant::FileSyncKeepsName) {
+            self.names.retain(|change| !change.named.touches(path));
+        }
+        let Some(sim) = self.files.get_mut(path) else {
+            return Err(crate::request::FsError::NotFound { path: path.clone() });
+        };
+        let all = sim.ops.len();
+        let covers = match less && all > 0 {
+            true => all - 1,
+            false => all,
+        };
+        sim.sync(covers);
+        self.flushed();
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub(crate) fn direct_rename(
+        &mut self,
+        from: &FileName,
+        to: &FileName,
+    ) -> Result<(), crate::request::FsError> {
+        self.fold_drawn();
+        self.direct_cannot_make(to, Some(from))?;
+        self.direct_check_fault(Some(to))?;
+        if from == to {
+            if !self.files.contains_key(from) {
+                return Err(crate::request::FsError::NotFound { path: from.clone() });
+            }
+            self.changed(from);
+            self.descriptors.forget(from);
+            return Ok(());
+        }
+        let Some(sim) = self.files.remove(from) else {
+            return Err(crate::request::FsError::NotFound { path: from.clone() });
+        };
+        self.make_parents(to, host::Maker::Effect);
+        let was = self.files.remove(to);
+        self.named(Named::Moved { from: from.share(), to: to.share(), was });
+        *file_mut(&mut self.files, to) = sim;
+        self.disk.renamed(from, to);
+        self.move_locks(from, to);
+        self.changed(from);
+        self.changed(to);
+        self.descriptors.forget(from);
+        self.descriptors.forget(to);
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub(crate) fn direct_sync_dir(
+        &mut self,
+        dir: &crate::DirName,
+    ) -> Result<(), crate::request::FsError> {
+        self.fold_drawn();
+        self.direct_check_fault(dir.name())?;
+        self.sync_names(dir.name().map_or("", FileName::as_str));
+        self.flushed();
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub(crate) fn direct_stat(
+        &mut self,
+        path: &FileName,
+    ) -> Result<Option<Meta>, crate::request::FsError> {
+        self.fold_drawn();
+        self.direct_check_fault(Some(path))?;
+        if self.files.get(path).is_some_and(|it| it.link) {
+            return match self.led_to(path) {
+                Ok(Some(at)) if self.files.contains_key(&at) => Ok(Some(self.meta(&at, false))),
+                Ok(Some(at)) if self.is_dir(&at) => Ok(Some(self.meta(&at, true))),
+                Ok(_) => Ok(None),
+                Err(error) => Err(crate::request::FsError::Io {
+                    path: Some(path.clone()),
+                    message: error.0,
+                }),
+            };
+        }
+        if let Some(above) = self.file_above(path) {
+            return Err(crate::request::FsError::Io {
+                path: Some(path.clone()),
+                message: format!("{path}: {above} {}", host::NOT_A_DIRECTORY),
+            });
+        }
+        Ok(match self.files.contains_key(path) {
+            true => Some(self.meta(path, false)),
+            false if self.is_dir(path) => Some(self.meta(path, true)),
+            false => None,
+        })
+    }
+}
+
 impl Driver for Sim {
     fn submit(&mut self, effects: &mut Vec<Effect>) {
         // An armed simulation traces them, and takes none while its power is cut.
@@ -3021,374 +3867,7 @@ impl Driver for Sim {
             return;
         }
         for effect in effects.drain(..) {
-            match effect {
-                Effect::Watch { dir, tag } => {
-                    self.watch(tag, crate::DirName::Named(dir), false);
-                    continue;
-                }
-                Effect::Journal { dir, since, tag } => {
-                    let parts = 1 + self.rng.below(3);
-                    let batches = self.disk.history(&dir, &since, parts);
-                    let id = self.watch(tag, dir, true);
-                    for batch in batches {
-                        // alloc: the batch's payload.
-                        self.tell(tag, Done::Journaled(Box::new(batch)), Of::Change(id));
-                    }
-                    continue;
-                }
-                Effect::Pressure { tag } => {
-                    match self.pressures.contains(&tag) {
-                        // alloc: an error's message.
-                        true => self.tell(
-                            tag,
-                            Done::Failed(IoError(format!(
-                                "memory pressure is watched as {tag:?} already"
-                            ))),
-                            Of::Op,
-                        ),
-                        // alloc: none past the most watched at once.
-                        false => self.pressures.push(tag),
-                    }
-                    continue;
-                }
-                // A watch of memory pressure ends after every pressure told it.
-                Effect::Unwatch { tag } if self.pressures.contains(&tag) => {
-                    self.pressures.retain(|&it| it != tag);
-                    self.tell_after(tag, tag, Done::Unwatched, Of::Op);
-                    continue;
-                }
-                Effect::Unwatch { tag } => {
-                    let ended = match self.watches.get_mut(tag) {
-                        Some(watch) if !watch.ending => {
-                            watch.ending = true;
-                            true
-                        }
-                        _ => false,
-                    };
-                    let (done, of) = match self.watches.id(tag) {
-                        Some(id) if ended => {
-                            self.ending += 1;
-                            (Done::Unwatched, Of::End(id))
-                        }
-                        // alloc: an error's message.
-                        _ => (
-                            Done::Failed(IoError(format!("nothing is watched as {tag:?}"))),
-                            Of::Op,
-                        ),
-                    };
-                    // A change told before the end is heard before it.
-                    self.tell_after(tag, tag, done, of);
-                    continue;
-                }
-                Effect::Flush { watch, tag } => {
-                    let done = match self.watches.get(watch).is_some_and(|it| !it.ending) {
-                        // alloc: an error path.
-                        false => Done::Failed(IoError(format!("nothing is watched as {watch:?}"))),
-                        true if self.rng.one_in(u64::from(self.faults.fail_one_in)) => {
-                            self.fail(tag).done
-                        }
-                        true => Done::Flushed,
-                    };
-                    // Every change of the watch told by now is heard first.
-                    self.tell_after(watch, tag, done, Of::Flush(watch));
-                    continue;
-                }
-                // A real unlock cannot fail, so none is injected to.
-                Effect::Unlock { lock, tag } => {
-                    let done = match self.unlock(lock) {
-                        true => Done::Unlocked,
-                        // alloc: an error's message.
-                        false => Done::Failed(IoError(format!(
-                            "unlock of lock {}: it holds no lock",
-                            lock.0
-                        ))),
-                    };
-                    self.tell(tag, done, Of::Op);
-                    continue;
-                }
-                Effect::Kill { tag } => {
-                    if let Some(spawning) = self.spawns.get_mut(tag)
-                        && let Some(handle) = spawning.pending
-                        && let Some(ready) = self.pending.deadline(handle)
-                    {
-                        let delay = latency(&mut self.rng, &self.faults);
-                        spawning.exit.code = None;
-                        spawning.exit.signal = Some(KILLED);
-                        let sooner = wheel::ticks(self.now).saturating_add(wheel::ticks(delay));
-                        if sooner < ready {
-                            let pending = self.pending.cancel(handle).expect("in the wheel");
-                            spawning.pending = Some(self.pending.insert(sooner, pending));
-                        }
-                    }
-                    continue;
-                }
-                Effect::Listen { at, options, tag } => {
-                    let side = crate::sockopt::Side::Listen;
-                    if let Err(refused) =
-                        crate::sockopt::check_tcp(options.get(), side, crate::sockopt::Platform::Simulated)
-                    {
-                        // alloc: an error's message.
-                        self.tell(tag, Done::Failed(IoError(format!("listening at {at:?}: {refused}"))), Of::Op);
-                        continue;
-                    }
-                    let at = match at {
-                        Address::Inherited { at, .. } => Address::Unix(at),
-                        at => at,
-                    };
-                    match self.listening_at(&at) {
-                        Some(_) => self.tell(
-                            tag,
-                            // alloc: an error's message.
-                            Done::Failed(IoError(format!("{at:?}: another listen has it"))),
-                            Of::Op,
-                        ),
-                        None if self.rng.one_in(u64::from(self.faults.fail_one_in)) => {
-                            let done = self.fail(tag).done;
-                            self.tell(tag, done, Of::Op);
-                        }
-                        None => _ = self.listens.insert(tag, at),
-                    }
-                    continue;
-                }
-                Effect::Unlisten { tag } => {
-                    let done = match self.listens.remove(tag) {
-                        Some(_) => Done::Unlistened,
-                        // alloc: an error's message.
-                        None => Done::Failed(IoError(format!("nothing is listened on as {tag:?}"))),
-                    };
-                    self.tell(tag, done, Of::Op);
-                    continue;
-                }
-                Effect::Connect { at, options, tag } => {
-                    let side = crate::sockopt::Side::Connect;
-                    if let Err(refused) =
-                        crate::sockopt::check_tcp(options.get(), side, crate::sockopt::Platform::Simulated)
-                    {
-                        // alloc: an error's message.
-                        self.tell(tag, Done::Failed(IoError(format!("connecting to {at:?}: {refused}"))), Of::Op);
-                        continue;
-                    }
-                    let done = match self.listening_at(&at) {
-                        _ if self.rng.one_in(u64::from(self.faults.fail_one_in)) => {
-                            self.fail(tag).done
-                        }
-                        // alloc: an error's message.
-                        None => Done::Failed(IoError(format!(
-                            "{at:?}: nothing listens there: connection refused"
-                        ))),
-                        Some(listen) => {
-                            let mine = self.new_end(None);
-                            let theirs = self.new_end(Some(end_of(mine)));
-                            self.ends.get_mut(end_of(mine)).expect("just made").peer =
-                                Some(end_of(theirs));
-                            self.tell(listen, Done::Accepted { conn: theirs }, Of::Op);
-                            Done::Connected { conn: mine }
-                        }
-                    };
-                    self.tell(tag, done, Of::Op);
-                    continue;
-                }
-                Effect::Recv { conn, most, into, tag } => {
-                    let end = end_of(conn);
-                    match self.ends.get(end).is_some_and(|it| !it.closed) {
-                        true => {
-                            self.receiving.push(Receiving { tag, end, most, into });
-                            self.wake();
-                        }
-                        false => self.tell(
-                            tag,
-                            Done::unread(into, format_args!("no connection {conn:?}")),
-                            Of::Op,
-                        ),
-                    }
-                    continue;
-                }
-                Effect::Send { conn, mut bytes, tag } => {
-                    let end = end_of(conn);
-                    if self
-                        .ends
-                        .get(end)
-                        .is_some_and(|it| it.holds_sends && !it.closed && !it.peer_closed)
-                    {
-                        self.held_sends.push((conn, tag, bytes));
-                        continue;
-                    }
-                    let done =
-                        match self.ends.get(end).map(|it| (it.closed, it.peer_closed, it.peer)) {
-                            None | Some((true, _, _)) => {
-                                Done::unsent(bytes, format_args!("no connection {conn:?}"))
-                            }
-                            Some((_, true, _)) => Done::unsent(
-                                bytes,
-                                format_args!("{conn:?}: the connection is hung up: broken pipe"),
-                            ),
-                            Some((_, _, None)) => {
-                                let it = self.ends.get_mut(end).expect("looked up");
-                                it.outbox.extend_from_slice(&bytes);
-                                bytes.clear();
-                                Done::Sent(bytes)
-                            }
-                            Some((_, _, Some(peer))) => {
-                                if let Some(peer) = self.ends.get_mut(peer) {
-                                    peer.inbox.extend_from_slice(&bytes);
-                                }
-                                bytes.clear();
-                                Done::Sent(bytes)
-                            }
-                        };
-                    self.tell(tag, done, Of::Op);
-                    self.wake();
-                    continue;
-                }
-                Effect::Hangup { conn, tag } => {
-                    let end = end_of(conn);
-                    let hung = match self.ends.get_mut(end) {
-                        Some(it) if !it.closed => {
-                            it.closed = true;
-                            Some((it.peer, it.peer_closed))
-                        }
-                        _ => None,
-                    };
-                    self.let_go_sends(conn);
-                    let done = match hung {
-                        Some((peer, peer_closed)) => {
-                            if let Some(it) = peer.and_then(|peer| self.ends.get_mut(peer)) {
-                                it.peer_closed = true;
-                            }
-                            // An end of the simulation's own, or one the peer outside hung up
-                            // too, is named by nothing now; one the peer outside may still
-                            // read from is kept for it.
-                            if peer.is_some() || peer_closed {
-                                self.ends.remove(end);
-                            }
-                            Done::HungUp
-                        }
-                        // alloc: an error's message.
-                        None => Done::Failed(IoError(format!("no connection {conn:?}"))),
-                    };
-                    self.wake();
-                    self.tell(tag, done, Of::Op);
-                    continue;
-                }
-                effect @ (Effect::Bind { .. }
-                | Effect::SendTo { .. }
-                | Effect::RecvFrom { .. }
-                | Effect::Unbind { .. }
-                | Effect::Resolve { .. }
-                | Effect::ReadStdin { .. }
-                | Effect::WriteOut { .. }
-                | Effect::Now { .. }
-                | Effect::Random { .. }
-                | Effect::Roots { .. }) => {
-                    self.hosted(effect);
-                    continue;
-                }
-                Effect::Spawn { ref command, tag } => match self.run(command) {
-                    Ok(ran) => {
-                        let after = ran.takes.saturating_add(self.delay());
-                        let ready = wheel::ticks(self.now).saturating_add(wheel::ticks(after));
-                        let (id, _) =
-                            self.spawns.insert(tag, Spawning { exit: ran.exit, pending: None });
-                        let pending = self
-                            .pending
-                            .insert(ready, Pending { effect, covers: 0, spawn: Some(id) });
-                        if let Some((_, spawning)) = self.spawns.by_id_mut(id) {
-                            spawning.pending = Some(pending);
-                        }
-                        continue;
-                    }
-                    Err(why) => {
-                        self.tell(tag, Done::Failed(why), Of::Op);
-                        continue;
-                    }
-                },
-                _ => {}
-            }
-            // The kernel may write a read's span from now until it completes.
-            Sim::scribble(&effect);
-            let held = match (&effect, &self.hold_reads) {
-                (Effect::ReadInto { file, .. }, Some(dir)) => file.is_under(dir),
-                (Effect::ReadMany { parts, .. }, Some(dir)) => {
-                    parts.iter().any(|part| part.file.is_under(dir))
-                }
-                _ => false,
-            };
-            if held {
-                self.held_reads.push(effect);
-                continue;
-            }
-            let delay = match (&effect, &self.slow) {
-                (Effect::Timer { after, .. }, _) => *after,
-                (
-                    Effect::Sync { file, .. }
-                    | Effect::Barrier { file, .. }
-                    | Effect::WriteBack { file, .. }
-                    | Effect::Write { file, .. }
-                    | Effect::WriteUnsynced { file, .. }
-                    | Effect::WriteAt { file, .. }
-                    | Effect::WriteFrom { file, .. }
-                    | Effect::Truncate { file, .. },
-                    Some((dir, by)),
-                ) if file.is_under(dir) => *by,
-                _ => self.delay(),
-            };
-            if let (
-                Effect::Sync { file, .. }
-                | Effect::Barrier { file, .. }
-                | Effect::WriteBack { file, .. },
-                Some(dir),
-            ) = (&effect, &self.hold_syncs)
-                && file.is_under(dir)
-            {
-                let covers = self.files.get(file).map_or(0, |it| it.ops.len());
-                self.held.push((effect, covers));
-                continue;
-            }
-            if let (Effect::List { dir, tag }, Some(held)) = (&effect, &self.hold_lists)
-                && dir.name() == Some(held)
-            {
-                // clone: the held list keeps its directory's name
-                self.held_lists.push((dir.share(), *tag));
-                continue;
-            }
-            // A directory the user may not read fails both listings: names alone, and names
-            // with stamps (bstd's `Dir::facts_of` lists folders by the second).
-            if let (Effect::List { dir, tag } | Effect::Entries { dir, tag }, Some((failing, left))) =
-                (&effect, &mut self.fail_lists)
-                && dir.name() == Some(&*failing)
-                && *left > 0
-            {
-                *left -= 1;
-                // alloc: an error's message.
-                let done = Done::Failed(IoError(format!("{dir}: Permission denied (os error 13)")));
-                let tag = *tag;
-                self.tell(tag, done, Of::Op);
-                continue;
-            }
-            if let (
-                Effect::Sync { file, tag }
-                | Effect::Barrier { file, tag }
-                | Effect::WriteBack { file, tag },
-                Some(dir),
-            ) = (&effect, &self.fail_syncs)
-                && file.is_under(dir)
-            {
-                // alloc: an error's message.
-                let done =
-                    Done::Failed(IoError(format!("{file}: Input/output error (os error 5)")));
-                let tag = *tag;
-                self.tell(tag, done, Of::Op);
-                continue;
-            }
-            let covers = match &effect {
-                Effect::Sync { file, .. }
-                | Effect::Barrier { file, .. }
-                | Effect::WriteBack { file, .. } => {
-                    self.files.get(file).map_or(0, |it| it.ops.len())
-                }
-                _ => 0,
-            };
-            self.pend(delay, effect, covers);
+            self.submit_one(effect);
         }
     }
 

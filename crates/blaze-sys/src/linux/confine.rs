@@ -159,6 +159,14 @@ const AUDIT_ARCH: u32 = 0xC000_003E;
 #[cfg(target_arch = "aarch64")]
 const AUDIT_ARCH: u32 = 0xC000_00B7;
 
+#[cfg(target_arch = "x86_64")]
+const CURRENT_SECCOMP_ARCH: crate::effects::SeccompArch = crate::effects::SeccompArch::X86_64;
+#[cfg(target_arch = "aarch64")]
+const CURRENT_SECCOMP_ARCH: crate::effects::SeccompArch = crate::effects::SeccompArch::Aarch64;
+
+const _: () = assert!(crate::effects::MAX_BPF_INSNS <= MOST_FILTER);
+const _: () = assert!(crate::effects::audit_arch(CURRENT_SECCOMP_ARCH) == AUDIT_ARCH);
+
 /// The calls every hermetic child is refused with `EPERM`, by this architecture's numbers.
 /// Network: `socket` (no socket of any family: no network, no unix socket to a host daemon).
 /// Others' memory and tracing: `ptrace`, `process_vm_readv`, `process_vm_writev`. The mount
@@ -278,6 +286,26 @@ pub fn build(filter: Filter, out: &mut [SockFilter; MOST_FILTER]) -> &[SockFilte
     }
     put(stmt(RET_K, RET_ALLOW));
     &out[..at]
+}
+
+/// Compiles a domain-based Classic-BPF seccomp filter for `allowed` on the current Linux
+/// architecture via [`crate::effects::compile_seccomp_bpf`] into `out`, returning the number of
+/// [`SockFilter`] instructions written.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn build_domain_filter(
+    allowed: crate::effects::DomainMask,
+    out: &mut [SockFilter; MOST_FILTER],
+) -> usize {
+    let prog = crate::effects::compile_seccomp_bpf(allowed, CURRENT_SECCOMP_ARCH);
+    let mut at = 0;
+    for &insn in prog.as_slice() {
+        if let Some(slot) = out.get_mut(at) {
+            *slot = SockFilter { code: insn.code, jt: insn.jt, jf: insn.jf, k: insn.k };
+            at += 1;
+        }
+    }
+    at
 }
 
 const AF_UNIX: u32 = 1;
@@ -1036,7 +1064,11 @@ pub fn enter_test_sandbox(
 
 #[cfg(test)]
 mod tests {
-    use super::{Filter, MOST_FILTER, RET_ALLOW, SockFilter, build, build_test};
+    use super::{
+        CURRENT_SECCOMP_ARCH, Filter, MOST_FILTER, RET_ALLOW, SockFilter, build,
+        build_domain_filter, build_test,
+    };
+    use crate::effects::{DomainMask, compile_seccomp_bpf};
 
     fn check_well_formed(filter: &[SockFilter]) {
         let last = filter.last().copied().expect("a filter");
@@ -1057,5 +1089,23 @@ mod tests {
         }
         let mut test_out = [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; MOST_FILTER];
         check_well_formed(build_test(&mut test_out));
+    }
+
+    /// `build_domain_filter` emits well-formed `SockFilter` instructions identical to
+    /// `crate::effects::compile_seccomp_bpf` for the current architecture.
+    #[test]
+    fn domain_filter_is_well_formed_and_matches_compiled_bpf() {
+        for allowed in [DomainMask::EMPTY, DomainMask::FS.union(DomainMask::CLOCK), DomainMask::ALL] {
+            let mut out = [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; MOST_FILTER];
+            let written = build_domain_filter(allowed, &mut out);
+            let slice = &out[..written];
+            check_well_formed(slice);
+
+            let expected = compile_seccomp_bpf(allowed, CURRENT_SECCOMP_ARCH);
+            assert_eq!(written, expected.len());
+            for (got, want) in slice.iter().zip(expected.as_slice().iter()) {
+                assert_eq!((got.code, got.jt, got.jf, got.k), (want.code, want.jt, want.jf, want.k));
+            }
+        }
     }
 }

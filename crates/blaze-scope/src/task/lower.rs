@@ -673,11 +673,19 @@ impl<'s, 'a> Cfg<'s, 'a> {
                     // whose first segment is none of the crate's tools (`Lower::attrs`). An item's
                     // own `register_tool` registers nothing (the Reference, `attributes.tool`:
                     // a crate-level attribute).
+                    let builtin_contract = matches!(
+                        name.trim().trim_start_matches("::"),
+                        "core::contracts::requires"
+                            | "core::contracts::ensures"
+                            | "std::contracts::requires"
+                            | "std::contracts::ensures"
+                    );
                     let tool = tool_segment(name).map(|first| TOOLS.contains(&first));
-                    let candidate = match tool {
-                        Some(tool) => !tool,
-                        None => !is_builtin_attr(name) && attrs.derives.is_empty(),
-                    };
+                    let candidate = !builtin_contract
+                        && match tool {
+                            Some(tool) => !tool,
+                            None => !is_builtin_attr(name) && attrs.derives.is_empty(),
+                        };
                     if candidate {
                         attrs.takers.push(name);
                         if attrs.attr_macro.is_none() {
@@ -688,7 +696,7 @@ impl<'s, 'a> Cfg<'s, 'a> {
                     // derive it is one of the item's after-derive calls too (derive_where's
                     // `#[::derive_where::derive_where_visited]`); `Lower::attrs` drops the paths
                     // of the crate's registered tools.
-                    if tool.map_or(!is_builtin_attr(name), |tool| !tool) {
+                    if !builtin_contract && tool.map_or(!is_builtin_attr(name), |tool| !tool) {
                         attrs.others.push(name);
                         attrs.derives_before.push(attrs.derives.len());
                     }

@@ -11,6 +11,8 @@
 //! 2. **Linux seccomp syscall allow/deny sets** ([`is_linux_syscall_allowed`],
 //!    [`denied_linux_syscalls`]): architecture-exact syscall numbers for both `aarch64` and
 //!    `x86_64`, matching [`crate::linux::nr`].
+//! 3. **Linux Classic-BPF seccomp bytecode** ([`compile_seccomp_bpf`], [`eval_seccomp_bpf`]):
+//!    cross-platform zero-allocation Classic-BPF compiler and bounded `#![no_std]` VM evaluator.
 
 use core::fmt;
 
@@ -454,6 +456,254 @@ pub const fn is_linux_syscall_allowed_with(
     }
 }
 
+/// One Classic-BPF instruction, bit-identical to Linux `struct sock_filter`.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct BpfInsn {
+    /// BPF opcode (`BPF_LD | BPF_W | BPF_ABS`, `BPF_JMP | BPF_JEQ | BPF_K`, `BPF_RET | BPF_K`, ...).
+    pub code: u16,
+    /// Jump offset when the branch condition is true (relative to the next instruction).
+    pub jt: u8,
+    /// Jump offset when the branch condition is false (relative to the next instruction).
+    pub jf: u8,
+    /// Multi-use immediate operand (`k`).
+    pub k: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<BpfInsn>() == 8);
+const _: () = assert!(core::mem::align_of::<BpfInsn>() == 4);
+
+/// Inline instruction capacity for a compiled [`BpfProgram`].
+pub const MAX_BPF_INSNS: usize = 128;
+
+// 4-instruction header (load arch, jeq, kill, load nr) + 2 instructions per denied syscall
+// + 1 trailing allow instruction must always fit within `MAX_BPF_INSNS`.
+const _: () = assert!(5 + 2 * MAX_CLASSIFIED_SYSCALLS <= MAX_BPF_INSNS);
+
+// Classic-BPF opcodes (`linux/bpf_common.h`, `linux/filter.h`).
+const BPF_LD_W_ABS: u16 = 0x20;
+const BPF_JMP_JA: u16 = 0x05;
+const BPF_JMP_JEQ_K: u16 = 0x15;
+const BPF_JMP_JGT_K: u16 = 0x25;
+const BPF_JMP_JGE_K: u16 = 0x35;
+const BPF_JMP_JSET_K: u16 = 0x45;
+const BPF_RET_K: u16 = 0x06;
+
+// `struct seccomp_data` field offsets (`linux/seccomp.h`).
+const SECCOMP_DATA_NR_OFFSET: u32 = 0;
+const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
+
+// Linux `AUDIT_ARCH_*` constants (`linux/audit.h`).
+const AUDIT_ARCH_AARCH64: u32 = 0xC000_00B7;
+const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+
+// Linux `SECCOMP_RET_*` return codes (`linux/seccomp.h`).
+const SECCOMP_RET_ACTION_FULL: u32 = 0xffff_0000;
+const SECCOMP_RET_DATA: u32 = 0x0000_ffff;
+const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+const SECCOMP_EPERM: u32 = 1;
+
+/// Returns the Linux `AUDIT_ARCH_*` word for `arch`.
+#[inline]
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub const fn audit_arch(arch: SeccompArch) -> u32 {
+    match arch {
+        SeccompArch::Aarch64 => AUDIT_ARCH_AARCH64,
+        SeccompArch::X86_64 => AUDIT_ARCH_X86_64,
+    }
+}
+
+/// Zero-allocation inline Classic-BPF seccomp bytecode program.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BpfProgram {
+    insns: [BpfInsn; MAX_BPF_INSNS],
+    len: usize,
+}
+
+impl BpfProgram {
+    /// Compiled instructions in execution order.
+    #[inline]
+    #[blaze::noalloc]
+    #[blaze::nopanic]
+    pub fn as_slice(&self) -> &[BpfInsn] {
+        self.insns.get(..self.len).unwrap_or_default()
+    }
+
+    /// Number of instructions in this program.
+    #[inline]
+    #[blaze::noalloc]
+    #[blaze::nopanic]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` iff this program contains zero instructions.
+    #[inline]
+    #[blaze::noalloc]
+    #[blaze::nopanic]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl AsRef<[BpfInsn]> for BpfProgram {
+    #[inline]
+    fn as_ref(&self) -> &[BpfInsn] {
+        self.as_slice()
+    }
+}
+
+/// Outcome of evaluating a Classic-BPF seccomp program via [`eval_seccomp_bpf`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum BpfVerdict {
+    /// `SECCOMP_RET_ALLOW`: syscall permitted.
+    Allow,
+    /// `SECCOMP_RET_ERRNO | errno`: syscall denied with the given POSIX errno.
+    DenyErrno(u16),
+    /// `SECCOMP_RET_KILL_PROCESS`: process terminated immediately (e.g. wrong architecture).
+    KillProcess,
+    /// Malformed, out-of-bounds, unknown-opcode, or non-terminating Classic-BPF program.
+    InvalidProgram,
+}
+
+/// Compiles a Linux Classic-BPF seccomp filter enforcing `allowed` on `arch`.
+///
+/// Emitted bytecode structure:
+/// 1. Load `seccomp_data.arch` (offset 4); if `!= audit_arch(arch)` -> `SECCOMP_RET_KILL_PROCESS`.
+/// 2. Load `seccomp_data.nr` (offset 0).
+/// 3. For each denied syscall number in [`denied_linux_syscalls`]`(allowed, arch)`:
+///    `BPF_JMP | BPF_JEQ | BPF_K` -> `SECCOMP_RET_ERRNO | EPERM` (`0x0005_0001`).
+/// 4. Default fallthrough: `SECCOMP_RET_ALLOW` (`0x7fff_0000`).
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub const fn compile_seccomp_bpf(allowed: DomainMask, arch: SeccompArch) -> BpfProgram {
+    compile_seccomp_bpf_with(allowed, arch, PolicyPlant::None)
+}
+
+/// Compiles a Linux Classic-BPF seccomp filter enforcing `allowed` on `arch` with an explicit
+/// [`PolicyPlant`] for planted-bug oracle testing.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub const fn compile_seccomp_bpf_with(
+    allowed: DomainMask,
+    arch: SeccompArch,
+    plant: PolicyPlant,
+) -> BpfProgram {
+    let denied = denied_linux_syscalls_with(allowed, arch, plant);
+    let mut insns = [BpfInsn { code: 0, jt: 0, jf: 0, k: 0 }; MAX_BPF_INSNS];
+    let mut len = 0;
+
+    // 1. Validate `seccomp_data.arch` (offset 4); kill on architecture mismatch.
+    insns[len] = BpfInsn { code: BPF_LD_W_ABS, jt: 0, jf: 0, k: SECCOMP_DATA_ARCH_OFFSET };
+    len += 1;
+    insns[len] = BpfInsn { code: BPF_JMP_JEQ_K, jt: 1, jf: 0, k: audit_arch(arch) };
+    len += 1;
+    insns[len] = BpfInsn { code: BPF_RET_K, jt: 0, jf: 0, k: SECCOMP_RET_KILL_PROCESS };
+    len += 1;
+
+    // 2. Load `seccomp_data.nr` (offset 0).
+    insns[len] = BpfInsn { code: BPF_LD_W_ABS, jt: 0, jf: 0, k: SECCOMP_DATA_NR_OFFSET };
+    len += 1;
+
+    // 3. Reject every denied syscall number with `SECCOMP_RET_ERRNO | EPERM`.
+    let mut i = 0;
+    while i < denied.len && len + 2 < MAX_BPF_INSNS {
+        insns[len] = BpfInsn { code: BPF_JMP_JEQ_K, jt: 0, jf: 1, k: denied.nrs[i] };
+        len += 1;
+        insns[len] = BpfInsn {
+            code: BPF_RET_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ERRNO | SECCOMP_EPERM,
+        };
+        len += 1;
+        i += 1;
+    }
+
+    // 4. Default allow.
+    insns[len] = BpfInsn { code: BPF_RET_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW };
+    len += 1;
+
+    BpfProgram { insns, len }
+}
+
+/// Pure `#![no_std]` Classic-BPF VM evaluator for compiled seccomp programs.
+///
+/// Strictly bounded to at most `prog.len()` steps (rule 18); returns
+/// [`BpfVerdict::InvalidProgram`] on empty programs, out-of-bounds jumps, unsupported opcodes or
+/// load offsets, unknown return actions, or falling off the end without returning.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub const fn eval_seccomp_bpf(prog: &BpfProgram, arch_word: u32, nr: u32) -> BpfVerdict {
+    let len = prog.len;
+    if len == 0 || len > MAX_BPF_INSNS {
+        return BpfVerdict::InvalidProgram;
+    }
+
+    let mut pc: usize = 0;
+    let mut acc: u32 = 0;
+    let mut steps: usize = 0;
+
+    while steps < len {
+        if pc >= len {
+            return BpfVerdict::InvalidProgram;
+        }
+        let insn = prog.insns[pc];
+        steps += 1;
+
+        match insn.code {
+            BPF_LD_W_ABS => {
+                match insn.k {
+                    SECCOMP_DATA_NR_OFFSET => acc = nr,
+                    SECCOMP_DATA_ARCH_OFFSET => acc = arch_word,
+                    _ => return BpfVerdict::InvalidProgram,
+                }
+                pc += 1;
+            }
+            BPF_JMP_JA => {
+                let Some(base) = pc.checked_add(1) else {
+                    return BpfVerdict::InvalidProgram;
+                };
+                let Some(next) = base.checked_add(insn.k as usize) else {
+                    return BpfVerdict::InvalidProgram;
+                };
+                pc = next;
+            }
+            BPF_JMP_JEQ_K | BPF_JMP_JGT_K | BPF_JMP_JGE_K | BPF_JMP_JSET_K => {
+                let cond = match insn.code {
+                    BPF_JMP_JEQ_K => acc == insn.k,
+                    BPF_JMP_JGT_K => acc > insn.k,
+                    BPF_JMP_JGE_K => acc >= insn.k,
+                    BPF_JMP_JSET_K => (acc & insn.k) != 0,
+                    _ => false,
+                };
+                let skip = if cond { insn.jt as usize } else { insn.jf as usize };
+                let Some(base) = pc.checked_add(1) else {
+                    return BpfVerdict::InvalidProgram;
+                };
+                let Some(next) = base.checked_add(skip) else {
+                    return BpfVerdict::InvalidProgram;
+                };
+                pc = next;
+            }
+            BPF_RET_K => match insn.k & SECCOMP_RET_ACTION_FULL {
+                SECCOMP_RET_ALLOW => return BpfVerdict::Allow,
+                SECCOMP_RET_KILL_PROCESS => return BpfVerdict::KillProcess,
+                SECCOMP_RET_ERRNO => {
+                    return BpfVerdict::DenyErrno((insn.k & SECCOMP_RET_DATA) as u16);
+                }
+                _ => return BpfVerdict::InvalidProgram,
+            },
+            _ => return BpfVerdict::InvalidProgram,
+        }
+    }
+
+    BpfVerdict::InvalidProgram
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,6 +778,18 @@ mod tests {
 
         for arch in [SeccompArch::Aarch64, SeccompArch::X86_64] {
             let denied = denied_linux_syscalls_with(allowed, arch, plant);
+            let prog = compile_seccomp_bpf_with(allowed, arch, plant);
+            if prog.is_empty() {
+                return Err("compiled bpf program is empty");
+            }
+            let arch_word = audit_arch(arch);
+            let wrong_arch = match arch {
+                SeccompArch::Aarch64 => audit_arch(SeccompArch::X86_64),
+                SeccompArch::X86_64 => audit_arch(SeccompArch::Aarch64),
+            };
+            if eval_seccomp_bpf(&prog, wrong_arch, 0) != BpfVerdict::KillProcess {
+                return Err("compiled bpf failed to kill on wrong arch");
+            }
             for spec in LINUX_SYSCALL_TABLE {
                 let nr = spec.nr(arch);
                 let expect_allow = spec.domain.is_subset_of(allowed);
@@ -537,6 +799,14 @@ mod tests {
                 }
                 if denied.contains(nr) == expect_allow {
                     return Err("linux denied_linux_syscalls disagrees with DomainMask");
+                }
+                let expected_verdict = if expect_allow {
+                    BpfVerdict::Allow
+                } else {
+                    BpfVerdict::DenyErrno(1)
+                };
+                if eval_seccomp_bpf(&prog, arch_word, nr) != expected_verdict {
+                    return Err("compiled bpf verdict disagrees with DomainMask");
                 }
             }
         }
@@ -661,6 +931,146 @@ mod tests {
             let execve = linux_syscall_nr("execve", arch).expect("execve");
             assert!(is_linux_syscall_allowed_with(execve, fs_only, arch, PolicyPlant::LeakProcIntoFsOnly));
         }
+    }
+
+    #[test]
+    fn bpf_wrong_arch_always_kills_process() {
+        for arch in [SeccompArch::Aarch64, SeccompArch::X86_64] {
+            let other_arch = match arch {
+                SeccompArch::Aarch64 => audit_arch(SeccompArch::X86_64),
+                SeccompArch::X86_64 => audit_arch(SeccompArch::Aarch64),
+            };
+            let wrong_arches = [other_arch, 0, 0xDEAD_BEEF, 0xC000_0000, u32::MAX];
+            for allowed in [DomainMask::EMPTY, DomainMask::FS.union(DomainMask::CLOCK), DomainMask::ALL] {
+                let prog = compile_seccomp_bpf(allowed, arch);
+                assert!(!prog.is_empty());
+                for &bad_arch in &wrong_arches {
+                    for spec in LINUX_SYSCALL_TABLE {
+                        assert_eq!(
+                            eval_seccomp_bpf(&prog, bad_arch, spec.nr(arch)),
+                            BpfVerdict::KillProcess,
+                            "expected KillProcess for bad arch {bad_arch:#x} on {} ({arch:?})",
+                            spec.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bpf_enforces_domain_masks_across_entire_syscall_table() {
+        let policies = [
+            DomainMask::EMPTY,
+            DomainMask::FS.union(DomainMask::CLOCK),
+            DomainMask::TAIL_RESUMPTIVE,
+            DomainMask::NET,
+            DomainMask::PROC,
+            DomainMask::ALL,
+        ];
+        for arch in [SeccompArch::Aarch64, SeccompArch::X86_64] {
+            let arch_word = audit_arch(arch);
+            for allowed in policies {
+                let prog = compile_seccomp_bpf(allowed, arch);
+                let slice = prog.as_slice();
+                assert_eq!(slice.len(), prog.len());
+                assert!(!prog.is_empty());
+                assert_eq!(
+                    slice.last().copied(),
+                    Some(BpfInsn { code: BPF_RET_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW })
+                );
+
+                // Every jump inside the compiled program must stay strictly within bounds.
+                for (pc, insn) in slice.iter().enumerate() {
+                    if (insn.code & 0x07) == 0x05 {
+                        assert!(
+                            pc + 1 + usize::from(insn.jt.max(insn.jf)) < slice.len(),
+                            "jump at pc={pc} escapes program of len {}",
+                            slice.len()
+                        );
+                    }
+                }
+
+                for spec in LINUX_SYSCALL_TABLE {
+                    let nr = spec.nr(arch);
+                    let verdict = eval_seccomp_bpf(&prog, arch_word, nr);
+                    let expected = if spec.domain.is_subset_of(allowed) {
+                        BpfVerdict::Allow
+                    } else {
+                        BpfVerdict::DenyErrno(1)
+                    };
+                    assert_eq!(
+                        verdict, expected,
+                        "BPF verdict mismatch for {} (nr={nr}, arch={arch:?}, allowed={allowed})",
+                        spec.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bpf_planted_bug_controls_are_caught_by_evaluator() {
+        for arch in [SeccompArch::Aarch64, SeccompArch::X86_64] {
+            let arch_word = audit_arch(arch);
+
+            // Planted bug 1: LeakNetIntoPure must be caught on `socket`.
+            let socket_nr = linux_syscall_nr("socket", arch).expect("socket");
+            let honest_pure = compile_seccomp_bpf(DomainMask::EMPTY, arch);
+            let leaked_pure =
+                compile_seccomp_bpf_with(DomainMask::EMPTY, arch, PolicyPlant::LeakNetIntoPure);
+            assert_eq!(eval_seccomp_bpf(&honest_pure, arch_word, socket_nr), BpfVerdict::DenyErrno(1));
+            assert_eq!(eval_seccomp_bpf(&leaked_pure, arch_word, socket_nr), BpfVerdict::Allow);
+
+            // Planted bug 2: LeakProcIntoFsOnly must be caught on `execve`.
+            let fs_only = DomainMask::FS.union(DomainMask::CLOCK);
+            let execve_nr = linux_syscall_nr("execve", arch).expect("execve");
+            let honest_fs = compile_seccomp_bpf(fs_only, arch);
+            let leaked_fs =
+                compile_seccomp_bpf_with(fs_only, arch, PolicyPlant::LeakProcIntoFsOnly);
+            assert_eq!(eval_seccomp_bpf(&honest_fs, arch_word, execve_nr), BpfVerdict::DenyErrno(1));
+            assert_eq!(eval_seccomp_bpf(&leaked_fs, arch_word, execve_nr), BpfVerdict::Allow);
+        }
+    }
+
+    #[test]
+    fn bpf_evaluator_rejects_invalid_programs() {
+        let zero = BpfInsn::default();
+
+        // Empty program.
+        let empty = BpfProgram { insns: [zero; MAX_BPF_INSNS], len: 0 };
+        assert!(empty.is_empty());
+        assert_eq!(eval_seccomp_bpf(&empty, AUDIT_ARCH_AARCH64, 0), BpfVerdict::InvalidProgram);
+
+        // Out-of-bounds jump.
+        let mut oob_insns = [zero; MAX_BPF_INSNS];
+        oob_insns[0] = BpfInsn { code: BPF_JMP_JEQ_K, jt: 10, jf: 10, k: 0 };
+        let oob = BpfProgram { insns: oob_insns, len: 1 };
+        assert_eq!(eval_seccomp_bpf(&oob, AUDIT_ARCH_AARCH64, 0), BpfVerdict::InvalidProgram);
+
+        // Unknown opcode.
+        let mut bad_op_insns = [zero; MAX_BPF_INSNS];
+        bad_op_insns[0] = BpfInsn { code: 0xFFFF, jt: 0, jf: 0, k: 0 };
+        let bad_op = BpfProgram { insns: bad_op_insns, len: 1 };
+        assert_eq!(eval_seccomp_bpf(&bad_op, AUDIT_ARCH_AARCH64, 0), BpfVerdict::InvalidProgram);
+
+        // Unsupported `seccomp_data` load offset.
+        let mut bad_off_insns = [zero; MAX_BPF_INSNS];
+        bad_off_insns[0] = BpfInsn { code: BPF_LD_W_ABS, jt: 0, jf: 0, k: 64 };
+        let bad_off = BpfProgram { insns: bad_off_insns, len: 1 };
+        assert_eq!(eval_seccomp_bpf(&bad_off, AUDIT_ARCH_AARCH64, 0), BpfVerdict::InvalidProgram);
+
+        // Program falling off the end with no `BPF_RET_K`.
+        let mut no_ret_insns = [zero; MAX_BPF_INSNS];
+        no_ret_insns[0] = BpfInsn { code: BPF_LD_W_ABS, jt: 0, jf: 0, k: SECCOMP_DATA_NR_OFFSET };
+        let no_ret = BpfProgram { insns: no_ret_insns, len: 1 };
+        assert_eq!(eval_seccomp_bpf(&no_ret, AUDIT_ARCH_AARCH64, 0), BpfVerdict::InvalidProgram);
+
+        // Unknown `SECCOMP_RET_*` action.
+        let mut bad_ret_insns = [zero; MAX_BPF_INSNS];
+        bad_ret_insns[0] = BpfInsn { code: BPF_RET_K, jt: 0, jf: 0, k: 0x1234_0000 };
+        let bad_ret = BpfProgram { insns: bad_ret_insns, len: 1 };
+        assert_eq!(eval_seccomp_bpf(&bad_ret, AUDIT_ARCH_AARCH64, 0), BpfVerdict::InvalidProgram);
     }
 
     #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "x86_64")))]

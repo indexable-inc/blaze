@@ -4,13 +4,15 @@
 //! in-process inside `blaze-shell` (zero `fork`/`exec`, thread-safe captured stdout/stderr,
 //! explicit `cwd`, and Git CLI compatibility via [`try_run_git_via_bgit`]).
 
-#![feature(default_field_values)]
+#![feature(default_field_values, register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
 #![forbid(unsafe_code)]
 
 mod cli;
 mod disk;
 mod fsmonitor;
 mod index_io;
+pub mod machine;
 mod net_driver;
 mod porcelain;
 mod remote_transport;
