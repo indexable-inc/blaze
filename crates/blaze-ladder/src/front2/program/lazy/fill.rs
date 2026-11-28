@@ -949,6 +949,18 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                 self.make_want(want, checker_of(lib), "closure_rows (Fn/FnMut/FnOnce trait members)")?;
             }
         }
+        for &sig_from in checked.closures.column::<4>() {
+            if let tc::SigFrom::Supertrait { trait_, output, .. } = sig_from {
+                for tr in core::iter::once(trait_).chain(output.map(|(t, _)| t)) {
+                    if let Some(lib) = self.front.keys.library_in(self.front.names, tr) {
+                        let want = Want::Members(lib);
+                        if !self.store.made(want) {
+                            self.make_want(want, checker_of(lib), "closure_rows (supertrait closure sig)")?;
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

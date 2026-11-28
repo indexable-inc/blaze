@@ -88,6 +88,33 @@ fn sig_from_causes(inputs: Cause, output: Option<Cause>) -> SigFrom {
     }
 }
 
+/// A `Fn*` supertrait found during closure-hint elaboration, with its declaring trait and
+/// occurrence index among `Self`-bounded clauses for that `Fn*` trait (for resolving its `nth`
+/// clause column in `Predicates(owner)` / `HeadRegions::clauses(owner)`).
+#[derive(Clone, Copy)]
+struct SupertraitFn {
+    inputs: TyList,
+    kind: ClosureKind,
+    owner: ItemKey,
+    fn_trait: ItemKey,
+    occ: u32,
+}
+
+/// An `<Self as FnOnce<Args>>::Output = term` projection found during supertrait elaboration.
+#[derive(Clone, Copy)]
+struct SupertraitOut {
+    ty: Ty,
+    owner: ItemKey,
+    occ: u32,
+}
+
+/// Which `Self`-bounded clause of a trait's `Predicates` to locate by occurrence index.
+#[derive(Clone, Copy)]
+enum TraitClauseTarget {
+    Trait { super_trait: ItemKey, occ: u32 },
+    Projection { proj_trait: ItemKey, name: Name, occ: u32 },
+}
+
 /// An expected closure signature: the inputs, the output if known, where it came from, and
 /// any callable kind hinted by an enclosing trait bound.
 #[derive(Clone, Copy)]
@@ -127,12 +154,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 else {
                     return Ok(None);
                 };
-                Ok(self.object_closure_sig(t, rows, [fn_, fn_mut, fn_once], fn_once)?.map(|(inputs, output, kind)| Expected {
-                    inputs,
-                    output,
-                    from: SigFrom::Object,
-                    kind,
-                }))
+                self.object_closure_sig(t, rows, [fn_, fn_mut, fn_once], fn_once)
             }
             _ => Ok(None),
         }
@@ -188,7 +210,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 };
                 Ok(Some(Expected {
                     inputs,
-                    output: elab_out,
+                    output: elab_out.map(|o| o.ty),
                     from: sig_from_causes(ic, None),
                     kind: Some(kind),
                 }))
@@ -199,24 +221,90 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     return Ok(None);
                 }
                 let (found_fn, elab_out) = self.elaborate_fn_supertraits(&seeds, fn_traits, output, None)?;
-                let Some((inputs, kind)) = found_fn else {
+                let Some(sfn) = found_fn else {
                     return Ok(None);
                 };
-                let out = match elab_out {
-                    Some(o) => Some(o),
-                    None => self.matching_proj_output(&direct_projs, inputs)?,
+                let (out, out_prov) = match elab_out {
+                    Some(o) => (Some(o.ty), Some(o)),
+                    None => (self.matching_proj_output(&direct_projs, sfn.inputs)?, None),
                 };
-                // No single `Fn*` clause of the callee's head carries this signature directly;
-                // flow lowering treats `SigFrom::Inferred` inputs universally without indexing
-                // into a non-`Fn*` clause's region column.
+                let from = self.supertrait_sig_from(sfn, out_prov, fn_traits[2], output, SigFrom::Inferred)?;
                 Ok(Some(Expected {
-                    inputs,
+                    inputs: sfn.inputs,
                     output: out,
-                    from: SigFrom::Inferred,
-                    kind: Some(kind),
+                    from,
+                    kind: Some(sfn.kind),
                 }))
             }
         }
+    }
+
+    /// Resolves `SigFrom::Supertrait` provenance (the declaring trait's clause indices in
+    /// `Predicates(owner)` / `HeadRegions::clauses(owner)`) so flow lowering preserves higher-ranked
+    /// `for<'a>` lifetimes from supertrait bounds (e.g. `trait ForAll: for<'a> Fn(&'a T) -> &'a T`).
+    /// Falls back to `fallback` when the trait's predicates do not list the clause (e.g. synthetic
+    /// unit-test fixtures).
+    fn supertrait_sig_from(
+        &mut self,
+        sfn: SupertraitFn,
+        out_prov: Option<SupertraitOut>,
+        once_trait: ItemKey,
+        output_name: Name,
+        fallback: SigFrom,
+    ) -> Result<SigFrom, Stop> {
+        let Some(nth) = self.trait_clause_nth(
+            sfn.owner,
+            TraitClauseTarget::Trait { super_trait: sfn.fn_trait, occ: sfn.occ },
+        )? else {
+            return Ok(fallback);
+        };
+        let output = match out_prov {
+            Some(o) => self
+                .trait_clause_nth(
+                    o.owner,
+                    TraitClauseTarget::Projection { proj_trait: once_trait, name: output_name, occ: o.occ },
+                )?
+                .map(|on| (o.owner, on)),
+            None => None,
+        };
+        Ok(SigFrom::Supertrait { trait_: sfn.owner, nth, output })
+    }
+
+    /// Maps the `occ`-th `Self`-bounded (`Param(0)`) supertrait clause matching `target` to its
+    /// index `nth` in `Predicates(owner)` (which matches `HeadRegions::clauses(owner)`).
+    fn trait_clause_nth(&mut self, owner: ItemKey, target: TraitClauseTarget) -> Result<Option<u32>, Stop> {
+        let preds = self.reads.predicates(owner)?;
+        let mut seen = 0u32;
+        for (nth, &clause) in preds.clauses.iter().enumerate() {
+            let matches = match (target, clause) {
+                (TraitClauseTarget::Trait { super_trait, .. }, PClause::Trait { trait_, args })
+                    if trait_ == super_trait =>
+                {
+                    preds.types.list(args)?.first().copied().is_some_and(|first| {
+                        matches!(preds.types.node(first), Ok(PNode::Param(0)))
+                    })
+                }
+                (TraitClauseTarget::Projection { proj_trait, name, .. }, PClause::Projection { trait_, args, name: n, .. })
+                    if trait_ == proj_trait && n == name =>
+                {
+                    preds.types.list(args)?.first().copied().is_some_and(|first| {
+                        matches!(preds.types.node(first), Ok(PNode::Param(0)))
+                    })
+                }
+                _ => false,
+            };
+            if !matches {
+                continue;
+            }
+            let want_occ = match target {
+                TraitClauseTarget::Trait { occ, .. } | TraitClauseTarget::Projection { occ, .. } => occ,
+            };
+            if seen == want_occ {
+                return Ok(u32::try_from(nth).ok());
+            }
+            seen = seen.saturating_add(1);
+        }
+        Ok(None)
     }
 
     /// Pending non-`Fn*`, non-`Sized` trait obligations whose self type resolves to `var`, plus
@@ -262,9 +350,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// Transitive BFS elaboration of supertrait bounds on `Self` (`Param(0)`) starting from
-    /// `seeds` (`(trait_, full_args_with_self)`), bounded and cycle-guarded. Substitutes generic
-    /// arguments through each hop and collects both `Fn*<(inputs..)>` trait bounds and
-    /// `<Self as Once<(inputs..)>>::Output = term` projection bounds.
+    /// `seeds` (`(trait_, full_args_with_self)`), bounded (`Limit::Supertraits`) and cycle-guarded.
+    /// Substitutes generic arguments through each hop and collects both `Fn*<(inputs..)>` trait
+    /// bounds and `<Self as Once<(inputs..)>>::Output = term` projection bounds.
     ///
     /// When `want_inputs` is `Some(inputs)`, skips recording new `Fn*` input tuples and only
     /// searches for an `Output` projection whose `Args` can unify with `inputs`.
@@ -274,7 +362,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         fn_traits: [ItemKey; 3],
         output_name: Name,
         want_inputs: Option<TyList>,
-    ) -> Result<(Option<(TyList, ClosureKind)>, Option<Ty>), Stop> {
+    ) -> Result<(Option<SupertraitFn>, Option<SupertraitOut>), Stop> {
         const MAX_SUPERTRAITS: usize = 64;
         let sized = self.lang(LangItem::Sized)?;
         let once_trait = fn_traits[2];
@@ -283,15 +371,16 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             if sized == Some(tr) || fn_traits.contains(&tr) {
                 continue;
             }
+            if work.iter().any(|&(t, a)| t == tr && a == args) {
+                continue;
+            }
             if work.len() >= MAX_SUPERTRAITS {
-                break;
+                return Err(CheckError::Limit(Limit::Supertraits).into());
             }
-            if !work.iter().any(|&(t, a)| t == tr && a == args) {
-                work.push((tr, args));
-            }
+            work.push((tr, args));
         }
-        let mut found_fn: Option<(TyList, ClosureKind)> = None;
-        let mut projs: Vec<(TyList, Ty), Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut found_fn: Option<SupertraitFn> = None;
+        let mut projs: Vec<(TyList, SupertraitOut), Alloc<'a>> = Vec::new_in(self.alloc);
         let mut at = 0;
         while let Some(&(cur_trait, cur_args)) = work.get(at) {
             at += 1;
@@ -299,6 +388,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             if def.supertraits.is_empty() || self.ty.list_len(cur_args) < def.generics {
                 continue;
             }
+            let mut fn_occs = [0u32; 3];
+            let mut proj_occ = 0u32;
             for &clause in def.supertraits {
                 match clause {
                     PClause::Trait { trait_: st, args: sa } => {
@@ -308,6 +399,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                             continue;
                         }
                         if let Some(ti) = fn_traits.iter().position(|&k| k == st) {
+                            let occ = fn_occs.get(ti).copied().unwrap_or(0);
+                            if let Some(slot) = fn_occs.get_mut(ti) {
+                                *slot = slot.saturating_add(1);
+                            }
                             if let &[_, arg_pt] = raw
                                 && want_inputs.is_none()
                             {
@@ -319,10 +414,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                                         1 => ClosureKind::FnMut,
                                         _ => ClosureKind::FnOnce,
                                     };
+                                    let cand = SupertraitFn { inputs, kind, owner: cur_trait, fn_trait: st, occ };
                                     match found_fn {
-                                        None => found_fn = Some((inputs, kind)),
-                                        Some((prev_in, prev_kind)) if prev_in == inputs && kind < prev_kind => {
-                                            found_fn = Some((prev_in, kind));
+                                        None => found_fn = Some(cand),
+                                        Some(prev) if prev.inputs == inputs && kind < prev.kind => {
+                                            found_fn = Some(cand);
                                         }
                                         _ => {}
                                     }
@@ -330,7 +426,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                             }
                             continue;
                         }
-                        if sized == Some(st) || work.len() >= MAX_SUPERTRAITS {
+                        if sized == Some(st) {
                             continue;
                         }
                         let mut lowered: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(raw.len(), self.alloc);
@@ -339,6 +435,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         }
                         let next_args = self.mk_list(&lowered)?;
                         if !work.iter().any(|&(t, a)| t == st && a == next_args) {
+                            if work.len() >= MAX_SUPERTRAITS {
+                                return Err(CheckError::Limit(Limit::Supertraits).into());
+                            }
                             work.push((st, next_args));
                         }
                     }
@@ -346,15 +445,18 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         if pt == once_trait && name == output_name =>
                     {
                         let raw = def.types.list(pa)?;
-                        let &[first, arg_pt] = raw else { continue };
+                        let Some(&first) = raw.first() else { continue };
                         if def.types.node(first)? != PNode::Param(0) {
                             continue;
                         }
+                        let occ = proj_occ;
+                        proj_occ = proj_occ.saturating_add(1);
+                        let &[_, arg_pt] = raw else { continue };
                         let arg_ty = self.lower(def.types, arg_pt, Lower::NormalizedArgs(cur_args), Cause::Body)?;
                         let arg_ty = self.ty.shallow_resolve(arg_ty);
                         if let TyView::Tuple(proj_inputs) = self.view(arg_ty) {
                             let out_ty = self.lower(def.types, term, Lower::NormalizedArgs(cur_args), Cause::Body)?;
-                            projs.push((proj_inputs, out_ty));
+                            projs.push((proj_inputs, SupertraitOut { ty: out_ty, owner: cur_trait, occ }));
                         }
                     }
                     _ => {}
@@ -363,12 +465,17 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         let target_inputs = match want_inputs {
             Some(i) => Some(i),
-            None => found_fn.map(|(i, _)| i),
+            None => found_fn.map(|s| s.inputs),
         };
-        let out = match target_inputs {
-            Some(inputs) => self.matching_proj_output(&projs, inputs)?,
-            None => None,
-        };
+        let mut out: Option<SupertraitOut> = None;
+        if let Some(inputs) = target_inputs {
+            for &(proj_in, proj_out) in projs.iter() {
+                if self.args_can_eq(proj_in, inputs)? {
+                    out = Some(proj_out);
+                    break;
+                }
+            }
+        }
         Ok((found_fn, out))
     }
 
@@ -421,7 +528,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         rows: TyList,
         fn_traits: [ItemKey; 3],
         fn_once: ItemKey,
-    ) -> Result<Option<(TyList, Option<Ty>, Option<ClosureKind>)>, Stop> {
+    ) -> Result<Option<Expected>, Stop> {
         let output_name = Name::of("Output");
         let mut from_principal: Option<(TyList, ClosureKind)> = None;
         let mut other_principal: Option<(ItemKey, TyList)> = None;
@@ -463,22 +570,26 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 Some((proj_in, proj_out)) if self.args_can_eq(proj_in, inputs)? => Some(proj_out),
                 _ => None,
             };
-            return Ok(Some((inputs, out, Some(kind))));
+            return Ok(Some(Expected { inputs, output: out, from: SigFrom::Object, kind: Some(kind) }));
         }
         if let Some((principal, args_after_self)) = other_principal {
             let self_list = self.mk_list(&[dyn_ty])?;
             let full_args = self.concat(self_list, args_after_self)?;
             let (found_fn, elab_out) = self.elaborate_fn_supertraits(&[(principal, full_args)], fn_traits, output_name, None)?;
-            if let Some((inputs, kind)) = found_fn {
-                let out = match from_proj {
-                    Some((proj_in, proj_out)) if self.args_can_eq(proj_in, inputs)? => Some(proj_out),
-                    _ => elab_out,
+            if let Some(sfn) = found_fn {
+                let (out, out_prov) = match elab_out {
+                    Some(o) => (Some(o.ty), Some(o)),
+                    None => match from_proj {
+                        Some((proj_in, proj_out)) if self.args_can_eq(proj_in, sfn.inputs)? => (Some(proj_out), None),
+                        _ => (None, None),
+                    },
                 };
-                return Ok(Some((inputs, out, Some(kind))));
+                let from = self.supertrait_sig_from(sfn, out_prov, fn_once, output_name, SigFrom::Object)?;
+                return Ok(Some(Expected { inputs: sfn.inputs, output: out, from, kind: Some(sfn.kind) }));
             }
         }
         if let Some((inputs, out)) = from_proj {
-            return Ok(Some((inputs, Some(out), None)));
+            return Ok(Some(Expected { inputs, output: Some(out), from: SigFrom::Object, kind: None }));
         }
         Ok(None)
     }
@@ -511,6 +622,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     output: None,
                     from: match x.from {
                         SigFrom::Clause { expr, nth, .. } => SigFrom::Clause { expr, nth, output: None },
+                        SigFrom::Supertrait { trait_, nth, .. } => SigFrom::Supertrait { trait_, nth, output: None },
                         other => other,
                     },
                     ..x

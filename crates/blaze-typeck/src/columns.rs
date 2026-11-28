@@ -117,6 +117,11 @@ pub enum SigFrom {
     /// clause `output`'s term (the `FnOnce::Output` projection of the same use) when one was
     /// pending, else the body's own.
     Clause { expr: ExprId, nth: u32, output: Option<u32> },
+    /// A `Fn*` supertrait elaborated from a pending trait bound (or `dyn SubTrait`): `trait_`
+    /// declares the `Fn*` clause at index `nth` in `Predicates(trait_)` /
+    /// `HeadRegions::clauses(trait_)`, and `output` names the trait and clause index of the
+    /// matching `<Self as FnOnce<..>>::Output` projection when it came from a supertrait.
+    Supertrait { trait_: ItemKey, nth: u32, output: Option<(ItemKey, u32)> },
     /// Every parameter's type and the return type written on the closure, no expectation used.
     Written,
     /// No expectation (or one the body itself made, not a declared clause): every region is the

@@ -812,6 +812,37 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 };
                 (Some((in_s, in_d, None)), outs)
             }
+            SigFrom::Supertrait { trait_, nth, output } => {
+                let clauses = match facts.regions().clauses(trait_) {
+                    Ok(c) => c,
+                    Err(u) => return self.refuse(Form::RegionsUnread { item: u.item, why: u.why }, e),
+                };
+                let part = |cs: &[blaze_typeck::region_facts::ClauseView<'b>], n: u32, child: u32| {
+                    let c = cs.iter().find(|c| c.nth == n)?;
+                    let slots = c.col.child(child)?;
+                    let declared = blaze_borrow::RegionTypes::kids(&heads, c.col.ty()).ok().and_then(|k| k.get(child));
+                    Some((slots, declared))
+                };
+                let Some((in_s, in_d)) = part(clauses, nth, 1) else { return self.refuse(Form::ClosureClauseUnread { nth }, e) };
+                let outs = match output {
+                    Some((out_trait, o)) => {
+                        let out_clauses = if out_trait == trait_ {
+                            clauses
+                        } else {
+                            match facts.regions().clauses(out_trait) {
+                                Ok(c) => c,
+                                Err(u) => return self.refuse(Form::RegionsUnread { item: u.item, why: u.why }, e),
+                            }
+                        };
+                        match part(out_clauses, o, 2) {
+                            Some(s) => Some(s),
+                            None => return self.refuse(Form::ClosureClauseUnread { nth: o }, e),
+                        }
+                    }
+                    None => None,
+                };
+                (Some((in_s, in_d, None)), outs)
+            }
             SigFrom::FnPtr => {
                 if let Some((in_s, decl_ins, out_s, decl_out, binder)) =
                     ck.closures.column::<0>().get(row).copied().and_then(|ce| self.fn_ptr_expectation(ce, inputs.len(), &heads, e))

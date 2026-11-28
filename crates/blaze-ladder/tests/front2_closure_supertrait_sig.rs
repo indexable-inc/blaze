@@ -82,6 +82,35 @@ fn wrong_arity_err() {
     take_impl_sub(|_, _| Box::new(Concrete(0)));
 }
 
+trait ForAll: for<'a> Fn(&'a i32) -> &'a i32 {}
+impl<F: for<'a> Fn(&'a i32) -> &'a i32> ForAll for F {}
+
+trait OuterForAll: ForAll {}
+impl<F: ForAll> OuterForAll for F {}
+
+fn take_for_all(_f: impl ForAll) {}
+fn take_outer_for_all(_f: impl OuterForAll) {}
+fn take_dyn_for_all(_f: Box<dyn ForAll>) {}
+
+fn hrtb_supertrait_ok() {
+    take_for_all(|x| x);
+}
+
+fn hrtb_multihop_supertrait_ok() {
+    take_outer_for_all(|x| x);
+}
+
+fn hrtb_dyn_supertrait_ok() {
+    take_dyn_for_all(Box::new(|x| x));
+}
+
+fn hrtb_supertrait_local_ref_err() {
+    take_for_all(|_x| {
+        let y = 1;
+        &y
+    });
+}
+
 fn main() {}
 "#;
 
@@ -121,7 +150,15 @@ fn closure_signatures_elaborate_supertraits_end_to_end() {
     };
 
     // Positives: both typeck and borrowck must be clean (no gaps, no refusals, no diagnostics).
-    for name in ["readiness_ok", "box_check_ok", "multihop_generic_ok", "dyn_subtrait_ok"] {
+    for name in [
+        "readiness_ok",
+        "box_check_ok",
+        "multihop_generic_ok",
+        "dyn_subtrait_ok",
+        "hrtb_supertrait_ok",
+        "hrtb_multihop_supertrait_ok",
+        "hrtb_dyn_supertrait_ok",
+    ] {
         let b = find(name);
         let (types, borrows) = world.check_borrows(b, alloc);
         assert!(
@@ -133,6 +170,18 @@ fn closure_signatures_elaborate_supertraits_end_to_end() {
             "POSITIVE `{name}` borrowck failed: {borrows:?}"
         );
     }
+
+    // Negative borrowck: returning a reference to a local under `for<'a> Fn(&'a i32) -> &'a i32`
+    // supertrait passes typeck and MUST fail borrowck (no refusal, at least one borrow finding).
+    let (hrtb_bad_ty, hrtb_bad_br) = world.check_borrows(find("hrtb_supertrait_local_ref_err"), alloc);
+    assert!(
+        hrtb_bad_ty.is_clean() && hrtb_bad_ty.gaps.is_empty() && hrtb_bad_ty.refused.is_none(),
+        "NEGATIVE `hrtb_supertrait_local_ref_err` typeck failed: {hrtb_bad_ty:?}"
+    );
+    assert!(
+        hrtb_bad_br.refused.is_none() && !hrtb_bad_br.findings.is_empty(),
+        "NEGATIVE `hrtb_supertrait_local_ref_err`: expected borrow finding, got {hrtb_bad_br:?}"
+    );
 
     // Negative 1a: wrong future output inside async block fails with E0271 (`Future::Output == bool`).
     let bad_ret = world.check(find("readiness_wrong_return"), alloc);

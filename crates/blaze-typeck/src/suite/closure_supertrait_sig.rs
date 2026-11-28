@@ -16,11 +16,14 @@ use super::check_body;
 use crate::body::IntSuffix;
 use crate::columns::Checked;
 use crate::diag::DiagCode;
+use crate::error::{CheckError, Limit};
 use crate::fixture::{Bb, Fx};
 use crate::ids::{Abi, FnPtrHeader, ItemKey, LangItem, Mutbl, Safety, UintTy};
-use crate::infer::InferPlant;
+use crate::infer::{InferCtx, InferPlant};
 use crate::machine::Plant;
 use crate::portable::PNode;
+use crate::world::Needs;
+use crate::{Outcome, check_with};
 
 struct World {
     readiness_ok: ItemKey,
@@ -323,4 +326,67 @@ fn cyclic_supertraits_terminate_cleanly() {
     let c = check_body(&fx, &b, w.cyclic_ok, root, Plant::None, InferPlant::None);
     // Unannotated param `x` has no `Fn` supertrait in the cycle, so E0282 is expected, never a hang.
     assert!(!codes(&c).is_empty(), "expected E0282 for unannotated closure param with no Fn supertrait");
+}
+
+/// A supertrait chain exceeding `MAX_SUPERTRAITS` (64) returns `CheckError::Limit(Limit::Supertraits)`
+/// rather than silently dropping callable bounds.
+#[test]
+fn supertrait_overflow_returns_limit_supertraits() {
+    let mut world = Fx::new();
+    let fx = &mut world;
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let (p0, p1) = (fx.param(0), fx.param(1));
+    let rust_call = FnPtrHeader { abi: Abi::RustCall, safety: Safety::Safe, c_variadic: false };
+
+    let fn_once = fx.tr("FnOnce", 2, Vec::new(), &["Output"]);
+    fx.lang(LangItem::FnOnce, fn_once);
+    let out = fx.alias(fn_once, "Output", &[p0, p1]);
+    let call_once = fx.trait_fn(fn_once, "call_once", true, &[p0, p1], out);
+    fx.set_header(call_once, rust_call);
+    let sup = fx.bound(fn_once, &[p0, p1]);
+    let fn_mut = fx.tr("FnMut", 2, std::vec![sup], &[]);
+    fx.lang(LangItem::FnMut, fn_mut);
+    let sup = fx.bound(fn_mut, &[p0, p1]);
+    let fn_ = fx.tr("Fn", 2, std::vec![sup], &[]);
+    fx.lang(LangItem::Fn, fn_);
+
+    let (u32_, unit) = (fx.ty(PNode::Uint(UintTy::U32)), fx.unit());
+    let empty_tup = fx.tuple(&[]);
+    let fn_bound = fx.bound(fn_, &[p0, empty_tup]);
+    let fn_out = fx.proj(fn_once, &[p0, empty_tup], "Output", u32_);
+    // Build a chain of 66 traits: T65 -> T64 -> ... -> T0 -> Fn() -> u32.
+    let mut prev = fx.tr("Chain0", 1, std::vec![fn_bound, fn_out], &[]);
+    for i in 1..66u32 {
+        let name = std::format!("Chain{i}");
+        let b = fx.bound(prev, &[p0]);
+        prev = fx.tr(&name, 1, std::vec![b], &[]);
+    }
+    let top_bound = fx.bound(prev, &[p0]);
+    fx.func("take_deep", 1, &[p0], unit, std::vec![top_bound]);
+    let caller = fx.func("caller", 0, &[], unit, Vec::new());
+    fx.finish();
+
+    let mut b = Bb::new();
+    let val = b.int(Some(IntSuffix::Uint(UintTy::U32)));
+    let cl = b.closure(&[], val);
+    let take = b.path(&["take_deep"]);
+    let call = b.call(take, &[cl]);
+    let root = b.block(&[], Some(call));
+
+    let mut ty = InferCtx::new_in(blaze_own::Alloc::global());
+    let res = check_with(
+        &b.view(caller, root),
+        &world,
+        &mut ty,
+        &Needs::new_in(blaze_own::Alloc::global()),
+        Plant::None,
+        blaze_own::Alloc::global(),
+    );
+    match res {
+        Err(CheckError::Limit(Limit::Supertraits)) => {}
+        Err(other) => panic!("expected CheckError::Limit(Limit::Supertraits), got Err({other:?})"),
+        Ok(Outcome::Done(_)) => panic!("expected CheckError::Limit(Limit::Supertraits), got Ok(Done)"),
+        Ok(Outcome::Need(n)) => panic!("expected CheckError::Limit(Limit::Supertraits), got Ok(Need({:?}))", n.questions),
+    }
 }

@@ -597,6 +597,18 @@ pub fn classify_closure_env_use<'a>(
             }
             ClosureEnvUse::FnOnceOnly
         }
+        tc::SigFrom::Supertrait { trait_, nth, .. } => {
+            let Some(preds) = store.preds.get(&trait_) else {
+                return ClosureEnvUse::Unknown;
+            };
+            let Ok(idx) = usize::try_from(nth) else {
+                return ClosureEnvUse::Unknown;
+            };
+            match preds.clauses.get(idx) {
+                Some(&tc::PClause::Trait { trait_: st, .. }) if is_fn_or_mut(st) => ClosureEnvUse::FnOrFnMut,
+                _ => ClosureEnvUse::Unknown,
+            }
+        }
         tc::SigFrom::Object => {
             let mut cur = closure;
             let mut behind_ref = false;
