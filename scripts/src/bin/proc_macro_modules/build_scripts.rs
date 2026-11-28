@@ -77,37 +77,86 @@ impl Input for Wrapped {
     }
 }
 
-/// The host the native mode builds for; the only one with a pinned clang and a sysroot today
-/// (pins/clang.json: Linux's sysroot is not pinned).
-const HOST: &str = "aarch64-apple-darwin";
+/// The host triple the native mode builds for: matches the running host OS and architecture so
+/// produced `script.bin` records match `blaze-proc-macro::native_unit::native_outputs`'s host
+/// lookup on both macOS and Linux.
+const HOST: &str = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    "aarch64-apple-darwin"
+} else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+    "x86_64-apple-darwin"
+} else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+    "aarch64-unknown-linux-gnu"
+} else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    "x86_64-unknown-linux-gnu"
+} else {
+    ""
+};
+
+/// Cargo's target-specific linker environment variable name for `triple`
+/// (e.g. `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER`).
+fn cargo_target_linker_env(triple: &str) -> String {
+    format!("CARGO_TARGET_{}_LINKER", triple.to_ascii_uppercase().replace('-', "_"))
+}
 
 /// `native`: the scripts are built as host binaries (no process shim: they really start the
-/// pinned clang), linked by the shelf's clang (`bin/clang`, whose `bin/clang.cfg` says
-/// `-fuse-ld=lld`: the release's `ld64.lld`) against the SDK; the machine's `cc` and `ld` are
-/// never asked.
+/// pinned clang), linked by the shelf's clang (`bin/clang`, with `lld` / `ld64.lld` / `ld.lld`)
+/// against the macOS SDK or Linux host sysroot; the machine's `cc` and `ld` are never asked.
 struct Native {
     /// `<home>/.blaze/v2/toolchain/clang/<sha256>`: the unpacked pin.
     clang: PathBuf,
-    /// The macOS SDK folder, resolved once by the caller (`xcrun --show-sdk-path`).
+    /// The macOS SDK folder (`xcrun --show-sdk-path`) or Linux host sysroot (`/usr` or NixOS `<glibc-dev>`).
     sdk: PathBuf,
+    /// Optional split Linux libc runtime library directory (e.g. NixOS `<glibc>/lib`).
+    lib_dir: Option<PathBuf>,
+    /// Optional resolved Linux ELF dynamic linker path (e.g. NixOS `<glibc>/lib/ld-linux-*.so.*`).
+    dynamic_linker: Option<PathBuf>,
+    /// Optional extra Linux runtime library search directories (`-rpath`).
+    rpaths: Vec<PathBuf>,
 }
 
 impl Input for Native {
-    const FIELDS: &'static [&'static str] = &["clang", "sdk"];
+    const FIELDS: &'static [&'static str] = &["clang", "sdk", "lib_dir", "dynamic_linker", "rpaths"];
 
     fn parse(f: &Fields<'_>) -> Result<Native, InputError> {
-        Ok(Native { clang: PathBuf::from(f.str("clang", None)?), sdk: PathBuf::from(f.str("sdk", None)?) })
+        let lib_dir = match f.get("lib_dir") {
+            None => None,
+            Some(_) => Some(PathBuf::from(f.str("lib_dir", None)?)),
+        };
+        let dynamic_linker = match f.get("dynamic_linker") {
+            None => None,
+            Some(_) => Some(PathBuf::from(f.str("dynamic_linker", None)?)),
+        };
+        let rpaths = match f.get("rpaths") {
+            None => Vec::new(),
+            Some(_) => f.strs("rpaths")?.into_iter().map(PathBuf::from).collect(),
+        };
+        Ok(Native {
+            clang: PathBuf::from(f.str("clang", None)?),
+            sdk: PathBuf::from(f.str("sdk", None)?),
+            lib_dir,
+            dynamic_linker,
+            rpaths,
+        })
     }
 }
 
 impl Native {
     /// The identity's lines: the target, the compiler by its shelf digest (the folder's name),
-    /// the SDK by its settings file's digest; no machine path.
+    /// the SDK/sysroot by its marker/settings digest; no machine path.
     fn identity(&self) -> Result<String, Failure> {
+        if HOST.is_empty() {
+            return Err(Failure::NoSandbox { why: "unsupported host platform for native build scripts".to_owned() });
+        }
         let digest = self.clang.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
-        let settings = self.sdk.join("SDKSettings.json");
-        let settings = std::fs::read(&settings).map_err(io(&settings))?;
-        Ok(format!("target {HOST}\nlinker clang {digest}\nsdk settings {}\n", sha256(&settings)))
+        if cfg!(target_os = "macos") {
+            let settings = self.sdk.join("SDKSettings.json");
+            let settings = std::fs::read(&settings).map_err(io(&settings))?;
+            Ok(format!("target {HOST}\nlinker clang {digest}\nsdk settings {}\n", sha256(&settings)))
+        } else {
+            let marker = self.sdk.join(blaze_build_script::toolchain::LINUX_HOST_SYSROOT_MARKER);
+            let marker_bytes = std::fs::read(&marker).map_err(io(&marker))?;
+            Ok(format!("target {HOST}\nlinker clang {digest}\nsdk features {}\n", sha256(&marker_bytes)))
+        }
     }
 }
 
@@ -533,28 +582,34 @@ impl Plan<'_> {
                 for dir in [&target, &cargo_home, &tmp] {
                     std::fs::create_dir_all(dir).map_err(io(dir))?;
                 }
-                let own_source = match origin {
-                    Origin::Path { dir, .. } | Origin::Git { dir, .. } => Some(dir.as_path()),
-                    Origin::Registry { .. } => None,
-                };
-                let vendor = self.work.join("vendor");
-                let mut reads: Vec<&Path> = vec![vendor.as_path(), self.tool.sysroot.as_path(), native.clang.as_path(), native.sdk.as_path()];
-                reads.extend(own_source);
-                // The interim builder's own start-up config: the LibreSSL cargo links reads it
-                // when it starts and stops if refused. One file, read-only, no secret in it; the
-                // scripts cargo starts inherit the grant, as they inherit this whole profile (the
-                // interim builder is one sandbox; the real path confines each script alone).
-                let openssl_config = Path::new("/private/etc/ssl/openssl.cnf");
-                reads.push(openssl_config);
-                let shelf_bin = native.clang.join("bin");
-                let toolchain_bin = self.tool.sysroot.join("bin");
-                // rustc starts the tools under `lib/rustlib/<host>/bin` (`rust-objcopy`,
-                // `rust-lld`, `gcc-ld`): the pinned toolchain's, read-only.
-                let toolchain_tools = self.tool.sysroot.join("lib").join("rustlib");
                 let writes: [&Path; 4] = [target.as_path(), ws.as_path(), cargo_home.as_path(), tmp.as_path()];
-                let exec_under: [&Path; 4] = [toolchain_bin.as_path(), toolchain_tools.as_path(), shelf_bin.as_path(), target.as_path()];
-                let builder = NativeBuilder { cargo: Path::new(&self.tool.cargo()).to_owned(), reads: &reads, writes: &writes, exec_under: &exec_under };
-                builder.profile().and_then(|profile| native_sandboxed(argv.clone(), profile))
+                if cfg!(target_os = "macos") {
+                    let own_source = match origin {
+                        Origin::Path { dir, .. } | Origin::Git { dir, .. } => Some(dir.as_path()),
+                        Origin::Registry { .. } => None,
+                    };
+                    let vendor = self.work.join("vendor");
+                    let mut reads: Vec<&Path> = vec![vendor.as_path(), self.tool.sysroot.as_path(), native.clang.as_path(), native.sdk.as_path()];
+                    reads.extend(own_source);
+                    // The interim builder's own start-up config: the LibreSSL cargo links reads it
+                    // when it starts and stops if refused. One file, read-only, no secret in it; the
+                    // scripts cargo starts inherit the grant, as they inherit this whole profile (the
+                    // interim builder is one sandbox; the real path confines each script alone).
+                    let openssl_config = Path::new("/private/etc/ssl/openssl.cnf");
+                    reads.push(openssl_config);
+                    let shelf_bin = native.clang.join("bin");
+                    let toolchain_bin = self.tool.sysroot.join("bin");
+                    // rustc starts the tools under `lib/rustlib/<host>/bin` (`rust-objcopy`,
+                    // `rust-lld`, `gcc-ld`): the pinned toolchain's, read-only.
+                    let toolchain_tools = self.tool.sysroot.join("lib").join("rustlib");
+                    let exec_under: [&Path; 4] = [toolchain_bin.as_path(), toolchain_tools.as_path(), shelf_bin.as_path(), target.as_path()];
+                    let builder = NativeBuilder { cargo: Path::new(&self.tool.cargo()).to_owned(), reads: &reads, writes: &writes, exec_under: &exec_under };
+                    builder.profile().and_then(|profile| native_sandboxed(argv.clone(), profile))
+                } else if cfg!(target_os = "linux") {
+                    native_sandboxed_linux(argv.clone(), &writes, &self.path)
+                } else {
+                    Err("native build-script building is supported on macOS and Linux hosts only".to_owned())
+                }
             }
         };
         let argv = match sandbox {
@@ -578,12 +633,61 @@ impl Plan<'_> {
             None => env.push(("__CARGO_TESTS_ONLY_SRC_ROOT".to_owned(), library.as_os_str().to_owned())),
             Some(native) => {
                 // Every host artifact (the script, its build-dependencies' scripts and proc
-                // macros) links with the shelf's clang, which links with `ld64.lld`, against
-                // the SDK: the machine's `cc` and `ld` are never asked.
-                env.push(("CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER".to_owned(), native.clang.join("bin/clang").into_os_string()));
-                env.push(("SDKROOT".to_owned(), native.sdk.clone().into_os_string()));
-                env.push(("MACOSX_DEPLOYMENT_TARGET".to_owned(), "11.0".into()));
+                // macros) links with the shelf's clang (with `ld64.lld` on macOS or `ld.lld` on
+                // Linux) against the SDK/sysroot: the machine's `cc` and `ld` are never asked.
+                env.push((cargo_target_linker_env(HOST), native.clang.join("bin/clang").into_os_string()));
                 env.push(("ZERO_AR_DATE".to_owned(), "1".into()));
+                if cfg!(target_os = "macos") {
+                    env.push(("SDKROOT".to_owned(), native.sdk.clone().into_os_string()));
+                    env.push(("MACOSX_DEPLOYMENT_TARGET".to_owned(), "11.0".into()));
+                } else if cfg!(target_os = "linux") {
+                    let cfg_dir = if ws.to_string_lossy().bytes().any(|b| b.is_ascii_whitespace()) {
+                        let tmp = PathBuf::from(format!("/tmp/blaze-pm-cfg-{}-{}", std::process::id(), &key[..16]));
+                        std::fs::create_dir_all(&tmp).map_err(io(&tmp))?;
+                        tmp
+                    } else {
+                        ws.clone()
+                    };
+                    let shelf_ld = native.clang.join("bin/ld.lld");
+                    let ld_lld = if shelf_ld.exists() {
+                        shelf_ld
+                    } else {
+                        let staged_ld = cfg_dir.join("ld.lld");
+                        let _ = std::fs::remove_file(&staged_ld);
+                        #[cfg(unix)]
+                        std::os::unix::fs::symlink(native.clang.join("bin/lld"), &staged_ld).map_err(io(&staged_ld))?;
+                        staged_ld
+                    };
+                    let shelf_s = native.clang.to_string_lossy();
+                    let sdk_s = native.sdk.to_string_lossy();
+                    let ld_s = ld_lld.to_string_lossy();
+                    let lib_dir_s = native.lib_dir.as_ref().map(|p| p.to_string_lossy().into_owned());
+                    let dyn_s = native.dynamic_linker.as_ref().map(|p| p.to_string_lossy().into_owned());
+                    let rpath_owned: Vec<String> = native.rpaths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                    let rpath_refs: Vec<&str> = rpath_owned.iter().map(String::as_str).collect();
+                    let clang_major = blaze_build_script::toolchain::clang_major(blaze_pins::CLANG_JSON).unwrap_or("23");
+                    let cfg_text = blaze_build_script::toolchain::format_linux_clang_cfg(
+                        sdk_s.as_ref(),
+                        blaze_build_script::toolchain::LinuxClangLink {
+                            lib_dir: lib_dir_s.as_deref(),
+                            gcc_lib_dir: None,
+                            dynamic_linker: dyn_s.as_deref(),
+                            rpaths: &rpath_refs,
+                            ld_lld: Some(ld_s.as_ref()),
+                            embed_runtime_paths: lib_dir_s.is_some(),
+                        },
+                        &[],
+                        blaze_build_script::toolchain::Shelf { dir: shelf_s.as_ref(), clang_major },
+                        alloc,
+                    );
+                    let cfg_path = cfg_dir.join("clang.cfg");
+                    write(&cfg_path, cfg_text.as_str())?;
+                    let override_val = blaze_build_script::toolchain::linux_clang_override_options(
+                        cfg_path.to_string_lossy().as_ref(),
+                        alloc,
+                    );
+                    env.push(("CCC_OVERRIDE_OPTIONS".to_owned(), override_val.as_str().into()));
+                }
             }
         }
         let what = format!("the build of {} {}'s script", wanted.name, wanted.version);
@@ -599,8 +703,8 @@ impl Plan<'_> {
         check_compiled(&compiled, &closure, &std_lock, library, &wanted.name, &wanted.version)?;
 
         let (artifact, module_file, digest_file) = match native {
-            None => ("wasm32-wasip1/release/build-script-build.wasm", "module.wasm", "wasm-sha256"),
-            Some(_) => ("aarch64-apple-darwin/release/build-script-build", "script.bin", "bin-sha256"),
+            None => ("wasm32-wasip1/release/build-script-build.wasm".to_owned(), "module.wasm", "wasm-sha256"),
+            Some(_) => (format!("{HOST}/release/build-script-build"), "script.bin", "bin-sha256"),
         };
         let wasm_path = target.join(artifact);
         let wasm = std::fs::read(&wasm_path).map_err(io(&wasm_path))?;
@@ -760,11 +864,10 @@ impl NativeBuilder<'_> {
     }
 }
 
-/// The command that runs `argv` under `profile`. macOS only: Linux has no pinned sysroot, so no
-/// native script is built there yet (D69).
+/// The command that runs `argv` under `profile` on macOS via Seatbelt.
 fn native_sandboxed(argv: Vec<OsString>, profile: String) -> Result<Vec<OsString>, String> {
     if !cfg!(target_os = "macos") {
-        return Err("a native build script is built only on macOS for now (D69: no Linux sysroot is pinned)".to_owned());
+        return Err("Seatbelt sandboxing is macOS-only".to_owned());
     }
     let exec = Path::new("/usr/bin/sandbox-exec");
     if !exec.exists() {
@@ -773,6 +876,71 @@ fn native_sandboxed(argv: Vec<OsString>, profile: String) -> Result<Vec<OsString
     let mut out = vec![exec.as_os_str().to_owned(), "-p".into(), profile.into()];
     out.extend(argv);
     Ok(out)
+}
+
+/// The command that runs `argv` in a networkless Linux `bwrap` sandbox whose only writable folders
+/// are `writes` (`target`, `ws`, `cargo_home`, `tmp`).
+fn native_sandboxed_linux(argv: Vec<OsString>, writes: &[&Path], path_env: &str) -> Result<Vec<OsString>, String> {
+    let fixed = ["/usr/bin/bwrap", "/bin/bwrap", "/run/current-system/sw/bin/bwrap"];
+    let bwrap = fixed
+        .into_iter()
+        .map(PathBuf::from)
+        .chain(path_env.split(':').filter(|dir| dir.starts_with('/')).map(|dir| Path::new(dir).join("bwrap")))
+        .find(|cand| cand.exists());
+    let Some(bwrap) = bwrap else {
+        return Err("no bwrap at /usr/bin, /bin, /run/current-system/sw/bin, or PATH".to_owned());
+    };
+    let mut out: Vec<OsString> = vec![bwrap.into_os_string()];
+    for arg in ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--unshare-net", "--die-with-parent"] {
+        out.push(arg.into());
+    }
+    for dir in writes {
+        out.push("--bind".into());
+        out.push(dir.as_os_str().to_owned());
+        out.push(dir.as_os_str().to_owned());
+    }
+    out.extend(argv);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::{HOST, Native, cargo_target_linker_env};
+
+    #[test]
+    fn host_triple_and_linker_env_match_running_platform() {
+        if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            assert_eq!(HOST, "aarch64-unknown-linux-gnu");
+            assert_eq!(cargo_target_linker_env(HOST), "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER");
+        } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            assert_eq!(HOST, "x86_64-unknown-linux-gnu");
+            assert_eq!(cargo_target_linker_env(HOST), "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER");
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert_eq!(HOST, "aarch64-apple-darwin");
+            assert_eq!(cargo_target_linker_env(HOST), "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER");
+        }
+        assert!(!HOST.is_empty());
+    }
+
+    #[test]
+    fn native_identity_uses_host_triple_and_platform_sysroot_marker() {
+        let root = std::env::temp_dir().join(format!("blaze-pm-native-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let clang = root.join("9b27cf263d711aa6");
+        let sdk = root.join("sdk");
+        std::fs::create_dir_all(&clang).expect("clang dir");
+        if cfg!(target_os = "macos") {
+            std::fs::create_dir_all(&sdk).expect("sdk dir");
+            std::fs::write(sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#).expect("SDKSettings.json");
+        } else {
+            std::fs::create_dir_all(sdk.join("include")).expect("sdk include");
+            std::fs::write(sdk.join("include/features.h"), b"#define __GLIBC__ 2\n").expect("features.h");
+        }
+        let native = Native { clang, sdk, lib_dir: None, dynamic_linker: None, rpaths: Vec::new() };
+        let id = native.identity().unwrap_or_else(|e| panic!("identity failed: {e}"));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(id.starts_with(&format!("target {HOST}\nlinker clang 9b27cf263d711aa6\n")), "unexpected identity: {id}");
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

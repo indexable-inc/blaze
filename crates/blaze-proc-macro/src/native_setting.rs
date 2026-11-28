@@ -62,6 +62,9 @@ pub struct OwnedNativeSetting<'a> {
     /// `/nix/store/<hash>-glibc-<ver>/lib`, holding `crt1.o`, `libc.so`, `libc_nonshared.a`) used
     /// when process-tree steps (`configure`/`make`) link against glibc under Landlock.
     pub sdk_lib: Option<AString<'a>>,
+    /// Optional host-architecture GCC runtime directory on FHS Linux (e.g.
+    /// `/usr/lib/gcc/aarch64-linux-gnu/13`, holding `crtbeginS.o`, `libgcc.a`, `libstdc++.so`).
+    pub sdk_gcc_lib: Option<AString<'a>>,
     /// Optional resolved ELF dynamic linker path (e.g.
     /// `/nix/store/<hash>-glibc-<ver>/lib/ld-linux-aarch64.so.1`) preserved from Nix wrapper
     /// metadata (`nix-support/dynamic-linker` / `libc-ldflags`) or discovered inside `sdk_lib`.
@@ -96,6 +99,7 @@ impl OwnedNativeSetting<'_> {
             sdk: self.sdk.as_str(),
             sdk_extra: self.sdk_extra.as_deref(),
             sdk_lib: self.sdk_lib.as_deref(),
+            sdk_gcc_lib: self.sdk_gcc_lib.as_deref(),
             sdk_dynamic_linker: self.sdk_dynamic_linker.as_deref(),
             sdk_rpaths: Rpaths(self.sdk_rpaths_nul.as_str()),
             sdk_extra_reads: Rpaths(self.sdk_extra_reads_nul.as_str()),
@@ -424,6 +428,7 @@ pub struct ResolvedLinuxSysroot<'a> {
     pub sdk: AString<'a>,
     pub sdk_extra: Option<AString<'a>>,
     pub sdk_lib: Option<AString<'a>>,
+    pub sdk_gcc_lib: Option<AString<'a>>,
     pub sdk_dynamic_linker: Option<AString<'a>>,
     pub sdk_rpaths: AVec<'a, AString<'a>>,
     pub sdk_extra_reads: AVec<'a, AString<'a>>,
@@ -431,14 +436,18 @@ pub struct ResolvedLinuxSysroot<'a> {
     pub sdk_digest: [u8; 32],
 }
 
-/// Standard FHS C runtime / glibc linker files hashed and granted individually on FHS hosts (where
-/// `/usr/lib/<multiarch>` also holds gigabytes of unrelated distribution libraries). Sorted.
+/// Standard FHS C and C++ runtime / glibc linker files hashed and granted individually on FHS
+/// hosts (where `/usr/lib/<multiarch>` also holds gigabytes of unrelated distribution libraries).
+/// Sorted.
 const FHS_LIBC_FILES: &[&str] = &[
     "Scrt1.o",
     "crt1.o",
     "crti.o",
     "crtn.o",
     "gcrt1.o",
+    "libatomic.a",
+    "libatomic.so",
+    "libatomic.so.1",
     "libc.a",
     "libc.so",
     "libc.so.6",
@@ -446,6 +455,8 @@ const FHS_LIBC_FILES: &[&str] = &[
     "libdl.a",
     "libdl.so",
     "libdl.so.2",
+    "libgcc_s.so",
+    "libgcc_s.so.1",
     "libm.a",
     "libm.so",
     "libm.so.6",
@@ -461,15 +472,173 @@ const FHS_LIBC_FILES: &[&str] = &[
     "librt.a",
     "librt.so",
     "librt.so.1",
+    "libstdc++.a",
+    "libstdc++.so",
+    "libstdc++.so.6",
+    "libsupc++.a",
     "libutil.a",
     "libutil.so",
     "libutil.so.1",
     "rcrt1.o",
 ];
 
-const FHS_LOADERS: &[&str] = &["ld-linux-aarch64.so.1", "ld-linux-x86-64.so.2"];
-const FHS_LIB_SUBDIRS: &[&str] = &["lib/aarch64-linux-gnu", "lib/x86_64-linux-gnu", "lib64", "lib"];
+/// Standard GCC runtime and C++ runtime files under `/usr/lib/gcc/<triple>/<ver>` hashed and
+/// granted individually on FHS hosts so `clang++` (`cc::Build::cpp(true)`) can link against the
+/// host `libstdc++` and `libgcc` under Landlock. Sorted.
+const FHS_GCC_FILES: &[&str] = &[
+    "crtbegin.o",
+    "crtbeginS.o",
+    "crtbeginT.o",
+    "crtend.o",
+    "crtendS.o",
+    "crtfastmath.o",
+    "crtprec32.o",
+    "crtprec64.o",
+    "crtprec80.o",
+    "libatomic.a",
+    "libatomic.so",
+    "libgcc.a",
+    "libgcc_eh.a",
+    "libgcc_s.so",
+    "libgcc_s.so.1",
+    "libstdc++.a",
+    "libstdc++.so",
+    "libstdc++.so.6",
+    "libstdc++exp.a",
+    "libstdc++fs.a",
+    "libsupc++.a",
+];
+
 const FHS_LIBC_MARKERS: &[&str] = &["crt1.o", "Scrt1.o", "libc.so", "libc.so.6"];
+const FHS_GCC_MARKERS: &[&str] = &["crtbeginS.o", "crtbegin.o", "libgcc.a", "libstdc++.so", "libstdc++.a"];
+
+/// Host-architecture-specific FHS library directory, ELF loader, and GCC triple candidates so
+/// multiarch hosts with cross-libc packages installed never pick a foreign architecture.
+struct FhsArchPaths {
+    lib_subdirs: &'static [&'static str],
+    loaders: &'static [&'static str],
+    fallback_loaders: &'static [&'static str],
+    gcc_triples: &'static [&'static str],
+}
+
+fn fhs_arch_paths(host: &str) -> FhsArchPaths {
+    if host.starts_with("aarch64-") {
+        FhsArchPaths {
+            lib_subdirs: &["lib/aarch64-linux-gnu", "lib64", "lib"],
+            loaders: &["ld-linux-aarch64.so.1"],
+            fallback_loaders: &["lib/ld-linux-aarch64.so.1"],
+            gcc_triples: &["aarch64-linux-gnu", "aarch64-redhat-linux", "aarch64-suse-linux", "aarch64-unknown-linux-gnu"],
+        }
+    } else if host.starts_with("x86_64-") {
+        FhsArchPaths {
+            lib_subdirs: &["lib/x86_64-linux-gnu", "lib64", "lib"],
+            loaders: &["ld-linux-x86-64.so.2"],
+            fallback_loaders: &["lib64/ld-linux-x86-64.so.2"],
+            gcc_triples: &["x86_64-linux-gnu", "x86_64-redhat-linux", "x86_64-suse-linux", "x86_64-pc-linux-gnu", "x86_64-unknown-linux-gnu"],
+        }
+    } else {
+        FhsArchPaths {
+            lib_subdirs: &["lib64", "lib"],
+            loaders: &[],
+            fallback_loaders: &[],
+            gcc_triples: &[],
+        }
+    }
+}
+
+/// Compares GCC version folder names (e.g. `"13"`, `"14"`, `"14.2.1"`) numerically by dot-separated
+/// components, falling back to lexicographical order.
+fn compare_gcc_version(a: &str, b: &str) -> core::cmp::Ordering {
+    let mut ai = a.split('.');
+    let mut bi = b.split('.');
+    loop {
+        match (ai.next(), bi.next()) {
+            (Some(ap), Some(bp)) => {
+                let ord = match (ap.parse::<u64>(), bp.parse::<u64>()) {
+                    (Ok(an), Ok(bn)) => an.cmp(&bn),
+                    _ => ap.cmp(bp),
+                };
+                if ord != core::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            (Some(_), None) => return core::cmp::Ordering::Greater,
+            (None, Some(_)) => return core::cmp::Ordering::Less,
+            (None, None) => return a.cmp(b),
+        }
+    }
+}
+
+/// Lists direct subdirectory names immediately under `dir` via `bstd` (`native_world`), never
+/// recursing into grandchildren. Returns an empty list when `dir` is absent or unreadable.
+fn direct_subdirs<'a>(dir: &str, alloc: Alloc<'a>) -> AVec<'a, AString<'a>> {
+    let mut out: AVec<'a, AString<'a>> = Vec::new_in(alloc);
+    let Ok((io, root)) = crate::record::native_world(std::path::Path::new(dir)) else {
+        return out;
+    };
+    let Ok(cx) = io.cx(Duration::from_secs(10), bstd::mem::TASK_FRAME) else {
+        return out;
+    };
+    let limits = bstd::fs::WalkLimits { folders: 64, entries: 1024, depth: 1 };
+    let _ = root.walk(&cx, None, limits, cx.frame(), |entries, _enter| {
+        for i in 0..entries.len() {
+            if matches!(entries.kind(i), bstd::fs::EntryKind::Dir | bstd::fs::EntryKind::Link) {
+                out.push(String::from_str_in(entries.name(i), alloc));
+            }
+        }
+        Ok::<(), ()>(())
+    });
+    out
+}
+
+/// Locates the highest host-architecture GCC runtime directory (`<base>/lib{,64}/gcc/<triple>/<ver>`)
+/// holding C/C++ runtime objects (`crtbegin*.o`, `libgcc.a`, `libstdc++.so*`).
+fn find_fhs_gcc_dir<'a>(bases: &[&str], triples: &[&str], alloc: Alloc<'a>) -> Option<AString<'a>> {
+    let mut best_ver: Option<AString<'a>> = None;
+    let mut best_dir: Option<AString<'a>> = None;
+    for base in bases {
+        for lib_sub in ["lib/gcc", "lib64/gcc"] {
+            for triple in triples {
+                let parent = if *base == "/" {
+                    text(&["/", lib_sub, "/", triple], alloc)
+                } else {
+                    text(&[base, "/", lib_sub, "/", triple], alloc)
+                };
+                if !stat_meta(parent.as_str()).is_ok_and(|m| m.is_dir()) {
+                    continue;
+                }
+                for ver_s in direct_subdirs(parent.as_str(), alloc) {
+                    let ver = ver_s.as_str();
+                    if ver.is_empty() || !ver.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+                        continue;
+                    }
+                    let cand = text(&[parent.as_str(), "/", ver], alloc);
+                    if !stat_meta(cand.as_str()).is_ok_and(|m| m.is_dir()) {
+                        continue;
+                    }
+                    let Ok(real_dir) = resolved(&cand, |path, error| NativeSettingError::NoSdk { path, error }, alloc) else {
+                        continue;
+                    };
+                    let has_marker = FHS_GCC_MARKERS.iter().any(|marker| {
+                        let p = text(&[real_dir.as_str(), "/", marker], alloc);
+                        stat_meta(p.as_str()).is_ok_and(|m| m.is_file())
+                    });
+                    if !has_marker {
+                        continue;
+                    }
+                    let is_newer = best_ver
+                        .as_ref()
+                        .is_none_or(|cur| compare_gcc_version(ver, cur.as_str()) == core::cmp::Ordering::Greater);
+                    if is_newer {
+                        best_ver = Some(ver_s);
+                        best_dir = Some(real_dir);
+                    }
+                }
+            }
+        }
+    }
+    best_dir
+}
 
 fn is_under_dir(path: &str, dir: &str) -> bool {
     path == dir || path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'))
@@ -481,12 +650,13 @@ fn push_unique_str<'a>(out: &mut AVec<'a, AString<'a>>, value: &str, alloc: Allo
     }
 }
 
-/// Resolves and hashes a `Sysroot::LinuxHost` sysroot (`sdk` + optional NixOS `link` inputs)
-/// into its canonical roots, exact Landlock extra read paths, and path-independent 32-byte SHA-256
-/// content digest.
+/// Resolves and hashes a `Sysroot::LinuxHost` sysroot (`sdk` + optional NixOS `link` inputs) for
+/// `host` into its canonical roots, exact Landlock extra read paths, and path-independent 32-byte
+/// SHA-256 content digest.
 pub fn resolve_linux_sysroot<'a>(
     sdk: &str,
     link: LinuxLinkInputs<'_>,
+    host: &str,
     alloc: Alloc<'a>,
 ) -> Result<ResolvedLinuxSysroot<'a>, NativeSettingError<'a>> {
     let sdk = resolved(&String::from_str_in(sdk, alloc), |path, error| NativeSettingError::NoSdk { path, error }, alloc)?;
@@ -522,6 +692,7 @@ pub fn resolve_linux_sysroot<'a>(
         Some(lib) => Some(resolved(&String::from_str_in(lib, alloc), |path, error| NativeSettingError::NoSdk { path, error }, alloc)?),
         None => None,
     };
+    let mut sdk_gcc_lib: Option<AString<'a>> = None;
     let mut sdk_dynamic_linker = match link.dynamic_linker {
         Some(dyn_linker) => Some(resolved(&String::from_str_in(dyn_linker, alloc), |path, error| NativeSettingError::NoSdk { path, error }, alloc)?),
         None => None,
@@ -676,15 +847,17 @@ pub fn resolve_linux_sysroot<'a>(
                 sdk_dynamic_linker = Some(resolved(&found, |path, error| NativeSettingError::NoSdk { path, error }, alloc)?);
             }
         } else {
-            // Standard FHS Linux host without explicit split Nix `lib_dir`: discover FHS C runtime
-            // / glibc linker files (`crt1.o`, `Scrt1.o`, `libc.so*`, `libm*`, `libpthread*`,
-            // `ld-linux-*.so.*`), stream-hash every present file into `sdk_digest`, set `sdk_lib`
-            // so `format_linux_clang_cfg` passes `-B`/`-L`/`-fuse-ld`, and grant ONLY those exact
-            // hashed files (never the unhashed remainder of `/usr/lib/*`).
+            // Standard FHS Linux host without explicit split Nix `lib_dir`: discover host-arch
+            // FHS C/C++ runtime and glibc linker files (`crt1.o`, `Scrt1.o`, `libc.so*`,
+            // `libstdc++.so*`, `libgcc_s.so*`, `ld-linux-*.so.*`) and the host GCC runtime
+            // directory (`<sdk>/lib/gcc/<triple>/<ver>`), stream-hash every present file into
+            // `sdk_digest`, and grant ONLY those exact hashed files (never the unhashed remainder
+            // of `/usr/lib/*`).
+            let arch = fhs_arch_paths(host);
             let sysroot_prefix = toolchain::linux_sysroot_prefix(sdk.as_str());
             let mut fhs_dirs: AVec<'a, AString<'a>> = Vec::new_in(alloc);
             let mut probe_base = |base: &str| {
-                for sub in FHS_LIB_SUBDIRS {
+                for sub in arch.lib_subdirs {
                     let cand = if base == "/" {
                         text(&["/", sub], alloc)
                     } else {
@@ -714,7 +887,7 @@ pub fn resolve_linux_sysroot<'a>(
                 sha.update(b"fhs-lib\0");
                 for dir in fhs_dirs.iter() {
                     sha.update(b"D");
-                    for name in FHS_LIBC_FILES.iter().chain(FHS_LOADERS.iter()) {
+                    for name in FHS_LIBC_FILES.iter().chain(arch.loaders.iter()) {
                         let full = text(&[dir.as_str(), "/", name], alloc);
                         if stat_meta(full.as_str()).is_ok_and(|m| m.is_file()) {
                             let real_file = resolved(&full, |path, error| NativeSettingError::NoSdk { path, error }, alloc)?;
@@ -724,15 +897,33 @@ pub fn resolve_linux_sysroot<'a>(
                             hash_regular(&mut sha, real_file.as_str())
                                 .map_err(|error| NativeSettingError::NoSdk { path: full, error })?;
                             push_unique_str(&mut raw_extra_reads, real_file.as_str(), alloc);
-                            if sdk_dynamic_linker.is_none() && FHS_LOADERS.contains(name) {
+                            if sdk_dynamic_linker.is_none() && arch.loaders.contains(name) {
                                 sdk_dynamic_linker = Some(real_file);
                             }
                         }
                     }
                 }
             }
+            let gcc_bases: [&str; 2] = [sdk.as_str(), sysroot_prefix];
+            let gcc_slice = if sysroot_prefix != sdk.as_str() { &gcc_bases[..] } else { &gcc_bases[..1] };
+            sdk_gcc_lib = find_fhs_gcc_dir(gcc_slice, arch.gcc_triples, alloc);
+            if let Some(gcc_dir) = sdk_gcc_lib.as_ref() {
+                sha.update(b"fhs-gcc\0");
+                for name in FHS_GCC_FILES {
+                    let full = text(&[gcc_dir.as_str(), "/", name], alloc);
+                    if stat_meta(full.as_str()).is_ok_and(|m| m.is_file()) {
+                        let real_file = resolved(&full, |path, error| NativeSettingError::NoSdk { path, error }, alloc)?;
+                        sha.update(b"F");
+                        sha.update(&u64::try_from(name.len()).unwrap_or(u64::MAX).to_le_bytes());
+                        sha.update(name.as_bytes());
+                        hash_regular(&mut sha, real_file.as_str())
+                            .map_err(|error| NativeSettingError::NoSdk { path: full, error })?;
+                        push_unique_str(&mut raw_extra_reads, real_file.as_str(), alloc);
+                    }
+                }
+            }
             if sdk_dynamic_linker.is_none() {
-                for loader_rel in ["lib/ld-linux-aarch64.so.1", "lib64/ld-linux-x86-64.so.2"] {
+                for loader_rel in arch.fallback_loaders {
                     let cand = if sysroot_prefix == "/" {
                         text(&["/", loader_rel], alloc)
                     } else {
@@ -788,6 +979,7 @@ pub fn resolve_linux_sysroot<'a>(
         sdk,
         sdk_extra,
         sdk_lib,
+        sdk_gcc_lib,
         sdk_dynamic_linker,
         sdk_rpaths,
         sdk_extra_reads,
@@ -804,6 +996,7 @@ pub struct ResolvedLinuxSetting<'s> {
     pub sdk: &'s str,
     pub sdk_extra: Option<&'s str>,
     pub sdk_lib: Option<&'s str>,
+    pub sdk_gcc_lib: Option<&'s str>,
     pub sdk_dynamic_linker: Option<&'s str>,
     pub sdk_rpaths: &'s [&'s str],
     pub sdk_extra_reads: &'s [&'s str],
@@ -853,6 +1046,7 @@ pub fn native_setting_from_resolved_linux<'a>(
         String::from_str_in(linux.sdk, alloc),
         linux.sdk_extra.map(|s| String::from_str_in(s, alloc)),
         linux.sdk_lib.map(|s| String::from_str_in(s, alloc)),
+        linux.sdk_gcc_lib.map(|s| String::from_str_in(s, alloc)),
         linux.sdk_dynamic_linker.map(|s| String::from_str_in(s, alloc)),
         sdk_rpaths,
         sdk_extra_reads,
@@ -906,6 +1100,7 @@ fn finish_native_setting<'a>(
     sdk: AString<'a>,
     sdk_extra: Option<AString<'a>>,
     sdk_lib: Option<AString<'a>>,
+    sdk_gcc_lib: Option<AString<'a>>,
     sdk_dynamic_linker: Option<AString<'a>>,
     sdk_rpaths: AVec<'a, AString<'a>>,
     sdk_extra_reads: AVec<'a, AString<'a>>,
@@ -925,6 +1120,7 @@ fn finish_native_setting<'a>(
         sdk,
         sdk_extra,
         sdk_lib,
+        sdk_gcc_lib,
         sdk_dynamic_linker,
         sdk_rpaths,
         sdk_rpaths_nul,
@@ -949,7 +1145,7 @@ pub fn native_setting_with_link<'a>(
 ) -> Result<OwnedNativeSetting<'a>, NativeSettingError<'a>> {
     let (shelf, sysroot) = validate_shelf(shelf, host, alloc)?;
 
-    let (sdk, sdk_extra, sdk_lib, sdk_dynamic_linker, sdk_rpaths, sdk_extra_reads, sdk_version) = match sysroot {
+    let (sdk, sdk_extra, sdk_lib, sdk_gcc_lib, sdk_dynamic_linker, sdk_rpaths, sdk_extra_reads, sdk_version) = match sysroot {
         Sysroot::MacosSdk => {
             let sdk = resolved(&String::from_str_in(sdk, alloc), |path, error| NativeSettingError::NoSdk { path, error }, alloc)?;
             let settings_path = text(&[sdk.as_str(), "/SDKSettings.json"], alloc);
@@ -960,14 +1156,15 @@ pub fn native_setting_with_link<'a>(
             let Some(version) = core::str::from_utf8(&settings).ok().and_then(sdk_version) else {
                 return Err(NativeSettingError::SdkVersion { path: settings_path });
             };
-            (sdk, None, None, None, Vec::new_in(alloc), Vec::new_in(alloc), String::from_str_in(version, alloc))
+            (sdk, None, None, None, None, Vec::new_in(alloc), Vec::new_in(alloc), String::from_str_in(version, alloc))
         }
         Sysroot::LinuxHost => {
-            let linux = resolve_linux_sysroot(sdk, link, alloc)?;
+            let linux = resolve_linux_sysroot(sdk, link, host, alloc)?;
             (
                 linux.sdk,
                 linux.sdk_extra,
                 linux.sdk_lib,
+                linux.sdk_gcc_lib,
                 linux.sdk_dynamic_linker,
                 linux.sdk_rpaths,
                 linux.sdk_extra_reads,
@@ -983,6 +1180,7 @@ pub fn native_setting_with_link<'a>(
         sdk,
         sdk_extra,
         sdk_lib,
+        sdk_gcc_lib,
         sdk_dynamic_linker,
         sdk_rpaths,
         sdk_extra_reads,

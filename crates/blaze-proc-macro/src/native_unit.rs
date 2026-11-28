@@ -156,9 +156,11 @@ pub struct NativeSetting<'s> {
     pub sdk: &'s str,
     /// Optional extra read-only root for split Linux kernel headers (NixOS `linux-headers`).
     pub sdk_extra: Option<&'s str>,
-    /// Optional split Linux libc runtime library directory (NixOS `<glibc>/lib`).
+    /// Optional split Linux libc runtime library directory (NixOS `<glibc>/lib` or FHS multiarch).
     pub sdk_lib: Option<&'s str>,
-    /// Optional resolved ELF dynamic linker path (NixOS `ld-linux-*.so.*`).
+    /// Optional host-architecture GCC runtime directory on FHS Linux (`<sdk>/lib/gcc/<triple>/<ver>`).
+    pub sdk_gcc_lib: Option<&'s str>,
+    /// Optional resolved ELF dynamic linker path (NixOS/FHS `ld-linux-*.so.*`).
     pub sdk_dynamic_linker: Option<&'s str>,
     /// Optional extra runtime library search directories (`-rpath`) preserved from Nix wrappers.
     pub sdk_rpaths: Rpaths<'s>,
@@ -351,17 +353,22 @@ fn remove_tree_under(work: &str, rel: &str, alloc: Alloc<'_>) {
 pub(crate) struct RunWorkGuard<'w, 'a> {
     work: &'w str,
     dirs: AVec<'a, AString<'a>>,
+    external_dirs: AVec<'a, (AString<'a>, AString<'a>)>,
     files: AVec<'a, AString<'a>>,
     alloc: Alloc<'a>,
 }
 
 impl<'w, 'a> RunWorkGuard<'w, 'a> {
     pub(crate) fn new(work: &'w str, alloc: Alloc<'a>) -> Self {
-        Self { work, dirs: Vec::new_in(alloc), files: Vec::new_in(alloc), alloc }
+        Self { work, dirs: Vec::new_in(alloc), external_dirs: Vec::new_in(alloc), files: Vec::new_in(alloc), alloc }
     }
 
     pub(crate) fn push_dir(&mut self, rel: AString<'a>) {
         self.dirs.push(rel);
+    }
+
+    pub(crate) fn push_external_dir(&mut self, base: AString<'a>, rel: AString<'a>) {
+        self.external_dirs.push((base, rel));
     }
 
     pub(crate) fn push_file(&mut self, rel: AString<'a>) {
@@ -374,6 +381,9 @@ impl Drop for RunWorkGuard<'_, '_> {
         for rel in self.dirs.iter() {
             remove_tree_under(self.work, rel.as_str(), self.alloc);
         }
+        for (base, rel) in self.external_dirs.iter() {
+            remove_tree_under(base.as_str(), rel.as_str(), self.alloc);
+        }
         if !self.files.is_empty()
             && let Ok((io, root)) = native_world(Path::new(self.work))
             && let Ok(cx) = io.cx(Duration::from_secs(60), TASK_FRAME)
@@ -385,6 +395,87 @@ impl Drop for RunWorkGuard<'_, '_> {
             }
         }
     }
+}
+
+/// Stages a Linux `clang.cfg` (and optional `ld.lld` symlink when the shelf only has `bin/lld`)
+/// at a whitespace-free path for `CCC_OVERRIDE_OPTIONS` (`--config=<path>` splits on ASCII
+/// whitespace in LLVM's `applyOverrideOptions`). When `<work>/cfg/<run_key>` has no whitespace,
+/// stages directly under `work`; when `work` contains whitespace (e.g. `/home/Build User/.blaze`),
+/// stages under a private whitespace-free temp directory cleaned up on drop via `work_guard`.
+#[allow(clippy::too_many_arguments)]
+fn stage_linux_clang_cfg<'a>(
+    native: &NativeSetting<'_>,
+    run_key: &str,
+    pkg_label: &str,
+    shown_maps: &[(&str, &str)],
+    shelf: Shelf<'_>,
+    embed_runtime_paths: bool,
+    work_guard: &mut RunWorkGuard<'_, 'a>,
+    alloc: Alloc<'a>,
+) -> Result<AString<'a>, NativeUnitError> {
+    let default_rel = blaze_own::format_in!(alloc, "cfg/{run_key}");
+    let default_dir = blaze_own::format_in!(alloc, "{}/{}", native.work, default_rel.as_str());
+    let (stage_base, stage_rel): (AString<'a>, AString<'a>) = if default_dir.as_str().bytes().any(|b| b.is_ascii_whitespace()) {
+        // Derive a whitespace-free per-command discriminator from the command's jobserver fifo
+        // filename (which embeds the command PID) + `run_key` so concurrent commands never collide
+        // without ambient `std::env` or `std::process::id` reads.
+        let fifo_leaf = native
+            .jobs
+            .fifo()
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.'))
+            .unwrap_or("run");
+        let short_key = run_key.get(..16).unwrap_or(run_key);
+        let rel = blaze_own::format_in!(alloc, "blaze-clang-cfg-{fifo_leaf}-{short_key}");
+        let base = OwnString::from_str_in("/tmp", alloc);
+        work_guard.push_external_dir(OwnString::from_str_in(base.as_str(), alloc), OwnString::from_str_in(rel.as_str(), alloc));
+        (base, rel)
+    } else {
+        work_guard.push_dir(OwnString::from_str_in(default_rel.as_str(), alloc));
+        (OwnString::from_str_in(native.work, alloc), default_rel)
+    };
+    let cfg_dir = fresh_folder(stage_base.as_str(), stage_rel.as_str(), &[], pkg_label, alloc)?;
+    let failed = |why: AString<'a>| NativeUnitError::Files {
+        package: pkg_label.to_owned(),
+        folder: cfg_dir.clone(),
+        why: why.as_str().to_owned(),
+    };
+    let ld_lld_path: Option<AString<'a>> = {
+        let shelf_ld = blaze_own::format_in!(alloc, "{}/bin/ld.lld", native.shelf);
+        if Path::new(shelf_ld.as_str()).exists() {
+            Some(shelf_ld)
+        } else {
+            let shelf_lld = blaze_own::format_in!(alloc, "{}/bin/lld", native.shelf);
+            let staged_ld = blaze_own::format_in!(alloc, "{cfg_dir}/ld.lld");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(shelf_lld.as_str(), staged_ld.as_str())
+                .map_err(|e| failed(blaze_own::format_in!(alloc, "could not link ld.lld: {e}")))?;
+            Some(staged_ld)
+        }
+    };
+    let mut rpath_strs: AVec<'a, &str> = Vec::new_in(alloc);
+    for rpath in native.sdk_rpaths.iter() {
+        rpath_strs.push(rpath);
+    }
+    let link = toolchain::LinuxClangLink {
+        lib_dir: native.sdk_lib,
+        gcc_lib_dir: native.sdk_gcc_lib,
+        dynamic_linker: native.sdk_dynamic_linker,
+        rpaths: rpath_strs.as_slice(),
+        ld_lld: ld_lld_path.as_deref(),
+        embed_runtime_paths,
+    };
+    let cfg_text = toolchain::format_linux_clang_cfg(native.sdk, link, shown_maps, shelf, alloc);
+    let cfg_path = blaze_own::format_in!(alloc, "{cfg_dir}/clang.cfg");
+    let cfg_rel_file = blaze_own::format_in!(alloc, "{}/clang.cfg", stage_rel.as_str());
+    let (io, stage_root) = native_world(Path::new(stage_base.as_str())).map_err(|e| failed(blaze_own::format_in!(alloc, "{e}")))?;
+    let cx = io.cx(WORK_TREE_DEADLINE, TASK_FRAME).map_err(|_| failed(OwnString::from_str_in("its world stopped", alloc)))?;
+    let path = bstd::path::Path::new(cfg_rel_file.as_str()).map_err(|_| failed(OwnString::from_str_in("clang.cfg: not a relative path", alloc)))?;
+    let file = stage_root.create(&cx, &path).map_err(|e| failed(blaze_own::format_in!(alloc, "clang.cfg: {e}")))?;
+    file.write_at(&cx, 0, cfg_text.as_bytes(), Durable::No).map_err(|e| failed(blaze_own::format_in!(alloc, "clang.cfg: {e}")))?;
+    file.close(&cx, Durable::No).map_err(|e| failed(blaze_own::format_in!(alloc, "clang.cfg: {e}")))?;
+    Ok(cfg_path)
 }
 
 /// `work/<rel>/` made to hold exactly `files` (none when `files` is empty: an empty folder):
@@ -645,69 +736,36 @@ pub fn native_outputs<'a>(
     }
     let shelf = Shelf { dir: native.shelf, clang_major };
     let linux_clang_cfg: Option<AString<'a>> = if native.sysroot == Sysroot::LinuxHost {
-        let cfg_rel = blaze_own::format_in!(alloc, "cfg/{}", run_key.as_str());
-        let cfg_dir = fresh_folder(native.work, cfg_rel.as_str(), &[], &pkg(), alloc)?;
-        work_guard.push_dir(cfg_rel);
-        let stage_cfg = || -> Result<AString<'a>, AString<'a>> {
-            let ld_lld_path: Option<AString<'a>> = {
-                let shelf_ld = blaze_own::format_in!(alloc, "{}/bin/ld.lld", native.shelf);
-                if Path::new(shelf_ld.as_str()).exists() {
-                    Some(shelf_ld)
-                } else {
-                    let shelf_lld = blaze_own::format_in!(alloc, "{}/bin/lld", native.shelf);
-                    let staged_ld = blaze_own::format_in!(alloc, "{cfg_dir}/ld.lld");
-                    #[cfg(unix)]
-                    std::os::unix::fs::symlink(shelf_lld.as_str(), staged_ld.as_str())
-                        .map_err(|e| blaze_own::format_in!(alloc, "could not link ld.lld: {e}"))?;
-                    Some(staged_ld)
-                }
-            };
-            let mut rpath_strs: AVec<'a, &str> = Vec::new_in(alloc);
-            for rpath in native.sdk_rpaths.iter() {
-                rpath_strs.push(rpath);
-            }
-            let mut shown_maps: AVec<'a, (&str, &str)> = Vec::new_in(alloc);
-            shown_maps.push(("/out", out_dir.as_str()));
-            shown_maps.push((root.seen().mount(), package_dir.as_str()));
-            for (real, shown) in dep_shown.iter() {
-                shown_maps.push((*shown, *real));
-            }
-            shown_maps.push(("/sdk", native.sdk));
-            if let Some(extra) = native.sdk_extra {
-                shown_maps.push(("/sdk-headers", extra));
-            }
-            if let Some(lib) = native.sdk_lib {
-                shown_maps.push(("/sdk-lib", lib));
-            }
-            for rpath in rpath_strs.iter() {
-                shown_maps.push(("/sdk-rpath", *rpath));
-            }
-            shown_maps.push(("/toolchain/clang", native.shelf));
-            let cfg_path = blaze_own::format_in!(alloc, "{cfg_dir}/clang.cfg");
-            if cfg_path.as_str().bytes().any(|b| b.is_ascii_whitespace()) {
-                return Err(OwnString::from_str_in("native script clang config path contains whitespace", alloc));
-            }
-            let link = toolchain::LinuxClangLink {
-                lib_dir: native.sdk_lib,
-                dynamic_linker: native.sdk_dynamic_linker,
-                rpaths: rpath_strs.as_slice(),
-                ld_lld: ld_lld_path.as_deref(),
-                embed_runtime_paths: host_tools::runs_out_dir(&tools),
-            };
-            let cfg_text = toolchain::format_linux_clang_cfg(native.sdk, link, &shown_maps, shelf, alloc);
-            let cfg_rel_file = blaze_own::format_in!(alloc, "cfg/{}/clang.cfg", run_key.as_str());
-            let (io, work_root) = native_world(Path::new(native.work)).map_err(|e| blaze_own::format_in!(alloc, "{e}"))?;
-            let cx = io.cx(WORK_TREE_DEADLINE, TASK_FRAME).map_err(|_| OwnString::from_str_in("its world stopped", alloc))?;
-            let path = bstd::path::Path::new(cfg_rel_file.as_str()).map_err(|_| OwnString::from_str_in("clang.cfg: not a relative path", alloc))?;
-            let file = work_root.create(&cx, &path).map_err(|e| blaze_own::format_in!(alloc, "clang.cfg: {e}"))?;
-            file.write_at(&cx, 0, cfg_text.as_bytes(), Durable::No).map_err(|e| blaze_own::format_in!(alloc, "clang.cfg: {e}"))?;
-            file.close(&cx, Durable::No).map_err(|e| blaze_own::format_in!(alloc, "clang.cfg: {e}"))?;
-            Ok(cfg_path)
-        };
-        match stage_cfg() {
-            Ok(cfg_path) => Some(cfg_path),
-            Err(why) => return Err(NativeUnitError::Files { package: pkg(), folder: cfg_dir, why: why.as_str().to_owned() }),
+        let mut shown_maps: AVec<'a, (&str, &str)> = Vec::new_in(alloc);
+        shown_maps.push(("/out", out_dir.as_str()));
+        shown_maps.push((root.seen().mount(), package_dir.as_str()));
+        for (real, shown) in dep_shown.iter() {
+            shown_maps.push((*shown, *real));
         }
+        shown_maps.push(("/sdk", native.sdk));
+        if let Some(extra) = native.sdk_extra {
+            shown_maps.push(("/sdk-headers", extra));
+        }
+        if let Some(lib) = native.sdk_lib {
+            shown_maps.push(("/sdk-lib", lib));
+        }
+        if let Some(gcc_lib) = native.sdk_gcc_lib {
+            shown_maps.push(("/sdk-gcc", gcc_lib));
+        }
+        for rpath in native.sdk_rpaths.iter() {
+            shown_maps.push(("/sdk-rpath", rpath));
+        }
+        shown_maps.push(("/toolchain/clang", native.shelf));
+        Some(stage_linux_clang_cfg(
+            &native,
+            run_key.as_str(),
+            &pkg(),
+            shown_maps.as_slice(),
+            shelf,
+            host_tools::runs_out_dir(&tools),
+            &mut work_guard,
+            alloc,
+        )?)
     } else {
         None
     };
@@ -1335,6 +1393,7 @@ mod tests {
                 sdk: "/usr",
                 sdk_extra: None,
                 sdk_lib: None,
+                sdk_gcc_lib: None,
                 sdk_dynamic_linker: None,
                 sdk_rpaths: super::Rpaths(""),
                 sdk_extra_reads: super::Rpaths(""),
@@ -1378,5 +1437,67 @@ mod tests {
 
         jobs.end().expect("end jobs");
         let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn stage_linux_clang_cfg_supports_whitespace_in_work_and_cleans_up_on_drop() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let base = std::env::temp_dir().join(format!("blaze home with spaces {}", std::process::id()));
+        let work = base.join(".blaze/v2/native-work/check");
+        let shelf = base.join(".blaze/v2/toolchain/clang/deadbeef");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&work).expect("work with spaces");
+        std::fs::create_dir_all(shelf.join("bin")).expect("shelf bin");
+        std::fs::write(shelf.join("bin/lld"), b"").expect("shelf lld");
+        let jobs = crate::jobserver::Jobserver::new(crate::jobserver::JobserverOpts {
+            work: work.to_str().expect("utf8"),
+            workers: core::num::NonZeroU32::new(1).expect("nz"),
+            id: std::process::id(),
+        })
+        .expect("jobserver");
+        let native = super::NativeSetting {
+            shelf: shelf.to_str().expect("utf8"),
+            sdk: "/usr",
+            sdk_extra: None,
+            sdk_lib: Some("/usr/lib/aarch64-linux-gnu"),
+            sdk_gcc_lib: Some("/usr/lib/gcc/aarch64-linux-gnu/13"),
+            sdk_dynamic_linker: None,
+            sdk_rpaths: super::Rpaths(""),
+            sdk_extra_reads: super::Rpaths(""),
+            sdk_version: "0000000000000000000000000000000000000000000000000000000000000000",
+            sysroot: blaze_build_script::toolchain::Sysroot::LinuxHost,
+            work: work.to_str().expect("utf8"),
+            deadline: core::time::Duration::from_secs(60),
+            jobs: &jobs,
+            shim: None,
+        };
+        let staged_dir_path;
+        {
+            let mut guard = super::RunWorkGuard::new(native.work, alloc);
+            let cfg_path = super::stage_linux_clang_cfg(
+                &native,
+                "0123456789abcdef0123456789abcdef",
+                "zstd-sys 2.0.0",
+                &[("/toolchain/clang", native.shelf)],
+                blaze_build_script::toolchain::Shelf { dir: native.shelf, clang_major: "23" },
+                false,
+                &mut guard,
+                alloc,
+            )
+            .unwrap_or_else(|e| panic!("whitespace home must stage clang.cfg cleanly: {e}"));
+            assert!(
+                !cfg_path.as_str().bytes().any(|b| b.is_ascii_whitespace()),
+                "staged clang.cfg path for CCC_OVERRIDE_OPTIONS must be whitespace-free: {}",
+                cfg_path.as_str()
+            );
+            let cfg_text = std::fs::read_to_string(cfg_path.as_str()).expect("read staged clang.cfg");
+            assert!(cfg_text.contains(native.shelf), "quoted shelf path with spaces must be preserved in clang.cfg: {cfg_text}");
+            assert!(cfg_text.contains("\"--gcc-install-dir=/usr/lib/gcc/aarch64-linux-gnu/13\"\n"), "gcc_lib_dir must be written: {cfg_text}");
+            staged_dir_path = std::path::Path::new(cfg_path.as_str()).parent().expect("parent").to_path_buf();
+            assert!(staged_dir_path.join("ld.lld").exists(), "ld.lld symlink staged beside clang.cfg");
+        }
+        assert!(!staged_dir_path.exists(), "RunWorkGuard drop must remove external clang.cfg staging dir");
+        jobs.end().expect("end jobs");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

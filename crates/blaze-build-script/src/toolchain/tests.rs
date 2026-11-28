@@ -60,6 +60,7 @@ fn format_linux_clang_cfg_gates_runtime_linker_paths() {
     let rpaths = ["/nix/store/extra/lib"];
     let base_link = super::LinuxClangLink {
         lib_dir: Some("/nix/store/glibc/lib"),
+        gcc_lib_dir: None,
         dynamic_linker: Some("/nix/store/glibc/lib/ld-linux-aarch64.so.1"),
         rpaths: &rpaths,
         ld_lld: Some("/h/shelf/bin/ld.lld"),
@@ -68,6 +69,7 @@ fn format_linux_clang_cfg_gates_runtime_linker_paths() {
     let clean = super::format_linux_clang_cfg("/nix/store/glibc-dev", base_link, &[], shelf, alloc);
     assert!(clean.as_str().contains("\"-B/nix/store/glibc/lib\"\n"));
     assert!(clean.as_str().contains("\"-L/nix/store/glibc/lib\"\n"));
+    assert!(clean.as_str().contains("-rtlib=compiler-rt\n"));
     assert!(!clean.as_str().contains("-Wl,-rpath,"), "default clang.cfg must not embed host rpath: {clean}");
     assert!(!clean.as_str().contains("-Wl,--dynamic-linker="), "default clang.cfg must not embed host PT_INTERP: {clean}");
 
@@ -82,16 +84,27 @@ fn format_linux_clang_cfg_gates_runtime_linker_paths() {
     assert!(probe.as_str().contains("\"-Wl,-rpath,/nix/store/extra/lib\"\n"));
     assert!(probe.as_str().contains("\"-Wl,--dynamic-linker=/nix/store/glibc/lib/ld-linux-aarch64.so.1\"\n"));
 
-    // FHS Linux without `lib_dir` STILL configures `-fuse-ld=<shelf ld.lld>` when provided.
+    // FHS Linux without `lib_dir` STILL configures `-fuse-ld=<shelf ld.lld>` when provided, and
+    // with `gcc_lib_dir` configures `--gcc-install-dir`/`-B`/`-L` for `clang++` (`libstdc++`)
+    // without overriding the host libgcc runtime with `-rtlib=compiler-rt --unwindlib=none`.
     let fhs_with_ld = super::format_linux_clang_cfg(
         "/usr",
-        super::LinuxClangLink { ld_lld: Some("/h/shelf/bin/ld.lld"), ..super::LinuxClangLink::default() },
+        super::LinuxClangLink {
+            lib_dir: Some("/usr/lib/aarch64-linux-gnu"),
+            gcc_lib_dir: Some("/usr/lib/gcc/aarch64-linux-gnu/13"),
+            ld_lld: Some("/h/shelf/bin/ld.lld"),
+            ..super::LinuxClangLink::default()
+        },
         &[],
         shelf,
         alloc,
     );
     assert!(fhs_with_ld.as_str().contains("\"--sysroot=/\"\n"));
+    assert!(fhs_with_ld.as_str().contains("\"--gcc-install-dir=/usr/lib/gcc/aarch64-linux-gnu/13\"\n"));
+    assert!(fhs_with_ld.as_str().contains("\"-B/usr/lib/gcc/aarch64-linux-gnu/13\"\n"));
+    assert!(fhs_with_ld.as_str().contains("\"-L/usr/lib/gcc/aarch64-linux-gnu/13\"\n"));
     assert!(fhs_with_ld.as_str().contains("\"-fuse-ld=/h/shelf/bin/ld.lld\"\n"));
+    assert!(!fhs_with_ld.as_str().contains("-rtlib=compiler-rt"), "FHS with gcc_lib_dir should use host libgcc/libstdc++: {fhs_with_ld}");
 }
 
 #[test]

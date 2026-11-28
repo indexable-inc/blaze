@@ -941,6 +941,7 @@ pub(crate) struct ResolvedLinuxHost<'f> {
     pub(crate) canonical_sdk: &'f str,
     pub(crate) sdk_extra: Option<&'f str>,
     pub(crate) sdk_lib: Option<&'f str>,
+    pub(crate) sdk_gcc_lib: Option<&'f str>,
     pub(crate) sdk_dynamic_linker: Option<&'f str>,
     pub(crate) sdk_rpaths: &'f [&'f str],
     pub(crate) sdk_extra_reads: &'f [&'f str],
@@ -956,6 +957,7 @@ impl<'f> ResolvedLinuxHost<'f> {
             sdk: self.canonical_sdk,
             sdk_extra: self.sdk_extra,
             sdk_lib: self.sdk_lib,
+            sdk_gcc_lib: self.sdk_gcc_lib,
             sdk_dynamic_linker: self.sdk_dynamic_linker,
             sdk_rpaths: self.sdk_rpaths,
             sdk_extra_reads: self.sdk_extra_reads,
@@ -980,11 +982,12 @@ pub(crate) fn linux_host_with_id<'f>(
         dynamic_linker: sysroot.dynamic_linker,
         rpaths: sysroot.rpaths,
     };
-    let keyed = blaze_proc_macro::native_setting::resolve_linux_sysroot(sysroot.dir, link, alloc)
+    let keyed = blaze_proc_macro::native_setting::resolve_linux_sysroot(sysroot.dir, link, crate::graph::TRIPLE, alloc)
         .map_err(|err| held(frame, format_args!("{err}")))?;
     let canonical_sdk = crate::work::held_str(keyed.sdk.as_str(), frame);
     let sdk_extra = keyed.sdk_extra.as_ref().map(|s| crate::work::held_str(s.as_str(), frame));
     let sdk_lib = keyed.sdk_lib.as_ref().map(|s| crate::work::held_str(s.as_str(), frame));
+    let sdk_gcc_lib = keyed.sdk_gcc_lib.as_ref().map(|s| crate::work::held_str(s.as_str(), frame));
     let sdk_dynamic_linker = keyed.sdk_dynamic_linker.as_ref().map(|s| crate::work::held_str(s.as_str(), frame));
     let mut rpaths_vec = blaze_own::Vec::with_capacity_in(keyed.sdk_rpaths.len(), frame);
     for rpath in keyed.sdk_rpaths.iter() {
@@ -1002,6 +1005,7 @@ pub(crate) fn linux_host_with_id<'f>(
         canonical_sdk,
         sdk_extra,
         sdk_lib,
+        sdk_gcc_lib,
         sdk_dynamic_linker,
         sdk_rpaths,
         sdk_extra_reads,

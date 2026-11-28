@@ -918,16 +918,35 @@ impl TreeRunner for ShelfTree<'_> {
             }
         }
         // `SHELF_MEMBERS_LINUX` guarantees `bin/lld` but does not require a `bin/ld.lld` alias.
-        // On Linux (both FHS and NixOS), resolve `<shelf>/bin/ld.lld` if present or stage
-        // `<folder>/ld.lld -> <shelf>/bin/lld` so `-fuse-ld=<path>` always invokes lld in GNU ELF
-        // mode without relying on ambient system `/usr/bin/ld`.
+        // Stage a Linux Clang config file (`clang.cfg`, plus optional `ld.lld` symlink) at a
+        // whitespace-free directory — `<folder>` normally, or a private `/tmp` directory cleaned
+        // up on drop via `RunWorkGuard` when `<folder>` contains whitespace (`CCC_OVERRIDE_OPTIONS`
+        // splits on ASCII whitespace).
+        let mut external_cfg_guard = crate::native_unit::RunWorkGuard::new(setting.work, alloc);
+        let mut external_cfg_dir: Option<AString<'a>> = None;
+        let linux_cfg_stage_dir: AString<'a> = if setting.sysroot == Sysroot::LinuxHost
+            && folder.as_str().bytes().any(|b| b.is_ascii_whitespace())
+        {
+            let work_digest = blaze_sha256::digest(setting.work.as_bytes());
+            let work_hex = hex(&work_digest, alloc);
+            let work_tag = work_hex.as_str().get(..12).unwrap_or(work_hex.as_str());
+            let short = named.as_str().get(..16).unwrap_or(named.as_str());
+            let leaf = joined(&["blaze-tree-cfg-", work_tag, "-", short], alloc);
+            external_cfg_guard.push_external_dir(String::from_str_in("/tmp", alloc), String::from_str_in(leaf.as_str(), alloc));
+            let dir = crate::native_unit::fresh_folder("/tmp", leaf.as_str(), &[], "process-tree", alloc)
+                .map_err(|_| fail(&[leaf.as_str(), ": could not create process-tree clang config dir"]))?;
+            external_cfg_dir = Some(String::from_str_in(dir.as_str(), alloc));
+            String::from_str_in(dir.as_str(), alloc)
+        } else {
+            String::from_str_in(folder.as_str(), alloc)
+        };
         let ld_lld_path: Option<AString<'a>> = if setting.sysroot == Sysroot::LinuxHost {
             let shelf_ld = joined(&[shelf, "/bin/ld.lld"], alloc);
             if Path::new(shelf_ld.as_str()).exists() {
                 Some(shelf_ld)
             } else {
                 let shelf_lld = joined(&[shelf, "/bin/lld"], alloc);
-                let staged_ld = joined(&[folder.as_str(), "/ld.lld"], alloc);
+                let staged_ld = joined(&[linux_cfg_stage_dir.as_str(), "/ld.lld"], alloc);
                 symlink(shelf_lld.as_str(), staged_ld.as_str())
                     .map_err(|_| fail(&[staged_ld.as_str(), ": could not link ld.lld to shelf lld"]))?;
                 held.push(String::from_str_in(staged_ld.as_str(), alloc));
@@ -936,14 +955,6 @@ impl TreeRunner for ShelfTree<'_> {
         } else {
             None
         };
-        // Stage a Linux Clang config file inside `<folder>/` (outside `<folder>/out`) and apply
-        // it per compiler invocation via `CCC_OVERRIDE_OPTIONS` rather than injecting host paths
-        // into `CFLAGS`/`LDFLAGS`. That keeps `configure`-generated `Makefile`/`config.status`
-        // free of host `sdk`, `sdk_lib`, `sdk_rpaths`, `dynamic_linker`, `shelf`, and `folder`
-        // paths so step 6 never triggers `TreeRan::HostPath`, while every `clang`/`clang++`
-        // invocation receives `-resource-dir`, `--sysroot`, `-ffile-prefix-map`, and Nix link
-        // flags automatically and any individual invocation's `--sysroot`/`-isysroot` overrides
-        // the default sysroot without affecting sibling C/C++ invocations in the same step.
         let linux_clang_cfg: Option<AString<'a>> = if setting.sysroot == Sysroot::LinuxHost {
             let mut rpath_hosts: AVec<'a, &str> = Vec::with_capacity_in(setting.sdk_rpaths.len(), alloc);
             for rpath in setting.sdk_rpaths {
@@ -951,15 +962,13 @@ impl TreeRunner for ShelfTree<'_> {
             }
             let link = LinuxClangLink {
                 lib_dir: setting.sdk_lib.map(|l| l.host),
+                gcc_lib_dir: None,
                 dynamic_linker: setting.sdk_dynamic_linker,
                 rpaths: rpath_hosts.as_slice(),
                 ld_lld: ld_lld_path.as_deref(),
                 embed_runtime_paths: runs_out_dir,
             };
-            let cfg_path = joined(&[folder.as_str(), "/clang.cfg"], alloc);
-            if cfg_path.as_str().bytes().any(|b| b.is_ascii_whitespace()) {
-                return Err(fail(&[cfg_path.as_str(), ": process-tree clang config path contains whitespace"]));
-            }
+            let cfg_path = joined(&[linux_cfg_stage_dir.as_str(), "/clang.cfg"], alloc);
             let clang_major = blaze_build_script::toolchain::clang_major(blaze_pins::CLANG_JSON).unwrap_or("23");
             let cfg_text = format_linux_clang_cfg(sdk, link, &shown, Shelf { dir: shelf, clang_major }, alloc);
             write_tree_file(cfg_path.as_str(), cfg_text.as_bytes(), |_| {
@@ -969,6 +978,9 @@ impl TreeRunner for ShelfTree<'_> {
         } else {
             None
         };
+        if let Some(ext_dir) = external_cfg_dir.as_deref() {
+            shown.push(("/cfg", ext_dir));
+        }
         for tool in self.tools.tools {
             for program in tool.programs_in(shelf, alloc) {
                 if Path::new(program.as_str()).exists() {
@@ -984,12 +996,17 @@ impl TreeRunner for ShelfTree<'_> {
 
         // 4. The roots: each read folder a tree root by its digest, the tree's folder the
         // output root (`out` and `tmp` under it).
-        let mut root_list: AVec<'a, Root<'_>> = Vec::with_capacity_in(read_roots.len() + 1, alloc);
-        let mut mounts: AVec<'a, Mount<'_>> = Vec::with_capacity_in(read_roots.len() + 1, alloc);
+        let mut root_list: AVec<'a, Root<'_>> = Vec::with_capacity_in(read_roots.len() + 2, alloc);
+        let mut mounts: AVec<'a, Mount<'_>> = Vec::with_capacity_in(read_roots.len() + 2, alloc);
         for (at, (folder, digest)) in read_roots.iter().enumerate() {
             let at = u8::try_from(at).map_err(|_| fail(&["more than 255 folders read by a process tree"]))?;
             root_list.push(Root { name: "a folder a process tree reads", kind: RootKind::Tree { tree: Digest(*digest) } });
             mounts.push(Mount { spelling: folder.as_bytes(), root: RootId(at) });
+        }
+        if let Some(ext_dir) = external_cfg_dir.as_deref() {
+            let at = u8::try_from(root_list.len()).map_err(|_| fail(&["more than 255 folders read by a process tree"]))?;
+            root_list.push(Root { name: "a process tree's staged clang config dir", kind: RootKind::Tree { tree: Digest(key.0) } });
+            mounts.push(Mount { spelling: ext_dir.as_bytes(), root: RootId(at) });
         }
         let output = RootId(u8::try_from(root_list.len()).map_err(|_| fail(&["more than 255 folders read by a process tree"]))?);
         root_list.push(Root { name: "a process tree's folder", kind: RootKind::Output });
@@ -1330,6 +1347,7 @@ mod tree_spelling_tests {
         let extra_rpaths = ["/nix/store/extra-lib/lib"];
         let nix_link = LinuxClangLink {
             lib_dir: Some("/nix/store/def-glibc/lib"),
+            gcc_lib_dir: None,
             dynamic_linker: Some("/nix/store/def-glibc/lib/ld-linux-aarch64.so.1"),
             rpaths: &extra_rpaths,
             ld_lld: Some("/h/work/trees/abc/ld.lld"),

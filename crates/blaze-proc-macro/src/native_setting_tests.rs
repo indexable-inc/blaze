@@ -261,6 +261,7 @@ fn linux_host_native_setting_accepts_linux_shelf_and_features_h() {
     let resolved_once = crate::native_setting::resolve_linux_sysroot(
         fhs_mirror.to_str().expect("utf8"),
         crate::native_setting::LinuxLinkInputs::default(),
+        LINUX_HOST,
         alloc,
     )
     .unwrap_or_else(|e| panic!("{e}"));
@@ -271,6 +272,7 @@ fn linux_host_native_setting_accepts_linux_shelf_and_features_h() {
             sdk: resolved_once.sdk.as_str(),
             sdk_extra: resolved_once.sdk_extra.as_deref(),
             sdk_lib: resolved_once.sdk_lib.as_deref(),
+            sdk_gcc_lib: resolved_once.sdk_gcc_lib.as_deref(),
             sdk_dynamic_linker: resolved_once.sdk_dynamic_linker.as_deref(),
             sdk_rpaths: &[],
             sdk_extra_reads: &[],
@@ -452,64 +454,124 @@ fn linux_host_native_setting_accepts_linux_shelf_and_features_h() {
         assert_eq!(with_large.sdk_version.len(), 64);
         assert_ne!(with_large.sdk_version.as_str(), full_owned.sdk_version.as_str());
 
-        // FHS Linux: external header symlinks AND FHS libc/CRT files are both hashed into
-        // `sdk_version` AND exported in `sdk_extra_reads` for Landlock (while unrelated sibling
-        // `.so` files in `/usr/lib/<multiarch>` are neither hashed nor granted).
+        // FHS Linux: external header symlinks, FHS libc/CRT files, AND host-arch C++/GCC runtime
+        // (`libstdc++.so*`, `libgcc_s.so*`, `lib/gcc/<triple>/<ver>/crtbeginS.o` + `libgcc.a` +
+        // `libstdc++.so`) are all hashed into `sdk_version` AND exported in `sdk_extra_reads` for
+        // Landlock, while unrelated sibling `.so` files in `/usr/lib/<multiarch>` and foreign-arch
+        // cross-libc directories are neither hashed nor granted.
         let fhs_full = home.join("fhs-full/usr");
         let fhs_inc_clang = fhs_full.join("include/clang/19");
         let ext_clang_inc = home.join("ext-llvm-19/lib/clang/19/include");
         let ext_file_dir = home.join("ext-file-header");
-        let fhs_lib = fhs_full.join("lib/aarch64-linux-gnu");
-        fs::create_dir_all(&fhs_inc_clang).expect("fhs inc clang");
-        fs::create_dir_all(&ext_clang_inc).expect("ext clang inc");
-        fs::create_dir_all(&ext_file_dir).expect("ext file dir");
-        fs::create_dir_all(&fhs_lib).expect("fhs lib");
+        let fhs_lib_arm = fhs_full.join("lib/aarch64-linux-gnu");
+        let fhs_lib_x86 = fhs_full.join("lib/x86_64-linux-gnu");
+        let fhs_gcc_arm_12 = fhs_full.join("lib/gcc/aarch64-linux-gnu/12");
+        let fhs_gcc_arm_14 = fhs_full.join("lib/gcc/aarch64-linux-gnu/14");
+        let fhs_gcc_x86_14 = fhs_full.join("lib/gcc/x86_64-linux-gnu/14");
+        for dir in [&fhs_inc_clang, &ext_clang_inc, &ext_file_dir, &fhs_lib_arm, &fhs_lib_x86, &fhs_gcc_arm_12, &fhs_gcc_arm_14, &fhs_gcc_x86_14] {
+            fs::create_dir_all(dir).expect("fhs dir");
+        }
         fs::write(fhs_full.join(LINUX_HOST_SYSROOT_MARKER), b"#define __GLIBC__ 2\n").expect("fhs features.h");
         fs::write(ext_clang_inc.join("stddef.h"), b"typedef unsigned long size_t;\n").expect("ext stddef.h");
         fs::write(ext_file_dir.join("real.h"), b"#define EXT_VER 1\n").expect("ext real.h");
         std::os::unix::fs::symlink(&ext_clang_inc, fhs_inc_clang.join("include")).expect("symlink clang inc");
         std::os::unix::fs::symlink(ext_file_dir.join("real.h"), fhs_full.join("include/ext.h")).expect("symlink ext.h");
-        fs::write(fhs_lib.join("crt1.o"), b"fhs-crt1-v1").expect("fhs crt1.o");
-        fs::write(fhs_lib.join("libc.so"), b"GROUP ( libc.so.6 )\n").expect("fhs libc.so");
-        fs::write(fhs_lib.join("libc.so.6"), b"fhs-libc6-v1").expect("fhs libc.so.6");
-        fs::write(fhs_lib.join("ld-linux-aarch64.so.1"), b"fhs-ldso-v1").expect("fhs ldso");
-        fs::write(fhs_lib.join("libunrelated-desktop.so"), b"desktop-blob").expect("unrelated so");
+        fs::write(fhs_lib_arm.join("crt1.o"), b"fhs-arm-crt1-v1").expect("fhs arm crt1.o");
+        fs::write(fhs_lib_arm.join("libc.so"), b"GROUP ( libc.so.6 )\n").expect("fhs arm libc.so");
+        fs::write(fhs_lib_arm.join("libc.so.6"), b"fhs-arm-libc6-v1").expect("fhs arm libc.so.6");
+        fs::write(fhs_lib_arm.join("libstdc++.so.6.0.33"), b"fhs-arm-libstdcxx-v1").expect("fhs arm libstdc++");
+        std::os::unix::fs::symlink(fhs_lib_arm.join("libstdc++.so.6.0.33"), fhs_lib_arm.join("libstdc++.so.6")).expect("symlink arm libstdc++.so.6");
+        fs::write(fhs_lib_arm.join("libgcc_s.so.1"), b"fhs-arm-libgcc_s-v1").expect("fhs arm libgcc_s");
+        fs::write(fhs_lib_arm.join("ld-linux-aarch64.so.1"), b"fhs-arm-ldso-v1").expect("fhs arm ldso");
+        fs::write(fhs_lib_arm.join("libunrelated-desktop.so"), b"desktop-blob").expect("unrelated so");
+        fs::write(fhs_gcc_arm_12.join("crtbeginS.o"), b"gcc12-crtbeginS").expect("gcc12 crtbeginS");
+        fs::write(fhs_gcc_arm_14.join("crtbeginS.o"), b"gcc14-crtbeginS-v1").expect("gcc14 crtbeginS");
+        fs::write(fhs_gcc_arm_14.join("crtendS.o"), b"gcc14-crtendS-v1").expect("gcc14 crtendS");
+        fs::write(fhs_gcc_arm_14.join("libgcc.a"), b"gcc14-libgcc-v1").expect("gcc14 libgcc");
+        std::os::unix::fs::symlink(fhs_lib_arm.join("libstdc++.so.6.0.33"), fhs_gcc_arm_14.join("libstdc++.so")).expect("symlink gcc14 libstdc++.so");
+
+        // Foreign cross-libc (x86_64) present beside aarch64: each host triple must pick ONLY its own arch.
+        fs::write(fhs_lib_x86.join("crt1.o"), b"fhs-x86-crt1").expect("fhs x86 crt1.o");
+        fs::write(fhs_lib_x86.join("libc.so"), b"GROUP ( libc.so.6 )\n").expect("fhs x86 libc.so");
+        fs::write(fhs_lib_x86.join("libc.so.6"), b"fhs-x86-libc6").expect("fhs x86 libc.so.6");
+        fs::write(fhs_lib_x86.join("ld-linux-x86-64.so.2"), b"fhs-x86-ldso").expect("fhs x86 ldso");
+        fs::write(fhs_gcc_x86_14.join("crtbeginS.o"), b"x86-gcc14-crtbeginS").expect("x86 gcc14 crtbeginS");
+        fs::write(fhs_gcc_x86_14.join("libstdc++.so"), b"x86-gcc14-libstdcxx").expect("x86 gcc14 libstdc++");
 
         let fhs_s = fhs_full.to_str().expect("utf8 fhs");
         let fhs_owned_v1 = command_native_setting(home_s, fhs_s, "test", LINUX_HOST, alloc)
             .unwrap_or_else(|e| panic!("FHS full setting failed: {e}"));
         let canon_ext_dir = fs::canonicalize(&ext_clang_inc).expect("canon ext dir");
         let canon_ext_file = fs::canonicalize(ext_file_dir.join("real.h")).expect("canon ext file");
-        let canon_fhs_lib = fs::canonicalize(&fhs_lib).expect("canon fhs lib");
-        let canon_crt1 = fs::canonicalize(fhs_lib.join("crt1.o")).expect("canon crt1");
-        let canon_libc6 = fs::canonicalize(fhs_lib.join("libc.so.6")).expect("canon libc6");
-        let canon_ldso = fs::canonicalize(fhs_lib.join("ld-linux-aarch64.so.1")).expect("canon ldso");
-        let canon_unrelated = fs::canonicalize(fhs_lib.join("libunrelated-desktop.so")).expect("canon unrelated");
+        let canon_fhs_lib = fs::canonicalize(&fhs_lib_arm).expect("canon fhs lib");
+        let canon_fhs_x86_lib = fs::canonicalize(&fhs_lib_x86).expect("canon fhs x86 lib");
+        let canon_gcc_arm_14 = fs::canonicalize(&fhs_gcc_arm_14).expect("canon gcc14 arm");
+        let canon_gcc_x86_14 = fs::canonicalize(&fhs_gcc_x86_14).expect("canon gcc14 x86");
+        let canon_crt1 = fs::canonicalize(fhs_lib_arm.join("crt1.o")).expect("canon crt1");
+        let canon_libc6 = fs::canonicalize(fhs_lib_arm.join("libc.so.6")).expect("canon libc6");
+        let canon_libstdcxx = fs::canonicalize(fhs_lib_arm.join("libstdc++.so.6.0.33")).expect("canon libstdc++");
+        let canon_libgcc_s = fs::canonicalize(fhs_lib_arm.join("libgcc_s.so.1")).expect("canon libgcc_s");
+        let canon_crtbegin = fs::canonicalize(fhs_gcc_arm_14.join("crtbeginS.o")).expect("canon crtbeginS");
+        let canon_libgcc_a = fs::canonicalize(fhs_gcc_arm_14.join("libgcc.a")).expect("canon libgcc.a");
+        let canon_ldso = fs::canonicalize(fhs_lib_arm.join("ld-linux-aarch64.so.1")).expect("canon ldso");
+        let canon_x86_ldso = fs::canonicalize(fhs_lib_x86.join("ld-linux-x86-64.so.2")).expect("canon x86 ldso");
+        let canon_unrelated = fs::canonicalize(fhs_lib_arm.join("libunrelated-desktop.so")).expect("canon unrelated");
 
         assert_eq!(fhs_owned_v1.sdk_lib.as_deref(), canon_fhs_lib.to_str());
+        assert_eq!(fhs_owned_v1.sdk_gcc_lib.as_deref(), canon_gcc_arm_14.to_str(), "must pick highest host GCC version dir");
         assert_eq!(fhs_owned_v1.sdk_dynamic_linker.as_deref(), canon_ldso.to_str());
         let fhs_jobs = jobserver(&fhs_owned_v1);
         let fhs_lent = fhs_owned_v1.setting(&fhs_jobs);
+        assert_eq!(fhs_lent.sdk_gcc_lib, canon_gcc_arm_14.to_str());
         let extra_reads: std::vec::Vec<&str> = fhs_lent.sdk_extra_reads.iter().collect();
         assert!(extra_reads.contains(&canon_ext_dir.to_str().expect("utf8")), "external header dir symlink target must be granted: {extra_reads:?}");
         assert!(extra_reads.contains(&canon_ext_file.to_str().expect("utf8")), "external header file symlink target must be granted: {extra_reads:?}");
         assert!(extra_reads.contains(&canon_crt1.to_str().expect("utf8")), "FHS crt1.o must be granted: {extra_reads:?}");
         assert!(extra_reads.contains(&canon_libc6.to_str().expect("utf8")), "FHS libc.so.6 must be granted: {extra_reads:?}");
+        assert!(extra_reads.contains(&canon_libstdcxx.to_str().expect("utf8")), "FHS libstdc++ must be granted: {extra_reads:?}");
+        assert!(extra_reads.contains(&canon_libgcc_s.to_str().expect("utf8")), "FHS libgcc_s must be granted: {extra_reads:?}");
+        assert!(extra_reads.contains(&canon_crtbegin.to_str().expect("utf8")), "FHS GCC crtbeginS.o must be granted: {extra_reads:?}");
+        assert!(extra_reads.contains(&canon_libgcc_a.to_str().expect("utf8")), "FHS GCC libgcc.a must be granted: {extra_reads:?}");
         assert!(extra_reads.contains(&canon_ldso.to_str().expect("utf8")), "FHS ld-linux must be granted: {extra_reads:?}");
         assert!(!extra_reads.contains(&canon_fhs_lib.to_str().expect("utf8")), "FHS must grant hashed libc files, not blanket /usr/lib/<arch>: {extra_reads:?}");
         assert!(!extra_reads.contains(&canon_unrelated.to_str().expect("utf8")), "unrelated /usr/lib .so must not be granted: {extra_reads:?}");
         fhs_jobs.end().unwrap_or_else(|e| panic!("{e}"));
 
-        // Editing a hashed FHS libc file OR a file under an external symlink target MUST move `sdk_version`.
-        fs::write(fhs_lib.join("libc.so.6"), b"fhs-libc6-v2").expect("fhs libc.so.6 v2");
+        // Multiarch host selection: `x86_64-unknown-linux-gnu` MUST select `x86_64-linux-gnu` +
+        // `ld-linux-x86-64.so.2` + `lib/gcc/x86_64-linux-gnu/14`, NEVER `aarch64-linux-gnu`!
+        let fhs_x86_resolved = crate::native_setting::resolve_linux_sysroot(
+            fhs_s,
+            crate::native_setting::LinuxLinkInputs::default(),
+            "x86_64-unknown-linux-gnu",
+            alloc,
+        )
+        .unwrap_or_else(|e| panic!("x86_64 FHS resolve failed: {e}"));
+        assert_eq!(fhs_x86_resolved.sdk_lib.as_deref(), canon_fhs_x86_lib.to_str());
+        assert_eq!(fhs_x86_resolved.sdk_gcc_lib.as_deref(), canon_gcc_x86_14.to_str());
+        assert_eq!(fhs_x86_resolved.sdk_dynamic_linker.as_deref(), canon_x86_ldso.to_str());
+        assert!(!fhs_x86_resolved.sdk_extra_reads.iter().any(|p| p.as_str().contains("aarch64")), "x86_64 resolve must never pull in aarch64 libs");
+
+        // Editing a hashed FHS libc file, C++ runtime file, GCC CRT file, OR external symlink
+        // target MUST move `sdk_version`.
+        fs::write(fhs_lib_arm.join("libc.so.6"), b"fhs-arm-libc6-v2").expect("fhs libc.so.6 v2");
         let fhs_owned_v2 = command_native_setting(home_s, fhs_s, "test", LINUX_HOST, alloc)
             .unwrap_or_else(|e| panic!("{e}"));
         assert_ne!(fhs_owned_v1.sdk_version.as_str(), fhs_owned_v2.sdk_version.as_str(), "updating FHS libc.so.6 must invalidate sdk_version");
 
+        fs::write(fhs_lib_arm.join("libstdc++.so.6.0.33"), b"fhs-arm-libstdcxx-v2").expect("fhs libstdc++ v2");
+        let fhs_owned_v2b = command_native_setting(home_s, fhs_s, "test", LINUX_HOST, alloc)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_ne!(fhs_owned_v2.sdk_version.as_str(), fhs_owned_v2b.sdk_version.as_str(), "updating FHS libstdc++ must invalidate sdk_version");
+
+        fs::write(fhs_gcc_arm_14.join("crtbeginS.o"), b"gcc14-crtbeginS-v2").expect("fhs crtbeginS v2");
+        let fhs_owned_v2c = command_native_setting(home_s, fhs_s, "test", LINUX_HOST, alloc)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_ne!(fhs_owned_v2b.sdk_version.as_str(), fhs_owned_v2c.sdk_version.as_str(), "updating FHS GCC crtbeginS.o must invalidate sdk_version");
+
         fs::write(ext_clang_inc.join("stddef.h"), b"typedef unsigned long long size_t;\n").expect("ext stddef.h v2");
         let fhs_owned_v3 = command_native_setting(home_s, fhs_s, "test", LINUX_HOST, alloc)
             .unwrap_or_else(|e| panic!("{e}"));
-        assert_ne!(fhs_owned_v2.sdk_version.as_str(), fhs_owned_v3.sdk_version.as_str(), "updating external symlinked header must invalidate sdk_version");
+        assert_ne!(fhs_owned_v2c.sdk_version.as_str(), fhs_owned_v3.sdk_version.as_str(), "updating external symlinked header must invalidate sdk_version");
 
         // Negative control: a symlink loop on `<sdk>/include/linux` propagates `NoSdk` naming
         // `include/linux` instead of silently dropping `sdk_extra`.

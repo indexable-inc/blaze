@@ -536,6 +536,11 @@ pub fn shelf_missing_for(sysroot: Sysroot, mut present: impl FnMut(&str) -> bool
 #[derive(Clone, Copy, Default, Debug)]
 pub struct LinuxClangLink<'s> {
     pub lib_dir: Option<&'s str>,
+    /// Optional host-architecture GCC runtime directory on FHS Linux (e.g.
+    /// `/usr/lib/gcc/aarch64-linux-gnu/13`, holding `crtbeginS.o`, `libgcc.a`, `libstdc++.so`).
+    /// Passed via `--gcc-install-dir`, `-B`, and `-L` so `clang++` finds the host C++ runtime
+    /// without probing ungranted parent directories under Landlock.
+    pub gcc_lib_dir: Option<&'s str>,
     pub dynamic_linker: Option<&'s str>,
     pub rpaths: &'s [&'s str],
     pub ld_lld: Option<&'s str>,
@@ -609,6 +614,20 @@ pub fn format_linux_clang_cfg<'a>(
         push_cfg_quoted(&mut cfg, map.as_str());
     }
 
+    if let Some(gcc_dir) = link.gcc_lib_dir {
+        let mut gcc_flag = String::from_str_in("--gcc-install-dir=", alloc);
+        gcc_flag.push_str(gcc_dir);
+        push_cfg_quoted(&mut cfg, gcc_flag.as_str());
+
+        let mut b_flag = String::from_str_in("-B", alloc);
+        b_flag.push_str(gcc_dir);
+        push_cfg_quoted(&mut cfg, b_flag.as_str());
+
+        let mut l_flag = String::from_str_in("-L", alloc);
+        l_flag.push_str(gcc_dir);
+        push_cfg_quoted(&mut cfg, l_flag.as_str());
+    }
+
     if let Some(lib_dir) = link.lib_dir {
         let mut b_flag = String::from_str_in("-B", alloc);
         b_flag.push_str(lib_dir);
@@ -636,8 +655,10 @@ pub fn format_linux_clang_cfg<'a>(
                 push_cfg_quoted(&mut cfg, dyn_flag.as_str());
             }
         }
-        cfg.push_str("-rtlib=compiler-rt\n");
-        cfg.push_str("--unwindlib=none\n");
+        if link.gcc_lib_dir.is_none() {
+            cfg.push_str("-rtlib=compiler-rt\n");
+            cfg.push_str("--unwindlib=none\n");
+        }
     }
 
     if let Some(ld_lld) = link.ld_lld {
