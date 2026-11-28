@@ -4,8 +4,10 @@
 //! one `Argument::new_display(&arg)` (`new_debug`, `new_lower_hex`, ..) per use, each
 //! `fn new_display<T: Display + ?Sized>(x: &T)`, and `Argument::from_usize(&arg)` for a width or
 //! precision (`x: &usize`). Checked here to the same effect: each argument once, a shared
-//! borrow recorded on it (codegen takes `&arg`), `T: Trait` per use with `T` the argument's type,
-//! and an argument used as a count coerced to `usize`. The node is `core::fmt::Arguments`.
+//! borrow recorded on it (codegen takes `&arg`), `T: Trait` per use with `T` the argument's
+//! pointee type, and an argument used as a count deref-coerced as `&arg -> &usize` (so `usize`,
+//! `&usize`, `&&usize`, `&mut usize`, `Box<usize>`, and `Deref<Target = usize>` all work, and
+//! unsuffixed integer literals still infer `usize`). The node is `core::fmt::Arguments`.
 //!
 //! `.await`: rustc's `lower_expr_await` calls `IntoFuture::into_future(e)` and loops on
 //! `Future::poll`, so `e.await` proves `T: IntoFuture` and has type
@@ -16,7 +18,7 @@
 
 use crate::body::FmtTrait;
 use crate::columns::AdjustKind;
-use crate::diag::{At, DiagCode};
+use crate::diag::{About, At, DiagCode};
 use crate::error::{CheckError, Malformed, Stop};
 use crate::ids::{ExprId, LangItem, List, Mutbl, Name};
 use crate::machine::{Expectation, Flow, Frame, Machine, Then};
@@ -47,14 +49,8 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             let i = f.a;
             f.a += 1;
             let arg = arg_ids[i as usize];
-            let count = use_list.iter().any(|u| u.arg == i && u.trait_ == FmtTrait::Count);
             self.resume(f, 1)?;
-            if count {
-                let to = self.common.usize_;
-                self.push_expr(arg, Expectation::HasType(to), Then::Coerce { to, two_phase: false })?;
-            } else {
-                self.push_expr(arg, Expectation::None, Then::Nothing)?;
-            }
+            self.push_expr(arg, Expectation::None, Then::Nothing)?;
             return Ok(Flow::Wait);
         }
         match self.lang(LangItem::FormatArguments)? {
@@ -69,26 +65,70 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         }
     }
 
-    /// Argument `i` (expression `arg`, type `t`): `t: Trait` for each of its uses, then the
-    /// shared borrow every use takes.
+    /// Argument `i` (expression `arg`, type `t`): for a `FmtTrait::Count` use, deref-coerce
+    /// `&arg` to `&usize` (matching `Argument::from_usize(&arg)`); otherwise take the shared
+    /// borrow `&arg`. Every formatting-trait use registers `pointee: Trait`.
     fn fmt_uses_of(&mut self, arg: ExprId, i: u32, t: Ty, uses: List) -> Result<(), Stop> {
         let use_list = self.body.fmt_use_list(uses)?;
         if self.is_err(t) {
+            return Ok(());
+        }
+        let count = use_list.iter().any(|u| u.arg == i && u.trait_ == FmtTrait::Count);
+        let pointee = if count {
+            self.fmt_count_borrow(arg, t)?
+        } else {
+            let borrowed = self.mk(TyView::Ref(Mutbl::Not, t))?;
+            self.adjust.push((arg, AdjustKind::Borrow { mutbl: Mutbl::Not, two_phase: false, raw: false }, borrowed));
+            t
+        };
+        if self.is_err(pointee) {
             return Ok(());
         }
         for u in use_list.iter().filter(|u| u.arg == i) {
             let Some(l) = u.trait_.lang() else { continue };
             match self.lang(l)? {
                 Some(tr) => {
-                    let args = self.mk_list(&[t])?;
+                    let args = self.mk_list(&[pointee])?;
                     self.register_trait(tr, args, Cause::Expr(arg))?;
                 }
                 None => self.missing_lang(l, At::Expr(arg)),
             }
         }
+        Ok(())
+    }
+
+    /// Deref-coerces `&arg` (where `arg: t`) to `&usize`, matching
+    /// `core::fmt::rt::Argument::from_usize(x: &usize)`: walks `t`'s autoderef chain until a step
+    /// unifies with `usize`, recording the leading derefs and shared borrow `&usize` on `arg`.
+    fn fmt_count_borrow(&mut self, arg: ExprId, t: Ty) -> Result<Ty, Stop> {
+        let usize_ = self.common.usize_;
+        let ref_usize = self.mk(TyView::Ref(Mutbl::Not, usize_))?;
+        let t = self.ty.shallow_resolve(t);
+        if self.is_never(t) {
+            self.adjust.push((arg, AdjustKind::NeverToAny, ref_usize));
+            return Ok(usize_);
+        }
+        let prev_place = self.place;
+        self.place = Cause::Expr(arg);
+        let found: Result<Option<()>, Stop> = self.commit_if(|m| {
+            let (steps, _limit) = m.autoderef(t, false)?;
+            for (idx, step) in steps.iter().enumerate() {
+                if m.commit_if(|m| Ok::<_, Stop>(m.unify(step.ty, usize_)?.then_some(())))?.is_some() {
+                    m.adjust_autoderef(arg, &steps, idx);
+                    m.adjust.push((arg, AdjustKind::Borrow { mutbl: Mutbl::Not, two_phase: false, raw: false }, ref_usize));
+                    return Ok(Some(()));
+                }
+            }
+            Ok(None)
+        });
+        self.place = prev_place;
+        if found?.is_some() {
+            return Ok(usize_);
+        }
+        self.diag(DiagCode::Mismatch, At::Expr(arg), About::types(usize_, t));
         let borrowed = self.mk(TyView::Ref(Mutbl::Not, t))?;
         self.adjust.push((arg, AdjustKind::Borrow { mutbl: Mutbl::Not, two_phase: false, raw: false }, borrowed));
-        Ok(())
+        Ok(self.common.err)
     }
 
     /// `operand.await`.
