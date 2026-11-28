@@ -1137,3 +1137,181 @@ fn effect_row_set_algebra_properties() {
         })
     });
 }
+
+// ---- syscall authority sets & sans-io / sandbox effect algebra -----------------------------
+
+#[test]
+fn syscall_set_bits_words_display_and_lowering_mode() {
+    use crate::syscall_ty::SyscallSet;
+
+    // Exact partition of all 8 authority bits into tail-resumptive (0..=3) and suspending (4..=7).
+    assert_eq!(
+        SyscallSet::CLOCK.union(SyscallSet::RNG).union(SyscallSet::VM).union(SyscallSet::STAT),
+        SyscallSet::TAIL_RESUMPTIVE
+    );
+    assert_eq!(
+        SyscallSet::FS.union(SyscallSet::NET).union(SyscallSet::PROC).union(SyscallSet::SYNC),
+        SyscallSet::SUSPENDING
+    );
+    assert_eq!(SyscallSet::TAIL_RESUMPTIVE.intersection(SyscallSet::SUSPENDING), SyscallSet::EMPTY);
+    assert_eq!(SyscallSet::TAIL_RESUMPTIVE.union(SyscallSet::SUSPENDING), SyscallSet::ALL);
+    assert_eq!(SyscallSet::EMPTY.bits(), 0);
+    assert_eq!(SyscallSet::ALL.bits(), 0xFF);
+    assert!(SyscallSet::EMPTY.is_empty());
+    assert!(!SyscallSet::CLOCK.is_empty());
+
+    // Word parsing accepts both bare and `sys::` prefixed forms.
+    let words = [
+        ("clock", "sys::clock", SyscallSet::CLOCK),
+        ("rng", "sys::rng", SyscallSet::RNG),
+        ("vm", "sys::vm", SyscallSet::VM),
+        ("stat", "sys::stat", SyscallSet::STAT),
+        ("fs", "sys::fs", SyscallSet::FS),
+        ("net", "sys::net", SyscallSet::NET),
+        ("proc", "sys::proc", SyscallSet::PROC),
+        ("sync", "sys::sync", SyscallSet::SYNC),
+    ];
+    for (bare, prefixed, expected) in words {
+        assert_eq!(SyscallSet::from_word(bare), Some(expected));
+        assert_eq!(SyscallSet::from_word(prefixed), Some(expected));
+    }
+    assert_eq!(SyscallSet::from_word("sys::unknown"), None);
+    assert_eq!(SyscallSet::from_word(""), None);
+
+    // Canonical Display formatting.
+    assert_eq!(format!("{}", SyscallSet::EMPTY), "sys()");
+    assert_eq!(format!("{}", SyscallSet::CLOCK), "sys(clock)");
+    assert_eq!(format!("{}", SyscallSet::FS.union(SyscallSet::CLOCK)), "sys(clock, fs)");
+    assert_eq!(format!("{}", SyscallSet::ALL), "sys(clock, rng, vm, stat, fs, net, proc, sync)");
+
+    // Tail-resumptive domains never require suspension and lower to PlainFn.
+    assert!(!SyscallSet::EMPTY.requires_suspend());
+    assert_eq!(SyscallSet::EMPTY.implied_effects(), EffectSet::PURE);
+    assert_eq!(SyscallSet::EMPTY.lowering_mode(), LoweringMode::PlainFn);
+
+    assert!(!SyscallSet::TAIL_RESUMPTIVE.requires_suspend());
+    assert_eq!(SyscallSet::TAIL_RESUMPTIVE.implied_effects(), EffectSet::PURE);
+    assert_eq!(SyscallSet::TAIL_RESUMPTIVE.lowering_mode(), LoweringMode::PlainFn);
+
+    // Any suspending domain implies EffectSet::SUSPEND and lowers to MachineCoroutine.
+    for domain in [SyscallSet::FS, SyscallSet::NET, SyscallSet::PROC, SyscallSet::SYNC] {
+        assert!(domain.requires_suspend());
+        assert_eq!(domain.implied_effects(), EffectSet::SUSPEND);
+        assert_eq!(domain.lowering_mode(), LoweringMode::MachineCoroutine);
+        let mixed = domain.union(SyscallSet::TAIL_RESUMPTIVE);
+        assert!(mixed.requires_suspend());
+        assert_eq!(mixed.implied_effects(), EffectSet::SUSPEND);
+        assert_eq!(mixed.lowering_mode(), LoweringMode::MachineCoroutine);
+    }
+}
+
+#[test]
+fn syscall_policy_and_sans_io_checks() {
+    use crate::syscall_ty::{
+        SyscallPolicyError, SyscallSet, check_sans_io, check_syscall_policy, is_sans_io_clean,
+    };
+
+    let fs_clock = SyscallSet::FS.union(SyscallSet::CLOCK);
+    assert_eq!(check_syscall_policy(SyscallSet::EMPTY, SyscallSet::EMPTY), Ok(()));
+    assert_eq!(check_syscall_policy(SyscallSet::CLOCK, fs_clock), Ok(()));
+    assert_eq!(check_syscall_policy(fs_clock, fs_clock), Ok(()));
+
+    let err = check_syscall_policy(SyscallSet::NET.union(SyscallSet::CLOCK), fs_clock).unwrap_err();
+    assert_eq!(
+        err,
+        SyscallPolicyError::SyscallExceedsPolicy {
+            required: SyscallSet::NET.union(SyscallSet::CLOCK),
+            allowed: fs_clock,
+        }
+    );
+    let err_msg = format!("{err}");
+    assert!(err_msg.contains("net"), "error message must name disallowed domain: {err_msg}");
+
+    // Pure, allocating, panicking, or diverging code with zero syscalls is sans-IO clean.
+    let pure_compute = EffectSet::ALLOC.union(EffectSet::PANIC).union(EffectSet::DIVERGE);
+    assert!(SyscallSet::is_sans_io_clean(EffectSet::PURE, SyscallSet::EMPTY));
+    assert!(is_sans_io_clean(pure_compute, SyscallSet::EMPTY));
+    assert_eq!(check_sans_io(pure_compute, SyscallSet::EMPTY), Ok(()));
+
+    // Any syscall (even tail-resumptive CLOCK), BLOCK, or SUSPEND violates sans-IO.
+    assert!(!is_sans_io_clean(EffectSet::PURE, SyscallSet::CLOCK));
+    assert_eq!(
+        check_sans_io(EffectSet::PURE, SyscallSet::CLOCK),
+        Err(SyscallPolicyError::SansIoViolation { effects: EffectSet::PURE, syscalls: SyscallSet::CLOCK })
+    );
+    assert_eq!(
+        check_sans_io(EffectSet::BLOCK, SyscallSet::EMPTY),
+        Err(SyscallPolicyError::SansIoViolation { effects: EffectSet::BLOCK, syscalls: SyscallSet::EMPTY })
+    );
+    assert_eq!(
+        check_sans_io(EffectSet::SUSPEND, SyscallSet::EMPTY),
+        Err(SyscallPolicyError::SansIoViolation { effects: EffectSet::SUSPEND, syscalls: SyscallSet::EMPTY })
+    );
+    let sans_io_msg = format!(
+        "{}",
+        SyscallPolicyError::SansIoViolation { effects: EffectSet::BLOCK, syscalls: SyscallSet::FS }
+    );
+    assert!(sans_io_msg.contains("sans-io"), "violation display should mention sans-io: {sans_io_msg}");
+}
+
+#[test]
+fn syscall_set_algebra_and_soundness_properties() {
+    use crate::syscall_ty::{SyscallSet, check_sans_io, check_syscall_policy};
+
+    fn draw_syscalls(tape: &Tape, name: &'static str) -> SyscallSet {
+        SyscallSet::from_bits(tape.int_in(0u8..=u8::MAX, name))
+    }
+    fn draw_effects(tape: &Tape, name: &'static str) -> EffectSet {
+        EffectSet::from_bits(tape.int_in(0u8..=31, name))
+    }
+
+    blaze_sim::check(Config::cases(500), |tape| {
+        let a = draw_syscalls(tape, "a");
+        let b = draw_syscalls(tape, "b");
+        let c = draw_syscalls(tape, "c");
+        let eff = draw_effects(tape, "eff");
+
+        // Boolean lattice laws.
+        oracle(a.union(b) == b.union(a), || format!("union not commutative for {a}, {b}"))?;
+        oracle(a.intersection(b) == b.intersection(a), || format!("intersection not commutative for {a}, {b}"))?;
+        oracle(a.union(b).union(c) == a.union(b.union(c)), || format!("union not associative for {a}, {b}, {c}"))?;
+        oracle(a.union(a) == a && a.intersection(a) == a, || format!("not idempotent for {a}"))?;
+        oracle(a.union(SyscallSet::EMPTY) == a, || format!("EMPTY not union identity for {a}"))?;
+        oracle(a.intersection(SyscallSet::ALL) == a, || format!("ALL not intersection identity for {a}"))?;
+        oracle(a.difference(a).is_empty(), || format!("self difference non-empty for {a}"))?;
+        oracle(a.is_subset_of(b) == a.difference(b).is_empty(), || format!("subset/difference mismatch for {a}, {b}"))?;
+        oracle(a.is_subset_of(b) == b.contains(a), || format!("subset/contains mismatch for {a}, {b}"))?;
+
+        // Suspension & lowering soundness.
+        let has_susp = !a.intersection(SyscallSet::SUSPENDING).is_empty();
+        oracle(a.requires_suspend() == has_susp, || format!("requires_suspend wrong for {a}"))?;
+        let expected_eff = if has_susp { EffectSet::SUSPEND } else { EffectSet::PURE };
+        oracle(a.implied_effects() == expected_eff, || format!("implied_effects wrong for {a}"))?;
+        oracle(a.lowering_mode() == LoweringMode::for_effects(expected_eff), || {
+            format!("lowering_mode wrong for {a}")
+        })?;
+        if a.is_subset_of(b) && a.requires_suspend() {
+            oracle(b.requires_suspend(), || format!("requires_suspend not monotone: {a} <= {b}"))?;
+        }
+
+        // Policy & sans-IO agreement.
+        oracle(check_syscall_policy(a, b).is_ok() == a.is_subset_of(b), || {
+            format!("check_syscall_policy disagrees with is_subset_of for {a}, {b}")
+        })?;
+        let expected_clean =
+            a.is_empty() && !eff.contains(EffectSet::BLOCK) && !eff.contains(EffectSet::SUSPEND);
+        oracle(SyscallSet::is_sans_io_clean(eff, a) == expected_clean, || {
+            format!("is_sans_io_clean wrong for {eff}, {a}")
+        })?;
+        oracle(check_sans_io(eff, a).is_ok() == expected_clean, || {
+            format!("check_sans_io disagrees with is_sans_io_clean for {eff}, {a}")
+        })?;
+        if expected_clean {
+            oracle(
+                a.lowering_mode() == LoweringMode::PlainFn && LoweringMode::for_effects(eff) == LoweringMode::PlainFn,
+                || format!("sans-io clean item must lower as PlainFn: {eff}, {a}"),
+            )?;
+        }
+        Ok::<(), Broke>(())
+    });
+}

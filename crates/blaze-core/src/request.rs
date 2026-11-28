@@ -15,6 +15,7 @@
 //!   `Unflushed` and returns `File<'io, Flushed>` in its answer, and `RenameFlushed` requires a
 //!   `FlushedProof` minted only by `Flush`—making durability ordering checkable in types.
 
+mod direct;
 mod handler;
 mod net;
 #[cfg(test)]
@@ -32,6 +33,13 @@ use crate::handle::{
 };
 use crate::{DirName, FileName, Listing, LockMode, Meta};
 
+pub use direct::{
+    DirectFsBackend, DirectFsHandler, DirectFsHandlerError, InMemoryDirectFs, PlannedSqe, SqeFlags,
+    SqeOpcode, SqePlanPlant, UringSqePlan, plan_batch_stat, plan_batch_stat_with,
+    plan_chain_write_flush, plan_chain_write_flush_with, plan_flush, plan_flush_with,
+    plan_read_into, plan_read_into_with, plan_stat, plan_stat_with, plan_write_from,
+    plan_write_from_with,
+};
 pub use handler::{DriverHandler, DriverHandlerError, SimHandler, SimHandlerError};
 pub use net::{
     Accept, CloseConn, Connect, ConnectOpts, Listen, ListenOpts, NetError, RecvInto, RecvIntoOpts,

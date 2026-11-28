@@ -8,8 +8,8 @@ use crate::{
     builder::{MemAttrs, Param, Variadic},
     coroutine::{FIRST_POINT, RETURNED, Saved},
     coroutine_machine::{
-        MachineEdge, MachineEdgeKind, MachineError, MachinePlant, MachineShape, split_machine,
-        split_machine_with_plant,
+        MachineBudget, MachineEdge, MachineEdgeKind, MachineError, MachinePlant, MachineShape,
+        split_machine, split_machine_bounded, split_machine_with_plant,
     },
     func::{Conv, RefKind, SlotId, SlotKind},
     verify,
@@ -184,6 +184,10 @@ fn valid_multi_suspend_machine_lowers_with_zero_pin_and_exact_graph() {
         MachineEdge { from_point: Some(1), to_point: None, kind: MachineEdgeKind::Cancel },
     ];
     assert_eq!(&split.graph.edges[..], &expected[..]);
+    assert!(split.graph.reaches_return());
+    assert!(split.graph.has_cancel_edge(0));
+    assert!(split.graph.has_cancel_edge(1));
+    assert!(!split.graph.has_cancel_edge(2));
 }
 
 #[test]
@@ -411,4 +415,90 @@ fn unreachable_suspend_block_reports_unreachable_resume() {
     let err = split_machine(func.view(), shape, Global)
         .expect_err("unreachable suspend must be rejected");
     assert_eq!(err, MachineError::UnreachableResume { point: 9 });
+}
+
+#[test]
+fn state_size_budget_accepts_compact_machine_and_rejects_oversized_state() {
+    let (func, shape) = build_two_suspend_body();
+
+    // Tight 8-byte cap must reject the two-suspend machine whose prefix + live SSA values exceed 8 bytes.
+    let err = split_machine_bounded(
+        func.view(),
+        shape,
+        MachineBudget::max_bytes(8),
+        MachinePlant::None,
+        Global,
+    )
+    .expect_err("oversized suspended state must be rejected by tight MachineBudget");
+
+    let (actual, largest_field_size) = match err {
+        MachineError::StateSizeExceeded { actual, max, largest_field_size } => {
+            assert_eq!(max, 8);
+            assert!(actual > 8, "expected state size > 8, got {actual}");
+            assert!(
+                largest_field_size >= PREFIX,
+                "largest_field_size ({largest_field_size}) must account for prefix ({PREFIX})"
+            );
+            assert!(largest_field_size <= actual);
+            (actual, largest_field_size)
+        }
+        other => panic!("expected StateSizeExceeded, got {other:?}"),
+    };
+
+    let msg = format!("{err}");
+    assert!(msg.contains(&actual.to_string()), "display must name actual size: {msg}");
+    assert!(msg.contains("8"), "display must name budget cap: {msg}");
+    assert!(
+        msg.contains(&largest_field_size.to_string()),
+        "display must name largest spilled field: {msg}"
+    );
+
+    // Exact budget of `actual` bytes (and UNBOUNDED) must accept the same machine.
+    let split = split_machine_bounded(
+        func.view(),
+        shape,
+        MachineBudget::max_bytes(actual),
+        MachinePlant::None,
+        Global,
+    )
+    .expect("exact MachineBudget::max_bytes(actual) must succeed");
+
+    assert_eq!(split.layout.size, actual);
+    assert!(split.graph.zero_pin_proven);
+    assert!(split.graph.reaches_return());
+    assert!(split.graph.has_cancel_edge(0));
+    assert!(split.graph.has_cancel_edge(1));
+    assert!(!split.graph.has_cancel_edge(2));
+
+    let unbounded = split_machine_bounded(
+        func.view(),
+        shape,
+        MachineBudget::UNBOUNDED,
+        MachinePlant::None,
+        Global,
+    )
+    .expect("MachineBudget::UNBOUNDED must succeed");
+    assert_eq!(unbounded.layout.size, actual);
+}
+
+#[test]
+fn control_skip_state_size_check_plant_bypasses_budget() {
+    let (func, shape) = build_two_suspend_body();
+
+    // Planted-bug control: the same oversized body slips past the 8-byte budget when
+    // SkipStateSizeCheck is selected.
+    let split = split_machine_bounded(
+        func.view(),
+        shape,
+        MachineBudget::max_bytes(8),
+        MachinePlant::SkipStateSizeCheck,
+        Global,
+    )
+    .expect("SkipStateSizeCheck plant must bypass tight MachineBudget");
+
+    assert!(split.layout.size > 8);
+    assert!(split.graph.reaches_return());
+    assert!(split.graph.has_cancel_edge(0));
+    verify::verify(split.step.view()).expect("lowered step is valid LIR");
+    verify::verify(split.on_cancel.view()).expect("lowered on_cancel is valid LIR");
 }

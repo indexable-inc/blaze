@@ -14,6 +14,7 @@
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 
+pub mod machine;
 pub mod plain;
 
 use std::fmt;

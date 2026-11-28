@@ -835,6 +835,58 @@ fn sans_io_core() {
 }
 
 #[test]
+fn sans_io_core_os_ffi_exemption_and_blaze_sys_detection() {
+    let only = RuleSet::only(&[Rule::SansIoCore]);
+    let core = |text| found(&only, text, CORE);
+    let empty = StdVec::<(&str, &str)>::new();
+
+    // Regression: `crates/blaze-data/src/std_types.rs:52` imports `os::unix::ffi::OsStrExt`
+    // inside `use super::std::{ .. }` for pure byte-slice conversion (zero syscalls / zero IO).
+    assert_eq!(
+        core(
+            "use super::std::{\n    ffi::OsStr,\n    os::unix::ffi::OsStrExt,\n    path::{Path, PathBuf},\n};"
+        ),
+        empty
+    );
+    for pure_case in [
+        "use std::os::unix::ffi::OsStrExt;",
+        "use std::os::unix::ffi::{OsStrExt, OsStringExt};",
+        "use std::os::wasi::ffi::OsStrExt;",
+        "use std::os::windows::ffi::OsStrExt;",
+        "use std::os::raw::c_int;",
+        "use crate::platform::{os::Target, io::Plan};",
+        "fn f(os: u32) -> u32 { os }",
+        "fn f(x: S) -> u32 { x.os }",
+        "fn f() { let blaze_sys = 1; }",
+        "fn f(x: S) { x.blaze_sys(); }",
+    ] {
+        assert_eq!(core(pure_case), empty, "sans-io-core false-positived on {pure_case:?}");
+    }
+
+    // Genuine OS IO paths under `std::os::*` and `bstd::os::*` ARE flagged.
+    assert_eq!(core("use std::os::unix::net::UnixStream;"), [("io", "os")]);
+    assert_eq!(core("use std::os::unix::fs::OpenOptionsExt;"), [("io", "os")]);
+    assert_eq!(core("use std::os::fd::OwnedFd;"), [("io", "os")]);
+    assert_eq!(core("use super::std::{ ffi::OsStr, os::unix::net::UnixStream };"), [("io", "os")]);
+    assert_eq!(core("fn f() { bstd::os::open(); }"), [("io", "os")]);
+    assert_eq!(core("use bstd::os::Fd;"), [("io", "os")]);
+    assert_eq!(core("use bstd::{ os::Fd };"), [("io", "os")]);
+
+    // Direct `blaze_sys::*` syscall invocations & imports inside `#![blaze::sans_io]` ARE flagged.
+    assert_eq!(core("fn f() { unsafe { blaze_sys::linux::openat(fd, p, flags, mode) }; }"), [("io", "blaze_sys")]);
+    assert_eq!(core("fn f() { unsafe { blaze_sys::macos::kqueue() }; }"), [("io", "blaze_sys")]);
+    assert_eq!(core("use blaze_sys::linux::openat;"), [("io", "blaze_sys")]);
+    assert_eq!(core("use blaze_sys;"), [("io", "blaze_sys")]);
+    assert_eq!(core("extern crate blaze_sys;"), [("io", "blaze_sys")]);
+
+    // Outside a sans-IO core, `blaze_sys::*` is allowed (driver / runtime code).
+    assert_eq!(
+        found(&only, "fn f() { unsafe { blaze_sys::linux::openat(fd, p, flags, mode) }; }", FILE),
+        empty
+    );
+}
+
+#[test]
 fn root_marks_and_lint_names() {
     let text = "//! A core.\n#![no_std]\n#![blaze::sans_io]\n// a comment between\n#![deny(blaze::std_use, blaze::process_static, unused, reason = \"C7\")]\n#![forbid(blaze::implicit_allocator)]\n\nuse a::b;\n#![blaze::driver]\n";
     let marks = RootMarks::read(text);

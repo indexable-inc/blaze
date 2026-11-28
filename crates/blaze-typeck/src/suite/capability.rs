@@ -313,3 +313,105 @@ fn deep_diamond_dag_terminates_without_subst_blowup() {
     let findings = check_adt_capabilities(&fx, top_adt, alloc()).expect("diamond DAG check");
     assert!(findings.is_empty(), "pure diamond DAG must have 0 findings: {findings:?}");
 }
+
+#[test]
+fn sans_io_effect_and_syscall_sound_check() {
+    use blaze_ty::effect_ty::EffectSet;
+    use blaze_ty::syscall_ty::{SyscallPolicyError, SyscallSet, check_sans_io, check_syscall_policy};
+
+    use crate::rules::capability::{
+        SansIoBodyFinding, check_body_syscall_policy, check_sans_io_body, check_sans_io_effects,
+    };
+
+    let mut fx = Fx::new();
+    let u32_ = fx.u32();
+
+    let core_fn = fx.func("pure_core_step", 0, &[u32_], u32_, vec![]);
+    fx.set_attrs(core_fn, TypeAttrs(TypeAttrs::SANS_IO));
+
+    let handle_fn = fx.func("handle_request_builder", 0, &[u32_], u32_, vec![]);
+    fx.set_attrs(handle_fn, TypeAttrs(TypeAttrs::SANS_IO | TypeAttrs::HANDLE));
+
+    let driver_fn = fx.func("driver_step", 0, &[u32_], u32_, vec![]);
+
+    let cap_fn = fx.func("cap_impl", 0, &[u32_], u32_, vec![]);
+    fx.set_attrs(cap_fn, TypeAttrs(TypeAttrs::SANS_IO | TypeAttrs::CAPABILITY));
+
+    fx.finish();
+
+    // 1. Pure core (`EffectSet::PURE`, `SyscallSet::EMPTY`) passes `check_sans_io` and body check.
+    assert_eq!(check_sans_io(EffectSet::PURE, SyscallSet::EMPTY), Ok(()));
+    assert_eq!(
+        check_sans_io_body(&fx, core_fn, EffectSet::PURE, SyscallSet::EMPTY, alloc()).expect("pure core"),
+        Ok(())
+    );
+    // Allocating, panicking, or diverging pure cores and inert `#[blaze::handle]` methods pass too.
+    let pure_compute = EffectSet::PANIC.union(EffectSet::ALLOC).union(EffectSet::DIVERGE);
+    assert_eq!(
+        check_sans_io_body(&fx, core_fn, pure_compute, SyscallSet::EMPTY, alloc()).expect("pure compute"),
+        Ok(())
+    );
+    assert_eq!(
+        check_sans_io_body(&fx, handle_fn, EffectSet::PURE, SyscallSet::EMPTY, alloc()).expect("handle method"),
+        Ok(())
+    );
+
+    // 2. Any kernel syscall domain (`FS`, `CLOCK`, `NET`, `VM`, `RNG`, `STAT`, `PROC`, `SYNC`)
+    //    or `EffectSet::SUSPEND` / `EffectSet::BLOCK` fails `check_sans_io` with `SansIoViolation`.
+    for domain in [
+        SyscallSet::FS,
+        SyscallSet::CLOCK,
+        SyscallSet::NET,
+        SyscallSet::VM,
+        SyscallSet::RNG,
+        SyscallSet::STAT,
+        SyscallSet::PROC,
+        SyscallSet::SYNC,
+    ] {
+        let expected_err = SyscallPolicyError::SansIoViolation { effects: EffectSet::PURE, syscalls: domain };
+        assert_eq!(check_sans_io(EffectSet::PURE, domain), Err(expected_err));
+        assert_eq!(
+            check_sans_io_body(&fx, core_fn, EffectSet::PURE, domain, alloc()).expect("domain check"),
+            Err(SansIoBodyFinding { owner: core_fn, error: expected_err })
+        );
+    }
+
+    for bad_effect in [EffectSet::SUSPEND, EffectSet::BLOCK] {
+        let expected_err = SyscallPolicyError::SansIoViolation { effects: bad_effect, syscalls: SyscallSet::EMPTY };
+        assert_eq!(check_sans_io(bad_effect, SyscallSet::EMPTY), Err(expected_err));
+        assert_eq!(
+            check_sans_io_body(&fx, core_fn, bad_effect, SyscallSet::EMPTY, alloc()).expect("effect check"),
+            Err(SansIoBodyFinding { owner: core_fn, error: expected_err })
+        );
+    }
+
+    // Non-sans-IO driver bodies and `#[blaze::capability]` definitions are allowed to perform syscalls.
+    assert_eq!(
+        check_sans_io_body(&fx, driver_fn, EffectSet::SUSPEND, SyscallSet::FS, alloc()).expect("driver"),
+        Ok(())
+    );
+    assert_eq!(
+        check_sans_io_body(&fx, cap_fn, EffectSet::SUSPEND, SyscallSet::NET, alloc()).expect("cap def"),
+        Ok(())
+    );
+    assert_eq!(
+        check_sans_io_effects(driver_fn, TypeAttrs::default(), EffectSet::BLOCK, SyscallSet::PROC),
+        Ok(())
+    );
+
+    // 3. Explicit syscall policy narrowing: accepts `FS | CLOCK` under `FS | CLOCK | STAT`
+    //    and rejects `NET` or `PROC`.
+    let allowed = SyscallSet::FS.union(SyscallSet::CLOCK).union(SyscallSet::STAT);
+    let required_ok = SyscallSet::FS.union(SyscallSet::CLOCK);
+    assert_eq!(check_syscall_policy(required_ok, allowed), Ok(()));
+    assert_eq!(check_body_syscall_policy(driver_fn, required_ok, allowed), Ok(()));
+
+    for disallowed in [SyscallSet::NET, SyscallSet::PROC] {
+        let expected_err = SyscallPolicyError::SyscallExceedsPolicy { required: disallowed, allowed };
+        assert_eq!(check_syscall_policy(disallowed, allowed), Err(expected_err));
+        assert_eq!(
+            check_body_syscall_policy(driver_fn, disallowed, allowed),
+            Err(SansIoBodyFinding { owner: driver_fn, error: expected_err })
+        );
+    }
+}

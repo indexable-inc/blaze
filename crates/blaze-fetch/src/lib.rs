@@ -40,6 +40,7 @@ pub mod drive;
 pub mod fetch;
 pub mod index;
 pub mod local;
+pub mod machine;
 pub mod pack;
 pub mod peer;
 pub mod plan;

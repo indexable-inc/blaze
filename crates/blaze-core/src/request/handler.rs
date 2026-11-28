@@ -9,8 +9,8 @@
 
 use core::fmt;
 
-use blaze_machine::{Handler, Perform};
-use blaze_own::{Alloc, Brand, Vec};
+use blaze_machine::{Batch, BatchReady, Chain, ChainOutcome, Handler, Perform};
+use blaze_own::{Alloc, Brand, FixedVec, Vec};
 
 use crate::handle::{
     Conn as ConnHandle, ConnKind, Dir, DirKind, ExitKind, File, FileKind, Flushed, HandleError,
@@ -1067,6 +1067,141 @@ impl<'io, 'd, D: Driver> DriverHandler<'io, 'd, D> {
     }
 
     #[inline(never)]
+    fn exec_chain_write_flush<'a>(
+        &mut self,
+        req: Chain<WriteFrom<'io, 'a>, Flush<'io>>,
+    ) -> Result<
+        ChainOutcome<
+            Result<DmaBuf<'a>, BufError<'a, FsError>>,
+            Result<(File<'io, Flushed>, FlushedProof), (File<'io, Unflushed>, FsError)>,
+        >,
+        DriverHandlerError,
+    > {
+        let (first, second) = req.split();
+        match self.exec_write_from(first)? {
+            Ok(buf) => {
+                let flushed = self.exec_flush(second)?;
+                Ok(ChainOutcome::Both(Ok(buf), flushed))
+            }
+            Err(buf_err) => {
+                // Short-circuit without running `Effect::Sync`; release the moved `File` slot if
+                // still live so the caller cannot leak a handle it no longer owns.
+                let Flush { file } = second;
+                let _ = self.files.remove(file.into_id(), self.task);
+                Ok(ChainOutcome::FirstOnly(Err(buf_err)))
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn exec_chain_flush_sync_dir(
+        &mut self,
+        req: Chain<Flush<'io>, SyncDir<'io>>,
+    ) -> Result<
+        ChainOutcome<
+            Result<(File<'io, Flushed>, FlushedProof), (File<'io, Unflushed>, FsError)>,
+            Result<(), FsError>,
+        >,
+        DriverHandlerError,
+    > {
+        let (first, second) = req.split();
+        match self.exec_flush(first)? {
+            Ok(flushed) => {
+                let synced = self.exec_sync_dir(second)?;
+                Ok(ChainOutcome::Both(Ok(flushed), synced))
+            }
+            Err(err) => {
+                let SyncDir { dir: _ } = second;
+                Ok(ChainOutcome::FirstOnly(Err(err)))
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn exec_chain_rename_sync(
+        &mut self,
+        req: Chain<RenameFlushed<'io>, SyncDir<'io>>,
+    ) -> Result<ChainOutcome<Result<(), FsError>, Result<(), FsError>>, DriverHandlerError> {
+        let (first, second) = req.split();
+        match self.exec_rename_flushed(first)? {
+            Ok(()) => {
+                let synced = self.exec_sync_dir(second)?;
+                Ok(ChainOutcome::Both(Ok(()), synced))
+            }
+            Err(err) => {
+                let SyncDir { dir: _ } = second;
+                Ok(ChainOutcome::FirstOnly(Err(err)))
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn exec_batch_stat<const CAP: usize>(
+        &mut self,
+        batch: Batch<Stat<'io>, CAP>,
+    ) -> Result<FixedVec<BatchReady<Result<Option<Meta>, FsError>>, CAP>, DriverHandlerError> {
+        let mut ready: FixedVec<BatchReady<Result<Option<Meta>, FsError>>, CAP> = FixedVec::new();
+        let mut pending: FixedVec<(Tag, u16, FileName), CAP> = FixedVec::new();
+        self.submit_buf.clear();
+
+        for (idx, Stat { dir, path }) in batch.into_items().into_iter().enumerate() {
+            let index = u16::try_from(idx).expect("batch slot index fits in u16");
+            let base = match self.dirs.get(dir.id()) {
+                Ok(d) => d.clone(),
+                Err(e) => {
+                    ready
+                        .push(BatchReady { index, answer: Err(FsError::StaleHandle(e)) })
+                        .ok()
+                        .expect("batch ready fits CAP");
+                    continue;
+                }
+            };
+            let full_path = Self::resolve_path(&base, &path);
+            let tag = self.alloc_tag();
+            self.submit_buf.push(Effect::Stat { file: full_path.clone(), tag });
+            pending.push((tag, index, full_path)).ok().expect("batch pending fits CAP");
+        }
+
+        if pending.is_empty() {
+            return Ok(ready);
+        }
+
+        // True batched fan-out: submit all valid `Stat` effects in a single driver call.
+        self.driver.submit(&mut self.submit_buf);
+
+        for _ in 0..MAX_POLL_ROUNDS {
+            self.poll_buf.clear();
+            let n = self.driver.poll(&mut self.poll_buf, Deadline::NEVER);
+            for comp in self.poll_buf.drain(..) {
+                if let Some(pos) = pending.as_slice().iter().position(|(t, _, _)| *t == comp.tag) {
+                    let (_, index, full_path) = pending.remove_swap(pos);
+                    let answer = match comp.done {
+                        Done::Stat(meta) => Ok(meta),
+                        Done::Failed(e) => Err(Self::map_io_err(full_path, e)),
+                        other => panic!("unexpected Stat completion in batch: {other:?}"),
+                    };
+                    ready
+                        .push(BatchReady { index, answer })
+                        .ok()
+                        .expect("batch ready fits CAP");
+                } else {
+                    self.inbox.push(comp);
+                }
+            }
+            if pending.is_empty() {
+                return Ok(ready);
+            }
+            if n == 0 {
+                let tag = pending.as_slice()[0].0;
+                return Err(DriverHandlerError::Stalled { tag });
+            }
+        }
+
+        let tag = pending.as_slice()[0].0;
+        Err(DriverHandlerError::Stalled { tag })
+    }
+
+    #[inline(never)]
     fn exec_fs<'s, 'a>(
         &'s mut self,
         request: FsRequest<'io, 'a>,
@@ -1212,6 +1347,50 @@ impl_direct_handler!([], CloseConn<'io>, Result<(), NetError>, exec_close_conn);
 impl_direct_handler!([], Unlisten<'io>, Result<(), NetError>, exec_unlisten);
 impl_direct_handler!([], Sleep, (), exec_sleep);
 impl_direct_handler!(['a], FillRandom<'a>, Result<DmaBuf<'a>, BufError<'a, FsError>>, exec_fill_random);
+
+// Linked sequential durability chains (`IOSQE_IO_LINK` semantics: short-circuit on first error).
+impl_direct_handler!(
+    ['a],
+    Chain<WriteFrom<'io, 'a>, Flush<'io>>,
+    ChainOutcome<
+        Result<DmaBuf<'a>, BufError<'a, FsError>>,
+        Result<(File<'io, Flushed>, FlushedProof), (File<'io, Unflushed>, FsError)>,
+    >,
+    exec_chain_write_flush
+);
+impl_direct_handler!(
+    [],
+    Chain<Flush<'io>, SyncDir<'io>>,
+    ChainOutcome<
+        Result<(File<'io, Flushed>, FlushedProof), (File<'io, Unflushed>, FsError)>,
+        Result<(), FsError>,
+    >,
+    exec_chain_flush_sync_dir
+);
+impl_direct_handler!(
+    [],
+    Chain<RenameFlushed<'io>, SyncDir<'io>>,
+    ChainOutcome<Result<(), FsError>, Result<(), FsError>>,
+    exec_chain_rename_sync
+);
+
+// Bounded-N batched `Stat` fan-out (one `Driver::submit` for the entire batch).
+impl<'io, 'd, D: Driver, const CAP: usize> Handler<Batch<Stat<'io>, CAP>>
+    for DriverHandler<'io, 'd, D>
+{
+    type Error = DriverHandlerError;
+
+    fn perform<Out>(
+        &mut self,
+        request: Batch<Stat<'io>, CAP>,
+        deliver: impl FnOnce(
+            Perform<FixedVec<BatchReady<Result<Option<Meta>, FsError>>, CAP>>,
+        ) -> Out,
+    ) -> Result<Out, Self::Error> {
+        let ans = self.exec_batch_stat(request)?;
+        Ok(deliver(Perform::Answered(ans)))
+    }
+}
 
 // Unified request-union handlers delegating to the same small `exec_*` methods.
 impl<'io, 'a, 'd, D: Driver> Handler<FsRequest<'io, 'a>> for DriverHandler<'io, 'd, D> {

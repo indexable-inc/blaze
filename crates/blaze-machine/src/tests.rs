@@ -14,11 +14,12 @@ use blaze_own::{Alloc, BrandedBump, FixedString, FixedVec, FrameVec, Inline, Vec
 use blaze_sim::{Broke, Config};
 
 use crate::{
-    Batch, BatchReady, CancelAction, CancelReason, Chain, ChainOutcome, DriveError, DriveOpts,
-    EdgeKind, GraceBudget, GraphEdge, GraphError, GraphPlant, HandleOp, HandleSlot, Handler,
-    Machine, MachineGraph, Perform, Race, RaceOutcome, Request, Script, ScriptError, StateId,
-    StateNode, Stopped, TaskFrame, TaskFramePlant, Turn, drive, emit_lean, run_sub, verify_graph,
-    verify_graph_with,
+    Batch, BatchReady, BufferRing, CancelAction, CancelReason, Chain, ChainOutcome, DriveError,
+    DriveOpts, EdgeKind, GraceBudget, GraphEdge, GraphError, GraphPlant, HandleOp, HandleSlot,
+    Handler, Join, LeaseError, LeasePlant, LeasedBuf, Machine, MachineGraph, Perform, Race,
+    RaceOutcome, RecordHandler, Request, ReturnBuf, RingBufId, RingGroupId, ScopeBudget, Script,
+    ScriptError, StateId, StateNode, Stopped, TaskFrame, TaskFramePlant, TranscriptEntry, Turn,
+    drive, emit_lean, run_sub, verify_graph, verify_graph_with,
 };
 
 // ---------------------------------------------------------------------------
@@ -1162,4 +1163,333 @@ fn verify_graph_catches_structural_and_handle_errors() {
         Err(GraphError::HandleMaskConflict { state: S2, a: 0, b: 1 })
             | Err(GraphError::HandleMaskConflict { state: S2, a: 1, b: 0 })
     ));
+}
+
+// ---------------------------------------------------------------------------
+// 6. Structured concurrency `Join<A, B>` + `ScopeBudget` over `Script`
+// ---------------------------------------------------------------------------
+
+enum JoinWorkMachine {
+    Start { stat_id: u32, fd: u32, bytes: usize },
+    Waiting,
+}
+
+impl Machine for JoinWorkMachine {
+    type Req = Join<StatReq, WriteReq>;
+    type Out = (u64, usize);
+    type Err = DiskErr;
+
+    fn start(self, _cx: &mut ()) -> Turn<Self, Self::Req, Self::Out, Self::Err> {
+        match self {
+            JoinWorkMachine::Start { stat_id, fd, bytes } => Turn::Ask {
+                request: Join::new(StatReq(stat_id), WriteReq { fd, bytes }),
+                next: JoinWorkMachine::Waiting,
+            },
+            JoinWorkMachine::Waiting => unreachable!("start called on Waiting state"),
+        }
+    }
+
+    fn resume(
+        self,
+        answer: (u64, Result<usize, DiskErr>),
+        _cx: &mut (),
+    ) -> Turn<Self, Self::Req, Self::Out, Self::Err> {
+        match answer {
+            (size, Ok(written)) => Turn::Done((size, written)),
+            (_, Err(err)) => Turn::Fail(err),
+        }
+    }
+}
+
+#[test]
+fn join_request_drives_both_arms_through_script() {
+    let h = heap();
+
+    // Verify `ScopeBudget::DEFAULT` and `Join::new` / `Join::split`.
+    let budget = ScopeBudget::DEFAULT;
+    assert_eq!(budget.grace, GraceBudget::DEFAULT);
+    assert!(budget.max_children > 0);
+
+    let join = Join::new(StatReq(7), WriteReq { fd: 2, bytes: 64 });
+    let (a, b) = join.split();
+    assert_eq!(a, StatReq(7));
+    assert_eq!(b, WriteReq { fd: 2, bytes: 64 });
+
+    // Happy path: both arms complete and both answers are delivered together as a tuple.
+    let mut ok_script = Script::new_in(h.alloc());
+    ok_script.expect_answer(
+        Join::new(StatReq(7), WriteReq { fd: 2, bytes: 64 }),
+        (4096u64, Ok(64usize)),
+    );
+    let res = drive(
+        &mut ok_script,
+        &mut (),
+        JoinWorkMachine::Start { stat_id: 7, fd: 2, bytes: 64 },
+        DriveOpts { max_steps: 4 },
+    );
+    assert_eq!(res, Ok((4096, 64)));
+    assert_eq!(ok_script.finish(), Ok(()));
+
+    // Second arm fails while first succeeded: machine sees both and fails cleanly.
+    let mut err_script = Script::new_in(h.alloc());
+    err_script.expect_answer(
+        Join::new(StatReq(7), WriteReq { fd: 2, bytes: 64 }),
+        (4096u64, Err(DiskErr::NoSpace)),
+    );
+    let res = drive(
+        &mut err_script,
+        &mut (),
+        JoinWorkMachine::Start { stat_id: 7, fd: 2, bytes: 64 },
+        DriveOpts { max_steps: 4 },
+    );
+    assert_eq!(res, Err(DriveError::Machine(DiskErr::NoSpace)));
+    assert_eq!(err_script.finish(), Ok(()));
+}
+
+// ---------------------------------------------------------------------------
+// 7. Kernel provided-buffer ring (`BufferRing` / `LeasedBuf` / `ReturnBuf`)
+// ---------------------------------------------------------------------------
+
+enum ReturnLeaseMachine<'io> {
+    Start(LeasedBuf<'io>),
+    Waiting,
+}
+
+impl<'io> Machine for ReturnLeaseMachine<'io> {
+    type Req = ReturnBuf<'io>;
+    type Out = ();
+    type Err = LeaseError;
+
+    fn start(self, _cx: &mut ()) -> Turn<Self, Self::Req, Self::Out, Self::Err> {
+        match self {
+            ReturnLeaseMachine::Start(lease) => Turn::Ask {
+                request: lease.into_return(),
+                next: ReturnLeaseMachine::Waiting,
+            },
+            ReturnLeaseMachine::Waiting => unreachable!("start called on Waiting state"),
+        }
+    }
+
+    fn resume(
+        self,
+        answer: Result<(), LeaseError>,
+        _cx: &mut (),
+    ) -> Turn<Self, Self::Req, Self::Out, Self::Err> {
+        match answer {
+            Ok(()) => Turn::Done(()),
+            Err(err) => Turn::Fail(err),
+        }
+    }
+}
+
+#[test]
+fn buffer_ring_lease_acquire_return_and_planted_controls() {
+    let h = heap();
+    with_brand(|brand| {
+        let group = RingGroupId(3);
+        let mut ring = BufferRing::new_in(group, 2, brand, h.alloc());
+        assert_eq!(ring.group(), group);
+        assert_eq!(ring.capacity(), 2);
+        assert_eq!(ring.outstanding(), 0);
+        assert_eq!(ring.available(), 2);
+        assert_eq!(ring.verify_drained(), Ok(()));
+
+        // Acquire both slots from the 2-buffer ring.
+        let b0 = ring.acquire_for_rx(128).expect("slot 0 available");
+        let b1 = ring.acquire_for_rx(256).expect("slot 1 available");
+        assert_eq!(b0.group(), group);
+        assert_eq!(b0.len(), 128);
+        assert!(!b0.is_empty());
+        assert_eq!(b1.len(), 256);
+        assert_ne!(b0.buf_id(), b1.buf_id());
+        assert!(ring.is_in_flight(b0.buf_id()));
+        assert!(ring.is_in_flight(b1.buf_id()));
+        assert_eq!(ring.outstanding(), 2);
+        assert_eq!(ring.available(), 0);
+
+        // Third acquire refuses cleanly with `RingEmpty`.
+        match ring.acquire_for_rx(64) {
+            Err(LeaseError::RingEmpty) => {}
+            Err(other) => panic!("expected RingEmpty, got {other:?}"),
+            Ok(unexpected) => {
+                let _ = ring.release(unexpected.into_return());
+                panic!("expected RingEmpty, acquired unexpected lease");
+            }
+        }
+
+        // Leak check catches outstanding leases; `SkipLeakCheck` planted control misses it.
+        assert_eq!(ring.verify_drained(), Err(LeaseError::LeakedLeases { outstanding: 2 }));
+        assert_eq!(ring.verify_drained_with(LeasePlant::SkipLeakCheck), Ok(()));
+
+        // Return `b0` cleanly.
+        let id0 = b0.buf_id();
+        assert_eq!(ring.release(ReturnBuf::new(b0)), Ok(()));
+        assert!(!ring.is_in_flight(id0));
+        assert_eq!(ring.outstanding(), 1);
+        assert_eq!(ring.verify_drained(), Err(LeaseError::LeakedLeases { outstanding: 1 }));
+
+        // Double-return is caught by `release`, and missed by `SkipDoubleReturnCheck` control.
+        let dup1 = LeasedBuf::new_for_ring(group, id0, 128, brand);
+        assert_eq!(
+            ring.release(ReturnBuf::new(dup1)),
+            Err(LeaseError::AlreadyReturned { buf_id: id0 })
+        );
+        let dup2 = LeasedBuf::new_for_ring(group, id0, 128, brand);
+        assert_eq!(
+            ring.release_with(ReturnBuf::new(dup2), LeasePlant::SkipDoubleReturnCheck),
+            Ok(())
+        );
+
+        // Out-of-range buffer id and mismatched ring group are refused with `InvalidBufId`.
+        let oob = LeasedBuf::new_for_ring(group, RingBufId(2), 64, brand);
+        assert_eq!(
+            ring.release(ReturnBuf::new(oob)),
+            Err(LeaseError::InvalidBufId { buf_id: RingBufId(2) })
+        );
+        let wrong_group = LeasedBuf::new_for_ring(RingGroupId(9), id0, 64, brand);
+        assert_eq!(
+            ring.release(ReturnBuf::new(wrong_group)),
+            Err(LeaseError::InvalidBufId { buf_id: id0 })
+        );
+
+        // Re-acquire the freed slot and return it via `ReturnBuf` as a `Machine` request.
+        let b2 = ring.acquire_for_rx(96).expect("returned slot is reusable");
+        assert_eq!(b2.buf_id(), id0);
+        assert_eq!(ring.outstanding(), 2);
+        let driven = drive(
+            &mut ring,
+            &mut (),
+            ReturnLeaseMachine::Start(b2),
+            DriveOpts { max_steps: 4 },
+        );
+        assert_eq!(driven, Ok(()));
+        assert_eq!(ring.outstanding(), 1);
+
+        // Return the last live lease and verify the ring is completely drained.
+        assert_eq!(ring.release(b1.into_return()), Ok(()));
+        assert_eq!(ring.outstanding(), 0);
+        assert_eq!(ring.verify_drained(), Ok(()));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 8. Deterministic transcript recorder (`RecordHandler` -> `Script` replay)
+// ---------------------------------------------------------------------------
+
+struct LiveTransportHandler {
+    step: usize,
+    cancel_at_step: Option<usize>,
+}
+
+impl Handler<TransportReq> for LiveTransportHandler {
+    type Error = ();
+
+    fn perform<Out>(
+        &mut self,
+        request: TransportReq,
+        deliver: impl FnOnce(Perform<TransportAns>) -> Out,
+    ) -> Result<Out, Self::Error> {
+        let cur = self.step;
+        self.step += 1;
+        if self.cancel_at_step == Some(cur) {
+            return Ok(deliver(Perform::Stopped(Stopped::cancelled(GraceBudget::DEFAULT))));
+        }
+        let ans = match request {
+            TransportReq::Send { len, .. } => TransportAns::Sent(Ok(len.min(4))),
+            TransportReq::RecvWithTimeout { .. } => {
+                TransportAns::RecvOrTimeout(RaceOutcome::First(Ok(3)))
+            }
+            TransportReq::Close { .. } => TransportAns::Closed(Ok(())),
+        };
+        Ok(deliver(Perform::Answered(ans)))
+    }
+}
+
+impl crate::RecordableRequest for TransportReq {
+    type Recorded = TransportAns;
+
+    fn record_answer(answer: &Self::Answer<'_>) -> Self::Recorded {
+        answer.clone()
+    }
+}
+
+#[test]
+fn record_handler_replays_live_machine_as_zero_io_script() {
+    let h = heap();
+    let conn = ConnToken { slot: 0, generation: NonZeroU32::new(1).unwrap() };
+
+    // 1. Record a full multi-step live run (3 partial sends + 3 partial recvs + 1 close = 7 steps).
+    let mut live = LiveTransportHandler { step: 0, cancel_at_step: None };
+    let mut recorder = RecordHandler::new_in(&mut live, h.alloc());
+    let live_res = drive(
+        &mut recorder,
+        &mut (),
+        HttpExchange::new(conn, 10, 8, ExchangePlant::None),
+        DriveOpts { max_steps: 16 },
+    );
+    assert_eq!(live_res, Ok(9));
+    assert_eq!(recorder.entries().len(), 7);
+    assert!(matches!(
+        recorder.entries()[0],
+        TranscriptEntry::Answered {
+            req: TransportReq::Send { offset: 0, len: 10, .. },
+            ans: TransportAns::Sent(Ok(4)),
+        }
+    ));
+
+    // Convert the recording into a zero-IO `Script` and replay the exact same machine.
+    let mut replay = recorder.into_script(h.alloc());
+    let replay_res = drive(
+        &mut replay,
+        &mut (),
+        HttpExchange::new(conn, 10, 8, ExchangePlant::None),
+        DriveOpts { max_steps: 16 },
+    );
+    assert_eq!(replay_res, Ok(9));
+    assert_eq!(replay.finish(), Ok(()));
+
+    // Verify copy-pasteable `Script` source emission.
+    let mut src = FixedString::<4096>::new();
+    assert_eq!(recorder.emit_script_source(&mut src), Ok(()));
+    let text = src.text().expect("recorded script source fits in 4096 bytes");
+    assert!(text.contains("let mut script = Script::new_in(alloc);"), "missing header:\n{text}");
+    assert!(text.contains("script.expect_answer("), "missing expect_answer:\n{text}");
+    assert!(text.contains("Send {"), "missing Send request:\n{text}");
+    assert!(text.contains("RecvWithTimeout {"), "missing RecvWithTimeout request:\n{text}");
+    assert!(text.contains("Close {"), "missing Close request:\n{text}");
+
+    // 2. Also record & replay a run with an external `Stopped` cancellation + graceful `Close`.
+    let mut cancel_live = LiveTransportHandler { step: 0, cancel_at_step: Some(0) };
+    let mut cancel_rec = RecordHandler::new_in(&mut cancel_live, h.alloc());
+    let cancel_live_res = drive(
+        &mut cancel_rec,
+        &mut (),
+        HttpExchange::new(conn, 10, 8, ExchangePlant::None),
+        DriveOpts { max_steps: 16 },
+    );
+    assert_eq!(cancel_live_res, Err(DriveError::Machine(NetErr::Reset)));
+    assert_eq!(cancel_rec.entries().len(), 2);
+    assert!(matches!(
+        cancel_rec.entries()[0],
+        TranscriptEntry::Stopped {
+            req: TransportReq::Send { offset: 0, len: 10, .. },
+            stopped,
+        } if stopped == Stopped::cancelled(GraceBudget::DEFAULT)
+    ));
+
+    let mut cancel_replay = cancel_rec.into_script(h.alloc());
+    let cancel_replay_res = drive(
+        &mut cancel_replay,
+        &mut (),
+        HttpExchange::new(conn, 10, 8, ExchangePlant::None),
+        DriveOpts { max_steps: 16 },
+    );
+    assert_eq!(cancel_replay_res, Err(DriveError::Machine(NetErr::Reset)));
+    assert_eq!(cancel_replay.finish(), Ok(()));
+
+    let mut cancel_src = FixedString::<2048>::new();
+    assert_eq!(cancel_rec.emit_script_source(&mut cancel_src), Ok(()));
+    let cancel_text = cancel_src.text().expect("cancel script source fits in 2048 bytes");
+    assert!(cancel_text.contains("script.expect_stop("), "missing expect_stop:\n{cancel_text}");
+    assert!(cancel_text.contains("Stopped::cancelled("), "missing Stopped::cancelled:\n{cancel_text}");
 }

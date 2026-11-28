@@ -19,6 +19,7 @@
 
 mod datagrams;
 pub mod options;
+pub mod req;
 
 use alloc::{alloc::Global, boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use core::fmt;
