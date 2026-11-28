@@ -164,12 +164,13 @@ impl<'g> Run<'g> {
     }
 
     fn ask(&mut self, child: usize, thread: u64, i: usize) -> Result<(), Broke> {
-        self.event(Event::Demand { child: Child(child), thread: Thread(thread), key: key(i) })
+        let affinity = Affinity(u32::try_from(child).unwrap_or(0));
+        self.event(Event::Demand { child: Child(child), thread: Thread(thread), key: key(i), affinity })
     }
 
     fn event(&mut self, event: Event<'_>) -> Result<(), Broke> {
         match event {
-            Event::Demand { child, thread, key } => self.model.demand(child, thread, key, self.graph),
+            Event::Demand { child, thread, key, .. } => self.model.demand(child, thread, key, self.graph),
             Event::Exited(child) => {
                 self.live[child.0] = false;
                 self.model.replies[child.0].clear();
@@ -449,7 +450,7 @@ fn a_producer_wait_keeps_the_request_deadline() {
     let k = key(GOOD_INPUT);
     let producer = Graph::producer(k);
     let w = Worker(0);
-    let demand = Event::Demand { child: Child(0), thread: Thread(1), key: k };
+    let demand = Event::Demand { child: Child(0), thread: Thread(1), key: k, affinity: Affinity(0) };
     let steps = [
         (demand, Wait::Lookup(k)),
         (Event::Looked { key: k, result: Ok(None) }, Wait::WorkerFor(k)),
@@ -517,7 +518,7 @@ fn serial_demands_reuse_most_recently_warm_worker() {
 
     // First miss takes cold Worker(0).
     let k0 = key(10);
-    step(&mut pool, Event::Demand { child: Child(0), thread: Thread(1), key: k0 }, &mut out);
+    step(&mut pool, Event::Demand { child: Child(0), thread: Thread(1), key: k0, affinity: Affinity(0) }, &mut out);
     step(&mut pool, Event::Looked { key: k0, result: Ok(None) }, &mut out);
     assert_eq!(build_worker(&out), Some(Worker(0)));
     step(&mut pool, Event::Finished { key: k0, worker: Worker(0), result: Finished::Made(Record { identity: ContentId([10; 32]), direct: &[] }) }, &mut out);
@@ -525,13 +526,13 @@ fn serial_demands_reuse_most_recently_warm_worker() {
 
     // Next serial miss reuses warm Worker(0) rather than cold-starting Worker(1).
     let k1 = key(11);
-    step(&mut pool, Event::Demand { child: Child(0), thread: Thread(1), key: k1 }, &mut out);
+    step(&mut pool, Event::Demand { child: Child(0), thread: Thread(1), key: k1, affinity: Affinity(0) }, &mut out);
     step(&mut pool, Event::Looked { key: k1, result: Ok(None) }, &mut out);
     assert_eq!(build_worker(&out), Some(Worker(0)));
 
     // Concurrent miss while Worker(0) is busy spills to cold Worker(1), leaving Worker(2) untouched.
     let k2 = key(12);
-    step(&mut pool, Event::Demand { child: Child(0), thread: Thread(2), key: k2 }, &mut out);
+    step(&mut pool, Event::Demand { child: Child(0), thread: Thread(2), key: k2, affinity: Affinity(0) }, &mut out);
     step(&mut pool, Event::Looked { key: k2, result: Ok(None) }, &mut out);
     assert_eq!(build_worker(&out), Some(Worker(1)));
 
@@ -542,7 +543,99 @@ fn serial_demands_reuse_most_recently_warm_worker() {
     step(&mut pool, Event::Free(Worker(1)), &mut out);
 
     let k3 = key(13);
-    step(&mut pool, Event::Demand { child: Child(0), thread: Thread(1), key: k3 }, &mut out);
+    step(&mut pool, Event::Demand { child: Child(0), thread: Thread(1), key: k3, affinity: Affinity(0) }, &mut out);
     step(&mut pool, Event::Looked { key: k3, result: Ok(None) }, &mut out);
     assert_eq!(build_worker(&out), Some(Worker(1)));
+}
+
+#[test]
+fn multi_suite_demands_route_by_suite_affinity_with_bounded_skip() {
+    let deadline = Time(200);
+    let mut pool = CodePool::new(Options {
+        alloc: alloc(), hash_seed: 19, children: 3, workers: 3, frontier: 0, demands: 32, deadline,
+    }).unwrap();
+    let mut out = SVec::new_in(alloc());
+    let mut t = 1u64;
+    let mut step = |pool: &mut CodePool<'_>, event: Event<'_>, out: &mut SVec<'_, Action>| {
+        out.clear();
+        pool.step(Time(t), event, out).unwrap();
+        t += 1;
+    };
+    for w in 0..3 {
+        step(&mut pool, Event::Free(Worker(w)), &mut out);
+    }
+    let build = |out: &[Action]| -> Option<(Worker, CodeKey)> {
+        out.iter().find_map(|a| match *a {
+            Action::Build { worker, key, .. } => Some((worker, key)),
+            _ => None,
+        })
+    };
+    let finish = |step: &mut dyn FnMut(&mut CodePool<'_>, Event<'_>, &mut SVec<'_, Action>), pool: &mut CodePool<'_>, out: &mut SVec<'_, Action>, w: Worker, k: CodeKey| {
+        step(pool, Event::Finished { key: k, worker: w, result: Finished::Made(Record { identity: k.0, direct: &[] }) }, out);
+        step(pool, Event::Free(w), out);
+    };
+
+    // Suite 0 warms Worker(0); Suite 1 picks cold Worker(1) instead of polluting Worker(0);
+    // Suite 2 picks cold Worker(2).
+    let (s0_a, s1_a, s2_a) = (key(20), key(21), key(22));
+    step(&mut pool, Event::Demand { child: Child(0), thread: Thread(1), key: s0_a, affinity: Affinity(0) }, &mut out);
+    step(&mut pool, Event::Looked { key: s0_a, result: Ok(None) }, &mut out);
+    assert_eq!(build(&out), Some((Worker(0), s0_a)));
+    finish(&mut step, &mut pool, &mut out, Worker(0), s0_a);
+
+    step(&mut pool, Event::Demand { child: Child(1), thread: Thread(1), key: s1_a, affinity: Affinity(1) }, &mut out);
+    step(&mut pool, Event::Looked { key: s1_a, result: Ok(None) }, &mut out);
+    assert_eq!(build(&out), Some((Worker(1), s1_a)), "new suite must pick cold Worker(1) over warm Suite 0 Worker(0)");
+    finish(&mut step, &mut pool, &mut out, Worker(1), s1_a);
+
+    step(&mut pool, Event::Demand { child: Child(2), thread: Thread(1), key: s2_a, affinity: Affinity(2) }, &mut out);
+    step(&mut pool, Event::Looked { key: s2_a, result: Ok(None) }, &mut out);
+    assert_eq!(build(&out), Some((Worker(2), s2_a)), "new suite must pick cold Worker(2)");
+    finish(&mut step, &mut pool, &mut out, Worker(2), s2_a);
+
+    // Subsequent demands for each suite route straight back to their dedicated warm worker.
+    for (child, aff, k, want_w) in [
+        (0, Affinity(0), key(23), Worker(0)),
+        (1, Affinity(1), key(24), Worker(1)),
+        (2, Affinity(2), key(25), Worker(2)),
+    ] {
+        step(&mut pool, Event::Demand { child: Child(child), thread: Thread(2), key: k, affinity: aff }, &mut out);
+        step(&mut pool, Event::Looked { key: k, result: Ok(None) }, &mut out);
+        assert_eq!(build(&out), Some((want_w, k)), "suite {} must reuse its warm worker", aff.0);
+        finish(&mut step, &mut pool, &mut out, want_w, k);
+    }
+
+    // Bounded skip (zero starvation): 1-worker pool warm on Suite 0 with Suite 1 queued at head
+    // and repeated Suite 0 arrivals. Suite 0 may bypass Suite 1 at most `MAX_AFFINITY_SKIPS` times;
+    // on the next completion Suite 1 MUST run.
+    let mut single = CodePool::new(Options {
+        alloc: alloc(), hash_seed: 23, children: 2, workers: 1, frontier: 0, demands: 32, deadline,
+    }).unwrap();
+    step(&mut single, Event::Free(Worker(0)), &mut out);
+    let busy = key(30);
+    step(&mut single, Event::Demand { child: Child(0), thread: Thread(1), key: busy, affinity: Affinity(0) }, &mut out);
+    step(&mut single, Event::Looked { key: busy, result: Ok(None) }, &mut out);
+    assert_eq!(build(&out), Some((Worker(0), busy)));
+
+    let waiting_s1 = key(31);
+    step(&mut single, Event::Demand { child: Child(1), thread: Thread(1), key: waiting_s1, affinity: Affinity(1) }, &mut out);
+    step(&mut single, Event::Looked { key: waiting_s1, result: Ok(None) }, &mut out);
+
+    let mut running = busy;
+    for i in 0..usize::from(MAX_AFFINITY_SKIPS) {
+        let s0_next = key(40 + i);
+        step(&mut single, Event::Demand { child: Child(0), thread: Thread(2 + i as u64), key: s0_next, affinity: Affinity(0) }, &mut out);
+        step(&mut single, Event::Looked { key: s0_next, result: Ok(None) }, &mut out);
+        step(&mut single, Event::Finished { key: running, worker: Worker(0), result: Finished::Made(Record { identity: running.0, direct: &[] }) }, &mut out);
+        step(&mut single, Event::Free(Worker(0)), &mut out);
+        assert_eq!(build(&out), Some((Worker(0), s0_next)), "skip {i} should keep warm Suite 0 on Worker(0)");
+        running = s0_next;
+    }
+    // One more Suite 0 arrival after MAX_AFFINITY_SKIPS: Suite 1 must NOT starve and runs now.
+    let s0_after = key(50);
+    step(&mut single, Event::Demand { child: Child(0), thread: Thread(99), key: s0_after, affinity: Affinity(0) }, &mut out);
+    step(&mut single, Event::Looked { key: s0_after, result: Ok(None) }, &mut out);
+    step(&mut single, Event::Finished { key: running, worker: Worker(0), result: Finished::Made(Record { identity: running.0, direct: &[] }) }, &mut out);
+    step(&mut single, Event::Free(Worker(0)), &mut out);
+    assert_eq!(build(&out), Some((Worker(0), waiting_s1)), "head Suite 1 must run once MAX_AFFINITY_SKIPS is reached");
 }

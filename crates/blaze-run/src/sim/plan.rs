@@ -496,3 +496,82 @@ fn postings_refuse_rows_out_of_order() {
     swapped[16..160].rotate_left(72);
     assert_eq!(Postings::open(&swapped).map(|p| p.len()), Err(PostingsError::Order { row: 1 }));
 }
+
+#[test]
+fn cold_tests_start_in_asked_order_preserving_suite_grouping() {
+    // Deliberately assign higher TestId hashes to suite 0 (rows 0..3) and lower TestId hashes to
+    // suite 1 (rows 3..6) so hash-based tie-breaking would scramble suites while asked-order
+    // tie-breaking keeps suite 0 together before starting suite 1.
+    let ids = [
+        TestId([0xF0; 32]),
+        TestId([0xE0; 32]),
+        TestId([0xD0; 32]),
+        TestId([0x10; 32]),
+        TestId([0x20; 32]),
+        TestId([0x30; 32]),
+    ];
+    let asked: Vec<Asked<'static>> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, &test)| Asked {
+            test,
+            path: if i < 3 { "s0::t" } else { "s1::t" },
+            ignore: None,
+            should_panic: ShouldPanic::No,
+            bench: false,
+        })
+        .collect();
+    let config = Config {
+        width: 2,
+        deadline: DEADLINE,
+        run_all: false,
+        ignored: Ignored::Skip,
+        benches: false,
+        filter: Filter::All,
+        skip: &NO_SKIP,
+    };
+    let mut plan = Plan::new(config, Alloc::global()).expect("plan");
+    let mut out = Own::new_in(Alloc::global());
+    plan.decide(&asked, &[], &[], &Postings::EMPTY, Nanos(0), &mut out).expect("cold decide");
+    let mut started: Vec<TestId> = Vec::new();
+    for step in 0..3u64 {
+        let mut batch = Vec::new();
+        for effect in out.as_slice() {
+            if let Effect::Start { test, .. } = *effect {
+                started.push(test);
+                batch.push(test);
+            }
+        }
+        out.clear();
+        for test in batch {
+            plan.ended(
+                test,
+                Ran { exit: Exit::Returned, keep: Ok(()), micros: 10 },
+                Nanos(10 * (step + 1)),
+                &mut out,
+            )
+            .expect("ended");
+        }
+    }
+    assert_eq!(started, ids, "cold tests must start in asked order so multi-suite runs stay grouped by suite");
+
+    // Warm tests with known durations still prioritize longer-running tests first (LPT).
+    let mut kept = vec![
+        Kept { test: ids[0], last: Last::Failed, micros: 50 },
+        Kept { test: ids[3], last: Last::Failed, micros: 5_000 },
+        Kept { test: ids[4], last: Last::Failed, micros: 100 },
+    ];
+    kept.sort_by_key(|row| row.test);
+    let mut warm = Plan::new(
+        Config { width: 1, ..config },
+        Alloc::global(),
+    )
+    .expect("warm plan");
+    out.clear();
+    warm.decide(&[asked[0], asked[3], asked[4]], &kept, &[], &Postings::EMPTY, Nanos(0), &mut out).expect("warm decide");
+    let first = out.as_slice().iter().find_map(|effect| match *effect {
+        Effect::Start { test, .. } => Some(test),
+        _ => None,
+    });
+    assert_eq!(first, Some(ids[3]), "longer recorded test must still start first");
+}

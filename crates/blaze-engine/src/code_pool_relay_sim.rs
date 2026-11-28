@@ -170,7 +170,7 @@ impl Sim {
                 kid.next += 1;
                 kid.open = Some(at);
                 let key = kid.script[at];
-                relayed(self.relay.ask(now, Child(child), key.map(key_of), Order { key, child, at }))?;
+                relayed(self.relay.ask(now, Child(child), key.map(key_of), Affinity(u32::try_from(child).unwrap_or(0)), Order { key, child, at }))?;
             }
             Move::Finish(j) => {
                 let (worker, _, order) = self.inflight.swap_remove(j);
@@ -296,8 +296,8 @@ fn one_childs_long_make_never_holds_anothers_answer() {
     for workers in [2usize, 1] {
         let opts = Options { alloc: alloc(), hash_seed: 7, children: 2, workers, asks: 8, deadline: DEADLINE, code_wait: CODE_WAIT, most_bytes: 1 << 20 };
         let mut relay: Relay<'static, Order, Refusal> = Relay::new(Time(0), opts).expect("a relay");
-        relay.ask(Time(1), Child(0), Some(key_of(1)), one(0, 1, 0)).expect("child 0 asks");
-        relay.ask(Time(2), Child(1), Some(key_of(2)), one(1, 2, 0)).expect("child 1 asks");
+        relay.ask(Time(1), Child(0), Some(key_of(1)), Affinity(0), one(0, 1, 0)).expect("child 0 asks");
+        relay.ask(Time(2), Child(1), Some(key_of(2)), Affinity(1), one(1, 2, 0)).expect("child 1 asks");
         let mut jobs = Vec::new();
         while let Some(job) = relay.job() {
             jobs.push(job);
@@ -328,7 +328,7 @@ fn one_childs_long_make_never_holds_anothers_answer() {
 fn a_late_ask_is_answered_late_and_withdrawn() {
     let opts = Options { alloc: alloc(), hash_seed: 3, children: 1, workers: 1, asks: 4, deadline: DEADLINE, code_wait: 10, most_bytes: 1 << 20 };
     let mut relay: Relay<'static, Order, Refusal> = Relay::new(Time(0), opts).expect("a relay");
-    relay.ask(Time(1), Child(0), Some(key_of(4)), one(0, 4, 0)).expect("child 0 asks");
+    relay.ask(Time(1), Child(0), Some(key_of(4)), Affinity(0), one(0, 4, 0)).expect("child 0 asks");
     assert_eq!(relay.wait(), Some((Wait::Code { child: Child(0), key: key_of(4) }, Time(11))));
     let (worker, _, order) = relay.job().expect("the make");
     relay.tick(Time(10)).expect("a tick");
@@ -358,21 +358,21 @@ fn idle_entries_evict_fifo_under_most_bytes_and_reask_cleanly() {
     let mut relay: Relay<'static, Order, Refusal> = Relay::new(Time(0), opts).expect("a relay");
 
     // 1. Key 1 (10 bytes) is made and taken by child 0 -> idle in cache (held = 10).
-    relay.ask(Time(1), Child(0), Some(key_of(1)), one(0, 1, 0)).expect("ask 1");
+    relay.ask(Time(1), Child(0), Some(key_of(1)), Affinity(0), one(0, 1, 0)).expect("ask 1");
     let (w, _, _) = relay.job().expect("job 1");
     relay.made(Time(2), w, payload(1, 10)).expect("made 1");
     let got1 = relay.answer(Child(0), |r| matches!(r, Reply::Made(b) if b.len() == 10 && b[0] == 1));
     assert_eq!(got1, Ok(Some(true)));
 
     // 2. Key 2 (10 bytes) exceeds 16-byte cap -> evicts idle key 1 (held becomes 10), succeeds.
-    relay.ask(Time(3), Child(0), Some(key_of(2)), one(0, 2, 0)).expect("ask 2");
+    relay.ask(Time(3), Child(0), Some(key_of(2)), Affinity(0), one(0, 2, 0)).expect("ask 2");
     let (w, _, _) = relay.job().expect("job 2");
     relay.made(Time(4), w, payload(2, 10)).expect("made 2 after evicting key 1");
     let got2 = relay.answer(Child(0), |r| matches!(r, Reply::Made(b) if b.len() == 10 && b[0] == 2));
     assert_eq!(got2, Ok(Some(true)));
 
     // 3. Re-asking evicted key 1 schedules a fresh make cleanly (evicting idle key 2).
-    relay.ask(Time(5), Child(0), Some(key_of(1)), one(0, 1, 1)).expect("re-ask 1");
+    relay.ask(Time(5), Child(0), Some(key_of(1)), Affinity(0), one(0, 1, 1)).expect("re-ask 1");
     let (w, k, _) = relay.job().expect("re-job 1");
     assert_eq!(k, key_of(1));
     relay.made(Time(6), w, payload(9, 10)).expect("re-made 1 after evicting key 2");
@@ -380,17 +380,17 @@ fn idle_entries_evict_fifo_under_most_bytes_and_reask_cleanly() {
     relay.exited(Time(7), Child(0)).expect("child 0 exits cleanly with evicted slot");
     // Now Child(1) asks for key 3 (10 bytes), which evicts idle key 1, and leaves it pinned
     // while another relay tests `RelayError::Full` on pinned entries.
-    relay.ask(Time(8), Child(1), Some(key_of(3)), one(1, 3, 0)).expect("ask 3");
+    relay.ask(Time(8), Child(1), Some(key_of(3)), Affinity(1), one(1, 3, 0)).expect("ask 3");
     let (w, _, _) = relay.job().expect("job 3");
     relay.made(Time(9), w, payload(3, 10)).expect("made 3 after evicting key 1");
     relay.exited(Time(10), Child(1)).expect("child 1 exits cleanly");
 
     let mut relay2: Relay<'static, Order, Refusal> = Relay::new(Time(0), opts).expect("relay 2");
-    relay2.ask(Time(1), Child(0), Some(key_of(1)), one(0, 1, 0)).expect("ask 1");
+    relay2.ask(Time(1), Child(0), Some(key_of(1)), Affinity(0), one(0, 1, 0)).expect("ask 1");
     let (w, _, _) = relay2.job().expect("job 1");
     relay2.made(Time(2), w, payload(1, 10)).expect("made 1");
     // Leave key 1 untaken (pinned by Child(0)) while Child(1) asks for key 2 (10 bytes) -> Full!
-    relay2.ask(Time(3), Child(1), Some(key_of(2)), one(1, 2, 0)).expect("ask 2");
+    relay2.ask(Time(3), Child(1), Some(key_of(2)), Affinity(1), one(1, 2, 0)).expect("ask 2");
     let (w, _, _) = relay2.job().expect("job 2");
     assert!(matches!(relay2.made(Time(4), w, payload(2, 10)), Err(RelayError::Full { .. })), "pinned entry must not be evicted");
 }
