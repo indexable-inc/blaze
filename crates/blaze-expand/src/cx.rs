@@ -11,7 +11,7 @@ use blaze_own::{AVec, Alloc};
 
 use crate::{
     builtin::stringified,
-    cfg::{CfgPredicateError, cfg_predicate_with_version},
+    cfg::{CfgPredicateError, cfg_predicate_with_version_hook},
     def::{MacroDefinition, ProcKind},
     error::ExpandError,
     expansion::{ProcLevel, ReadAnswer, ReadKind, Reads, TokenOrigin},
@@ -148,21 +148,36 @@ impl<'x, 'a, C: ExpandCx> Recorder<'x, 'a, C> {
     pub(crate) fn cfg(&mut self, predicate: &TokenStream<'_>) -> Result<bool, CfgPredicateError<ExpandError>> {
         let Recorder { cx, reads, edition, scratch } = self;
         let (cx, root, scratch) = (*cx, Ctx::root(*edition), *scratch);
-        cfg_predicate_with_version(predicate, cx.cfg_version_enabled(), scratch, &mut |name, value| -> Result<bool, ExpandError> {
-            let mut atom = TokenStream::new_in(scratch);
-            atom.ident(name, root)?;
-            if let Some(value) = value {
-                atom.punct('=', Spacing::Alone, root)?;
-                let mut text = Buf::new_in(scratch);
-                escape_str(value, &mut text);
-                atom.literal(LitKind::Str, text.as_str(), 0, root)?;
-            }
-            let outcome = cx.cfg(&atom)?;
-            let mut subject = Buf::new_in(scratch);
-            stringified(&atom, scratch, &mut subject)?;
-            reads.push(ReadKind::Cfg, subject.as_str(), ReadAnswer::Bool(outcome))?;
-            Ok(outcome)
-        })
+        let cfg_version = cx.cfg_version_enabled();
+        let mut saw_cfg_version = false;
+        let outcome = cfg_predicate_with_version_hook(
+            predicate,
+            cfg_version,
+            scratch,
+            &mut |name, value| -> Result<bool, ExpandError> {
+                let mut atom = TokenStream::new_in(scratch);
+                atom.ident(name, root)?;
+                if let Some(value) = value {
+                    atom.punct('=', Spacing::Alone, root)?;
+                    let mut text = Buf::new_in(scratch);
+                    escape_str(value, &mut text);
+                    atom.literal(LitKind::Str, text.as_str(), 0, root)?;
+                }
+                let outcome = cx.cfg(&atom)?;
+                let mut subject = Buf::new_in(scratch);
+                stringified(&atom, scratch, &mut subject)?;
+                reads.push(ReadKind::Cfg, subject.as_str(), ReadAnswer::Bool(outcome))?;
+                Ok(outcome)
+            },
+            &mut || {
+                saw_cfg_version = true;
+            },
+        );
+        if saw_cfg_version {
+            reads.push(ReadKind::CrateFeature, "cfg_version", ReadAnswer::Bool(cfg_version))
+                .map_err(|e| CfgPredicateError::Atom(ExpandError::from(e)))?;
+        }
+        outcome
     }
 }
 

@@ -1206,6 +1206,7 @@ mod tests {
             (Area::Drive, OVER_CAP_RULE),
             (Area::Drive, blaze_drive::task::MODULE_FILE_MISSING_RULE),
             (Area::Drive, blaze_drive::task::PATH_FILE_MISSING_RULE),
+            (Area::Cli, crate::names::module_missing::CFG_VER_GATE_RULE),
             (Area::Ladder, RefusalRule::Unsupported as u16),
             (Area::Ladder, RefusalRule::Syntax as u16),
             (Area::Ladder, RefusalRule::Program as u16),

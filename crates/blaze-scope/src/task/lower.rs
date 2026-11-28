@@ -1339,6 +1339,60 @@ pub fn file_attrs<'t, 'a>(cfg: &Cfg<'_, '_>, outline: &Outline<'_>, text: &'t st
     attrs
 }
 
+/// Whether a file's inner attributes enable `#![feature(<feature>)]` (directly or via an active
+/// `#![cfg_attr(..., feature(<feature>))]`), collected independently of crate-level `#![cfg(...)]`
+/// attributes so `#![cfg(version("..."))]` written before `#![feature(cfg_version)]` still sees
+/// the feature gate (matching rustc's crate-feature collection before cfg stripping).
+pub fn file_enables_feature(cfg: &Cfg<'_, '_>, outline: &Outline<'_>, text: &str, feature: &str, alloc: Alloc<'_>) -> bool {
+    let mut stack: AVec<'_, &str> = AVec::new_in(alloc);
+    for attr in outline.file_attrs() {
+        if attr.kind == AttrKind::Doc {
+            continue;
+        }
+        let mut next = Some(strip_attr(attr.range.of(text)));
+        stack.clear();
+        loop {
+            let content = match next.take() {
+                Some(it) => it,
+                None => match stack.pop() {
+                    Some(it) => it,
+                    None => break,
+                },
+            };
+            let content = skip_attr_trivia(content);
+            if content.is_empty() {
+                continue;
+            }
+            match prelude_attr(head(content)) {
+                "feature" => {
+                    if SplitTop::new(args(content)).any(|f| f.trim() == feature) {
+                        return true;
+                    }
+                }
+                "cfg_attr" => {
+                    let mut parts = SplitTop::new(args(content));
+                    let Some(predicate) = parts.next() else { continue };
+                    if cfg.eval(predicate) == Some(true) {
+                        let start = stack.len();
+                        for part in parts {
+                            let part = part.trim();
+                            if !part.is_empty() {
+                                stack.push(part);
+                            }
+                        }
+                        if let Some(tail) = stack.get_mut(start..) {
+                            tail.reverse();
+                        }
+                    }
+                }
+                "unsafe" => next = Some(args(content).trim()),
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------------------------
 // Paths and `use` trees.
 

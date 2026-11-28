@@ -333,6 +333,7 @@ impl Expansion<'_> {
                 ReadKind::File => 6,
                 ReadKind::ModulePath => 7,
                 ReadKind::ProcMacro => 8,
+                ReadKind::CrateFeature => 9,
             };
             let subject = self.reads.subject(read);
             c.put(RecordColumn::Reads, &[kind]);
@@ -973,6 +974,7 @@ fn read_reads(
             6 => ReadKind::File,
             7 => ReadKind::ModulePath,
             8 => ReadKind::ProcMacro,
+            9 => ReadKind::CrateFeature,
             _ => return Err(reads.bad("a read of no kind")),
         };
         let len = reads.usize()?;

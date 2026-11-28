@@ -162,4 +162,54 @@ pub struct StackedSkipped;
     let crates_dis = [input("dis", "/dis/lib.rs", &[])];
     let names_dis = resolved(&crates_dis, &T_DIS);
     assert!(names_dis.notes(0).is_empty(), "disabled outer cfg must not trigger cfg_version gate: {:?}", names_dis.notes(0));
+
+    // 4. `#![cfg(version("1.76"))]` placed BEFORE `#![feature(cfg_version)]` (or before an active
+    //    `#![cfg_attr(rust_nightly, feature(cfg_version))]`) is accepted and keeps the crate's items.
+    const CFG_BEFORE_FEATURE: &str = "#![no_core]
+#![cfg(version(\"1.76\"))]
+#![feature(cfg_version)]
+pub struct AfterOrder;
+";
+    static T_ORD: Texts = Texts(&[&[("/ord/lib.rs", CFG_BEFORE_FEATURE)]]);
+    let crates_ord = [input("ord", "/ord/lib.rs", &[])];
+    let names_ord = resolved(&crates_ord, &T_ORD);
+    assert!(names_ord.notes(0).is_empty(), "cfg(version) before feature(cfg_version) must be accepted: {:?}", names_ord.notes(0));
+    assert!(names_ord.krate(0).tree.notes.is_empty(), "expected no walk notes: {:?}", names_ord.krate(0).tree.notes);
+    assert!(names_ord.item_at(names_ord.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments: &["AfterOrder"] }, g).is_ok());
+
+    // 5. `#![cfg(version("1.76"))]` before `#![cfg_attr(rust_nightly, feature(cfg_version))]`:
+    //    accepted when `rust_nightly` is active, rejected with UnstableCfgVersion when inactive.
+    const CFG_BEFORE_CFG_ATTR_FEATURE: &str = "#![no_core]
+#![cfg(version(\"1.76\"))]
+#![cfg_attr(rust_nightly, feature(cfg_version))]
+pub struct NightlyOrder;
+";
+    static T_NORD: Texts = Texts(&[&[("/nord/lib.rs", CFG_BEFORE_CFG_ATTR_FEATURE)]]);
+    let mut c_nord_on = input("nord_on", "/nord/lib.rs", &[]);
+    c_nord_on.cfg = &[("rust_nightly", None)];
+    let names_nord_on = resolved(&[c_nord_on], &T_NORD);
+    assert!(names_nord_on.notes(0).is_empty(), "active cfg_attr(feature(cfg_version)) after cfg(version) must succeed: {:?}", names_nord_on.notes(0));
+    assert!(names_nord_on.item_at(names_nord_on.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments: &["NightlyOrder"] }, g).is_ok());
+
+    let crates_nord_off = [input("nord_off", "/nord/lib.rs", &[])];
+    let names_nord_off = resolved(&crates_nord_off, &T_NORD);
+    assert!(
+        names_nord_off.notes(0).iter().any(|n| matches!(n, NamesNote::Lower(l) if matches!(l.kind, LowerNoteKind::UnstableCfgVersion)))
+            || names_nord_off.krate(0).tree.notes.iter().any(|n| matches!(n, crate::task::WalkNote::UnstableCfgVersion { .. })),
+        "inactive cfg_attr(feature(cfg_version)) must still gate cfg(version)"
+    );
+
+    // 6. False `#![cfg(version("99.0"))]` before `#![feature(cfg_version)]`: gate enabled (no E0658),
+    //    crate contents cleanly stripped.
+    const FALSE_CFG_BEFORE_FEATURE: &str = "#![no_core]
+#![cfg(version(\"99.0\"))]
+#![feature(cfg_version)]
+pub struct Stripped;
+";
+    static T_F_ORD: Texts = Texts(&[&[("/ford/lib.rs", FALSE_CFG_BEFORE_FEATURE)]]);
+    let crates_f_ord = [input("ford", "/ford/lib.rs", &[])];
+    let names_f_ord = resolved(&crates_f_ord, &T_F_ORD);
+    assert!(names_f_ord.notes(0).is_empty(), "false cfg(version) with feature(cfg_version) must not emit gate error: {:?}", names_f_ord.notes(0));
+    assert!(names_f_ord.krate(0).tree.notes.is_empty(), "expected no walk notes: {:?}", names_f_ord.krate(0).tree.notes);
+    assert!(names_f_ord.item_at(names_f_ord.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments: &["Stripped"] }, g).is_err());
 }

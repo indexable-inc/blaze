@@ -207,7 +207,19 @@ pub fn cfg_predicate_at_with_version<E>(
     alloc: Alloc<'_>,
     atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>,
 ) -> Result<bool, CfgPredicateError<E>> {
-    predicate_in::<bool, E>(tokens, range, cfg_version, alloc, atom)
+    predicate_in::<bool, E>(tokens, range, cfg_version, alloc, atom, &mut || {})
+}
+
+/// Like [`cfg_predicate_with_version`], also invoking `on_cfg_version` whenever a `version(..)`
+/// predicate is evaluated so [`crate::cx::Recorder`] can record the `cfg_version` gate as a read.
+pub(crate) fn cfg_predicate_with_version_hook<E>(
+    tokens: &TokenStream<'_>,
+    cfg_version: bool,
+    alloc: Alloc<'_>,
+    atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>,
+    on_cfg_version: &mut dyn FnMut(),
+) -> Result<bool, CfgPredicateError<E>> {
+    predicate_in::<bool, E>(tokens, 0..tokens.tokens().len(), cfg_version, alloc, atom, on_cfg_version)
 }
 
 /// [`cfg_predicate_at`] in Kleene's three values: `atom` answers [`Tri::Unknown`] for an atom not
@@ -220,7 +232,7 @@ pub fn cfg_predicate_tri(
     alloc: Alloc<'_>,
     atom: &mut dyn FnMut(&str, Option<&str>) -> Tri,
 ) -> Result<Tri, CfgPredicateError<core::convert::Infallible>> {
-    predicate_in::<Tri, core::convert::Infallible>(tokens, range, false, alloc, &mut |name, value| Ok(atom(name, value)))
+    predicate_in::<Tri, core::convert::Infallible>(tokens, range, false, alloc, &mut |name, value| Ok(atom(name, value)), &mut || {})
 }
 
 /// THE ONE READING of a cfg predicate (the module doc), folded in `V`.
@@ -230,6 +242,7 @@ fn predicate_in<V: Truth, E>(
     cfg_version: bool,
     alloc: Alloc<'_>,
     atom: &mut dyn FnMut(&str, Option<&str>) -> Result<V, E>,
+    on_cfg_version: &mut dyn FnMut(),
 ) -> Result<V, CfgPredicateError<E>> {
     let list = tokens.tokens().get(..range.end).unwrap_or(&[]);
     // Macro-by-example captures (`$s:expr`, `$m:meta`, `$l:literal`) wrap substituted tokens in
@@ -283,6 +296,7 @@ fn predicate_in<V: Truth, E>(
                 }
                 let Some(TokenKind::Close(Delim::Paren)) = tok(pos).map(|t| t.kind) else { return Err(malformed(pos)) };
                 pos += 1;
+                on_cfg_version();
                 if !cfg_version {
                     return Err(CfgPredicateError::UnstableCfgVersion { token: start_token });
                 }

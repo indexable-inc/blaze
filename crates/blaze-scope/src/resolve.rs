@@ -59,7 +59,7 @@ use crate::task::{
     CallSrc, Cfg, Fill, FillEnv, FillReport, Files, First, Fragment, FragmentTokens, Held, ImplSrc,
     ItemText, LangSrc, Loc, LowerCx, LowerNote, Lowered, MacroBody, MacroSrc, Member, ModMade, Par,
     PreludeImport, RootInput, RootNote, RootPlan, TaskError, Tree, Variant, Where,
-    crate_root, crate_tools, file_attrs, lower, lower_in, walk,
+    crate_root, crate_tools, file_attrs, file_enables_feature, lower, lower_in, walk,
 };
 use crate::task::{joined, pop_dir};
 use crate::task::ExpandPart;
@@ -2315,8 +2315,7 @@ fn walked_files<'a, S: SourceTexts<'a>, P: Par>(
     let mut set = FileSet::new_in(alloc);
     let root_outline = blaze_file_items::outline_auto_extensions(root_text, edition, blaze_file_items::Bodies::Skipped, alloc);
     let root_file = set.add(file_of(input.root, root_text, root_outline, input.shown_from, bump));
-    let pre_root = file_attrs(cfg, &set.at(usize::try_from(root_file).unwrap_or(0)).outline, root_text, alloc);
-    let cfg_version = pre_root.features.iter().any(|&f| f == "cfg_version");
+    let cfg_version = file_enables_feature(cfg, &set.at(usize::try_from(root_file).unwrap_or(0)).outline, root_text, "cfg_version", alloc);
     let cfg_with_version = if cfg_version {
         Some(Cfg::from_atoms(cfg.atoms(), alloc).with_cfg_version(true))
     } else {
@@ -2525,8 +2524,7 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
     let stored_cfg_version = stored_view.has_feature("cfg_version");
     let cfg_version = if root_member {
         let root = set.at(usize::try_from(tree.modules[0].file).unwrap_or(0));
-        let pre = file_attrs(cfg, &root.outline, root.text, alloc);
-        let enabled = pre.features.iter().any(|&f| f == "cfg_version");
+        let enabled = file_enables_feature(cfg, &root.outline, root.text, "cfg_version", alloc);
         if enabled != stored_cfg_version {
             return Ok(None);
         }
