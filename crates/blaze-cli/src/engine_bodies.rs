@@ -3637,6 +3637,7 @@ fn open_stretch_records<'n>(
             callers,
             by_need,
             run_stopped: core::cell::Cell::new(None),
+            proc_exports_cache: core::cell::OnceCell::new(),
             activity: None,
         },
         frame,

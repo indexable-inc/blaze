@@ -215,6 +215,10 @@ pub(crate) struct JobTexts<'n> {
     /// the frame: [`SourceTexts::proc_macro_unusable`] gives them for the call the solve asks
     /// about just after the run (one job, one thread: the run and the ask are in order).
     pub(crate) run_stopped: core::cell::Cell<Option<&'n str>>,
+    /// Cached result of [`SourceTexts::proc_exports`] for `self.own`, populated at most once per
+    /// job so repeated held-body solves (`--block-scopes=bodies`) reuse the same bump-allocated
+    /// slice in O(1) instead of re-allocating in `self.frame` per body.
+    pub(crate) proc_exports_cache: core::cell::OnceCell<Result<Option<&'n [blaze_scope::resolve::ProcExport<'n>]>, &'n str>>,
     /// Live status board and clock, when running inside `engine_check`: reports active
     /// Wasmtime proc-macro expansions (`WorkKind::ProcMacro`) while they execute.
     pub(crate) activity: Option<(&'n crate::engine_status::Board<'n>, &'n bstd::clock::Clock)>,
@@ -541,14 +545,16 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
         if self.own != Some(krate) {
             return Ok(None);
         }
-        let Some(procs) = self.runner()? else {
-            return Ok(None);
-        };
-        match procs.exports_of(krate) {
-            Ok(Some(exports)) => Ok(Some(proc_exports_in(exports, self.frame))),
-            Ok(None) => Ok(None),
-            Err(error) => Err(blaze_own::format_in!(self.frame, "{error}").into_bump_str()),
-        }
+        *self.proc_exports_cache.get_or_init(|| {
+            let Some(procs) = self.runner()? else {
+                return Ok(None);
+            };
+            match procs.exports_of(krate) {
+                Ok(Some(exports)) => Ok(Some(proc_exports_in(exports, self.frame))),
+                Ok(None) => Ok(None),
+                Err(error) => Err(blaze_own::format_in!(self.frame, "{error}").into_bump_str()),
+            }
+        })
     }
 
     /// A proc-macro call written in the crate `krate`: through the runner's one path
@@ -686,6 +692,7 @@ mod tests {
             callers: &[],
             by_need: None,
             run_stopped: core::cell::Cell::new(None),
+            proc_exports_cache: core::cell::OnceCell::new(),
             activity: None,
         }
     }
@@ -791,6 +798,13 @@ mod tests {
             .proc_exports(0)
             .expect("loaded proc-macro crate must not error")
             .expect("loaded proc-macro crate must return Some(exports)");
+        let used_after_first = loaded_job.frame.used();
+        let second = loaded_job
+            .proc_exports(0)
+            .expect("cached proc-macro exports must not error")
+            .expect("cached proc-macro exports must return Some(exports)");
+        assert!(core::ptr::eq(exports.as_ptr(), second.as_ptr()), "repeated proc_exports calls must reuse the cached slice");
+        assert_eq!(loaded_job.frame.used(), used_after_first, "repeated proc_exports calls must not re-allocate in the job frame");
         assert_eq!(
             exports,
             &[
@@ -810,6 +824,10 @@ mod tests {
         let mut missing_job = texts(&cx, &root, Procs::Made(&runner));
         missing_job.own = Some(2);
         let err = missing_job.proc_exports(2).expect_err("missing registered module must return Err, never Ok(None)");
+        let used_after_err = missing_job.frame.used();
+        let err2 = missing_job.proc_exports(2).expect_err("cached missing module error must stay Err");
+        assert!(core::ptr::eq(err.as_ptr(), err2.as_ptr()), "repeated proc_exports error calls must reuse the cached message");
+        assert_eq!(missing_job.frame.used(), used_after_err, "repeated proc_exports error calls must not re-allocate in the job frame");
         assert!(err.contains("missing_macros"), "error must name the missing macro crate: {err}");
 
         let mut unregistered_job = texts(&cx, &root, Procs::Made(&runner));
