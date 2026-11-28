@@ -796,9 +796,9 @@ pub fn write_native_par<'a, R: ExportRunner>(
             }
             "__DATA_CONST" => {
                 let mut cursor = laid.got_at + got_size;
-                let mod_init = laid.mod_init_at.map(|at| {
-                    cursor = at + 8;
-                    section("__mod_init_func", "__DATA_CONST", at, 8, at, 3, S_MOD_INIT_FUNC_POINTERS)
+                let mod_init = laid.inits.map(|(at, len)| {
+                    cursor = at + len;
+                    section("__mod_init_func", "__DATA_CONST", at, len, at, 3, S_MOD_INIT_FUNC_POINTERS)
                 });
                 let const_start = up(cursor, 16);
                 let rest = laid.const_end().saturating_sub(const_start);

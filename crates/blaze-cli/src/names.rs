@@ -78,7 +78,9 @@ pub(crate) mod sections;
 // `OUT_DOMAIN` 3. Source 19: `CrateScope` form 7 (32-byte `NameCell` rows + columnar `ItemsRecord` v14).
 // Source 20: `OUT_DOMAIN` 4 digests exports + Section 2 (`names_record`) + Section 3
 // (`items_record`) + expansions directory instead of dead `done.inner`.
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 20";
+// Source 21: Section 6 (`links`) `TABLE_FORM` 2 includes Rust `.init_array` / `__mod_init_func`
+// initializer statics.
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 21";
 /// The out: the exports record, Section 2 (`NAMES_OUT_DOMAIN`), Section 3 (`ITEMS_OUT_DOMAIN`),
 /// the crate's expansion record keys (`EXPANSIONS_OUT_DOMAIN`), AND the checkout files the crate
 /// holds ([`crate_out`]). "1" was the names record alone, but a body's check reads its crate's

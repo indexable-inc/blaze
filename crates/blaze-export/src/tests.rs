@@ -11,8 +11,8 @@ use blaze_own::{AVec, Alloc, Vec};
 use crate::check::{self, CheckError};
 use crate::error::ExportError;
 use crate::export::export;
-use crate::input::{Data, DataPlace, DataWord, Entry, Function, Panic, Platform, Profile, ProgramIn, Tier, TlsRuntime};
-use crate::layout::{FixTo, Member, TlsPlan, lay_out, lay_out_with_tls};
+use crate::input::{Data, DataPlace, DataWord, Entry, Function, InitStatic, Panic, Platform, Profile, ProgramIn, Tier, TlsRuntime};
+use crate::layout::{FixTo, InitPlan, Member, TlsPlan, lay_out, lay_out_with_tls};
 use crate::plant::{self, Plant};
 use crate::{elf, macho};
 
@@ -69,7 +69,7 @@ fn tiny() -> (AVec<'static, u8>, AVec<'static, u8>) {
 }
 
 fn program<'r>(functions: &'r [Function<'r>], data: &'r [Data<'r>], profile: Option<Profile<'r>>) -> ProgramIn<'r> {
-    ProgramIn { name: "tiny", functions, data, entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality: None, tls: None, profile, natives: None, exports: &[], symbol_names: &[] }
+    ProgramIn { name: "tiny", functions, data, entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality: None, tls: None, profile, natives: None, exports: &[], inits: &[], symbol_names: &[] }
 }
 
 fn functions<'r>(main: &'r [u8], second: &'r [u8]) -> [Function<'r>; 2] {
@@ -560,7 +560,8 @@ fn rust_tls_macho_and_elf_layout_and_determinism() {
         None,
         macho::plan(),
         0,
-        Some(TlsPlan { descriptor: desc_sym, mod_init_fn: None, initial_root: 0 }),
+        Some(TlsPlan { descriptor: desc_sym, initial_root: 0 }),
+        InitPlan::default(),
         alloc,
     )
     .unwrap();
@@ -603,6 +604,7 @@ fn rust_tls_macho_and_elf_layout_and_determinism() {
         profile: None,
         natives: None,
         exports: &[],
+        inits: &[],
         symbol_names: &[],
     };
     let prog_b = ProgramIn { functions: &fs_rev, data: &data_rev, ..prog_a };
@@ -657,6 +659,7 @@ fn rust_tls_refusals_are_named() {
         profile: None,
         natives: None,
         exports: &[],
+        inits: &[],
         symbol_names: &[],
     };
     assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::NoTlsRuntime { target: tls_a }));
@@ -951,6 +954,7 @@ fn elf_native_merge_full_end_to_end() {
         profile: None,
         natives: Some(&img),
         exports: &c_exports,
+        inits: &[],
         symbol_names: &[],
     };
     let prog_rev = ProgramIn { functions: &fs_rev, ..prog };
@@ -1196,6 +1200,7 @@ fn elf_native_merge_coexists_with_rust_tls() {
         profile: None,
         natives: Some(&img_unaligned),
         exports: &c_exports,
+        inits: &[],
         symbol_names: &[],
     };
     let mut elf1 = Vec::new_in(alloc);
@@ -1968,6 +1973,7 @@ fn export_par_bit_identical_across_worker_counts_macho_and_elf() {
         profile: None,
         natives: None,
         exports: &[],
+        inits: &[],
         symbol_names: &sym_names,
     };
 
@@ -2040,6 +2046,7 @@ fn export_par_scaling_benchmark() {
         profile: None,
         natives: None,
         exports: &[],
+        inits: &[],
         symbol_names: &sym_names,
     };
 
@@ -2079,4 +2086,172 @@ fn export_par_scaling_benchmark() {
             times.sign_ns as f64 / 1e6,
         );
     }
+}
+
+/// Rust `#[link_section = ".init_array..."]` statics are sorted by ascending numeric priority
+/// (e.g. `.init_array.00098` -> `.init_array.00099` -> unsuffixed `.init_array`), emitted into
+/// ELF `DT_INIT_ARRAY` / `DT_INIT_ARRAYSZ` with `R_AARCH64_RELATIVE` relocations, merged cleanly
+/// into one contiguous `DT_INIT_ARRAY` alongside native C `Region::Inits` when both are present,
+/// and emitted into Mach-O `__DATA_CONST,__mod_init_func` after macOS TLS init.
+#[test]
+fn rust_init_array_elf_priority_native_merge_and_macho() {
+    let alloc = blaze_own::testing::heap().alloc();
+    // Four distinct functions with distinct code so folding keeps separate addresses.
+    let main_bytes = rec(&[MOV_W0_42, RET], &[], &[]);
+    let init98_bytes = rec(&[NOP, RET], &[], &[]);
+    let init99_bytes = rec(&[NOP, NOP, RET], &[], &[]);
+    let init_plain_bytes = rec(&[NOP, NOP, NOP, RET], &[], &[]);
+    let rust_cb_bytes = rec(&[NOP, NOP, NOP, NOP, RET], &[], &[]);
+
+    let fs = [
+        Function { symbol: sym("main"), record: CodeView::read(&main_bytes).expect("main"), tier: Tier::Fast },
+        Function { symbol: sym("init_98"), record: CodeView::read(&init98_bytes).expect("init_98"), tier: Tier::Fast },
+        Function { symbol: sym("init_99"), record: CodeView::read(&init99_bytes).expect("init_99"), tier: Tier::Fast },
+        Function { symbol: sym("init_plain"), record: CodeView::read(&init_plain_bytes).expect("init_plain"), tier: Tier::Fast },
+        Function { symbol: sym("rust_cb"), record: CodeView::read(&rust_cb_bytes).expect("rust_cb"), tier: Tier::Fast },
+    ];
+    let zero8 = [0u8; 8];
+    let w98 = [DataWord { at: 0, target: Some(Target { space: Space::Func, symbol: sym("init_98") }), addend: 0 }];
+    let w99 = [DataWord { at: 0, target: Some(Target { space: Space::Func, symbol: sym("init_99") }), addend: 0 }];
+    let wplain = [DataWord { at: 0, target: Some(Target { space: Space::Func, symbol: sym("init_plain") }), addend: 0 }];
+    let data = [
+        Data { target: Target { space: Space::Static, symbol: sym("INIT_PLAIN") }, bytes: &zero8, align: 8, words: &wplain, outside: &[], place: DataPlace::ReadOnly },
+        Data { target: Target { space: Space::Static, symbol: sym("INIT_99") }, bytes: &zero8, align: 8, words: &w99, outside: &[], place: DataPlace::ReadOnly },
+        Data { target: Target { space: Space::Static, symbol: sym("INIT_98") }, bytes: &zero8, align: 8, words: &w98, outside: &[], place: DataPlace::ReadOnly },
+    ];
+    // Given deliberately out of priority order; reversed input must produce byte-identical output.
+    let inits_a = [
+        InitStatic { symbol: sym("INIT_PLAIN"), priority: None },
+        InitStatic { symbol: sym("INIT_99"), priority: Some(99) },
+        InitStatic { symbol: sym("INIT_98"), priority: Some(98) },
+    ];
+    let inits_b = [inits_a[2], inits_a[1], inits_a[0]];
+
+    // Helper: extract (init_vaddr, init_sz) and map each R_AARCH64_RELATIVE r_offset -> r_addend.
+    let read_elf_init_targets = |file: &[u8]| -> (u64, u64, AVec<'_, (u64, u64)>) {
+        let u16_at = |at: usize| u16::from_le_bytes(file[at..at + 2].try_into().expect("u16"));
+        let u32_at = |at: usize| u32::from_le_bytes(file[at..at + 4].try_into().expect("u32"));
+        let u64_at = |at: usize| u64::from_le_bytes(file[at..at + 8].try_into().expect("u64"));
+        let phoff = u64_at(32) as usize;
+        let phnum = u16_at(56) as usize;
+        let mut loads: AVec<'_, (u64, u64, u64)> = Vec::new_in(alloc);
+        let mut dyn_ph = None;
+        for k in 0..phnum {
+            let p = phoff + 56 * k;
+            let kind = u32_at(p);
+            let off = u64_at(p + 8);
+            let va = u64_at(p + 16);
+            let filesz = u64_at(p + 32);
+            if kind == 1 {
+                loads.push((off, va, filesz));
+            } else if kind == 2 {
+                dyn_ph = Some((off, filesz));
+            }
+        }
+        let vaddr_to_off = |va: u64| -> usize {
+            let l = loads.iter().find(|l| va >= l.1 && va < l.1 + l.2).expect("vaddr in PT_LOAD");
+            (l.0 + (va - l.1)) as usize
+        };
+        let (dyn_off, dyn_len) = dyn_ph.expect("PT_DYNAMIC");
+        let (mut init_va, mut init_sz, mut rela_va, mut relasz) = (0u64, 0u64, 0u64, 0u64);
+        let mut off = dyn_off as usize;
+        while off < (dyn_off + dyn_len) as usize {
+            let (tag, val) = (u64_at(off), u64_at(off + 8));
+            if tag == 0 {
+                break;
+            }
+            match tag {
+                7 => rela_va = val,
+                8 => relasz = val,
+                25 => init_va = val,
+                27 => init_sz = val,
+                _ => {}
+            }
+            off += 16;
+        }
+        let rela_off = vaddr_to_off(rela_va);
+        let mut slots: AVec<'_, (u64, u64)> = Vec::new_in(alloc);
+        for r in 0..(relasz / 24) as usize {
+            let at = rela_off + 24 * r;
+            let r_off = u64_at(at);
+            let r_info = u64_at(at + 8);
+            let r_addend = u64_at(at + 16);
+            if (r_info & 0xFFFF_FFFF) == 1027 && r_off >= init_va && r_off < init_va + init_sz {
+                slots.push((r_off - init_va, r_addend));
+            }
+        }
+        slots.sort_unstable_by_key(|&(slot_off, _)| slot_off);
+        (init_va, init_sz, slots)
+    };
+
+    // 1. Pure-Rust ELF with 3 Rust .init_array statics (no native C image).
+    let prog_pure_a = ProgramIn {
+        name: "elf-rust-inits",
+        functions: &fs,
+        data: &data,
+        entry: Entry::CMain { main: sym("main") },
+        panic: Panic::Unwind,
+        personality: None,
+        tls: None,
+        profile: None,
+        natives: None,
+        exports: &[],
+        inits: &inits_a,
+        symbol_names: &[],
+    };
+    let prog_pure_b = ProgramIn { inits: &inits_b, ..prog_pure_a };
+    let mut pure_a = Vec::new_in(alloc);
+    let mut pure_b = Vec::new_in(alloc);
+    export(&prog_pure_a, Platform::LinuxArm64, &mut pure_a, alloc).expect("pure Rust ELF export");
+    export(&prog_pure_b, Platform::LinuxArm64, &mut pure_b, alloc).expect("pure Rust ELF export (reversed)");
+    assert_eq!(&pure_a[..], &pure_b[..], "ELF Rust init_array export must be deterministic across input orders");
+    let pure_facts = check::elf(&pure_a).expect("check::elf pure Rust inits");
+    let (pure_va, pure_sz, pure_slots) = read_elf_init_targets(&pure_a);
+    assert_eq!(pure_facts.init_array, Some((pure_va, 24)), "DT_INIT_ARRAYSZ must cover all 3 Rust inits (24 bytes)");
+    assert_eq!(pure_sz, 24);
+    assert_eq!(pure_slots.len(), 3);
+    assert_eq!([pure_slots[0].0, pure_slots[1].0, pure_slots[2].0], [0, 8, 16]);
+    // Verify exact priority ordering by checking the code length at each target function address.
+    // init_98 has 2 insts (NOP, RET), init_99 has 3 (NOP, NOP, RET), init_plain has 4 (NOP, NOP, NOP, RET).
+    let inst_at = |file: &[u8], va: u64| u32::from_le_bytes(file[va as usize..va as usize + 4].try_into().expect("inst"));
+    assert_eq!(inst_at(&pure_a, pure_slots[0].1 + 4), RET, "slot 0 must be init_98 (priority 98)");
+    assert_eq!(inst_at(&pure_a, pure_slots[1].1 + 8), RET, "slot 1 must be init_99 (priority 99)");
+    assert_eq!(inst_at(&pure_a, pure_slots[2].1 + 12), RET, "slot 2 must be init_plain (unsuffixed)");
+
+    // 2. ELF with BOTH Rust .init_array statics AND native C Region::Inits -> ONE contiguous DT_INIT_ARRAY!
+    let img = linux_native_image(alloc, true, 0x3_0080, 3);
+    let c_exports = [crate::input::CExport { name: b"rust_cb", symbol: sym("rust_cb") }];
+    let prog_both = ProgramIn { natives: Some(&img), exports: &c_exports, ..prog_pure_a };
+    let mut both = Vec::new_in(alloc);
+    export(&prog_both, Platform::LinuxArm64, &mut both, alloc).expect("ELF Rust + native C inits export");
+    let both_facts = check::elf(&both).expect("check::elf Rust + native C inits");
+    let (both_va, both_sz, both_slots) = read_elf_init_targets(&both);
+    assert_eq!(both_facts.init_array, Some((both_va, 32)), "DT_INIT_ARRAYSZ must merge 24B Rust + 8B C = 32B");
+    assert_eq!(both_sz, 32);
+    assert_eq!(both_slots.len(), 4, "all 4 init_array slots must have R_AARCH64_RELATIVE relocations");
+    assert_eq!([both_slots[0].0, both_slots[1].0, both_slots[2].0, both_slots[3].0], [0, 8, 16, 24]);
+    assert_eq!(inst_at(&both, both_slots[0].1 + 4), RET, "slot 0 is Rust init_98");
+    assert_eq!(inst_at(&both, both_slots[1].1 + 8), RET, "slot 1 is Rust init_99");
+    assert_eq!(inst_at(&both, both_slots[2].1 + 12), RET, "slot 2 is Rust init_plain");
+    assert!(both_slots[3].1 > both_va, "slot 3 points to shifted native C c_init");
+
+    // 3. Mach-O with Rust __mod_init_func statics emits 24-byte __DATA_CONST,__mod_init_func.
+    let mut mac_out = Vec::new_in(alloc);
+    export(&prog_pure_a, Platform::MacosArm64, &mut mac_out, alloc).expect("Mach-O Rust inits export");
+    let mac_facts = check::macho(&mac_out).expect("check::macho Rust inits");
+    assert!(matches!(mac_facts.mod_init, Some((_, 24))), "Mach-O must emit 24-byte __DATA_CONST,__mod_init_func");
+
+    // 4. Refusals: missing static datum and invalid (zeroed / non-8-byte) datum.
+    let missing_init = [InitStatic { symbol: sym("NO_SUCH_INIT"), priority: Some(98) }];
+    let mut err_out = Vec::new_in(alloc);
+    assert_eq!(
+        export(&ProgramIn { inits: &missing_init, ..prog_pure_a }, Platform::LinuxArm64, &mut err_out, alloc),
+        Err(ExportError::InitNotPlaced { symbol: sym("NO_SUCH_INIT") })
+    );
+    let bad_zero = [Data { target: Target { space: Space::Static, symbol: sym("BAD_ZERO") }, bytes: &[], align: 8, words: &[], outside: &[], place: DataPlace::Zeroed { len: 8 } }];
+    let bad_zero_init = [InitStatic { symbol: sym("BAD_ZERO"), priority: None }];
+    assert!(matches!(
+        export(&ProgramIn { data: &bad_zero, inits: &bad_zero_init, ..prog_pure_a }, Platform::LinuxArm64, &mut err_out, alloc),
+        Err(ExportError::InitBadDatum { symbol, .. }) if symbol == sym("BAD_ZERO")
+    ));
 }
