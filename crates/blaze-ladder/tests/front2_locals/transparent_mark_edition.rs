@@ -278,6 +278,17 @@ impl SourceTexts<'static> for TransparentEditionRunner {
         let tokens = lex(text, edition, alloc).map_err(|_| refused)?;
         let mut origins = AVec::new_in(alloc);
         origins.extend(tokens.tokens().iter().map(|_| TokenOrigin::Made(Transparency::Transparent)));
+        // `match_ref_mut!($x)` forwards the input token `x` with its input span (like `quote!(match #input { ... })`),
+        // so calling it from inside a `macro_rules!` preserves the caller's hygiene for `x` after #2840.
+        if def.proc_name() == Some("match_ref_mut") {
+            if let Some(in_idx) = call.input.tokens().iter().position(|t| call.input.text_of(t) == "x") {
+                if let Some(out_idx) = tokens.tokens().iter().position(|t| tokens.text_of(t) == "x") {
+                    if let Ok(in_u32) = u32::try_from(in_idx) {
+                        origins[out_idx] = TokenOrigin::Input(in_u32);
+                    }
+                }
+            }
+        }
         Ok(Produced { tokens, origins, reads: Reads::new_in(alloc), diagnostics: AVec::new_in(alloc), text: AVec::new_in(alloc) })
     }
 }
