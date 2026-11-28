@@ -893,6 +893,67 @@ fn dyn_expect_destructuring_reassign_err(
     readers.push(Box::new(move |link| link.downcast()));
 }
 
+fn dyn_expect_reassigned_after_use_ok(static_r: Vec<Reader>) {
+    let mut r = static_r;
+    r.push(Box::new(move |link| link.downcast()));
+    r = Vec::new();
+    let _ = r;
+}
+
+fn dyn_expect_reassigned_in_loop_err(
+    static_r: Vec<Reader>,
+    non_static: Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool + Send + Sync>>,
+) {
+    let mut r = static_r;
+    let mut opt = Some(non_static);
+    for _ in 0..2 {
+        r.push(Box::new(move |link| link.downcast()));
+        if let Some(ns) = opt.take() {
+            r = ns;
+        }
+    }
+}
+
+struct NestedRef<'a, T>(PhantomData<&'a ()>, PhantomData<T>);
+impl<'a> Copy for NestedRef<'a, &'a u8> {}
+impl<'a> Clone for NestedRef<'a, &'a u8> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_nested_ref_same_ok<'a>(n: NestedRef<'a, &'a u8>) {
+    let a = n;
+    let b = n;
+    let _ = (a, b);
+}
+
+fn copy_nested_ref_diff_err<'a, 'b>(n: NestedRef<'a, &'b u8>) {
+    let a = n;
+    let b = n;
+    let _ = (a, b);
+}
+
+struct TwoArgs<'a, T, U>(PhantomData<&'a ()>, PhantomData<T>, PhantomData<U>);
+impl<'a, T> Copy for TwoArgs<'a, T, &'a u8> {}
+impl<'a, T> Clone for TwoArgs<'a, T, &'a u8> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_nested_after_param_ok<'a, 'b>(x: TwoArgs<'a, &'b u8, &'a u8>) {
+    let a = x;
+    let b = x;
+    let _ = (a, b);
+}
+
+fn copy_nested_after_param_err<'a, 'b>(x: TwoArgs<'a, &'a u8, &'b u8>) {
+    let a = x;
+    let b = x;
+    let _ = (a, b);
+}
+
 fn copy_outlives_static_ref_ok(t: OutlivesToken<'static, &'static u8>) {
     let a = t;
     let b = t;
@@ -1226,6 +1287,7 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         "dyn_expect_match_ok_static_ok",
         "dyn_expect_destructured_generic_param_ok",
         "dyn_expect_long_alias_chain_ok",
+        "dyn_expect_reassigned_after_use_ok",
         "copy_proj_shared_ok",
         "copy_proj_generic_tuple_shared_ok",
         "copy_outlives_static_scalar_ok",
@@ -1239,6 +1301,8 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         "copy_trait_region_param_static_ok",
         "copy_constrained_static_ok",
         "copy_constrained_same_pair_ok",
+        "copy_nested_ref_same_ok",
+        "copy_nested_after_param_ok",
         "copy_supertrait_region_ok",
         "copy_proj_region_ok",
         "PROMOTED_OUTLIVES",
@@ -1252,7 +1316,7 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
     // Negative controls: non-`'static` `dyn Fn(&(dyn MyErr + '_))` MUST still fail with E0521
     // (including beside an unrelated `&READERS` sibling arg, unrelated owner param, sibling arg
     // using a different generic parameter, unrelated unary wrapper call, `Err(v)` match arm,
-    // or a local reassigned inside a destructuring assignment target).
+    // destructuring assignment target, or reassignment inside an enclosing loop).
     for err_fn in [
         "dyn_expect_negative_elided",
         "dyn_expect_negative_unrelated_owner_param",
@@ -1262,6 +1326,7 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         "dyn_expect_negative_unrelated_unary_call",
         "dyn_expect_match_err_elided_err",
         "dyn_expect_destructuring_reassign_err",
+        "dyn_expect_reassigned_in_loop_err",
     ] {
         let body = find(err_fn);
         let (types, v) = world.check_borrows(body, heap.alloc());
@@ -1305,6 +1370,8 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         "copy_trait_region_param_mismatch_err",
         "copy_constrained_static_err",
         "copy_constrained_same_pair_err",
+        "copy_nested_ref_diff_err",
+        "copy_nested_after_param_err",
         "copy_supertrait_region_mismatch_err",
         "copy_proj_region_mismatch_err",
         "copy_proj_region_wrong_out_err",

@@ -3815,11 +3815,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             return Ok(false);
         };
         let lifetimes = self.adt_facts(k, e)?.lifetimes;
+        let adt_npos = self.npos(adt_ty, e)?;
         let args = self.list(l, e)?;
         let region_orig = |s: &mut Self, idx: u32| -> Option<Origin> {
             if idx == u32::MAX {
                 Some(s.universal(Region::Static))
-            } else if idx < lifetimes {
+            } else if idx < adt_npos {
                 let pos = adt_off.checked_add(idx)?;
                 origs.get(usize::try_from(pos).ok()?).copied()
             } else {

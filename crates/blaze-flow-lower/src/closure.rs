@@ -1186,7 +1186,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         let mut cur = ce;
         let mut want_dyn: Option<PTy> = None;
         let mut path: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
-        for _ in 0..8 {
+        let max_wrap = self.body.exprs.len().saturating_add(1);
+        let mut visited_wrap: Vec<ExprId, A> = Vec::new_in(self.alloc);
+        for _ in 0..max_wrap {
+            if visited_wrap.scan_for(&cur).is_some() {
+                break;
+            }
+            visited_wrap.push(cur);
             if let Ok(adj) = self.adjusted_ty(cur)
                 && let Ok(Some(d)) = self.peel_body_dyn_path(adj, &mut path, e)
             {
@@ -1592,11 +1598,23 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
     }
 
     /// Peels `&`/`&mut` and zero-lifetime smart-pointer wrappers (`Box`, `Arc`, `Rc`) off `t` to
-    /// find `PNode::Dynamic`, recording the outer-to-inner [`DynPathStep`]s into `out`.
+    /// find `PNode::Dynamic`, recording the outer-to-inner [`DynPathStep`]s into `out`. Bounded
+    /// by visited `PTy` cycle detection and [`MOST_POSITIONS`] (refusing with [`Form::Bound`] if
+    /// exceeded, never silently truncating at a small fixed cap).
     fn peel_body_dyn_path(&self, mut t: PTy, out: &mut Vec<DynPathStep, A>, e: ExprId) -> Result<Option<PTy>, Refusal> {
         let facts: &'b F = self.facts;
         out.clear();
-        for _ in 0..16u32 {
+        let mut visited: Vec<PTy, A> = Vec::new_in(self.alloc);
+        let mut steps = 0u32;
+        loop {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse(Form::Bound, e);
+            }
+            if visited.scan_for(&t).is_some() {
+                return Ok(None);
+            }
+            visited.push(t);
             match self.node(t, e)? {
                 PNode::Ref(_, inner) => {
                     out.push(DynPathStep::RefInner);
@@ -1615,7 +1633,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 _ => return Ok(None),
             }
         }
-        Ok(None)
     }
 
     /// Applies `expr`'s adjustments forward (from unadjusted `expr_ty(expr)` to `adjusted_ty(expr)`)
@@ -1992,6 +2009,398 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         false
     }
 
+    /// Whether any assignment inside the subtree rooted at `root` (excluding `skip_assign`)
+    /// writes to local `target`.
+    fn expr_subtree_writes_local(&self, root: ExprId, target: PatId, skip_assign: Option<ExprId>) -> bool {
+        use blaze_typeck::Stmt;
+        let mut stack: Vec<ExprId, A> = Vec::new_in(self.alloc);
+        stack.push(root);
+        let mut steps = 0usize;
+        let max_steps = self.body.exprs.len().saturating_add(1);
+        while let Some(cur) = stack.pop() {
+            steps += 1;
+            if steps > max_steps {
+                return true;
+            }
+            let Some(&ex) = self.body.exprs.get(cur.ix()) else { continue };
+            match ex {
+                Expr::Assign { lhs, rhs } | Expr::AssignOp { lhs, rhs, .. } => {
+                    if skip_assign != Some(cur) && self.assign_lhs_writes_local(lhs, target) {
+                        return true;
+                    }
+                    stack.push(lhs);
+                    stack.push(rhs);
+                }
+                Expr::Paren(i)
+                | Expr::Field { base: i, .. }
+                | Expr::TupleField { base: i, .. }
+                | Expr::Unary { operand: i, .. }
+                | Expr::Cast { operand: i, .. }
+                | Expr::Ref { operand: i, .. }
+                | Expr::RawRef { operand: i, .. }
+                | Expr::Loop { body: i }
+                | Expr::Await(i)
+                | Expr::Do(i)
+                | Expr::Defer(i)
+                | Expr::Let { init: i, .. }
+                | Expr::Closure { body: i, .. }
+                | Expr::AsyncBlock { body: i, .. } => stack.push(i),
+                Expr::Return { value: Some(i) } | Expr::Break { value: Some(i), .. } | Expr::Become { value: i } => {
+                    stack.push(i);
+                }
+                Expr::Binary { lhs, rhs, .. } | Expr::Index { base: lhs, index: rhs } => {
+                    stack.push(lhs);
+                    stack.push(rhs);
+                }
+                Expr::Repeat { elem, count, .. } => {
+                    stack.push(elem);
+                    if let Some(c) = count {
+                        stack.push(c);
+                    }
+                }
+                Expr::Tuple { elems } | Expr::Array { elems } => {
+                    if let Some(es) = self.body.expr_lists.get(elems.range()) {
+                        stack.extend_from_slice(es);
+                    }
+                }
+                Expr::Call { callee, args } => {
+                    stack.push(callee);
+                    if let Some(es) = self.body.expr_lists.get(args.range()) {
+                        stack.extend_from_slice(es);
+                    }
+                }
+                Expr::MethodCall { receiver, args, .. } => {
+                    stack.push(receiver);
+                    if let Some(es) = self.body.expr_lists.get(args.range()) {
+                        stack.extend_from_slice(es);
+                    }
+                }
+                Expr::FormatArgs { args, .. } => {
+                    if let Some(es) = self.body.expr_lists.get(args.range()) {
+                        stack.extend_from_slice(es);
+                    }
+                }
+                Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
+                    if let Some(fs) = self.body.field_inits.get(fields.range()) {
+                        for f in fs {
+                            stack.push(f.expr);
+                        }
+                    }
+                    if let blaze_typeck::StructBase::Expr(b) = base {
+                        stack.push(b);
+                    }
+                }
+                Expr::If { cond, then, else_ } => {
+                    stack.push(cond);
+                    stack.push(then);
+                    if let Some(el) = else_ {
+                        stack.push(el);
+                    }
+                }
+                Expr::Match { scrutinee, arms } => {
+                    stack.push(scrutinee);
+                    if let Some(as_) = self.body.arms.get(arms.range()) {
+                        for arm in as_ {
+                            if let Some(g) = arm.guard {
+                                stack.push(g);
+                            }
+                            stack.push(arm.body);
+                        }
+                    }
+                }
+                Expr::Block { stmts, tail, .. } => {
+                    if let Some(ss) = self.body.stmt_lists.get(stmts.range()) {
+                        for &s in ss {
+                            if let Some(st) = self.body.stmts.get(s.ix()) {
+                                match *st {
+                                    Stmt::Let { init, else_, .. } => {
+                                        if let Some(i) = init {
+                                            stack.push(i);
+                                        }
+                                        if let Some(el) = else_ {
+                                            stack.push(el);
+                                        }
+                                    }
+                                    Stmt::Expr { expr, .. } => stack.push(expr),
+                                    Stmt::Item => {}
+                                }
+                            }
+                        }
+                    }
+                    if let Some(t) = tail {
+                        stack.push(t);
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Whether a statement `stmt_id` contains an assignment writing to `target`.
+    fn stmt_writes_local(&self, stmt_id: blaze_typeck::StmtId, target: PatId, skip_assign: Option<ExprId>) -> bool {
+        use blaze_typeck::Stmt;
+        let Some(st) = self.body.stmts.get(stmt_id.ix()) else {
+            return false;
+        };
+        match *st {
+            Stmt::Let { init, else_, .. } => {
+                init.is_some_and(|i| self.expr_subtree_writes_local(i, target, skip_assign))
+                    || else_.is_some_and(|el| self.expr_subtree_writes_local(el, target, skip_assign))
+            }
+            Stmt::Expr { expr, .. } => self.expr_subtree_writes_local(expr, target, skip_assign),
+            Stmt::Item => false,
+        }
+    }
+
+    /// Finds the direct parent `ExprId` of `child` in `self.body.exprs`, if any.
+    fn direct_expr_parent(&self, child: ExprId) -> Option<ExprId> {
+        use blaze_typeck::Stmt;
+        for (ix, ex) in self.body.exprs.iter().enumerate() {
+            let pe = ExprId(to_u32(ix));
+            let has = match *ex {
+                Expr::Paren(i)
+                | Expr::Field { base: i, .. }
+                | Expr::TupleField { base: i, .. }
+                | Expr::Unary { operand: i, .. }
+                | Expr::Cast { operand: i, .. }
+                | Expr::Ref { operand: i, .. }
+                | Expr::RawRef { operand: i, .. }
+                | Expr::Loop { body: i }
+                | Expr::Await(i)
+                | Expr::Do(i)
+                | Expr::Defer(i)
+                | Expr::Let { init: i, .. }
+                | Expr::Closure { body: i, .. }
+                | Expr::AsyncBlock { body: i, .. }
+                | Expr::Become { value: i } => i == child,
+                Expr::Return { value } | Expr::Break { value, .. } => value == Some(child),
+                Expr::Binary { lhs, rhs, .. }
+                | Expr::Assign { lhs, rhs }
+                | Expr::AssignOp { lhs, rhs, .. }
+                | Expr::Index { base: lhs, index: rhs } => lhs == child || rhs == child,
+                Expr::Repeat { elem, count, .. } => elem == child || count == Some(child),
+                Expr::Tuple { elems } | Expr::Array { elems } => {
+                    self.body.expr_lists.get(elems.range()).is_some_and(|es| es.contains(&child))
+                }
+                Expr::Call { callee, args } => {
+                    callee == child || self.body.expr_lists.get(args.range()).is_some_and(|es| es.contains(&child))
+                }
+                Expr::MethodCall { receiver, args, .. } => {
+                    receiver == child || self.body.expr_lists.get(args.range()).is_some_and(|es| es.contains(&child))
+                }
+                Expr::FormatArgs { args, .. } => {
+                    self.body.expr_lists.get(args.range()).is_some_and(|es| es.contains(&child))
+                }
+                Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
+                    self.body.field_inits.get(fields.range()).is_some_and(|fs| fs.iter().any(|f| f.expr == child))
+                        || matches!(base, blaze_typeck::StructBase::Expr(b) if b == child)
+                }
+                Expr::If { cond, then, else_ } => cond == child || then == child || else_ == Some(child),
+                Expr::Match { scrutinee, arms } => {
+                    scrutinee == child
+                        || self.body.arms.get(arms.range()).is_some_and(|as_| {
+                            as_.iter().any(|arm| arm.guard == Some(child) || arm.body == child)
+                        })
+                }
+                Expr::Block { stmts, tail, .. } => {
+                    tail == Some(child)
+                        || self.body.stmt_lists.get(stmts.range()).is_some_and(|ss| {
+                            ss.iter().any(|&s| {
+                                self.body.stmts.get(s.ix()).is_some_and(|st| match *st {
+                                    Stmt::Let { init, else_, .. } => init == Some(child) || else_ == Some(child),
+                                    Stmt::Expr { expr, .. } => expr == child,
+                                    Stmt::Item => false,
+                                })
+                            })
+                        })
+                }
+                _ => false,
+            };
+            if has {
+                return Some(pe);
+            }
+        }
+        None
+    }
+
+    /// Whether any assignment writing to `target` (direct or destructuring) can execute before
+    /// `use_expr` (including via any enclosing loop back-edge), ignoring assignments in statements
+    /// strictly after `use_expr` outside loops.
+    fn local_written_before(&self, target: PatId, use_expr: ExprId, skip_assign: Option<ExprId>) -> bool {
+        use blaze_typeck::Stmt;
+        // Walk from `use_expr` up to `self.body.root`.
+        let mut child = use_expr;
+        let max_depth = self.body.exprs.len().saturating_add(1);
+        for _ in 0..max_depth {
+            if child == self.body.root {
+                return false;
+            }
+            let Some(parent) = self.direct_expr_parent(child) else {
+                // Unreachable from `body.root`: fall back conservatively to scanning the whole body.
+                return self.expr_subtree_writes_local(self.body.root, target, skip_assign);
+            };
+            let Some(&pex) = self.body.exprs.get(parent.ix()) else {
+                return true;
+            };
+            match pex {
+                Expr::Loop { .. } => {
+                    // Loop back-edge: any write anywhere in the loop body can reach `use_expr`.
+                    if self.expr_subtree_writes_local(parent, target, skip_assign) {
+                        return true;
+                    }
+                }
+                Expr::Closure { .. } | Expr::AsyncBlock { .. } => {
+                    // A closure/async body can run at any later point in the enclosing fn.
+                    return self.expr_subtree_writes_local(self.body.root, target, skip_assign);
+                }
+                Expr::Block { stmts, tail, .. } => {
+                    if let Some(ss) = self.body.stmt_lists.get(stmts.range()) {
+                        if tail == Some(child) {
+                            for &s in ss {
+                                if self.stmt_writes_local(s, target, skip_assign) {
+                                    return true;
+                                }
+                            }
+                        } else {
+                            for &s in ss {
+                                let Some(st) = self.body.stmts.get(s.ix()) else { continue };
+                                match *st {
+                                    Stmt::Let { init, .. } if init == Some(child) => break,
+                                    Stmt::Let { init, else_, .. } if else_ == Some(child) => {
+                                        if init.is_some_and(|i| self.expr_subtree_writes_local(i, target, skip_assign)) {
+                                            return true;
+                                        }
+                                        break;
+                                    }
+                                    Stmt::Expr { expr, .. } if expr == child => break,
+                                    _ => {
+                                        if self.stmt_writes_local(s, target, skip_assign) {
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Expr::Binary { lhs, rhs, .. } | Expr::Index { base: lhs, index: rhs } if rhs == child => {
+                    if self.expr_subtree_writes_local(lhs, target, skip_assign) {
+                        return true;
+                    }
+                }
+                Expr::Assign { lhs, rhs } | Expr::AssignOp { lhs, rhs, .. } => {
+                    if skip_assign != Some(parent) && self.assign_lhs_writes_local(lhs, target) {
+                        return true;
+                    }
+                    let other = if lhs == child { rhs } else { lhs };
+                    if self.expr_subtree_writes_local(other, target, skip_assign) {
+                        return true;
+                    }
+                }
+                Expr::Repeat { elem, count, .. } if count == Some(child) => {
+                    if self.expr_subtree_writes_local(elem, target, skip_assign) {
+                        return true;
+                    }
+                }
+                Expr::Tuple { elems } | Expr::Array { elems } => {
+                    if let Some(es) = self.body.expr_lists.get(elems.range()) {
+                        for &el in es {
+                            if el == child {
+                                break;
+                            }
+                            if self.expr_subtree_writes_local(el, target, skip_assign) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                Expr::Call { callee, args } if callee != child => {
+                    if self.expr_subtree_writes_local(callee, target, skip_assign) {
+                        return true;
+                    }
+                    if let Some(es) = self.body.expr_lists.get(args.range()) {
+                        for &a in es {
+                            if a == child {
+                                break;
+                            }
+                            if self.expr_subtree_writes_local(a, target, skip_assign) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                Expr::MethodCall { receiver, args, .. } if receiver != child => {
+                    if self.expr_subtree_writes_local(receiver, target, skip_assign) {
+                        return true;
+                    }
+                    if let Some(es) = self.body.expr_lists.get(args.range()) {
+                        for &a in es {
+                            if a == child {
+                                break;
+                            }
+                            if self.expr_subtree_writes_local(a, target, skip_assign) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                Expr::FormatArgs { args, .. } => {
+                    if let Some(es) = self.body.expr_lists.get(args.range()) {
+                        for &a in es {
+                            if a == child {
+                                break;
+                            }
+                            if self.expr_subtree_writes_local(a, target, skip_assign) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
+                    if let Some(fs) = self.body.field_inits.get(fields.range()) {
+                        let mut found_in_fields = false;
+                        for f in fs {
+                            if f.expr == child {
+                                found_in_fields = true;
+                                break;
+                            }
+                            if self.expr_subtree_writes_local(f.expr, target, skip_assign) {
+                                return true;
+                            }
+                        }
+                        if !found_in_fields && matches!(base, blaze_typeck::StructBase::Expr(b) if b == child) {
+                            // `base` evaluates after all fields (already checked above).
+                        }
+                    }
+                }
+                Expr::If { cond, then, else_ } if then == child || else_ == Some(child) => {
+                    if self.expr_subtree_writes_local(cond, target, skip_assign) {
+                        return true;
+                    }
+                }
+                Expr::Match { scrutinee, arms } if scrutinee != child => {
+                    if self.expr_subtree_writes_local(scrutinee, target, skip_assign) {
+                        return true;
+                    }
+                    if let Some(as_) = self.body.arms.get(arms.range()) {
+                        for arm in as_ {
+                            if arm.body == child
+                                && let Some(g) = arm.guard
+                                && self.expr_subtree_writes_local(g, target, skip_assign)
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            child = parent;
+        }
+        true
+    }
+
     /// Traces a container expression `start` (whose adjusted type is the root of `path`) back to a
     /// declared head (`static`, `const`, struct field, callee output, or owner parameter),
     /// transforming `path` step-by-step along every resolved call, deref, field, constructor,
@@ -2262,21 +2671,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                             None => return Ok(None),
                         }
                     }
-                    // 2. Unreassigned local bound by `let pat = init`, `match scrutinee { pat => .. }`,
-                    //    or `if let pat = init`. Check both direct `p = ...` and destructuring
-                    //    assignment targets such as `(p, _) = ...`, `[p, _] = ...`, `S { a: p } = ...`,
-                    //    and `Wrap(p) = ...`.
-                    let reassigned = self.body.exprs.iter().enumerate().any(|(ix, ex)| {
-                        let ex_id = ExprId(to_u32(ix));
-                        if skip_assign == Some(ex_id) {
-                            return false;
-                        }
-                        match *ex {
-                            Expr::Assign { lhs, .. } | Expr::AssignOp { lhs, .. } => self.assign_lhs_writes_local(lhs, p),
-                            _ => false,
-                        }
-                    });
-                    if reassigned {
+                    // 2. Local bound by `let pat = init`, `match scrutinee { pat => .. }`, or
+                    //    `if let pat = init`, provided no direct or destructuring assignment can
+                    //    overwrite `p` before this use `cur` (including via any enclosing loop).
+                    if self.local_written_before(p, cur, skip_assign) {
                         return Ok(None);
                     }
                     let mut source: Option<(PatId, ExprId)> = None;

@@ -356,27 +356,30 @@ fn read_copy_impl<'a>(store: &Store<'_>, langs: super::BorrowLangs, adt: tc::Ite
     // region-aware `inst_is_copy` enforces the exact lifetime obligations.
     let adt_lts = usize::try_from(store.adts.get(&adt)?.lifetimes).ok()?;
     let mut lt_map: AVec<'a, Option<u32>> = AVec::new_in(alloc);
-    if adt_lts > 0 {
+    {
         let reader = store.regions.reader(store.work_alloc());
-        let (self_col, _) = reader.impl_header(imp).ok()?;
-        let self_slice = self_col.as_slice();
-        if self_slice.len() < adt_lts {
-            return None;
-        }
-        for (j, &r) in self_slice.get(..adt_lts)?.iter().enumerate() {
-            let Region::Param(imp_p) = r else {
+        if let Ok((self_col, _)) = reader.impl_header(imp) {
+            let self_slice = self_col.as_slice();
+            if self_slice.len() != adt_lts {
                 return None;
-            };
-            let pi = usize::try_from(imp_p).ok()?;
-            if lt_map.len() <= pi {
-                lt_map.resize(pi + 1, None);
             }
-            if let Some(entry) = lt_map.get_mut(pi) {
-                if entry.is_some() {
+            for (j, &r) in self_slice.iter().enumerate() {
+                let Region::Param(imp_p) = r else {
                     return None;
+                };
+                let pi = usize::try_from(imp_p).ok()?;
+                if lt_map.len() <= pi {
+                    lt_map.resize(pi + 1, None);
                 }
-                *entry = u32::try_from(j).ok();
+                if let Some(entry) = lt_map.get_mut(pi) {
+                    if entry.is_some() {
+                        return None;
+                    }
+                    *entry = u32::try_from(j).ok();
+                }
             }
+        } else if adt_lts > 0 {
+            return None;
         }
     }
     for c in store.preds.get(&imp)?.clauses.iter() {
@@ -1441,6 +1444,7 @@ pub(super) struct InstDropEval<'a, 'f> {
     adt_facts: Option<&'f crate::front2::adt_facts::AdtFactsTable<'a>>,
     strict_outlives: bool,
     owner_loaded: Option<tc::ItemKey>,
+    owner_clauses_incomplete: bool,
     owner_traits: AVec<'a, (tc::ItemKey, AVec<'a, tc::PTy>, Option<AVec<'a, Region>>)>,
     owner_projs: AVec<'a, (tc::ItemKey, tc::Name, AVec<'a, tc::PTy>, tc::PTy, Option<AVec<'a, Region>>)>,
     read_adts: AVec<'a, (u128, u64)>,
@@ -1460,6 +1464,7 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
             adt_facts,
             strict_outlives: false,
             owner_loaded: None,
+            owner_clauses_incomplete: false,
             owner_traits: AVec::new_in(alloc),
             owner_projs: AVec::new_in(alloc),
             read_adts: AVec::new_in(alloc),
@@ -1505,8 +1510,8 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
         let res = match self.prove_trait(r, langs, copy, &[root], Some(&[]), 0, &mut budget) {
             Truth::True => Some(InstCopyOwned::Yes),
             Truth::TrueIfOutlives(obs) => Some(InstCopyOwned::IfOutlives(obs)),
-            Truth::False | Truth::OutlivesUnproven => Some(InstCopyOwned::No),
-            Truth::Unknown => None,
+            Truth::False | Truth::OutlivesUnproven if !self.owner_clauses_incomplete => Some(InstCopyOwned::No),
+            Truth::False | Truth::OutlivesUnproven | Truth::Unknown => None,
         };
         self.strict_outlives = false;
         res
@@ -1517,6 +1522,7 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
             return;
         }
         self.owner_loaded = Some(owner);
+        self.owner_clauses_incomplete = false;
         self.owner_traits.clear();
         self.owner_projs.clear();
         let mut budget = MOST_INST_DROP_STEPS;
@@ -1590,11 +1596,16 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                 }
             }
         }
-        // Elaborate supertraits of `owner`'s trait clauses (bounded to 64 clauses, Rule 18) and
-        // record Rule 21 digests for each trait's `supertraits` and clause regions inspected.
+        // Elaborate all reachable supertraits of `owner`'s trait clauses (deduplicated to break
+        // cycles; bounded by `budget` and flagging `owner_clauses_incomplete` if truncated or if a
+        // supertrait definition is unread) and record Rule 21 digests for each trait inspected.
         let super_shape_digest = tc::StableHasher::new("blaze-ladder front2 inst drop super shape v1").finish();
         let mut cursor = 0usize;
-        while self.owner_traits.len() < 64 && budget > 0 {
+        while cursor < self.owner_traits.len() {
+            if budget == 0 {
+                self.owner_clauses_incomplete = true;
+                break;
+            }
             let Some((tr, tr_args, tr_regs_opt)) = self.owner_traits.get(cursor) else { break };
             let tr = *tr;
             let mut subst: AVec<'a, tc::PTy> = AVec::with_capacity_in(tr_args.len(), self.alloc);
@@ -1679,13 +1690,15 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                                     if ok {
                                         match self.copy_from_table(stys, a, Some(&subst), 0, &mut budget) {
                                             Some(t) => inst.push(t),
-                                            None => ok = false,
+                                            None => {
+                                                ok = false;
+                                                self.owner_clauses_incomplete = true;
+                                            }
                                         }
                                     }
                                 }
                                 let regs = s_regs();
                                 if ok
-                                    && self.owner_traits.len() < 64
                                     && !self.owner_traits.iter().any(|(ot, oa, or)| {
                                         *ot == sup
                                             && oa.as_slice() == inst.as_slice()
@@ -1710,24 +1723,29 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                                     if ok {
                                         match self.copy_from_table(stys, a, Some(&subst), 0, &mut budget) {
                                             Some(t) => inst.push(t),
-                                            None => ok = false,
+                                            None => {
+                                                ok = false;
+                                                self.owner_clauses_incomplete = true;
+                                            }
                                         }
                                     }
                                 }
                                 let mut hb = MOST_DROP_NODES;
                                 hash_pty_structural(stys, term, &mut h, &mut hb, &mut hstack);
                                 let regs = s_regs();
-                                if ok
-                                    && self.owner_projs.len() < 64
-                                    && let Some(iterm) = self.copy_from_table(stys, term, Some(&subst), 0, &mut budget)
-                                    && !self.owner_projs.iter().any(|(pt, pn, pa, _, pr)| {
-                                        *pt == sup
-                                            && *pn == name
-                                            && pa.as_slice() == inst.as_slice()
-                                            && pr.as_deref() == regs.as_deref()
-                                    })
-                                {
-                                    self.owner_projs.push((sup, name, inst, iterm, regs));
+                                if ok {
+                                    if let Some(iterm) = self.copy_from_table(stys, term, Some(&subst), 0, &mut budget) {
+                                        if !self.owner_projs.iter().any(|(pt, pn, pa, _, pr)| {
+                                            *pt == sup
+                                                && *pn == name
+                                                && pa.as_slice() == inst.as_slice()
+                                                && pr.as_deref() == regs.as_deref()
+                                        }) {
+                                            self.owner_projs.push((sup, name, inst, iterm, regs));
+                                        }
+                                    } else {
+                                        self.owner_clauses_incomplete = true;
+                                    }
                                 }
                             }
                         }
@@ -1736,6 +1754,7 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                 }
             } else {
                 h.tag(0);
+                self.owner_clauses_incomplete = true;
             }
             let super_digest = h.finish();
             if !self.read_queries.iter().any(|&(t, sd, _)| t == tr.0 && sd == super_shape_digest) {
@@ -2459,57 +2478,56 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
             };
             // When checking a trait goal under `strict_outlives`, verify the candidate impl's
             // header regions. For a top-level `Copy` impl (`norm_depth == 1`, `req_regs == Some(&[])`),
-            // constrained self-type ADT lifetimes (`'static` at slot `j`, or repeated param `'a` at
-            // slots `i` and `j`, e.g. `Copy for Token<'static, T>` / `Copy for Pair<'a, 'a, T>`) are
-            // translated into concrete `CopyOutlives` obligations instead of rejecting the impl.
+            // map every slot of `self_col` (both top-level ADT lifetimes and lifetimes nested
+            // inside type arguments, e.g. `Copy for NestedRef<'a, &'a u8>` or
+            // `Copy for TwoArgs<'a, T, &'a u8>`) to its exact concrete origin index in `self_ty`,
+            // translating `'static` and repeated lifetime params into `CopyOutlives` obligations.
             let mut header_obs: AVec<'a, blaze_flow_lower::CopyOutlives> = AVec::new_in(self.alloc);
             if self.strict_outlives {
-                let top_copy_adt_lts = if norm_depth == 1
+                let top_copy_slot_pos = if norm_depth == 1
                     && req_regs.is_some_and(|rr| rr.is_empty())
-                    && let Some(head) = r.store.impls.get(&imp)
-                    && let Ok(tc::PNode::Adt(adt, _)) = r.store.tys.view().node(head.self_ty)
-                    && let Some(adt_row) = r.store.adts.get(&adt)
+                    && let Some(pat_self) = r.store.impls.get(&imp).map(|h| h.self_ty)
                 {
-                    usize::try_from(adt_row.lifetimes).ok()
+                    let mut pos: AVec<'a, u32> = AVec::new_in(self.alloc);
+                    let mut next_concrete = 0u32;
+                    if self.map_self_col_slots(r, langs, pat_self, self_ty, &mut pos, &mut next_concrete, 0, budget) {
+                        Some(pos)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
                 let check_self_col = |sc: &[Region], obs: &mut AVec<'a, blaze_flow_lower::CopyOutlives>| -> bool {
-                    if let Some(adt_lts) = top_copy_adt_lts
-                        && adt_lts <= sc.len()
+                    if let Some(slot_pos) = &top_copy_slot_pos
+                        && slot_pos.len() == sc.len()
                     {
                         for (j, &reg) in sc.iter().enumerate() {
-                            if j < adt_lts {
-                                let Ok(j32) = u32::try_from(j) else { return false };
-                                match reg {
-                                    Region::Static => {
-                                        let ob = blaze_flow_lower::CopyOutlives::SlotEqOwner {
-                                            slot: j32,
-                                            owner_region: u32::MAX,
-                                        };
-                                        if obs.scan_for(&ob).is_none() {
-                                            obs.push(ob);
-                                        }
+                            let Some(&cj) = slot_pos.get(j) else { return false };
+                            match reg {
+                                Region::Static => {
+                                    let ob = blaze_flow_lower::CopyOutlives::SlotEqOwner {
+                                        slot: cj,
+                                        owner_region: u32::MAX,
+                                    };
+                                    if obs.scan_for(&ob).is_none() {
+                                        obs.push(ob);
                                     }
-                                    Region::Param(_) => {
-                                        if let Some(prev_i) = sc.get(..j).and_then(|pref| pref.iter().position(|r| *r == reg)) {
-                                            let Ok(i32) = u32::try_from(prev_i) else { return false };
-                                            let ob1 = blaze_flow_lower::CopyOutlives::Region { long: i32, short: j32 };
-                                            let ob2 = blaze_flow_lower::CopyOutlives::Region { long: j32, short: i32 };
-                                            if obs.scan_for(&ob1).is_none() {
-                                                obs.push(ob1);
-                                            }
-                                            if obs.scan_for(&ob2).is_none() {
-                                                obs.push(ob2);
-                                            }
-                                        }
-                                    }
-                                    Region::Late { .. } => return false,
                                 }
-                            } else if !matches!(reg, Region::Param(_))
-                                || sc.get(..j).is_some_and(|prev| prev.contains(&reg))
-                            {
-                                return false;
+                                Region::Param(_) => {
+                                    if let Some(prev_i) = sc.get(..j).and_then(|pref| pref.iter().position(|r| *r == reg)) {
+                                        let Some(&ci) = slot_pos.get(prev_i) else { return false };
+                                        let ob1 = blaze_flow_lower::CopyOutlives::Region { long: ci, short: cj };
+                                        let ob2 = blaze_flow_lower::CopyOutlives::Region { long: cj, short: ci };
+                                        if obs.scan_for(&ob1).is_none() {
+                                            obs.push(ob1);
+                                        }
+                                        if obs.scan_for(&ob2).is_none() {
+                                            obs.push(ob2);
+                                        }
+                                    }
+                                }
+                                Region::Late { .. } => return false,
                             }
                         }
                         true
@@ -2591,6 +2609,163 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
             (None, None, false) if shape != tc::Shape::Param => ImplMatch::None,
             (None, None, _) if self.strict_outlives && req_regs.is_none_or(|rr| !rr.is_empty()) => ImplMatch::OutlivesUnproven,
             _ => ImplMatch::Unknown,
+        }
+    }
+
+    /// Flattened region-slot count (`npos`) of concrete `ty` in `self.tys` (for skipping over
+    /// concrete type arguments substituted into impl `Param` positions).
+    fn concrete_npos<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        langs: super::BorrowLangs,
+        ty: tc::PTy,
+        depth: u32,
+        budget: &mut u32,
+    ) -> Option<u32> {
+        if depth > MOST_INST_NORM_DEPTH || *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        match self.tys.view().node(ty).ok()? {
+            tc::PNode::Bool
+            | tc::PNode::Char
+            | tc::PNode::Int(_)
+            | tc::PNode::Uint(_)
+            | tc::PNode::Float(_)
+            | tc::PNode::Str
+            | tc::PNode::Never
+            | tc::PNode::ConstValue { .. }
+            | tc::PNode::ConstParam(_)
+            | tc::PNode::Param(_)
+            | tc::PNode::Foreign(_) => Some(0),
+            tc::PNode::Ref(_, inner) => Some(1u32.checked_add(self.concrete_npos(r, langs, inner, depth + 1, budget)?)?),
+            tc::PNode::Ptr(_, inner) | tc::PNode::Slice(inner) | tc::PNode::Array(inner, _) | tc::PNode::Pat(inner, _) => {
+                self.concrete_npos(r, langs, inner, depth + 1, budget)
+            }
+            tc::PNode::Tuple(l) | tc::PNode::Record(_, l) | tc::PNode::Union(l) => {
+                let elems = self.copy_own_list(l)?;
+                let mut n = 0u32;
+                for &el in elems.iter() {
+                    n = n.checked_add(self.concrete_npos(r, langs, el, depth + 1, budget)?)?;
+                }
+                Some(n)
+            }
+            tc::PNode::Adt(adt, l) => {
+                let info = self.adt_info(r, langs, adt);
+                if !info.made {
+                    return None;
+                }
+                let mut n = r.store.adts.get(&adt)?.lifetimes;
+                let args = self.copy_own_list(l)?;
+                for &a in args.iter() {
+                    n = n.checked_add(self.concrete_npos(r, langs, a, depth + 1, budget)?)?;
+                }
+                Some(n)
+            }
+            _ => None,
+        }
+    }
+
+    /// Maps every region slot in impl header pattern `pat_ty` (in `r.store.tys`) to its exact
+    /// flattened concrete origin offset in `concrete_ty` (in `self.tys`), advancing
+    /// `*next_concrete` past any concrete regions inside `Param` substitutions.
+    #[allow(clippy::too_many_arguments)]
+    fn map_self_col_slots<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        langs: super::BorrowLangs,
+        pat_ty: tc::PTy,
+        concrete_ty: tc::PTy,
+        out_pos: &mut AVec<'a, u32>,
+        next_concrete: &mut u32,
+        depth: u32,
+        budget: &mut u32,
+    ) -> bool {
+        if depth > MOST_INST_NORM_DEPTH || *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        let Ok(pat_node) = r.store.tys.view().node(pat_ty) else { return false };
+        let Ok(conc_node) = self.tys.view().node(concrete_ty) else { return false };
+        match (pat_node, conc_node) {
+            (tc::PNode::Param(_), _) => {
+                let Some(n) = self.concrete_npos(r, langs, concrete_ty, depth + 1, budget) else {
+                    return false;
+                };
+                let Some(next) = next_concrete.checked_add(n) else { return false };
+                *next_concrete = next;
+                true
+            }
+            (
+                tc::PNode::Bool
+                | tc::PNode::Char
+                | tc::PNode::Int(_)
+                | tc::PNode::Uint(_)
+                | tc::PNode::Float(_)
+                | tc::PNode::Str
+                | tc::PNode::Never
+                | tc::PNode::ConstValue { .. }
+                | tc::PNode::ConstParam(_)
+                | tc::PNode::Foreign(_),
+                _,
+            ) => true,
+            (tc::PNode::Ref(_, pi), tc::PNode::Ref(_, ci)) => {
+                out_pos.push(*next_concrete);
+                let Some(next) = next_concrete.checked_add(1) else { return false };
+                *next_concrete = next;
+                self.map_self_col_slots(r, langs, pi, ci, out_pos, next_concrete, depth + 1, budget)
+            }
+            (tc::PNode::Ptr(_, pi), tc::PNode::Ptr(_, ci))
+            | (tc::PNode::Slice(pi), tc::PNode::Slice(ci))
+            | (tc::PNode::Array(pi, _), tc::PNode::Array(ci, _))
+            | (tc::PNode::Pat(pi, _), tc::PNode::Pat(ci, _)) => {
+                self.map_self_col_slots(r, langs, pi, ci, out_pos, next_concrete, depth + 1, budget)
+            }
+            (tc::PNode::Tuple(pl), tc::PNode::Tuple(cl))
+            | (tc::PNode::Record(_, pl), tc::PNode::Record(_, cl))
+            | (tc::PNode::Union(pl), tc::PNode::Union(cl)) => {
+                let Ok(ps) = r.store.tys.view().list(pl) else { return false };
+                let mut pat_elems: AVec<'a, tc::PTy> = AVec::with_capacity_in(ps.len(), self.alloc);
+                pat_elems.extend_from_slice(ps);
+                let Some(conc_elems) = self.copy_own_list(cl) else { return false };
+                if pat_elems.len() != conc_elems.len() {
+                    return false;
+                }
+                for (&pe, &ce) in pat_elems.iter().zip(conc_elems.iter()) {
+                    if !self.map_self_col_slots(r, langs, pe, ce, out_pos, next_concrete, depth + 1, budget) {
+                        return false;
+                    }
+                }
+                true
+            }
+            (tc::PNode::Adt(padt, pl), tc::PNode::Adt(cadt, cl)) if padt == cadt => {
+                let info = self.adt_info(r, langs, padt);
+                if !info.made {
+                    return false;
+                }
+                let Some(lts) = r.store.adts.get(&padt).map(|row| row.lifetimes) else {
+                    return false;
+                };
+                for _ in 0..lts {
+                    out_pos.push(*next_concrete);
+                    let Some(next) = next_concrete.checked_add(1) else { return false };
+                    *next_concrete = next;
+                }
+                let Ok(ps) = r.store.tys.view().list(pl) else { return false };
+                let mut pat_args: AVec<'a, tc::PTy> = AVec::with_capacity_in(ps.len(), self.alloc);
+                pat_args.extend_from_slice(ps);
+                let Some(conc_args) = self.copy_own_list(cl) else { return false };
+                if pat_args.len() != conc_args.len() {
+                    return false;
+                }
+                for (&pa, &ca) in pat_args.iter().zip(conc_args.iter()) {
+                    if !self.map_self_col_slots(r, langs, pa, ca, out_pos, next_concrete, depth + 1, budget) {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => false,
         }
     }
 
