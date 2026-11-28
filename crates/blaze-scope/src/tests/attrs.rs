@@ -31,7 +31,7 @@ static TEXTS: Texts = Texts(&[&[("/user/lib.rs", USER)], &[("/dep/lib.rs", DEP)]
 fn a_struct_under_a_prelude_path_derive_is_declared() {
     let crates = [input("user", "/user/lib.rs", &[("dep", 1)]), input("dep", "/dep/lib.rs", &[])];
     let names = resolved(&crates, &TEXTS);
-    let g = blaze_own::Alloc::global();
+    let g = blaze_own::testing::heap().alloc();
     for name in ["Made", "Written", "Edition"] {
         let segments: &'static [&'static str] = match name {
             "Made" => &["Made"],
@@ -62,7 +62,7 @@ fn a_path_with_spaces_between_its_tokens_is_one_head() {
 /// Block comments nest ("Nested block comments are supported").
 #[test]
 fn a_comment_inside_a_cfg_predicate_is_whitespace() {
-    let g = blaze_own::Alloc::global();
+    let g = blaze_own::testing::heap().alloc();
     let cfg = crate::task::Cfg::from_atoms(&[("feature", Some("fs"))], g);
     assert_eq!(cfg.eval("any(feature = \"gzip\", feature = \"fs\" // served as well\n)"), Some(true));
     assert_eq!(cfg.eval("all(/* a /* nested */ note */ feature = \"fs\")"), Some(true));
@@ -72,7 +72,7 @@ fn a_comment_inside_a_cfg_predicate_is_whitespace() {
 
 #[test]
 fn cfg_version_predicate_evaluates_against_pinned_release() {
-    let g = blaze_own::Alloc::global();
+    let g = blaze_own::testing::heap().alloc();
     // Gate OFF by default: `version(..)` is unread (`None`) whether it would hold or not.
     let gated = crate::task::Cfg::from_atoms(&[("rust_nightly", None)], g);
     assert_eq!(gated.eval("version(\"1.76\")"), None);
@@ -152,7 +152,7 @@ pub struct StackedSkipped;
     c_on.cfg = &[("rust_nightly", None)];
     let names_on = resolved(&[c_on], &T_ON);
     assert!(names_on.notes(0).is_empty(), "expected no notes with feature(cfg_version): {:?}", names_on.notes(0));
-    let g = blaze_own::Alloc::global();
+    let g = blaze_own::testing::heap().alloc();
     assert!(names_on.item_at(names_on.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments: &["Kept"] }, g).is_ok());
     assert!(names_on.item_at(names_on.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments: &["Escaped"] }, g).is_ok());
     assert!(names_on.item_at(names_on.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments: &["Dropped"] }, g).is_err());

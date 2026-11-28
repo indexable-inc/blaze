@@ -2877,9 +2877,8 @@ fn recursive_macro_rules_text_mark_preserves_distinct_local_hygiene() {
     //   [1] `let value = 42u64;` (Arm 1 template via `$from_val`)
     //   [2] `*value` (Arm 2 template)
     //   [3] `value as i32` (Arm 1 template via `$from_expr`)
-    let value_positions: std::vec::Vec<usize> = (0..exp2.tokens.len())
-        .filter(|&i| exp2.tokens.text_at(i) == "value")
-        .collect();
+    let mut value_positions = blaze_own::Vec::new_in(alloc);
+    value_positions.extend((0..exp2.tokens.len()).filter(|&i| exp2.tokens.text_at(i) == "value"));
     assert_eq!(value_positions.len(), 4, "expected 4 `value` tokens, got {value_positions:?}");
 
     let m_param = exp2.text_mark_of(value_positions[0], key2).expect("param mark");

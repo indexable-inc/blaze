@@ -1403,14 +1403,15 @@ pub(crate) fn find_hash_in_array(array: &[u32], hash: u32) -> Option<usize> {
     }
 }"#;
 
-    let kept_items = |v: &View<'_>| -> StdVec<String> {
-        let mut out = StdVec::new();
+    let test_alloc = blaze_own::testing::heap().alloc();
+    let kept_items = |v: &View<'_>| {
+        let mut out = blaze_own::Vec::new_in(test_alloc);
         for s in 0..v.scopes.len() {
             let scope = v.scope(ScopeId(s as u32)).expect("scope");
             for i in scope.items.start..scope.items.start + scope.items.len {
                 let row = v.row(RowIdx(i)).expect("local item row");
                 let item = v.local_item(row).expect("local item");
-                out.push(String::from(v.text_at(item.range).expect("item text").trim()));
+                out.push(blaze_own::AString::from_str_in(v.text_at(item.range).expect("item text").trim(), test_alloc));
             }
         }
         out
@@ -1424,7 +1425,7 @@ pub(crate) fn find_hash_in_array(array: &[u32], hash: u32) -> Option<usize> {
         Edition::E2021,
         &mut Nightly { nightly: true, cfg_version: true },
         &mut crate::NoModule,
-        Alloc::global(),
+        test_alloc,
     )
     .expect("active nightly simd fn lowers");
     let av = active.view();
@@ -1432,15 +1433,15 @@ pub(crate) fn find_hash_in_array(array: &[u32], hash: u32) -> Option<usize> {
     assert!(av.unhandled.is_empty(), "active unhandled:\n{}", dump_of(&active));
     let active_items = kept_items(&av);
     assert!(
-        active_items.iter().any(|it| it.contains("use std::simd::cmp::SimdPartialEq;")),
+        active_items.iter().any(|it| it.as_str().contains("use std::simd::cmp::SimdPartialEq;")),
         "expected SimdPartialEq import to be kept: {active_items:?}",
     );
     assert!(
-        active_items.iter().any(|it| it.contains("const LANES: usize = T::LEN;")),
+        active_items.iter().any(|it| it.as_str().contains("const LANES: usize = T::LEN;")),
         "expected T::LEN const to be kept: {active_items:?}",
     );
     assert!(
-        !active_items.iter().any(|it| it.contains("const LANES: usize = T::LANES;")),
+        !active_items.iter().any(|it| it.as_str().contains("const LANES: usize = T::LANES;")),
         "expected T::LANES const to be stripped: {active_items:?}",
     );
 
@@ -1452,7 +1453,7 @@ pub(crate) fn find_hash_in_array(array: &[u32], hash: u32) -> Option<usize> {
         Edition::E2021,
         &mut Nightly { nightly: false, cfg_version: false },
         &mut crate::NoModule,
-        Alloc::global(),
+        test_alloc,
     )
     .expect("disabled nightly simd fn lowers");
     let dv = disabled.view();
@@ -1477,7 +1478,7 @@ pub(crate) fn find_hash_in_array(array: &[u32], hash: u32) -> Option<usize> {
         Edition::E2021,
         &mut Nightly { nightly: false, cfg_version: false },
         &mut crate::NoModule,
-        Alloc::global(),
+        test_alloc,
     )
     .expect("disabled block skips inner bad cfg");
     assert!(dbi.view().diags.is_empty(), "disabled block must not diagnose inner bad cfg:\n{}", dump_of(&dbi));
@@ -1497,7 +1498,7 @@ pub(crate) fn find_hash_in_array(array: &[u32], hash: u32) -> Option<usize> {
             }
             fn cfg_version_enabled(&self) -> bool { true }
         }
-        lower_body(text, Edition::E2024, &mut Ver, &mut crate::NoModule, Alloc::global())
+        lower_body(text, Edition::E2024, &mut Ver, &mut crate::NoModule, blaze_own::testing::heap().alloc())
             .expect("lower with cfg_version")
     }
     fn sig_ver(text: &str) -> Lowered<'static, '_> {
@@ -1508,7 +1509,7 @@ pub(crate) fn find_hash_in_array(array: &[u32], hash: u32) -> Option<usize> {
             }
             fn cfg_version_enabled(&self) -> bool { true }
         }
-        lower_signature(text, Edition::E2024, &mut Ver, Alloc::global())
+        lower_signature(text, Edition::E2024, &mut Ver, blaze_own::testing::heap().alloc())
             .expect("sig with cfg_version")
     }
     let active_all = body_ver(

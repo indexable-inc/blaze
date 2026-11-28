@@ -11,8 +11,6 @@
 //! where `k: &&(u64, u64)`. `(u64, u64): Borrow<?Q>` uniquely determines `?Q = (u64, u64)`,
 //! constraining `?Idx = &(u64, u64)`, and `k` deref-coerces `&&(u64, u64) -> &(u64, u64)`.
 
-use std::vec::Vec;
-
 use super::{adjusts, check_body};
 use crate::body::{Expr, IntSuffix};
 use crate::diag::DiagCode;
@@ -44,20 +42,20 @@ struct World {
 
 fn world() -> World {
     let mut fx = Fx::new();
-    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    let sized = fx.tr("Sized", 1, Default::default(), &[]);
     fx.lang(LangItem::Sized, sized);
-    let deref = fx.tr("Deref", 1, Vec::new(), &["Target"]);
+    let deref = fx.tr("Deref", 1, Default::default(), &["Target"]);
     fx.lang(LangItem::Deref, deref);
-    let index = fx.tr("Index", 2, Vec::new(), &["Output"]);
+    let index = fx.tr("Index", 2, Default::default(), &["Output"]);
     fx.lang(LangItem::Index, index);
     let (p0, p1, p2) = (fx.param(0), fx.param(1), fx.param(2));
     let index_sup = fx.bound(index, &[p0, p1]);
-    let index_mut = fx.tr("IndexMut", 2, std::vec![index_sup], &[]);
+    let index_mut = fx.tr("IndexMut", 2, [index_sup].into(), &[]);
     fx.lang(LangItem::IndexMut, index_mut);
 
-    let borrow = fx.tr("Borrow", 2, Vec::new(), &[]);
+    let borrow = fx.tr("Borrow", 2, Default::default(), &[]);
     // `impl<T: ?Sized> Borrow<T> for T`
-    fx.imp("impl<T> Borrow<T> for T", 1, p0, Some((borrow, &[p0])), &[], Vec::new());
+    fx.imp("impl<T> Borrow<T> for T", 1, p0, Some((borrow, &[p0])), &[], Default::default());
 
     let u8_ = fx.u8();
     let u16_ = fx.u16();
@@ -73,13 +71,13 @@ fn world() -> World {
     let string_k = fx.strukt("String", 0, &[]);
     let string_t = fx.adt(string_k, &[]);
     let r_string = fx.r(Mutbl::Not, string_t);
-    fx.imp("impl Deref for String", 0, string_t, Some((deref, &[])), &[("Target", str_)], Vec::new());
-    fx.imp("impl Borrow<str> for String", 0, string_t, Some((borrow, &[str_])), &[], Vec::new());
+    fx.imp("impl Deref for String", 0, string_t, Some((deref, &[])), &[("Target", str_)], Default::default());
+    fx.imp("impl Borrow<str> for String", 0, string_t, Some((borrow, &[str_])), &[], Default::default());
 
     // `Box<T>`: `Deref<Target = T>`.
     let box_k = fx.strukt("Box", 1, &[]);
     let box_p0 = fx.adt(box_k, &[p0]);
-    fx.imp("impl<T> Deref for Box<T>", 1, box_p0, Some((deref, &[])), &[("Target", p0)], Vec::new());
+    fx.imp("impl<T> Deref for Box<T>", 1, box_p0, Some((deref, &[])), &[("Target", p0)], Default::default());
 
     // `Map<K, V>`: `impl<K: Borrow<Q>, V, Q> Index<&Q> for Map<K, V> { type Output = V; }`
     let map_k = fx.strukt("Map", 2, &[]);
@@ -92,7 +90,7 @@ fn world() -> World {
         map_kv,
         Some((index, &[r_q])),
         &[("Output", p1)],
-        std::vec![k_borrow_q],
+        [k_borrow_q].into(),
     );
 
     // `MutMap<K, V>`: both `Index<&Q>` and `IndexMut<&Q>` where `K: Borrow<Q>`.
@@ -105,7 +103,7 @@ fn world() -> World {
         mutmap_kv,
         Some((index, &[r_q])),
         &[("Output", p1)],
-        std::vec![k_borrow_q],
+        [k_borrow_q].into(),
     );
     let k_borrow_q = fx.bound(borrow, &[p0, p2]);
     fx.imp(
@@ -114,20 +112,20 @@ fn world() -> World {
         mutmap_kv,
         Some((index_mut, &[r_q])),
         &[],
-        std::vec![k_borrow_q],
+        [k_borrow_q].into(),
     );
 
     // `StrMap`: `impl Index<&str> for StrMap { type Output = u32; }`.
     let strmap_k = fx.strukt("StrMap", 0, &[]);
     let strmap_t = fx.adt(strmap_k, &[]);
-    fx.imp("impl Index<&str> for StrMap", 0, strmap_t, Some((index, &[r_str])), &[("Output", u32_)], Vec::new());
+    fx.imp("impl Index<&str> for StrMap", 0, strmap_t, Some((index, &[r_str])), &[("Output", u32_)], Default::default());
 
     // `SliceMap`: `impl Index<&[u8]> for SliceMap { type Output = u32; }`.
     let slice_u8 = fx.ty(PNode::Slice(u8_));
     let r_slice_u8 = fx.r(Mutbl::Not, slice_u8);
     let slicemap_k = fx.strukt("SliceMap", 0, &[]);
     let slicemap_t = fx.adt(slicemap_k, &[]);
-    fx.imp("impl Index<&[u8]> for SliceMap", 0, slicemap_t, Some((index, &[r_slice_u8])), &[("Output", u32_)], Vec::new());
+    fx.imp("impl Index<&[u8]> for SliceMap", 0, slicemap_t, Some((index, &[r_slice_u8])), &[("Output", u32_)], Default::default());
 
     // Receiver-step priority (rustc `place_op.rs`):
     // - `Outer`: `Deref<Target = Inner>` + `Index<&str, Output = u8>` (`Inner: Index<&String, Output = u16>`)
@@ -141,20 +139,20 @@ fn world() -> World {
     let outer_no_idx_t = fx.adt(outer_no_idx_k, &[]);
     let outer_incompat_k = fx.strukt("OuterIncompatIndex", 0, &[]);
     let outer_incompat_t = fx.adt(outer_incompat_k, &[]);
-    fx.imp("impl Deref for Outer", 0, outer_t, Some((deref, &[])), &[("Target", inner_t)], Vec::new());
-    fx.imp("impl Index<&str> for Outer", 0, outer_t, Some((index, &[r_str])), &[("Output", u8_)], Vec::new());
-    fx.imp("impl Deref for OuterWithoutIndex", 0, outer_no_idx_t, Some((deref, &[])), &[("Target", inner_t)], Vec::new());
-    fx.imp("impl Deref for OuterIncompatIndex", 0, outer_incompat_t, Some((deref, &[])), &[("Target", inner_t)], Vec::new());
-    fx.imp("impl Index<usize> for OuterIncompatIndex", 0, outer_incompat_t, Some((index, &[usize_])), &[("Output", u8_)], Vec::new());
-    fx.imp("impl Index<&String> for Inner", 0, inner_t, Some((index, &[r_string])), &[("Output", u16_)], Vec::new());
+    fx.imp("impl Deref for Outer", 0, outer_t, Some((deref, &[])), &[("Target", inner_t)], Default::default());
+    fx.imp("impl Index<&str> for Outer", 0, outer_t, Some((index, &[r_str])), &[("Output", u8_)], Default::default());
+    fx.imp("impl Deref for OuterWithoutIndex", 0, outer_no_idx_t, Some((deref, &[])), &[("Target", inner_t)], Default::default());
+    fx.imp("impl Deref for OuterIncompatIndex", 0, outer_incompat_t, Some((deref, &[])), &[("Target", inner_t)], Default::default());
+    fx.imp("impl Index<usize> for OuterIncompatIndex", 0, outer_incompat_t, Some((index, &[usize_])), &[("Output", u8_)], Default::default());
+    fx.imp("impl Index<&String> for Inner", 0, inner_t, Some((index, &[r_string])), &[("Output", u16_)], Default::default());
 
     // `Vec<T>` and `[T]` with multiple `Index` impls (`usize` and `Range`) via `SliceIndex`.
     let range_k = fx.strukt("Range", 0, &[]);
     let range_t = fx.adt(range_k, &[]);
-    let slice_index = fx.tr("SliceIndex", 2, Vec::new(), &["Output"]);
+    let slice_index = fx.tr("SliceIndex", 2, Default::default(), &["Output"]);
     let slice_p0 = fx.ty(PNode::Slice(p0));
-    fx.imp("impl<T> SliceIndex<[T]> for usize", 1, usize_, Some((slice_index, &[slice_p0])), &[("Output", p0)], Vec::new());
-    fx.imp("impl<T> SliceIndex<[T]> for Range", 1, range_t, Some((slice_index, &[slice_p0])), &[("Output", slice_p0)], Vec::new());
+    fx.imp("impl<T> SliceIndex<[T]> for usize", 1, usize_, Some((slice_index, &[slice_p0])), &[("Output", p0)], Default::default());
+    fx.imp("impl<T> SliceIndex<[T]> for Range", 1, range_t, Some((slice_index, &[slice_p0])), &[("Output", slice_p0)], Default::default());
     let vec_k = fx.strukt("Vec", 1, &[]);
     let vec_p0 = fx.adt(vec_k, &[p0]);
     let i_si_slice = fx.bound(slice_index, &[p1, slice_p0]);
@@ -165,7 +163,7 @@ fn world() -> World {
         vec_p0,
         Some((index, &[p1])),
         &[("Output", si_out)],
-        std::vec![i_si_slice],
+        [i_si_slice].into(),
     );
     let i_si_slice = fx.bound(slice_index, &[p1, slice_p0]);
     let si_out = fx.alias(slice_index, "Output", &[p1, slice_p0]);
@@ -175,7 +173,7 @@ fn world() -> World {
         slice_p0,
         Some((index, &[p1])),
         &[("Output", si_out)],
-        std::vec![i_si_slice],
+        [i_si_slice].into(),
     );
 
     // Concrete types for test functions.
@@ -200,24 +198,24 @@ fn world() -> World {
     let rr_u32 = fx.r(Mutbl::Not, r_u32);
     let r_p0 = fx.r(Mutbl::Not, p0);
 
-    let f_map_rr = fx.func("f_map_rr", 0, &[map_pair_u32, rr_key], u32_, Vec::new());
-    let f_ref_map_rr = fx.func("f_ref_map_rr", 0, &[r_map_pair_u32, rr_key], u32_, Vec::new());
-    let f_map_box = fx.func("f_map_box", 0, &[map_pair_u32, r_box_key], u32_, Vec::new());
-    let f_map_mut_ref = fx.func("f_map_mut_ref", 0, &[map_pair_u32, mut_key], u32_, Vec::new());
-    let f_strmap_string = fx.func("f_strmap_string", 0, &[strmap_t, r_string], u32_, Vec::new());
-    let f_strmap_rr_str = fx.func("f_strmap_rr_str", 0, &[strmap_t, rr_str], u32_, Vec::new());
-    let f_slicemap_arr = fx.func("f_slicemap_arr", 0, &[slicemap_t, r_arr_u8_4], u32_, Vec::new());
-    let f_mutmap_assign = fx.func("f_mutmap_assign", 0, &[m_mutmap, rr_key], unit, Vec::new());
+    let f_map_rr = fx.func("f_map_rr", 0, &[map_pair_u32, rr_key], u32_, Default::default());
+    let f_ref_map_rr = fx.func("f_ref_map_rr", 0, &[r_map_pair_u32, rr_key], u32_, Default::default());
+    let f_map_box = fx.func("f_map_box", 0, &[map_pair_u32, r_box_key], u32_, Default::default());
+    let f_map_mut_ref = fx.func("f_map_mut_ref", 0, &[map_pair_u32, mut_key], u32_, Default::default());
+    let f_strmap_string = fx.func("f_strmap_string", 0, &[strmap_t, r_string], u32_, Default::default());
+    let f_strmap_rr_str = fx.func("f_strmap_rr_str", 0, &[strmap_t, rr_str], u32_, Default::default());
+    let f_slicemap_arr = fx.func("f_slicemap_arr", 0, &[slicemap_t, r_arr_u8_4], u32_, Default::default());
+    let f_mutmap_assign = fx.func("f_mutmap_assign", 0, &[m_mutmap, rr_key], unit, Default::default());
     let m_idx_bound = fx.bound(index, &[p0, r_u32]);
     let m_idx_out = fx.proj(index, &[p0, r_u32], "Output", u8_);
-    let f_generic_param = fx.func("f_generic_param", 1, &[r_p0, rr_u32], u8_, std::vec![m_idx_bound, m_idx_out]);
-    let f_outer_coerced = fx.func("f_outer_coerced", 0, &[outer_t, r_string], u8_, Vec::new());
-    let f_outer_without_index = fx.func("f_outer_without_index", 0, &[outer_no_idx_t, r_string], u16_, Vec::new());
-    let f_outer_incompat_index = fx.func("f_outer_incompat_index", 0, &[outer_incompat_t, r_string], u16_, Vec::new());
-    let f_neg_vec_ref_usize = fx.func("f_neg_vec_ref_usize", 0, &[vec_u32, r_usize], u32_, Vec::new());
-    let f_neg_arr_ref_usize = fx.func("f_neg_arr_ref_usize", 0, &[arr_u32_4, r_usize], u32_, Vec::new());
-    let f_neg_map_wrong_key = fx.func("f_neg_map_wrong_key", 0, &[map_pair_u32, r_u32], u32_, Vec::new());
-    let f_neg_string_map_wrong_key = fx.func("f_neg_string_map_wrong_key", 0, &[map_string_u32, r_u32], u32_, Vec::new());
+    let f_generic_param = fx.func("f_generic_param", 1, &[r_p0, rr_u32], u8_, [m_idx_bound, m_idx_out].into());
+    let f_outer_coerced = fx.func("f_outer_coerced", 0, &[outer_t, r_string], u8_, Default::default());
+    let f_outer_without_index = fx.func("f_outer_without_index", 0, &[outer_no_idx_t, r_string], u16_, Default::default());
+    let f_outer_incompat_index = fx.func("f_outer_incompat_index", 0, &[outer_incompat_t, r_string], u16_, Default::default());
+    let f_neg_vec_ref_usize = fx.func("f_neg_vec_ref_usize", 0, &[vec_u32, r_usize], u32_, Default::default());
+    let f_neg_arr_ref_usize = fx.func("f_neg_arr_ref_usize", 0, &[arr_u32_4, r_usize], u32_, Default::default());
+    let f_neg_map_wrong_key = fx.func("f_neg_map_wrong_key", 0, &[map_pair_u32, r_u32], u32_, Default::default());
+    let f_neg_string_map_wrong_key = fx.func("f_neg_string_map_wrong_key", 0, &[map_string_u32, r_u32], u32_, Default::default());
 
     fx.finish();
     World {
@@ -385,7 +383,8 @@ fn negative_controls_reject_invalid_indexing() {
         ("Map<String, u32>[&u32]", w.f_neg_string_map_wrong_key),
     ] {
         let (_, _, indexed, c) = check_index(&w.fx, owner);
-        let codes: Vec<_> = c.diags.iter().map(|d| (d.code, d.at.start)).collect();
-        assert_eq!(codes, [(DiagCode::CantIndex, indexed.0)], "CONTROL {name} must fail with E0608");
+        let mut codes = blaze_own::Vec::new_in(blaze_own::testing::heap().alloc());
+        codes.extend(c.diags.iter().map(|d| (d.code, d.at.start)));
+        assert_eq!(codes.as_slice(), [(DiagCode::CantIndex, indexed.0)], "CONTROL {name} must fail with E0608");
     }
 }

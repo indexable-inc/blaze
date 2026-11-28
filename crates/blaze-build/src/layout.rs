@@ -807,7 +807,7 @@ fn niche_single_scalar_enum_over_plain_newtype_matches_underlying_scalar_rust_pa
     let res_err_i32 = g.adt(result, &[unit, error_i32]);
     let res_err_u32 = g.adt(result, &[unit, error_u32]);
 
-    let mut ls = Layouts::new_in(std::alloc::Global);
+    let mut ls = Layouts::new_in(blaze_own::testing::heap().alloc());
     let want = Pass::Scalar { ty: Ty::I32, ext: Ext::None, agg: true };
     for ty in [res_nz_i32, res_err_i32, res_err_u32] {
         let row = lay(&w, &mut g, &mut ls, ty).unwrap();
@@ -883,7 +883,7 @@ fn transparent_wrappers_preserve_niche_single_scalar_enum_rust_pass() {
     let opt_fieldless_i8 = g.adt(option, &[fl_i8_ty]);
     let zst_niche_i32 = g.adt(zst_plus_niche, &[non_zero_i32]);
 
-    let mut ls = Layouts::new_in(std::alloc::Global);
+    let mut ls = Layouts::new_in(blaze_own::testing::heap().alloc());
     let cases = [
         ("Result<(), PlainNewtype(NonZeroI32)>", res_err_i32, Pass::Scalar { ty: Ty::I32, ext: Ext::None, agg: true }),
         ("Option<FieldlessU8>", opt_fieldless_u8, Pass::Scalar { ty: Ty::I8, ext: Ext::Zext, agg: true }),
