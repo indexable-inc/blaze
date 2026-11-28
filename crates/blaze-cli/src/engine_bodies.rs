@@ -3116,11 +3116,19 @@ impl CachedDepFile {
         snapshot: &'n StoreSnapshot,
         index: u32,
         text: &'n str,
+        expected_surface: ContentId,
     ) -> Result<blaze_scope::items_record::CurrentFile<'n>, blaze_scope::items_record::ItemsRecordError> {
+        if self.surface != expected_surface {
+            return Err(blaze_scope::items_record::ItemsRecordError::FileItemsSurfaceConflict {
+                file: index,
+                expected: expected_surface,
+                found: self.surface,
+            });
+        }
         match &self.data {
             CachedDepData::Snapshot => match snapshot.get(self.key) {
                 Ok(Some(bytes)) => {
-                    let (surface, view) = crate::front_load::open_pack_file_items(bytes, index, self.text_digest)?;
+                    let (surface, view) = crate::front_load::open_pack_file_items(bytes, index, self.text_digest, expected_surface)?;
                     Ok(blaze_scope::items_record::CurrentFile { view, text, surface })
                 }
                 Ok(None) => Err(blaze_scope::items_record::ItemsRecordError::FileItemsUnavailable {
@@ -3269,7 +3277,7 @@ impl DependencyFiles {
         vec.map(Vec::as_slice)
     }
 
-    #[expect(clippy::too_many_arguments, reason = "dependency file lookup: snapshot, identity, text, digest, edition, pin, bump")]
+    #[expect(clippy::too_many_arguments, reason = "dependency file lookup: snapshot, identity, text, digest, expected surface, edition, pin, bump")]
     fn get_or_outline<'n>(
         &'n self,
         snapshot: &'n StoreSnapshot,
@@ -3277,29 +3285,34 @@ impl DependencyFiles {
         index: u32,
         text: &'n str,
         digest: Option<ContentId>,
+        expected_surface: ContentId,
         edition: blaze_surface::Edition,
         pin: DepFilePin,
         bump: blaze_own::Bump<'n>,
     ) -> Result<blaze_scope::items_record::CurrentFile<'n>, blaze_scope::items_record::ItemsRecordError> {
         let ed = edition.byte();
         let hash = Self::slot_hash(world_at, index, ed);
-        // 1. In-phase lock-free cache: skips even re-hashing immutable pack file text on repeat asks.
+        // 1. In-phase lock-free cache: skips even re-hashing immutable pack file text on repeat asks,
+        //    failing loudly with `FileItemsSurfaceConflict` if `cached.surface != expected_surface`.
         if let Some(small) = self.small.get()
             && let Some(cached) = Self::find_in(small.as_slice(), DEP_FILE_SMALL_PROBES, hash, world_at, index, ed, text.len(), digest)
         {
-            return cached.open(snapshot, index, text);
+            return cached.open(snapshot, index, text, expected_surface);
         }
         if let Some(large) = self.large.get()
             && let Some(cached) = Self::find_in(large.as_slice(), DEP_FILE_PROBES, hash, world_at, index, ed, text.len(), digest)
         {
-            return cached.open(snapshot, index, text);
+            return cached.open(snapshot, index, text, expected_surface);
         }
-        // 2. Committed CAS lookup: zero-copy `FileItemsView` straight from `snapshot`.
+        // 2. Committed CAS lookup: zero-copy `FileItemsView` straight from `snapshot`. Because
+        //    `pack_file_items_key` binds `PACK_FILE_ITEMS_SOURCE`, all four outliner domains,
+        //    edition, and text digest, a stored surface mismatch is a typed CAS conflict error
+        //    (`FileItemsSurfaceConflict`), never silently re-outlined.
         let digest = digest.unwrap_or_else(|| ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes()));
         let cas_key = crate::front_load::pack_file_items_key(edition, digest);
         match snapshot.get(cas_key) {
             Ok(Some(bytes)) => {
-                let (surface, view) = crate::front_load::open_pack_file_items(bytes, index, digest)?;
+                let (surface, view) = crate::front_load::open_pack_file_items(bytes, index, digest, expected_surface)?;
                 let mut candidate = Some(CachedDepFile {
                     world_at,
                     index,
@@ -3346,16 +3359,18 @@ impl DependencyFiles {
             Ok((surface, cached))
         })?;
         let mut candidate = Some(cached_entry);
-        if let Some(small) = Self::init_slab(&self.small, DEP_FILE_SMALL_SLOTS, self.heap)
-            && let Some(published) = Self::insert_in(small, DEP_FILE_SMALL_PROBES, hash, &mut candidate, world_at, index, ed, text.len(), digest)
-        {
-            return published.open(snapshot, index, text);
-        }
-        if candidate.is_some()
-            && let Some(large) = Self::init_slab(&self.large, DEP_FILE_SLOTS, self.heap)
-            && let Some(published) = Self::insert_in(large, DEP_FILE_PROBES, hash, &mut candidate, world_at, index, ed, text.len(), digest)
-        {
-            return published.open(snapshot, index, text);
+        if surface == expected_surface {
+            if let Some(small) = Self::init_slab(&self.small, DEP_FILE_SMALL_SLOTS, self.heap)
+                && let Some(published) = Self::insert_in(small, DEP_FILE_SMALL_PROBES, hash, &mut candidate, world_at, index, ed, text.len(), digest)
+            {
+                return published.open(snapshot, index, text, expected_surface);
+            }
+            if candidate.is_some()
+                && let Some(large) = Self::init_slab(&self.large, DEP_FILE_SLOTS, self.heap)
+                && let Some(published) = Self::insert_in(large, DEP_FILE_PROBES, hash, &mut candidate, world_at, index, ed, text.len(), digest)
+            {
+                return published.open(snapshot, index, text, expected_surface);
+            }
         }
         let Some(entry) = candidate else {
             return Err(blaze_scope::items_record::ItemsRecordError::FileItemsUnavailable {
@@ -3551,7 +3566,7 @@ impl<'n> blaze_ladder::front2::source::Load<'n> for BodiesLoad<'n> {
         } else {
             DepFilePin::MemberRow
         };
-        self.dep_files.get_or_outline(self.snapshot, world_at, index, text, digest, edition, pin, bump).map(Some)
+        self.dep_files.get_or_outline(self.snapshot, world_at, index, text, digest, surface, edition, pin, bump).map(Some)
     }
 
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<blaze_ladder::front2::source::LoadedExpansion<'n>> {
@@ -3759,11 +3774,12 @@ impl crate::front_load::OpenByNeed for LazyScopeRecords<'_> {
         world_at: usize,
         nfiles: usize,
         file: u32,
+        expected_surface: ContentId,
         edition: blaze_surface::Edition,
         text: &'s str,
         verify_digest: bool,
     ) -> Option<Result<blaze_scope::items_record::CurrentFile<'s>, blaze_scope::items_record::ItemsRecordError>> {
-        self.inner.pack_file_items(world_at, nfiles, file, edition, text, verify_digest)
+        self.inner.pack_file_items(world_at, nfiles, file, expected_surface, edition, text, verify_digest)
     }
 }
 
@@ -8723,6 +8739,7 @@ fn run_stretch_with<'d, 's, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
         // The reads of this body's calls that left its package inside the workspace (D111), told
         // to the texts while it is checked (job_texts.rs `left_package`): its warnings.
         let left_at = opened.sources.0.left.borrow().len();
+        let unserved_at = opened.load.unserved_len();
         // A refused large allocation need not increase the peak, and an ordinary panic can
         // happen arbitrarily close to the limit. Read the typed refusal at its source.
         let frame_limit = |what: &'static str, heads: Option<&StretchStore<'_>>| {
@@ -9097,6 +9114,19 @@ fn run_stretch_with<'d, 's, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
             if let Some(words) = seed.and_then(|s| s.lang_refused()) && !matches!(said, Some(Said::Panicked)) {
                 said = Some(Said::Refused(words));
                 scope_required = true;
+                seed_refused = false;
+            }
+            // Surface any expansion read error (`OldForm`, `Missing`, `Zstd`, etc.) recorded by
+            // `StoreLoad` during this body's check when the body was refused, so failures do not
+            // collapse into opaque `NoText`.
+            if !scope_required
+                && said.is_some()
+                && !matches!(said, Some(Said::Panicked))
+                && let Some(words) = opened.load.with_first_unserved_error_since(unserved_at, |err| {
+                    leak(g, format_args!("an expansion record read during this body's check failed: {err} (engine_bodies.rs `run_stretch`)"))
+                })
+            {
+                said = Some(Said::Refused(words));
                 seed_refused = false;
             }
             // A checked verdict and a refusal at a seed both depend on the evaluator. Its
@@ -10043,6 +10073,7 @@ mod worker_frame_caps_tests {
 
         let text = "pub fn wrapping_demo(x: u64) -> u64 { x.wrapping_add(1) }\n";
         let ed = blaze_surface::Edition::E2021;
+        let expected_surface = blaze_file_items::outline(text, ed, alloc).surface();
         let frame = Frame::new(bstd::mem::Tag::Other).expect("frame");
         let erased = blaze_own::Erased::new(&frame);
         let bump = erased.bump();
@@ -10050,7 +10081,7 @@ mod worker_frame_caps_tests {
         // Phase 1 (cold CAS miss): outlines once into compact `small` slab (never allocates 4096-slot `large`).
         let cold_deps = DependencyFiles::new(heap);
         let cold_file = cold_deps
-            .get_or_outline(&empty_snap, 1, 0, text, None, ed, DepFilePin::Toolchain, bump)
+            .get_or_outline(&empty_snap, 1, 0, text, None, expected_surface, ed, DepFilePin::Toolchain, bump)
             .expect("cold get_or_outline");
         assert!(cold_deps.small.get().is_some(), "cold miss populates compact small slab");
         assert!(cold_deps.large.get().is_none(), "single file must not spill to 4096-slot slab");
@@ -10063,7 +10094,7 @@ mod worker_frame_caps_tests {
         // Phase 2 (warm CAS hit): borrows zero-copy from `warm_snap` (`CachedDepData::Snapshot`), never allocates `large`.
         let warm_deps = DependencyFiles::new(heap);
         let warm_file = warm_deps
-            .get_or_outline(&warm_snap, 1, 0, text, None, ed, DepFilePin::Toolchain, bump)
+            .get_or_outline(&warm_snap, 1, 0, text, None, expected_surface, ed, DepFilePin::Toolchain, bump)
             .expect("warm get_or_outline");
         assert_eq!(warm_file.surface, cold_file.surface, "warm CAS hit surface matches cold");
         assert_eq!(warm_file.view.file(), cold_file.view.file(), "warm CAS hit file digest matches cold");
@@ -10081,18 +10112,56 @@ mod worker_frame_caps_tests {
 
         // Second lookup in Phase 2 hits `warm_deps.small` directly without re-outlining.
         let repeat_file = warm_deps
-            .get_or_outline(&warm_snap, 1, 0, text, None, ed, DepFilePin::Toolchain, bump)
+            .get_or_outline(&warm_snap, 1, 0, text, None, expected_surface, ed, DepFilePin::Toolchain, bump)
             .expect("repeat warm get_or_outline");
         assert_eq!(repeat_file.surface, cold_file.surface);
         assert_eq!(repeat_file.view.len(), cold_file.view.len());
 
         // Non-toolchain pack file pins into `member_rows` on persist.
         let dep_text = "pub const DEP_VAL: u32 = 42;\n";
+        let dep_surface = blaze_file_items::outline(dep_text, ed, alloc).surface();
         let _ = warm_deps
-            .get_or_outline(&warm_snap, 2, 0, dep_text, None, ed, DepFilePin::MemberRow, bump)
+            .get_or_outline(&warm_snap, 2, 0, dep_text, None, dep_surface, ed, DepFilePin::MemberRow, bump)
             .expect("non-toolchain dep file");
         warm_deps.persist(&cx, &mut store, &mut member_rows, heap).expect("persist warm dep files");
         assert_eq!(member_rows.as_ref().map_or(0, Vec::len), 1, "non-toolchain pack file pins into member_rows");
+
+        // Negative control: a conflicting CAS record under `pack_file_items_key` whose stored
+        // `surface` disagrees with `ItemsRecord`'s `expected_surface` must fail loudly with typed
+        // `FileItemsSurfaceConflict` rather than silently re-outlining into a non-persistable slot.
+        let stale_text = "pub fn stale_surface_demo(a: i32) -> i32 { a + 1 }\n";
+        let stale_digest = ContentId::of(crate::sweep::FILE_DOMAIN, stale_text.as_bytes());
+        let stale_key = crate::front_load::pack_file_items_key(ed, stale_digest);
+        let real_outline = blaze_file_items::outline(stale_text, ed, alloc);
+        let real_surface = real_outline.surface();
+        let bogus_surface = ContentId([0xAB; 32]);
+        assert_ne!(real_surface, bogus_surface);
+        let raw = real_outline.to_file_items(stale_text, stale_digest, alloc).expect("to_file_items");
+        let head = crate::front_load::pack_file_items_head(stale_key, stale_digest, bogus_surface, raw.len(), alloc);
+        let mut stale_rec = Vec::with_capacity_in(head.len() + raw.len(), alloc);
+        stale_rec.extend_from_slice(&head);
+        stale_rec.extend_from_slice(&raw);
+        store.put(&cx, stale_key, &stale_rec).expect("put stale pack FileItems");
+        let stale_snap = store.commit_for_body_reads().expect("stale committed snapshot");
+
+        let conflict_deps = DependencyFiles::new(heap);
+        match conflict_deps.get_or_outline(&stale_snap, 3, 0, stale_text, None, real_surface, ed, DepFilePin::MemberRow, bump) {
+            Err(blaze_scope::items_record::ItemsRecordError::FileItemsSurfaceConflict { file: 0, expected, found }) => {
+                assert_eq!((expected, found), (real_surface, bogus_surface));
+            }
+            Ok(_) => panic!("conflicting CAS surface must return typed FileItemsSurfaceConflict"),
+            Err(other) => panic!("expected FileItemsSurfaceConflict, got {other:?}"),
+        }
+        assert!(conflict_deps.small.get().is_none(), "conflicting CAS entry must not silently populate slab");
+
+        // Negative control (in-phase slab): querying a cached entry with a conflicting surface fails loudly.
+        match warm_deps.get_or_outline(&warm_snap, 1, 0, text, None, bogus_surface, ed, DepFilePin::Toolchain, bump) {
+            Err(blaze_scope::items_record::ItemsRecordError::FileItemsSurfaceConflict { file: 0, expected, found }) => {
+                assert_eq!((expected, found), (bogus_surface, expected_surface));
+            }
+            Ok(_) => panic!("mismatched in-phase slab surface must fail loudly"),
+            Err(other) => panic!("expected FileItemsSurfaceConflict, got {other:?}"),
+        }
     }
 
     #[test]

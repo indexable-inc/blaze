@@ -179,6 +179,25 @@ pub enum ConstFail {
 }
 
 impl ConstFail {
+    /// Returns the underlying infrastructure [`super::heads::HeadError`] (`NoText`, `Cfg`, or
+    /// `Filed`) if this constant-evaluation failure was caused by missing/unreadable compiler
+    /// metadata rather than a user program or const-eval refusal. Infrastructure errors must never
+    /// be swallowed into `Maps::anon_failed` or cached as a permanent `AliasGap` in `BZFZ`.
+    pub(super) fn infra_head_error(&self) -> Option<super::heads::HeadError> {
+        match self {
+            Self::RequiredBody { cause, .. } => match cause {
+                RequiredBodyCause::Lower(error) => body_infra_head_error(error),
+                RequiredBodyCause::Check(error) => check_infra_head_error(error),
+                RequiredBodyCause::Spelling(why) => why_infra_head_error(why),
+                RequiredBodyCause::Diagnostic(_) | RequiredBodyCause::Literal => None,
+            },
+            Self::Body { error, .. } => body_infra_head_error(error),
+            Self::Check { error, .. } => check_infra_head_error(error),
+            Self::Spelling { why, .. } => why_infra_head_error(why),
+            _ => None,
+        }
+    }
+
     fn required_by<'n, S: NamesSource<'n>>(self, r: &Records<'_, 'n, S>, constant: ItemKey, needed: ItemKey) -> Self {
         if super::const_open::needed_first(&self).is_some()
             || !matches!(r.keys.origin(constant), Some(super::keys::Origin::Member { kind: super::keys::MemberKind::Anon, .. }))
@@ -282,6 +301,46 @@ fn cycle_of<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, chain: &[ItemKey]) -
 /// work list (`Consts::value_listed`) evaluates `LEN` first, then this need again, which makes
 /// the row (the Reference, "Constant evaluation": an array type's length is a const context,
 /// evaluated as a constant item is, to any depth).
+pub(super) fn head_infra_error(error: &super::heads::HeadError) -> Option<super::heads::HeadError> {
+    use super::heads::HeadError;
+    match error {
+        HeadError::NoText(k) => Some(HeadError::NoText(*k)),
+        HeadError::Cfg(k) => Some(HeadError::Cfg(*k)),
+        HeadError::Filed { want, at, what } => Some(HeadError::Filed { want: *want, at: *at, what }),
+        HeadError::Item(_, why) => why_infra_head_error(why),
+        _ => None,
+    }
+}
+
+pub(super) fn why_infra_head_error(why: &Why) -> Option<super::heads::HeadError> {
+    match why {
+        Why::Resolve(crate::resolve::ResolveError::NoText { key }, _) => Some(super::heads::HeadError::NoText(*key)),
+        _ => None,
+    }
+}
+
+pub(super) fn body_infra_head_error(error: &BodyError) -> Option<super::heads::HeadError> {
+    use super::heads::HeadError;
+    match error {
+        BodyError::NoText(k) => Some(HeadError::NoText(*k)),
+        BodyError::Cfg(k) => Some(HeadError::Cfg(*k)),
+        BodyError::Head { error, .. } => head_infra_error(error),
+        BodyError::Generics { why, .. } | BodyError::Record { why, .. } => why_infra_head_error(why),
+        BodyError::Convert { why: Some(why), .. } => why_infra_head_error(why),
+        BodyError::PatternName { error: crate::resolve::ResolveError::NoText { key }, .. } => Some(HeadError::NoText(*key)),
+        BodyError::Const { error, .. } => error.infra_head_error(),
+        _ => None,
+    }
+}
+
+pub(super) fn check_infra_head_error(error: &CheckFail) -> Option<super::heads::HeadError> {
+    match error {
+        CheckFail::Head { error, .. } => head_infra_error(error),
+        CheckFail::Const { error, .. } => error.infra_head_error(),
+        _ => None,
+    }
+}
+
 fn adt_row<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,item: ItemKey, adt: ItemKey) -> Result<(), ConstFail> {
     let refuse = |why: String| ConstFail::AdtRow { item, adt, why: why.into_boxed_str() };
     if r.store.adts.contains_key(&adt) {
@@ -290,8 +349,15 @@ fn adt_row<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,item: ItemKey, adt
     let lib = r.keys.library_in(r.names, adt).ok_or_else(|| refuse(String::from("it has no library key")))?;
     match r.store.ensure(r.names, &mut *r.keys, super::heads::Want::Adt(lib)) {
         Ok(()) => {}
-        Err(error @ super::heads::HeadError::Item(_, Why::NeedConst(..))) => return Err(ConstFail::Body { item, error: BodyError::Head { item: lib, error } }),
-        Err(e) => return Err(refuse(format!("{e}"))),
+        Err(error @ super::heads::HeadError::Item(_, Why::NeedConst(..))) => {
+            return Err(ConstFail::Body { item, error: BodyError::Head { item: lib, error } });
+        }
+        Err(e) => {
+            if let Some(infra) = head_infra_error(&e) {
+                return Err(ConstFail::Body { item, error: BodyError::Head { item: lib, error: infra } });
+            }
+            return Err(refuse(format!("{e}")));
+        }
     }
     match r.store.adts.get(&adt) {
         Some(_) => Ok(()),
@@ -1108,7 +1174,7 @@ impl<'n> Consts<'n> {
                 let row = self.records.iter().find(|x| x.record.key == key).ok_or(ConstFail::MissingRecord { item, key })?;
                 int_of(&row.record)
             }
-            Err(e) if !anonymous || super::const_open::needed_first(&e).is_some() => return Err(e),
+            Err(e) if !anonymous || super::const_open::needed_first(&e).is_some() || e.infra_head_error().is_some() => return Err(e),
             Err(e) => {
                 r.store.maps.noted_const_result(c);
                 r.store.maps.anon_failed.insert(c, format!("{e}").into_boxed_str());

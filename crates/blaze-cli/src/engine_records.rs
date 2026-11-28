@@ -177,13 +177,16 @@ pub(crate) fn open_record<'r, R: Route>(
     counts.bytes += record.len() as u64;
     store_read(record.len());
     counts.sections += (parts.names.len() + parts.items.len() + parts.expansions.len()) as u64;
+    let exports = Aligned16::new(parts.exports)
+        .map(Aligned16::bytes)
+        .map_err(|why| ReadError::Misaligned { name, which: "exports section", why })?;
     let names = R::section(name, "names section", parts.names, counts, alloc)?;
     let items = R::section(name, "items section", parts.items, counts, alloc)?;
     let expansions = R::section(name, "expansions directory", parts.expansions, counts, alloc)?;
     if R::check_lazy() {
-        Ok(crate::front_load::checked_records_lazy(name, key, names, items, expansions)?)
+        Ok(crate::front_load::checked_records_lazy(name, key, exports, names, items, expansions)?)
     } else {
-        Ok(crate::front_load::checked_records(name, key, names, items, expansions, alloc)?)
+        Ok(crate::front_load::checked_records(name, key, exports, names, items, expansions, alloc)?)
     }
 }
 
