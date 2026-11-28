@@ -887,4 +887,133 @@ mod tests {
         assert_eq!(stats.head_hits, (threads * items) as u64);
         assert_eq!(stats.typed_hits, (threads * items) as u64);
     }
+
+    #[derive(Clone, Copy)]
+    enum PlantedConstBitBug {
+        None,
+        DropPrimTy,
+        SwapPrimTy,
+    }
+
+    fn xorshift64(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    fn oracle_const_entry(idx: usize) -> (LibKey, u128, Option<blaze_typeck::PNode>) {
+        use blaze_typeck::{IntTy, PNode, UintTy};
+        let mut bytes = [0u8; 32];
+        bytes[0..8].copy_from_slice(&(idx as u64).to_le_bytes());
+        bytes[8] = (idx as u8).wrapping_mul(37).wrapping_add(11);
+        let key = LibKey(ContentId(bytes));
+        let ty = match idx % 7 {
+            0 => Some(PNode::Bool),
+            1 => Some(PNode::Char),
+            2 => Some(PNode::Uint(UintTy::U8)),
+            3 => Some(PNode::Uint(UintTy::Usize)),
+            4 => Some(PNode::Int(IntTy::I32)),
+            5 => Some(PNode::Int(IntTy::Isize)),
+            _ => None,
+        };
+        let bits = match idx % 7 {
+            0 => u128::from(((idx / 7) & 1) as u64),
+            1 => u128::from(b'a' + (idx % 26) as u8),
+            2 => u128::from(((idx * 13) & 0xff) as u64),
+            _ => (u128::from(idx as u64) << 16) ^ 0xA55A_1234,
+        };
+        (key, bits, ty)
+    }
+
+    fn run_const_bit_dst_schedule(seed: u64, cap: usize, universe: usize, steps: usize, planted: PlantedConstBitBug) -> Result<(), std::string::String> {
+        let alloc = blaze_own::testing::heap().shared();
+        let shared = SharedLazyFront::with_caps_in(alloc, 16, cap, 16, 16, 16);
+        let mut rng = seed ^ 0x9E37_79B9_7F4A_7C15;
+        let mut inserted_any = std::vec![false; universe];
+
+        for step in 0..steps {
+            let idx = (xorshift64(&mut rng) as usize) % universe;
+            let op = xorshift64(&mut rng) % 3;
+            let (key, bits, expected_ty) = oracle_const_entry(idx);
+            if op == 0 {
+                let stored_ty = match planted {
+                    PlantedConstBitBug::None => expected_ty,
+                    PlantedConstBitBug::DropPrimTy => None,
+                    PlantedConstBitBug::SwapPrimTy => oracle_const_entry((idx + 1) % universe).2,
+                };
+                let _ = shared.put_const_bit(key, bits, stored_ty);
+                inserted_any[idx] = true;
+            } else if let Some((got_bits, got_ty)) = shared.get_const_bit(key) {
+                if !inserted_any[idx] {
+                    return Err(std::format!("seed {seed} step {step}: key {idx} returned before any insert"));
+                }
+                if got_bits != bits || got_ty != expected_ty {
+                    return Err(std::format!(
+                        "seed {seed} step {step}: key {idx} mismatch: got ({got_bits:#x}, {got_ty:?}), expected ({bits:#x}, {expected_ty:?})"
+                    ));
+                }
+            }
+            if shared.const_bits_len() > cap {
+                return Err(std::format!("seed {seed} step {step}: len {} exceeded cap {cap}", shared.const_bits_len()));
+            }
+        }
+        // Final full-universe sweep verifying every cached entry matches the oracle exactly.
+        for idx in 0..universe {
+            let (key, bits, expected_ty) = oracle_const_entry(idx);
+            if let Some((got_bits, got_ty)) = shared.get_const_bit(key)
+                && (got_bits != bits || got_ty != expected_ty)
+            {
+                return Err(std::format!(
+                    "seed {seed} sweep: key {idx} mismatch: got ({got_bits:#x}, {got_ty:?}), expected ({bits:#x}, {expected_ty:?})"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_const_bits_dst_preserves_bits_and_prim_ty_with_planted_bug_controls() {
+        let seeds = [1u64, 7, 42, 0xDEAD_BEEF, 0xCAFE_BABE, 2026_1128];
+        for &seed in &seeds {
+            run_const_bit_dst_schedule(seed, 24, 96, 2000, PlantedConstBitBug::None)
+                .unwrap_or_else(|e| panic!("clean schedule failed: {e}"));
+        }
+        // Planted-bug controls: the oracle must catch dropped or swapped `prim_ty`.
+        let dropped = run_const_bit_dst_schedule(42, 24, 96, 2000, PlantedConstBitBug::DropPrimTy);
+        assert!(dropped.is_err(), "planted DropPrimTy bug must be caught by the DST oracle");
+        let swapped = run_const_bit_dst_schedule(42, 24, 96, 2000, PlantedConstBitBug::SwapPrimTy);
+        assert!(swapped.is_err(), "planted SwapPrimTy bug must be caught by the DST oracle");
+
+        // Concurrent multi-worker storm across shards under bounded capacity.
+        let alloc = blaze_own::testing::heap().shared();
+        let cap = 32usize;
+        let universe = 96usize;
+        let shared = Arc::new_in(SharedLazyFront::with_caps_in(alloc, 16, cap, 16, 16, 16), alloc);
+        std::thread::scope(|scope| {
+            for t in 0..4u64 {
+                let s = Arc::clone(&shared);
+                scope.spawn(move || {
+                    let mut rng = (t + 1).wrapping_mul(0x517C_C1B7_2722_0A95);
+                    for _ in 0..1500 {
+                        let idx = (xorshift64(&mut rng) as usize) % universe;
+                        let (key, bits, expected_ty) = oracle_const_entry(idx);
+                        if xorshift64(&mut rng) & 1 == 0 {
+                            let _ = s.put_const_bit(key, bits, expected_ty);
+                        }
+                        if let Some((got_bits, got_ty)) = s.get_const_bit(key) {
+                            assert_eq!(
+                                (got_bits, got_ty),
+                                (bits, expected_ty),
+                                "concurrent worker observed torn or mismatched (bits, prim_ty) for key {idx}"
+                            );
+                        }
+                    }
+                });
+            }
+        });
+        assert!(shared.const_bits_len() <= cap, "concurrent const_bits table must respect cap");
+    }
 }
