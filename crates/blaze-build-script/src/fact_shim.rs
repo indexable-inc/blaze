@@ -150,9 +150,66 @@ fn push_hex32(bytes: &[u8; 32], out: &mut AString<'_>) {
     }
 }
 
+/// Checks whether a classified `rustc` try-compile invocation is strictly an exit-status-only
+/// compiler-capability probe (`autocfg`, `rustix`, `proc-macro2`, `thiserror`, `anyhow`, `eyre`):
+/// - `--crate-type` is explicitly `lib` or `rlib` (never `bin`, `cdylib`, `dylib`, `staticlib`,
+///   `proc-macro`, or default `bin`),
+/// - `--emit` is strictly within `{dep-info, llvm-ir, metadata}` (never `link`, `obj`, `asm`,
+///   `llvm-bc`, `mir`, or default `link`),
+/// - `-o` is absent or `/dev/null` (never a named output file or `-` stdout),
+/// - no `--emit` item specifies a per-kind output path other than `/dev/null`,
+/// - `--test` is not requested.
+/// Returns `Some(reason)` when the invocation asks for a real artifact the shim does not
+/// materialize so it is refused loudly with [`REFUSED_CODE`] instead of returning exit 0 without
+/// creating output files (Rule 3).
+fn compile_output_refusal(args: &[&str], compile: &probe_ask::Compile<'_, '_>) -> Option<&'static str> {
+    if compile.test {
+        return Some("`--test` builds a test executable the fact shim does not materialize");
+    }
+    if compile.crate_types.is_empty()
+        || !compile.crate_types.iter().all(|ty| matches!(*ty, "lib" | "rlib"))
+    {
+        return Some("only exit-status-only `--crate-type=lib|rlib` probes are answered; artifact crate types are not materialized");
+    }
+    // Allowed emit mask: `dep-info` (bit 1), `llvm-ir` (bit 4), `metadata` (bit 5).
+    const ALLOWED_PROBE_EMITS: u8 = (1 << 1) | (1 << 4) | (1 << 5);
+    if compile.emits.0 == 0 || (compile.emits.0 & !ALLOWED_PROBE_EMITS) != 0 {
+        return Some("only `--emit` within `{dep-info,llvm-ir,metadata}` is answered; linked/object/asm/mir artifacts are not materialized");
+    }
+    if let Some(out) = compile.out
+        && out != "/dev/null"
+    {
+        return Some("`-o <path>` requests a named output artifact the fact shim does not materialize");
+    }
+    let mut i = 0;
+    while i < args.len() {
+        let Some(&arg) = args.get(i) else { break };
+        let emit_val = if let Some(val) = arg.strip_prefix("--emit=") {
+            Some(val)
+        } else if arg == "--emit" {
+            i += 1;
+            args.get(i).copied()
+        } else {
+            None
+        };
+        if let Some(val) = emit_val {
+            for item in val.split(',') {
+                if let Some((_, path)) = item.split_once('=')
+                    && path != "/dev/null"
+                {
+                    return Some("`--emit=<kind>=<path>` requests a named output artifact the fact shim does not materialize");
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Answers a `rustc` probe (`autocfg` / try-compile / version) using the exact same keyed probe
 /// machinery ([`probe_ask::classify`] + [`probe_ask::answer`]) as the Wasm runner (Rule 1, Rule 30).
-/// Refuses unknown flags, `--print`, and unanswered probes loudly with [`REFUSED_CODE`] (Rule 3).
+/// Refuses artifact-producing compiles, unknown flags, `--print`, and unanswered probes loudly
+/// with [`REFUSED_CODE`] (Rule 3).
 pub fn ask_rustc_probe<'a>(
     args: &[&str],
     snippet: &[u8],
@@ -184,6 +241,9 @@ pub fn ask_rustc_probe<'a>(
         }
         Ok(Ask::Print { what, .. }) => refuse(format_args!("`--print {what}` is not answered by the keyed probe table"), raw_subject),
         Ok(Ask::Compile(compile)) => {
+            if let Some(why) = compile_output_refusal(args, &compile) {
+                return refuse(format_args!("{why}"), raw_subject);
+            }
             let answered = probe_ask::answer(&compile, host, snippet, table);
             let mut key_hex = String::new_in(alloc);
             push_hex32(&answered.key.0, &mut key_hex);
@@ -557,5 +617,35 @@ mod tests {
         let print_cfg = super::ask_rustc_probe(&["--print", "cfg"], b"", HOST, &decoded_table, alloc);
         assert_eq!((print_cfg.code, print_cfg.answered), (REFUSED_CODE, false));
         assert!(print_cfg.stderr.as_str().contains("--print cfg"), "{}", print_cfg.stderr.as_str());
+
+        // 5. Invocations requesting real output artifacts (`-o <path>`, `-o -`, `--emit=link`,
+        //    default `--emit` (`link`), `--emit=obj`, `--emit=metadata=<path>`, `--crate-type=bin`)
+        //    MUST be refused with exit 127 instead of returning exit 0 without creating outputs.
+        for artifact_args in [
+            &["--crate-type=lib", "--emit=metadata", "-o", "/out/libfoo.rmeta", "-"][..],
+            &["--crate-type=rlib", "--emit=metadata", "-o", "-", "-"][..],
+            &["--crate-type=lib", "-"][..],
+            &["--crate-type=lib", "--emit=link", "-"][..],
+            &["--crate-type=lib", "--emit=obj", "-"][..],
+            &["--crate-type=lib", "--emit=metadata=/out/foo.rmeta", "-"][..],
+            &["--crate-type=bin", "--emit=metadata", "-"][..],
+        ] {
+            let refused = super::ask_rustc_probe(artifact_args, b"#![no_std]\n", HOST, &decoded_table, alloc);
+            assert_eq!(
+                (refused.code, refused.answered),
+                (REFUSED_CODE, false),
+                "artifact-requesting invocation must be refused: {artifact_args:?}"
+            );
+        }
+
+        // Control: `-o /dev/null` explicitly discards outputs and is allowed for metadata probes.
+        let devnull = super::ask_rustc_probe(
+            &["--crate-type=rlib", "--emit=metadata", "-o", "/dev/null", "-"],
+            b"#![no_std]\n",
+            HOST,
+            &decoded_table,
+            alloc,
+        );
+        assert_eq!((devnull.code, devnull.answered), (0, true));
     }
 }

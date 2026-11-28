@@ -203,16 +203,23 @@ pub(crate) enum NativeSysrootId {
 }
 
 /// The identity of the command's target C library sysroot (macOS `SdkId` or Linux host sysroot
-/// content SHA-256, never its folder), which a native run's key holds; `None` when the command
-/// has none, and then a native run fails naming why ([`run`]).
+/// content SHA-256, never its folder), selected strictly by `host_sysroot(crate::graph::TRIPLE)`
+/// so keying matches `open_shared` even if `SDKROOT` is set on a Linux host (Rule 21); `None`
+/// when the command has none, and then a native run fails naming why ([`run`]).
 pub(crate) fn sdk_identity(env: &FetchEnv<'_>) -> Option<NativeSysrootId> {
-    if let Ok(sdk) = env.sdk {
-        return Some(NativeSysrootId::Macos(sdk.identity()));
+    sdk_identity_for_host(env, crate::graph::TRIPLE)
+}
+
+fn sdk_identity_for_host(env: &FetchEnv<'_>, host: &str) -> Option<NativeSysrootId> {
+    match blaze_proc_macro::native_setting::host_sysroot(host) {
+        Ok(blaze_build_script::toolchain::Sysroot::MacosSdk) => {
+            env.sdk.ok().map(|sdk| NativeSysrootId::Macos(sdk.identity()))
+        }
+        Ok(blaze_build_script::toolchain::Sysroot::LinuxHost) => {
+            env.linux_sysroot.ok().flatten().map(|linux| NativeSysrootId::LinuxHost(linux.id))
+        }
+        Ok(blaze_build_script::toolchain::Sysroot::Pinned { .. }) | Err(_) => None,
     }
-    if let Ok(Some(linux)) = env.linux_sysroot {
-        return Some(NativeSysrootId::LinuxHost(linux.id));
-    }
-    None
 }
 
 const MAX_SDK_KEY_LEN: usize = if blaze_apple_sdk::SdkId::KEY_LEN > 32 {

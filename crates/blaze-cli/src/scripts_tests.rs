@@ -206,7 +206,7 @@ fn scripts_linux_native_sysroot_id_moves_key_and_handles_missing_sysroot() {
     use blaze_ids::ContentId;
     use bstd::io::{Io, Limits, SimWorld};
 
-    use super::{NativeSysrootId, RanAs, parts, sdk_identity};
+    use super::{NativeSysrootId, RanAs, parts, sdk_identity_for_host};
     use crate::fetch::FetchEnv;
     use crate::sdk::{LinuxHostSysroot, ResolvedLinuxHost};
 
@@ -240,9 +240,11 @@ fn scripts_linux_native_sysroot_id_moves_key_and_handles_missing_sysroot() {
         lan_peer: crate::fetch::LanPeerConfig::DISABLED,
         heap: blaze_own::testing::heap(),
     };
-    assert_eq!(sdk_identity(&env), None, "cleanly absent Linux sysroot yields None");
+    const LINUX_HOST: &str = "aarch64-unknown-linux-gnu";
+    const MACOS_HOST: &str = "aarch64-apple-darwin";
+    assert_eq!(sdk_identity_for_host(&env, LINUX_HOST), None, "cleanly absent Linux sysroot yields None");
     env.linux_sysroot = Err("broken nix-support/libc-cflags");
-    assert_eq!(sdk_identity(&env), None, "failed Linux sysroot probe yields None");
+    assert_eq!(sdk_identity_for_host(&env, LINUX_HOST), None, "failed Linux sysroot probe yields None");
     env.linux_sysroot = Ok(Some(ResolvedLinuxHost {
         sysroot: LinuxHostSysroot {
             dir: "/nix/store/abc-glibc-dev",
@@ -258,7 +260,34 @@ fn scripts_linux_native_sysroot_id_moves_key_and_handles_missing_sysroot() {
         sdk_version: "1111111111111111111111111111111111111111111111111111111111111111",
         id: [0x11; 32],
     }));
-    assert_eq!(sdk_identity(&env), Some(linux_a), "resolved Linux host sysroot yields NativeSysrootId::LinuxHost");
+    assert_eq!(sdk_identity_for_host(&env, LINUX_HOST), Some(linux_a), "resolved Linux host sysroot yields NativeSysrootId::LinuxHost");
+
+    // Even when `SDKROOT` happens to resolve a valid macOS SDK alongside `linux_sysroot`,
+    // `sdk_identity_for_host` selects strictly by `host_sysroot(host)`: LinuxHost uses
+    // `linux_sysroot` and MacosSdk uses `env.sdk` (matching `open_shared`, Rule 21).
+    let mac_sdk = blaze_apple_sdk::resolve(
+        Some("/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk"),
+        || Err(blaze_apple_sdk::XcrunFailed::NotMacos),
+        |_| Ok(r#"{"Version":"15.0"}"#),
+        |_| Ok(r#"<plist><dict><key>ProductBuildVersion</key><string>24A335</string></dict></plist>"#),
+    )
+    .expect("valid macOS SDK");
+    env.sdk = Ok(mac_sdk);
+    assert_eq!(
+        sdk_identity_for_host(&env, LINUX_HOST),
+        Some(linux_a),
+        "Linux host must key by LinuxHost sysroot even when env.sdk is populated"
+    );
+    assert_eq!(
+        sdk_identity_for_host(&env, MACOS_HOST),
+        Some(NativeSysrootId::Macos(mac_sdk.identity())),
+        "macOS host must key by MacosSdk even when env.linux_sysroot is populated"
+    );
+    assert_eq!(
+        sdk_identity_for_host(&env, "x86_64-unknown-linux-gnu"),
+        None,
+        "unpinned host yields None"
+    );
 }
 
 /// The refusal a native script fails with when the command has no SDK is the resolution's own
