@@ -14,13 +14,18 @@
 //!   tree (by `..` or a link) stops the run with [`ProcLimit::Paths`], naming the path.
 //! - Standard output and error are dropped.
 
-use std::path::{Path, PathBuf};
+use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::{Component, Path, PathBuf}};
 
 use blaze_expand::ProcLimit;
 use blaze_ids::ContentId;
 use blaze_wasi::{Answer, Dirent, Errno, Filestat, Filetype, Open, ROOT_FD, Stop, System};
 
 use crate::package_env::{EnvAnswer, EnvRefused, PackageEnv};
+
+/// WASI preview 1 `RIGHTS_PATH_OPEN` (bit 13).
+const RIGHT_PATH_OPEN: u64 = 1 << 13;
+/// WASI preview 1 `RIGHTS_PATH_FILESTAT_GET` (bit 18).
+const RIGHT_PATH_FILESTAT_GET: u64 = 1 << 18;
 
 /// The virtual folder a fetched package's files are served at, and its `CARGO_MANIFEST_DIR`
 /// (a member's is `/workspace/<dir>`: [`Files::seen`]).
@@ -137,10 +142,16 @@ impl Files {
     /// a member's `Files::Member { workspace, .. }` is (blaze-cli proc_callers.rs `shown`). The OS names it `.`: `canonicalize("")` is
     /// `ENOENT`, which refused every file of every member of a checkout so started, `chdir` into
     /// `/workspace/<dir>` first (the shim's, at each call; MX 2026-11-17).
-    fn real(&self, root: &Path, rel: &str) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    fn real(&self, root: &Path, rel: &Path) -> Result<Option<(PathBuf, PathBuf)>, String> {
         let root = if root.as_os_str().is_empty() { Path::new(".") } else { root };
         let seen = self.seen();
-        let shown = || if rel.is_empty() { seen.mount().to_owned() } else { format!("{}/{rel}", seen.mount()) };
+        let shown = || {
+            if rel.as_os_str().is_empty() {
+                seen.mount().to_owned()
+            } else {
+                format!("{}/{}", seen.mount(), rel.to_string_lossy())
+            }
+        };
         let Ok(real) = std::fs::canonicalize(root.join(rel)) else { return Ok(None) };
         let Ok(top) = std::fs::canonicalize(root) else {
             return Err(format!("opened {}, but the folder {} is served from cannot be resolved", shown(), seen.mount()));
@@ -191,22 +202,25 @@ impl Files {
         out
     }
 
-    fn find(&self, rel: &str, follow: bool) -> Result<Option<Found>, String> {
+    fn find(&self, rel: &Path, follow: bool) -> Result<Option<Found>, String> {
         match self {
             Files::Folder(root) | Files::Member { workspace: root, .. } => {
                 if follow {
                     return Ok(self.real(root, rel)?.and_then(|(real, _)| stat_of(&real, true)));
                 }
-                if rel.is_empty() {
+                if rel.as_os_str().is_empty() {
                     return Ok(self.real(root, rel)?.map(|_| Found::Folder));
                 }
-                let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
-                if matches!(name, "" | "." | "..") {
+                if rel.is_absolute() {
                     return Ok(self.real(root, rel)?.and_then(|(real, _)| stat_of(&real, true)));
                 }
+                let (Some(parent), Some(name)) = (rel.parent(), rel.file_name()) else {
+                    return Ok(self.real(root, rel)?.and_then(|(real, _)| stat_of(&real, true)));
+                };
                 Ok(self.real(root, parent)?.and_then(|(parent_real, _)| stat_of(&parent_real.join(name), false)))
             }
             Files::Listed(files) => {
+                let Some(rel) = rel.to_str() else { return Ok(None) };
                 if let Some((path, commit)) = self.submodule_covering(rel) {
                     let hex = Self::submodule_hex(&commit);
                     return Err(format!("`{rel}` is inside unpopulated git submodule `{path}` at commit {}", core::str::from_utf8(&hex).unwrap_or("")));
@@ -220,10 +234,11 @@ impl Files {
     }
 
     /// The bytes of the file `rel`; `None` when absent.
-    fn bytes(&self, rel: &str) -> Result<Option<Vec<u8>>, String> {
+    fn bytes(&self, rel: &Path) -> Result<Option<Vec<u8>>, String> {
         match self {
             Files::Folder(root) | Files::Member { workspace: root, .. } => Ok(self.real(root, rel)?.and_then(|(real, _)| std::fs::read(real).ok())),
             Files::Listed(files) => {
+                let Some(rel) = rel.to_str() else { return Ok(None) };
                 if let Some((path, commit)) = self.submodule_covering(rel) {
                     let hex = Self::submodule_hex(&commit);
                     return Err(format!("`{rel}` is inside unpopulated git submodule `{path}` at commit {}", core::str::from_utf8(&hex).unwrap_or("")));
@@ -234,13 +249,14 @@ impl Files {
     }
 
     /// The canonical in-tree path and entries of the folder `rel`, sorted by name.
-    fn listing(&self, rel: &str) -> Result<(PathBuf, Vec<(Vec<u8>, Filetype)>), String> {
+    fn listing(&self, rel: &Path) -> Result<(PathBuf, Vec<(Vec<u8>, Filetype)>), String> {
         match self {
             Files::Folder(root) | Files::Member { workspace: root, .. } => Ok(match self.real(root, rel)? {
                 Some((real, top)) => (real.strip_prefix(&top).map(Path::to_path_buf).unwrap_or_default(), listing(&real)),
                 None => Default::default(),
             }),
             Files::Listed(files) => {
+                let Some(rel) = rel.to_str() else { return Ok(Default::default()) };
                 if let Some((path, commit)) = self.submodule_covering(rel) {
                     let hex = Self::submodule_hex(&commit);
                     return Err(format!("`{rel}` is inside unpopulated git submodule `{path}` at commit {}", core::str::from_utf8(&hex).unwrap_or("")));
@@ -297,8 +313,11 @@ struct Opened {
     /// Its whole bytes, read when opened.
     bytes: Vec<u8>,
     pos: u64,
-    /// A folder's normalized path from the served tree's root (`""` for the root) and its sorted entries.
-    dir: Option<(String, Vec<(Vec<u8>, Filetype)>)>,
+    /// WASI base and inheriting rights granted when this descriptor was opened.
+    rights_base: u64,
+    rights_inheriting: u64,
+    /// A folder's canonical in-tree path (`""` for the root) and its sorted entries.
+    dir: Option<(PathBuf, Vec<(Vec<u8>, Filetype)>)>,
 }
 
 /// One run's sandbox.
@@ -383,33 +402,55 @@ pub fn call_file_digest(shown: &str) -> ContentId {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct UnknownSubject(pub String);
 
+fn decode_hex_path(hex: &str) -> Option<PathBuf> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = [0u8; 0].to_vec();
+    for i in (0..hex.len()).step_by(2) {
+        bytes.push(u8::from_str_radix(hex.get(i..i + 2)?, 16).ok()?);
+    }
+    Some(PathBuf::from(OsStr::from_bytes(&bytes)))
+}
+
 /// What the read `subject` (as a [`Read`] names it) is answered by now, in `package`: the
 /// same answer a run would record. `None`: absent.
 pub fn answer_now(package: &Package, subject: &str) -> Result<Option<ContentId>, UnknownSubject> {
     let unknown = || UnknownSubject(subject.to_owned());
-    let (kind, rest) = subject.split_once(':').ok_or_else(unknown)?;
+    let (raw_kind, rest) = subject.split_once(':').ok_or_else(unknown)?;
     let files = &package.files;
+    if raw_kind == "env" {
+        return Ok(if let Some(row) = package.row_var(rest) {
+            Some(digest(row.as_bytes()))
+        } else {
+            match package.env.get(rest) {
+                EnvAnswer::Set(value) => Some(digest(value.as_bytes())),
+                EnvAnswer::Unset => None,
+                EnvAnswer::Unknown => return Err(unknown()),
+            }
+        });
+    }
+    let (kind, decoded);
+    let path = if let Some(base) = raw_kind.strip_suffix("-hex") {
+        kind = base;
+        decoded = decode_hex_path(rest).ok_or_else(unknown)?;
+        decoded.as_path()
+    } else {
+        kind = raw_kind;
+        Path::new(rest)
+    };
     // A link out of the package now answers as absent: the run that reads it is refused.
     Ok(match kind {
-        // Set: the value's digest (`""` is a value); unset: absent. Unknown now: no answer, so
-        // a kept answer that read the name is not taken here, and the run that reads it again
-        // is refused by name.
-        "env" if let Some(row) = package.row_var(rest) => Some(digest(row.as_bytes())),
-        "env" => match package.env.get(rest) {
-            EnvAnswer::Set(value) => Some(digest(value.as_bytes())),
-            EnvAnswer::Unset => None,
-            EnvAnswer::Unknown => return Err(unknown()),
-        },
-        "file" => files.bytes(rest).map_err(UnknownSubject)?.map(|bytes| digest(&bytes)),
-        "dir" => match files.find(rest, true).map_err(UnknownSubject)? {
+        "file" => files.bytes(path).map_err(UnknownSubject)?.map(|bytes| digest(&bytes)),
+        "dir" => match files.find(path, true).map_err(UnknownSubject)? {
             Some(Found::Folder) => {
-                let (canon, entries) = files.listing(rest).map_err(UnknownSubject)?;
+                let (canon, entries) = files.listing(path).map_err(UnknownSubject)?;
                 Some(listing_digest(&canon, &entries))
             }
             _ => None,
         },
-        "stat" | "lstat" if rest.is_empty() => Some(stat_digest(Filetype::Directory, 0)),
-        "stat" | "lstat" => match files.find(rest, kind == "stat").map_err(UnknownSubject)? {
+        "stat" | "lstat" if path.as_os_str().is_empty() => Some(stat_digest(Filetype::Directory, 0)),
+        "stat" | "lstat" => match files.find(path, kind == "stat").map_err(UnknownSubject)? {
             Some(Found::Folder) => Some(stat_digest(Filetype::Directory, 0)),
             Some(Found::File(size)) => Some(stat_digest(Filetype::RegularFile, size)),
             Some(Found::Link) => Some(stat_digest(Filetype::SymbolicLink, 0)),
@@ -431,6 +472,20 @@ impl Sandbox {
     fn record(&mut self, subject: String, digest: Option<ContentId>) {
         if !self.reads.iter().any(|it| it.subject == subject) {
             self.reads.push(Read { subject, digest });
+        }
+    }
+
+    /// Formats a path read subject (`kind:rel`, or `kind-hex:<hex>` when `rel` is not UTF-8).
+    fn subject(kind: &str, rel: &Path) -> String {
+        match rel.to_str() {
+            Some(s) => format!("{kind}:{s}"),
+            None => {
+                let mut out = format!("{kind}-hex:");
+                for &b in rel.as_os_str().as_encoded_bytes() {
+                    let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{b:02x}"));
+                }
+                out
+            }
         }
     }
 
@@ -458,11 +513,11 @@ impl Sandbox {
 
     /// A `track_path` of the macro: the file's digest, recorded like an open.
     pub fn track_path(&mut self, path: &str) -> Result<(), Stop> {
-        let Ok(rel) = self.resolve_at(ROOT_FD, path.trim_start_matches('/').as_bytes())? else {
+        let Ok((rel, _)) = self.resolve_at(ROOT_FD, path.trim_start_matches('/').as_bytes(), RIGHT_PATH_OPEN, None)? else {
             return Ok(());
         };
         let bytes = self.package.files.bytes(&rel).map_err(|why| self.refuse(why))?;
-        self.record(format!("file:{rel}"), bytes.as_deref().map(digest));
+        self.record(Self::subject("file", &rel), bytes.as_deref().map(digest));
         Ok(())
     }
 
@@ -473,66 +528,94 @@ impl Sandbox {
     }
 
     /// `path`, named from the directory descriptor `at` (`ROOT_FD` for `/`, or an open folder's
-    /// descriptor), as a path from the served tree's root: `..` and `.` taken out; a path that
-    /// leaves the tree, climbs above `/`, or passes an absolute path to a non-root descriptor is
-    /// refused, naming it.
-    fn resolve_at(&mut self, at: u32, path: &[u8]) -> Answer<String> {
+    /// descriptor), as a path from the served tree's root together with `at`'s inheriting rights:
+    /// `..` and `.` taken out; verifies `at` holds `required_right` (and, when `child_rights` is
+    /// given, that requested base/inheriting rights do not exceed `at`'s inheriting rights); a path
+    /// that leaves the tree, climbs above `/`, or passes an absolute path to a non-root descriptor
+    /// is refused, naming it.
+    fn resolve_at(&mut self, at: u32, path: &[u8], required_right: u64, child_rights: Option<(u64, u64)>) -> Answer<(PathBuf, u64)> {
         let mount = self.package.files.seen().mount();
-        let dir = if at == ROOT_FD {
-            None
+        let mount_name = OsStr::new(mount.trim_start_matches('/'));
+        let mut parts: Vec<&OsStr> = Vec::new();
+        let parent_inheriting = if at == ROOT_FD {
+            let Ok(text) = std::str::from_utf8(path) else {
+                return Err(self.refuse(format!("named the path {:?}, which is not UTF-8", String::from_utf8_lossy(path))));
+            };
+            for part in text.split('/') {
+                match part {
+                    "" | "." => {}
+                    ".." => {
+                        if parts.pop().is_none() {
+                            return Err(self.refuse(format!("named {text:?}, which leaves the root")));
+                        }
+                    }
+                    part => parts.push(OsStr::new(part)),
+                }
+            }
+            if parts.first().copied() != Some(mount_name) {
+                let slash = if text.starts_with('/') { "" } else { "/" };
+                return Err(self.refuse(format!("named {slash}{text}, outside {mount}, the tree the macro is served, the only one it may read")));
+            }
+            u64::MAX
         } else {
             let slot = at.checked_sub(ROOT_FD + 1).and_then(|i| usize::try_from(i).ok());
-            match slot.and_then(|i| self.files.get(i)).and_then(Option::as_ref) {
-                Some(Opened { dir: Some((folder, _)), .. }) => Some(folder.as_str()),
+            let (folder, rights_base, rights_inheriting) = match slot.and_then(|i| self.files.get(i)).and_then(Option::as_ref) {
+                Some(Opened { rights_base, rights_inheriting, dir: Some((folder, _)), .. }) => (folder.as_path(), *rights_base, *rights_inheriting),
                 Some(_) => return Ok(Err(Errno::NOTDIR)),
                 None => return Ok(Err(Errno::BADF)),
+            };
+            if rights_base & required_right == 0 {
+                return Ok(Err(Errno::NOTCAPABLE));
             }
-        };
-        let Ok(text) = std::str::from_utf8(path) else {
-            return Err(self.refuse(format!("named the path {:?}, which is not UTF-8", String::from_utf8_lossy(path))));
-        };
-        let joined;
-        let text = if let Some(folder) = dir {
-            if text.starts_with('/') {
-                return Err(self.refuse(format!("named absolute path {text} from a directory descriptor, outside {mount}, the tree the macro is served")));
+            if let Some((req_base, req_inheriting)) = child_rights
+                && ((req_base & !rights_inheriting) != 0 || (req_inheriting & !rights_inheriting) != 0)
+            {
+                return Ok(Err(Errno::NOTCAPABLE));
             }
-            if text.is_empty() {
+            if path.starts_with(b"/") {
+                let shown = OsStr::from_bytes(path).to_string_lossy();
+                return Err(self.refuse(format!("named absolute path {shown} from a directory descriptor, outside {mount}, the tree the macro is served")));
+            }
+            if path.is_empty() {
                 return Ok(Err(Errno::NOENT));
             }
-            joined = if folder.is_empty() { format!("{mount}/{text}") } else { format!("{mount}/{folder}/{text}") };
-            joined.as_str()
-        } else {
-            text
-        };
-        let mut parts: Vec<&str> = Vec::new();
-        for part in text.split('/') {
-            match part {
-                "" | "." => {}
-                ".." => {
-                    if parts.pop().is_none() {
-                        return Err(self.refuse(format!("named {text:?}, which leaves the root")));
-                    }
+            parts.push(mount_name);
+            for comp in folder.components() {
+                if let Component::Normal(seg) = comp {
+                    parts.push(seg);
                 }
-                part => parts.push(part),
             }
-        }
-        // The one home of the mount points: `SeenRoot::in_tree` (a member's path is from its
-        // workspace's folder, a dependency's from its package's).
-        let full = format!("/{}", parts.join("/"));
-        let rel = self.package.files.seen().in_tree(&full).map(str::to_owned);
-        match rel {
-            Some(rel) => Ok(Ok(rel)),
-            // From the root `/`: a relative path the module asked (wasi-libc's, from its cwd) is
-            // shown absolute, one written absolute as it was.
-            None => {
-                let slash = if text.starts_with('/') { "" } else { "/" };
-                Err(self.refuse(format!("named {slash}{text}, outside {mount}, the tree the macro is served, the only one it may read")))
+            for part in path.split(|&b| b == b'/') {
+                match part {
+                    b"" | b"." => {}
+                    b".." => {
+                        if parts.pop().is_none() {
+                            let shown_dir = folder.to_string_lossy();
+                            let shown_path = OsStr::from_bytes(path).to_string_lossy();
+                            let full = if shown_dir.is_empty() { format!("{mount}/{shown_path}") } else { format!("{mount}/{shown_dir}/{shown_path}") };
+                            return Err(self.refuse(format!("named {full:?}, which leaves the root")));
+                        }
+                    }
+                    part => parts.push(OsStr::from_bytes(part)),
+                }
             }
+            if parts.first().copied() != Some(mount_name) {
+                let shown_dir = folder.to_string_lossy();
+                let shown_path = OsStr::from_bytes(path).to_string_lossy();
+                let full = if shown_dir.is_empty() { format!("{mount}/{shown_path}") } else { format!("{mount}/{shown_dir}/{shown_path}") };
+                return Err(self.refuse(format!("named {full}, outside {mount}, the tree the macro is served, the only one it may read")));
+            }
+            rights_inheriting
+        };
+        let mut rel = PathBuf::new();
+        for seg in parts.iter().skip(1) {
+            rel.push(seg);
         }
+        Ok(Ok((rel, parent_inheriting)))
     }
 
     /// What `rel` is in the package, refused when a link takes it out of the package.
-    fn found(&mut self, rel: &str, follow: bool) -> Result<Option<Found>, Stop> {
+    fn found(&mut self, rel: &Path, follow: bool) -> Result<Option<Found>, Stop> {
         self.package.files.find(rel, follow).map_err(|why| self.refuse(why))
     }
 
@@ -639,40 +722,43 @@ impl System for Sandbox {
     }
 
     fn open(&mut self, at: u32, path: &[u8], how: Open) -> Answer<u32> {
-        let rel = match self.resolve_at(at, path)? {
-            Ok(rel) => rel,
+        let (rel, parent_inheriting) = match self.resolve_at(at, path, RIGHT_PATH_OPEN, Some((how.rights_base, how.rights_inheriting)))? {
+            Ok(resolved) => resolved,
             Err(errno) => return Ok(Err(errno)),
         };
         if how.create() || how.truncate() || how.write() || how.append() {
             return Ok(Err(Errno::ROFS));
         }
-        let Some(found) = self.found(&rel, true)? else {
-            self.record(format!("stat:{rel}"), None);
+        let follow = how.follow() || path.ends_with(b"/");
+        let Some(found) = self.found(&rel, follow)? else {
+            let kind = if follow { "stat" } else { "lstat" };
+            self.record(Self::subject(kind, &rel), None);
             return Ok(Err(Errno::NOENT));
         };
+        let rights_base = how.rights_base & parent_inheriting;
+        let rights_inheriting = how.rights_inheriting & parent_inheriting;
         let opened = match found {
             Found::Folder => {
                 let (canon, entries) = self.package.files.listing(&rel).map_err(|why| self.refuse(why))?;
-                let Some(folder) = canon.to_str() else {
-                    return Err(self.refuse(format!("opened {rel:?}, whose resolved path is not UTF-8")));
-                };
-                self.record(format!("dir:{rel}"), Some(listing_digest(&canon, &entries)));
-                Opened { bytes: Vec::new(), pos: 0, dir: Some((folder.to_owned(), entries)) }
+                self.record(Self::subject("dir", &rel), Some(listing_digest(&canon, &entries)));
+                Opened { bytes: Vec::new(), pos: 0, rights_base, rights_inheriting, dir: Some((canon, entries)) }
             }
             Found::File(size) => {
                 if how.directory() {
-                    self.record(format!("stat:{rel}"), Some(stat_digest(Filetype::RegularFile, size)));
+                    let kind = if follow { "stat" } else { "lstat" };
+                    self.record(Self::subject(kind, &rel), Some(stat_digest(Filetype::RegularFile, size)));
                     return Ok(Err(Errno::NOTDIR));
                 }
                 let Some(bytes) = self.package.files.bytes(&rel).map_err(|why| self.refuse(why))? else {
-                    self.record(format!("stat:{rel}"), None);
+                    let kind = if follow { "stat" } else { "lstat" };
+                    self.record(Self::subject(kind, &rel), None);
                     return Ok(Err(Errno::IO));
                 };
-                self.record(format!("file:{rel}"), Some(digest(&bytes)));
-                Opened { bytes, pos: 0, dir: None }
+                self.record(Self::subject("file", &rel), Some(digest(&bytes)));
+                Opened { bytes, pos: 0, rights_base, rights_inheriting, dir: None }
             }
             Found::Link => {
-                self.record(format!("lstat:{rel}"), Some(stat_digest(Filetype::SymbolicLink, 0)));
+                self.record(Self::subject("lstat", &rel), Some(stat_digest(Filetype::SymbolicLink, 0)));
                 return Ok(Err(Errno::LOOP));
             }
         };
@@ -688,13 +774,14 @@ impl System for Sandbox {
     }
 
     fn path_stat(&mut self, at: u32, path: &[u8], follow: bool) -> Answer<Filestat> {
-        let rel = match self.resolve_at(at, path)? {
-            Ok(rel) => rel,
+        let (rel, _) = match self.resolve_at(at, path, RIGHT_PATH_FILESTAT_GET, None)? {
+            Ok(resolved) => resolved,
             Err(errno) => return Ok(Err(errno)),
         };
-        if rel.is_empty() {
+        if rel.as_os_str().is_empty() {
             return Ok(Ok(filestat(Filetype::Directory, 0)));
         }
+        let follow = follow || path.ends_with(b"/");
         let found = match self.found(&rel, follow)? {
             Some(Found::Folder) => Some((Filetype::Directory, 0)),
             Some(Found::File(size)) => Some((Filetype::RegularFile, size)),
@@ -702,7 +789,7 @@ impl System for Sandbox {
             None => None,
         };
         let kind = if follow { "stat" } else { "lstat" };
-        self.record(format!("{kind}:{rel}"), found.map(|(filetype, size)| stat_digest(filetype, size)));
+        self.record(Self::subject(kind, &rel), found.map(|(filetype, size)| stat_digest(filetype, size)));
         Ok(match found {
             Some((filetype, size)) => Ok(filestat(filetype, size)),
             None => Err(Errno::NOENT),
@@ -751,12 +838,21 @@ mod seen_tests {
         let dependency = Package::new(Files::Listed(Arc::from(Vec::new())), PackageEnv::default()).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(dependency.cwd(), "/package");
         let mut sandbox = Sandbox::new(Arc::new(member));
-        assert_eq!(sandbox.resolve_at(blaze_wasi::ROOT_FD, b"/workspace/crates/m/Cargo.toml").ok().and_then(Result::ok).as_deref(), Some("crates/m/Cargo.toml"));
-        assert_eq!(sandbox.resolve_at(blaze_wasi::ROOT_FD, b"workspace/Cargo.toml").ok().and_then(Result::ok).as_deref(), Some("Cargo.toml"));
-        assert!(sandbox.resolve_at(blaze_wasi::ROOT_FD, b"/package/Cargo.toml").is_err(), "a member's macro is not served /package");
+        assert_eq!(
+            sandbox.resolve_at(blaze_wasi::ROOT_FD, b"/workspace/crates/m/Cargo.toml", super::RIGHT_PATH_OPEN, None).ok().and_then(Result::ok).map(|(p, _)| p),
+            Some(PathBuf::from("crates/m/Cargo.toml"))
+        );
+        assert_eq!(
+            sandbox.resolve_at(blaze_wasi::ROOT_FD, b"workspace/Cargo.toml", super::RIGHT_PATH_OPEN, None).ok().and_then(Result::ok).map(|(p, _)| p),
+            Some(PathBuf::from("Cargo.toml"))
+        );
+        assert!(sandbox.resolve_at(blaze_wasi::ROOT_FD, b"/package/Cargo.toml", super::RIGHT_PATH_OPEN, None).is_err(), "a member's macro is not served /package");
         let mut dep = Sandbox::new(Arc::new(dependency));
-        assert_eq!(dep.resolve_at(blaze_wasi::ROOT_FD, b"/package/src/lib.rs").ok().and_then(Result::ok).as_deref(), Some("src/lib.rs"));
-        assert!(dep.resolve_at(blaze_wasi::ROOT_FD, b"/workspace/x").is_err());
+        assert_eq!(
+            dep.resolve_at(blaze_wasi::ROOT_FD, b"/package/src/lib.rs", super::RIGHT_PATH_OPEN, None).ok().and_then(Result::ok).map(|(p, _)| p),
+            Some(PathBuf::from("src/lib.rs"))
+        );
+        assert!(dep.resolve_at(blaze_wasi::ROOT_FD, b"/workspace/x", super::RIGHT_PATH_OPEN, None).is_err());
 
         // Package-local submodules in `Files::Listed` appear as directories in parent listings
         // and fail closed on find/bytes/listing.
@@ -765,14 +861,15 @@ mod seen_tests {
             (String::from("Cargo.toml"), super::ListedBytes::Static(b"[package]\n")),
             (String::from("v8"), super::ListedBytes::Submodule(oid)),
         ]));
-        assert!(with_sub.bytes("Cargo.toml").expect("manifest").is_some());
-        let (_, root_list) = with_sub.listing("").expect("root listing");
+        assert!(with_sub.bytes(std::path::Path::new("Cargo.toml")).expect("manifest").is_some());
+        let (_, root_list) = with_sub.listing(std::path::Path::new("")).expect("root listing");
         assert!(root_list.iter().any(|(name, ft)| name.as_slice() == b"v8" && *ft == blaze_wasi::Filetype::Directory));
         for bad in ["v8", "v8/include/v8.h"] {
-            assert!(with_sub.find(bad, true).is_err(), "{bad} find must fail closed");
-            assert!(with_sub.find(bad, false).is_err(), "{bad} lstat find must fail closed");
-            assert!(with_sub.bytes(bad).is_err(), "{bad} bytes must fail closed");
-            assert!(with_sub.listing(bad).is_err(), "{bad} listing must fail closed");
+            let bad_p = std::path::Path::new(bad);
+            assert!(with_sub.find(bad_p, true).is_err(), "{bad} find must fail closed");
+            assert!(with_sub.find(bad_p, false).is_err(), "{bad} lstat find must fail closed");
+            assert!(with_sub.bytes(bad_p).is_err(), "{bad} bytes must fail closed");
+            assert!(with_sub.listing(bad_p).is_err(), "{bad} listing must fail closed");
         }
         let sub_pkg = Package::new(with_sub, PackageEnv::default()).unwrap_or_else(|e| panic!("{e}"));
         assert!(super::answer_now(&sub_pkg, "file:v8/include/v8.h").is_err(), "answer_now file must propagate submodule refusal");
@@ -840,11 +937,19 @@ mod dir_fd_tests {
     use blaze_expand::ProcLimit;
     use blaze_wasi::{Errno, Filetype, Open, ROOT_FD, System};
 
-    use super::{Files, ListedBytes, Package, Sandbox, answer_now};
+    use super::{Files, ListedBytes, Package, RIGHT_PATH_FILESTAT_GET, RIGHT_PATH_OPEN, Sandbox, answer_now};
     use crate::package_env::PackageEnv;
     use crate::script_sandbox::ScriptRoot;
 
-    const READ_ONLY: Open = Open { dirflags: 1, oflags: 0, rights_base: 1 << 1, rights_inheriting: 0, fdflags: 0 };
+    const RIGHT_FD_READ: u64 = 1 << 1;
+    const RIGHT_FD_READDIR: u64 = 1 << 14;
+    const READ_ONLY: Open = Open {
+        dirflags: 1,
+        oflags: 0,
+        rights_base: RIGHT_FD_READ | RIGHT_PATH_OPEN | RIGHT_FD_READDIR | RIGHT_PATH_FILESTAT_GET,
+        rights_inheriting: u64::MAX,
+        fdflags: 0,
+    };
     const WRITE_ONLY: Open = Open { dirflags: 1, oflags: 1, rights_base: 1 << 6, rights_inheriting: 0, fdflags: 0 };
 
     fn read_all(sandbox: &mut Sandbox, fd: u32) -> Vec<u8> {
@@ -1344,5 +1449,148 @@ mod dir_fd_tests {
 
         // Security control: crafted `lstat:..` directly into `answer_now` cannot escape `top`.
         assert!(answer_now(&pkg, "lstat:..").is_err(), "crafted `lstat:..` must fail closed");
+    }
+
+    /// Codex Round 2 P2 #1 (`O_NOFOLLOW`): opening a symlink via a dir fd with `how.follow() == false`
+    /// returns `Errno::LOOP` and records a type-sensitive `lstat:` read, while `how.follow() == true`
+    /// reads the target.
+    #[cfg(unix)]
+    #[test]
+    fn open_honors_o_nofollow_on_symlinks_via_dir_fd() {
+        use std::os::unix::fs::symlink;
+
+        let tree = make_workspace("o_nofollow");
+        let parts = tree.ws.join("crates/m/parts");
+        symlink("sub", parts.join("dir_link")).expect("dir symlink");
+        symlink("does_not_exist", parts.join("dangling")).expect("dangling symlink");
+
+        let (pkg, mut sandbox) = member_sandbox(&tree);
+        let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
+
+        let nofollow = Open { dirflags: 0, ..READ_ONLY };
+        // Regular file with O_NOFOLLOW still opens cleanly.
+        let reg_fd = sandbox.open(dir_fd, b"a.rs", nofollow).expect("not stopped").expect("regular file opens with O_NOFOLLOW");
+        assert_eq!(read_all(&mut sandbox, reg_fd), b"pub fn a() {}\n");
+
+        // File symlink, directory symlink, and dangling symlink with O_NOFOLLOW all return ELOOP.
+        assert_eq!(sandbox.open(dir_fd, b"inside_link", nofollow).expect("not stopped"), Err(Errno::LOOP));
+        assert_eq!(sandbox.open(dir_fd, b"dir_link", nofollow).expect("not stopped"), Err(Errno::LOOP));
+        assert_eq!(sandbox.open(dir_fd, b"dangling", nofollow).expect("not stopped"), Err(Errno::LOOP));
+
+        // Out-of-tree symlink with O_NOFOLLOW also returns ELOOP without dereferencing the target.
+        assert_eq!(sandbox.open(dir_fd, b"escape", nofollow).expect("not stopped"), Err(Errno::LOOP));
+
+        // Same in-tree symlink with follow=true succeeds and reads the target.
+        let followed_fd = sandbox.open(dir_fd, b"inside_link", READ_ONLY).expect("not stopped").expect("followed symlink");
+        assert_eq!(read_all(&mut sandbox, followed_fd), b"pub fn b() {}\n");
+
+        // Verify type-sensitive `lstat:` reads were recorded and match `answer_now`.
+        for expected in ["lstat:crates/m/parts/inside_link", "lstat:crates/m/parts/dir_link", "lstat:crates/m/parts/dangling"] {
+            let read = sandbox.reads.iter().find(|r| r.subject == expected).unwrap_or_else(|| panic!("missing {expected}"));
+            assert_eq!(answer_now(&pkg, &read.subject), Ok(read.digest), "parity for {expected}");
+        }
+    }
+
+    /// Codex Round 2 P2 #2 (non-UTF-8 canonical directory target): a UTF-8 symlink pointing to
+    /// an in-tree directory whose real name contains non-UTF-8 bytes opens, lists via `fd_readdir`,
+    /// resolves children and `..` siblings relative to that dir fd, records hex-encoded subjects
+    /// with full `answer_now` parity, and still blocks escapes past `/workspace`.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_non_utf8_dir_opens_lists_and_reads_children_via_dir_fd() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let tree = make_workspace("non_utf8_dir");
+        let m = tree.ws.join("crates/m");
+        let non_utf8_parent = m.join(OsStr::from_bytes(b"real_\xff"));
+        let non_utf8_sub = non_utf8_parent.join("sub");
+        std::fs::create_dir_all(&non_utf8_sub).expect("non-utf8 dir");
+        std::fs::write(non_utf8_sub.join("child.txt"), b"from-non-utf8-child").expect("child");
+        std::fs::write(non_utf8_parent.join("sibling.txt"), b"from-non-utf8-sibling").expect("sibling");
+        symlink(OsStr::from_bytes(b"real_\xff/sub"), m.join("utf8_alias")).expect("utf8 symlink to non-utf8 dir");
+
+        let (pkg, mut sandbox) = member_sandbox(&tree);
+        let alias_fd = sandbox
+            .open(ROOT_FD, b"/workspace/crates/m/utf8_alias", READ_ONLY)
+            .expect("not stopped")
+            .expect("utf8 alias to non-utf8 dir opens");
+
+        let entries = collect_dir_entries(&mut sandbox, alias_fd);
+        assert_eq!(entries, vec![(b"child.txt".to_vec(), Filetype::RegularFile)]);
+
+        let child_fd = sandbox.open(alias_fd, b"child.txt", READ_ONLY).expect("not stopped").expect("child opens");
+        assert_eq!(read_all(&mut sandbox, child_fd), b"from-non-utf8-child");
+
+        let sib_fd = sandbox.open(alias_fd, b"../sibling.txt", READ_ONLY).expect("not stopped").expect("sibling opens");
+        assert_eq!(read_all(&mut sandbox, sib_fd), b"from-non-utf8-sibling");
+
+        // All recorded reads (including `-hex:` subjects for non-UTF-8 paths) match `answer_now`.
+        assert!(sandbox.reads.iter().any(|r| r.subject.starts_with("file-hex:")), "expected hex subject in {:?}", sandbox.reads);
+        for read in &sandbox.reads {
+            assert_eq!(answer_now(&pkg, &read.subject), Ok(read.digest), "parity for {}", read.subject);
+        }
+
+        // Security control: climbing past `/workspace` from the non-UTF-8 canonical dir is still refused.
+        let Err(stop) = sandbox.open(alias_fd, b"../../../../../outside/secret.txt", READ_ONLY) else {
+            panic!("escape past /workspace via non-utf8 dir fd must be refused");
+        };
+        assert!(stop.0.contains("outside /workspace"), "{}", stop.0);
+        assert!(matches!(sandbox.refused, Some((ProcLimit::Paths, _))));
+    }
+
+    /// Codex Round 2 P2 #3 (WASI descriptor rights): opening a directory with restricted
+    /// `rights_base` or `rights_inheriting` retains those limits and returns `Errno::NOTCAPABLE`
+    /// when child `open` or `path_stat` exceeds them, while full read-only dir rights succeed.
+    #[test]
+    fn dir_fd_enforces_base_and_inheriting_wasi_rights() {
+        let tree = make_workspace("rights");
+        let (_pkg, mut sandbox) = member_sandbox(&tree);
+
+        // 1. Directory opened with only `FD_READDIR` (no `PATH_OPEN`, no `PATH_FILESTAT_GET`):
+        //    `dir_entry` works, but child `open` and `path_stat` both fail with `ENOTCAPABLE`.
+        let list_only = Open { dirflags: 1, oflags: 0, rights_base: RIGHT_FD_READDIR, rights_inheriting: u64::MAX, fdflags: 0 };
+        let list_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", list_only).expect("not stopped").expect("list_only dir");
+        assert!(!collect_dir_entries(&mut sandbox, list_fd).is_empty());
+        assert_eq!(sandbox.open(list_fd, b"a.rs", READ_ONLY).expect("not stopped"), Err(Errno::NOTCAPABLE));
+        assert_eq!(sandbox.path_stat(list_fd, b"a.rs", true).expect("not stopped"), Err(Errno::NOTCAPABLE));
+
+        // 2. Directory opened with `PATH_OPEN | PATH_FILESTAT_GET` but `rights_inheriting = 0`:
+        //    `path_stat` works, but child `open` requesting `RIGHT_FD_READ` fails with `ENOTCAPABLE`.
+        let no_inherit = Open {
+            dirflags: 1,
+            oflags: 0,
+            rights_base: RIGHT_PATH_OPEN | RIGHT_PATH_FILESTAT_GET,
+            rights_inheriting: 0,
+            fdflags: 0,
+        };
+        let no_inherit_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", no_inherit).expect("not stopped").expect("no_inherit dir");
+        assert_eq!(sandbox.path_stat(no_inherit_fd, b"a.rs", true).expect("not stopped").expect("stat ok").filetype, Filetype::RegularFile);
+        let read_file = Open { dirflags: 1, oflags: 0, rights_base: RIGHT_FD_READ, rights_inheriting: 0, fdflags: 0 };
+        assert_eq!(sandbox.open(no_inherit_fd, b"a.rs", read_file).expect("not stopped"), Err(Errno::NOTCAPABLE));
+
+        // 3. Directory opened with `rights_inheriting = RIGHT_PATH_FILESTAT_GET` only:
+        //    opening nested `sub` with `RIGHT_PATH_OPEN` fails (`ENOTCAPABLE`), opening `sub`
+        //    with `RIGHT_PATH_FILESTAT_GET` succeeds, and `sub` can `path_stat` but not `open`.
+        let stat_inherit = Open {
+            dirflags: 1,
+            oflags: 0,
+            rights_base: RIGHT_PATH_OPEN | RIGHT_PATH_FILESTAT_GET,
+            rights_inheriting: RIGHT_PATH_FILESTAT_GET,
+            fdflags: 0,
+        };
+        let parent_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", stat_inherit).expect("not stopped").expect("stat_inherit dir");
+        assert_eq!(sandbox.open(parent_fd, b"sub", READ_ONLY).expect("not stopped"), Err(Errno::NOTCAPABLE));
+        let stat_only_child = Open { dirflags: 1, oflags: 0, rights_base: RIGHT_PATH_FILESTAT_GET, rights_inheriting: RIGHT_PATH_FILESTAT_GET, fdflags: 0 };
+        let sub_fd = sandbox.open(parent_fd, b"sub", stat_only_child).expect("not stopped").expect("sub opens with stat right");
+        assert_eq!(sandbox.path_stat(sub_fd, b"b.rs", true).expect("not stopped").expect("b.rs stat").filetype, Filetype::RegularFile);
+        assert_eq!(sandbox.open(sub_fd, b"b.rs", read_file).expect("not stopped"), Err(Errno::NOTCAPABLE));
+
+        // 4. Positive: full read-only dir rights succeed across nested opens and stats.
+        let full_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("full dir");
+        let a_fd = sandbox.open(full_fd, b"a.rs", READ_ONLY).expect("not stopped").expect("a.rs opens");
+        assert_eq!(read_all(&mut sandbox, a_fd), b"pub fn a() {}\n");
+        assert!(sandbox.refused.is_none());
     }
 }
