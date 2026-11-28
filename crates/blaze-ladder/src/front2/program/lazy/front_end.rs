@@ -72,6 +72,11 @@ impl<'n> ExportBindings<'n> {
         }
     }
 
+    pub(super) fn clear_cache(&mut self) {
+        self.linked = None;
+        self.resolved.clear();
+    }
+
     fn read<S: NamesSource<'n>>(&mut self, owner: Option<ItemKey>, names: S) -> Result<(), Front2Refusal> {
         if self.reads.is_empty() {
             for krate in 0..names.crate_count() {
@@ -208,7 +213,15 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                 bindings.linked.insert(crates).as_slice()
             }
         };
-        let target = export_shim::bound_in(names, &self.front.keys, linked, &decl, alloc).map_err(refused)?;
+        let target = export_shim::bound_in(
+            names,
+            &self.front.keys,
+            linked,
+            self.export_override_crates.as_slice(),
+            &decl,
+            alloc,
+        )
+        .map_err(refused)?;
         bindings.resolved.insert(item, target);
         Ok(target)
     }

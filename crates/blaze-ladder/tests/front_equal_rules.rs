@@ -1287,3 +1287,150 @@ pub unsafe extern "C" fn matched_rt(x: i32) -> i32 { x + 50 }
         assert!(records.errors().is_empty(), "record reads: {:?}", records.errors());
     });
 }
+
+#[test]
+fn export_override_crates_take_precedence_and_preserve_duplicate_refusals() {
+    on_checker_stack(|| {
+        let app_src: &'static str = r#"#![feature(no_core)]
+#![no_core]
+unsafe extern "C" {
+    fn rt_getenv() -> i32;
+    fn rt_other() -> i32;
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    unsafe { rt_getenv() + rt_other() }
+}
+"#;
+        let base_rt_src: &'static str = r#"#![feature(no_core)]
+#![no_core]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_getenv() -> i32 { 1 }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_other() -> i32 { 2 }
+"#;
+        let shim_a_src: &'static str = r#"#![feature(no_core)]
+#![no_core]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_getenv() -> i32 { 10 }
+"#;
+        let shim_b_src: &'static str = r#"#![feature(no_core)]
+#![no_core]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_getenv() -> i32 { 20 }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_other() -> i32 { 30 }
+"#;
+        let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+        let a = blaze_own::testing::heap().alloc();
+        let files = [SourceFile { path: ROOT, text: app_src }];
+        let tc = Toolchain::none(a);
+        let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: OverflowChecks::Off };
+        let texts = ProgramTexts::new(&files, ROOT, new, &tc, Panic::Unwind).expect("fixture texts");
+        let user = texts.user();
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let app = inputs.crates()[0];
+        let lib_implicit = blaze_unit_graph::implicit(user.edition, &blaze_unit_graph::UnitKind::Lib);
+        let crates = [
+            // Crate 0 depends only on base_rt (crate 1), NOT on shim_a (crate 2) or shim_b (crate 3).
+            CrateInput { deps: &[("base_rt", 1)], ..app },
+            CrateInput {
+                name: "base_rt",
+                key: CrateItemKey(ContentId::of("override fixture crate", b"base_rt")),
+                implicit: lib_implicit,
+                root: "/base_rt/src/lib.rs",
+                shown_from: "/base_rt",
+                deps: &[],
+                ..app
+            },
+            CrateInput {
+                name: "shim_a",
+                key: CrateItemKey(ContentId::of("override fixture crate", b"shim_a")),
+                implicit: lib_implicit,
+                root: "/shim_a/src/lib.rs",
+                shown_from: "/shim_a",
+                deps: &[],
+                ..app
+            },
+            CrateInput {
+                name: "shim_b",
+                key: CrateItemKey(ContentId::of("override fixture crate", b"shim_b")),
+                implicit: lib_implicit,
+                root: "/shim_b/src/lib.rs",
+                shown_from: "/shim_b",
+                deps: &[],
+                ..app
+            },
+        ];
+        let roots = [
+            (app.root, app_src),
+            (crates[1].root, base_rt_src),
+            (crates[2].root, shim_a_src),
+            (crates[3].root, shim_b_src),
+        ];
+        let names = resolve_crates(&crates, Sysroot::default(), &FixtureFiles(&roots), &Serial, blaze_own::testing::bump()).expect("fixture names");
+        let lib = |krate, name| names.items(krate).map(|(k, _, _)| k).find(|&k| names.name_of(k) == Some(name)).expect("named item");
+        let entry = checker_of(lib(0, "main"));
+        let decl_getenv = checker_of(lib(0, "rt_getenv"));
+        let decl_other = checker_of(lib(0, "rt_other"));
+        let base_other = checker_of(lib(1, "rt_other"));
+        let shim_a_getenv = checker_of(lib(2, "rt_getenv"));
+
+        let log = frame.alloc(Log::new(&["ladder", "base_rt", "shim_a", "shim_b"], a));
+        let kept = keep(&names, &frame, a);
+        let keys = frame.alloc_slice_copy(&[crates[0].key, crates[1].key, crates[2].key, crates[3].key]);
+        let records = frame.alloc(Records::new(keys, kept, log, &frame, a));
+
+        // 1. Positive case: override crate 2 (`shim_a`) wins `rt_getenv` over `base_rt` even though
+        //    `app` does not depend on `shim_a`, while non-overridden `rt_other` still binds to `base_rt`.
+        let mut lazy = LazyProgram::from_records(records, &frame, &[0], Some(entry), a).expect("lazy program");
+        lazy.set_export_override_crates(&[2]);
+        lazy.decide_start(blaze_ladder::run::special::MakerStart::ByRule).expect("exported main");
+        let (li, _) = lazy.check_one(entry).expect("lazy check main").expect("main has a body");
+        let mut ground = PortableTys::new_in(a);
+        assert_eq!(lazy.resolve(li, decl_getenv, List::EMPTY, &mut ground).expect("override getenv"), (shim_a_getenv, List::EMPTY));
+        assert_eq!(lazy.resolve(li, decl_other, List::EMPTY, &mut ground).expect("fallback other"), (base_other, List::EMPTY));
+
+        // 2. Negative control (default `&[]`): when both `base_rt` and `shim_a` are in the linked
+        //    closure without override precedence, duplicate strong `rt_getenv` still fails with DefinedTwice.
+        let mut default_dup = LazyProgram::from_records(records, &frame, &[0, 2], Some(entry), a).expect("default dup lazy");
+        default_dup.decide_start(blaze_ladder::run::special::MakerStart::ByRule).expect("exported main");
+        let err = default_dup.check_one(entry);
+        let Err(RunError::Front2(Front2Refusal::Lazy(blaze_ladder::front2::program::lazy::LazyRefusal::Row { refusal, .. }))) = err else {
+            panic!("default `&[]` must refuse duplicate strong `rt_getenv`, got {err:?}");
+        };
+        let Front2Refusal::Unchecked { first, .. } = *refusal else {
+            panic!("expected Unchecked payload, got {refusal:?}");
+        };
+        assert!(first.contains("rt_getenv") && first.contains("defined twice"), "unexpected refusal: {first}");
+
+        // 3. Negative control (duplicate BOTH inside override crates `&[2, 3]`): still fails with DefinedTwice.
+        let mut ov_dup = LazyProgram::from_records(records, &frame, &[0], Some(entry), a).expect("override dup lazy");
+        ov_dup.set_export_override_crates(&[2, 3]);
+        ov_dup.decide_start(blaze_ladder::run::special::MakerStart::ByRule).expect("exported main");
+        let err = ov_dup.check_one(entry);
+        let Err(RunError::Front2(Front2Refusal::Lazy(blaze_ladder::front2::program::lazy::LazyRefusal::Row { refusal, .. }))) = err else {
+            panic!("duplicate strong `rt_getenv` inside override_crates must refuse, got {err:?}");
+        };
+        let Front2Refusal::Unchecked { first, .. } = *refusal else {
+            panic!("expected Unchecked payload, got {refusal:?}");
+        };
+        assert!(first.contains("rt_getenv") && first.contains("defined twice"), "unexpected refusal: {first}");
+
+        // 4. Negative control (duplicate BOTH inside non-override crates while override crate is set):
+        //    `shim_a` overrides `rt_getenv`, but `rt_other` is defined in both `base_rt` (1) and `shim_b` (3).
+        let mut non_ov_dup = LazyProgram::from_records(records, &frame, &[0, 3], Some(entry), a).expect("non-override dup lazy");
+        non_ov_dup.set_export_override_crates(&[2]);
+        non_ov_dup.decide_start(blaze_ladder::run::special::MakerStart::ByRule).expect("exported main");
+        let err = non_ov_dup.check_one(entry);
+        let Err(RunError::Front2(Front2Refusal::Lazy(blaze_ladder::front2::program::lazy::LazyRefusal::Row { refusal, .. }))) = err else {
+            panic!("duplicate strong `rt_other` in non-override crates must refuse, got {err:?}");
+        };
+        let Front2Refusal::Unchecked { first, .. } = *refusal else {
+            panic!("expected Unchecked payload, got {refusal:?}");
+        };
+        assert!(first.contains("rt_other") && first.contains("defined twice"), "unexpected refusal: {first}");
+
+        assert!(records.errors().is_empty(), "record reads: {:?}", records.errors());
+    });
+}

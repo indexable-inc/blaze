@@ -4288,6 +4288,10 @@ pub struct Maker<'n, G: Grant = Fixture, T: Typing<RecordsProgram<'n>> = SecondC
     /// Cached `compiler_builtins` soft-float routine bindings usable even before `self.made` is
     /// constructed (e.g. warm export LTO runs with 100% `HomeCodeStore` hits).
     routines: core::cell::OnceCell<crate::front2::builtins_shim::Bound>,
+    /// Explicitly injected host runtime shim crate indices (empty by default; `[shim_idx]` for
+    /// self-compiled wasm64 proc-macros) whose strong `#[no_mangle]` / `#[export_name]` exports
+    /// override sysroot defaults in [`RecordsProgram`].
+    export_override_crates: AVec<'static, usize>,
 }
 
 impl<'n> Maker<'n, Fixture, SecondCheck> {
@@ -4423,6 +4427,18 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
             lto_lir_capture: None,
             captured_lir: None,
             routines: core::cell::OnceCell::new(),
+            export_override_crates: AVec::new_in(alloc),
+        }
+    }
+
+    /// Registers host runtime shim crate indices whose strong `#[no_mangle]` / `#[export_name]`
+    /// exports take precedence over non-override crates (e.g. `blaze_wasm64_pm_shim` overriding
+    /// `wasi_rt::rt::env::getenv` in self-compiled wasm64 proc-macros).
+    pub fn set_export_override_crates(&mut self, crates: &[usize]) {
+        self.export_override_crates.clear();
+        self.export_override_crates.extend_from_slice(crates);
+        if let Some((program, _)) = self.made.as_mut() {
+            program.set_export_override_crates(crates);
         }
     }
 
@@ -4894,7 +4910,13 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
     /// item that make is of).
     fn construct(&mut self, tabled: ItemKey) -> Result<(), RunError> {
         if self.made.is_none() {
-            let program = program_of(self.names, self.entry, self.start, self.alloc)?;
+            let program = program_of(
+                self.names,
+                self.entry,
+                self.start,
+                self.export_override_crates.as_slice(),
+                self.alloc,
+            )?;
             self.checks.constructed += 1;
             // A lazy program holds no checked body when made: 0, counted as the claim reads it.
             self.checks.by_construction += (0..program.fn_count()).filter(|&c| program.function(c).body.is_some()).count();
@@ -4911,9 +4933,18 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
 
 /// The lazy program over `names`, its body sources set and its start decided: the one way a
 /// maker's program is made ([`Maker`]'s first make, and the test double [`FromRecord::rechecked`]).
-fn program_of<'n>(names: NamesRecords<'n>, entry: Option<ItemKey>, start: crate::run::special::MakerStart, alloc: Alloc<'static>) -> Result<RecordsProgram<'n>, RunError> {
+fn program_of<'n>(
+    names: NamesRecords<'n>,
+    entry: Option<ItemKey>,
+    start: crate::run::special::MakerStart,
+    export_override_crates: &[usize],
+    alloc: Alloc<'static>,
+) -> Result<RecordsProgram<'n>, RunError> {
     let NamesRecords { records, frame, lang_crates, body_sources } = names;
     let mut program = RecordsProgram::from_records(records, frame, lang_crates, entry, alloc).map_err(RunError::Front2)?;
+    if !export_override_crates.is_empty() {
+        program.set_export_override_crates(export_override_crates);
+    }
     if let Some(sources) = body_sources {
         program.set_body_sources(sources);
     }
@@ -4932,7 +4963,7 @@ impl<'n> FromRecord<RecheckedRecords<'n>> {
     /// a lazy program of its own over `names` (the same records, start and entry as the maker
     /// it serves; [`Maker::new`]'s start rule), handed over as a typed record would hand them.
     pub fn rechecked(names: NamesRecords<'n>, entry: Option<ItemKey>, alloc: Alloc<'static>) -> Result<FromRecord<RecheckedRecords<'n>>, RunError> {
-        let program = program_of(names, entry, crate::run::special::MakerStart::ByRule, alloc)?;
+        let program = program_of(names, entry, crate::run::special::MakerStart::ByRule, &[], alloc)?;
         Ok(FromRecord(crate::front2::program::lazy::typed::Rechecked::new(program, alloc)))
     }
 }

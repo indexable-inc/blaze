@@ -311,12 +311,13 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&blaze_sha256::digest(bytes))
 }
 
-/// Current proc-macro module identity header (`blaze proc-macro module wasm64 10`): target-bearing
+/// Current proc-macro module identity header (`blaze proc-macro module wasm64 11`): target-bearing
 /// so on-demand `wasm64-blaze-wasip1` self-compiled modules never share a write-once key with
-/// `wasm32-wasip1` bootstrap records (`blaze proc-macro module wasm32 7`) or pre-v10 records.
-/// Form 10 enables target-level `getrandom_backend="custom"` for `wasm64-blaze-wasip1` (Rule 21),
-/// invalidating pre-v10 wasm64 modules whose dependency closure may compile differently under it.
-pub const MODULE_HEADER: &str = "blaze proc-macro module wasm64 10";
+/// `wasm32-wasip1` bootstrap records (`blaze proc-macro module wasm32 7`) or pre-v11 records.
+/// Form 11 registers `blaze_wasm64_pm_shim` in `export_override_crates` so `libc::getenv` binds
+/// to `blaze_wasm64_pm_shim::getenv` -> `blaze_proc_macro_64::env_var` (Rule 21), invalidating
+/// stale form-10 wasm64 proc-macro modules whose `std::env::var` calls missed host env vars.
+pub const MODULE_HEADER: &str = "blaze proc-macro module wasm64 11";
 
 /// Folds the resolved `wasm64-blaze-wasip1` dependency closure's unified feature sets (bound to
 /// each package's source pin — registry checksum/source, git commit+URL, or path files digest)
@@ -490,6 +491,10 @@ pub fn identity(id: &CrateId<'_>) -> String {
         // `&[T; N] -> &[T]`), invalidating stale form-8 wasm64 modules (e.g. `snafu-derive`).
         // Form 10 (2026-11-27): `wasm64-blaze-wasip1` target cfg includes `getrandom_backend="custom"`
         // matching `library/wasi_rt/src/rt/random.rs` and `.cargo/config.toml` (Rule 21).
+        // Form 11 (2026-11-28): `wasm64_compile` registers `blaze_wasm64_pm_shim` as an
+        // `export_override_crates` shim so `export_shim` binds `libc::getenv` to
+        // `blaze_wasm64_pm_shim::getenv` (`blaze_proc_macro_64::env_var`) instead of
+        // `wasi_rt::rt::env::getenv`, invalidating stale form-10 wasm64 proc-macro modules (Rule 21).
         "{MODULE_HEADER}\nname {}\nversion {}\n{source}\ndeps {}\nfeatures {}\ntoolchain {}\ntarget {}\nshim {}\nprofile debug-assertions std-release ub-checks-off\nbuilder bootstrap\n",
         id.name,
         id.version,
@@ -698,7 +703,7 @@ mod header_tests {
     use super::*;
 
     #[test]
-    fn proc_macro_module_identity_uses_form_10_and_misses_stale_form_9_through_4_store_entries() {
+    fn proc_macro_module_identity_uses_form_11_and_misses_stale_form_10_through_4_store_entries() {
         let id = CrateId {
             name: "demo_derive",
             version: "0.1.0",
@@ -706,16 +711,18 @@ mod header_tests {
             deps: "deps-hash",
             features: &["default"],
         };
-        let v10_identity = identity(&id);
-        assert_eq!(MODULE_HEADER, "blaze proc-macro module wasm64 10");
-        assert_eq!(v10_identity.lines().next(), Some(MODULE_HEADER));
-        let v9_w64_identity = v10_identity.replacen(MODULE_HEADER, "blaze proc-macro module wasm64 9", 1);
-        let v8_w64_identity = v10_identity.replacen(MODULE_HEADER, "blaze proc-macro module wasm64 8", 1);
-        let v7_w32_identity = v10_identity.replacen(MODULE_HEADER, "blaze proc-macro module wasm32 7", 1);
-        let v7_identity = v10_identity.replacen(MODULE_HEADER, "blaze proc-macro module 7", 1);
-        let v6_identity = v10_identity.replacen(MODULE_HEADER, "blaze proc-macro module 6", 1);
-        let v5_identity = v10_identity.replacen(MODULE_HEADER, "blaze proc-macro module 5", 1);
-        let v4_identity = v10_identity.replacen(MODULE_HEADER, "blaze proc-macro module 4", 1);
+        let v11_identity = identity(&id);
+        assert_eq!(MODULE_HEADER, "blaze proc-macro module wasm64 11");
+        assert_eq!(v11_identity.lines().next(), Some(MODULE_HEADER));
+        let v10_w64_identity = v11_identity.replacen(MODULE_HEADER, "blaze proc-macro module wasm64 10", 1);
+        let v9_w64_identity = v11_identity.replacen(MODULE_HEADER, "blaze proc-macro module wasm64 9", 1);
+        let v8_w64_identity = v11_identity.replacen(MODULE_HEADER, "blaze proc-macro module wasm64 8", 1);
+        let v7_w32_identity = v11_identity.replacen(MODULE_HEADER, "blaze proc-macro module wasm32 7", 1);
+        let v7_identity = v11_identity.replacen(MODULE_HEADER, "blaze proc-macro module 7", 1);
+        let v6_identity = v11_identity.replacen(MODULE_HEADER, "blaze proc-macro module 6", 1);
+        let v5_identity = v11_identity.replacen(MODULE_HEADER, "blaze proc-macro module 5", 1);
+        let v4_identity = v11_identity.replacen(MODULE_HEADER, "blaze proc-macro module 4", 1);
+        let v10_w64_key = sha256_hex(v10_w64_identity.as_bytes());
         let v9_w64_key = sha256_hex(v9_w64_identity.as_bytes());
         let v8_w64_key = sha256_hex(v8_w64_identity.as_bytes());
         let v7_w32_key = sha256_hex(v7_w32_identity.as_bytes());
@@ -723,16 +730,17 @@ mod header_tests {
         let v6_key = sha256_hex(v6_identity.as_bytes());
         let v5_key = sha256_hex(v5_identity.as_bytes());
         let v4_key = sha256_hex(v4_identity.as_bytes());
-        let v10_key = module_key(&id);
-        assert_ne!(v9_w64_key, v10_key, "wasm64 form 10 key must differ from stale wasm64 form 9 key");
-        assert_ne!(v8_w64_key, v10_key, "wasm64 form 10 key must differ from stale wasm64 form 8 key");
-        assert_ne!(v7_w32_key, v10_key, "wasm64 form 10 key must differ from wasm32 bootstrap form 7 key");
-        assert_ne!(v7_key, v10_key, "form 10 key must differ from stale form 7 key");
-        assert_ne!(v6_key, v10_key, "form 10 key must differ from stale form 6 key");
-        assert_ne!(v5_key, v10_key, "form 10 key must differ from stale form 5 key");
-        assert_ne!(v4_key, v10_key, "form 10 key must differ from stale form 4 key");
+        let v11_key = module_key(&id);
+        assert_ne!(v10_w64_key, v11_key, "wasm64 form 11 key must differ from stale wasm64 form 10 key");
+        assert_ne!(v9_w64_key, v11_key, "wasm64 form 11 key must differ from stale wasm64 form 9 key");
+        assert_ne!(v8_w64_key, v11_key, "wasm64 form 11 key must differ from stale wasm64 form 8 key");
+        assert_ne!(v7_w32_key, v11_key, "wasm64 form 11 key must differ from wasm32 bootstrap form 7 key");
+        assert_ne!(v7_key, v11_key, "form 11 key must differ from stale form 7 key");
+        assert_ne!(v6_key, v11_key, "form 11 key must differ from stale form 6 key");
+        assert_ne!(v5_key, v11_key, "form 11 key must differ from stale form 5 key");
+        assert_ne!(v4_key, v11_key, "form 11 key must differ from stale form 4 key");
 
-        let store = std::env::temp_dir().join(format!("blaze-pm-module-v10-test-{}", std::process::id()));
+        let store = std::env::temp_dir().join(format!("blaze-pm-module-v11-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
         let write_entry = |dir: &Path, id_text: &str, digest: &str, macros: &str| {
             std::fs::create_dir_all(dir).expect("create module dir");
@@ -753,23 +761,24 @@ mod header_tests {
             (&v7_w32_key, &v7_w32_identity, "76543210\n"),
             (&v8_w64_key, &v8_w64_identity, "89abcdef\n"),
             (&v9_w64_key, &v9_w64_identity, "fedcba98\n"),
+            (&v10_w64_key, &v10_w64_identity, "11223344\n"),
         ] {
             write_entry(&store.join("proc-macro/modules").join(stale_key), stale_identity, stale_digest, "");
         }
 
-        // Lookup by current wasm64 form 10 misses stale wasm64 form 9..8, wasm32 form 7, and form 7..4 directories cleanly.
-        assert!(matches!(find_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v10_key));
-        assert!(matches!(read_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v10_key));
+        // Lookup by current wasm64 form 11 misses stale wasm64 form 10..8, wasm32 form 7, and form 7..4 directories cleanly.
+        assert!(matches!(find_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v11_key));
+        assert!(matches!(read_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v11_key));
 
-        // Publishing form 10 alongside stale form 9..4 resolves uniquely to form 10.
-        let v10_dir = store.join("proc-macro/modules").join(&v10_key);
-        write_entry(&v10_dir, &v10_identity, "cafebabe\n", "0 derive Demo\n");
+        // Publishing form 11 alongside stale form 10..4 resolves uniquely to form 11.
+        let v11_dir = store.join("proc-macro/modules").join(&v11_key);
+        write_entry(&v11_dir, &v11_identity, "cafebabe\n", "0 derive Demo\n");
 
-        let (found_key, digest) = find_module(&store, &id).expect("find v10 module");
-        assert_eq!(found_key, v10_key);
+        let (found_key, digest) = find_module(&store, &id).expect("find v11 module");
+        assert_eq!(found_key, v11_key);
         assert_eq!(digest, "cafebabe");
-        let rec = read_module(&store, &id).expect("read v10 module");
-        assert_eq!(rec.key, v10_key);
+        let rec = read_module(&store, &id).expect("read v11 module");
+        assert_eq!(rec.key, v11_key);
         assert_eq!(rec.wasm_sha256, "cafebabe");
         assert_eq!(rec.macros.len(), 1);
         assert_eq!(rec.macros[0].name, "Demo");
