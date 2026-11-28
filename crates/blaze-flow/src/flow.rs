@@ -695,6 +695,16 @@ impl<A: Allocator + Copy> FlowBuilder<A> {
         &self.flow.known
     }
 
+    /// Subset constraints `(at, long, short)` recorded so far in this flow.
+    pub fn subset_edges(&self) -> &[(Stmt, Origin, Origin)] {
+        &self.flow.subsets
+    }
+
+    /// Whether `o` was created as a universal placeholder origin.
+    pub fn is_placeholder(&self, o: Origin) -> bool {
+        self.flow.placeholder.get(o.index()).copied().unwrap_or(false)
+    }
+
     pub fn block(&mut self) -> Block {
         self.flow.blocks.push(Ops { start: 0, end: 0 });
         self.filled.push(false);

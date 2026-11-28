@@ -557,7 +557,8 @@ pub trait Facts {
 }
 
 /// One extra outlives obligation required by an instantiated ADT's `Copy` impl beyond what the
-/// ADT's own well-formedness guarantees (e.g. `impl<'a, T: 'a> Copy for OutlivesToken<'a, T>`).
+/// ADT's own well-formedness guarantees (e.g. `impl<'a, T: 'a> Copy for OutlivesToken<'a, T>` or
+/// `impl<'a, T: Marker<'a>> Copy for Marked<'a, T>`).
 /// A lifetime index of `u32::MAX` denotes `'static`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CopyOutlives {
@@ -566,6 +567,9 @@ pub enum CopyOutlives {
     /// Every origin and type parameter inside ADT type argument `arg` must outlive ADT lifetime
     /// slot `region`.
     Arg { arg: u32, region: u32 },
+    /// ADT lifetime slot `slot` must equal the enclosing owner's region `owner_region` (`u32::MAX`
+    /// for `'static`, else `Region::Param(owner_region)`).
+    SlotEqOwner { slot: u32, owner_region: u32 },
 }
 
 /// Instantiated `Copy` answer for [`Facts::inst_is_copy`].
@@ -3734,7 +3738,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     }
 
     /// Whether `long: short` is provably known in this flow (`long == short`, `long` is the
-    /// universal `'static` placeholder, or `(long, short)` is reachable through `self.b.known_edges()`).
+    /// universal `'static` placeholder, or `(long, short)` is reachable through `self.b.known_edges()`
+    /// and existential-target `self.b.subset_edges()`, never traversing unproven universal-to-universal
+    /// subset constraints).
     fn origin_outlives_known(&self, long: Origin, short: Origin) -> bool {
         if long == short {
             return true;
@@ -3745,7 +3751,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             return true;
         }
         let edges = self.b.known_edges();
-        if edges.is_empty() {
+        let subsets = self.b.subset_edges();
+        if edges.is_empty() && subsets.is_empty() {
             return false;
         }
         let mut stack: Vec<Origin, A> = Vec::new_in(self.alloc);
@@ -3770,17 +3777,29 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     stack.push(into);
                 }
             }
+            for &(_, from, into) in subsets {
+                if from != cur || self.b.is_placeholder(into) {
+                    continue;
+                }
+                if into == short {
+                    return true;
+                }
+                if visited.scan_for(&into).is_none() && visited.len() < 128 {
+                    visited.push(into);
+                    stack.push(into);
+                }
+            }
         }
         false
     }
 
     /// Verifies that every extra [`CopyOutlives`] obligation on an ADT at `(adt_ty, adt_off)`
-    /// inside place `p` (whose origins start at `p_start`) holds under `known_edges()`.
+    /// inside `origs` holds under `known_edges()`.
     fn check_copy_outlives(
         &mut self,
         adt_ty: PTy,
         adt_off: u32,
-        p_start: u32,
+        origs: &[Origin],
         obs: &[CopyOutlives],
         e: ExprId,
     ) -> Result<bool, Refusal> {
@@ -3793,8 +3812,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             if idx == u32::MAX {
                 Some(s.universal(Region::Static))
             } else if idx < lifetimes {
-                let pos = p_start.checked_add(adt_off)?.checked_add(idx)?;
-                s.origs.get(usize::try_from(pos).ok()?).copied()
+                let pos = adt_off.checked_add(idx)?;
+                origs.get(usize::try_from(pos).ok()?).copied()
             } else {
                 None
             }
@@ -3825,10 +3844,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     }
                     let arg_npos = self.npos(arg_ty, e)?;
                     for j in 0..arg_npos {
-                        let Some(pos) = p_start.checked_add(adt_off).and_then(|x| x.checked_add(off)).and_then(|x| x.checked_add(j)) else {
+                        let Some(pos) = adt_off.checked_add(off).and_then(|x| x.checked_add(j)) else {
                             return Ok(false);
                         };
-                        let Some(&o) = usize::try_from(pos).ok().and_then(|ix| self.origs.get(ix)) else {
+                        let Some(&o) = usize::try_from(pos).ok().and_then(|ix| origs.get(ix)) else {
                             return Ok(false);
                         };
                         if !self.origin_outlives_known(o, os) {
@@ -3846,28 +3865,34 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         }
                     }
                 }
+                CopyOutlives::SlotEqOwner { slot, owner_region } => {
+                    let Some(os) = region_orig(self, slot) else {
+                        return Ok(false);
+                    };
+                    let owner_r = if owner_region == u32::MAX {
+                        Region::Static
+                    } else {
+                        Region::Param(owner_region)
+                    };
+                    let oo = self.universal(owner_r);
+                    if !(self.origin_outlives_known(os, oo) && self.origin_outlives_known(oo, os)) {
+                        return Ok(false);
+                    }
+                }
             }
         }
         Ok(true)
     }
 
-    /// Region-aware `Copy` check for a place `p` of type `ty`: identical to [`Self::is_copy`],
-    /// except that an ADT whose `Copy` impl returned [`InstCopy::IfOutlives`] verifies its extra
-    /// outlives obligations against `p`'s live origins and `self.b.known_edges()`.
-    fn place_is_copy(&mut self, p: Place, ty: TyD, e: ExprId) -> Result<bool, Refusal> {
-        if let Some(m) = ty.wrap {
-            return Ok(m == Mutbl::Not);
-        }
-        if self.is_copy_pty(ty.ty, e)? {
+    /// Region-aware `Copy` check for a type `root_ty` whose flattened origins are `origs`:
+    /// verifies [`InstCopy::IfOutlives`] obligations on ADTs and traverses closure by-value
+    /// captures with their concrete capture origins.
+    fn ty_origs_is_copy(&mut self, root_ty: PTy, origs: &[Origin], e: ExprId) -> Result<bool, Refusal> {
+        if self.is_copy_pty(root_ty, e)? {
             return Ok(true);
         }
-        let pi = self.info(p);
-        if !pi.exact {
-            return Ok(false);
-        }
-        let p_start = pi.start;
         let mut stack: Vec<(PTy, u32), A> = Vec::new_in(self.alloc);
-        stack.push((ty.ty, 0));
+        stack.push((root_ty, 0));
         let mut steps = 0u32;
         while let Some((t, off)) = stack.pop() {
             steps += 1;
@@ -3917,7 +3942,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                             Some(InstCopy::Yes) => {}
                             Some(InstCopy::No) => return Ok(false),
                             Some(InstCopy::IfOutlives(obs)) => {
-                                if !self.check_copy_outlives(t, off, p_start, obs, e)? {
+                                if !self.check_copy_outlives(t, off, origs, obs, e)? {
                                     return Ok(false);
                                 }
                             }
@@ -3947,15 +3972,64 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         return Ok(false);
                     }
                 }
-                PNode::Closure { .. } => {
-                    if !self.is_copy_pty(t, e)? {
-                        return Ok(false);
+                PNode::Closure { owner, ordinal, .. } if owner == self.body.owner => {
+                    let ck: &'c Checked<'c> = self.ck;
+                    let Ok(ord_ix) = usize::try_from(ordinal) else {
+                        return self.refuse(Form::Malformed, e);
+                    };
+                    let Some(&ce) = ck.closures.column::<0>().get(ord_ix) else {
+                        return self.refuse(Form::Malformed, e);
+                    };
+                    let mut cap_off = off;
+                    for f in ck.env_fields_by::<blaze_typeck::Places>(ce) {
+                        let Some(ct) = f.place_ty(ck) else {
+                            return self.refuse(Form::Malformed, e);
+                        };
+                        let n = self.npos(ct, e)?;
+                        match f.how {
+                            blaze_typeck::CaptureKind::ByMutRef => return Ok(false),
+                            blaze_typeck::CaptureKind::ByRef => {
+                                cap_off = cap_off.saturating_add(1).saturating_add(n);
+                            }
+                            blaze_typeck::CaptureKind::ByValue => {
+                                stack.push((ct, cap_off));
+                                cap_off = cap_off.saturating_add(n);
+                            }
+                        }
                     }
                 }
                 _ => return Ok(false),
             }
         }
         Ok(true)
+    }
+
+    /// Region-aware `Copy` check for a place `p` of type `ty`: identical to [`Self::is_copy`],
+    /// except that an ADT whose `Copy` impl returned [`InstCopy::IfOutlives`] verifies its extra
+    /// outlives obligations against `p`'s live origins and `self.b.known_edges()`.
+    fn place_is_copy(&mut self, p: Place, ty: TyD, e: ExprId) -> Result<bool, Refusal> {
+        if let Some(m) = ty.wrap {
+            return Ok(m == Mutbl::Not);
+        }
+        if self.is_copy_pty(ty.ty, e)? {
+            return Ok(true);
+        }
+        let pi = self.info(p);
+        if !pi.exact {
+            return Ok(false);
+        }
+        let (Ok(start), Ok(len)) = (usize::try_from(pi.start), usize::try_from(pi.len)) else {
+            return Ok(false);
+        };
+        let Some(end) = start.checked_add(len) else {
+            return Ok(false);
+        };
+        let Some(slice) = self.origs.get(start..end) else {
+            return Ok(false);
+        };
+        let mut origs: Vec<Origin, A> = Vec::with_capacity_in(len, self.alloc);
+        origs.extend_from_slice(slice);
+        self.ty_origs_is_copy(ty.ty, &origs, e)
     }
 
     fn operand(&mut self, v: Val, e: ExprId) -> Result<Operand, Refusal> {
@@ -11396,7 +11470,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             // A guard over a by-value binding of a non-`Copy` type (pattern_forms.rs, "Match
             // guards"): bound by shared reference for the guard, moved once it holds.
             let moves = match arm.guard {
-                Some(_) => self.guard_moves(arm.pat)? && self.plant != Plant::GuardBindsByValue,
+                Some(_) => self.guard_moves(arm.pat, val, e)? && self.plant != Plant::GuardBindsByValue,
                 None => false,
             };
             if let Some(g) = arm.guard {
@@ -11420,12 +11494,131 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         Ok(())
     }
 
-    /// Whether a pattern binds a non-`Copy` value by value (its guard would see it moved).
-    fn guard_moves(&self, p: PatId) -> Result<bool, Refusal> {
-        let mut stack: Vec<PatId, A> = Vec::new_in(self.alloc);
-        stack.push(p);
+    /// Computes the flattened origin slice of field `fi` of `adt`/`variant` from the parent ADT's
+    /// origin slice `parent_origs`, mirroring `field_origs` without mutating `self.origs`.
+    fn slice_field_origs(
+        &mut self,
+        adt: ItemKey,
+        args: &[PTy],
+        variant: u32,
+        fi: u32,
+        parent_origs: &[Origin],
+        e: ExprId,
+    ) -> Result<Option<Vec<Origin, A>>, Refusal> {
+        let Some(regions) = self.facts.field_regions(adt, variant, fi) else {
+            return Ok(None);
+        };
+        let lifetimes = self.adt_facts(adt, e)?.lifetimes;
+        let mut at: Vec<(u32, u32), A> = Vec::with_capacity_in(args.len(), self.alloc);
+        let mut total = lifetimes;
+        for &a in args {
+            let n = self.npos(a, e)?;
+            at.push((total, n));
+            total = total.saturating_add(n);
+        }
+        if usize::try_from(total).ok() != Some(parent_origs.len()) {
+            return Ok(None);
+        }
+        let mut out: Vec<Origin, A> = Vec::new_in(self.alloc);
+        let mut bound: Vec<(u32, Origin), A> = Vec::new_in(self.alloc);
+        let Ok(max_pos) = usize::try_from(MOST_POSITIONS) else {
+            return Ok(None);
+        };
+        for &r in regions {
+            if out.len() > max_pos {
+                return Ok(None);
+            }
+            match r {
+                FieldRegion::Lifetime(i) if i < lifetimes => {
+                    let Some(&o) = usize::try_from(i).ok().and_then(|ix| parent_origs.get(ix)) else {
+                        return Ok(None);
+                    };
+                    out.push(o);
+                }
+                FieldRegion::Static => {
+                    out.push(self.universal(Region::Static));
+                }
+                FieldRegion::Arg(i) => {
+                    let Some(&(off, n)) = usize::try_from(i).ok().and_then(|ix| at.get(ix)) else {
+                        return Ok(None);
+                    };
+                    let (Ok(s), Ok(len)) = (usize::try_from(off), usize::try_from(n)) else {
+                        return Ok(None);
+                    };
+                    let Some(end) = s.checked_add(len) else {
+                        return Ok(None);
+                    };
+                    let Some(sl) = parent_origs.get(s..end) else {
+                        return Ok(None);
+                    };
+                    out.extend_from_slice(sl);
+                }
+                FieldRegion::Bound(v) => {
+                    let o = match bound.iter().find(|(x, _)| *x == v) {
+                        Some(&(_, o)) => o,
+                        None => {
+                            let o = self.b.origin(false);
+                            bound.push((v, o));
+                            o
+                        }
+                    };
+                    out.push(o);
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// Whether a pattern binds a non-`Copy` value by value (its guard would see it moved),
+    /// tracking the scrutinee's live origins so conditional `Copy` (`InstCopy::IfOutlives`) is
+    /// proved accurately when the body's bounds establish it.
+    fn guard_moves(&mut self, p: PatId, scrut: Val, e: ExprId) -> Result<bool, Refusal> {
+        let init_state = match scrut.at {
+            At::Place(sp) => {
+                let pi = self.info(sp);
+                if pi.exact
+                    && let (Ok(start), Ok(len)) = (usize::try_from(pi.start), usize::try_from(pi.len))
+                    && let Some(end) = start.checked_add(len)
+                    && let Some(sl) = self.origs.get(start..end)
+                {
+                    let mut v: Vec<Origin, A> = Vec::with_capacity_in(len, self.alloc);
+                    v.extend_from_slice(sl);
+                    Some((scrut.ty, v))
+                } else {
+                    None
+                }
+            }
+            At::Const => None,
+        };
+        let peel_refs = |s: &Self, mut ty: TyD, origs: &[Origin]| -> Result<Option<(PTy, usize)>, Refusal> {
+            let mut drop = 0usize;
+            if ty.wrap.is_some() {
+                if drop >= origs.len() {
+                    return Ok(None);
+                }
+                drop += 1;
+                ty.wrap = None;
+            }
+            let mut t = ty.ty;
+            for _ in 0..16 {
+                match s.node(t, e)? {
+                    PNode::Ref(_, inner) => {
+                        if drop >= origs.len() {
+                            return Ok(None);
+                        }
+                        drop += 1;
+                        t = inner;
+                    }
+                    _ => break,
+                }
+            }
+            Ok(Some((t, drop)))
+        };
+        let mut stack: Vec<(PatId, Option<(TyD, Vec<Origin, A>)>), A> = Vec::new_in(self.alloc);
+        stack.push((p, init_state));
         let mut steps = 0usize;
-        while let Some(p) = stack.pop() {
+        while let Some((p, state)) = stack.pop() {
             steps += 1;
             if steps > self.body.pats.len() + 1 {
                 return self.refuse_pat(Form::Bound, p);
@@ -11434,22 +11627,205 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 Some(x) => *x,
                 None => return self.refuse_pat(Form::Malformed, p),
             };
-            if let Pat::Bind { ann, .. } = pat {
-                let lt = self.ck.local_ty.get(p.ix()).copied().unwrap_or(PTy(0));
-                // By value when no `ref` is written and the binding's type is the matched
-                // place's (`pat_ty`): one bound by reference under a default binding mode has
-                // `&pat_ty` (the Reference, "Binding modes"). The binding's type alone does not
-                // say it: `Some(count)` over `Option<&mut usize>` binds a `&mut usize` BY VALUE,
-                // and taken as by reference it was moved before the guard's fake borrow of the
-                // scrutinee, a false E0382 at the `match` (tempo zones-antithesis checks.rs:434,
-                // zones/node role.rs:767).
-                let Some(&pt) = self.ck.pat_ty.get(p.ix()) else { return self.refuse_pat(Form::Malformed, p) };
-                let by_value = ann.by_ref.is_none() && pt == lt;
-                if by_value && !self.is_copy(TyD::of(lt), self.body.root)? {
-                    return Ok(true);
+            match pat {
+                Pat::Bind { ann, sub, .. } => {
+                    let lt = self.ck.local_ty.get(p.ix()).copied().unwrap_or(PTy(0));
+                    // By value when no `ref` is written and the binding's type is the matched
+                    // place's (`pat_ty`): one bound by reference under a default binding mode has
+                    // `&pat_ty` (the Reference, "Binding modes"). The binding's type alone does not
+                    // say it: `Some(count)` over `Option<&mut usize>` binds a `&mut usize` BY VALUE,
+                    // and taken as by reference it was moved before the guard's fake borrow of the
+                    // scrutinee, a false E0382 at the `match` (tempo zones-antithesis checks.rs:434,
+                    // zones/node role.rs:767).
+                    let Some(&pt) = self.ck.pat_ty.get(p.ix()) else { return self.refuse_pat(Form::Malformed, p) };
+                    let by_value = ann.by_ref.is_none() && pt == lt;
+                    if by_value {
+                        let is_copy = match &state {
+                            Some((cur_ty, cur_origs)) if cur_ty.wrap.is_none() && cur_ty.ty == lt => {
+                                self.ty_origs_is_copy(lt, cur_origs, e)?
+                            }
+                            _ => self.is_copy(TyD::of(lt), e)?,
+                        };
+                        if !is_copy {
+                            return Ok(true);
+                        }
+                    }
+                    if let Some(s) = sub {
+                        stack.push((s, state));
+                    }
+                }
+                Pat::Ref { inner, .. } => {
+                    let next = match state {
+                        Some((mut ty, origs)) => {
+                            if ty.wrap.is_some() {
+                                ty.wrap = None;
+                                origs.get(1..).map(|rest| {
+                                    let mut v: Vec<Origin, A> = Vec::with_capacity_in(rest.len(), self.alloc);
+                                    v.extend_from_slice(rest);
+                                    (ty, v)
+                                })
+                            } else if let PNode::Ref(_, inner_ty) = self.node(ty.ty, e)? {
+                                origs.get(1..).map(|rest| {
+                                    let mut v: Vec<Origin, A> = Vec::with_capacity_in(rest.len(), self.alloc);
+                                    v.extend_from_slice(rest);
+                                    (TyD::of(inner_ty), v)
+                                })
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    };
+                    stack.push((inner, next));
+                }
+                Pat::Or { alts } => {
+                    let alts = self.body.pat_lists.get(alts.range()).unwrap_or(&[]);
+                    for &alt in alts {
+                        let dup = state.as_ref().map(|(ty, origs)| {
+                            let mut v: Vec<Origin, A> = Vec::with_capacity_in(origs.len(), self.alloc);
+                            v.extend_from_slice(origs);
+                            (*ty, v)
+                        });
+                        stack.push((alt, dup));
+                    }
+                }
+                Pat::Tuple { elems, .. } => {
+                    let es = self.body.pat_lists.get(elems.range()).unwrap_or(&[]);
+                    let mut pushed = false;
+                    if let Some((ty, origs)) = &state
+                        && let Some((base_ty, drop)) = peel_refs(self, *ty, origs)?
+                        && let PNode::Tuple(tl) = self.node(base_ty, e)?
+                        && let Ok(tys) = self.list(tl, e)
+                        && tys.len() == es.len()
+                        && let Some(rest) = origs.get(drop..)
+                    {
+                        let mut off = 0usize;
+                        let mut ok = true;
+                        let mut entries: Vec<(PatId, TyD, Vec<Origin, A>), A> = Vec::with_capacity_in(es.len(), self.alloc);
+                        for (&sp, &el_ty) in es.iter().zip(tys.iter()) {
+                            let Ok(n) = usize::try_from(self.npos(el_ty, e)?) else {
+                                ok = false;
+                                break;
+                            };
+                            let Some(end) = off.checked_add(n) else {
+                                ok = false;
+                                break;
+                            };
+                            let Some(sl) = rest.get(off..end) else {
+                                ok = false;
+                                break;
+                            };
+                            let mut v: Vec<Origin, A> = Vec::with_capacity_in(n, self.alloc);
+                            v.extend_from_slice(sl);
+                            entries.push((sp, TyD::of(el_ty), v));
+                            off = end;
+                        }
+                        if ok {
+                            for (sp, ety, ev) in entries {
+                                stack.push((sp, Some((ety, ev))));
+                            }
+                            pushed = true;
+                        }
+                    }
+                    if !pushed {
+                        for &sp in es {
+                            stack.push((sp, None));
+                        }
+                    }
+                }
+                Pat::TupleStruct { elems, rest, .. } => {
+                    let es = self.body.pat_lists.get(elems.range()).unwrap_or(&[]);
+                    let mut pushed = false;
+                    if let Some((ty, origs)) = &state
+                        && let Some((base_ty, drop)) = peel_refs(self, *ty, origs)?
+                        && let PNode::Adt(adt, args_l) = self.node(base_ty, e)?
+                        && let Ok((v_adt, variant)) = self.variant_of(p)
+                        && v_adt == adt
+                        && let Some(n_fields) = self.facts.field_count(adt, variant)
+                        && let Ok(n_fields_usize) = usize::try_from(n_fields)
+                        && let Some(parent_origs) = origs.get(drop..)
+                    {
+                        let args = self.list(args_l, e)?;
+                        for (j, &sp) in es.iter().enumerate() {
+                            let fi = field_index(j, es.len(), n_fields_usize, rest);
+                            let next = match (
+                                self.ck.pat_ty.get(sp.ix()).copied(),
+                                self.slice_field_origs(adt, args, variant, fi, parent_origs, e)?,
+                            ) {
+                                (Some(fty), Some(fv)) => Some((TyD::of(fty), fv)),
+                                _ => None,
+                            };
+                            stack.push((sp, next));
+                        }
+                        pushed = true;
+                    }
+                    if !pushed {
+                        for &sp in es {
+                            stack.push((sp, None));
+                        }
+                    }
+                }
+                Pat::Struct { fields, .. } => {
+                    let fs = self.body.field_pats.get(fields.range()).unwrap_or(&[]);
+                    let mut pushed = false;
+                    if let Some((ty, origs)) = &state
+                        && let Some((base_ty, drop)) = peel_refs(self, *ty, origs)?
+                        && let PNode::Adt(adt, args_l) = self.node(base_ty, e)?
+                        && let Ok((v_adt, variant)) = self.variant_of(p)
+                        && v_adt == adt
+                        && let Some(parent_origs) = origs.get(drop..)
+                    {
+                        let args = self.list(args_l, e)?;
+                        for f in fs {
+                            let next = match (
+                                self.facts.field(adt, variant, f.name),
+                                self.ck.pat_ty.get(f.pat.ix()).copied(),
+                            ) {
+                                (Some(fi), Some(fty)) => self
+                                    .slice_field_origs(adt, args, variant, fi, parent_origs, e)?
+                                    .map(|fv| (TyD::of(fty), fv)),
+                                _ => None,
+                            };
+                            stack.push((f.pat, next));
+                        }
+                        pushed = true;
+                    }
+                    if !pushed {
+                        for f in fs {
+                            stack.push((f.pat, None));
+                        }
+                    }
+                }
+                Pat::Slice { elems, .. } => {
+                    let es = self.body.pat_lists.get(elems.range()).unwrap_or(&[]);
+                    let elem_state = if let Some((ty, origs)) = &state
+                        && let Some((base_ty, drop)) = peel_refs(self, *ty, origs)?
+                        && let Some(rest) = origs.get(drop..)
+                    {
+                        match self.node(base_ty, e)? {
+                            PNode::Array(el, _) | PNode::Slice(el) => Some((el, rest)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    for &sp in es {
+                        let next = elem_state.map(|(el, rest)| {
+                            let mut v: Vec<Origin, A> = Vec::with_capacity_in(rest.len(), self.alloc);
+                            v.extend_from_slice(rest);
+                            (TyD::of(el), v)
+                        });
+                        stack.push((sp, next));
+                    }
+                }
+                _ => {
+                    let mut subs: Vec<PatId, A> = Vec::new_in(self.alloc);
+                    self.sub_pats(pat, &mut subs)?;
+                    for sp in subs {
+                        stack.push((sp, None));
+                    }
                 }
             }
-            self.sub_pats(pat, &mut stack)?;
         }
         Ok(false)
     }

@@ -516,8 +516,44 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
                 };
                 externals.push((self.origs[to_usize(o)], what));
             }
+            // If this whole capture is an unmodified direct parameter of the enclosing owner,
+            // equate its capture origin slots to the owner signature's universal regions so
+            // region-aware `Copy` checks (`InstCopy::IfOutlives`) inside the closure body see
+            // the owner's proven outlives bounds (e.g. `T: 'a` on `OutlivesToken<'a, T>`).
+            let val_start = first + u32::from(env);
+            let val_len = made.saturating_sub(val_start);
+            if f.is_whole()
+                && self.local_is_immutable(f.base)
+                && let Some(param_ix) = self.body.params.iter().position(|&p| p == f.base)
+                && let Ok(param32) = u32::try_from(param_ix)
+                && let Ok(own_sig) = self.facts.sig(self.body.owner)
+                && let Some(in_slots) = own_sig.input(param32)
+                && in_slots.len() == to_usize(val_len)
+            {
+                for (j, &reg) in in_slots.iter().enumerate() {
+                    if matches!(reg, Region::Static | Region::Param(_))
+                        && let Some(&cap_o) = self.origs.get(to_usize(val_start).saturating_add(j))
+                    {
+                        let u = self.universal(reg);
+                        self.b.known(cap_o, u);
+                        self.b.known(u, cap_o);
+                    }
+                }
+            }
             value_at += (made - first) - u32::from(by_value_env);
             self.vars.push(l);
+        }
+        if let Ok(outlives) = self.facts.regions().outlives(self.body.owner) {
+            for &ov in outlives {
+                if let blaze_typeck::region_facts::Outlives::Region { long, short } = ov
+                    && matches!(long, Region::Static | Region::Param(_))
+                    && matches!(short, Region::Static | Region::Param(_))
+                {
+                    let ol = self.universal(long);
+                    let os = self.universal(short);
+                    self.b.known(ol, os);
+                }
+            }
         }
         let upvar_origins = self.origs.len();
         // What each signature position is (the module doc, THE SIGNATURE'S REGIONS). Computed
@@ -1214,7 +1250,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         //    from `walk_cur`'s adjusted type when `walk_cur == target_expr`, or `walk_cur`'s type
         //    otherwise, down to `want_dyn`).
         let mut walk_cur = target_expr;
-        for _ in 0..16 {
+        let max_up = self.body.exprs.len().saturating_add(1);
+        let mut visited_up: Vec<ExprId, A> = Vec::new_in(self.alloc);
+        for _ in 0..max_up {
+            if visited_up.scan_for(&walk_cur).is_some() {
+                break;
+            }
+            visited_up.push(walk_cur);
             if walk_cur != target_expr && !self.forward_expr_adjusts(walk_cur, &mut path, e) {
                 break;
             }
@@ -1336,7 +1378,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                                         }
                                     }
                                 }
-                                if !ambiguous && let Some(m) = arg_match {
+                                if ambiguous {
+                                    stop = true;
+                                    break;
+                                }
+                                if let Some(m) = arg_match {
                                     found = Some(m);
                                     stop = true;
                                     break;
@@ -1369,20 +1415,51 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                                 break;
                             }
                             if let Some((param_p, rem_start)) = self.match_head_path_to_param(in_ty, &path, heads, e) {
+                                // Scan both the receiver (param 0) and every explicit sibling
+                                // argument (params 1..=es.len()) whose declared parameter type
+                                // carries this exact `param_p` at a unique structural path.
+                                let mut arg_match: Option<(PTy, &'b [Region], u32)> = None;
+                                let mut ambiguous = false;
                                 let mut prefix: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
-                                if let Ok(self_ty) = self.sig_declared(sig, 0, e)
-                                    && self.find_unique_param_path(self_ty, param_p, heads, &mut prefix, e)
-                                {
-                                    let mut recv_path: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
-                                    recv_path.extend_from_slice(&prefix);
+                                for cand_idx in 0..=es.len() {
+                                    let (other, other_param) = if cand_idx == 0 {
+                                        (receiver, 0u32)
+                                    } else {
+                                        let j = cand_idx - 1;
+                                        if j == arg_i {
+                                            continue;
+                                        }
+                                        let Some(&oe) = es.get(j) else { continue };
+                                        (oe, to_u32(cand_idx))
+                                    };
+                                    let Ok(other_ty) = self.sig_declared(sig, other_param, e) else { continue };
+                                    if !self.find_unique_param_path(other_ty, param_p, heads, &mut prefix, e) {
+                                        continue;
+                                    }
+                                    let mut sib_path: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
+                                    sib_path.extend_from_slice(&prefix);
                                     if let Some(tail) = path.get(rem_start..) {
-                                        recv_path.extend_from_slice(tail);
+                                        sib_path.extend_from_slice(tail);
                                     }
-                                    if let Ok(Some(m)) = self.trace_dyn_path(receiver, recv_path, heads, want_dyn, e) {
-                                        found = Some(m);
-                                        stop = true;
-                                        break;
+                                    if let Ok(Some(m)) = self.trace_dyn_path(other, sib_path, heads, want_dyn, e) {
+                                        match arg_match {
+                                            None => arg_match = Some(m),
+                                            Some((_, prev_s, prev_b)) if prev_b == m.2 && prev_s == m.1 => {}
+                                            Some(_) => {
+                                                ambiguous = true;
+                                                break;
+                                            }
+                                        }
                                     }
+                                }
+                                if ambiguous {
+                                    stop = true;
+                                    break;
+                                }
+                                if let Some(m) = arg_match {
+                                    found = Some(m);
+                                    stop = true;
+                                    break;
                                 }
                                 if let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
                                     && self.find_unique_param_path(out_ty, param_p, heads, &mut prefix, e)
@@ -1679,10 +1756,200 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         true
     }
 
+    /// Translates `path` (pointing into binding `target`) outward through destructuring pattern
+    /// `root_pat` (e.g. `Holder { readers }`, `Result::Err(v)`, `(a, b)`, `&x`), resolving any
+    /// concrete field declaration immediately or translating generic ADT fields through their
+    /// `AdtArg(param_p)` step. Returns `Ok(Some(Some(m)))` when a concrete field resolved the
+    /// target directly, `Ok(Some(None))` when `path` was translated up to `root_pat`, and
+    /// `Ok(None)` when `target` is not uniquely projected by `root_pat`.
+    #[allow(clippy::type_complexity)]
+    fn trace_pat_bind(
+        &self,
+        root_pat: PatId,
+        target: PatId,
+        path: &mut Vec<DynPathStep, A>,
+        heads: &blaze_borrow::Columns<'_>,
+        want_dyn: PTy,
+        e: ExprId,
+    ) -> Result<Option<Option<(PTy, &'b [Region], u32)>>, Refusal> {
+        use blaze_typeck::Pat;
+        #[derive(Clone, Copy)]
+        enum PatStep {
+            Bind(PatId),
+            Ref,
+            Tuple(u32),
+            Slice(PatId),
+            AdtField { pat: PatId, adt: ItemKey, variant: u32, field: u32 },
+        }
+        enum Work {
+            Enter(PatId, Option<PatStep>),
+            Leave,
+        }
+        let mut cur_steps: Vec<PatStep, A> = Vec::new_in(self.alloc);
+        let mut found_steps: Option<Vec<PatStep, A>> = None;
+        let mut stack: Vec<Work, A> = Vec::new_in(self.alloc);
+        stack.push(Work::Enter(root_pat, None));
+        let mut visits = 0usize;
+        let max_visits = self.body.pats.len().saturating_mul(2).saturating_add(4);
+        while let Some(w) = stack.pop() {
+            visits += 1;
+            if visits > max_visits {
+                return Ok(None);
+            }
+            match w {
+                Work::Leave => {
+                    cur_steps.pop();
+                }
+                Work::Enter(pid, step) => {
+                    if let Some(st) = step {
+                        cur_steps.push(st);
+                        stack.push(Work::Leave);
+                    }
+                    if pid == target {
+                        if found_steps.is_some() {
+                            return Ok(None);
+                        }
+                        let mut snap: Vec<PatStep, A> = Vec::with_capacity_in(cur_steps.len().saturating_add(1), self.alloc);
+                        snap.extend_from_slice(&cur_steps);
+                        snap.push(PatStep::Bind(pid));
+                        found_steps = Some(snap);
+                        continue;
+                    }
+                    let Some(&pat) = self.body.pats.get(pid.ix()) else { continue };
+                    match pat {
+                        Pat::Bind { sub: Some(s), .. } => {
+                            stack.push(Work::Enter(s, Some(PatStep::Bind(pid))));
+                        }
+                        Pat::Ref { inner, .. } => {
+                            stack.push(Work::Enter(inner, Some(PatStep::Ref)));
+                        }
+                        Pat::Tuple { elems, .. } => {
+                            if let Some(es) = self.body.pat_lists.get(elems.range()) {
+                                for (j, &sp) in es.iter().enumerate().rev() {
+                                    stack.push(Work::Enter(sp, Some(PatStep::Tuple(to_u32(j)))));
+                                }
+                            }
+                        }
+                        Pat::Slice { elems, .. } => {
+                            if let Some(es) = self.body.pat_lists.get(elems.range()) {
+                                for &sp in es.iter().rev() {
+                                    stack.push(Work::Enter(sp, Some(PatStep::Slice(pid))));
+                                }
+                            }
+                        }
+                        Pat::TupleStruct { elems, rest, .. } => {
+                            if let Some(es) = self.body.pat_lists.get(elems.range())
+                                && let Ok((adt, variant)) = self.variant_of(pid)
+                                && let Some(n) = self.facts.field_count(adt, variant)
+                            {
+                                for (j, &sp) in es.iter().enumerate().rev() {
+                                    let fi = crate::field_index(j, es.len(), to_usize(n), rest);
+                                    stack.push(Work::Enter(sp, Some(PatStep::AdtField { pat: pid, adt, variant, field: fi })));
+                                }
+                            }
+                        }
+                        Pat::Struct { fields, .. } => {
+                            if let Some(fs) = self.body.field_pats.get(fields.range())
+                                && let Ok((adt, variant)) = self.variant_of(pid)
+                            {
+                                for f in fs.iter().rev() {
+                                    if let Some(fi) = self.facts.field(adt, variant, f.name) {
+                                        stack.push(Work::Enter(f.pat, Some(PatStep::AdtField { pat: pid, adt, variant, field: fi })));
+                                    }
+                                }
+                            }
+                        }
+                        // Refuse `Pat::Or` so different variants/fields are never conflated.
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let Some(steps) = found_steps else {
+            return Ok(None);
+        };
+        let facts: &'b F = self.facts;
+        for &st in steps.iter().rev() {
+            match st {
+                PatStep::Bind(bp) => {
+                    if let Some(Pat::Bind { ann, .. }) = self.body.pats.get(bp.ix()) {
+                        let by_ref = ann.by_ref.is_some()
+                            || self.ck.local_ty.get(bp.ix()).is_some_and(|lt| self.ck.pat_ty.get(bp.ix()).is_some_and(|pt| lt != pt));
+                        if by_ref {
+                            if path.first() != Some(&DynPathStep::RefInner) {
+                                return Ok(None);
+                            }
+                            Self::replace_path_prefix(path, &[], 1);
+                        }
+                    }
+                }
+                PatStep::Ref => Self::prepend_path_step(path, DynPathStep::RefInner),
+                PatStep::Tuple(j) => Self::prepend_path_step(path, DynPathStep::TupleElem(j)),
+                PatStep::Slice(sp) => {
+                    let Some(&mut_ty) = self.ck.pat_ty.get(sp.ix()) else { return Ok(None) };
+                    let mut bt = mut_ty;
+                    let mut derefs: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
+                    let mut elem_step = None;
+                    for _ in 0..8 {
+                        match self.node(bt, e)? {
+                            PNode::Array(..) => {
+                                elem_step = Some(DynPathStep::ArrayElem);
+                                break;
+                            }
+                            PNode::Slice(_) => {
+                                elem_step = Some(DynPathStep::SliceElem);
+                                break;
+                            }
+                            PNode::Ref(_, inner) => {
+                                derefs.push(DynPathStep::RefInner);
+                                bt = inner;
+                            }
+                            _ => return Ok(None),
+                        }
+                    }
+                    let Some(es) = elem_step else { return Ok(None) };
+                    Self::prepend_path_step(path, es);
+                    if !derefs.is_empty() {
+                        Self::replace_path_prefix(path, &derefs, 0);
+                    }
+                }
+                PatStep::AdtField { pat: sp, adt, variant, field } => {
+                    let Ok(col) = facts.regions().field(adt, variant, field) else { return Ok(None) };
+                    if let Some(m) = self.project_head_path(col.ty(), col.as_slice(), 0, path, heads, want_dyn, e)? {
+                        return Ok(Some(Some(m)));
+                    }
+                    let Some((param_p, rem_start)) = self.match_head_path_to_param(col.ty(), path, heads, e) else {
+                        return Ok(None);
+                    };
+                    Self::replace_path_prefix(path, &[DynPathStep::AdtArg(param_p)], rem_start);
+                    if let Some(&pat_ty) = self.ck.pat_ty.get(sp.ix()) {
+                        let mut bt = pat_ty;
+                        let mut derefs: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
+                        for _ in 0..8 {
+                            match self.node(bt, e)? {
+                                PNode::Adt(k, _) if k == adt => break,
+                                PNode::Ref(_, inner) => {
+                                    derefs.push(DynPathStep::RefInner);
+                                    bt = inner;
+                                }
+                                _ => return Ok(None),
+                            }
+                        }
+                        if !derefs.is_empty() {
+                            Self::replace_path_prefix(path, &derefs, 0);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Some(None))
+    }
+
     /// Traces a container expression `start` (whose adjusted type is the root of `path`) back to a
     /// declared head (`static`, `const`, struct field, callee output, or owner parameter),
-    /// transforming `path` step-by-step along every resolved call, deref, field, and local binding,
-    /// and projecting the root head's `HeadRegions` along the exact final path.
+    /// transforming `path` step-by-step along every resolved call, deref, field, constructor,
+    /// destructuring pattern, and local binding, and projecting the root head's `HeadRegions`
+    /// along the exact final path.
     #[allow(clippy::type_complexity)]
     fn trace_dyn_path(
         &self,
@@ -1695,8 +1962,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         use blaze_typeck::{Def, Stmt, UnOp};
 
         let facts: &'b F = self.facts;
+        let max_steps = self.body.exprs.len().saturating_add(self.body.stmts.len()).saturating_add(16);
+        let mut visited: Vec<ExprId, A> = Vec::new_in(self.alloc);
         let mut cur = start;
-        for _ in 0..24 {
+        for _ in 0..max_steps {
+            if visited.scan_for(&cur).is_some() {
+                return Ok(None);
+            }
+            visited.push(cur);
             if !self.reverse_expr_adjusts(cur, &mut path, heads, e) {
                 return Ok(None);
             }
@@ -1786,15 +2059,54 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     }
                     cur = base;
                 }
+                Expr::Struct { fields, .. } => {
+                    let Some(&DynPathStep::AdtArg(param_p)) = path.first() else { return Ok(None) };
+                    let Some((adt, variant)) = (match self.expr_def(cur) {
+                        Some(Def::Ctor { adt, variant, .. }) => Some((adt, variant)),
+                        Some(Def::Adt(adt)) if facts.adt(adt).is_some_and(|a| !a.is_enum) => Some((adt, 0)),
+                        _ => None,
+                    }) else {
+                        return Ok(None);
+                    };
+                    let Some(fs) = self.body.field_inits.get(fields.range()) else { return Ok(None) };
+                    let mut chosen: Option<(ExprId, Vec<DynPathStep, A>)> = None;
+                    let mut prefix: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
+                    for f in fs {
+                        let Some(fi) = facts.field(adt, variant, f.name) else { continue };
+                        let Ok(col) = facts.regions().field(adt, variant, fi) else { continue };
+                        if self.find_unique_param_path(col.ty(), param_p, heads, &mut prefix, e) {
+                            if chosen.is_some() {
+                                return Ok(None);
+                            }
+                            let mut saved: Vec<DynPathStep, A> = Vec::with_capacity_in(prefix.len(), self.alloc);
+                            saved.extend_from_slice(&prefix);
+                            chosen = Some((f.expr, saved));
+                        }
+                    }
+                    let Some((field_expr, field_prefix)) = chosen else { return Ok(None) };
+                    Self::replace_path_prefix(&mut path, &field_prefix, 1);
+                    cur = field_expr;
+                }
                 Expr::Call { callee, args } => {
-                    if let Some(Def::Ctor { adt, variant, .. }) = self.expr_def(callee)
-                        && let Some(&[only]) = self.body.expr_lists.get(args.range())
-                        && let Ok(col) = facts.regions().field(adt, variant, 0)
-                        && let Some((param_p, rem_start)) = self.match_head_path_to_param(col.ty(), &path, heads, e)
-                    {
-                        let _ = param_p;
-                        Self::replace_path_prefix(&mut path, &[], rem_start);
-                        cur = only;
+                    if let Some(Def::Ctor { adt, variant, .. }) = self.expr_def(callee) {
+                        let Some(&DynPathStep::AdtArg(param_p)) = path.first() else { return Ok(None) };
+                        let Some(es) = self.body.expr_lists.get(args.range()) else { return Ok(None) };
+                        let mut chosen: Option<(ExprId, Vec<DynPathStep, A>)> = None;
+                        let mut prefix: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
+                        for (j, &arg_e) in es.iter().enumerate() {
+                            let Ok(col) = facts.regions().field(adt, variant, to_u32(j)) else { continue };
+                            if self.find_unique_param_path(col.ty(), param_p, heads, &mut prefix, e) {
+                                if chosen.is_some() {
+                                    return Ok(None);
+                                }
+                                let mut saved: Vec<DynPathStep, A> = Vec::with_capacity_in(prefix.len(), self.alloc);
+                                saved.extend_from_slice(&prefix);
+                                chosen = Some((arg_e, saved));
+                            }
+                        }
+                        let Some((arg_e, field_prefix)) = chosen else { return Ok(None) };
+                        Self::replace_path_prefix(&mut path, &field_prefix, 1);
+                        cur = arg_e;
                         continue;
                     }
                     let callee_item = self.callee_of(cur).map(|(k, _)| k).or_else(|| match self.expr_def(callee) {
@@ -1864,38 +2176,46 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     let Some(arm) = live_arm else { return Ok(None) };
                     if let Expr::Local(v) = self.expr(arm.body)?
                         && self.pat_contains(arm.pat, v)?
-                        && let Expr::Call { args, .. } = self.expr(scrutinee)?
-                        && let Some(&[only]) = self.body.expr_lists.get(args.range())
                     {
-                        if let (Ok(only_ty), Ok(arm_ty)) = (self.adjusted_ty(only), self.expr_ty(arm.body))
-                            && let Ok(PNode::Adt(_, adt_args)) = self.node(only_ty, e)
-                            && let Some(pos) = self.list(adt_args, e)?.iter().position(|&a| a == arm_ty)
-                        {
-                            Self::prepend_path_step(&mut path, DynPathStep::AdtArg(to_u32(pos)));
-                            cur = only;
-                            continue;
+                        match self.trace_pat_bind(arm.pat, v, &mut path, heads, want_dyn, e)? {
+                            Some(Some(m)) => return Ok(Some(m)),
+                            Some(None) => {
+                                cur = scrutinee;
+                                continue;
+                            }
+                            None => return Ok(None),
                         }
-                        return Ok(None);
                     }
                     cur = arm.body;
                 }
                 Expr::Local(p) => {
-                    if let Some((adt, variant, field)) = self.pat_field_source(p)?
-                        && let Ok(col) = facts.regions().field(adt, variant, field)
-                    {
-                        return self.project_head_path(col.ty(), col.as_slice(), 0, &path, heads, want_dyn, e);
+                    // 1. Direct or destructured owner parameter (e.g. `Holder { readers }: Holder<Vec<Reader>>`).
+                    let mut owner_param: Option<(usize, PatId)> = None;
+                    for (ix, &param_pat) in self.body.params.iter().enumerate() {
+                        if self.pat_contains(param_pat, p)? {
+                            owner_param = Some((ix, param_pat));
+                            break;
+                        }
                     }
-                    if let Some(param) = self.body.params.iter().position(|x| *x == p)
-                        && let Ok(param32) = u32::try_from(param)
-                        && let Ok(own_sig) = facts.sig(self.body.owner)
-                        && let Some(in_slots) = own_sig.input(param32)
-                        && let Ok(in_ty) = self.sig_declared(own_sig, param32, e)
-                    {
-                        let base = self.fn_sig_param_binder(own_sig, param32, heads);
-                        return self.project_head_path(in_ty, in_slots, base, &path, heads, want_dyn, e);
+                    if let Some((param_ix, param_pat)) = owner_param {
+                        match self.trace_pat_bind(param_pat, p, &mut path, heads, want_dyn, e)? {
+                            Some(Some(m)) => return Ok(Some(m)),
+                            Some(None) => {
+                                if let Ok(param32) = u32::try_from(param_ix)
+                                    && let Ok(own_sig) = facts.sig(self.body.owner)
+                                    && let Some(in_slots) = own_sig.input(param32)
+                                    && let Ok(in_ty) = self.sig_declared(own_sig, param32, e)
+                                {
+                                    let base = self.fn_sig_param_binder(own_sig, param32, heads);
+                                    return self.project_head_path(in_ty, in_slots, base, &path, heads, want_dyn, e);
+                                }
+                                return Ok(None);
+                            }
+                            None => return Ok(None),
+                        }
                     }
-                    // Trace through an unannotated, unreassigned `let p = init;` (exact binding
-                    // `pat == p`, so no destructuring offset is dropped).
+                    // 2. Unreassigned local bound by `let pat = init`, `match scrutinee { pat => .. }`,
+                    //    or `if let pat = init`.
                     let reassigned = self.body.exprs.iter().any(|ex| {
                         matches!(
                             *ex,
@@ -1906,19 +2226,46 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     if reassigned {
                         return Ok(None);
                     }
-                    let mut init_expr: Option<ExprId> = None;
+                    let mut source: Option<(PatId, ExprId)> = None;
                     for stmt in self.body.stmts.iter() {
                         if let Stmt::Let { pat, ty, init: Some(i), .. } = *stmt
-                            && pat == p
+                            && self.pat_contains(pat, p)?
                         {
-                            if ty.is_some() || init_expr.is_some() {
+                            if ty.is_some() || source.is_some() {
                                 return Ok(None);
                             }
-                            init_expr = Some(i);
+                            source = Some((pat, i));
                         }
                     }
-                    let Some(init) = init_expr else { return Ok(None) };
-                    cur = init;
+                    for expr in self.body.exprs.iter() {
+                        match *expr {
+                            Expr::Let { pat, init } if self.pat_contains(pat, p)? => {
+                                if source.is_some() {
+                                    return Ok(None);
+                                }
+                                source = Some((pat, init));
+                            }
+                            Expr::Match { scrutinee, arms } => {
+                                if let Some(arm_list) = self.body.arms.get(arms.range()) {
+                                    for arm in arm_list.iter() {
+                                        if self.pat_contains(arm.pat, p)? {
+                                            if source.is_some() {
+                                                return Ok(None);
+                                            }
+                                            source = Some((arm.pat, scrutinee));
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let Some((bind_pat, init)) = source else { return Ok(None) };
+                    match self.trace_pat_bind(bind_pat, p, &mut path, heads, want_dyn, e)? {
+                        Some(Some(m)) => return Ok(Some(m)),
+                        Some(None) => cur = init,
+                        None => return Ok(None),
+                    }
                 }
                 _ => return Ok(None),
             }

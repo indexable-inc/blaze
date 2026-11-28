@@ -161,6 +161,12 @@ impl<A: Allocator + Copy> Builder<A> {
     pub(crate) fn known_edges(&self) -> &[(Origin, Origin)] {
         self.inner.known_edges()
     }
+    pub(crate) fn subset_edges(&self) -> &[(blaze_flow::Stmt, Origin, Origin)] {
+        self.inner.subset_edges()
+    }
+    pub(crate) fn is_placeholder(&self, o: Origin) -> bool {
+        self.inner.is_placeholder(o)
+    }
     pub(crate) fn block(&mut self) -> Block {
         self.inner.block()
     }

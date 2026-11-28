@@ -659,6 +659,158 @@ fn copy_trait_region_short_err<'short, T: Marker<'short>>(m: Marked<T>) {
     let _ = (a, b);
 }
 
+struct MarkedLt<'a, T>(PhantomData<&'a ()>, PhantomData<T>);
+impl<'a, T: Copy + Marker<'a>> Copy for MarkedLt<'a, T> {}
+impl<'a, T: Copy + Marker<'a>> Clone for MarkedLt<'a, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_trait_region_param_ok<'a, T: Copy + Marker<'a>>(m: MarkedLt<'a, T>) {
+    let a = m;
+    let b = m;
+    let _ = (a, b);
+}
+
+fn copy_trait_region_param_static_ok<T: Copy + Marker<'static>>(m: MarkedLt<'static, T>) {
+    let a = m;
+    let b = m;
+    let _ = (a, b);
+}
+
+fn copy_trait_region_param_mismatch_err<'a, 'b, T: Copy + Marker<'b>>(m: MarkedLt<'a, T>) {
+    let a = m;
+    let b = m;
+    let _ = (a, b);
+}
+
+fn copy_outlives_match_guard_ok<'a, T: 'a>(t: OutlivesToken<'a, T>) {
+    match t {
+        x if true => {
+            let _ = (x, t);
+        }
+        _ => {}
+    }
+}
+
+fn copy_outlives_match_guard_err<'short>(t: OutlivesToken<'static, &'short u8>) {
+    match t {
+        x if true => {
+            let _ = (x, t);
+        }
+        _ => {}
+    }
+}
+
+fn copy_outlives_closure_capture_ok<'a, T: 'a>(t: OutlivesToken<'a, T>) {
+    let c = move || {
+        let _x = t;
+    };
+    let a = c;
+    let b = c;
+    let _ = (a, b);
+}
+
+fn copy_outlives_closure_capture_err<'short>(t: OutlivesToken<'static, &'short u8>) {
+    let c = move || {
+        let _x = t;
+    };
+    let a = c;
+    let b = c;
+    let _ = (a, b);
+}
+
+struct BoxSink<T>(T);
+impl<T> BoxSink<T> {
+    fn push(&mut self, _v: T) {}
+}
+
+fn dyn_expect_ctor_wrap_seed_ok(seed: Reader) {
+    let mut w = BoxSink(seed);
+    w.push(Box::new(move |link| link.downcast()));
+}
+
+struct MethodSink;
+impl MethodSink {
+    fn put<T>(&mut self, _exemplar: &T, _value: T) {}
+}
+
+fn dyn_expect_method_sibling_ok(exemplar: &Reader) {
+    let mut s = MethodSink;
+    s.put(exemplar, Box::new(move |link| link.downcast()));
+}
+
+fn id_res<T, E>(r: Result<T, E>) -> Result<T, E> {
+    r
+}
+
+fn dyn_expect_match_ok_static_ok<'a>(res: Result<Vec<Reader>, Vec<Box<dyn Fn(&(dyn MyErr + 'a)) -> bool>>>) {
+    let mut v = match id_res(res) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    v.push(Box::new(move |link| link.downcast()));
+}
+
+fn dyn_expect_match_err_elided_err(res: Result<Vec<Reader>, Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool>>>) {
+    let mut v = match id_res(res) {
+        Err(v) => v,
+        Ok(_) => return,
+    };
+    v.push(Box::new(move |link| link.downcast()));
+}
+
+fn dyn_expect_match_err_short_err<'a>(res: Result<Vec<Reader>, Vec<Box<dyn Fn(&(dyn MyErr + 'a)) -> bool>>>) {
+    let mut v = match id_res(res) {
+        Err(v) => v,
+        Ok(_) => return,
+    };
+    v.push(Box::new(move |link| link.downcast()));
+}
+
+struct Holder<T> {
+    readers: T,
+}
+
+fn dyn_expect_destructured_generic_param_ok(Holder { mut readers }: Holder<Vec<Reader>>) {
+    readers.push(Box::new(move |link| link.downcast()));
+}
+
+fn dyn_expect_long_alias_chain_ok(v0: &mut Vec<Reader>) {
+    let v1 = v0;
+    let v2 = v1;
+    let v3 = v2;
+    let v4 = v3;
+    let v5 = v4;
+    let v6 = v5;
+    let v7 = v6;
+    let v8 = v7;
+    let v9 = v8;
+    let v10 = v9;
+    let v11 = v10;
+    let v12 = v11;
+    let v13 = v12;
+    let v14 = v13;
+    let v15 = v14;
+    let v16 = v15;
+    let v17 = v16;
+    let v18 = v17;
+    let v19 = v18;
+    let v20 = v19;
+    let v21 = v20;
+    let v22 = v21;
+    let v23 = v22;
+    let v24 = v23;
+    let v25 = v24;
+    let v26 = v25;
+    let v27 = v26;
+    let v28 = v27;
+    let v29 = v28;
+    let v30 = v29;
+    v30.push(Box::new(move |link| link.downcast()));
+}
+
 trait Sealed {}
 trait Alignment: Sealed {}
 trait Invariants {
@@ -777,13 +929,22 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         "dyn_expect_static_chained_unwrap",
         "dyn_expect_param_vec_tuple",
         "dyn_expect_owner_return_ok",
+        "dyn_expect_ctor_wrap_seed_ok",
+        "dyn_expect_method_sibling_ok",
+        "dyn_expect_match_ok_static_ok",
+        "dyn_expect_destructured_generic_param_ok",
+        "dyn_expect_long_alias_chain_ok",
         "copy_proj_shared_ok",
         "copy_proj_generic_tuple_shared_ok",
         "copy_outlives_static_scalar_ok",
         "copy_outlives_static_ref_ok",
         "copy_outlives_free_fn_bound_ok",
         "copy_outlives_generic_bound_ok",
+        "copy_outlives_match_guard_ok",
+        "copy_outlives_closure_capture_ok",
         "copy_trait_region_static_ok",
+        "copy_trait_region_param_ok",
+        "copy_trait_region_param_static_ok",
     ] {
         let body = find(ok_fn);
         let (types, v) = world.check_borrows(body, heap.alloc());
@@ -793,7 +954,7 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
 
     // Negative controls: non-`'static` `dyn Fn(&(dyn MyErr + '_))` MUST still fail with E0521
     // (including beside an unrelated `&READERS` sibling arg, unrelated owner param, sibling arg
-    // using a different generic parameter, or through an unrelated unary wrapper call).
+    // using a different generic parameter, unrelated unary wrapper call, or `Err(v)` match arm).
     for err_fn in [
         "dyn_expect_negative_elided",
         "dyn_expect_negative_unrelated_owner_param",
@@ -801,6 +962,7 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         "dyn_expect_negative_unrelated_wrapper_call",
         "dyn_expect_negative_unrelated_sibling",
         "dyn_expect_negative_unrelated_unary_call",
+        "dyn_expect_match_err_elided_err",
     ] {
         let body = find(err_fn);
         let (types, v) = world.check_borrows(body, heap.alloc());
@@ -813,9 +975,22 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         );
     }
 
+    // Named early-bound `'a` in `Err(v)` arm must also fail borrowck (cannot satisfy `'static`).
+    {
+        let body = find("dyn_expect_match_err_short_err");
+        let (types, v) = world.check_borrows(body, heap.alloc());
+        assert!(types.is_clean(), "dyn_expect_match_err_short_err types: {types:?}");
+        assert!(v.refused.is_none(), "dyn_expect_match_err_short_err refused: {:?}", v.refused);
+        assert!(
+            !v.findings.is_empty(),
+            "dyn_expect_match_err_short_err expected outlives error, got: {}",
+            shown(text_of(body), &v)
+        );
+    }
+
     // Negative controls: `Ptr` with `Aliasing = Exclusive` (including Copy markers and generic
-    // tuples), `OutlivesToken` with unproven `T: 'a` `Copy` bounds, and `Marked<T>` with weaker
-    // `T: Marker<'short>` owner bounds MUST still fail with E0382.
+    // tuples), `OutlivesToken` with unproven `T: 'a` `Copy` bounds (including closure captures),
+    // and `Marked`/`MarkedLt` with weaker or mismatched `Marker<'r>` bounds MUST fail with E0382.
     for err_fn in [
         "copy_proj_exclusive_err",
         "copy_proj_exclusive_copy_arg_err",
@@ -823,7 +998,10 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         "copy_outlives_unproven_err",
         "copy_outlives_unproven_param_err",
         "copy_outlives_free_fn_missing_bound_err",
+        "copy_outlives_match_guard_err",
+        "copy_outlives_closure_capture_err",
         "copy_trait_region_short_err",
+        "copy_trait_region_param_mismatch_err",
     ] {
         let body = find(err_fn);
         let (types, v) = world.check_borrows(body, heap.alloc());
