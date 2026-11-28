@@ -253,16 +253,29 @@ pub(crate) fn lang_places_of<A: core::alloc::Allocator>(
 /// Content-addressed CAS key for a pack/dependency file's encoded `(surface, FileItems)` record.
 /// Built purely from registered `blaze_drive::key` primitives (`FILE_SOURCE_DOMAIN`,
 /// `CONTENT_DOMAIN`, `VALUE_DOMAIN`, `TASK_DOMAIN`) and covering all four `blaze-file-items`
-/// outliner domains, the file edition, and the file text's `FILE_DOMAIN` digest (rule 21).
+/// outliner domains, the compile-time compiler-crate source closure (`CODE_BUILDER_SOURCE`, which
+/// covers `blaze-file-items`, `blaze-surface`, and `parser` so any outliner/surface/encoding
+/// change automatically invalidates stale CAS entries even without a manual domain bump while
+/// CLI-only rebuilds stay warm), the file edition, and the file text's `FILE_DOMAIN` digest
+/// (rule 21, rule 54).
 pub(crate) fn pack_file_items_key(edition: blaze_surface::Edition, text_digest: ContentId) -> Key {
+    pack_file_items_key_with_producer(edition, text_digest, crate::producers::CODE_BUILDER_SOURCE)
+}
+
+pub(crate) fn pack_file_items_key_with_producer(
+    edition: blaze_surface::Edition,
+    text_digest: ContentId,
+    producer_digest: [u8; 32],
+) -> Key {
     let source = blaze_drive::key::file_source(text_digest, edition.byte());
     let name = Name::new(blaze_drive::Kind::FileItems, text_digest);
-    let base = blaze_drive::key::content_key(b"pack-file-items-v1");
+    let base = blaze_drive::key::content_key(b"pack-file-items-v2");
     let reads = [
         (Name::new(blaze_drive::Kind::FileItems, blaze_drive::key::content_key(blaze_file_items::SURFACE_DOMAIN.as_bytes()).0), blaze_drive::key::ABSENT),
         (Name::new(blaze_drive::Kind::FileItems, blaze_drive::key::content_key(blaze_file_items::ITEM_DOMAIN.as_bytes()).0), blaze_drive::key::ABSENT),
         (Name::new(blaze_drive::Kind::FileItems, blaze_drive::key::content_key(blaze_file_items::SIGNATURE_DOMAIN.as_bytes()).0), blaze_drive::key::ABSENT),
         (Name::new(blaze_drive::Kind::FileItems, blaze_drive::key::content_key(blaze_file_items::NAMES_DOMAIN.as_bytes()).0), blaze_drive::key::ABSENT),
+        (Name::new(blaze_drive::Kind::FileItems, ContentId(producer_digest)), blaze_drive::key::ABSENT),
     ];
     let tool = blaze_drive::Tool(blaze_drive::key::value_key(base, &reads).0);
     blaze_drive::key::task_key(tool, name, &source)
@@ -1354,8 +1367,19 @@ mod tests {
         let k2021 = pack_file_items_key(Edition::E2021, digest);
         let k2024 = pack_file_items_key(Edition::E2024, digest);
         let k_other = pack_file_items_key(Edition::E2021, other_digest);
+        let k_old_producer = pack_file_items_key_with_producer(Edition::E2021, digest, [0x11; 32]);
+        let k_new_producer = pack_file_items_key_with_producer(Edition::E2021, digest, [0x22; 32]);
         assert_ne!(k2021, k2024, "pack FileItems CAS key must distinguish editions (rule 21)");
         assert_ne!(k2021, k_other, "pack FileItems CAS key must distinguish file digests (rule 21)");
+        assert_ne!(
+            k_old_producer, k_new_producer,
+            "pack FileItems CAS key must distinguish compiler-crate producer digests (rule 21, rule 54)"
+        );
+        assert_eq!(
+            k2021,
+            pack_file_items_key_with_producer(Edition::E2021, digest, crate::producers::CODE_BUILDER_SOURCE),
+            "pack_file_items_key must bind CODE_BUILDER_SOURCE"
+        );
 
         let outline = blaze_file_items::outline(text, Edition::E2021, alloc);
         let raw = outline.to_file_items(text, digest, alloc).expect("to_file_items");
@@ -1394,6 +1418,94 @@ mod tests {
         // Lazy `ScopeRecords::slots` stays unallocated until first crate ask.
         let scope_records = ScopeRecords::new(&snapshot, 16, heap);
         assert!(scope_records.slots.get().is_none(), "unused ScopeRecords must not allocate slots");
+    }
+
+    /// Regression test for the #2861 (`lowered_one_by_one` on `Trait`/`Impl`) stale pack
+    /// `FileItems` CAS bug (`ItemsRecordError::Stale` -> `HeadError::NoText` on `alloc::string::String`
+    /// and `core::clone::Clone`):
+    /// - Positive: a stale record with an old `surface` digest stored under a previous producer's
+    ///   key is ignored by `ScopeRecords::cached_pack_file_items`, which misses the stale entry,
+    ///   re-outlines the file fresh, and returns the current `surface`.
+    /// - Negative (Rule 23 causal control): planting the same stale `surface` record under the
+    ///   CURRENT key returns the stale `surface` (mismatching the fresh outline's `surface`),
+    ///   reproducing the exact `ItemsRecordError::Stale` mismatch that caused `HeadError::NoText`.
+    #[test]
+    fn stale_pack_file_items_under_prior_producer_key_never_poisons_current_surface() {
+        use crate::store::{CommandStore, Facts, Home};
+
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let shared = heap.shared();
+        // Mirrors `library/alloc/src/string.rs` and `library/core/src/clone.rs`: a type/trait
+        // whose `impl` block has an associated method carrying `#[cfg_attr(...)]`.
+        let text = "#![no_core]\npub struct String;\nimpl String {\n    #[cfg_attr(debug_assertions, track_caller)]\n    pub fn new() -> Self { String }\n}\n";
+        let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
+        let outline = blaze_file_items::outline(text, Edition::E2024, alloc);
+        let raw = outline.to_file_items(text, digest, alloc).expect("to_file_items");
+        let fresh_surface = outline.surface();
+        let stale_surface = ContentId([0xaa; 32]);
+        assert_ne!(stale_surface, fresh_surface, "control stale surface must differ from current surface");
+
+        let old_producer = [0x01; 32];
+        assert_ne!(old_producer, crate::producers::CODE_BUILDER_SOURCE);
+        let stale_key = pack_file_items_key_with_producer(Edition::E2024, digest, old_producer);
+        let current_key = pack_file_items_key(Edition::E2024, digest);
+        assert_ne!(stale_key, current_key, "prior producer key must not collide with current key");
+
+        let encode_with_surface = |key: Key, surface: ContentId| {
+            let head = pack_file_items_head(key, digest, surface, raw.len(), alloc);
+            let mut buf = Vec::with_capacity_in(head.len() + raw.len(), shared);
+            buf.extend_from_slice(&head);
+            buf.extend_from_slice(&raw);
+            buf
+        };
+
+        // Positive case: stale surface record sits in CAS under the old producer's key.
+        // `ScopeRecords::cached_pack_file_items` must miss it and compute `fresh_surface`.
+        let io = Io::simulated(SimWorld::new(72, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root context");
+        let err = io.need_err().expect("stderr");
+        let home = Home::of(&cx, &io.need_fs().expect("files"), Some("/h-pos")).expect("test home");
+        let lent = home.open_store(&blaze_cas::plain::Settings::default(), Facts { boot: Some(1), nonce: 72 }, alloc).expect("store");
+        let mut store = CommandStore::new(&cx, &lent, false, 0, None, io.need_clock().expect("clock"), &err, alloc).expect("command store");
+        let stale_old_bytes = encode_with_surface(stale_key, stale_surface);
+        store.put(&cx, stale_key, &stale_old_bytes).expect("put stale record under old producer key");
+        let snap_pos = store.commit_for_body_reads().expect("commit positive snapshot");
+        let scope_pos = ScopeRecords::new(&snap_pos, 4, heap);
+        let opened_pos = scope_pos
+            .cached_pack_file_items(1, 2, 0, Edition::E2024, text, false)
+            .expect("cached_pack_file_items must return Some")
+            .expect("positive path must succeed");
+        assert_eq!(
+            opened_pos.surface, fresh_surface,
+            "stale pack FileItems under prior producer key must not poison current surface"
+        );
+
+        // Negative causal control (Rule 23): planting the stale surface under `current_key`
+        // (what happened before NAMES_DOMAIN + CODE_BUILDER_SOURCE were bound) returns
+        // `stale_surface != fresh_surface`, reproducing the exact `ItemsRecordError::Stale` cause.
+        let io_neg = Io::simulated(SimWorld::new(73, Limits::USUAL));
+        let cx_neg = io_neg.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root context");
+        let err_neg = io_neg.need_err().expect("stderr");
+        let home_neg = Home::of(&cx_neg, &io_neg.need_fs().expect("files"), Some("/h-neg")).expect("test home");
+        let lent_neg = home_neg.open_store(&blaze_cas::plain::Settings::default(), Facts { boot: Some(1), nonce: 73 }, alloc).expect("store");
+        let mut store_neg = CommandStore::new(&cx_neg, &lent_neg, false, 0, None, io_neg.need_clock().expect("clock"), &err_neg, alloc).expect("command store");
+        let stale_cur_bytes = encode_with_surface(current_key, stale_surface);
+        store_neg.put(&cx_neg, current_key, &stale_cur_bytes).expect("put stale record under current key");
+        let snap_neg = store_neg.commit_for_body_reads().expect("commit negative snapshot");
+        let scope_neg = ScopeRecords::new(&snap_neg, 4, heap);
+        let opened_neg = scope_neg
+            .cached_pack_file_items(1, 2, 0, Edition::E2024, text, false)
+            .expect("cached_pack_file_items must return Some")
+            .expect("negative control opens planted record");
+        assert_eq!(
+            opened_neg.surface, stale_surface,
+            "causal control: colliding key surfaces the planted stale digest"
+        );
+        assert_ne!(
+            opened_neg.surface, fresh_surface,
+            "causal control: colliding stale digest disagrees with fresh outline surface"
+        );
     }
 
     #[test]

@@ -221,8 +221,10 @@ pub const ITEM_DOMAIN: &str = "blaze v2 file item merkle 3";
 pub const SIGNATURE_DOMAIN: &str = "blaze v2 file item signature 2";
 
 /// The domain of an entry's names digest ([`Outline::names_digest`]): what name resolution can
-/// observe of it without its types (crate::names_digest).
-pub const NAMES_DOMAIN: &str = "blaze v2 file item names 1";
+/// observe of it without its types (crate::names_digest). `2` since #2861: `lowered_one_by_one`
+/// includes `ItemDetail::Trait` and `ItemDetail::Impl` so attributes on associated items move
+/// their names digest and file surface.
+pub const NAMES_DOMAIN: &str = "blaze v2 file item names 2";
 
 /// The domain of [`Outline::surface`] (the drive's `Surface` part). `v2` since 2026-11-16: the
 /// surface hashes each entry's names digest, no longer its signature digest, so a surface of

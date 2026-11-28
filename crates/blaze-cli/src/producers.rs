@@ -141,6 +141,40 @@ mod tests {
             "editing blaze-export must keep ProducerId<CodeBuilder> stable"
         );
 
+        // Editing `blaze-file-items` (`names_digest.rs`), `blaze-surface` (`file_items.rs`), or
+        // `parser` MUST invalidate `ProducerId<CodeBuilder>` and `pack_file_items_key_with_producer`
+        // (Rule 21, Rule 54: prevents stale cached pack `FileItems` surfaces from causing
+        // `ItemsRecordError::Stale` -> `HeadError::NoText` after outliner/names_digest changes).
+        let sample_digest = blaze_ids::ContentId::of("producers test file", b"struct S; impl S { #[cfg_attr(a, inline)] fn f() {} }");
+        let base_pack_key = crate::front_load::pack_file_items_key_with_producer(
+            blaze_surface::Edition::E2024,
+            sample_digest,
+            CODE_BUILDER_SOURCE,
+        );
+        for rel in [
+            "crates/blaze-file-items/src/names_digest.rs",
+            "crates/blaze-surface/src/file_items.rs",
+            "crates/parser/src/lib.rs",
+        ] {
+            let edited = walk_workspace_code_builder(
+                &workspace_root,
+                Some((rel, b"// simulated outliner edit\n")),
+            );
+            assert_ne!(
+                edited, CODE_BUILDER_SOURCE,
+                "editing {rel} MUST invalidate ProducerId<CodeBuilder> (Rule 21)"
+            );
+            let edited_pack_key = crate::front_load::pack_file_items_key_with_producer(
+                blaze_surface::Edition::E2024,
+                sample_digest,
+                edited,
+            );
+            assert_ne!(
+                edited_pack_key, base_pack_key,
+                "editing {rel} MUST move pack_file_items_key (Rule 21, Rule 54)"
+            );
+        }
+
         // Editing CLI glue (`blaze-cli`) MUST NOT change `ProducerId<CodeBuilder>`.
         let with_cli_edit = walk_workspace_code_builder(
             &workspace_root,
@@ -149,6 +183,15 @@ mod tests {
         assert_eq!(
             with_cli_edit, CODE_BUILDER_SOURCE,
             "editing blaze-cli glue must keep ProducerId<CodeBuilder> stable"
+        );
+        assert_eq!(
+            crate::front_load::pack_file_items_key_with_producer(
+                blaze_surface::Edition::E2024,
+                sample_digest,
+                with_cli_edit,
+            ),
+            base_pack_key,
+            "editing blaze-cli glue must keep pack_file_items_key warm across CLI-only rebuilds"
         );
     }
 
