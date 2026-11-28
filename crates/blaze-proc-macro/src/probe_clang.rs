@@ -1555,7 +1555,6 @@ fn replace_pairs_escape_dollar<'a>(text: &str, pairs: &[(&str, &str)], alloc: Al
     out
 }
 
-#[cfg(any(target_os = "linux", test))]
 fn own_str<'a>(s: &str, alloc: Alloc<'a>) -> AString<'a> {
     OwnString::from_str_in(s, alloc)
 }
