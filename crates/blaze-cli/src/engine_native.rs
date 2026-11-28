@@ -807,7 +807,11 @@ fn prepare_crates<'r, 'm: 's, 's>(
             }
         },
         Platform::LinuxArm64 => match standing.resolve_linux_sysroot() {
-            Ok(dir) => (None, crate::native_runner_c::TargetSdk::LinuxHost { dir }),
+            Ok(Some(sysroot)) => (
+                None,
+                crate::native_runner_c::TargetSdk::LinuxHost { dir: Some(sysroot.dir), lib_dir: sysroot.lib_dir },
+            ),
+            Ok(None) => (None, crate::native_runner_c::TargetSdk::LinuxHost { dir: None, lib_dir: None }),
             Err(why) => {
                 let ask = &standing.native;
                 return Err(NativeError::Sdk { words: held(bstd::mem::format_in!(scratch, "{why}").as_str(), ask) });

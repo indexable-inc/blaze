@@ -571,7 +571,7 @@ pub(crate) struct LazySdk<'f> {
     linux_sysroot_env: crate::sdk::LinuxSysrootEnv<'f>,
     frame: &'f Frame,
     resolved: core::cell::OnceCell<Result<blaze_apple_sdk::Sdk<'f>, blaze_apple_sdk::SdkRefused<'f>>>,
-    linux_sysroot: core::cell::OnceCell<Result<Option<&'f str>, crate::sdk::LinuxSysrootError<'f>>>,
+    linux_sysroot: core::cell::OnceCell<Result<Option<crate::sdk::LinuxHostSysroot<'f>>, crate::sdk::LinuxSysrootError<'f>>>,
 }
 
 impl<'f> LazySdk<'f> {
@@ -625,7 +625,7 @@ impl<'f> LazySdk<'f> {
 
     /// Resolves the Linux host sysroot root directory lazily on first demand (at most once per
     /// command via `OnceCell`, 0 ms cost on macOS and pure-Rust checks/runs).
-    fn resolve_linux_sysroot(&self) -> Result<Option<&'f str>, crate::sdk::LinuxSysrootError<'f>> {
+    fn resolve_linux_sysroot(&self) -> Result<Option<crate::sdk::LinuxHostSysroot<'f>>, crate::sdk::LinuxSysrootError<'f>> {
         *self.linux_sysroot.get_or_init(|| {
             crate::sdk::resolve_linux_host_sysroot(&self.linux_sysroot_env, self.frame)
         })
@@ -790,6 +790,7 @@ fn edge_at<'l, R>(
         linux_sysroot_env: crate::sdk::LinuxSysrootEnv {
             path: var("PATH"),
             nix_cflags_compile: var("NIX_CFLAGS_COMPILE"),
+            nix_ldflags: var("NIX_LDFLAGS"),
         },
         frame,
         resolved: core::cell::OnceCell::new(),
@@ -938,8 +939,8 @@ pub(crate) struct Standing<'r, 'm> {
     /// already-opened `~/.blaze` directory so pure-Rust starts pay 0 ms for SDK probing.
     sdk_resolver: &'r dyn Fn(&Cx, Option<&Dir<ReadWrite>>, u64) -> Result<blaze_apple_sdk::Sdk<'r>, blaze_apple_sdk::SdkRefused<'r>>,
     /// Deferred Linux host sysroot resolver (backed by `LazySdk`'s `OnceCell`, using only the
-    /// edge-injected `PATH` and `NIX_CFLAGS_COMPILE`).
-    linux_sysroot_resolver: &'r dyn Fn() -> Result<Option<&'r str>, crate::sdk::LinuxSysrootError<'r>>,
+    /// edge-injected `PATH`, `NIX_CFLAGS_COMPILE`, and `NIX_LDFLAGS`).
+    linux_sysroot_resolver: &'r dyn Fn() -> Result<Option<crate::sdk::LinuxHostSysroot<'r>>, crate::sdk::LinuxSysrootError<'r>>,
     home_dir: Option<&'r Dir<ReadWrite>>,
     /// Check-time command probes (`SharedCommandProbes`) carried into start-time proc-macro
     /// runners (`RunProcs`) so `run`/`test`/`export` reuse the exact probe/pin snapshot that
@@ -999,7 +1000,7 @@ impl<'r, 'm> Standing<'r, 'm> {
 
     /// Resolves the Linux host C library sysroot root directory lazily on first demand (at most
     /// once per command via `LazySdk`'s `OnceCell`).
-    pub(crate) fn resolve_linux_sysroot(&self) -> Result<Option<&'r str>, crate::sdk::LinuxSysrootError<'r>> {
+    pub(crate) fn resolve_linux_sysroot(&self) -> Result<Option<crate::sdk::LinuxHostSysroot<'r>>, crate::sdk::LinuxSysrootError<'r>> {
         (self.linux_sysroot_resolver)()
     }
     /// E2's answer (engine_run_answer.rs) over the stored rows and the store: what run_ids.rs
@@ -2421,6 +2422,7 @@ pub(crate) fn open_pinned_standing<R>(
         linux_sysroot_env: crate::sdk::LinuxSysrootEnv {
             path: var("PATH"),
             nix_cflags_compile: var("NIX_CFLAGS_COMPILE"),
+            nix_ldflags: var("NIX_LDFLAGS"),
         },
         frame,
         resolved: core::cell::OnceCell::new(),

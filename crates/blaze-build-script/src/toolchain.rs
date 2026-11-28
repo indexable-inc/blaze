@@ -214,6 +214,79 @@ pub fn for_each_nix_sysroot_candidate<'a>(flags: &'a str, mut each: impl FnMut(&
     }
 }
 
+/// Yields each candidate Linux libc library/CRT directory named by `-B` or `-L` flags in `flags`
+/// (e.g. a Nix wrapper's `nix-support/libc-crt1-cflags`, `nix-support/libc-ldflags`, or
+/// `NIX_LDFLAGS`).
+///
+/// Recognizes separated (`-L /nix/store/.../lib`, `-B "/nix/store/.../lib/"`) and joined
+/// (`-B/nix/store/.../lib/`, `-L/nix/store/.../lib`) forms. Yields normalized absolute paths with
+/// trailing slashes removed. Sans-IO: callers check for link artifacts such as `crt1.o`/`libc.so`.
+pub fn for_each_nix_lib_candidate<'a>(flags: &'a str, mut each: impl FnMut(&'a str)) {
+    let bytes = flags.as_bytes();
+    let mut at = 0usize;
+    let mut expect_dir = false;
+    let next_token = |at: &mut usize| -> Option<&'a str> {
+        while let Some(&b) = bytes.get(*at) {
+            if !b.is_ascii_whitespace() {
+                break;
+            }
+            *at += 1;
+        }
+        let &quote = bytes.get(*at)?;
+        if quote == b'"' || quote == b'\'' {
+            *at += 1;
+            let start = *at;
+            while let Some(&b) = bytes.get(*at) {
+                if b == quote {
+                    break;
+                }
+                *at += 1;
+            }
+            let token = flags.get(start..*at)?;
+            if bytes.get(*at) == Some(&quote) {
+                *at += 1;
+            }
+            Some(token)
+        } else {
+            let start = *at;
+            while let Some(&b) = bytes.get(*at) {
+                if b.is_ascii_whitespace() {
+                    break;
+                }
+                *at += 1;
+            }
+            flags.get(start..*at)
+        }
+    };
+    let mut emit_dir = |raw: &'a str| {
+        let trimmed = raw.trim_end_matches('/');
+        if trimmed.starts_with('/') && trimmed.len() > 1 {
+            each(trimmed);
+        }
+    };
+    while let Some(token) = next_token(&mut at) {
+        if expect_dir {
+            expect_dir = false;
+            emit_dir(token);
+            continue;
+        }
+        if token == "-B" || token == "-L" {
+            expect_dir = true;
+            continue;
+        }
+        if let Some(dir) = token.strip_prefix("-B").or_else(|| token.strip_prefix("-L"))
+            && !dir.is_empty()
+        {
+            let unquoted = dir
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| dir.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                .unwrap_or(dir);
+            emit_dir(unquoted);
+        }
+    }
+}
+
 /// Where a target's C library headers come from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sysroot {

@@ -4,7 +4,7 @@ use blaze_unit_graph::UnitId;
 
 use super::{
     CInputs, ClangPin, Mode, NATIVE_EVERY_MODE, PinError, SHELF_MEMBERS_LINUX, Shelf, Sysroot, c_env, clang_major, clang_pin, depfile_reads,
-    for_each_nix_sysroot_candidate, headers_digest, placement, shelf_missing_for, sysroot,
+    for_each_nix_lib_candidate, for_each_nix_sysroot_candidate, headers_digest, placement, shelf_missing_for, sysroot,
 };
 use crate::native::Runner;
 
@@ -150,4 +150,24 @@ fn nix_sysroot_candidates_parses_isystem_and_idirafter_flags() {
     // Negative controls: non-matching flags, relative paths, non-`/include` dirs, bare `/include`, dangling flag.
     let non_matching = "-I/nix/store/xxx/include -isystem relative/include -isystem /nix/store/xxx/not-include -isystem /nix/store/xxx/myinclude -idirafter /include -isystem";
     assert!(collect(non_matching).is_empty(), "non-matching flags must yield no candidates");
+}
+
+#[test]
+fn nix_lib_candidates_parses_crt_and_library_flags() {
+    fn collect(flags: &str) -> std::vec::Vec<&str> {
+        let mut out = std::vec::Vec::new();
+        for_each_nix_lib_candidate(flags, |dir| out.push(dir));
+        out
+    }
+
+    assert_eq!(
+        collect("-B/nix/store/nhph-glibc-2.44-57/lib/ "),
+        ["/nix/store/nhph-glibc-2.44-57/lib"]
+    );
+    assert_eq!(
+        collect(r#"-rpath /nix/store/x/lib -L /nix/store/a-glibc/lib/ -L"/nix/store/b-glibc/lib" -B '/nix/store/c-glibc/lib/'"#),
+        ["/nix/store/a-glibc/lib", "/nix/store/b-glibc/lib", "/nix/store/c-glibc/lib"]
+    );
+    // Negative controls: relative paths, bare `/`, unrelated flags, dangling `-L`.
+    assert!(collect("-I/nix/store/x/include -L relative/lib -B / -Wl,-rpath=/nix/store/x/lib -L").is_empty());
 }

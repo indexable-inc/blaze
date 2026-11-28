@@ -276,6 +276,53 @@ fn linux_host_native_setting_accepts_linux_shelf_and_features_h() {
         fs::write(headers.join("include/asm/errno.h"), b"#define EINVAL 22\n#define EAGAIN 11\n").expect("asm/errno.h v2");
         let split_b = command_native_setting(home_s, sdk_s, "test", LINUX_HOST, alloc).unwrap_or_else(|e| panic!("{e}"));
         assert_ne!(split_a.sdk_version.as_str(), split_b.sdk_version.as_str());
+
+        // Split libc runtime `sdk_lib` is canonicalized, stored, and hashed into `sdk_version`:
+        // changing any link input (e.g. `crt1.o`) invalidates `sdk_version`.
+        let libc_lib = home.join("glibc-2.44/lib");
+        fs::create_dir_all(&libc_lib).expect("glibc lib");
+        fs::write(libc_lib.join("crt1.o"), b"crt-v1").expect("crt1.o");
+        fs::write(libc_lib.join("libc.so"), b"GROUP ( libc.so.6 )\n").expect("libc.so");
+        let libc_lib_s = libc_lib.to_str().expect("utf8");
+        let with_lib_a = crate::native_setting::command_native_setting_with_lib(
+            home_s,
+            sdk_s,
+            Some(libc_lib_s),
+            "test",
+            LINUX_HOST,
+            alloc,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let expected_lib = fs::canonicalize(&libc_lib).expect("canon lib");
+        assert_eq!(with_lib_a.sdk_lib.as_ref().map(|s| s.as_str()), expected_lib.to_str());
+        assert_ne!(with_lib_a.sdk_version.as_str(), split_b.sdk_version.as_str());
+
+        fs::write(libc_lib.join("crt1.o"), b"crt-v2").expect("crt1.o v2");
+        let with_lib_b = crate::native_setting::command_native_setting_with_lib(
+            home_s,
+            sdk_s,
+            Some(libc_lib_s),
+            "test",
+            LINUX_HOST,
+            alloc,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_ne!(with_lib_a.sdk_version.as_str(), with_lib_b.sdk_version.as_str());
+
+        // Negative control: a symlink loop on `<sdk>/include/linux` propagates `NoSdk` naming
+        // `include/linux` instead of silently dropping `sdk_extra`.
+        let broken_sdk = home.join("glibc-broken");
+        fs::create_dir_all(broken_sdk.join("include")).expect("broken inc");
+        fs::write(broken_sdk.join(LINUX_HOST_SYSROOT_MARKER), b"#define __GLIBC__ 2\n").expect("broken features.h");
+        std::os::unix::fs::symlink(broken_sdk.join("include/linux"), broken_sdk.join("include/linux")).expect("loop symlink");
+        let loop_err = command_native_setting(home_s, broken_sdk.to_str().expect("utf8"), "test", LINUX_HOST, alloc)
+            .expect_err("symlink loop on include/linux must fail with NoSdk");
+        match loop_err {
+            NativeSettingError::NoSdk { path, .. } => {
+                assert!(path.as_str().ends_with("/include/linux"), "expected include/linux path, got {}", path.as_str());
+            }
+            other => panic!("expected NoSdk, got {other}"),
+        }
     }
     let _ = fs::remove_dir_all(&home);
 }

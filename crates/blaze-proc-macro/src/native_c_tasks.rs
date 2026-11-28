@@ -79,6 +79,9 @@ pub struct CTasksSetting<'s> {
     pub sdk: Laid<'s>,
     /// Optional extra read-only root for split Linux kernel headers (NixOS `linux-headers`).
     pub sdk_extra: Option<Laid<'s>>,
+    /// Optional split Linux libc runtime library directory (NixOS `<glibc-runtime>/lib`) mounted
+    /// read-only and passed via `LDFLAGS` for process-tree linking under Landlock.
+    pub sdk_lib: Option<Laid<'s>>,
     /// Which sysroot model clang uses (`MacosSdk` vs `LinuxHost`).
     pub sysroot: Sysroot,
     /// A folder of the home's, canonical and existing: each worker's task folder is under it.
@@ -812,6 +815,9 @@ impl ShelfTree<'_> {
         if let Some(extra) = self.setting.sdk_extra {
             out.push((extra.host, extra.digest));
         }
+        if let Some(lib) = self.setting.sdk_lib {
+            out.push((lib.host, lib.digest));
+        }
         out.push((self.setting.shelf.host, self.setting.shelf.digest));
         for tool in self.tools.tools {
             let digest = self.tools.keys.iter().find(|key| key.name == tool.name).map_or([0; 32], |key| key.digest);
@@ -858,6 +864,9 @@ impl TreeRunner for ShelfTree<'_> {
         if let Some(extra) = setting.sdk_extra {
             pairs.push((extra.guest, extra.host));
         }
+        if let Some(lib) = setting.sdk_lib {
+            pairs.push((lib.guest, lib.host));
+        }
         pairs.push((setting.shelf.guest, shelf));
         pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         // What a file is checked against and an error shows: every host folder, `tmp` too.
@@ -865,10 +874,11 @@ impl TreeRunner for ShelfTree<'_> {
         shown.push(("/tmp", tmp.as_str()));
 
         // 3. The grant: the shelf's compilers and archiver, the linker when a tool runs what
-        // the tree built (D112), each granted tool and what it starts; read the roots; write
-        // the tree's folder alone.
+        // the tree built (D112) or links against a split Linux libc root, each granted tool and
+        // what it starts; read the roots; write the tree's folder alone.
         let runs_out_dir = host_tools::runs_out_dir(self.tools.tools);
-        let linker: &[&str] = if runs_out_dir { &["bin/ld64.lld", "bin/ld.lld", "bin/lld"] } else { &[] };
+        let needs_linker = runs_out_dir || (setting.sysroot == Sysroot::LinuxHost && setting.sdk_lib.is_some());
+        let linker: &[&str] = if needs_linker { &["bin/ld64.lld", "bin/ld.lld", "bin/lld"] } else { &[] };
         let mut held: AVec<'a, AString<'a>> = Vec::new_in(alloc);
         for name in ["bin/clang-23", "bin/clang", "bin/clang++", "bin/llvm-ar"].iter().chain(linker) {
             let path = joined(&[shelf, "/", name], alloc);
@@ -977,7 +987,7 @@ impl TreeRunner for ShelfTree<'_> {
             // `CXXFLAGS`, `CPPFLAGS`, `ASFLAGS`), whether set or unset: no host folder reaches
             // any C, C++, preprocessed, or assembly object's debug information (rule 25, rule 54).
             inject_prefix_map_flags(&mut vars, &shown, alloc);
-            inject_linux_sysroot_flags(&mut vars, setting.sysroot, sdk, shelf, alloc);
+            inject_linux_sysroot_flags(&mut vars, setting.sysroot, sdk, setting.sdk_lib.map(|l| l.host), shelf, alloc);
             for (name, value) in tool_env.iter() {
                 vars.push((name.clone_in(alloc), value.clone_in(alloc)));
             }
@@ -1127,14 +1137,21 @@ fn inject_prefix_map_flags<'a>(
     }
 }
 
-/// For `Sysroot::LinuxHost`, injects the pinned clang resource dir (`-resource-dir`) and Linux
-/// sysroot/include flags (`--sysroot=...` and, for flat NixOS roots, `-idirafter <sdk>/include`)
-/// into every variable in [`PREFIX_MAP_FLAG_VARS`] that does not already carry an explicit
-/// `--sysroot` or `-isysroot`, matching direct object compilation in [`ShelfClang`].
+/// For `Sysroot::LinuxHost`, injects:
+/// - `-resource-dir <shelf>/lib/clang/<major>` into every variable in [`PREFIX_MAP_FLAG_VARS`]
+///   that does not already specify `-resource-dir` (always required under Linux Landlock where
+///   `/proc/self/exe` is outside the roots, even when a build supplies a custom `--sysroot`);
+/// - Linux sysroot/include flags (`--sysroot=...` and, for flat NixOS roots,
+///   `-idirafter <sdk>/include`) into every variable in [`PREFIX_MAP_FLAG_VARS`] that does not
+///   already carry `--sysroot` or `-isysroot`;
+/// - When `sdk_lib` is `Some(lib_dir)` (NixOS split glibc runtime), link flags
+///   (`-B<lib_dir> -L<lib_dir> -fuse-ld=lld -rtlib=compiler-rt --unwindlib=none`) into `LDFLAGS`
+///   so `configure`/`make` link probes find `crt1.o`, `libc.so`, and the shelf's `ld.lld`.
 fn inject_linux_sysroot_flags<'a>(
     vars: &mut AVec<'a, (AString<'a>, AString<'a>)>,
     sysroot: Sysroot,
     sdk: &str,
+    sdk_lib: Option<&str>,
     shelf: &str,
     alloc: Alloc<'a>,
 ) {
@@ -1142,34 +1159,68 @@ fn inject_linux_sysroot_flags<'a>(
         return;
     }
     let major = blaze_build_script::toolchain::clang_major(blaze_pins::CLANG_JSON).unwrap_or("23");
+    let mut resource_arg: AString<'a> = String::new_in(alloc);
+    resource_arg.push_str("-resource-dir ");
+    resource_arg.push_str(shelf);
+    resource_arg.push_str("/lib/clang/");
+    resource_arg.push_str(major);
+
     let mut sysroot_args: AVec<'a, AString<'a>> = Vec::new_in(alloc);
     crate::native_c::push_linux_sysroot_flags(sdk, &mut sysroot_args, alloc);
-    let mut extra: AString<'a> = String::new_in(alloc);
-    extra.push_str(" -resource-dir ");
-    extra.push_str(shelf);
-    extra.push_str("/lib/clang/");
-    extra.push_str(major);
-    for arg in sysroot_args.iter() {
-        extra.push(' ');
-        extra.push_str(arg.as_str());
+    let mut sysroot_text: AString<'a> = String::new_in(alloc);
+    for (at, arg) in sysroot_args.iter().enumerate() {
+        if at > 0 {
+            sysroot_text.push(' ');
+        }
+        sysroot_text.push_str(arg.as_str());
     }
-    let trimmed = extra.as_str().trim_start();
+
+    let append_tokens = |target: &mut AString<'a>, extra: &str| {
+        if extra.is_empty() {
+            return;
+        }
+        if !target.is_empty() {
+            target.push(' ');
+        }
+        target.push_str(extra);
+    };
+
     for flags in PREFIX_MAP_FLAG_VARS {
         match vars.iter().rposition(|(name, _)| name.as_str() == flags) {
             Some(at) => {
                 if let Some((_, value)) = vars.get_mut(at) {
-                    let existing = value.as_str();
-                    if existing.contains("--sysroot") || existing.contains("-isysroot") {
-                        continue;
+                    let has_resource = value.as_str().contains("-resource-dir");
+                    let has_sysroot = value.as_str().contains("--sysroot") || value.as_str().contains("-isysroot");
+                    if !has_resource {
+                        append_tokens(value, resource_arg.as_str());
                     }
-                    if existing.is_empty() {
-                        value.push_str(trimmed);
-                    } else {
-                        value.push_str(extra.as_str());
+                    if !has_sysroot {
+                        append_tokens(value, sysroot_text.as_str());
                     }
                 }
             }
-            None => vars.push((String::from_str_in(flags, alloc), String::from_str_in(trimmed, alloc))),
+            None => {
+                let mut combined = String::from_str_in(resource_arg.as_str(), alloc);
+                append_tokens(&mut combined, sysroot_text.as_str());
+                vars.push((String::from_str_in(flags, alloc), combined));
+            }
+        }
+    }
+
+    if let Some(lib_dir) = sdk_lib {
+        let mut ldflags: AString<'a> = String::new_in(alloc);
+        ldflags.push_str("-B");
+        ldflags.push_str(lib_dir);
+        ldflags.push_str(" -L");
+        ldflags.push_str(lib_dir);
+        ldflags.push_str(" -fuse-ld=lld -rtlib=compiler-rt --unwindlib=none");
+        match vars.iter().rposition(|(name, _)| name.as_str() == "LDFLAGS") {
+            Some(at) => {
+                if let Some((_, value)) = vars.get_mut(at) {
+                    append_tokens(value, ldflags.as_str());
+                }
+            }
+            None => vars.push((String::from_str_in("LDFLAGS", alloc), ldflags)),
         }
     }
 }
@@ -1239,29 +1290,46 @@ mod tree_spelling_tests {
         let alloc = blaze_own::testing::heap().alloc();
         let shelf = "/h/shelf";
 
-        // 1. Flat NixOS glibc-dev root: injects `-resource-dir`, `--sysroot=<sdk>`, and `-idirafter <sdk>/include`.
+        // 1. Flat NixOS glibc-dev + split glibc runtime `lib`: injects `-resource-dir`,
+        //    `--sysroot=<sdk>`, `-idirafter <sdk>/include`, and `LDFLAGS` for linking.
         let mut nix_vars: AVec<'_, (AString<'_>, AString<'_>)> = Vec::new_in(alloc);
         nix_vars.push((String::from_str_in("CFLAGS", alloc), String::from_str_in("-O2", alloc)));
         nix_vars.push((String::from_str_in("CXXFLAGS", alloc), String::from_str_in("--sysroot=/custom", alloc)));
-        inject_linux_sysroot_flags(&mut nix_vars, Sysroot::LinuxHost, "/nix/store/abc-glibc-dev", shelf, alloc);
+        nix_vars.push((String::from_str_in("ASFLAGS", alloc), String::from_str_in("-resource-dir /custom/res --sysroot=/custom", alloc)));
+        nix_vars.push((String::from_str_in("LDFLAGS", alloc), String::from_str_in("-Wl,--as-needed", alloc)));
+        inject_linux_sysroot_flags(
+            &mut nix_vars,
+            Sysroot::LinuxHost,
+            "/nix/store/abc-glibc-dev",
+            Some("/nix/store/def-glibc/lib"),
+            shelf,
+            alloc,
+        );
         fn lookup<'a>(vars: &'a AVec<'_, (AString<'_>, AString<'_>)>, name: &str) -> Option<&'a str> {
             vars.iter().rev().find(|(k, _)| k.as_str() == name).map(|(_, v)| v.as_str())
         }
         let expected_nix = "-resource-dir /h/shelf/lib/clang/23 --sysroot=/nix/store/abc-glibc-dev -idirafter /nix/store/abc-glibc-dev/include";
         assert_eq!(lookup(&nix_vars, "CFLAGS"), Some("-O2 -resource-dir /h/shelf/lib/clang/23 --sysroot=/nix/store/abc-glibc-dev -idirafter /nix/store/abc-glibc-dev/include"));
         assert_eq!(lookup(&nix_vars, "CPPFLAGS"), Some(expected_nix));
-        assert_eq!(lookup(&nix_vars, "ASFLAGS"), Some(expected_nix));
-        // Negative control: existing explicit `--sysroot` is preserved without duplicating flags.
-        assert_eq!(lookup(&nix_vars, "CXXFLAGS"), Some("--sysroot=/custom"));
+        // Custom `--sysroot` is preserved while STILL appending `-resource-dir` for Landlock.
+        assert_eq!(lookup(&nix_vars, "CXXFLAGS"), Some("--sysroot=/custom -resource-dir /h/shelf/lib/clang/23"));
+        // Negative control: existing explicit `-resource-dir` and `--sysroot` are both preserved.
+        assert_eq!(lookup(&nix_vars, "ASFLAGS"), Some("-resource-dir /custom/res --sysroot=/custom"));
+        // Split libc runtime link flags are appended to `LDFLAGS`.
+        assert_eq!(
+            lookup(&nix_vars, "LDFLAGS"),
+            Some("-Wl,--as-needed -B/nix/store/def-glibc/lib -L/nix/store/def-glibc/lib -fuse-ld=lld -rtlib=compiler-rt --unwindlib=none")
+        );
 
-        // 2. Standard FHS `/usr` root injects `--sysroot=/` without `-idirafter`.
+        // 2. Standard FHS `/usr` root without split `sdk_lib` injects `--sysroot=/` and no `LDFLAGS`.
         let mut fhs_vars: AVec<'_, (AString<'_>, AString<'_>)> = Vec::new_in(alloc);
-        inject_linux_sysroot_flags(&mut fhs_vars, Sysroot::LinuxHost, "/usr", shelf, alloc);
+        inject_linux_sysroot_flags(&mut fhs_vars, Sysroot::LinuxHost, "/usr", None, shelf, alloc);
         assert_eq!(lookup(&fhs_vars, "CFLAGS"), Some("-resource-dir /h/shelf/lib/clang/23 --sysroot=/"));
+        assert_eq!(lookup(&fhs_vars, "LDFLAGS"), None);
 
-        // 3. Negative control: macOS SDK does not receive Linux sysroot flags.
+        // 3. Negative control: macOS SDK does not receive Linux sysroot or linker flags.
         let mut mac_vars: AVec<'_, (AString<'_>, AString<'_>)> = Vec::new_in(alloc);
-        inject_linux_sysroot_flags(&mut mac_vars, Sysroot::MacosSdk, "/Library/SDKs/MacOSX.sdk", shelf, alloc);
+        inject_linux_sysroot_flags(&mut mac_vars, Sysroot::MacosSdk, "/Library/SDKs/MacOSX.sdk", Some("/nix/store/def-glibc/lib"), shelf, alloc);
         assert!(mac_vars.is_empty());
     }
 }

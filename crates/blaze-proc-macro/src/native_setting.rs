@@ -55,7 +55,11 @@ pub struct OwnedNativeSetting<'a> {
     /// Optional extra read-only root for split Linux kernel headers (e.g. NixOS where
     /// `<glibc-dev>/include/linux` symlinks into `/nix/store/<hash>-linux-headers-<ver>/include/linux`).
     pub sdk_extra: Option<AString<'a>>,
-    /// The SDK's `Version` (macOS) or marker SHA-256 hex (Linux host).
+    /// Optional split Linux libc runtime library directory (e.g. NixOS
+    /// `/nix/store/<hash>-glibc-<ver>/lib`, holding `crt1.o`, `libc.so`, `libc_nonshared.a`) used
+    /// when process-tree steps (`configure`/`make`) link against glibc under Landlock.
+    pub sdk_lib: Option<AString<'a>>,
+    /// The SDK's `Version` (macOS) or marker/tree SHA-256 hex (Linux host).
     pub sdk_version: AString<'a>,
     /// Which sysroot model `pins/clang.json` selected for the host.
     pub sysroot: Sysroot,
@@ -238,10 +242,24 @@ pub fn command_native_setting<'a>(
     host: &'a str,
     alloc: Alloc<'a>,
 ) -> Result<OwnedNativeSetting<'a>, NativeSettingError<'a>> {
+    command_native_setting_with_lib(home, sdk, None, command, host, alloc)
+}
+
+/// Same as [`command_native_setting`], optionally naming a separate Linux libc link-library
+/// directory (`sdk_lib`, e.g. NixOS `/nix/store/<hash>-glibc-<ver>/lib`) to validate, mount
+/// read-only for process-tree linking, and include in `sdk_version`.
+pub fn command_native_setting_with_lib<'a>(
+    home: &str,
+    sdk: &str,
+    sdk_lib: Option<&str>,
+    command: &str,
+    host: &'a str,
+    alloc: Alloc<'a>,
+) -> Result<OwnedNativeSetting<'a>, NativeSettingError<'a>> {
     let digest = hex(&toolchain::clang_pin(CLANG_JSON, host).map_err(NativeSettingError::Pin)?.sha256, alloc);
     let shelf = text(&[home, "/", SHELF_DIR, "/", digest.as_str()], alloc);
     let work = text(&[home, "/", NATIVE_WORK_DIR, "/", command], alloc);
-    native_setting(shelf.as_str(), sdk, work.as_str(), host, alloc)
+    native_setting_with_lib(shelf.as_str(), sdk, sdk_lib, work.as_str(), host, alloc)
 }
 
 /// The native setting from a named `shelf`, `sdk` and `work` folder (an example or a test that
@@ -251,6 +269,18 @@ pub fn command_native_setting<'a>(
 pub fn native_setting<'a>(
     shelf: &str,
     sdk: &str,
+    work: &str,
+    host: &'a str,
+    alloc: Alloc<'a>,
+) -> Result<OwnedNativeSetting<'a>, NativeSettingError<'a>> {
+    native_setting_with_lib(shelf, sdk, None, work, host, alloc)
+}
+
+/// [`native_setting`] with an optional separate Linux libc link-library directory (`sdk_lib`).
+pub fn native_setting_with_lib<'a>(
+    shelf: &str,
+    sdk: &str,
+    sdk_lib: Option<&str>,
     work: &str,
     host: &'a str,
     alloc: Alloc<'a>,
@@ -302,10 +332,22 @@ pub fn native_setting<'a>(
                             .map(|root| String::from_str_in(root, alloc))
                     }
                 }
-                Err(_) => None,
+                Err(NativeSettingError::NoSdk { error, .. })
+                    if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) =>
+                {
+                    None
+                }
+                Err(error) => return Err(error),
             }
         }
         Sysroot::MacosSdk | Sysroot::Pinned { .. } => None,
+    };
+    let sdk_lib = match (sysroot, sdk_lib) {
+        (Sysroot::LinuxHost, Some(lib)) => {
+            let real_lib = resolved(&String::from_str_in(lib, alloc), |path, error| NativeSettingError::NoSdk { path, error }, alloc)?;
+            Some(real_lib)
+        }
+        _ => None,
     };
     let sdk_version = match sysroot {
         Sysroot::MacosSdk => {
@@ -315,29 +357,28 @@ pub fn native_setting<'a>(
             String::from_str_in(version, alloc)
         }
         Sysroot::LinuxHost => {
-            // Standard FHS `/usr` without split kernel headers stays keyed by `include/features.h`
-            // so we never scan unrelated packages under `/usr/include`. Flat or split sysroots
-            // (e.g. NixOS `<glibc-dev>` + `<linux-headers>`) hash every header file byte under
-            // `<sdk>/include` (and `<sdk_extra>/include` when present) in sorted relative-path
-            // order so `sdk_version` is a complete, path-independent content identity (Rule 21,
-            // Rule 25): changing any consumed header (e.g. `asm/errno.h`) invalidates C caches.
-            let is_fhs_single = sdk.as_str().ends_with("/usr") && sdk_extra.is_none();
+            // Standard FHS `/usr` without split kernel headers or split libc runtime stays keyed by
+            // `include/features.h` so we never scan unrelated packages under `/usr/include`. Flat or
+            // split sysroots (e.g. NixOS `<glibc-dev>` + `<linux-headers>` + `<glibc-runtime>/lib`)
+            // hash every file byte under `<sdk>/include`, `<sdk_extra>/include`, and `<sdk_lib>` in
+            // sorted relative-path order so `sdk_version` is a complete, content-addressed identity
+            // covering all headers and link inputs (Rule 21, Rule 25).
+            let is_fhs_single = sdk.as_str().ends_with("/usr") && sdk_extra.is_none() && sdk_lib.is_none();
             if is_fhs_single {
                 hex(&blaze_sha256::digest(&settings), alloc)
             } else {
                 let mut sha = blaze_sha256::Sha256::new();
                 sha.update(b"blaze linux-host sysroot headers 1\0");
-                let hash_tree = |sha: &mut blaze_sha256::Sha256, root: &str, tag: &[u8]| -> Result<(), NativeSettingError<'a>> {
-                    let inc_dir = text(&[root, "/include"], alloc);
-                    let listed = crate::native_script::listed_under(inc_dir.as_str()).map_err(|_| NativeSettingError::NoSdk {
-                        path: String::from_str_in(inc_dir.as_str(), alloc),
+                let hash_dir = |sha: &mut blaze_sha256::Sha256, dir: &str, tag: &[u8]| -> Result<(), NativeSettingError<'a>> {
+                    let listed = crate::native_script::listed_under(dir).map_err(|_| NativeSettingError::NoSdk {
+                        path: String::from_str_in(dir, alloc),
                         error: io::Error::from(io::ErrorKind::Other),
                     })?;
                     sha.update(tag);
                     sha.update(&u64::try_from(listed.len()).unwrap_or(u64::MAX).to_le_bytes());
                     for entry in listed {
                         let name = entry.name.as_str();
-                        let full = text(&[inc_dir.as_str(), "/", name], alloc);
+                        let full = text(&[dir, "/", name], alloc);
                         match entry.kind {
                             bstd::fs::EntryKind::File => {
                                 let bytes = read_file(full.as_str())
@@ -378,9 +419,14 @@ pub fn native_setting<'a>(
                     }
                     Ok(())
                 };
-                hash_tree(&mut sha, sdk.as_str(), b"sdk\0")?;
+                let sdk_inc = text(&[sdk.as_str(), "/include"], alloc);
+                hash_dir(&mut sha, sdk_inc.as_str(), b"sdk\0")?;
                 if let Some(extra) = sdk_extra.as_ref() {
-                    hash_tree(&mut sha, extra.as_str(), b"extra\0")?;
+                    let extra_inc = text(&[extra.as_str(), "/include"], alloc);
+                    hash_dir(&mut sha, extra_inc.as_str(), b"extra\0")?;
+                }
+                if let Some(lib) = sdk_lib.as_ref() {
+                    hash_dir(&mut sha, lib.as_str(), b"lib\0")?;
                 }
                 hex(&sha.finish(), alloc)
             }
@@ -392,5 +438,5 @@ pub fn native_setting<'a>(
     fs::create_dir_all(work.as_str()).map_err(|error| NativeSettingError::Work { path: work.clone(), error })?;
     let work = resolved(&work, |path, error| NativeSettingError::Work { path, error }, alloc)?;
 
-    Ok(OwnedNativeSetting { shelf, sdk, sdk_extra, sdk_version, sysroot, work, deadline: NATIVE_RUN_DEADLINE })
+    Ok(OwnedNativeSetting { shelf, sdk, sdk_extra, sdk_lib, sdk_version, sysroot, work, deadline: NATIVE_RUN_DEADLINE })
 }
