@@ -765,6 +765,10 @@ impl<C: ExpandCx> ExpandCx for ProcCx<'_, '_, C> {
         self.inner.cfg(predicate)
     }
 
+    fn cfg_version_enabled(&self) -> bool {
+        self.inner.cfg_version_enabled()
+    }
+
     fn include(&self, path: &str, how: IncludeAs) -> Result<Included<'_>, HostError> {
         self.inner.include(path, how)
     }

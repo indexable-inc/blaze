@@ -280,6 +280,7 @@ where
         }
     };
     let mut gather = Gather::new(c.name, c.edition, c.cfg.atoms(), &c.values, bump)?;
+    gather.cfg_version = c.cfg.cfg_version_enabled();
     gather.crate_key = Some(c.key);
     let inputs = taken_inputs(c, alloc)?;
     // The calls whose expansion was walked, sorted: each is walked once.
@@ -384,6 +385,7 @@ struct Gather<'a, 'c> {
     krate: &'a str,
     edition: Edition,
     atoms: &'c [(&'c str, Option<&'c str>)],
+    cfg_version: bool,
     /// The crate's `link_name`/`export_name` values written as macro calls, each expanded at
     /// its item by the names' fill (`CrateNames::values`): read by item key, never expanded here.
     values: &'c [ValueRow<'a>],
@@ -619,6 +621,7 @@ impl<'a, 'c> Gather<'a, 'c> {
             krate,
             edition,
             atoms,
+            cfg_version: false,
             values,
             bump,
             scratch: core::cell::RefCell::new(scratch),
@@ -798,7 +801,7 @@ impl<'a, 'c> Gather<'a, 'c> {
         scratch.scope(|frame| {
             let erased = Erased::new(frame);
             let alloc = erased.handle();
-            let low = blaze_lower::lower_signature(item_text, self.edition, &mut CrateCfg(self.atoms), alloc)
+            let low = blaze_lower::lower_signature(item_text, self.edition, &mut CrateCfg::with_version(self.atoms, self.cfg_version), alloc)
                 .map_err(|_| LinksError::Cfg { krate: self.krate, at: self.at(at) })?;
             f(&low, alloc)
         })
@@ -931,7 +934,7 @@ impl<'a, 'c> Gather<'a, 'c> {
                         bytes.try_extend_from_slice(attrs.as_bytes()).map_err(|_| LinksError::Alloc)?;
                         bytes.try_extend_from_slice(b"\nmod __blaze_block {}").map_err(|_| LinksError::Alloc)?;
                         let item = core::str::from_utf8(&bytes).map_err(|_| LinksError::Alloc)?;
-                        let low = blaze_lower::lower_signature(item, self.edition, &mut CrateCfg(self.atoms), alloc)
+                        let low = blaze_lower::lower_signature(item, self.edition, &mut CrateCfg::with_version(self.atoms, self.cfg_version), alloc)
                             .map_err(|_| LinksError::Cfg { krate: self.krate, at: self.at(at) })?;
                         Ok(low.view().cfg_out())
                     })?
@@ -1043,7 +1046,7 @@ impl<'a, 'c> Gather<'a, 'c> {
         if let Some(predicate) = cfg {
             let tokens = blaze_expand::lex(predicate, self.edition, alloc)
                 .map_err(|_| self.attr_err(at, "a `#[link(cfg(..))]` whose predicate does not lex"))?;
-            let holds = blaze_lower::cfg_outcome(&tokens, &mut CrateCfg(self.atoms), alloc)
+            let holds = blaze_lower::cfg_outcome(&tokens, &mut CrateCfg::with_version(self.atoms, self.cfg_version), alloc)
                 .map_err(|_| LinksError::Cfg { krate: self.krate, at })?;
             if !holds {
                 return Ok(None);

@@ -110,7 +110,7 @@ pub fn file_body_left_includes<'c>(
         for read in &list[span] {
             match read.kind {
                 ReadKind::IncludeStr | ReadKind::IncludeBytes => {}
-                ReadKind::Env | ReadKind::Cfg | ReadKind::Line | ReadKind::Column | ReadKind::File | ReadKind::ModulePath | ReadKind::ProcMacro => continue,
+                ReadKind::Env | ReadKind::Cfg | ReadKind::Line | ReadKind::Column | ReadKind::File | ReadKind::ModulePath | ReadKind::ProcMacro | ReadKind::CrateFeature => continue,
             }
             let Some(calling) = calling.as_deref() else { return filed };
             let Some(place) = blaze_scope::include_place::include_place(package, seen, calling, reads.subject(read), alloc) else { continue };

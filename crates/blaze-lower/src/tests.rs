@@ -1350,3 +1350,209 @@ fn rust_2015_trait_anonymous_params_lower_in_trait_context_only() {
         crate::body_key(pats, Edition::E2015, crate::ItemContext::TopLevel),
     );
 }
+
+/// Regression for `starlark_map-0.14.2/src/vec_map/simd.rs:30-47` (`find_hash_in_array`):
+/// RFC 2523 `#[cfg(version("1.76"))]` / `#[cfg(not(version("1.76")))]` predicates lower cleanly
+/// against `blaze_pins::RUSTC_RELEASE_TRIPLE` (both when active under `#[cfg(rust_nightly)]` and
+/// when stripped inside a disabled `#[cfg(rust_nightly)]` block), while malformed predicates
+/// (`version(123)`, `version()`, `version("1.76", "1.77")`, `unknown_call("foo")`) still emit
+/// `DiagKind::Syntax` when active.
+#[test]
+fn cfg_version_predicate_and_starlark_map_simd_pattern() {
+    struct Nightly {
+        nightly: bool,
+        cfg_version: bool,
+    }
+    impl Cfg for Nightly {
+        fn atom(&mut self, name: &str, value: Option<&str>) -> CfgAnswer {
+            match (name, value) {
+                ("rust_nightly", None) => {
+                    if self.nightly {
+                        CfgAnswer::Yes
+                    } else {
+                        CfgAnswer::No
+                    }
+                }
+                _ => CfgAnswer::No,
+            }
+        }
+        fn cfg_version_enabled(&self) -> bool {
+            self.cfg_version
+        }
+    }
+
+    let simd_fn = r#"#[inline]
+pub(crate) fn find_hash_in_array(array: &[u32], hash: u32) -> Option<usize> {
+    #[cfg(rust_nightly)]
+    unsafe {
+        #[cfg(version("1.76"))]
+        use std::simd::cmp::SimdPartialEq;
+        use std::simd::*;
+        type T = Simd<u32, 4>;
+        #[cfg(version("1.76"))]
+        const LANES: usize = T::LEN;
+        #[cfg(not(version("1.76")))]
+        const LANES: usize = T::LANES;
+        let _ = (array, hash, LANES);
+        None
+    }
+    #[cfg(not(rust_nightly))]
+    {
+        let _ = (array, hash);
+        None
+    }
+}"#;
+
+    let kept_items = |v: &View<'_>| -> StdVec<String> {
+        let mut out = StdVec::new();
+        for s in 0..v.scopes.len() {
+            let scope = v.scope(ScopeId(s as u32)).expect("scope");
+            for i in scope.items.start..scope.items.start + scope.items.len {
+                let row = v.row(RowIdx(i)).expect("local item row");
+                let item = v.local_item(row).expect("local item");
+                out.push(String::from(v.text_at(item.range).expect("item text").trim()));
+            }
+        }
+        out
+    };
+
+    // 1. Active `rust_nightly` + `#![feature(cfg_version)]`: `version("1.76")` holds on pinned
+    //    nightly, so `SimdPartialEq` and `const LANES: usize = T::LEN;` are kept while
+    //    `const LANES: usize = T::LANES;` is stripped.
+    let active = lower_body(
+        simd_fn,
+        Edition::E2021,
+        &mut Nightly { nightly: true, cfg_version: true },
+        &mut crate::NoModule,
+        Alloc::global(),
+    )
+    .expect("active nightly simd fn lowers");
+    let av = active.view();
+    assert!(av.diags.is_empty(), "active diags:\n{}", dump_of(&active));
+    assert!(av.unhandled.is_empty(), "active unhandled:\n{}", dump_of(&active));
+    let active_items = kept_items(&av);
+    assert!(
+        active_items.iter().any(|it| it.contains("use std::simd::cmp::SimdPartialEq;")),
+        "expected SimdPartialEq import to be kept: {active_items:?}",
+    );
+    assert!(
+        active_items.iter().any(|it| it.contains("const LANES: usize = T::LEN;")),
+        "expected T::LEN const to be kept: {active_items:?}",
+    );
+    assert!(
+        !active_items.iter().any(|it| it.contains("const LANES: usize = T::LANES;")),
+        "expected T::LANES const to be stripped: {active_items:?}",
+    );
+
+    // 2. Disabled `rust_nightly` (AND `cfg_version: false`, matching stable `starlark_map`):
+    //    the entire `unsafe { ... }` block is stripped before inner `version(..)` predicates are
+    //    evaluated or feature-gate-checked!
+    let disabled = lower_body(
+        simd_fn,
+        Edition::E2021,
+        &mut Nightly { nightly: false, cfg_version: false },
+        &mut crate::NoModule,
+        Alloc::global(),
+    )
+    .expect("disabled nightly simd fn lowers");
+    let dv = disabled.view();
+    assert!(dv.diags.is_empty(), "disabled diags:\n{}", dump_of(&disabled));
+    assert!(dv.unhandled.is_empty(), "disabled unhandled:\n{}", dump_of(&disabled));
+    assert!(kept_items(&dv).is_empty(), "disabled block must leave no local items");
+
+    let disabled_with_bad_inner = r#"fn f() -> u32 {
+        #[cfg(rust_nightly)]
+        unsafe {
+            #[cfg(bad_unknown(123))]
+            const X: u32 = 1;
+            X
+        }
+        #[cfg(not(rust_nightly))]
+        {
+            42
+        }
+    }"#;
+    let dbi = lower_body(
+        disabled_with_bad_inner,
+        Edition::E2021,
+        &mut Nightly { nightly: false, cfg_version: false },
+        &mut crate::NoModule,
+        Alloc::global(),
+    )
+    .expect("disabled block skips inner bad cfg");
+    assert!(dbi.view().diags.is_empty(), "disabled block must not diagnose inner bad cfg:\n{}", dump_of(&dbi));
+
+    // Inactive `cfg_attr` must also skip inner attributes without diagnosing them.
+    let inactive_cfg_attr = "fn f() { #[cfg_attr(false, cfg(bad_unknown(123)))] let _x = 1; }";
+    let ica = body(inactive_cfg_attr);
+    assert!(ica.view().diags.is_empty(), "inactive cfg_attr must not diagnose inner bad cfg:\n{}", dump_of(&ica));
+
+    // 3. Active `version(..)` with `cfg_version: true`: plain, escaped (`\x31`), line-continued,
+    //    and raw string literals all decode cleanly + no stray `Expr::Lit` emitted into `exprs`.
+    fn body_ver(text: &str) -> Lowered<'static, '_> {
+        struct Ver;
+        impl Cfg for Ver {
+            fn atom(&mut self, name: &str, value: Option<&str>) -> CfgAnswer {
+                if name == "rust_nightly" && value.is_none() { CfgAnswer::Yes } else { CfgAnswer::No }
+            }
+            fn cfg_version_enabled(&self) -> bool { true }
+        }
+        lower_body(text, Edition::E2024, &mut Ver, &mut crate::NoModule, Alloc::global())
+            .expect("lower with cfg_version")
+    }
+    fn sig_ver(text: &str) -> Lowered<'static, '_> {
+        struct Ver;
+        impl Cfg for Ver {
+            fn atom(&mut self, name: &str, value: Option<&str>) -> CfgAnswer {
+                if name == "rust_nightly" && value.is_none() { CfgAnswer::Yes } else { CfgAnswer::No }
+            }
+            fn cfg_version_enabled(&self) -> bool { true }
+        }
+        lower_signature(text, Edition::E2024, &mut Ver, Alloc::global())
+            .expect("sig with cfg_version")
+    }
+    let active_all = body_ver(
+        "fn f() -> u32 { #[cfg(version(\"1.76\"))] { return 1; } #[cfg(version(\"99.0\"))] { return 2; } #[cfg(not(version(\"99.0\")))] { return 3; } #[cfg(version(\"1.76.0\"))] { return 4; } #[cfg(version(\"..\"))] { return 5; } #[cfg(version(\"\\x31.76\"))] { return 6; } #[cfg(version(\"1.\\\n  76\"))] { return 7; } #[cfg(version(r#\"1.76\"#))] { return 8; } 0 }",
+    );
+    let dump_all = dump_of(&active_all);
+    assert!(active_all.view().diags.is_empty(), "diags:\n{dump_all}");
+    assert!(in_order(&dump_all, &["1", "3", "4", "6", "7", "8", "0"]).is_ok(), "dump:\n{dump_all}");
+    assert!(!dump_all.contains("\"1.76\"") && !dump_all.contains("\"99.0\""), "version literal leaked into exprs:\n{dump_all}");
+    assert!(!dump_all.contains("return 2") && !dump_all.contains("return 5"), "false branches must be stripped:\n{dump_all}");
+
+    // Signature-level `#[cfg(version(..))]` with `cfg_version: true`:
+    assert!(sig_ver("#[cfg(version(\"1.76\"))] fn f() {}").view().diags.is_empty());
+    assert!(!sig_ver("#[cfg(version(\"1.76\"))] fn f() {}").view().cfg_out());
+    assert!(!sig_ver("#[cfg(version(\"\\x31.76\"))] fn f() {}").view().cfg_out());
+    assert!(sig_ver("#[cfg(version(\"99.0\"))] fn f() {}").view().cfg_out());
+    assert!(!sig_ver("#[cfg(not(version(\"99.0\")))] fn f() {}").view().cfg_out());
+
+    // 4. Feature gate negative controls: without `cfg_version_enabled()`, active `version(..)`
+    //    MUST emit `DiagKind::UnstableCfgVersion` whether the version holds or not!
+    for (label, text) in [
+        ("true version ungated", "fn f() { #[cfg(version(\"1.76\"))] let _x = 1; }"),
+        ("false version ungated", "fn f() { #[cfg(version(\"99.0\"))] let _x = 1; }"),
+        ("negated version ungated", "fn f() { #[cfg(not(version(\"99.0\")))] let _x = 1; }"),
+        ("all(false, version) ungated", "fn f() { #[cfg(all(false, version(\"99.0\")))] let _x = 1; }"),
+    ] {
+        let gated = body(text);
+        let has_gate = gated.view().diags().any(|d| d.is_ok_and(|d| d.kind == DiagKind::UnstableCfgVersion));
+        assert!(has_gate, "{label}: expected DiagKind::UnstableCfgVersion, got:\n{}", dump_of(&gated));
+    }
+
+    // 5. Malformed syntax negative controls: MUST emit `DiagKind::Syntax` (even with `cfg_version: true`).
+    for (label, text) in [
+        ("version(123)", "fn f() { #[cfg(version(123))] let _x = 1; }"),
+        ("version()", "fn f() { #[cfg(version())] let _x = 1; }"),
+        ("version(two args)", "fn f() { #[cfg(version(\"1.76\", \"1.77\"))] let _x = 1; }"),
+        ("version(ident)", "fn f() { #[cfg(version(unix))] let _x = 1; }"),
+        ("version(bad escape)", "fn f() { #[cfg(version(\"\\q\"))] let _x = 1; }"),
+        ("unknown_call", "fn f() { #[cfg(unknown_call(\"foo\"))] let _x = 1; }"),
+        ("any(lit)", "fn f() { #[cfg(any(1, \"a\"))] let _x = 1; }"),
+        ("bare string", "fn f() { #[cfg(\"1.76\")] let _x = 1; }"),
+    ] {
+        let bad = body_ver(text);
+        let has_syntax = bad.view().diags().any(|d| d.is_ok_and(|d| d.kind == DiagKind::Syntax));
+        assert!(has_syntax, "{label}: expected DiagKind::Syntax, got:\n{}", dump_of(&bad));
+    }
+}

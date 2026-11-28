@@ -19,6 +19,8 @@ pub enum CfgPredicateError<E> {
     Malformed { token: u32 },
     /// `not(..)` holds no predicate, or more than one, at this token.
     NotTakesOne { token: u32 },
+    /// `version(..)` was written without `#![feature(cfg_version)]` enabled in the crate root.
+    UnstableCfgVersion { token: u32 },
     /// The cfg set could not answer an atom.
     Atom(E),
 }
@@ -28,9 +30,40 @@ impl<E: fmt::Debug> fmt::Display for CfgPredicateError<E> {
         match self {
             CfgPredicateError::Malformed { token } => write!(f, "no cfg predicate: it stops at token {token}"),
             CfgPredicateError::NotTakesOne { token } => write!(f, "`not(..)` takes one predicate (token {token})"),
+            CfgPredicateError::UnstableCfgVersion { token } => {
+                write!(f, "`cfg(version(..))` is unstable and requires `#![feature(cfg_version)]` (token {token})")
+            }
             CfgPredicateError::Atom(e) => write!(f, "a cfg atom has no answer: {e:?}"),
         }
     }
+}
+
+/// Decodes one unsuffixed Rust string literal token (`"..."` or `r#"..."#`, including escapes and
+/// line continuations) and evaluates [`blaze_pins::cfg_version_holds`] on the decoded value.
+/// Returns `None` if `token_text` is not a valid unsuffixed string literal or has a fatal escape.
+/// One home for every cfg evaluator (`blaze-expand`, `blaze-lower`, `blaze-scope`).
+pub fn eval_cfg_version_literal(token_text: &str) -> Option<bool> {
+    let mut buf = [0u8; 64];
+    let mut len = 0usize;
+    let mut overflow = false;
+    let ok = crate::literal::decode_str_literal(token_text, |ch| {
+        let mut enc = [0u8; 4];
+        let bytes = ch.encode_utf8(&mut enc).as_bytes();
+        if let Some(dst) = buf.get_mut(len..len + bytes.len()) {
+            dst.copy_from_slice(bytes);
+            len += bytes.len();
+        } else {
+            overflow = true;
+        }
+    });
+    if !ok {
+        return None;
+    }
+    if overflow {
+        return Some(false);
+    }
+    let spec = core::str::from_utf8(buf.get(..len)?).ok()?;
+    Some(blaze_pins::cfg_version_holds(spec))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -134,13 +167,25 @@ impl Truth for Tri {
 
 /// The outcome of the predicate `tokens`, asking `atom(name, value)` for each atom (`value` is
 /// a `name = "value"` atom's string, unescaped). Trailing commas are taken; an empty `any()` is
-/// false and an empty `all()` true.
+/// false and an empty `all()` true. Unstable `version(..)` is rejected unless
+/// [`cfg_predicate_with_version`] is called with `cfg_version = true`.
 pub fn cfg_predicate<E>(
     tokens: &TokenStream<'_>,
     alloc: Alloc<'_>,
     atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>,
 ) -> Result<bool, CfgPredicateError<E>> {
-    cfg_predicate_at(tokens, 0..tokens.tokens().len(), alloc, atom)
+    cfg_predicate_with_version(tokens, false, alloc, atom)
+}
+
+/// Like [`cfg_predicate`], allowing RFC 2523 `version(..)` when `cfg_version` is true
+/// (`#![feature(cfg_version)]` active in the crate root).
+pub fn cfg_predicate_with_version<E>(
+    tokens: &TokenStream<'_>,
+    cfg_version: bool,
+    alloc: Alloc<'_>,
+    atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>,
+) -> Result<bool, CfgPredicateError<E>> {
+    cfg_predicate_at_with_version(tokens, 0..tokens.tokens().len(), cfg_version, alloc, atom)
 }
 
 /// [`cfg_predicate`] of the tokens `range` of `tokens` (a `cfg_attr`'s first argument); token
@@ -151,7 +196,30 @@ pub fn cfg_predicate_at<E>(
     alloc: Alloc<'_>,
     atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>,
 ) -> Result<bool, CfgPredicateError<E>> {
-    predicate_in::<bool, E>(tokens, range, alloc, atom)
+    cfg_predicate_at_with_version(tokens, range, false, alloc, atom)
+}
+
+/// Like [`cfg_predicate_at`], allowing RFC 2523 `version(..)` when `cfg_version` is true.
+pub fn cfg_predicate_at_with_version<E>(
+    tokens: &TokenStream<'_>,
+    range: Range<usize>,
+    cfg_version: bool,
+    alloc: Alloc<'_>,
+    atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>,
+) -> Result<bool, CfgPredicateError<E>> {
+    predicate_in::<bool, E>(tokens, range, cfg_version, alloc, atom, &mut || {})
+}
+
+/// Like [`cfg_predicate_with_version`], also invoking `on_cfg_version` whenever a `version(..)`
+/// predicate is evaluated so [`crate::cx::Recorder`] can record the `cfg_version` gate as a read.
+pub(crate) fn cfg_predicate_with_version_hook<E>(
+    tokens: &TokenStream<'_>,
+    cfg_version: bool,
+    alloc: Alloc<'_>,
+    atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>,
+    on_cfg_version: &mut dyn FnMut(),
+) -> Result<bool, CfgPredicateError<E>> {
+    predicate_in::<bool, E>(tokens, 0..tokens.tokens().len(), cfg_version, alloc, atom, on_cfg_version)
 }
 
 /// [`cfg_predicate_at`] in Kleene's three values: `atom` answers [`Tri::Unknown`] for an atom not
@@ -164,15 +232,17 @@ pub fn cfg_predicate_tri(
     alloc: Alloc<'_>,
     atom: &mut dyn FnMut(&str, Option<&str>) -> Tri,
 ) -> Result<Tri, CfgPredicateError<core::convert::Infallible>> {
-    predicate_in::<Tri, core::convert::Infallible>(tokens, range, alloc, &mut |name, value| Ok(atom(name, value)))
+    predicate_in::<Tri, core::convert::Infallible>(tokens, range, false, alloc, &mut |name, value| Ok(atom(name, value)), &mut || {})
 }
 
 /// THE ONE READING of a cfg predicate (the module doc), folded in `V`.
 fn predicate_in<V: Truth, E>(
     tokens: &TokenStream<'_>,
     range: Range<usize>,
+    cfg_version: bool,
     alloc: Alloc<'_>,
     atom: &mut dyn FnMut(&str, Option<&str>) -> Result<V, E>,
+    on_cfg_version: &mut dyn FnMut(),
 ) -> Result<V, CfgPredicateError<E>> {
     let list = tokens.tokens().get(..range.end).unwrap_or(&[]);
     // Macro-by-example captures (`$s:expr`, `$m:meta`, `$l:literal`) wrap substituted tokens in
@@ -214,6 +284,25 @@ fn predicate_in<V: Truth, E>(
                     continue;
                 }
             }
+            (None, Some(TokenKind::Open(Delim::Paren))) if name == "version" => {
+                let start_token = u32::try_from(raw(pos)).unwrap_or(u32::MAX);
+                let lit = tok(pos + 2).ok_or(malformed(pos + 2))?;
+                let TokenKind::Literal { kind, suffix_len: 0, .. } = lit.kind else { return Err(malformed(pos + 2)) };
+                value_buf.0.clear();
+                string_value(kind, tokens.text_of(lit), 0, &mut value_buf).map_err(|_| malformed(pos + 2))?;
+                pos += 3;
+                if matches!(tok(pos).map(|t| t.kind), Some(TokenKind::Punct { char: ',', .. })) {
+                    pos += 1;
+                }
+                let Some(TokenKind::Close(Delim::Paren)) = tok(pos).map(|t| t.kind) else { return Err(malformed(pos)) };
+                pos += 1;
+                on_cfg_version();
+                if !cfg_version {
+                    return Err(CfgPredicateError::UnstableCfgVersion { token: start_token });
+                }
+                Some(V::of(blaze_pins::cfg_version_holds(value_buf.as_str())))
+            }
+            (None, Some(TokenKind::Open(Delim::Paren))) => return Err(malformed(pos)),
             (_, Some(TokenKind::Punct { char: '=', .. })) => {
                 let lit = tok(pos + 2).ok_or(malformed(pos + 2))?;
                 let TokenKind::Literal { kind, suffix_len, .. } = lit.kind else { return Err(malformed(pos + 2)) };
@@ -293,6 +382,16 @@ pub fn cfg_attr_metas<'a, E>(
     alloc: Alloc<'a>,
     atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>,
 ) -> Result<AVec<'a, Range<u32>>, CfgAttrError<E>> {
+    cfg_attr_metas_with_version(attr, false, alloc, atom)
+}
+
+/// Like [`cfg_attr_metas`], allowing RFC 2523 `version(..)` when `cfg_version` is true.
+pub fn cfg_attr_metas_with_version<'a, E>(
+    attr: &TokenStream<'_>,
+    cfg_version: bool,
+    alloc: Alloc<'a>,
+    atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>,
+) -> Result<AVec<'a, Range<u32>>, CfgAttrError<E>> {
     let list = attr.tokens();
     let is_hash = matches!(list.first().map(|t| t.kind), Some(TokenKind::Punct { char: '#', .. }));
     let is_bracket = matches!(list.get(1).map(|t| t.kind), Some(TokenKind::Open(Delim::Bracket)));
@@ -347,7 +446,7 @@ pub fn cfg_attr_metas<'a, E>(
         if predicate.is_empty() {
             return Err(CfgAttrError::NoPredicate { token: index(meta.start) });
         }
-        if cfg_predicate_at(attr, predicate, alloc, atom).map_err(CfgAttrError::Predicate)? {
+        if cfg_predicate_at_with_version(attr, predicate, cfg_version, alloc, atom).map_err(CfgAttrError::Predicate)? {
             left.extend(pieces[1..].iter().rev().filter(|p| !p.is_empty()).cloned());
         }
     }

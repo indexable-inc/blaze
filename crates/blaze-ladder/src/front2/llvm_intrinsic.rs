@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn body_block_cfg_attr() {
         let block = "unsafe extern \"llvm-intrinsic\" {\n    #[cfg_attr(\n        any(target_arch = \"aarch64\", target_arch = \"arm64ec\"),\n        link_name = \"llvm.aarch64.neon.tbl1.v16i8\"\n    )]\n    fn _vqtbl1q(a: int8x16_t, b: uint8x16_t) -> int8x16_t;\n}";
-        let (abi, decls) = declared(block, Edition::E2024, &mut CrateCfg(AARCH64), Alloc::global()).expect("the block reads");
+        let (abi, decls) = declared(block, Edition::E2024, &mut CrateCfg::atoms_only(AARCH64), Alloc::global()).expect("the block reads");
         assert_eq!(abi, "\"llvm-intrinsic\"");
         assert_eq!(decls.len(), 1);
         let d = decls[0];
@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn body_block_cfg_removes() {
         let block = "unsafe extern \"C\" {\n    #[cfg(target_arch = \"arm\")]\n    fn on_arm(x: i32) -> i32;\n    #[cfg(any(target_arch = \"aarch64\", target_arch = \"arm64ec\"))]\n    fn on_aarch64(x: i32) -> i32;\n    #[cfg_attr(target_arch = \"aarch64\", cfg(target_os = \"none\"))]\n    fn on_bare_aarch64(x: i32) -> i32;\n}";
-        let (abi, decls) = declared(block, Edition::E2024, &mut CrateCfg(AARCH64), Alloc::global()).expect("the block reads");
+        let (abi, decls) = declared(block, Edition::E2024, &mut CrateCfg::atoms_only(AARCH64), Alloc::global()).expect("the block reads");
         assert_eq!(abi, "\"C\"");
         assert_eq!(decls.len(), 1, "one declaration stays");
         assert_eq!(decls[0].name, "on_aarch64");

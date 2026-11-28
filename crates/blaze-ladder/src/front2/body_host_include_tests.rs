@@ -201,7 +201,7 @@ fn a_record_backed_body_reads_data_relative_to_its_calling_file() {
     };
     let mut expand = blaze_lower::by_name::ByName::new(&[], builtin, host, alloc);
     let text = tables.text_of(item).expect("the recorded function body").text;
-    let lowered = blaze_lower::lower_body_expanding(text, input.edition, &mut super::heads::CrateCfg(&[]), &mut blaze_lower::NoModule, &mut expand, alloc).expect("lower the two builtins");
+    let lowered = blaze_lower::lower_body_expanding(text, input.edition, &mut super::heads::CrateCfg::atoms_only(&[]), &mut blaze_lower::NoModule, &mut expand, alloc).expect("lower the two builtins");
     assert_eq!(lowered.view().unhandled().count(), 0);
     assert!(expand.findings().is_empty());
     let reads = expand.reads();

@@ -233,6 +233,7 @@ impl fmt::Display for Target<'_> {
 #[derive(Clone, Debug)]
 pub struct Cfg<'s, 'a> {
     atoms: AVec<'a, (&'s str, Option<&'s str>)>,
+    cfg_version: bool,
 }
 
 /// The most nested a predicate this reads may be (`all(any(not(..)))`): past it, unread.
@@ -308,11 +309,23 @@ impl<'s, 'a> Cfg<'s, 'a> {
         &self.atoms
     }
 
+    /// Enables RFC 2523 `#[cfg(version("..."))]` predicates when `#![feature(cfg_version)]` is
+    /// active in the crate root.
+    pub fn with_cfg_version(mut self, enabled: bool) -> Cfg<'s, 'a> {
+        self.cfg_version = enabled;
+        self
+    }
+
+    /// Whether `#![feature(cfg_version)]` is active for this cfg.
+    pub fn cfg_version_enabled(&self) -> bool {
+        self.cfg_version
+    }
+
     /// The one constructor: `atoms` sorted and each kept once.
     fn from_owned(mut atoms: AVec<'a, (&'s str, Option<&'s str>)>) -> Cfg<'s, 'a> {
         atoms.sort_unstable();
         atoms.dedup();
-        Cfg { atoms }
+        Cfg { atoms, cfg_version: false }
     }
 
     /// What the configuration is, as a key's part: the sorted atoms, so equal atoms give equal
@@ -356,8 +369,19 @@ impl<'s, 'a> Cfg<'s, 'a> {
     }
 
     /// The predicate's value, `None` when it does not read as one (a token or form this does
-    /// not know, or nested past [`MOST_CFG_DEPTH`]).
+    /// not know, an ungated `version(..)` without `#![feature(cfg_version)]`, or nested past
+    /// [`MOST_CFG_DEPTH`]).
     pub fn eval(&self, text: &str) -> Option<bool> {
+        match self.eval_detail(text) {
+            CfgEval::Val(v) => Some(v),
+            CfgEval::UnstableCfgVersion | CfgEval::Unread => None,
+        }
+    }
+
+    /// Like [`Self::eval`], distinguishing an ungated `version(..)` (RFC 2523, E0658) from an
+    /// otherwise unread predicate so the feature gate is reported independently of whether the
+    /// version would hold.
+    fn eval_detail(&self, text: &str) -> CfgEval {
         #[derive(Clone, Copy)]
         enum Op {
             All,
@@ -383,33 +407,51 @@ impl<'s, 'a> Cfg<'s, 'a> {
         let mut depth = 0usize;
         let mut lex = CLex { text, at: 0, peeked: None, bad: false };
         'pred: loop {
-            let Some(CTok::Ident(name)) = lex.next() else { return None };
+            let Some(CTok::Ident(name)) = lex.next() else { return CfgEval::Unread };
             let target = depth > 0 && frames[depth - 1].target;
             let prefix = if target { "target_" } else { "" };
             let mut value = match lex.peek() {
                 Some(CTok::Open) => {
                     lex.next();
-                    let op = match name {
-                        "all" | "target" => Op::All,
-                        "any" => Op::Any,
-                        "not" => Op::Not,
-                        _ => return None,
-                    };
-                    if depth == MOST_CFG_DEPTH {
-                        return None;
+                    if name == "version" && !target {
+                        let Some(CTok::Str { token, .. }) = lex.next() else { return CfgEval::Unread };
+                        if lex.peek() == Some(CTok::Comma) {
+                            lex.next();
+                        }
+                        if lex.next() != Some(CTok::Close) {
+                            return CfgEval::Unread;
+                        }
+                        let Some(holds) = blaze_expand::eval_cfg_version_literal(token) else {
+                            return CfgEval::Unread;
+                        };
+                        if !self.cfg_version {
+                            return CfgEval::UnstableCfgVersion;
+                        }
+                        holds
+                    } else {
+                        let op = match name {
+                            "all" | "target" => Op::All,
+                            "any" => Op::Any,
+                            "not" => Op::Not,
+                            _ => return CfgEval::Unread,
+                        };
+                        if depth == MOST_CFG_DEPTH {
+                            return CfgEval::Unread;
+                        }
+                        frames[depth] = Frame { op, target: target || name == "target", value: matches!(op, Op::All), count: 0 };
+                        depth += 1;
+                        if lex.peek() != Some(CTok::Close) {
+                            continue 'pred;
+                        }
+                        lex.next();
+                        depth -= 1;
+                        let Some(v) = finish(frames[depth]) else { return CfgEval::Unread };
+                        v
                     }
-                    frames[depth] = Frame { op, target: target || name == "target", value: matches!(op, Op::All), count: 0 };
-                    depth += 1;
-                    if lex.peek() != Some(CTok::Close) {
-                        continue 'pred;
-                    }
-                    lex.next();
-                    depth -= 1;
-                    finish(frames[depth])?
                 }
                 Some(CTok::Eq) => {
                     lex.next();
-                    let Some(CTok::Str(value)) = lex.next() else { return None };
+                    let Some(CTok::Str { body: value, .. }) = lex.next() else { return CfgEval::Unread };
                     self.has_pair(prefix, name, value)
                 }
                 _ => self.has_name(prefix, name),
@@ -417,7 +459,7 @@ impl<'s, 'a> Cfg<'s, 'a> {
             // A predicate is read: fold it into the lists it ends.
             loop {
                 if depth == 0 {
-                    return (lex.next().is_none() && !lex.bad).then_some(value);
+                    return if lex.next().is_none() && !lex.bad { CfgEval::Val(value) } else { CfgEval::Unread };
                 }
                 let frame = &mut frames[depth - 1];
                 match frame.op {
@@ -434,10 +476,11 @@ impl<'s, 'a> Cfg<'s, 'a> {
                         lex.next();
                     }
                     Some(CTok::Close) => {}
-                    _ => return None,
+                    _ => return CfgEval::Unread,
                 }
                 depth -= 1;
-                value = finish(frames[depth])?;
+                let Some(v) = finish(frames[depth]) else { return CfgEval::Unread };
+                value = v;
             }
         }
     }
@@ -462,21 +505,39 @@ impl<'s, 'a> Cfg<'s, 'a> {
                 attrs.checks.push(path);
             }
             match name {
-                "cfg" => match self.eval(args(content)) {
-                    Some(true) => {}
-                    Some(false) => attrs.cfg_ok = false,
-                    None => {
+                "cfg" => match self.eval_detail(args(content)) {
+                    CfgEval::Val(true) => {}
+                    CfgEval::Val(false) => {
+                        attrs.cfg_ok = false;
+                        stack.truncate(base);
+                        break;
+                    }
+                    CfgEval::UnstableCfgVersion => {
                         attrs.cfg_ok = false;
                         attrs.cfg_unread += 1;
+                        attrs.cfg_version_gated = true;
+                        stack.truncate(base);
+                        break;
+                    }
+                    CfgEval::Unread => {
+                        attrs.cfg_ok = false;
+                        attrs.cfg_unread += 1;
+                        stack.truncate(base);
+                        break;
                     }
                 },
                 "cfg_attr" => {
                     attrs.cfg_attrs += 1;
                     let mut parts = SplitTop::new(args(content));
                     let Some(predicate) = parts.next() else { continue };
-                    let on = match self.eval(predicate) {
-                        Some(on) => on,
-                        None => {
+                    let on = match self.eval_detail(predicate) {
+                        CfgEval::Val(on) => on,
+                        CfgEval::UnstableCfgVersion => {
+                            attrs.cfg_unread += 1;
+                            attrs.cfg_version_gated = true;
+                            false
+                        }
+                        CfgEval::Unread => {
                             attrs.cfg_unread += 1;
                             false
                         }
@@ -665,10 +726,17 @@ fn tool_segment(path: &str) -> Option<&str> {
     path.split_once("::").map(|(first, _)| first.trim())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CfgEval {
+    Val(bool),
+    UnstableCfgVersion,
+    Unread,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum CTok<'a> {
     Ident(&'a str),
-    Str(&'a str),
+    Str { body: &'a str, token: &'a str },
     Open,
     Close,
     Comma,
@@ -750,6 +818,7 @@ impl<'a> CLex<'a> {
                     });
                 }
                 b'"' => {
+                    let tok_start = self.at;
                     let start = self.at + 1;
                     let mut end = start;
                     while end < bytes.len() && bytes[end] != b'"' {
@@ -760,7 +829,38 @@ impl<'a> CLex<'a> {
                         return None;
                     }
                     self.at = end + 1;
-                    return Some(CTok::Str(&text[start..end]));
+                    let Some(token) = text.get(tok_start..self.at) else {
+                        self.bad = true;
+                        return None;
+                    };
+                    return Some(CTok::Str { body: &text[start..end], token });
+                }
+                b'r' if raw_str_hashes(bytes, self.at).is_some() => {
+                    let tok_start = self.at;
+                    let hashes = raw_str_hashes(bytes, tok_start).unwrap_or(0);
+                    let body_start = tok_start + 2 + hashes;
+                    let mut end = body_start;
+                    let mut found = None;
+                    while let Some(&b) = bytes.get(end) {
+                        if b == b'"' {
+                            let after = end + 1;
+                            if bytes.get(after..after + hashes).is_some_and(|s| s.iter().all(|&x| x == b'#')) {
+                                found = Some((end, after + hashes));
+                                break;
+                            }
+                        }
+                        end += 1;
+                    }
+                    let Some((body_end, tok_end)) = found else {
+                        self.bad = true;
+                        return None;
+                    };
+                    let (Some(body), Some(token)) = (text.get(body_start..body_end), text.get(tok_start..tok_end)) else {
+                        self.bad = true;
+                        return None;
+                    };
+                    self.at = tok_end;
+                    return Some(CTok::Str { body, token });
                 }
                 _ if c == b'_' || c.is_ascii_alphanumeric() => {
                     let start = self.at;
@@ -779,6 +879,15 @@ impl<'a> CLex<'a> {
     }
 }
 
+/// If `bytes[at..]` starts a raw string literal (`r"..."` or `r#"..."#`), returns its `#` count.
+fn raw_str_hashes(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut hashes = 0usize;
+    while bytes.get(at + 1 + hashes) == Some(&b'#') {
+        hashes += 1;
+    }
+    (bytes.get(at + 1 + hashes) == Some(&b'"')).then_some(hashes)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Attributes.
 
@@ -789,6 +898,8 @@ pub struct Attrs<'t, 'a> {
     pub cfg_attrs: u32,
     /// `cfg` and `cfg_attr` predicates that did not read ([`Cfg::eval`]): each taken as false.
     pub cfg_unread: u32,
+    /// `version(..)` was used in `cfg` / `cfg_attr` without `#![feature(cfg_version)]`.
+    pub cfg_version_gated: bool,
     pub path: Option<&'t str>,
     pub derives: AVec<'a, &'t str>,
     pub macro_export: bool,
@@ -909,6 +1020,7 @@ impl<'a> Attrs<'_, 'a> {
             cfg_ok: true,
             cfg_attrs: 0,
             cfg_unread: 0,
+            cfg_version_gated: false,
             path: None,
             derives: AVec::new_in(alloc),
             macro_export: false,
@@ -1199,6 +1311,9 @@ pub fn item_attrs<'t, 'a>(cfg: &Cfg<'_, '_>, outline: &Outline<'_>, item: &Item,
             continue;
         }
         cfg.attr(&mut attrs, strip_attr(item.text(text, attr.range)), &mut stack);
+        if !attrs.cfg_ok {
+            break;
+        }
     }
     attrs
 }
@@ -1222,6 +1337,60 @@ pub fn file_attrs<'t, 'a>(cfg: &Cfg<'_, '_>, outline: &Outline<'_>, text: &'t st
         }
     }
     attrs
+}
+
+/// Whether a file's inner attributes enable `#![feature(<feature>)]` (directly or via an active
+/// `#![cfg_attr(..., feature(<feature>))]`), collected independently of crate-level `#![cfg(...)]`
+/// attributes so `#![cfg(version("..."))]` written before `#![feature(cfg_version)]` still sees
+/// the feature gate (matching rustc's crate-feature collection before cfg stripping).
+pub fn file_enables_feature(cfg: &Cfg<'_, '_>, outline: &Outline<'_>, text: &str, feature: &str, alloc: Alloc<'_>) -> bool {
+    let mut stack: AVec<'_, &str> = AVec::new_in(alloc);
+    for attr in outline.file_attrs() {
+        if attr.kind == AttrKind::Doc {
+            continue;
+        }
+        let mut next = Some(strip_attr(attr.range.of(text)));
+        stack.clear();
+        loop {
+            let content = match next.take() {
+                Some(it) => it,
+                None => match stack.pop() {
+                    Some(it) => it,
+                    None => break,
+                },
+            };
+            let content = skip_attr_trivia(content);
+            if content.is_empty() {
+                continue;
+            }
+            match prelude_attr(head(content)) {
+                "feature" => {
+                    if SplitTop::new(args(content)).any(|f| f.trim() == feature) {
+                        return true;
+                    }
+                }
+                "cfg_attr" => {
+                    let mut parts = SplitTop::new(args(content));
+                    let Some(predicate) = parts.next() else { continue };
+                    if cfg.eval(predicate) == Some(true) {
+                        let start = stack.len();
+                        for part in parts {
+                            let part = part.trim();
+                            if !part.is_empty() {
+                                stack.push(part);
+                            }
+                        }
+                        if let Some(tail) = stack.get_mut(start..) {
+                            tail.reverse();
+                        }
+                    }
+                }
+                "unsafe" => next = Some(args(content).trim()),
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1618,6 +1787,8 @@ pub enum WalkNote<'t, 'a> {
     TooManyModules { at: Loc },
     /// A `#[path = <macro call>]` that does not read to a string: the module is not walked.
     PathValueRefused { at: Loc, refusal: AttrValueRefusal<'t> },
+    /// `#[cfg(version(..))]` used without `#![feature(cfg_version)]` at the crate root.
+    UnstableCfgVersion { at: Loc },
 }
 
 impl fmt::Display for WalkNote<'_, '_> {
@@ -1629,6 +1800,7 @@ impl fmt::Display for WalkNote<'_, '_> {
             WalkNote::PathFileNotFound { .. } => "module: #[path] file not found",
             WalkNote::TooManyModules { .. } => "module: more modules than the walk takes",
             WalkNote::PathValueRefused { .. } => "module: #[path] value is a macro call that does not read to a string",
+            WalkNote::UnstableCfgVersion { .. } => "module: #[cfg(version(..))] requires #![feature(cfg_version)]",
         })
     }
 }
@@ -1793,6 +1965,9 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
         missing: AVec::new_in(alloc),
     };
     let root_attrs = file_attrs(cfg, files.outline(root), files.text(root), alloc);
+    if root_attrs.cfg_version_gated {
+        tree.notes.push(WalkNote::UnstableCfgVersion { at: Loc { file: root, offset: 0 } });
+    }
     let root_dir = joined(root_dir, &[], alloc);
     tree.modules.push(Module {
         key: root_key(krate),
@@ -1820,6 +1995,9 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
         for (idx, child) in o.children(item) {
             let ItemDetail::Mod { inline, .. } = child.detail else { continue };
             let mut attrs = item_attrs(cfg, o, child, text, alloc);
+            if attrs.cfg_version_gated {
+                tree.notes.push(WalkNote::UnstableCfgVersion { at: Loc { file, offset: child.range.start } });
+            }
             if !attrs.cfg_ok {
                 continue;
             }
@@ -1904,6 +2082,9 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
                 continue;
             };
             let fattrs = file_attrs(cfg, files.outline(cfile), files.text(cfile), alloc);
+            if fattrs.cfg_version_gated {
+                tree.notes.push(WalkNote::UnstableCfgVersion { at: Loc { file: cfile, offset: 0 } });
+            }
             if !fattrs.cfg_ok {
                 continue;
             }
@@ -2260,6 +2441,8 @@ pub enum LowerNoteKind<'t> {
     AttrValueRefused(AttrValueRefusal<'t>),
     /// A generated macro definition mixes `$crate` tokens from two different crates (token-mark-3).
     MixedDollarCrate,
+    /// `#[cfg(version(..))]` used without `#![feature(cfg_version)]` at the crate root (E0658).
+    UnstableCfgVersion,
 }
 
 impl fmt::Display for LowerNoteKind<'_> {
@@ -2279,6 +2462,7 @@ impl fmt::Display for LowerNoteKind<'_> {
             LowerNoteKind::UnhandledItem { syntax } => write!(f, "unhandled item form: {:?}", syntax_kind(*syntax)),
             LowerNoteKind::AttrValueRefused(refusal) => write!(f, "{refusal}"),
             LowerNoteKind::MixedDollarCrate => f.write_str("macro definition mixes `$crate` from different crates"),
+            LowerNoteKind::UnstableCfgVersion => f.write_str("`cfg(version(..))` requires `#![feature(cfg_version)]`"),
         }
     }
 }
@@ -2555,8 +2739,14 @@ pub fn lower_in_out<'p: 't, 't, 'o, 's, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<
     // cfg.attr.crate-level-attrs: "removing all of the following crate contents"). The walk
     // keeps no module file whose `#![cfg]` is false, so this is the crate root's: the crate
     // exists and is empty (a proc-macro crate's harness lists nothing).
-    if fragment.items.is_none() && fragment.depth == 0 && matches!(fragment.at, Where::File(_)) && !file_attrs(low.cfg, outline, low.text, scratch).cfg_ok {
-        return low.out;
+    if fragment.items.is_none() && fragment.depth == 0 && matches!(fragment.at, Where::File(_)) {
+        let fattrs = file_attrs(low.cfg, outline, low.text, scratch);
+        if fattrs.cfg_version_gated {
+            low.note(LowerNoteKind::UnstableCfgVersion, 0, "cfg(version(..))");
+        }
+        if !fattrs.cfg_ok {
+            return low.out;
+        }
     }
     // A macro crate's module list: the root's fragment declares each macro it names.
     if let ProcDecls::Module { here } = low.procs {
@@ -2700,6 +2890,9 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
                 continue;
             }
             self.cfg.attr(&mut attrs, strip_attr(item.text(self.text, attr.range)), &mut self.stack);
+            if !attrs.cfg_ok {
+                break;
+            }
         }
         // The item's taker: the first attribute that takes it whose first segment is none of the
         // crate's tools (a tool the root registers included: the Reference, `attributes.tool`).
@@ -2784,6 +2977,9 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
     fn item(&mut self, idx: ItemIndex, item: &Item) -> bool {
         let text = self.text;
         let attrs = self.attrs(item);
+        if attrs.cfg_version_gated {
+            self.note(LowerNoteKind::UnstableCfgVersion, item.range.start, "cfg(version(..))");
+        }
         if !attrs.cfg_ok {
             // A function-like call's place still counts: calls have no name, so a call's key is
             // its place among its owner's calls, and the body side numbers a block's calls from

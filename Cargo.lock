@@ -954,6 +954,7 @@ dependencies = [
  "blaze-ids",
  "blaze-mem",
  "blaze-own",
+ "blaze-pins",
  "blaze-sim",
  "blaze-surface",
  "blaze-tokens",

@@ -42,6 +42,8 @@ parser.workspace = true
 # `tokenize`: a literal token's kind, quotes and suffix; `is_ident`: whether the text
 # `${concat(..)}` makes is an identifier.
 rustc_lexer.workspace = true
+# `cfg_version_holds`: RFC 2523 `#[cfg(version("..."))]` against the pinned rustc release.
+blaze-pins.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true
