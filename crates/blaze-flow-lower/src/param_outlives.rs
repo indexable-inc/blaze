@@ -310,8 +310,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
 ///
 /// Walks `root` in the exact pre-order of `RegionCol` (`slots`) so column alignment is verified
 /// (`cursor == slots.len()`) before the caller commits any component. Stops emitting inside
-/// `PNode::Alias` (projections) and `PNode::Opaque` while still advancing `cursor` over their
-/// subtrees, and ignores `Region::Late` bound regions inside `for<..>` binders.
+/// `PNode::Alias` (projections), `PNode::Opaque`, and `PNode::Dynamic` predicate children
+/// (`(dyn Tr<'a> + 'o): 'k` implies only `'o: 'k`, never `'a: 'k`) while still advancing `cursor`
+/// over their subtrees, and ignores `Region::Late` bound regions inside `for<..>` binders.
 #[expect(clippy::too_many_arguments, reason = "pre-order region column walk with reusable scratch buffers")]
 fn decompose_type_outlives<F: blaze_typeck::regions::Arity, A: Allocator>(
     tys: blaze_typeck::PTys<'_>,
@@ -337,8 +338,9 @@ fn decompose_type_outlives<F: blaze_typeck::regions::Arity, A: Allocator>(
         let Ok(own) = usize::try_from(own_u32) else { return false };
         let Some(end) = cursor.checked_add(own) else { return false };
         let Some(own_slots) = slots.get(cursor..end) else { return false };
-        let child_emit = emit && !matches!(node, PNode::Alias { .. } | PNode::Opaque(..) | PNode::FnDef(..));
-        if child_emit {
+        let emit_own = emit && !matches!(node, PNode::Alias { .. } | PNode::Opaque(..) | PNode::FnDef(..));
+        let child_emit = emit_own && !matches!(node, PNode::Dynamic(_));
+        if emit_own {
             for &r in own_slots {
                 if matches!(r, Region::Param(_)) && r != target {
                     regs.push(r);

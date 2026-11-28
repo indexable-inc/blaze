@@ -311,6 +311,20 @@ where
 {
     x
 }
+
+fn dyn_object_lifetime_yields_bound<'a, 'b, 'k>(x: &'b str) -> &'k str
+where
+    (dyn UnusedDyn<'a> + 'b): 'k,
+{
+    x
+}
+
+fn dyn_predicate_lifetime_does_not_yield_bound<'a, 'k>(x: &'a str) -> &'k str
+where
+    (dyn UnusedDyn<'a> + 'static): 'k,
+{
+    x
+}
 ";
 
 #[test]
@@ -359,6 +373,7 @@ fn async_implied_bounds_and_concrete_type_outlives() {
         "proj_sibling_yields_ref",
         "proj_sibling_yields_param",
         "dyn_sibling_yields_ref",
+        "dyn_object_lifetime_yields_bound",
     ] {
         let b = find(name);
         let (types, v) = world.check_borrows(b, heap.alloc());
@@ -387,6 +402,7 @@ fn async_implied_bounds_and_concrete_type_outlives() {
         "proj_outlives_no_region",
         "hr_fn_ptr_no_region",
         "proj_sibling_does_not_yield_proj_region",
+        "dyn_predicate_lifetime_does_not_yield_bound",
     ] {
         let b = find(name);
         let (types, v) = world.check_borrows(b, heap.alloc());
