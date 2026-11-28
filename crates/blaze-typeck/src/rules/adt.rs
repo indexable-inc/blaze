@@ -99,7 +99,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             self.push_expr(el, Expectation::HasType(f.t), Then::CoerceMany(f.b))?;
             return Ok(Flow::Wait);
         }
-        let elem = self.coerce_many_complete(f.b);
+        let elem = self.coerce_many_complete(f.b)?;
         let n = self.len_value(ids.len() as u64)?;
         Ok(Flow::Done(self.mk(TyView::Array(elem, n))?))
     }

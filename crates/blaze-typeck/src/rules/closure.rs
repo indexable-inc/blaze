@@ -310,7 +310,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         self.ret_sites.pop();
         self.async_sites.pop();
-        let actual = self.coerce_many_complete(f.a);
+        let actual = self.coerce_many_complete(f.a)?;
         if !self.is_never(actual) && !self.is_err(actual) {
             self.demand_eq(At::Expr(body), f.u, actual)?;
             if self.ty.list_len(f.l) != 0 {

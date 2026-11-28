@@ -61,7 +61,7 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         if ctx.is_some_and(|c| c.may_break) {
             self.diverges = false;
         }
-        Ok(Flow::Done(self.coerce_many_complete(f.a)))
+        Ok(Flow::Done(self.coerce_many_complete(f.a)?))
     }
 
     /// `check_stmt`. `f.saved` is the divergence before the statement; for a `let`, `f.t` is

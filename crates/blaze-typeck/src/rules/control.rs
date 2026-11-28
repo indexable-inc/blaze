@@ -239,7 +239,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         self.resolve_inferred_err()?;
         self.async_sites.pop();
         let Some(site) = self.ret_sites.pop() else { return Ok(()) };
-        let actual = self.coerce_many_complete(site);
+        let actual = self.coerce_many_complete(site)?;
         if !self.is_never(actual) && !self.is_err(actual) {
             // The body's value against the declared output: reported at the body's block.
             let root = self.body.root;
@@ -443,14 +443,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     None => {
                         self.if_fallback(e, f.a)?;
                         self.diverges = f.b & 1 != 0;
-                        Ok(Flow::Done(self.coerce_many_complete(f.a)))
+                        Ok(Flow::Done(self.coerce_many_complete(f.a)?))
                     }
                 }
             }
             _ => {
                 let else_div = self.diverges;
                 self.diverges = (f.b & 1 != 0) || ((f.b & 2 != 0) && else_div);
-                Ok(Flow::Done(self.coerce_many_complete(f.a)))
+                Ok(Flow::Done(self.coerce_many_complete(f.a)?))
             }
         }
     }
@@ -702,7 +702,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     fn match_arm(&mut self, f: Frame, arms: &[crate::body::Arm]) -> Result<Flow, Stop> {
         let Some(arm) = arms.get(f.a as usize) else {
             self.diverges = f.c != 0;
-            return Ok(Flow::Done(self.coerce_many_complete(f.b)));
+            return Ok(Flow::Done(self.coerce_many_complete(f.b)?));
         };
         self.resume(f, 3)?;
         if let Some(g) = arm.guard {
@@ -724,7 +724,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         let ctx = self.breaks.pop();
         self.diverges = !ctx.is_some_and(|c| c.may_break);
-        Ok(Flow::Done(self.coerce_many_complete(f.a)))
+        Ok(Flow::Done(self.coerce_many_complete(f.a)?))
     }
 
     fn find_break(&self, target: ExprId) -> Result<usize, Stop> {
