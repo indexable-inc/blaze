@@ -2906,3 +2906,156 @@ fn recursive_macro_rules_text_mark_preserves_distinct_local_hygiene() {
     assert_eq!(h_relex_let, m_let.local_hygiene());
     assert_ne!(h_relex_param, h_relex_let);
 }
+
+#[test]
+fn doc_comment_desugars_to_str_raw_with_minimal_hashes() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let assert_doc_lit = |src: &str, inner: bool, want_kind: LitKind, want_body: Option<&str>| {
+        let stream = lex(src, Edition::E2021, alloc).expect("doc comment lexes");
+        let idx = if inner { 5 } else { 4 };
+        let tok = stream.tokens()[idx];
+        let TokenKind::Literal { kind, suffix_len, .. } = tok.kind else {
+            panic!("expected literal at token {idx} for `{src:?}`, got {:?}", tok.kind);
+        };
+        assert_eq!((kind, suffix_len), (want_kind, 0), "literal kind for `{src:?}`");
+        if let Some(body) = want_body {
+            assert_eq!(stream.text_at(idx), body, "literal body for `{src:?}`");
+        }
+        // Every desugared doc comment must round-trip through source rendering back to the exact
+        // same literal kind and body text.
+        let mut rendered = blaze_own::AString::new_in(alloc);
+        blaze_expand::write_tokens(&stream, &mut rendered);
+        let relexed = lex(rendered.as_str(), Edition::E2021, alloc).expect("rendered doc comment re-lexes");
+        assert_eq!(relexed.tokens().len(), stream.tokens().len(), "round-trip token count for `{src:?}`");
+        let TokenKind::Literal { kind: rk, suffix_len: rsl, .. } = relexed.tokens()[idx].kind else {
+            panic!("expected literal after round-trip for `{src:?}`");
+        };
+        assert_eq!((rk, rsl), (kind, 0), "round-trip literal kind for `{src:?}`");
+        assert_eq!(relexed.text_at(idx), stream.text_at(idx), "round-trip literal body for `{src:?}`");
+    };
+
+    assert_doc_lit("/// attr\n", false, LitKind::StrRaw(0), Some(" attr"));
+    assert_doc_lit("///\n", false, LitKind::StrRaw(0), Some(""));
+    assert_doc_lit("//! inner\n", true, LitKind::StrRaw(0), Some(" inner"));
+    assert_doc_lit("/** block */", false, LitKind::StrRaw(0), Some(" block "));
+    assert_doc_lit("/*! inner block */", true, LitKind::StrRaw(0), Some(" inner block "));
+    assert_doc_lit("/// has \"quote\"\n", false, LitKind::StrRaw(1), Some(" has \"quote\""));
+    assert_doc_lit("/// trailing \"\n", false, LitKind::StrRaw(1), Some(" trailing \""));
+    assert_doc_lit("/// has \"#\n", false, LitKind::StrRaw(2), Some(" has \"#"));
+    assert_doc_lit("/// a\"###b\n", false, LitKind::StrRaw(4), Some(" a\"###b"));
+    assert_doc_lit("/// \"\"#\n", false, LitKind::StrRaw(2), Some(" \"\"#"));
+    assert_doc_lit("/// has \\n backslash\n", false, LitKind::StrRaw(0), Some(" has \\n backslash"));
+    assert_doc_lit("/** a\r\nb */", false, LitKind::StrRaw(0), Some(" a\nb "));
+
+    // 254 hashes after `"` needs 255 hashes (the u8 maximum for raw strings); 255 hashes after `"`
+    // cannot be represented as `StrRaw(u8)` and falls back to cooked `LitKind::Str`.
+    let mut hashes_254 = blaze_own::AString::new_in(alloc);
+    hashes_254.push_str("/// \"");
+    for _ in 0..254 {
+        hashes_254.push('#');
+    }
+    hashes_254.push('\n');
+    let mut want_254 = blaze_own::AString::new_in(alloc);
+    want_254.push_str(" \"");
+    for _ in 0..254 {
+        want_254.push('#');
+    }
+    assert_doc_lit(hashes_254.as_str(), false, LitKind::StrRaw(255), Some(want_254.as_str()));
+
+    let mut hashes_255 = blaze_own::AString::new_in(alloc);
+    hashes_255.push_str("/// \"");
+    for _ in 0..255 {
+        hashes_255.push('#');
+    }
+    hashes_255.push('\n');
+    assert_doc_lit(hashes_255.as_str(), false, LitKind::Str, None);
+
+    // Bare `\r` (not followed by `\n`) in a doc comment is refused by the lexer, matching rustc.
+    assert!(lex("/** bare\rcr */", Edition::E2021, alloc).is_err());
+}
+
+/// Exact `ctor-1.0.13` pattern (`__parse_feature_input!` in `ctor-1.0.13/src/macros/features.rs`):
+/// doc comments desugar to `#[doc = r"..."]` (`LitKind::StrRaw(n)`), so `#[doc = r" attr"]`,
+/// `#[doc = r" crate"]`, `#[doc = r#" has "quote""#]`, and `#[doc = $s:literal]` all match as in
+/// rustc, while mismatched text, leading spaces, hash counts, and cooked `LitKind::Str` do not.
+#[test]
+fn doc_comment_matches_raw_doc_attr_in_macro_rules() {
+    let cx = TestCx::new();
+
+    // ctor-1.0.13 optional `/// crate` and `/// attr` sections followed by `$doc:literal`.
+    let ctor_def = rules(
+        "(
+            $( #[doc = r\" crate\"] $( #[doc = $doc_crate:literal] )* )?
+            feature: $feat:literal;
+            $( #[doc = r\" attr\"] $( #[doc = $doc_attr:literal] )* )?
+            attr: $attr:ident;
+        ) => {
+            const FEAT: &str = $feat;
+            const ATTR_DOCS: &[&str] = &[ $( $( $doc_attr ),* )? ];
+            const CRATE_DOCS: &[&str] = &[ $( $( $doc_crate ),* )? ];
+            struct $attr;
+        }",
+        1,
+    );
+    let exp = call_fn(
+        &ctor_def,
+        "/// crate\n/// crate doc\nfeature: \"my_feat\";\n/// attr\n/// attr doc 1\n/// attr doc 2\nattr: MyAttr;",
+        &cx,
+    );
+    assert!(exp.diagnostics.is_empty(), "{:?}", exp.diagnostics);
+    assert_eq!(exp.arm, Some(0));
+    assert!(show(&exp.tokens).contains("struct MyAttr ;"), "got: {}", show(&exp.tokens));
+
+    // Quotes, hashes, inner doc comments, `:literal`, and `:expr` capture.
+    let raw_match = rules(
+        "(#[doc = r#\" has \"quote\"\"#]) => { const Q: i32 = 1; };
+         (#[doc = r##\" has \"#\"##]) => { const H: i32 = 2; };
+         (#![doc = r\" inner\"]) => { const I: i32 = 3; };
+         (#[doc = $s:literal]) => { const L: &str = $s; };",
+        1,
+    );
+    let q = call_fn(&raw_match, "/// has \"quote\"\n", &cx);
+    assert_eq!((q.arm, q.diagnostics.is_empty()), (Some(0), true));
+    let h = call_fn(&raw_match, "/// has \"#\n", &cx);
+    assert_eq!((h.arm, h.diagnostics.is_empty()), (Some(1), true));
+    let inner = call_fn(&raw_match, "//! inner\n", &cx);
+    assert_eq!((inner.arm, inner.diagnostics.is_empty()), (Some(2), true));
+    let fallback = call_fn(&raw_match, "/// other\n", &cx);
+    assert_eq!((fallback.arm, fallback.diagnostics.is_empty()), (Some(3), true));
+
+    // Explicit `#[doc = " attr"]` matches explicit cooked string, NOT `/// attr` (rustc semantics).
+    let cooked_def = rules("(#[doc = \" attr\"]) => { const COOKED: i32 = 1; };", 1);
+    let cooked_ok = call_fn(&cooked_def, "#[doc = \" attr\"]", &cx);
+    assert_eq!((cooked_ok.arm, cooked_ok.diagnostics.is_empty()), (Some(0), true));
+    let cooked_doc = call_fn(&cooked_def, "/// attr\n", &cx);
+    assert_eq!(cooked_doc.arm, None, "cooked #[doc = \" attr\"] must not match /// attr");
+
+    // Negative controls for `#[doc = r" attr"]` and hash-count strictness.
+    let attr_def = rules("(#[doc = r\" attr\"]) => { const OK: i32 = 1; };", 1);
+    assert_eq!(call_fn(&attr_def, "/// attr\n", &cx).arm, Some(0));
+    assert_eq!(call_fn(&attr_def, "/// other\n", &cx).arm, None, "different doc text must not match");
+    assert_eq!(call_fn(&attr_def, "///attr\n", &cx).arm, None, "missing leading space must not match");
+    assert_eq!(call_fn(&attr_def, "", &cx).arm, None, "explicit #[doc = r\" attr\"] must not match empty");
+
+    let hash_strict = rules("(#[doc = r#\" attr\"#]) => { const OK: i32 = 1; };", 1);
+    assert_eq!(call_fn(&hash_strict, "/// attr\n", &cx).arm, None, "StrRaw(1) must not match StrRaw(0)");
+}
+
+#[test]
+fn doc_comment_in_matcher_still_ignored_for_all_doc_forms() {
+    let cx = TestCx::new();
+    let def = rules(
+        "(
+            /// line doc in matcher
+            //! inner doc in matcher
+            /** block doc in matcher */
+            /*! inner block doc in matcher */
+            $x:ident
+        ) => { fn $x() {} }",
+        1,
+    );
+    let ok = call_fn(&def, "hello", &cx);
+    assert_eq!(show(&ok.tokens), "fn hello ( ) { }", "{:?}", ok.diagnostics);
+    let with_doc = call_fn(&def, "/// line doc in matcher\nhello", &cx);
+    assert_eq!(with_doc.arm, None, "a doc comment written in a matcher must not match a doc comment in the call");
+}

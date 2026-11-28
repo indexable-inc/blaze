@@ -1115,8 +1115,32 @@ fn literal_parts(text: &str) -> (LitKind, &str, &str) {
     (lit, inside, if suffix == "_" { "" } else { suffix })
 }
 
-/// The doc comment `token` as the attribute it stands for, `#[doc = ".."]` (`#![..]` when
-/// inner), its text quoted as a proc macro sees it; `None` if it is not a doc comment's text.
+/// The minimal raw-string `#` count `n` such that `r#...#"text"#...#` lexes back to `text`,
+/// or `None` when `text` cannot be represented as a raw string literal (contains a bare `\r`, or
+/// a `"` followed by 255 or more `#`s, exceeding Rust's 255-hash raw-string limit).
+fn raw_str_hashes(text: &str) -> Option<u8> {
+    let mut bytes = text.bytes().peekable();
+    let mut needed: Option<u8> = None;
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'\r' => return None,
+            b'"' => {
+                let mut hashes = 0u8;
+                while bytes.next_if_eq(&b'#').is_some() {
+                    hashes = hashes.checked_add(1)?;
+                }
+                let next = hashes.checked_add(1)?;
+                needed = Some(needed.map_or(next, |cur| cur.max(next)));
+            }
+            _ => {}
+        }
+    }
+    Some(needed.unwrap_or(0))
+}
+
+/// The doc comment `token` as the attribute it stands for, `#[doc = r"..."]` (`#![..]` when
+/// inner), matching rustc's raw-string desugaring (falling back to cooked `LitKind::Str` only
+/// when a raw string cannot represent the body); `None` if it is not a doc comment's text.
 fn doc_comment(
     out: &mut TokenStream<'_>,
     scratch: &mut blaze_own::AString<'_>,
@@ -1133,12 +1157,27 @@ fn doc_comment(
     };
     let from_end = if token.starts_with("/*") && token.ends_with("*/") { 2 } else { 0 };
     let body = token.get(3..token.len().checked_sub(from_end)?)?;
-    scratch.clear();
-    for piece in parser::line_break::without_break_crs(body) {
-        for char in piece.escape_debug() {
-            scratch.push(char);
+    let normalized = if body.contains('\r') {
+        scratch.clear();
+        for piece in parser::line_break::without_break_crs(body) {
+            scratch.push_str(piece);
         }
-    }
+        scratch.as_str()
+    } else {
+        body
+    };
+    let (lit_kind, lit_text) = match raw_str_hashes(normalized) {
+        Some(hashes) => (LitKind::StrRaw(hashes), normalized),
+        None => {
+            scratch.clear();
+            for piece in parser::line_break::without_break_crs(body) {
+                for char in piece.escape_debug() {
+                    scratch.push(char);
+                }
+            }
+            (LitKind::Str, scratch.as_str())
+        }
+    };
     let write = |out: &mut TokenStream<'_>| -> Result<(), StreamError> {
         out.punct('#', Spacing::Alone, ctx)?;
         if inner {
@@ -1147,8 +1186,8 @@ fn doc_comment(
         out.open(Delim::Bracket, ctx)?;
         out.push(TokenKind::Ident { raw: Raw::No, spacing: Spacing::Alone }, "doc", ctx)?;
         out.punct('=', Spacing::Alone, ctx)?;
-        let kind = TokenKind::Literal { kind: LitKind::Str, suffix_len: 0, spacing: Spacing::Alone };
-        out.push(kind, scratch.as_str(), ctx)?;
+        let kind = TokenKind::Literal { kind: lit_kind, suffix_len: 0, spacing: Spacing::Alone };
+        out.push(kind, lit_text, ctx)?;
         out.close(Delim::Bracket, ctx)
     };
     Some(write(out))

@@ -947,27 +947,49 @@ impl<'d, 'f> Compiler<'_, 'd, 'f> {
         }
     }
 
-    /// BLAZE'S RULE (the Reference is silent; konst 0.2.20's `__declare_string_cmp_fns!` needs
-    /// it): a doc attribute in a matcher, `#[doc = "..."]` or `#![doc = "..."]` with a string
-    /// literal (what a `///` or `//!` comment lexes to: the Reference, "Comments", "Doc comments
-    /// are interpreted as a special syntax for attributes"), matches nothing: it is a comment on
-    /// the matcher, not tokens the call must write. Gives the cursor after it, `None` when `c`
-    /// starts no such attribute. A `$` fragment inside the brackets is not one: it binds.
+    /// A doc comment (`///`, `//!`, `/** */`, `/*! */`) written in a matcher matches nothing
+    /// (konst 0.2.20's `__declare_string_cmp_fns!`), whereas an explicit `#[doc = r" attr"]` or
+    /// `#[doc = "..."]` attribute in a matcher is real matcher tokens (ctor 1.0.13's
+    /// `__parse_feature_input!`).
+    ///
+    /// `tokens::doc_comment` desugars doc comments with `Spacing::Alone` on `#`, `!`, `doc`, `=`,
+    /// and the unsuffixed string literal, whereas written `#[doc = ...]` / `#![doc = ...]` has
+    /// `Spacing::JointHidden` or `Spacing::Joint` on `#` (and `JointHidden` on `!` and the closing
+    /// literal). Gives the cursor after a desugared doc comment, `None` for an explicit attribute
+    /// or anything else. A `$` fragment inside the brackets is not one: it binds.
     fn doc_attr_end(&self, c: Cur<'f>) -> Option<Cur<'f>> {
         let mut at = c;
-        if !self.expect_char(&mut at, &['#']) {
+        if !matches!(self.kind(at), Some(TokenKind::Punct { char: '#', spacing: Spacing::Alone })) {
             return None;
         }
-        if matches!(self.kind(at), Some(TokenKind::Punct { char: '!', .. })) {
+        self.next(&mut at);
+        if matches!(self.kind(at), Some(TokenKind::Punct { char: '!', spacing: Spacing::Alone })) {
             self.next(&mut at);
         }
         if !matches!(self.kind(at), Some(TokenKind::Open(Delim::Bracket))) {
             return None;
         }
         let (_, mut inside) = self.expect_group(&mut at)?;
-        let doc = self.expect_ident(&mut inside, false).is_some_and(|tok| self.def.text(tok) == "doc");
-        let eq = doc && self.expect_char(&mut inside, &['=']);
-        let lit = eq && matches!(self.next(&mut inside).map(|tok| self.def.kind(tok)), Some(TokenKind::Literal { kind: LitKind::Str, .. }));
+        let doc = matches!(
+            self.next(&mut inside),
+            Some(tok)
+                if matches!(self.def.kind(tok), TokenKind::Ident { raw: Raw::No, spacing: Spacing::Alone })
+                    && self.def.text(tok) == "doc"
+        );
+        let eq = doc
+            && matches!(
+                self.next(&mut inside).map(|tok| self.def.kind(tok)),
+                Some(TokenKind::Punct { char: '=', spacing: Spacing::Alone })
+            );
+        let lit = eq
+            && matches!(
+                self.next(&mut inside).map(|tok| self.def.kind(tok)),
+                Some(TokenKind::Literal {
+                    kind: LitKind::Str | LitKind::StrRaw(_),
+                    suffix_len: 0,
+                    spacing: Spacing::Alone,
+                })
+            );
         (lit && inside.is_empty()).then_some(at)
     }
 
