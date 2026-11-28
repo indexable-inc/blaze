@@ -77,37 +77,158 @@ impl Input for Wrapped {
     }
 }
 
-/// The host the native mode builds for; the only one with a pinned clang and a sysroot today
-/// (pins/clang.json: Linux's sysroot is not pinned).
-const HOST: &str = "aarch64-apple-darwin";
+/// The host triple the native mode builds for: matches the running host OS and architecture so
+/// produced `script.bin` records match `blaze-proc-macro::native_unit::native_outputs`'s host
+/// lookup on both macOS and Linux.
+const HOST: &str = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    "aarch64-apple-darwin"
+} else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+    "x86_64-apple-darwin"
+} else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+    "aarch64-unknown-linux-gnu"
+} else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    "x86_64-unknown-linux-gnu"
+} else {
+    ""
+};
+
+/// Cargo's target-specific linker environment variable name for `triple`
+/// (e.g. `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER`).
+fn cargo_target_linker_env(triple: &str) -> String {
+    format!("CARGO_TARGET_{}_LINKER", triple.to_ascii_uppercase().replace('-', "_"))
+}
 
 /// `native`: the scripts are built as host binaries (no process shim: they really start the
-/// pinned clang), linked by the shelf's clang (`bin/clang`, whose `bin/clang.cfg` says
-/// `-fuse-ld=lld`: the release's `ld64.lld`) against the SDK; the machine's `cc` and `ld` are
-/// never asked.
+/// pinned clang), linked by the shelf's clang (`bin/clang`, with `lld` / `ld64.lld` / `ld.lld`)
+/// against the macOS SDK or Linux host sysroot; the machine's `cc` and `ld` are never asked.
 struct Native {
     /// `<home>/.blaze/v2/toolchain/clang/<sha256>`: the unpacked pin.
     clang: PathBuf,
-    /// The macOS SDK folder, resolved once by the caller (`xcrun --show-sdk-path`).
+    /// The macOS SDK folder (`xcrun --show-sdk-path`) or Linux host sysroot (`/usr` or NixOS `<glibc-dev>`).
     sdk: PathBuf,
+    /// Optional split Linux libc runtime library directory (e.g. NixOS `<glibc>/lib`).
+    lib_dir: Option<PathBuf>,
+    /// Optional resolved Linux ELF dynamic linker path (e.g. NixOS `<glibc>/lib/ld-linux-*.so.*`).
+    dynamic_linker: Option<PathBuf>,
+    /// Optional extra Linux runtime library search directories (`-rpath`).
+    rpaths: Vec<PathBuf>,
 }
 
 impl Input for Native {
-    const FIELDS: &'static [&'static str] = &["clang", "sdk"];
+    const FIELDS: &'static [&'static str] = &["clang", "sdk", "lib_dir", "dynamic_linker", "rpaths"];
 
     fn parse(f: &Fields<'_>) -> Result<Native, InputError> {
-        Ok(Native { clang: PathBuf::from(f.str("clang", None)?), sdk: PathBuf::from(f.str("sdk", None)?) })
+        let lib_dir = match f.get("lib_dir") {
+            None => None,
+            Some(_) => Some(PathBuf::from(f.str("lib_dir", None)?)),
+        };
+        let dynamic_linker = match f.get("dynamic_linker") {
+            None => None,
+            Some(_) => Some(PathBuf::from(f.str("dynamic_linker", None)?)),
+        };
+        let rpaths = match f.get("rpaths") {
+            None => Vec::new(),
+            Some(_) => f.strs("rpaths")?.into_iter().map(PathBuf::from).collect(),
+        };
+        Ok(Native {
+            clang: PathBuf::from(f.str("clang", None)?),
+            sdk: PathBuf::from(f.str("sdk", None)?),
+            lib_dir,
+            dynamic_linker,
+            rpaths,
+        })
     }
 }
 
 impl Native {
+    /// Resolves and content-keys the Linux host sysroot (headers, split kernel headers, libc/CRT
+    /// and GCC C++ runtime libraries, dynamic linker, rpaths, and external symlinks) via the
+    /// workspace's single source of truth (`blaze_proc_macro::native_setting::resolve_linux_sysroot`).
+    fn resolve_linux<'a>(
+        &self,
+        alloc: blaze_own::Alloc<'a>,
+    ) -> Result<blaze_proc_macro::native_setting::ResolvedLinuxSysroot<'a>, Failure> {
+        let sdk_s = self.sdk.to_str().ok_or_else(|| Failure::Manifest {
+            path: self.sdk.clone(),
+            why: "native sdk path is not UTF-8".to_owned(),
+        })?;
+        let lib_dir_s = match self.lib_dir.as_ref() {
+            None => None,
+            Some(p) => Some(p.to_str().ok_or_else(|| Failure::Manifest {
+                path: p.clone(),
+                why: "native lib_dir path is not UTF-8".to_owned(),
+            })?),
+        };
+        let dyn_s = match self.dynamic_linker.as_ref() {
+            None => None,
+            Some(p) => Some(p.to_str().ok_or_else(|| Failure::Manifest {
+                path: p.clone(),
+                why: "native dynamic_linker path is not UTF-8".to_owned(),
+            })?),
+        };
+        let mut rpath_refs: Vec<&str> = Vec::with_capacity(self.rpaths.len());
+        for p in &self.rpaths {
+            rpath_refs.push(p.to_str().ok_or_else(|| Failure::Manifest {
+                path: p.clone(),
+                why: "native rpath is not UTF-8".to_owned(),
+            })?);
+        }
+        blaze_proc_macro::native_setting::resolve_linux_sysroot(
+            sdk_s,
+            blaze_proc_macro::native_setting::LinuxLinkInputs {
+                lib_dir: lib_dir_s,
+                dynamic_linker: dyn_s,
+                rpaths: &rpath_refs,
+            },
+            HOST,
+            alloc,
+        )
+        .map_err(|e| Failure::Manifest { path: self.sdk.clone(), why: e.to_string() })
+    }
+
     /// The identity's lines: the target, the compiler by its shelf digest (the folder's name),
-    /// the SDK by its settings file's digest; no machine path.
-    fn identity(&self) -> Result<String, Failure> {
+    /// and the complete SDK/sysroot identity (on macOS `SDKSettings.json`; on Linux the full
+    /// `ResolvedLinuxSysroot` content digest covering every granted header, libc/CRT/GCC runtime
+    /// library, dynamic linker, and rpath, plus canonical embedded runtime linker paths when
+    /// NixOS split runtime paths are embedded in `script.bin`).
+    fn identity(&self, linux: Option<&blaze_proc_macro::native_setting::ResolvedLinuxSysroot<'_>>) -> Result<String, Failure> {
+        if HOST.is_empty() {
+            return Err(Failure::NoSandbox { why: "unsupported host platform for native build scripts".to_owned() });
+        }
         let digest = self.clang.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
-        let settings = self.sdk.join("SDKSettings.json");
-        let settings = std::fs::read(&settings).map_err(io(&settings))?;
-        Ok(format!("target {HOST}\nlinker clang {digest}\nsdk settings {}\n", sha256(&settings)))
+        if cfg!(target_os = "macos") {
+            let settings = self.sdk.join("SDKSettings.json");
+            let settings = std::fs::read(&settings).map_err(io(&settings))?;
+            Ok(format!("target {HOST}\nlinker clang {digest}\nsdk settings {}\n", sha256(&settings)))
+        } else {
+            let resolved = linux.ok_or_else(|| Failure::Manifest {
+                path: self.sdk.clone(),
+                why: "missing resolved Linux sysroot for native identity".to_owned(),
+            })?;
+            let mut link_inputs = String::new();
+            if self.lib_dir.is_some() {
+                if let Some(lib) = resolved.sdk_lib.as_deref() {
+                    link_inputs.push_str("lib ");
+                    link_inputs.push_str(lib);
+                    link_inputs.push('\n');
+                }
+                if let Some(dyn_linker) = resolved.sdk_dynamic_linker.as_deref() {
+                    link_inputs.push_str("dyn ");
+                    link_inputs.push_str(dyn_linker);
+                    link_inputs.push('\n');
+                }
+                for rpath in resolved.sdk_rpaths.iter() {
+                    link_inputs.push_str("rpath ");
+                    link_inputs.push_str(rpath.as_str());
+                    link_inputs.push('\n');
+                }
+            }
+            Ok(format!(
+                "target {HOST}\nlinker clang {digest}\nsdk linux-host {}\nsdk link-paths {}\n",
+                resolved.sdk_version.as_str(),
+                sha256(link_inputs.as_bytes()),
+            ))
+        }
     }
 }
 
@@ -458,9 +579,13 @@ impl Plan<'_> {
         // Distinct target-bearing header for `wasm32-wasip1` bootstrap records so they never
         // collide with on-demand `wasm64-blaze-wasip1` self-compiled modules
         // (`blaze build-script module wasm64 7` in `crates/blaze-proc-macro/src/script_unit.rs`).
+        let linux_sysroot = match native {
+            Some(native) if cfg!(target_os = "linux") => Some(native.resolve_linux(alloc)?),
+            _ => None,
+        };
         let (header, runner) = match native {
             None => ("blaze build-script module wasm32 5", format!("shim {shim_digest}\npatches {rt_digest}\n")),
-            Some(native) => ("blaze build-script module 3", native.identity()?),
+            Some(native) => ("blaze build-script module 3", native.identity(linux_sysroot.as_ref())?),
         };
         let identity = format!(
             "{header}\nname {}\nversion {}\n{}\ndeps {}\nfeatures {}\ntoolchain {}\n{runner}builder bootstrap\n",
@@ -521,6 +646,65 @@ impl Plan<'_> {
             argv.push("--features".into());
             argv.push(features.join(",").into());
         }
+        // Stage Linux `clang.cfg` (and optional `ld.lld` symlink) before building the sandbox so
+        // an external whitespace-free staging directory is explicitly mounted read-only inside
+        // `bwrap` and cleaned up automatically when this function returns.
+        struct ExternalCfgGuard(Option<PathBuf>);
+        impl Drop for ExternalCfgGuard {
+            fn drop(&mut self) {
+                if let Some(dir) = self.0.take() {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+        }
+        let mut external_cfg_guard = ExternalCfgGuard(None);
+        let mut linux_override: Option<(PathBuf, String)> = None;
+        if let (Some(native), Some(resolved)) = (native, linux_sysroot.as_ref()) {
+            let cfg_dir = if ws.to_string_lossy().bytes().any(|b| b.is_ascii_whitespace()) {
+                let tmp = PathBuf::from(format!("/tmp/blaze-pm-cfg-{}-{}", std::process::id(), &key[..16]));
+                std::fs::create_dir_all(&tmp).map_err(io(&tmp))?;
+                external_cfg_guard.0 = Some(tmp.clone());
+                tmp
+            } else {
+                ws.clone()
+            };
+            let shelf_ld = native.clang.join("bin/ld.lld");
+            let ld_lld = if shelf_ld.exists() {
+                shelf_ld
+            } else {
+                let staged_ld = cfg_dir.join("ld.lld");
+                let _ = std::fs::remove_file(&staged_ld);
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(native.clang.join("bin/lld"), &staged_ld).map_err(io(&staged_ld))?;
+                staged_ld
+            };
+            let shelf_s = native.clang.to_string_lossy();
+            let ld_s = ld_lld.to_string_lossy();
+            let rpath_refs: Vec<&str> = resolved.sdk_rpaths.iter().map(|s| s.as_str()).collect();
+            let clang_major = blaze_build_script::toolchain::clang_major(blaze_pins::CLANG_JSON).unwrap_or("23");
+            let cfg_text = blaze_build_script::toolchain::format_linux_clang_cfg(
+                resolved.sdk.as_str(),
+                blaze_build_script::toolchain::LinuxClangLink {
+                    lib_dir: resolved.sdk_lib.as_deref(),
+                    gcc_lib_dir: resolved.sdk_gcc_lib.as_deref(),
+                    dynamic_linker: resolved.sdk_dynamic_linker.as_deref(),
+                    rpaths: &rpath_refs,
+                    ld_lld: Some(ld_s.as_ref()),
+                    embed_runtime_paths: native.lib_dir.is_some(),
+                },
+                &[],
+                blaze_build_script::toolchain::Shelf { dir: shelf_s.as_ref(), clang_major },
+                alloc,
+            );
+            let cfg_path = cfg_dir.join("clang.cfg");
+            write(&cfg_path, cfg_text.as_str())?;
+            let override_val = blaze_build_script::toolchain::linux_clang_override_options(
+                cfg_path.to_string_lossy().as_ref(),
+                alloc,
+            );
+            linux_override = Some((cfg_dir, override_val.as_str().to_owned()));
+        }
+
         // A native build (D65) runs under the deny-by-default profile: reads only of its own
         // sources, its dependencies' (vendored), the pinned Rust toolchain, the shelf's clang
         // and the SDK; writes only of its own folders. The wasm build keeps the builder's
@@ -533,28 +717,65 @@ impl Plan<'_> {
                 for dir in [&target, &cargo_home, &tmp] {
                     std::fs::create_dir_all(dir).map_err(io(dir))?;
                 }
+                let writes: [&Path; 4] = [target.as_path(), ws.as_path(), cargo_home.as_path(), tmp.as_path()];
                 let own_source = match origin {
                     Origin::Path { dir, .. } | Origin::Git { dir, .. } => Some(dir.as_path()),
                     Origin::Registry { .. } => None,
                 };
                 let vendor = self.work.join("vendor");
-                let mut reads: Vec<&Path> = vec![vendor.as_path(), self.tool.sysroot.as_path(), native.clang.as_path(), native.sdk.as_path()];
-                reads.extend(own_source);
-                // The interim builder's own start-up config: the LibreSSL cargo links reads it
-                // when it starts and stops if refused. One file, read-only, no secret in it; the
-                // scripts cargo starts inherit the grant, as they inherit this whole profile (the
-                // interim builder is one sandbox; the real path confines each script alone).
-                let openssl_config = Path::new("/private/etc/ssl/openssl.cnf");
-                reads.push(openssl_config);
-                let shelf_bin = native.clang.join("bin");
-                let toolchain_bin = self.tool.sysroot.join("bin");
-                // rustc starts the tools under `lib/rustlib/<host>/bin` (`rust-objcopy`,
-                // `rust-lld`, `gcc-ld`): the pinned toolchain's, read-only.
-                let toolchain_tools = self.tool.sysroot.join("lib").join("rustlib");
-                let writes: [&Path; 4] = [target.as_path(), ws.as_path(), cargo_home.as_path(), tmp.as_path()];
-                let exec_under: [&Path; 4] = [toolchain_bin.as_path(), toolchain_tools.as_path(), shelf_bin.as_path(), target.as_path()];
-                let builder = NativeBuilder { cargo: Path::new(&self.tool.cargo()).to_owned(), reads: &reads, writes: &writes, exec_under: &exec_under };
-                builder.profile().and_then(|profile| native_sandboxed(argv.clone(), profile))
+                if cfg!(target_os = "macos") {
+                    let mut reads: Vec<&Path> = vec![vendor.as_path(), self.tool.sysroot.as_path(), native.clang.as_path(), native.sdk.as_path()];
+                    reads.extend(own_source);
+                    // The interim builder's own start-up config: the LibreSSL cargo links reads it
+                    // when it starts and stops if refused. One file, read-only, no secret in it; the
+                    // scripts cargo starts inherit the grant, as they inherit this whole profile (the
+                    // interim builder is one sandbox; the real path confines each script alone).
+                    let openssl_config = Path::new("/private/etc/ssl/openssl.cnf");
+                    reads.push(openssl_config);
+                    let shelf_bin = native.clang.join("bin");
+                    let toolchain_bin = self.tool.sysroot.join("bin");
+                    // rustc starts the tools under `lib/rustlib/<host>/bin` (`rust-objcopy`,
+                    // `rust-lld`, `gcc-ld`): the pinned toolchain's, read-only.
+                    let toolchain_tools = self.tool.sysroot.join("lib").join("rustlib");
+                    let exec_under: [&Path; 4] = [toolchain_bin.as_path(), toolchain_tools.as_path(), shelf_bin.as_path(), target.as_path()];
+                    let builder = NativeBuilder { cargo: Path::new(&self.tool.cargo()).to_owned(), reads: &reads, writes: &writes, exec_under: &exec_under };
+                    builder.profile().and_then(|profile| native_sandboxed(argv.clone(), profile))
+                } else if cfg!(target_os = "linux") {
+                    let mut reads: Vec<PathBuf> = vec![vendor.clone(), self.tool.sysroot.clone(), native.clang.clone()];
+                    if let Some(src) = own_source {
+                        reads.push(src.to_path_buf());
+                    }
+                    if let Some(resolved) = linux_sysroot.as_ref() {
+                        reads.push(PathBuf::from(format!("{}/include", resolved.sdk.as_str())));
+                        for extra in resolved.sdk_extra_reads.iter() {
+                            reads.push(PathBuf::from(extra.as_str()));
+                        }
+                    }
+                    if let Some((cfg_dir, _)) = linux_override.as_ref()
+                        && cfg_dir != &ws
+                    {
+                        reads.push(cfg_dir.clone());
+                    }
+                    let executables: Vec<PathBuf> = [
+                        PathBuf::from(self.tool.cargo()),
+                        self.tool.sysroot.join("bin/rustc"),
+                        native.clang.join("bin/clang"),
+                        native.clang.join("bin/clang++"),
+                        native.clang.join("bin/lld"),
+                    ]
+                    .into_iter()
+                    .filter(|p| p.exists())
+                    .collect();
+                    let read_refs: Vec<&Path> = reads.iter().map(PathBuf::as_path).collect();
+                    let exec_refs: Vec<&Path> = executables.iter().map(PathBuf::as_path).collect();
+                    native_sandboxed_linux(
+                        argv.clone(),
+                        &LinuxSandboxSpec { reads: &read_refs, writes: &writes, executables: &exec_refs },
+                        &self.path,
+                    )
+                } else {
+                    Err("native build-script building is supported on macOS and Linux hosts only".to_owned())
+                }
             }
         };
         let argv = match sandbox {
@@ -578,12 +799,16 @@ impl Plan<'_> {
             None => env.push(("__CARGO_TESTS_ONLY_SRC_ROOT".to_owned(), library.as_os_str().to_owned())),
             Some(native) => {
                 // Every host artifact (the script, its build-dependencies' scripts and proc
-                // macros) links with the shelf's clang, which links with `ld64.lld`, against
-                // the SDK: the machine's `cc` and `ld` are never asked.
-                env.push(("CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER".to_owned(), native.clang.join("bin/clang").into_os_string()));
-                env.push(("SDKROOT".to_owned(), native.sdk.clone().into_os_string()));
-                env.push(("MACOSX_DEPLOYMENT_TARGET".to_owned(), "11.0".into()));
+                // macros) links with the shelf's clang (with `ld64.lld` on macOS or `ld.lld` on
+                // Linux) against the SDK/sysroot: the machine's `cc` and `ld` are never asked.
+                env.push((cargo_target_linker_env(HOST), native.clang.join("bin/clang").into_os_string()));
                 env.push(("ZERO_AR_DATE".to_owned(), "1".into()));
+                if cfg!(target_os = "macos") {
+                    env.push(("SDKROOT".to_owned(), native.sdk.clone().into_os_string()));
+                    env.push(("MACOSX_DEPLOYMENT_TARGET".to_owned(), "11.0".into()));
+                } else if let Some((_, override_val)) = linux_override.as_ref() {
+                    env.push(("CCC_OVERRIDE_OPTIONS".to_owned(), override_val.into()));
+                }
             }
         }
         let what = format!("the build of {} {}'s script", wanted.name, wanted.version);
@@ -599,8 +824,8 @@ impl Plan<'_> {
         check_compiled(&compiled, &closure, &std_lock, library, &wanted.name, &wanted.version)?;
 
         let (artifact, module_file, digest_file) = match native {
-            None => ("wasm32-wasip1/release/build-script-build.wasm", "module.wasm", "wasm-sha256"),
-            Some(_) => ("aarch64-apple-darwin/release/build-script-build", "script.bin", "bin-sha256"),
+            None => ("wasm32-wasip1/release/build-script-build.wasm".to_owned(), "module.wasm", "wasm-sha256"),
+            Some(_) => (format!("{HOST}/release/build-script-build"), "script.bin", "bin-sha256"),
         };
         let wasm_path = target.join(artifact);
         let wasm = std::fs::read(&wasm_path).map_err(io(&wasm_path))?;
@@ -760,11 +985,10 @@ impl NativeBuilder<'_> {
     }
 }
 
-/// The command that runs `argv` under `profile`. macOS only: Linux has no pinned sysroot, so no
-/// native script is built there yet (D69).
+/// The command that runs `argv` under `profile` on macOS via Seatbelt.
 fn native_sandboxed(argv: Vec<OsString>, profile: String) -> Result<Vec<OsString>, String> {
     if !cfg!(target_os = "macos") {
-        return Err("a native build script is built only on macOS for now (D69: no Linux sysroot is pinned)".to_owned());
+        return Err("Seatbelt sandboxing is macOS-only".to_owned());
     }
     let exec = Path::new("/usr/bin/sandbox-exec");
     if !exec.exists() {
@@ -773,6 +997,396 @@ fn native_sandboxed(argv: Vec<OsString>, profile: String) -> Result<Vec<OsString
     let mut out = vec![exec.as_os_str().to_owned(), "-p".into(), profile.into()];
     out.extend(argv);
     Ok(out)
+}
+
+/// Scoped grants for building a Linux native build-script module inside `bwrap` without ever
+/// binding `/` or `$HOME`.
+struct LinuxSandboxSpec<'a> {
+    reads: &'a [&'a Path],
+    writes: &'a [&'a Path],
+    executables: &'a [&'a Path],
+}
+
+fn read_u16_le(bytes: &[u8], off: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(bytes.get(off..off + 2)?.try_into().ok()?))
+}
+
+fn read_u32_le(bytes: &[u8], off: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.get(off..off + 4)?.try_into().ok()?))
+}
+
+fn read_u64_le(bytes: &[u8], off: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(bytes.get(off..off + 8)?.try_into().ok()?))
+}
+
+fn read_cstr(bytes: &[u8], off: usize) -> Option<&str> {
+    let tail = bytes.get(off..)?;
+    let end = tail.iter().position(|&b| b == 0)?;
+    core::str::from_utf8(tail.get(..end)?).ok()
+}
+
+/// Parses ELF64 little-endian `PT_INTERP`, `DT_NEEDED`, and `DT_RPATH`/`DT_RUNPATH` entries from
+/// `path` so the Linux `bwrap` sandbox mounts ONLY the exact runtime shared-library closure of
+/// `cargo`, `rustc`, `clang`, and `lld` (never `/` or `$HOME`).
+fn parse_elf64_deps(path: &Path) -> (Option<PathBuf>, Vec<String>, Vec<PathBuf>) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return (None, Vec::new(), Vec::new());
+    };
+    if bytes.get(0..4) != Some(b"\x7fELF") || bytes.get(4) != Some(&2) || bytes.get(5) != Some(&1) {
+        return (None, Vec::new(), Vec::new());
+    }
+    let (Some(phoff), Some(phentsize), Some(phnum)) = (read_u64_le(&bytes, 32), read_u16_le(&bytes, 54), read_u16_le(&bytes, 56)) else {
+        return (None, Vec::new(), Vec::new());
+    };
+    let (Ok(phoff), phentsize, phnum) = (usize::try_from(phoff), usize::from(phentsize), usize::from(phnum)) else {
+        return (None, Vec::new(), Vec::new());
+    };
+    let mut interp: Option<PathBuf> = None;
+    let mut dyn_off: Option<(usize, usize)> = None;
+    let mut loads: Vec<(u64, u64, u64)> = Vec::new();
+    for i in 0..phnum {
+        let Some(base) = i.checked_mul(phentsize).and_then(|o| phoff.checked_add(o)) else { break };
+        let Some(p_type) = read_u32_le(&bytes, base) else { break };
+        let (Some(p_offset), Some(p_vaddr), Some(p_filesz)) = (read_u64_le(&bytes, base + 8), read_u64_le(&bytes, base + 16), read_u64_le(&bytes, base + 32)) else {
+            break;
+        };
+        match p_type {
+            1 => loads.push((p_vaddr, p_offset, p_filesz)),
+            2 => {
+                if let (Ok(off), Ok(sz)) = (usize::try_from(p_offset), usize::try_from(p_filesz)) {
+                    dyn_off = Some((off, sz));
+                }
+            }
+            3 => {
+                if let (Ok(off), Ok(sz)) = (usize::try_from(p_offset), usize::try_from(p_filesz))
+                    && let Some(slice) = bytes.get(off..off.saturating_add(sz))
+                {
+                    let trimmed = slice.split(|&b| b == 0).next().unwrap_or(slice);
+                    if let Ok(s) = core::str::from_utf8(trimmed)
+                        && s.starts_with('/')
+                    {
+                        interp = Some(PathBuf::from(s));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut needed_offs: Vec<u64> = Vec::new();
+    let mut rpath_offs: Vec<u64> = Vec::new();
+    let mut strtab_va: Option<u64> = None;
+    if let Some((off, sz)) = dyn_off {
+        let mut pos = off;
+        let end = off.saturating_add(sz);
+        while pos.saturating_add(16) <= end {
+            let (Some(tag), Some(val)) = (read_u64_le(&bytes, pos), read_u64_le(&bytes, pos + 8)) else { break };
+            pos += 16;
+            match tag {
+                0 => break,
+                1 => needed_offs.push(val),
+                5 => strtab_va = Some(val),
+                15 | 29 => rpath_offs.push(val),
+                _ => {}
+            }
+        }
+    }
+    let strtab_file_off = strtab_va.and_then(|va| {
+        loads.iter().find_map(|&(vaddr, offset, filesz)| {
+            (va >= vaddr && va < vaddr.saturating_add(filesz))
+                .then(|| offset.saturating_add(va.saturating_sub(vaddr)))
+                .and_then(|o| usize::try_from(o).ok())
+        })
+    });
+    let mut needed = Vec::new();
+    let mut rpaths = Vec::new();
+    if let Some(str_off) = strtab_file_off {
+        for noff in needed_offs {
+            if let Ok(rel) = usize::try_from(noff)
+                && let Some(name) = read_cstr(&bytes, str_off.saturating_add(rel))
+                && !name.is_empty()
+            {
+                needed.push(name.to_owned());
+            }
+        }
+        let origin = path.parent().and_then(Path::to_str).unwrap_or("");
+        for roff in rpath_offs {
+            if let Ok(rel) = usize::try_from(roff)
+                && let Some(raw) = read_cstr(&bytes, str_off.saturating_add(rel))
+            {
+                for entry in raw.split(':').filter(|e| !e.is_empty()) {
+                    let expanded = entry.replace("$ORIGIN", origin).replace("${ORIGIN}", origin);
+                    if expanded.starts_with('/') {
+                        rpaths.push(PathBuf::from(expanded));
+                    }
+                }
+            }
+        }
+    }
+    (interp, needed, rpaths)
+}
+
+/// Collects the bounded transitive ELF runtime shared-library read paths needed by `executables`
+/// inside a `--tmpfs /` Linux `bwrap` sandbox (without binding `/` or `$HOME`).
+fn collect_elf_runtime_reads(executables: &[&Path]) -> Vec<PathBuf> {
+    const MAX_FILES: usize = 256;
+    const FHS_DIRS: &[&str] = &[
+        "/lib/aarch64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+        "/lib/x86_64-linux-gnu",
+        "/usr/lib/x86_64-linux-gnu",
+        "/lib64",
+        "/usr/lib64",
+        "/lib",
+        "/usr/lib",
+    ];
+    let mut queue: Vec<PathBuf> = executables.iter().map(|p| (*p).to_path_buf()).collect();
+    let mut visited: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    let mut grants: Vec<PathBuf> = Vec::new();
+    let mut push_grant = |p: &Path| {
+        if p.exists() {
+            grants.push(p.to_path_buf());
+            if let Ok(real) = std::fs::canonicalize(p)
+                && real != p
+            {
+                grants.push(real);
+            }
+        }
+    };
+    while let Some(cur) = queue.pop() {
+        if visited.len() >= MAX_FILES {
+            break;
+        }
+        let key = std::fs::canonicalize(&cur).unwrap_or_else(|_| cur.clone());
+        if !visited.insert(key.clone()) {
+            continue;
+        }
+        let (interp, needed, rpaths) = parse_elf64_deps(&key);
+        if let Some(loader) = interp {
+            push_grant(&loader);
+            queue.push(loader);
+        }
+        for rp in &rpaths {
+            if rp.is_dir() {
+                push_grant(rp);
+            }
+        }
+        for soname in needed {
+            let found = rpaths
+                .iter()
+                .map(|dir| dir.join(&soname))
+                .chain(FHS_DIRS.iter().map(|dir| Path::new(dir).join(&soname)))
+                .find(|cand| cand.exists());
+            if let Some(lib_path) = found {
+                push_grant(&lib_path);
+                queue.push(lib_path);
+            }
+        }
+    }
+    for sys_file in ["/etc/ld.so.cache", "/etc/ssl/openssl.cnf"] {
+        let p = Path::new(sys_file);
+        if p.exists() {
+            push_grant(p);
+        }
+    }
+    grants
+}
+
+/// Builds the scoped `bwrap` argument vector for `spec`: starts from an empty `--tmpfs /` root
+/// with `--unshare-net` and `--die-with-parent`, binding ONLY the granted `reads` + ELF runtime
+/// closure read-only and ONLY `writes` read-write (NEVER `--ro-bind / /` and NEVER `$HOME`).
+fn build_linux_bwrap_args(bwrap: &Path, argv: Vec<OsString>, spec: &LinuxSandboxSpec<'_>) -> Vec<OsString> {
+    let mut out: Vec<OsString> = vec![
+        bwrap.as_os_str().to_owned(),
+        "--tmpfs".into(),
+        "/".into(),
+        "--dev".into(),
+        "/dev".into(),
+        "--proc".into(),
+        "/proc".into(),
+        "--tmpfs".into(),
+        "/tmp".into(),
+        "--unshare-net".into(),
+        "--die-with-parent".into(),
+    ];
+    let mut ro_seen: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    let mut push_ro = |p: &Path| {
+        if p == Path::new("/") || !p.is_absolute() || !p.exists() {
+            return;
+        }
+        if ro_seen.insert(p.to_path_buf()) {
+            out.push("--ro-bind".into());
+            out.push(p.as_os_str().to_owned());
+            out.push(p.as_os_str().to_owned());
+        }
+        if let Ok(real) = std::fs::canonicalize(p)
+            && real != Path::new("/")
+            && ro_seen.insert(real.clone())
+        {
+            out.push("--ro-bind".into());
+            out.push(real.as_os_str().to_owned());
+            out.push(real.into_os_string());
+        }
+    };
+    for &r in spec.reads {
+        push_ro(r);
+    }
+    for rt in collect_elf_runtime_reads(spec.executables) {
+        push_ro(&rt);
+    }
+    let mut rw_seen: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    for &w in spec.writes {
+        if w == Path::new("/") || !w.is_absolute() {
+            continue;
+        }
+        if rw_seen.insert(w.to_path_buf()) {
+            out.push("--bind".into());
+            out.push(w.as_os_str().to_owned());
+            out.push(w.as_os_str().to_owned());
+        }
+    }
+    out.extend(argv);
+    out
+}
+
+/// The command that runs `argv` in a networkless, scoped Linux `bwrap` sandbox whose root is an
+/// empty `--tmpfs /` with read-only binds ONLY for granted inputs and runtime libraries, and
+/// writable binds ONLY for `spec.writes` (`target`, `ws`, `cargo_home`, `tmp`).
+fn native_sandboxed_linux(argv: Vec<OsString>, spec: &LinuxSandboxSpec<'_>, path_env: &str) -> Result<Vec<OsString>, String> {
+    let fixed = ["/usr/bin/bwrap", "/bin/bwrap", "/run/current-system/sw/bin/bwrap"];
+    let bwrap = fixed
+        .into_iter()
+        .map(PathBuf::from)
+        .chain(path_env.split(':').filter(|dir| dir.starts_with('/')).map(|dir| Path::new(dir).join("bwrap")))
+        .find(|cand| cand.exists());
+    let Some(bwrap) = bwrap else {
+        return Err("no bwrap at /usr/bin, /bin, /run/current-system/sw/bin, or PATH".to_owned());
+    };
+    Ok(build_linux_bwrap_args(&bwrap, argv, spec))
+}
+
+#[cfg(test)]
+mod host_tests {
+    use std::path::Path;
+
+    use super::{HOST, LinuxSandboxSpec, Native, build_linux_bwrap_args, cargo_target_linker_env};
+
+    #[test]
+    fn host_triple_and_linker_env_match_running_platform() {
+        if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            assert_eq!(HOST, "aarch64-unknown-linux-gnu");
+            assert_eq!(cargo_target_linker_env(HOST), "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER");
+        } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            assert_eq!(HOST, "x86_64-unknown-linux-gnu");
+            assert_eq!(cargo_target_linker_env(HOST), "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER");
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert_eq!(HOST, "aarch64-apple-darwin");
+            assert_eq!(cargo_target_linker_env(HOST), "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER");
+        }
+        assert!(!HOST.is_empty());
+    }
+
+    #[test]
+    fn native_identity_commits_to_complete_linux_sysroot_headers_libs_and_link_paths() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let root = std::env::temp_dir().join(format!("blaze-pm-native-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let clang = root.join("9b27cf263d711aa6");
+        let sdk = root.join("sdk");
+        std::fs::create_dir_all(&clang).expect("clang dir");
+        if cfg!(target_os = "macos") {
+            std::fs::create_dir_all(&sdk).expect("sdk dir");
+            std::fs::write(sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#).expect("SDKSettings.json");
+            let native = Native { clang, sdk, lib_dir: None, dynamic_linker: None, rpaths: Vec::new() };
+            let id = native.identity(None).unwrap_or_else(|e| panic!("identity failed: {e}"));
+            assert!(id.starts_with(&format!("target {HOST}\nlinker clang 9b27cf263d711aa6\n")), "unexpected identity: {id}");
+        } else {
+            let lib_a = root.join("glibc-a/lib");
+            let lib_b = root.join("glibc-b/lib");
+            std::fs::create_dir_all(sdk.join("include/sys")).expect("sdk include");
+            std::fs::create_dir_all(&lib_a).expect("lib_a");
+            std::fs::create_dir_all(&lib_b).expect("lib_b");
+            std::fs::write(sdk.join("include/features.h"), b"#define __GLIBC__ 2\n").expect("features.h");
+            std::fs::write(sdk.join("include/sys/types.h"), b"typedef long off_t;\n").expect("types.h v1");
+            std::fs::write(lib_a.join("crt1.o"), b"crt-v1").expect("crt-a");
+            std::fs::write(lib_b.join("crt1.o"), b"crt-v1").expect("crt-b");
+
+            let native_a = Native {
+                clang: clang.clone(),
+                sdk: sdk.clone(),
+                lib_dir: Some(lib_a.clone()),
+                dynamic_linker: None,
+                rpaths: Vec::new(),
+            };
+            let id_v1 = native_a
+                .identity(Some(&native_a.resolve_linux(alloc).unwrap_or_else(|e| panic!("resolve v1: {e}"))))
+                .unwrap_or_else(|e| panic!("id v1: {e}"));
+            assert!(id_v1.starts_with(&format!("target {HOST}\nlinker clang 9b27cf263d711aa6\nsdk linux-host ")), "{id_v1}");
+
+            // 1. Editing a header other than `features.h` MUST move the module identity.
+            std::fs::write(sdk.join("include/sys/types.h"), b"typedef long long off_t;\n").expect("types.h v2");
+            let id_v2 = native_a
+                .identity(Some(&native_a.resolve_linux(alloc).unwrap_or_else(|e| panic!("resolve v2: {e}"))))
+                .unwrap_or_else(|e| panic!("id v2: {e}"));
+            assert_ne!(id_v1, id_v2, "editing non-features.h header must move module identity");
+
+            // 2. Editing a libc runtime file (`crt1.o`) MUST move the module identity.
+            std::fs::write(lib_a.join("crt1.o"), b"crt-v2").expect("crt-a v2");
+            let id_v3 = native_a
+                .identity(Some(&native_a.resolve_linux(alloc).unwrap_or_else(|e| panic!("resolve v3: {e}"))))
+                .unwrap_or_else(|e| panic!("id v3: {e}"));
+            assert_ne!(id_v2, id_v3, "editing crt1.o must move module identity");
+
+            // 3. Switching to a content-identical Nix `lib_dir` at another store path MUST move
+            //    the module identity because `script.bin` embeds the runtime linker path.
+            std::fs::write(lib_b.join("crt1.o"), b"crt-v2").expect("crt-b v2");
+            let native_b = Native { lib_dir: Some(lib_b), ..native_a };
+            let id_v4 = native_b
+                .identity(Some(&native_b.resolve_linux(alloc).unwrap_or_else(|e| panic!("resolve v4: {e}"))))
+                .unwrap_or_else(|e| panic!("id v4: {e}"));
+            assert_ne!(id_v3, id_v4, "distinct embedded lib_dir path must move module identity");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn native_sandboxed_linux_scopes_reads_without_root_or_home_bind() {
+        let root = std::env::temp_dir().join(format!("blaze-pm-bwrap-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let vendor = root.join("vendor");
+        let shelf = root.join("shelf");
+        let target = root.join("target");
+        let secret_home = root.join("fake-home");
+        let sibling_repo = root.join("other-checkout");
+        for dir in [&vendor, &shelf, &target, &secret_home, &sibling_repo] {
+            std::fs::create_dir_all(dir).expect("mkdir");
+        }
+        let args: Vec<String> = build_linux_bwrap_args(
+            Path::new("/usr/bin/bwrap"),
+            vec!["cargo".into(), "build".into()],
+            &LinuxSandboxSpec {
+                reads: &[vendor.as_path(), shelf.as_path()],
+                writes: &[target.as_path()],
+                executables: &[],
+            },
+        )
+        .into_iter()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(args.windows(2).any(|w| w == ["--tmpfs", "/"]), "must start from empty tmpfs root: {args:?}");
+        assert!(args.iter().any(|a| a == "--unshare-net"), "must disable network: {args:?}");
+        assert!(!args.windows(3).any(|w| w == ["--ro-bind", "/", "/"]), "must NEVER bind host root `/`: {args:?}");
+        assert!(!args.iter().any(|a| a.contains("fake-home")), "must NEVER mount $HOME: {args:?}");
+        assert!(!args.iter().any(|a| a.contains("other-checkout")), "must NEVER mount unrelated checkout: {args:?}");
+        if let Ok(home) = std::env::var("HOME")
+            && !home.is_empty()
+        {
+            assert!(!args.iter().any(|a| a == &home), "must NEVER mount real $HOME `{home}`: {args:?}");
+        }
+        assert!(args.windows(3).any(|w| w == ["--ro-bind", vendor.to_str().unwrap(), vendor.to_str().unwrap()]));
+        assert!(args.windows(3).any(|w| w == ["--bind", target.to_str().unwrap(), target.to_str().unwrap()]));
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

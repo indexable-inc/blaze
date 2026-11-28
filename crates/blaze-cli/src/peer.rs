@@ -1958,6 +1958,7 @@ mod tests {
                 toolchain: blaze_toolchain::PINNED,
                 fs: io.need_fs().expect("fs"),
                 sdk: crate::sdk::NONE_IN_TESTS,
+                linux_sysroot: Ok(None),
                 exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
                 lan_peer: LanPeerConfig { enabled: true, udp_port, unicast_target: Some(udp_addr) },
                 heap: blaze_own::testing::heap(),

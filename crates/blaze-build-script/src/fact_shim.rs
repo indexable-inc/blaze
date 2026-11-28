@@ -29,12 +29,17 @@
 //! to a shared cache). Sans-IO: the binary and the runner do the IO.
 #![blaze::sans_io]
 
+use blaze_ids::ContentId;
 use blaze_own::{AString, AVec, Alloc, String, Vec};
 
-use crate::facts::{self, Pins};
+use crate::{
+    facts::{self, Pins},
+    probe::{self, Row, Table},
+    probe_ask::{self, Ask, Verdict},
+};
 
 /// The programs the shim answers as, by `argv[0]`'s last component. Sorted.
-pub const PROGRAMS: [&str; 3] = ["pkg-config", "pkgconf", "sw_vers"];
+pub const PROGRAMS: [&str; 5] = ["cargo", "pkg-config", "pkgconf", "rustc", "sw_vers"];
 
 /// The shim binary's file name.
 pub const SHIM_NAME: &str = "blaze-fact-shim";
@@ -43,11 +48,22 @@ pub const SHIM_NAME: &str = "blaze-fact-shim";
 /// environment; children inherit it).
 pub const FOLDER_VAR: &str = "BLAZE_FACT_SHIM_RUN";
 
-/// Under the run's facts folder: the links, the pins file, the log folder and the log.
+/// Under the run's facts folder: the links, the pins file, the probe table file, the metadata
+/// snapshot file, the log folder and the log.
 pub const BIN_DIR: &str = "bin";
 pub const PINS_FILE: &str = "pins";
+pub const PROBES_FILE: &str = "probes";
+pub const METADATA_FILE: &str = "metadata";
 pub const LOG_DIR: &str = "log";
 pub const LOG_FILE: &str = "asked";
+
+/// Logged subject prefix for an answered `rustc` try-compile probe (keyed by the command's
+/// `Table::id()` in `KeyInputs::answers`, identical to the Wasm runner).
+pub const RUSTC_PROBE_PREFIX: &str = "rustc-probe\n";
+
+/// Logged subject prefix for an answered `cargo metadata` query (keyed by the metadata snapshot
+/// digest in `KeyInputs::answers`).
+pub const CARGO_METADATA_PREFIX: &str = "cargo-metadata\n";
 
 /// The exit code of a refused question (a shell's "command not found", so a script that
 /// checks the code sees no answer).
@@ -66,6 +82,10 @@ pub enum ShimError {
     PinsField { field: &'static str },
     /// Bytes after the last field.
     PinsTrailing,
+    /// The probe table file (`probes`) is malformed.
+    Probes,
+    /// The metadata snapshot file (`metadata`) is malformed.
+    Metadata,
     /// A log entry with no kind byte, no NUL end, or a subject not UTF-8.
     LogEntry { at: usize },
 }
@@ -76,7 +96,359 @@ impl core::fmt::Display for ShimError {
             ShimError::PinsHead => write!(f, "the fact shim's {PINS_FILE} file has no `blaze fact pins` head (D112)"),
             ShimError::PinsField { field } => write!(f, "the fact shim's {PINS_FILE} file: field `{field}` is missing or malformed (D112)"),
             ShimError::PinsTrailing => write!(f, "the fact shim's {PINS_FILE} file has bytes after its last field (D112)"),
+            ShimError::Probes => write!(f, "the fact shim's {PROBES_FILE} file is malformed (D112)"),
+            ShimError::Metadata => write!(f, "the fact shim's {METADATA_FILE} file is malformed (D112)"),
             ShimError::LogEntry { at } => write!(f, "the fact shim's {LOG_DIR}/{LOG_FILE}: entry at byte {at} is malformed (D112)"),
+        }
+    }
+}
+
+const PROBES_HEAD: &[u8] = b"blaze fact probes 1\n";
+const METADATA_HEAD: &[u8] = b"blaze fact metadata 1\n";
+const NO_METADATA: &[u8] = b"blaze fact metadata none\n";
+
+/// Precomputed Cargo format-1 `cargo metadata` answers staged for one native build-script run so
+/// `blaze-fact-shim` answers `cargo metadata` (e.g. `cbindgen` / `cargo_metadata`) from Blaze's
+/// resolved unit graph without spawning host `cargo` (Rule 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataSnapshot<'a> {
+    pub manifest_path: &'a str,
+    pub package_dir: &'a str,
+    pub target: &'a str,
+    pub host: &'a str,
+    pub full_json: &'a str,
+    pub no_deps_json: &'a str,
+    pub digest: ContentId,
+}
+
+fn push_len_str(s: &str, out: &mut AVec<'_, u8>) {
+    let len = u32::try_from(s.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&len.to_le_bytes());
+    let take = usize::try_from(len).unwrap_or(0);
+    if let Some(bytes) = s.as_bytes().get(..take) {
+        out.extend_from_slice(bytes);
+    }
+}
+
+fn read_len_str<'b>(rest: &mut &'b [u8]) -> Result<&'b str, ShimError> {
+    let len_bytes: [u8; 4] = rest.get(..4).and_then(|s| s.try_into().ok()).ok_or(ShimError::Metadata)?;
+    let len = usize::try_from(u32::from_le_bytes(len_bytes)).map_err(|_| ShimError::Metadata)?;
+    let after = rest.get(4..).ok_or(ShimError::Metadata)?;
+    let slice = after.get(..len).ok_or(ShimError::Metadata)?;
+    let text = core::str::from_utf8(slice).map_err(|_| ShimError::Metadata)?;
+    *rest = after.get(len..).ok_or(ShimError::Metadata)?;
+    Ok(text)
+}
+
+/// Encodes an optional [`MetadataSnapshot`] into `<facts>/metadata`.
+pub fn encode_metadata(meta: Option<&MetadataSnapshot<'_>>, out: &mut AVec<'_, u8>) {
+    let Some(meta) = meta else {
+        out.extend_from_slice(NO_METADATA);
+        return;
+    };
+    out.extend_from_slice(METADATA_HEAD);
+    out.extend_from_slice(&meta.digest.0);
+    push_len_str(meta.manifest_path, out);
+    push_len_str(meta.package_dir, out);
+    push_len_str(meta.target, out);
+    push_len_str(meta.host, out);
+    push_len_str(meta.full_json, out);
+    push_len_str(meta.no_deps_json, out);
+}
+
+/// Decodes `<facts>/metadata` written by [`encode_metadata`].
+pub fn decode_metadata<'b>(bytes: &'b [u8]) -> Result<Option<MetadataSnapshot<'b>>, ShimError> {
+    if bytes == NO_METADATA {
+        return Ok(None);
+    }
+    let mut rest = bytes.strip_prefix(METADATA_HEAD).ok_or(ShimError::Metadata)?;
+    let digest: [u8; 32] = rest.get(..32).and_then(|s| s.try_into().ok()).ok_or(ShimError::Metadata)?;
+    rest = rest.get(32..).ok_or(ShimError::Metadata)?;
+    let manifest_path = read_len_str(&mut rest)?;
+    let package_dir = read_len_str(&mut rest)?;
+    let target = read_len_str(&mut rest)?;
+    let host = read_len_str(&mut rest)?;
+    let full_json = read_len_str(&mut rest)?;
+    let no_deps_json = read_len_str(&mut rest)?;
+    if !rest.is_empty() {
+        return Err(ShimError::Metadata);
+    }
+    Ok(Some(MetadataSnapshot {
+        manifest_path,
+        package_dir,
+        target,
+        host,
+        full_json,
+        no_deps_json,
+        digest: ContentId(digest),
+    }))
+}
+
+/// Answers a `cargo metadata` invocation via [`crate::metadata_ask::classify`] and the run's
+/// keyed [`MetadataSnapshot`] without spawning host `cargo` (Rule 1, Rule 3).
+pub fn ask_cargo_metadata<'a>(
+    args: &[&str],
+    cwd: &str,
+    meta: Option<&MetadataSnapshot<'_>>,
+    alloc: Alloc<'a>,
+) -> Reply<'a> {
+    use core::fmt::Write as _;
+    let mut raw_subject = String::from_str_in("cargo", alloc);
+    for arg in args {
+        raw_subject.push('\n');
+        raw_subject.push_str(arg);
+    }
+    let refuse = |why: core::fmt::Arguments<'_>, subject: AString<'a>| -> Reply<'a> {
+        let mut stderr = String::new_in(alloc);
+        let _ = write!(stderr, "{SHIM_NAME}: `cargo");
+        for arg in args {
+            stderr.push(' ');
+            stderr.push_str(arg);
+        }
+        let _ = writeln!(stderr, "` refused (D112 interim, rule 3): {why}");
+        Reply { code: REFUSED_CODE, stdout: String::new_in(alloc), stderr, answered: false, subject }
+    };
+    let ask = match crate::metadata_ask::classify("cargo", args, alloc) {
+        Ok(ask) => ask,
+        Err(refused) => return refuse(format_args!("{refused}"), raw_subject),
+    };
+    let Some(meta) = meta else {
+        return refuse(format_args!("no metadata snapshot was staged for this native build script"), raw_subject);
+    };
+    let expected_manifest = crate::metadata_ask::normalize_manifest_path(meta.manifest_path, meta.package_dir, alloc);
+    let expected_pkg = crate::metadata_ask::normalize_manifest_path(meta.package_dir, "/", alloc);
+    match ask.manifest_path {
+        Some(raw) => {
+            let asked = crate::metadata_ask::normalize_manifest_path(raw, cwd, alloc);
+            if asked.as_str() != expected_manifest.as_str() {
+                return refuse(
+                    format_args!(
+                        "`--manifest-path {raw}` (resolved `{}`) does not match this package's manifest `{}`",
+                        asked.as_str(),
+                        expected_manifest.as_str()
+                    ),
+                    raw_subject,
+                );
+            }
+        }
+        None => {
+            let norm_cwd = crate::metadata_ask::normalize_manifest_path(cwd, "/", alloc);
+            let inside_pkg = norm_cwd.as_str() == expected_pkg.as_str()
+                || norm_cwd.as_str().strip_prefix(expected_pkg.as_str()).is_some_and(|rest| rest.starts_with('/'));
+            if !inside_pkg {
+                return refuse(
+                    format_args!("working directory `{cwd}` is outside package root `{}`", expected_pkg.as_str()),
+                    raw_subject,
+                );
+            }
+        }
+    }
+    if !ask.no_deps {
+        for platform in ask.platforms.iter() {
+            if *platform != meta.target && *platform != meta.host {
+                return refuse(
+                    format_args!(
+                        "`--filter-platform {platform}` does not match target `{}` or host `{}`",
+                        meta.target,
+                        meta.host
+                    ),
+                    raw_subject,
+                );
+            }
+        }
+    }
+    let mut stdout = String::from_str_in(if ask.no_deps { meta.no_deps_json } else { meta.full_json }, alloc);
+    if !stdout.as_str().ends_with('\n') {
+        stdout.push('\n');
+    }
+    let stderr = if ask.format_given {
+        String::new_in(alloc)
+    } else {
+        String::from_str_in("warning: please specify `--format-version` flag explicitly to avoid compatibility problems\n", alloc)
+    };
+    let mut digest_hex = String::new_in(alloc);
+    push_hex32(&meta.digest.0, &mut digest_hex);
+    let mut subject = String::from_str_in(CARGO_METADATA_PREFIX, alloc);
+    subject.push_str(digest_hex.as_str());
+    Reply { code: 0, stdout, stderr, answered: true, subject }
+}
+
+/// Encodes `host` and `table` (the sorted keyed `rustc` probe table from `ScriptSetup`) for
+/// `blaze-fact-shim` to answer `autocfg` and try-compile probes without host `rustc` (Rule 1).
+pub fn encode_probes(host: &str, table: &Table<'_>, out: &mut AVec<'_, u8>) {
+    out.extend_from_slice(PROBES_HEAD);
+    out.extend_from_slice(host.as_bytes());
+    out.push(b'\n');
+    let count = u32::try_from(table.rows.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&count.to_le_bytes());
+    for row in table.rows.iter().take(usize::try_from(count).unwrap_or(0)) {
+        out.extend_from_slice(&row.key.0);
+        out.push(u8::from(row.accepted));
+    }
+}
+
+/// Decodes a `probes` file written by [`encode_probes`].
+pub fn decode_probes<'b, 'a>(bytes: &'b [u8], alloc: Alloc<'a>) -> Result<(&'b str, AVec<'a, Row>), ShimError> {
+    let rest = bytes.strip_prefix(PROBES_HEAD).ok_or(ShimError::Probes)?;
+    let nl = rest.iter().position(|&b| b == b'\n').ok_or(ShimError::Probes)?;
+    let host_bytes = rest.get(..nl).ok_or(ShimError::Probes)?;
+    let host = core::str::from_utf8(host_bytes).map_err(|_| ShimError::Probes)?;
+    let after_host = rest.get(nl + 1..).ok_or(ShimError::Probes)?;
+    let count_bytes: [u8; 4] = after_host.get(..4).and_then(|s| s.try_into().ok()).ok_or(ShimError::Probes)?;
+    let count = usize::try_from(u32::from_le_bytes(count_bytes)).map_err(|_| ShimError::Probes)?;
+    let body = after_host.get(4..).ok_or(ShimError::Probes)?;
+    let expected = count.checked_mul(33).ok_or(ShimError::Probes)?;
+    if body.len() != expected {
+        return Err(ShimError::Probes);
+    }
+    let mut rows: AVec<'a, Row> = Vec::with_capacity_in(count, alloc);
+    for chunk in body.chunks_exact(33) {
+        let key: [u8; 32] = chunk.get(..32).and_then(|s| s.try_into().ok()).ok_or(ShimError::Probes)?;
+        let accepted = match chunk.get(32).copied() {
+            Some(0) => false,
+            Some(1) => true,
+            _ => return Err(ShimError::Probes),
+        };
+        rows.push(Row { key: ContentId(key), accepted });
+    }
+    Ok((host, rows))
+}
+
+fn push_hex32(bytes: &[u8; 32], out: &mut AString<'_>) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &byte in bytes {
+        if let Some(&hi) = HEX.get(usize::from(byte >> 4)) {
+            out.push(char::from(hi));
+        }
+        if let Some(&lo) = HEX.get(usize::from(byte & 0x0f)) {
+            out.push(char::from(lo));
+        }
+    }
+}
+
+/// Checks whether a classified `rustc` try-compile invocation is strictly an exit-status-only
+/// compiler-capability probe (`autocfg`, `rustix`, `proc-macro2`, `thiserror`, `anyhow`, `eyre`):
+/// - `--crate-type` is explicitly `lib` or `rlib` (never `bin`, `cdylib`, `dylib`, `staticlib`,
+///   `proc-macro`, or default `bin`),
+/// - `--emit` is strictly within `{dep-info, llvm-ir, metadata}` (never `link`, `obj`, `asm`,
+///   `llvm-bc`, `mir`, or default `link`),
+/// - `-o` is absent or `/dev/null` (never a named output file or `-` stdout),
+/// - no `--emit` item specifies a per-kind output path other than `/dev/null`,
+/// - `--test` is not requested.
+/// Returns `Some(reason)` when the invocation asks for a real artifact the shim does not
+/// materialize so it is refused loudly with [`REFUSED_CODE`] instead of returning exit 0 without
+/// creating output files (Rule 3).
+fn compile_output_refusal(args: &[&str], compile: &probe_ask::Compile<'_, '_>) -> Option<&'static str> {
+    if compile.test {
+        return Some("`--test` builds a test executable the fact shim does not materialize");
+    }
+    if compile.crate_types.is_empty()
+        || !compile.crate_types.iter().all(|ty| matches!(*ty, "lib" | "rlib"))
+    {
+        return Some("only exit-status-only `--crate-type=lib|rlib` probes are answered; artifact crate types are not materialized");
+    }
+    // Allowed emit mask: `dep-info` (bit 1), `llvm-ir` (bit 4), `metadata` (bit 5).
+    const ALLOWED_PROBE_EMITS: u8 = (1 << 1) | (1 << 4) | (1 << 5);
+    if compile.emits.0 == 0 || (compile.emits.0 & !ALLOWED_PROBE_EMITS) != 0 {
+        return Some("only `--emit` within `{dep-info,llvm-ir,metadata}` is answered; linked/object/asm/mir artifacts are not materialized");
+    }
+    if let Some(out) = compile.out
+        && out != "/dev/null"
+    {
+        return Some("`-o <path>` requests a named output artifact the fact shim does not materialize");
+    }
+    let mut i = 0;
+    while i < args.len() {
+        let Some(&arg) = args.get(i) else { break };
+        let emit_val = if let Some(val) = arg.strip_prefix("--emit=") {
+            Some(val)
+        } else if arg == "--emit" {
+            i += 1;
+            args.get(i).copied()
+        } else {
+            None
+        };
+        if let Some(val) = emit_val {
+            for item in val.split(',') {
+                if let Some((_, path)) = item.split_once('=')
+                    && path != "/dev/null"
+                {
+                    return Some("`--emit=<kind>=<path>` requests a named output artifact the fact shim does not materialize");
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Answers a `rustc` probe (`autocfg` / try-compile / version) using the exact same keyed probe
+/// machinery ([`probe_ask::classify`] + [`probe_ask::answer`]) as the Wasm runner (Rule 1, Rule 30).
+/// Refuses artifact-producing compiles, unknown flags, `--print`, and unanswered probes loudly
+/// with [`REFUSED_CODE`] (Rule 3).
+pub fn ask_rustc_probe<'a>(
+    args: &[&str],
+    snippet: &[u8],
+    host: &str,
+    table: &Table<'_>,
+    alloc: Alloc<'a>,
+) -> Reply<'a> {
+    use core::fmt::Write as _;
+    let mut raw_subject = String::from_str_in("rustc", alloc);
+    for arg in args {
+        raw_subject.push('\n');
+        raw_subject.push_str(arg);
+    }
+    let refuse = |why: core::fmt::Arguments<'_>, subject: AString<'a>| -> Reply<'a> {
+        let mut stderr = String::new_in(alloc);
+        let _ = write!(stderr, "{SHIM_NAME}: `rustc");
+        for arg in args {
+            stderr.push(' ');
+            stderr.push_str(arg);
+        }
+        let _ = writeln!(stderr, "` refused (D112 interim, rule 3): {why}");
+        Reply { code: REFUSED_CODE, stdout: String::new_in(alloc), stderr, answered: false, subject }
+    };
+    match probe_ask::classify(args, alloc) {
+        Err(refused) => refuse(format_args!("argument {}: {}", refused.at, refused.why), raw_subject),
+        Ok(Ask::Version { verbose }) => {
+            let subject = facts::subject(&facts::Fact::RustcVersion { verbose }, alloc);
+            Reply { code: 0, stdout: probe::version(verbose, host, alloc), stderr: String::new_in(alloc), answered: true, subject }
+        }
+        Ok(Ask::Print { what, .. }) => refuse(format_args!("`--print {what}` is not answered by the keyed probe table"), raw_subject),
+        Ok(Ask::Compile(compile)) => {
+            if let Some(why) = compile_output_refusal(args, &compile) {
+                return refuse(format_args!("{why}"), raw_subject);
+            }
+            let answered = probe_ask::answer(&compile, host, snippet, table);
+            let mut key_hex = String::new_in(alloc);
+            push_hex32(&answered.key.0, &mut key_hex);
+            let mut probe_subject = String::from_str_in(RUSTC_PROBE_PREFIX, alloc);
+            probe_subject.push_str(key_hex.as_str());
+            match answered.verdict {
+                Verdict::Accepted(_) => Reply {
+                    code: 0,
+                    stdout: String::new_in(alloc),
+                    stderr: String::new_in(alloc),
+                    answered: true,
+                    subject: probe_subject,
+                },
+                Verdict::Rejected(rejection) => Reply {
+                    code: 1,
+                    stdout: String::new_in(alloc),
+                    stderr: rejection.stderr(&compile, snippet, alloc),
+                    answered: true,
+                    subject: probe_subject,
+                },
+                Verdict::Unanswered(open) => refuse(
+                    format_args!(
+                        "try-compile probe {} for `{}` is not answered by the pinned probe table ({open:?})",
+                        key_hex.as_str(),
+                        answered.target
+                    ),
+                    raw_subject,
+                ),
+            }
         }
     }
 }
@@ -279,7 +651,7 @@ mod tests {
 
     /// The shim's programs are the facts table's own: each is read as a question by
     /// `facts::question` in some form, and no C compiler is among them. Prints "shim programs:
-    /// pkg-config pkgconf sw_vers".
+    /// cargo pkg-config pkgconf rustc sw_vers".
     #[test]
     fn every_shim_program_is_a_facts_row() {
         assert!(PROGRAMS.is_sorted());
@@ -291,5 +663,235 @@ mod tests {
             assert!(!PROGRAMS.contains(&compiler));
         }
         println!("shim programs: {}", PROGRAMS.join(" "));
+    }
+
+    /// Rule 1 (`no-rustc`): `blaze-fact-shim` answers `rustc -V` / `--version` / `-vV` and
+    /// `cargo -V` / `--version` strictly from the pinned toolchain constants (never host `rustc`),
+    /// and refuses try-compiles or unknown invocations with exit 127 naming them.
+    #[test]
+    fn rustc_and_cargo_version_probes_are_answered_and_compiles_refused() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let linux_pins = Pins {
+            clang_version_text: "clang version 23.1.4\nTarget: aarch64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /usr/bin\n",
+            macos_product_version: "",
+            macos_build_version: "",
+        };
+
+        // Short `rustc -V` and `rustc --version` match `probe::version(false, ...)`.
+        let expected_short = crate::probe::version(false, "", alloc);
+        for args in [&["-V"][..], &["--version"][..]] {
+            let reply = ask("/run/bin/rustc", args, Some(&linux_pins), alloc);
+            assert_eq!((reply.code, reply.answered, reply.stderr.as_str()), (0, true, ""), "{args:?}");
+            assert_eq!(reply.stdout.as_str(), expected_short.as_str(), "{args:?}");
+            assert_eq!(reply.subject.as_str(), "rustc\n--version");
+        }
+
+        // Verbose `rustc -vV` and `--version --verbose` include the host triple from the pins.
+        let expected_linux_v = crate::probe::version(true, "aarch64-unknown-linux-gnu", alloc);
+        for args in [&["-vV"][..], &["--version", "--verbose"][..]] {
+            let reply = ask("rustc", args, Some(&linux_pins), alloc);
+            assert_eq!((reply.code, reply.answered, reply.stderr.as_str()), (0, true, ""), "{args:?}");
+            assert_eq!(reply.stdout.as_str(), expected_linux_v.as_str(), "{args:?}");
+            assert_eq!(reply.subject.as_str(), "rustc\n--version\n--verbose");
+        }
+        let mac_v = ask("rustc", &["-vV"], Some(&PINS), alloc);
+        assert_eq!(mac_v.code, 0);
+        assert!(mac_v.stdout.as_str().contains("host: aarch64-apple-darwin\n"), "{}", mac_v.stdout.as_str());
+
+        // `cargo -V`, `--version`, and `version` match `probe::cargo_version`.
+        let expected_cargo = crate::probe::cargo_version(alloc);
+        for args in [&["-V"][..], &["--version"][..], &["version"][..]] {
+            let reply = ask("/run/bin/cargo", args, Some(&linux_pins), alloc);
+            assert_eq!((reply.code, reply.answered, reply.stderr.as_str()), (0, true, ""), "{args:?}");
+            assert_eq!(reply.stdout.as_str(), expected_cargo.as_str(), "{args:?}");
+            assert_eq!(reply.subject.as_str(), "cargo\n--version");
+        }
+
+        // Try-compile and unknown invocations MUST be refused with exit 127 naming them.
+        let compile = ask("rustc", &["--crate-type", "lib", "foo.rs"], Some(&linux_pins), alloc);
+        assert_eq!((compile.code, compile.answered, compile.stdout.as_str()), (REFUSED_CODE, false, ""));
+        assert!(
+            compile.stderr.as_str().contains("`rustc --crate-type lib foo.rs` refused"),
+            "{}",
+            compile.stderr.as_str()
+        );
+        let stdin_compile = ask("rustc", &["--crate-type=rlib", "-"], Some(&linux_pins), alloc);
+        assert_eq!((stdin_compile.code, stdin_compile.answered), (REFUSED_CODE, false));
+        let print_cfg = ask("rustc", &["--print", "cfg"], Some(&linux_pins), alloc);
+        assert_eq!((print_cfg.code, print_cfg.answered), (REFUSED_CODE, false));
+        let cargo_build = ask("cargo", &["build"], Some(&linux_pins), alloc);
+        assert_eq!((cargo_build.code, cargo_build.answered), (REFUSED_CODE, false));
+        assert!(cargo_build.stderr.as_str().contains("`cargo build` refused"), "{}", cargo_build.stderr.as_str());
+    }
+
+    /// `encode_probes`/`decode_probes` round-trip and `ask_rustc_probe` answers `autocfg`-style
+    /// try-compiles via `probe_ask::classify` + `probe_ask::answer` (zero host `rustc`, Rule 1).
+    #[test]
+    fn rustc_probe_table_round_trip_and_autocfg_answers() {
+        const HOST: &str = "aarch64-unknown-linux-gnu";
+        let alloc = blaze_own::testing::heap().alloc();
+
+        let mut rows = crate::probe::pinned_rows(HOST, crate::pinned::TEMPO, alloc);
+        let ships = crate::probe_ask::ships_rows(HOST, ["core", "std"], alloc);
+        rows.extend_from_slice(ships.as_slice());
+        rows.sort_by(|a, b| a.key.cmp(&b.key));
+        let table = crate::probe::Table { rows: rows.as_slice() };
+
+        // Round-trip probe table encoding/decoding (and reject truncated/corrupt payloads).
+        let mut encoded = Vec::new_in(alloc);
+        super::encode_probes(HOST, &table, &mut encoded);
+        let (decoded_host, decoded_rows) = super::decode_probes(encoded.as_slice(), alloc).expect("decode probes");
+        assert_eq!(decoded_host, HOST);
+        assert_eq!(decoded_rows.len(), table.rows.len());
+        assert_eq!(super::decode_probes(&encoded.as_slice()[..encoded.len() - 1], alloc).err(), Some(ShimError::Probes));
+
+        let decoded_table = crate::probe::Table { rows: decoded_rows.as_slice() };
+
+        // 1. autocfg empty `#![no_std]` probe -> decided Accepted (exit 0) with `rustc-probe\n` subject.
+        let autocfg_empty = super::ask_rustc_probe(
+            &["--crate-type=lib", "--emit=llvm-ir", "--crate-name=probe0", "-"],
+            b"#![no_std]\n",
+            HOST,
+            &decoded_table,
+            alloc,
+        );
+        assert_eq!((autocfg_empty.code, autocfg_empty.answered, autocfg_empty.stderr.as_str()), (0, true, ""));
+        assert!(autocfg_empty.subject.as_str().starts_with(super::RUSTC_PROBE_PREFIX), "{}", autocfg_empty.subject.as_str());
+
+        // 2. Pinned autocfg probe (`f64::total_cmp` from `pinned::TEMPO`) -> answered from table (exit 0).
+        let num_traits = super::ask_rustc_probe(
+            &["--crate-type=lib", "--emit=llvm-ir", "--crate-name=probe1", "-"],
+            b"pub fn probe() { let _ = 1f64.total_cmp(&2f64); }",
+            HOST,
+            &decoded_table,
+            alloc,
+        );
+        assert_eq!((num_traits.code, num_traits.answered), (0, true));
+
+        // 3. Removed language feature -> decided Rejected (exit 1, E0557 on stderr, answered = true).
+        let bad_feat = super::ask_rustc_probe(
+            &["--crate-type=lib", "--emit=metadata", "-"],
+            b"#![feature(no_debug)]\n",
+            HOST,
+            &decoded_table,
+            alloc,
+        );
+        assert_eq!((bad_feat.code, bad_feat.answered), (1, true));
+        assert!(bad_feat.stderr.as_str().contains("E0557"), "{}", bad_feat.stderr.as_str());
+
+        // 4. Unanswered try-compile and `--print cfg` are refused loudly with exit 127.
+        let unknown = super::ask_rustc_probe(
+            &["--crate-type=lib", "--emit=llvm-ir", "-"],
+            b"pub fn definitely_unknown_probe_item_xyz() {}",
+            HOST,
+            &decoded_table,
+            alloc,
+        );
+        assert_eq!((unknown.code, unknown.answered), (REFUSED_CODE, false));
+        assert!(unknown.stderr.as_str().contains("not answered by the pinned probe table"), "{}", unknown.stderr.as_str());
+
+        let print_cfg = super::ask_rustc_probe(&["--print", "cfg"], b"", HOST, &decoded_table, alloc);
+        assert_eq!((print_cfg.code, print_cfg.answered), (REFUSED_CODE, false));
+        assert!(print_cfg.stderr.as_str().contains("--print cfg"), "{}", print_cfg.stderr.as_str());
+
+        // 5. Invocations requesting real output artifacts (`-o <path>`, `-o -`, `--emit=link`,
+        //    default `--emit` (`link`), `--emit=obj`, `--emit=metadata=<path>`, `--crate-type=bin`)
+        //    MUST be refused with exit 127 instead of returning exit 0 without creating outputs.
+        for artifact_args in [
+            &["--crate-type=lib", "--emit=metadata", "-o", "/out/libfoo.rmeta", "-"][..],
+            &["--crate-type=rlib", "--emit=metadata", "-o", "-", "-"][..],
+            &["--crate-type=lib", "-"][..],
+            &["--crate-type=lib", "--emit=link", "-"][..],
+            &["--crate-type=lib", "--emit=obj", "-"][..],
+            &["--crate-type=lib", "--emit=metadata=/out/foo.rmeta", "-"][..],
+            &["--crate-type=bin", "--emit=metadata", "-"][..],
+        ] {
+            let refused = super::ask_rustc_probe(artifact_args, b"#![no_std]\n", HOST, &decoded_table, alloc);
+            assert_eq!(
+                (refused.code, refused.answered),
+                (REFUSED_CODE, false),
+                "artifact-requesting invocation must be refused: {artifact_args:?}"
+            );
+        }
+
+        // Control: `-o /dev/null` explicitly discards outputs and is allowed for metadata probes.
+        let devnull = super::ask_rustc_probe(
+            &["--crate-type=rlib", "--emit=metadata", "-o", "/dev/null", "-"],
+            b"#![no_std]\n",
+            HOST,
+            &decoded_table,
+            alloc,
+        );
+        assert_eq!((devnull.code, devnull.answered), (0, true));
+    }
+
+    #[test]
+    fn ask_cargo_metadata_answers_cbindgen_and_refuses_unsupported_flags_or_manifests() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let snapshot = super::MetadataSnapshot {
+            manifest_path: "/work/pkg/Cargo.toml",
+            package_dir: "/work/pkg",
+            target: "aarch64-unknown-linux-gnu",
+            host: "aarch64-unknown-linux-gnu",
+            full_json: r#"{"packages":[{"name":"hegeltest-c"}],"version":1,"workspace_root":"/work/pkg"}"#,
+            no_deps_json: r#"{"packages":[{"name":"hegeltest-c"}],"resolve":null,"version":1,"workspace_root":"/work/pkg"}"#,
+            digest: blaze_ids::ContentId([0x42; 32]),
+        };
+        let mut encoded = Vec::new_in(alloc);
+        super::encode_metadata(Some(&snapshot), &mut encoded);
+        assert_eq!(super::decode_metadata(encoded.as_slice()), Ok(Some(snapshot)));
+
+        let mut none_encoded = Vec::new_in(alloc);
+        super::encode_metadata(None, &mut none_encoded);
+        assert_eq!(super::decode_metadata(none_encoded.as_slice()), Ok(None));
+
+        // 1. Exact cbindgen invocation: returns full JSON with exit 0 and logs `cargo-metadata\n<hex>`.
+        let cbindgen = super::ask_cargo_metadata(
+            &["metadata", "--all-features", "--format-version", "1", "--manifest-path", "/work/pkg/Cargo.toml"],
+            "/work/pkg",
+            Some(&snapshot),
+            alloc,
+        );
+        assert_eq!((cbindgen.code, cbindgen.answered, cbindgen.stderr.as_str()), (0, true, ""));
+        assert_eq!(cbindgen.stdout.as_str().trim_end(), snapshot.full_json);
+        assert!(cbindgen.subject.as_str().starts_with(super::CARGO_METADATA_PREFIX), "{}", cbindgen.subject.as_str());
+
+        // 2. Relative `--manifest-path Cargo.toml`, `--no-deps`, and matching `--filter-platform`.
+        let no_deps = super::ask_cargo_metadata(
+            &["metadata", "--no-deps", "--format-version=1", "--manifest-path", "Cargo.toml"],
+            "/work/pkg",
+            Some(&snapshot),
+            alloc,
+        );
+        assert_eq!((no_deps.code, no_deps.answered), (0, true));
+        assert_eq!(no_deps.stdout.as_str().trim_end(), snapshot.no_deps_json);
+
+        let filtered = super::ask_cargo_metadata(
+            &["metadata", "--all-features", "--format-version", "1", "--filter-platform", "aarch64-unknown-linux-gnu"],
+            "/work/pkg",
+            Some(&snapshot),
+            alloc,
+        );
+        assert_eq!((filtered.code, filtered.answered), (0, true));
+
+        // 3. Bare `cargo metadata` emits Cargo's `--format-version` warning on stderr.
+        let bare = super::ask_cargo_metadata(&["metadata"], "/work/pkg", Some(&snapshot), alloc);
+        assert_eq!((bare.code, bare.answered), (0, true));
+        assert!(bare.stderr.as_str().contains("--format-version"), "{}", bare.stderr.as_str());
+
+        // 4. Negative controls: unknown flags, bad format version, wrong manifest path, foreign
+        //    platform, and missing metadata snapshot MUST be refused with exit 127.
+        for bad_args in [
+            &["metadata", "--config", "net.offline=true"][..],
+            &["metadata", "-Zunstable-options"][..],
+            &["metadata", "--format-version", "2"][..],
+            &["metadata", "--format-version", "1", "--manifest-path", "/other/Cargo.toml"][..],
+            &["metadata", "--format-version", "1", "--filter-platform", "riscv64gc-unknown-none-elf"][..],
+        ] {
+            let refused = super::ask_cargo_metadata(bad_args, "/work/pkg", Some(&snapshot), alloc);
+            assert_eq!((refused.code, refused.answered), (REFUSED_CODE, false), "must refuse {bad_args:?}");
+        }
+        let no_meta = super::ask_cargo_metadata(&["metadata", "--format-version", "1"], "/work/pkg", None, alloc);
+        assert_eq!((no_meta.code, no_meta.answered), (REFUSED_CODE, false));
     }
 }

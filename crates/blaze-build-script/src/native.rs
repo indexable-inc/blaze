@@ -101,3 +101,40 @@ pub fn closure(graph: &UnitGraph<'_>, script: UnitId, alloc: Alloc<'_>) -> Closu
     };
     Closure { runner, no_wasm }
 }
+
+/// Whether `script`'s transitive dependency closure contains a unit of package `target_name`
+/// (e.g. `"cmake"`). Iterative walk with a visited set; sans-IO.
+pub fn closure_has_crate(graph: &UnitGraph<'_>, script: UnitId, target_name: &str, alloc: Alloc<'_>) -> bool {
+    let count = graph.units.len();
+    let mut seen: AVec<'_, bool> = Vec::with_capacity_in(count, alloc);
+    for _ in 0..count {
+        seen.push(false);
+    }
+    let mut stack: AVec<'_, UnitId> = Vec::new_in(alloc);
+    let Some(root) = graph.units.get(script.index()) else {
+        return false;
+    };
+    for dep in root.deps.iter() {
+        stack.push(dep.unit);
+    }
+    while let Some(at) = stack.pop() {
+        let index = at.index();
+        let Some(flag) = seen.get_mut(index) else {
+            continue;
+        };
+        if *flag {
+            continue;
+        }
+        *flag = true;
+        let Some(unit) = graph.units.get(index) else {
+            continue;
+        };
+        if unit.name.as_str() == target_name {
+            return true;
+        }
+        for dep in unit.deps.iter() {
+            stack.push(dep.unit);
+        }
+    }
+    false
+}

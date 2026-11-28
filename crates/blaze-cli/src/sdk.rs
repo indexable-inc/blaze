@@ -932,6 +932,88 @@ pub(crate) struct LinuxHostSysroot<'f> {
     pub(crate) rpaths: &'f [&'f str],
 }
 
+/// Resolved Linux host sysroot together with its canonical roots and 32-byte content identity
+/// (`sdk_version` SHA-256) computed once at the command's edge and reused by both `Script` task
+/// keying and native execution without re-hashing (Rule 21, Rule 75).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ResolvedLinuxHost<'f> {
+    pub(crate) sysroot: LinuxHostSysroot<'f>,
+    pub(crate) canonical_sdk: &'f str,
+    pub(crate) sdk_extra: Option<&'f str>,
+    pub(crate) sdk_lib: Option<&'f str>,
+    pub(crate) sdk_gcc_lib: Option<&'f str>,
+    pub(crate) sdk_dynamic_linker: Option<&'f str>,
+    pub(crate) sdk_rpaths: &'f [&'f str],
+    pub(crate) sdk_extra_reads: &'f [&'f str],
+    pub(crate) sdk_version: &'f str,
+    pub(crate) id: [u8; 32],
+}
+
+impl<'f> ResolvedLinuxHost<'f> {
+    /// Borrows this already-verified Linux host sysroot snapshot for
+    /// `native_setting::command_native_setting_from_resolved_linux`.
+    pub(crate) fn as_setting(&self) -> blaze_proc_macro::native_setting::ResolvedLinuxSetting<'f> {
+        blaze_proc_macro::native_setting::ResolvedLinuxSetting {
+            sdk: self.canonical_sdk,
+            sdk_extra: self.sdk_extra,
+            sdk_lib: self.sdk_lib,
+            sdk_gcc_lib: self.sdk_gcc_lib,
+            sdk_dynamic_linker: self.sdk_dynamic_linker,
+            sdk_rpaths: self.sdk_rpaths,
+            sdk_extra_reads: self.sdk_extra_reads,
+            sdk_version: self.sdk_version,
+        }
+    }
+}
+
+/// Computes the canonical roots and 32-byte content digest (`sdk_version` SHA-256) of a resolved
+/// [`LinuxHostSysroot`] once at the command's edge, retaining the complete snapshot in `frame` so
+/// execution never re-walks or re-hashes the sysroot.
+pub(crate) fn linux_host_with_id<'f>(
+    resolved: Result<Option<LinuxHostSysroot<'f>>, LinuxSysrootError<'f>>,
+    alloc: blaze_own::Alloc<'_>,
+    frame: &'f Frame,
+) -> Result<Option<ResolvedLinuxHost<'f>>, &'f str> {
+    let Some(sysroot) = resolved.map_err(|err| held(frame, format_args!("{err}")))? else {
+        return Ok(None);
+    };
+    let link = blaze_proc_macro::native_setting::LinuxLinkInputs {
+        lib_dir: sysroot.lib_dir,
+        dynamic_linker: sysroot.dynamic_linker,
+        rpaths: sysroot.rpaths,
+    };
+    let keyed = blaze_proc_macro::native_setting::resolve_linux_sysroot(sysroot.dir, link, crate::graph::TRIPLE, alloc)
+        .map_err(|err| held(frame, format_args!("{err}")))?;
+    let canonical_sdk = crate::work::held_str(keyed.sdk.as_str(), frame);
+    let sdk_extra = keyed.sdk_extra.as_ref().map(|s| crate::work::held_str(s.as_str(), frame));
+    let sdk_lib = keyed.sdk_lib.as_ref().map(|s| crate::work::held_str(s.as_str(), frame));
+    let sdk_gcc_lib = keyed.sdk_gcc_lib.as_ref().map(|s| crate::work::held_str(s.as_str(), frame));
+    let sdk_dynamic_linker = keyed.sdk_dynamic_linker.as_ref().map(|s| crate::work::held_str(s.as_str(), frame));
+    let mut rpaths_vec = blaze_own::Vec::with_capacity_in(keyed.sdk_rpaths.len(), frame);
+    for rpath in keyed.sdk_rpaths.iter() {
+        rpaths_vec.push(crate::work::held_str(rpath.as_str(), frame));
+    }
+    let sdk_rpaths: &'f [&'f str] = rpaths_vec.into_bump_slice();
+    let mut reads_vec = blaze_own::Vec::with_capacity_in(keyed.sdk_extra_reads.len(), frame);
+    for path in keyed.sdk_extra_reads.iter() {
+        reads_vec.push(crate::work::held_str(path.as_str(), frame));
+    }
+    let sdk_extra_reads: &'f [&'f str] = reads_vec.into_bump_slice();
+    let sdk_version = crate::work::held_str(keyed.sdk_version.as_str(), frame);
+    Ok(Some(ResolvedLinuxHost {
+        sysroot,
+        canonical_sdk,
+        sdk_extra,
+        sdk_lib,
+        sdk_gcc_lib,
+        sdk_dynamic_linker,
+        sdk_rpaths,
+        sdk_extra_reads,
+        sdk_version,
+        id: keyed.sdk_digest,
+    }))
+}
+
 /// Why Linux host sysroot discovery failed on a concrete host path (rule 3, rule 19):
 /// clean absence (`ENOENT`/`ENOTDIR`) is represented as `Ok(None)`, whereas permission errors,
 /// I/O errors, non-UTF-8 wrapper files, and symlink loops stop discovery immediately naming the

@@ -271,6 +271,84 @@ pub fn granted<'t, 'a>(tools: &[HostTool<'t>], package: &str, alloc: Alloc<'a>) 
     out
 }
 
+/// Top-level JSON object key names inside `{ ... }`, in order. Sans-IO helper for scanning every
+/// target row in `pins/clang.json`'s `host_tools` table without hardcoding target triples.
+fn top_level_keys<'t, 'a>(obj: &'t str, alloc: Alloc<'a>) -> AVec<'a, &'t str> {
+    let mut keys: AVec<'a, &'t str> = Vec::new_in(alloc);
+    let bytes = obj.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes.get(i).copied() {
+            Some(b'{') => {
+                depth += 1;
+                i += 1;
+            }
+            Some(b'}') => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            Some(b'"') => {
+                let start = i + 1;
+                i += 1;
+                while i < bytes.len() {
+                    match bytes.get(i).copied() {
+                        Some(b'\\') => i += 2,
+                        Some(b'"') => break,
+                        _ => i += 1,
+                    }
+                }
+                let end = i;
+                i += 1;
+                if depth == 1 {
+                    let mut j = i;
+                    while bytes.get(j).is_some_and(u8::is_ascii_whitespace) {
+                        j += 1;
+                    }
+                    if bytes.get(j) == Some(&b':')
+                        && let Some(key) = obj.get(start..end)
+                    {
+                        keys.push(key);
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    keys
+}
+
+/// First host tool that ANY target row in `text`'s `host_tools` table declares as `needed_by`
+/// `package`, but that `target`'s own `host_tools` row does NOT grant to `package` (Rule 30:
+/// single table-driven source of truth across all targets — catches `sha3-asm` (`perl`),
+/// `tikv-jemalloc-sys` (`hostname`/`make`/`nm`/`sh`/`uname`), and any future `needed_by` tool
+/// without special-casing package names). Returns `Ok(None)` when `target` grants every tool
+/// declared for `package`.
+pub fn missing_for_target<'t, 'h, 'a>(
+    text: &'t str,
+    target: &'h str,
+    package: &str,
+    alloc: Alloc<'a>,
+) -> Result<Option<&'t str>, HostToolError<'h>> {
+    let (rows, _) = object(text, "host_tools", 0).ok_or(HostToolError::NoRow { target })?;
+    let target_tools = host_tools(text, target, alloc).map_err(|_| HostToolError::NoRow { target })?;
+    let target_granted = granted(&target_tools, package, alloc);
+    for other_target in top_level_keys(rows, alloc) {
+        if other_target == target {
+            continue;
+        }
+        let Ok(other_tools) = host_tools(text, other_target, alloc) else {
+            continue;
+        };
+        for tool in granted(&other_tools, package, alloc) {
+            if !target_granted.iter().any(|g| g.name == tool.name) {
+                return Ok(Some(tool.name));
+            }
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use blaze_own::Alloc;
@@ -397,5 +475,33 @@ mod tests {
         assert_eq!(sha3.iter().map(|t| t.name).collect::<std::vec::Vec<_>>(), ["perl"]);
         assert!(!runs_out_dir(&sha3));
         println!("jemalloc tools: {}; runs out dir: {}", names.join(" "), out_dir.join(" "));
+    }
+
+    #[test]
+    fn missing_for_target_covers_all_needed_by_packages() {
+        let alloc = blaze_own::testing::heap().alloc();
+        // Linux grants no host tools, so every package declared in macOS's `needed_by` is reported
+        // missing on Linux while clean on macOS.
+        assert_eq!(
+            super::missing_for_target(PIN, "aarch64-unknown-linux-gnu", "tikv-jemalloc-sys", alloc),
+            Ok(Some("hostname"))
+        );
+        assert_eq!(
+            super::missing_for_target(PIN, "aarch64-unknown-linux-gnu", "sha3-asm", alloc),
+            Ok(Some("perl"))
+        );
+        assert_eq!(
+            super::missing_for_target(PIN, "aarch64-apple-darwin", "tikv-jemalloc-sys", alloc),
+            Ok(None)
+        );
+        assert_eq!(
+            super::missing_for_target(PIN, "aarch64-apple-darwin", "sha3-asm", alloc),
+            Ok(None)
+        );
+        // Control: crates with no `needed_by` entry need no extra host tools on either platform.
+        assert_eq!(
+            super::missing_for_target(PIN, "aarch64-unknown-linux-gnu", "zstd-sys", alloc),
+            Ok(None)
+        );
     }
 }

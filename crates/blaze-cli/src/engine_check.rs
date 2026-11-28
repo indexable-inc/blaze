@@ -572,6 +572,7 @@ pub(crate) struct LazySdk<'f> {
     frame: &'f Frame,
     resolved: core::cell::OnceCell<Result<blaze_apple_sdk::Sdk<'f>, blaze_apple_sdk::SdkRefused<'f>>>,
     linux_sysroot: core::cell::OnceCell<Result<Option<crate::sdk::LinuxHostSysroot<'f>>, crate::sdk::LinuxSysrootError<'f>>>,
+    linux_sysroot_id: core::cell::OnceCell<Result<Option<crate::sdk::ResolvedLinuxHost<'f>>, &'f str>>,
 }
 
 impl<'f> LazySdk<'f> {
@@ -628,6 +629,14 @@ impl<'f> LazySdk<'f> {
     fn resolve_linux_sysroot(&self) -> Result<Option<crate::sdk::LinuxHostSysroot<'f>>, crate::sdk::LinuxSysrootError<'f>> {
         *self.linux_sysroot.get_or_init(|| {
             crate::sdk::resolve_linux_host_sysroot(&self.linux_sysroot_env, self.frame)
+        })
+    }
+
+    /// Resolves the Linux host sysroot and its 32-byte content identity once per command for
+    /// `Script` task keys and native build-script execution (Rule 21, Rule 75).
+    fn resolve_linux_sysroot_with_id(&self, alloc: blaze_own::Alloc<'_>) -> Result<Option<crate::sdk::ResolvedLinuxHost<'f>>, &'f str> {
+        *self.linux_sysroot_id.get_or_init(|| {
+            crate::sdk::linux_host_with_id(self.resolve_linux_sysroot(), alloc, self.frame)
         })
     }
 
@@ -795,6 +804,7 @@ fn edge_at<'l, R>(
         frame,
         resolved: core::cell::OnceCell::new(),
         linux_sysroot: core::cell::OnceCell::new(),
+        linux_sysroot_id: core::cell::OnceCell::new(),
     };
     let sdk = Err(blaze_apple_sdk::SdkRefused::Neither { xcrun: blaze_apple_sdk::XcrunFailed::NotMacos });
     // The checkout's absolute root: the one resolution of the start folder a command makes
@@ -821,6 +831,7 @@ fn edge_at<'l, R>(
         cargo_home: cargo_home.as_ref().map(|cargo| cargo.as_str()),
         start: served.root_text(),
         sdk,
+        linux_sysroot: Ok(None),
         exe_dir: exe_dir.as_ref().map(|dir| dir.as_str()).map_err(|why| *why),
         lan_peer: crate::fetch::LanPeerConfig::from_env(var("BLAZE_NO_LAN_PEER")),
     };
@@ -2428,6 +2439,7 @@ pub(crate) fn open_pinned_standing<R>(
         frame,
         resolved: core::cell::OnceCell::new(),
         linux_sysroot: core::cell::OnceCell::new(),
+        linux_sysroot_id: core::cell::OnceCell::new(),
     };
     let sdk = Err(blaze_apple_sdk::SdkRefused::Neither { xcrun: blaze_apple_sdk::XcrunFailed::NotMacos });
     let served = crate::engine_script_reads::Served::at_edge(cx.is_simulated(), checkout_abs, frame)
@@ -2450,6 +2462,7 @@ pub(crate) fn open_pinned_standing<R>(
         cargo_home: cargo_home_buf.as_ref().map(|c| c.as_str()),
         start: served.root_text().or(Some(checkout_abs)),
         sdk,
+        linux_sysroot: Ok(None),
         exe_dir: exe_dir.as_ref().map(|dir| dir.as_str()).map_err(|why| *why),
         lan_peer: crate::fetch::LanPeerConfig::from_env(var("BLAZE_NO_LAN_PEER")),
     };
@@ -3104,6 +3117,7 @@ pub(crate) struct Place<'f> {
     /// `PWD`, where the toolchain's shelf is.
     pub(crate) start: Option<&'f str>,
     pub(crate) sdk: Result<blaze_apple_sdk::Sdk<'f>, blaze_apple_sdk::SdkRefused<'f>>,
+    pub(crate) linux_sysroot: Result<Option<crate::sdk::ResolvedLinuxHost<'f>>, &'f str>,
     pub(crate) exe_dir: Result<&'f str, crate::fetch::ExeDirWhy>,
     pub(crate) lan_peer: crate::fetch::LanPeerConfig,
 }
@@ -3125,6 +3139,7 @@ impl<'f> Place<'f> {
             toolchain,
             fs,
             sdk: self.sdk,
+            linux_sysroot: self.linux_sysroot,
             exe_dir: self.exe_dir,
             lan_peer: self.lan_peer,
             // PHASE-MEM-DEBT(Units): the fetches' and every stage's `handles.env.heap` (fetch.rs
@@ -4487,6 +4502,11 @@ fn checking<'f, 's: 'f>(
             }) && let Some(lazy) = lazy_sdk
             {
                 env.sdk = lazy.resolve_in_home(cx, Some(opened.home.dir()), phases);
+                if blaze_proc_macro::native_setting::host_sysroot(crate::graph::TRIPLE)
+                    == Ok(blaze_build_script::toolchain::Sysroot::LinuxHost)
+                {
+                    env.linux_sysroot = lazy.resolve_linux_sysroot_with_id(env.heap.alloc());
+                }
             }
             let ready_dep_probes = crate::engine_scripts::plan_dep_probe_tags_at(
                 cx,
@@ -4733,6 +4753,11 @@ fn checking<'f, 's: 'f>(
                 }) && let Some(lazy) = lazy_sdk
                 {
                     env.sdk = lazy.resolve_in_home(cx, home_dir, phases);
+                    if blaze_proc_macro::native_setting::host_sysroot(crate::graph::TRIPLE)
+                        == Ok(blaze_build_script::toolchain::Sysroot::LinuxHost)
+                    {
+                        env.linux_sysroot = lazy.resolve_linux_sysroot_with_id(env.heap.alloc());
+                    }
                 }
                 let planned_dep_probes = match (stage.names.as_ref(), discovered.get_mut(Name::unit_graph())) {
                     (Some(world), Some(graph_pub)) => crate::engine_scripts::plan_dep_probe_tags(

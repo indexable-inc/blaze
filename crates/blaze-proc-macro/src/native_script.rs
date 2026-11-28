@@ -28,7 +28,7 @@ use blaze_build_script::{
     key::RunLimits,
     host_tools::{self, HostTool},
     outputs::{FileLimits, FileMode, Outputs},
-    toolchain::{CInputs, c_env, depfile_reads, headers_digest, map_paths},
+    toolchain::{CInputs, Sysroot, c_env, depfile_reads, headers_digest, map_paths},
 };
 use blaze_core::wait::Deadline;
 use blaze_ids::ContentId;
@@ -153,6 +153,9 @@ pub enum NativeScriptError {
     /// The script left something in `OUT_DIR` that is not a plain file or a folder (a link, a
     /// socket): the record holds files only, and a link's target is not the script's output.
     NotAFile { folder: std::string::String, name: std::string::String, kind: bstd::fs::EntryKind },
+    /// A kept file in `OUT_DIR` embeds a host sysroot or linker path (e.g. a Nix store `RPATH` or
+    /// `PT_INTERP`), which would violate key/output path-independence (Rule 25).
+    HostPath { file: std::string::String, host: std::string::String },
 }
 
 impl std::fmt::Display for NativeScriptError {
@@ -201,6 +204,10 @@ impl std::fmt::Display for NativeScriptError {
                 f,
                 "{folder}/{name}: the build script left a {kind:?} in OUT_DIR, not a file or a folder; its outputs record holds files only (a link's target is not its output), so it is refused (rule 3)"
             ),
+            NativeScriptError::HostPath { file, host } => write!(
+                f,
+                "kept output `{file}` in OUT_DIR embeds host path `{host}` (rule 25: equal inputs, equal bytes)"
+            ),
         }
     }
 }
@@ -224,6 +231,16 @@ fn signal_name(signal: i32) -> &'static str {
     }
 }
 
+/// The primary sysroot directory granted read-only to the sandbox: on `Sysroot::LinuxHost` this
+/// is narrowed to `<sysroot>/include` (never blanket `/usr` or unhashed sibling directories) so
+/// Landlock read grants match `resolve_linux_sysroot`'s `sdk_digest` 1:1 (Rule 21).
+fn sysroot_primary_read<'a>(c: &CInputs<'_>, alloc: Alloc<'a>) -> AString<'a> {
+    if c.sysroot_kind == Sysroot::LinuxHost {
+        blaze_own::format_in!(alloc, "{}/include", c.sysroot)
+    } else {
+        String::from_str_in(c.sysroot, alloc)
+    }
+}
 /// The `OUT_DIR` and `CARGO_MANIFEST_DIR` the script is shown (what its outputs' real folders
 /// are mapped back to), each from its environment; a missing one is refused by name (rule 3).
 fn shown_folders<'e>(env: &'e Env<'_>, program: &str) -> Result<(&'e str, &'e str), NativeScriptError> {
@@ -261,6 +278,32 @@ mod d96_tests {
         assert!(matches!(shown_folders(&no_dir, "s"), Err(NativeScriptError::MissingVar { name: "CARGO_MANIFEST_DIR", .. })));
         let no_out = env(&[("CARGO_MANIFEST_DIR", "/package")]);
         assert!(matches!(shown_folders(&no_out, "s"), Err(NativeScriptError::MissingVar { name: "OUT_DIR", .. })));
+    }
+
+    #[test]
+    fn linux_sysroot_primary_read_narrows_fhs_and_nixos_to_include() {
+        use blaze_build_script::toolchain::{CInputs, Shelf, Sysroot};
+        let alloc = blaze_own::testing::heap().alloc();
+        let make = |sysroot_kind, sysroot| CInputs {
+            shelf: Shelf { dir: "/h/shelf", clang_major: "23" },
+            sysroot_kind,
+            sysroot,
+            sysroot_extra_reads: &[],
+            linux_clang_cfg: None,
+            out_dir: "/h/out",
+            package: "/h/pkg",
+            seen: blaze_expand::seen::SeenRoot::Package,
+            macos_min: "11.0",
+        };
+        assert_eq!(super::sysroot_primary_read(&make(Sysroot::LinuxHost, "/usr"), alloc).as_str(), "/usr/include");
+        assert_eq!(
+            super::sysroot_primary_read(&make(Sysroot::LinuxHost, "/nix/store/abc-glibc-dev"), alloc).as_str(),
+            "/nix/store/abc-glibc-dev/include"
+        );
+        assert_eq!(
+            super::sysroot_primary_read(&make(Sysroot::MacosSdk, "/Applications/Xcode.app/SDKs/MacOSX.sdk"), alloc).as_str(),
+            "/Applications/Xcode.app/SDKs/MacOSX.sdk"
+        );
     }
 }
 
@@ -404,7 +447,73 @@ fn hex64(digest: &[u8; 32]) -> std::string::String {
 /// the record can hold. No length is limited; the count of files is (`limits.files`).
 ///
 /// `out_dir` and `area` are canonical and `area` exists.
+fn slice_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+/// Scans a streamed chunk (plus the overlap tail from previous chunks) for any forbidden host path
+/// needle without buffering the whole file in memory.
+fn scan_stream_chunk<'a, 'n>(
+    data: &[u8],
+    forbidden_hosts: &[&'n str],
+    max_needle: usize,
+    tail: &mut AVec<'a, u8>,
+    bridge: &mut AVec<'a, u8>,
+) -> Option<&'n str> {
+    if max_needle == 0 || data.is_empty() {
+        return None;
+    }
+    for &host in forbidden_hosts {
+        if slice_contains(data, host.as_bytes()) {
+            return Some(host);
+        }
+    }
+    let keep = max_needle.saturating_sub(1);
+    if keep > 0 && !tail.is_empty() {
+        bridge.clear();
+        bridge.extend_from_slice(tail.as_slice());
+        let take = data.len().min(keep);
+        if let Some(prefix) = data.get(..take) {
+            bridge.extend_from_slice(prefix);
+        }
+        for &host in forbidden_hosts {
+            if slice_contains(bridge.as_slice(), host.as_bytes()) {
+                return Some(host);
+            }
+        }
+    }
+    if keep > 0 {
+        if data.len() >= keep {
+            tail.clear();
+            if let Some(suffix) = data.get(data.len() - keep..) {
+                tail.extend_from_slice(suffix);
+            }
+        } else {
+            tail.extend_from_slice(data);
+            if tail.len() > keep {
+                let drop = tail.len() - keep;
+                tail.as_mut_slice().copy_within(drop.., 0);
+                tail.truncate(keep);
+            }
+        }
+    }
+    None
+}
+
 pub fn store_out_dir<'a>(out_dir: &str, area: &str, listed: &[Listed], outputs: &mut Outputs<'a>, limits: FileLimits, alloc: Alloc<'a>) -> Result<StoredOutputs, NativeScriptError> {
+    store_out_dir_checked(out_dir, area, listed, outputs, limits, &[], alloc)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_out_dir_checked<'a>(
+    out_dir: &str,
+    area: &str,
+    listed: &[Listed],
+    outputs: &mut Outputs<'a>,
+    limits: FileLimits,
+    forbidden_hosts: &[&str],
+    alloc: Alloc<'a>,
+) -> Result<StoredOutputs, NativeScriptError> {
     let failed = |why: std::string::String| NativeScriptError::Files { folder: out_dir.to_owned(), why };
     let top = common_folder(out_dir, area);
     let under = |path: &str| path.get(top.len()..).unwrap_or("").trim_start_matches('/').to_owned();
@@ -413,6 +522,10 @@ pub fn store_out_dir<'a>(out_dir: &str, area: &str, listed: &[Listed], outputs: 
     let mem = io.mem().ok_or_else(|| failed("the world over it offers no memory to stream a digest through".to_owned()))?;
     let arena = mem.arena(DIGEST_ARENA_NAME, DIGEST_ARENA).map_err(|e| failed(format!("{e:?}")))?;
     let mut chunk = arena.bytes();
+    let max_needle = forbidden_hosts.iter().map(|h| h.len()).max().unwrap_or(0);
+    let keep = max_needle.saturating_sub(1);
+    let mut tail: AVec<'a, u8> = Vec::with_capacity_in(keep, alloc);
+    let mut bridge: AVec<'a, u8> = Vec::with_capacity_in(keep.saturating_mul(2), alloc);
     let mut stored = StoredOutputs { peak: 0, files: 0, bytes: 0, present: 0 };
     for file in listed {
         if file.kind != bstd::fs::EntryKind::File {
@@ -428,11 +541,15 @@ pub fn store_out_dir<'a>(out_dir: &str, area: &str, listed: &[Listed], outputs: 
         let opened = root.open_read(&cx, &from).map_err(|e| named(e.to_string()))?;
         let mut sha = blaze_sha256::Sha256::new();
         let mut at = 0u64;
+        tail.clear();
         loop {
             chunk.clear();
             let n = opened.read_at(&cx, at, CHUNK, &mut chunk).map_err(|e| named(e.to_string()))?;
             if n == 0 {
                 break;
+            }
+            if let Some(host) = scan_stream_chunk(chunk.as_slice(), forbidden_hosts, max_needle, &mut tail, &mut bridge) {
+                return Err(NativeScriptError::HostPath { file: file.name.as_str().into(), host: host.into() });
             }
             sha.update(chunk.as_slice());
             at += n as u64;
@@ -603,6 +720,55 @@ mod stored_tests {
         assert_eq!(common_folder("/x/out", "/y/files"), "/");
         assert_eq!(common_folder("/a/b", "/a/b/files"), "/a/b");
     }
+
+    /// Streaming host-path scan rejects any kept `OUT_DIR` file embedding a forbidden host
+    /// sysroot/linker path — including a path split across `CHUNK` boundaries — without buffering
+    /// the whole file, while clean files pass through unchanged.
+    #[test]
+    fn store_out_dir_checked_rejects_host_path_across_chunk_boundary() {
+        let (root, out, files) = folders("hostpath");
+        let needle = "/nix/store/0123456789abcdef-glibc-2.44/lib";
+        let split_at = super::CHUNK - 10;
+        let mut payload = vec![b'A'; super::CHUNK + 128];
+        payload[split_at..split_at + needle.len()].copy_from_slice(needle.as_bytes());
+        std::fs::write(format!("{out}/leaked.so"), &payload).expect("write leaked.so");
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let listed = listed_under(&out).expect("listed");
+        let mut outputs = Outputs::new_in("/target/debug/build/x-0/out", alloc);
+        let err = super::store_out_dir_checked(
+            &out,
+            &files,
+            &listed,
+            &mut outputs,
+            FileLimits::DEFAULT,
+            &[needle],
+            alloc,
+        )
+        .expect_err("leaked host path across chunk boundary must be rejected");
+        assert!(
+            matches!(&err, NativeScriptError::HostPath { file, host } if file == "leaked.so" && host == needle),
+            "expected HostPath(leaked.so, {needle}), got {err:?}"
+        );
+
+        // Control: removing the leaked file and writing a clean file passes.
+        std::fs::remove_file(format!("{out}/leaked.so")).expect("rm leaked.so");
+        std::fs::write(format!("{out}/clean.a"), b"!<arch>\nclean bytes\n").expect("write clean.a");
+        let listed_clean = listed_under(&out).expect("listed clean");
+        let mut clean_out = Outputs::new_in("/target/debug/build/x-0/out", alloc);
+        let stored = super::store_out_dir_checked(
+            &out,
+            &files,
+            &listed_clean,
+            &mut clean_out,
+            FileLimits::DEFAULT,
+            &[needle],
+            alloc,
+        )
+        .unwrap_or_else(|e| panic!("clean file must pass: {e}"));
+        _ = std::fs::remove_dir_all(&root);
+        assert_eq!(stored.files, 1);
+    }
 }
 
 pub(crate) fn remove(folder: &str, name: &str) -> Result<(), NativeScriptError> {
@@ -715,33 +881,6 @@ impl RootFiles for OutDir<'_> {
     }
 }
 
-/// Resolves and caches the pinned nightly toolchain's canonical `(sysroot, rustc_bin)` once so
-/// native build scripts (`serde_core`, `serde_json`, `thiserror`, `libc`, `autocfg`, etc.) can
-/// invoke the pinned `rustc` inside `bstd::procs::hermetic` read-only confinement with zero ambient paths.
-fn pinned_rustc_paths() -> Option<&'static (std::string::String, std::string::String)> {
-    static CACHE: std::sync::OnceLock<Option<(std::string::String, std::string::String)>> = std::sync::OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            for args in [
-                &[format!("+{}", blaze_pins::TOOLCHAIN), "--print".to_owned(), "sysroot".to_owned()][..],
-                &["--print".to_owned(), "sysroot".to_owned()][..],
-            ] {
-                if let Ok(out) = std::process::Command::new("rustc").args(args).output() {
-                    if out.status.success() {
-                        let raw = std::string::String::from_utf8_lossy(&out.stdout).trim().to_owned();
-                        let Ok(sysroot) = std::fs::canonicalize(&raw) else { continue };
-                        let Ok(rustc_bin) = std::fs::canonicalize(sysroot.join("bin/rustc")) else { continue };
-                        if let (Some(sr), Some(rb)) = (sysroot.to_str(), rustc_bin.to_str()) {
-                            return Some((sr.to_owned(), rb.to_owned()));
-                        }
-                    }
-                }
-            }
-            None
-        })
-        .as_ref()
-}
-
 /// Resolves and caches the real macOS `dsymutil` binary (never the `/usr/bin/dsymutil` xcrun shim)
 /// so `configure` scripts that compile+link `conftest.c` with `-g` succeed under hermetic confinement.
 fn pinned_dsymutil_paths() -> Option<&'static (std::string::String, std::string::String)> {
@@ -791,17 +930,25 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         _ => blaze_build_script::Jobs::One,
     };
     let run_env = script.env.for_run(jobs, alloc);
-    let pinned_rustc = pinned_rustc_paths();
+    let shim_rustc: Option<AString<'a>> = script.facts.map(|facts| blaze_own::format_in!(alloc, "{}/rustc", facts.bin));
+    let shim_cargo: Option<AString<'a>> = script.facts.map(|facts| blaze_own::format_in!(alloc, "{}/cargo", facts.bin));
     let mut vars: AVec<'a, (&str, &str)> = Vec::new_in(alloc);
     for (name, value) in run_env.vars.iter() {
         let value = match name.as_str() {
             "OUT_DIR" => c.out_dir,
             "CARGO_MANIFEST_DIR" => c.package,
             "CARGO_MANIFEST_PATH" => manifest.as_str(),
-            "RUSTC" => pinned_rustc.map(|(_, rb)| rb.as_str()).unwrap_or(value.as_str()),
+            "RUSTC" => shim_rustc.as_deref().unwrap_or(value.as_str()),
+            "CARGO" => shim_cargo.as_deref().unwrap_or(value.as_str()),
             _ => value.as_str(),
         };
         vars.push((name.as_str(), value));
+    }
+    if let Some(rustc_path) = shim_rustc.as_deref() {
+        vars.push(("RUSTC", rustc_path));
+    }
+    if let Some(cargo_path) = shim_cargo.as_deref() {
+        vars.push(("CARGO", cargo_path));
     }
     let toolchain = c_env(c, alloc);
     let mut cleaned_flags: AVec<'a, AString<'a>> = Vec::new_in(alloc);
@@ -869,10 +1016,14 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
     }
 
     // D112: a script granted a tool that runs what the script built under OUT_DIR (sh running
-    // configure's test programs) links those programs: the pinned linker too (the shelf's
-    // clang.cfg says `-fuse-ld=lld`; clang starts `ld64.lld`, a link to `lld`), and it may start
-    // what is under OUT_DIR. Every other script is granted neither.
-    let linker: &[&str] = if runs_out_dir { &["bin/ld64.lld", "bin/ld.lld", "bin/lld"] } else { &[] };
+    // configure's test programs) or linking against a split Linux libc root needs the pinned
+    // linker (`lld`/`ld.lld`/`ld64.lld`); only `runs_out_dir` may start what is under OUT_DIR.
+    let linux_cfg_dir: Option<&str> = c.linux_clang_cfg.and_then(|cfg| cfg.rsplit_once('/').map(|(dir, _)| dir)).filter(|dir| !dir.is_empty());
+    let staged_ld_lld: Option<AString<'a>> = linux_cfg_dir
+        .map(|dir| blaze_own::format_in!(alloc, "{dir}/ld.lld"))
+        .filter(|path| Path::new(path.as_str()).exists());
+    let needs_linker = runs_out_dir || c.sysroot_kind == Sysroot::LinuxHost;
+    let linker: &[&str] = if needs_linker { &["bin/ld64.lld", "bin/ld.lld", "bin/lld"] } else { &[] };
     let mut exec: AVec<'a, AString<'a>> = Vec::new_in(alloc);
     for name in ["bin/clang-23", "bin/clang", "bin/clang++", "bin/llvm-ar"].iter().chain(linker) {
         let mut path: AString<'a> = String::from_str_in(c.shelf.dir, alloc);
@@ -899,10 +1050,8 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         for path in exec.iter() {
             out.push(path.as_str());
         }
-        // Pinned nightly `rustc` binary so native Rust build scripts (`autocfg`, `serde_core`,
-        // `thiserror`, `libc`, etc.) can probe the pinned compiler hermetically.
-        if let Some((_, rustc_bin)) = pinned_rustc {
-            out.push(rustc_bin.as_str());
+        if let Some(ld_lld) = staged_ld_lld.as_deref() {
+            out.push(ld_lld);
         }
         if let Some((_, dsym_bin)) = dsymutil {
             out.push(dsym_bin.as_str());
@@ -910,10 +1059,7 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         if xcode_dev_dir.is_some() {
             out.push("/Applications/Xcode.app/Contents/Developer/usr/bin/gnumake");
         }
-        if runs_out_dir && Path::new("/usr/bin/cmp").is_file() {
-            out.push("/usr/bin/cmp");
-        }
-        // The fact shim (N7), started through its links.
+        // The fact shim (N7), started through its links (`rustc`, `cargo`, `pkg-config`, `sw_vers`).
         if let Some(facts) = script.facts {
             out.push(facts.shim.as_str());
             for link in facts.links.iter() {
@@ -926,9 +1072,14 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
     if script.confined.is_none() {
         reads.push(c.package);
     }
-    reads.extend_from_slice(&[c.shelf.dir, c.sysroot]);
-    if let Some((sysroot_dir, _)) = pinned_rustc {
-        reads.push(sysroot_dir.as_str());
+    reads.push(c.shelf.dir);
+    let primary_sysroot_read = sysroot_primary_read(&c, alloc);
+    reads.push(primary_sysroot_read.as_str());
+    // Linux Landlock split sysroot roots (`<sdk_extra>/include`, `sdk_lib`, `sdk_rpaths`,
+    // external `sdk_dynamic_linker`) and staged `clang.cfg` folder (deduplicated in `spellings`).
+    reads.extend_from_slice(c.sysroot_extra_reads);
+    if let Some(cfg_dir) = linux_cfg_dir {
+        reads.push(cfg_dir);
     }
     if let Some((dsym_dir, _)) = dsymutil {
         reads.push(dsym_dir.as_str());
@@ -1130,13 +1281,37 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         for path in read.iter() {
             if let Some(under) = path.strip_prefix(sysroot_prefix.as_str()) {
                 headers.push((under.to_owned(), [0; 32]));
-            } else if path.starts_with('/') && !path.starts_with(c.package) && !path.starts_with(c.out_dir) && !path.starts_with(c.shelf.dir) {
+            } else if path.starts_with('/')
+                && !path.starts_with(c.package)
+                && !path.starts_with(c.out_dir)
+                && !path.starts_with(c.shelf.dir)
+                && !c.sysroot_extra_reads.iter().any(|extra| path.starts_with(extra))
+            {
                 other_reads += 1;
             }
         }
         remove(c.out_dir, name)?;
     }
-    store_out_dir(c.out_dir, script.files, &kept, &mut outputs, file_limits, alloc)?;
+    // On `Sysroot::LinuxHost`, reject any kept output file in `OUT_DIR` that embeds a host
+    // sysroot/linker path (e.g. Nix store `RPATH` or `PT_INTERP`), so path-independent
+    // `sdk_version` keys can never cache machine-specific output bytes (Rule 25).
+    let mut forbidden_hosts: AVec<'a, &str> = Vec::new_in(alloc);
+    if c.sysroot_kind == Sysroot::LinuxHost {
+        if c.sysroot != "/usr" && !c.sysroot.is_empty() {
+            forbidden_hosts.push(c.sysroot);
+        }
+        for extra in c.sysroot_extra_reads {
+            if *extra != "/usr" && !extra.is_empty() && !forbidden_hosts.contains(extra) {
+                forbidden_hosts.push(*extra);
+            }
+        }
+        if let Some(cfg_dir) = linux_cfg_dir
+            && !forbidden_hosts.contains(&cfg_dir)
+        {
+            forbidden_hosts.push(cfg_dir);
+        }
+    }
+    store_out_dir_checked(c.out_dir, script.files, &kept, &mut outputs, file_limits, forbidden_hosts.as_slice(), alloc)?;
     headers.sort();
     headers.dedup();
     for (under, digest) in headers.iter_mut() {

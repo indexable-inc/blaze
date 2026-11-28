@@ -26,7 +26,8 @@
 
 #![blaze::sans_io]
 
-use blaze_own::{AVec, Alloc, Vec};
+use blaze_own::{AString, AVec, Alloc, String, Vec};
+use blaze_unit_graph::{UnitGraph, UnitId, UnitKind};
 
 /// The `--format-version` `cargo metadata` has (cargo's `metadata.rs`: "only version 1 is
 /// supported").
@@ -288,3 +289,351 @@ pub const FIELDS: &[Field] = &[
     Field { path: "resolve", reader: Reader::Format, required: false, from: "the unit graph's edges (null under `--no-deps`); cbindgen's fork removed it (\"was causing parse failures\")" },
     Field { path: "target_directory", reader: Reader::Format, required: false, from: "a stated path in the sandbox with nothing in it (no target directory exists: rule 1)" },
 ];
+
+/// Normalizes a `--manifest-path` value against `cwd` (resolving relative paths and `.` / `..`
+/// components cleanly without touching the filesystem, sans-IO).
+pub fn normalize_manifest_path<'a>(raw: &str, cwd: &str, alloc: Alloc<'a>) -> AString<'a> {
+    let mut parts: AVec<'a, &str> = Vec::new_in(alloc);
+    if !raw.starts_with('/') {
+        for seg in cwd.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    let _ = parts.pop();
+                }
+                other => parts.push(other),
+            }
+        }
+    }
+    for seg in raw.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                let _ = parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    let mut out = String::new_in(alloc);
+    if parts.is_empty() {
+        out.push('/');
+        return out;
+    }
+    for part in parts.iter() {
+        out.push('/');
+        out.push_str(part);
+    }
+    out
+}
+
+/// Inputs for serializing a deterministic Cargo format-1 `cargo metadata` JSON payload from
+/// Blaze's resolved [`UnitGraph`] without spawning `cargo` (Rule 1).
+pub struct MetadataSpec<'s> {
+    pub graph: &'s UnitGraph<'s>,
+    /// The served unit (library/binary) whose package is the focal package of the build script.
+    pub package: UnitId,
+    /// Directory of `package` (`CARGO_MANIFEST_DIR`, e.g. real host path or `/package` for keying).
+    pub package_dir: &'s str,
+    /// Workspace root directory (same as `package_dir` for non-workspace packages).
+    pub workspace_root: &'s str,
+    /// Stated target directory path.
+    pub target_dir: &'s str,
+}
+
+fn push_json_str(out: &mut AString<'_>, s: &str) {
+    use core::fmt::Write as _;
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if u32::from(c) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn push_pkg_id(out: &mut AString<'_>, is_focal: bool, package_dir: &str, name: &str, version: &str) {
+    out.push('"');
+    if is_focal {
+        out.push_str("path+file://");
+        for ch in package_dir.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c => out.push(c),
+            }
+        }
+        out.push('#');
+        out.push_str(name);
+        out.push('@');
+        out.push_str(version);
+    } else {
+        out.push_str("registry+https://github.com/rust-lang/crates.io-index#");
+        out.push_str(name);
+        out.push('@');
+        out.push_str(version);
+    }
+    out.push('"');
+}
+
+fn target_kind_str<'u>(kind: &'u UnitKind<'u>) -> (&'static str, &'static str, bool, bool) {
+    match kind {
+        UnitKind::Lib => ("lib", "lib", true, true),
+        UnitKind::ProcMacro => ("proc-macro", "proc-macro", true, true),
+        UnitKind::Bin(_) => ("bin", "bin", false, true),
+        UnitKind::BuildScript => ("custom-build", "bin", false, false),
+        UnitKind::Test { .. } | UnitKind::IntegrationTest(_) => ("test", "bin", false, true),
+        UnitKind::Example(_) => ("example", "bin", false, false),
+        UnitKind::Bench(_) => ("bench", "bin", false, false),
+    }
+}
+
+/// Formats deterministic Cargo format-1 `cargo metadata` JSON for `spec` covering every field
+/// required by `cbindgen` and `cargo_metadata` ([`FIELDS`]) without spawning `cargo` (Rule 1).
+pub fn format_metadata_json<'a>(spec: &MetadataSpec<'_>, no_deps: bool, alloc: Alloc<'a>) -> AString<'a> {
+    let mut out = String::new_in(alloc);
+    let Some(focal_unit) = spec.graph.units.get(spec.package.index()) else {
+        out.push_str("{\"packages\":[],\"workspace_members\":[],\"workspace_default_members\":[],\"resolve\":null,\"target_directory\":");
+        push_json_str(&mut out, spec.target_dir);
+        out.push_str(",\"version\":1,\"workspace_root\":");
+        push_json_str(&mut out, spec.workspace_root);
+        out.push_str(",\"metadata\":null}");
+        return out;
+    };
+    let focal_pkg = focal_unit.package;
+
+    // Collect distinct packages in deterministic order: focal package only when `no_deps`, else
+    // every package reachable from `focal_pkg`'s units in `spec.graph`.
+    let mut reachable_units: AVec<'a, usize> = Vec::new_in(alloc);
+    let mut stack: AVec<'a, usize> = Vec::new_in(alloc);
+    for (idx, unit) in spec.graph.units.iter().enumerate() {
+        if unit.package == focal_pkg {
+            reachable_units.push(idx);
+            if !no_deps {
+                stack.push(idx);
+            }
+        }
+    }
+    while let Some(cur) = stack.pop() {
+        let Some(unit) = spec.graph.units.get(cur) else { continue };
+        for dep in unit.deps.iter() {
+            let dep_idx = dep.unit.index();
+            if reachable_units.scan_for(&dep_idx).is_none() {
+                reachable_units.push(dep_idx);
+                stack.push(dep_idx);
+            }
+        }
+        if let Some(bs) = unit.build_script {
+            let bs_idx = bs.index();
+            if reachable_units.scan_for(&bs_idx).is_none() {
+                reachable_units.push(bs_idx);
+                stack.push(bs_idx);
+            }
+        }
+    }
+
+    let mut pkg_reps: AVec<'a, usize> = Vec::new_in(alloc);
+    for &idx in reachable_units.iter() {
+        let Some(unit) = spec.graph.units.get(idx) else { continue };
+        let seen = pkg_reps.iter().any(|&rep| spec.graph.units.get(rep).is_some_and(|u| u.package == unit.package));
+        if !seen {
+            pkg_reps.push(idx);
+        }
+    }
+    pkg_reps.sort_unstable_by(|&a, &b| {
+        let ua = spec.graph.units.get(a);
+        let ub = spec.graph.units.get(b);
+        match (ua, ub) {
+            (Some(ua), Some(ub)) => (ua.name.as_str(), ua.version.as_str(), ua.package).cmp(&(ub.name.as_str(), ub.version.as_str(), ub.package)),
+            _ => a.cmp(&b),
+        }
+    });
+
+    out.push_str("{\"packages\":[");
+    for (pkg_at, &rep_idx) in pkg_reps.iter().enumerate() {
+        let Some(rep) = spec.graph.units.get(rep_idx) else { continue };
+        if pkg_at > 0 {
+            out.push(',');
+        }
+        let is_focal = rep.package == focal_pkg;
+        let pkg_base = if is_focal { spec.package_dir } else { "/deps" };
+        out.push_str("{\"name\":");
+        push_json_str(&mut out, rep.name.as_str());
+        out.push_str(",\"version\":");
+        push_json_str(&mut out, rep.version.as_str());
+        out.push_str(",\"id\":");
+        push_pkg_id(&mut out, is_focal, spec.package_dir, rep.name.as_str(), rep.version.as_str());
+        out.push_str(",\"source\":");
+        if is_focal {
+            out.push_str("null");
+        } else {
+            out.push_str("\"registry+https://github.com/rust-lang/crates.io-index\"");
+        }
+
+        // Dependencies from all units of this package in the unit graph (deduplicated by dep pkg + kind + rename).
+        out.push_str(",\"dependencies\":[");
+        let mut dep_count = 0usize;
+        let mut seen_deps: AVec<'a, (&str, Option<&str>, Option<&str>)> = Vec::new_in(alloc);
+        for unit in spec.graph.units.iter().filter(|u| u.package == rep.package) {
+            let dep_kind: Option<&str> = match unit.kind {
+                UnitKind::BuildScript => Some("build"),
+                UnitKind::Test { .. } | UnitKind::IntegrationTest(_) | UnitKind::Example(_) | UnitKind::Bench(_) => Some("dev"),
+                UnitKind::Lib | UnitKind::ProcMacro | UnitKind::Bin(_) => None,
+            };
+            for dep in unit.deps.iter() {
+                let Some(dep_unit) = spec.graph.units.get(dep.unit.index()) else { continue };
+                if dep_unit.package == rep.package {
+                    continue;
+                }
+                let dep_pkg_name = dep_unit.name.as_str();
+                let rename = (dep.name.as_str() != dep_unit.crate_name.as_str()).then_some(dep.name.as_str());
+                let key = (dep_pkg_name, dep_kind, rename);
+                if seen_deps.scan_for(&key).is_some() {
+                    continue;
+                }
+                seen_deps.push(key);
+                if dep_count > 0 {
+                    out.push(',');
+                }
+                dep_count += 1;
+                out.push_str("{\"name\":");
+                push_json_str(&mut out, dep_pkg_name);
+                out.push_str(",\"source\":\"registry+https://github.com/rust-lang/crates.io-index\",\"req\":\"*\",\"kind\":");
+                match dep_kind {
+                    Some(k) => push_json_str(&mut out, k),
+                    None => out.push_str("null"),
+                }
+                out.push_str(",\"rename\":");
+                match rename {
+                    Some(r) => push_json_str(&mut out, r),
+                    None => out.push_str("null"),
+                }
+                out.push_str(",\"optional\":false,\"uses_default_features\":true,\"features\":[],\"target\":null,\"registry\":null,\"path\":null}");
+            }
+        }
+        out.push(']');
+
+        // Targets of this package (Lib/ProcMacro/Bin/BuildScript), deduplicated by (kind, name, root).
+        out.push_str(",\"targets\":[");
+        let mut tgt_count = 0usize;
+        let mut seen_tgts: AVec<'a, (&str, &str, &str)> = Vec::new_in(alloc);
+        for unit in spec.graph.units.iter().filter(|u| u.package == rep.package) {
+            if matches!(unit.kind, UnitKind::Test { .. }) {
+                continue;
+            }
+            let (kind_str, crate_type, doctest, test) = target_kind_str(&unit.kind);
+            let tgt_name = match &unit.kind {
+                UnitKind::Bin(bin_name) => bin_name.as_str(),
+                UnitKind::BuildScript => "build-script-build",
+                _ => unit.name.as_str(),
+            };
+            let root_rel = unit.root.as_str();
+            let key = (kind_str, tgt_name, root_rel);
+            if seen_tgts.scan_for(&key).is_some() {
+                continue;
+            }
+            seen_tgts.push(key);
+            if tgt_count > 0 {
+                out.push(',');
+            }
+            tgt_count += 1;
+            out.push_str("{\"kind\":[");
+            push_json_str(&mut out, kind_str);
+            out.push_str("],\"crate_types\":[");
+            push_json_str(&mut out, crate_type);
+            out.push_str("],\"name\":");
+            push_json_str(&mut out, tgt_name);
+            out.push_str(",\"src_path\":");
+            let mut src_path = String::from_str_in(pkg_base, alloc);
+            if !is_focal {
+                src_path.push('/');
+                src_path.push_str(rep.name.as_str());
+                src_path.push('-');
+                src_path.push_str(rep.version.as_str());
+            }
+            src_path.push('/');
+            src_path.push_str(root_rel);
+            push_json_str(&mut out, src_path.as_str());
+            out.push_str(",\"edition\":");
+            if let Some(blaze) = unit.edition.blaze {
+                push_json_str(&mut out, blaze.manifest());
+            } else {
+                use core::fmt::Write as _;
+                out.push('"');
+                let _ = write!(out, "{}", unit.edition.syntax);
+                out.push('"');
+            }
+            out.push_str(",\"doctest\":");
+            out.push_str(if doctest { "true" } else { "false" });
+            out.push_str(",\"test\":");
+            out.push_str(if test { "true" } else { "false" });
+            out.push('}');
+        }
+        out.push(']');
+
+        // Features map: sorted unique feature names across units of this package.
+        let mut feat_names: AVec<'a, &str> = Vec::new_in(alloc);
+        for unit in spec.graph.units.iter().filter(|u| u.package == rep.package) {
+            for feat in unit.features.iter() {
+                if feat_names.scan_for(&feat.as_str()).is_none() {
+                    feat_names.push(feat.as_str());
+                }
+            }
+        }
+        feat_names.sort_unstable();
+        out.push_str(",\"features\":{");
+        for (fi, feat) in feat_names.iter().enumerate() {
+            if fi > 0 {
+                out.push(',');
+            }
+            push_json_str(&mut out, feat);
+            out.push_str(":[]");
+        }
+        out.push('}');
+
+        // Manifest path.
+        out.push_str(",\"manifest_path\":");
+        let mut manifest_path = String::from_str_in(pkg_base, alloc);
+        if !is_focal {
+            manifest_path.push('/');
+            manifest_path.push_str(rep.name.as_str());
+            manifest_path.push('-');
+            manifest_path.push_str(rep.version.as_str());
+        }
+        manifest_path.push_str("/Cargo.toml");
+        push_json_str(&mut out, manifest_path.as_str());
+
+        out.push_str(",\"metadata\":null,\"edition\":");
+        if let Some(blaze) = rep.edition.blaze {
+            push_json_str(&mut out, blaze.manifest());
+        } else {
+            use core::fmt::Write as _;
+            out.push('"');
+            let _ = write!(out, "{}", rep.edition.syntax);
+            out.push('"');
+        }
+        out.push_str(",\"links\":");
+        match rep.links.as_ref() {
+            Some(links) => push_json_str(&mut out, links.as_str()),
+            None => out.push_str("null"),
+        }
+        out.push('}');
+    }
+    out.push_str("],\"workspace_members\":[");
+    push_pkg_id(&mut out, true, spec.package_dir, focal_unit.name.as_str(), focal_unit.version.as_str());
+    out.push_str("],\"workspace_default_members\":[");
+    push_pkg_id(&mut out, true, spec.package_dir, focal_unit.name.as_str(), focal_unit.version.as_str());
+    out.push_str("],\"resolve\":null,\"target_directory\":");
+    push_json_str(&mut out, spec.target_dir);
+    out.push_str(",\"version\":1,\"workspace_root\":");
+    push_json_str(&mut out, spec.workspace_root);
+    out.push_str(",\"metadata\":null}");
+    out
+}

@@ -58,10 +58,33 @@ pub fn placed(graph: &UnitGraph<'_>, script: UnitId, mode: Mode, alloc: Alloc<'_
     toolchain::placement(native::closure(graph, script, alloc), mode, graph.units[script.index()].name.as_str())
 }
 
-/// Like [`placed`], but honors the D175 zero-Wasm fast path: whenever `store` holds a native
-/// host binary record (`script.bin`, `target <host>`) for `script` and does not hold a legacy
-/// `module.wasm` record, places `script` on [`Runner::Native`] so it runs confined under
-/// `bstd::procs::hermetic` (macOS Seatbelt / Linux Landlock + seccomp) with zero Wasm.
+/// Returns the name of a host tool that `script` requires to run natively on `host` but that
+/// `pins/clang.json`'s `host_tools` row for `host` does not grant:
+/// - a script whose closure contains `cmake` requires a granted `cmake` tool;
+/// - any package for which another target row in `pins/clang.json`'s `host_tools` declares a
+///   `needed_by` tool (e.g. `sha3-asm` -> `perl`, `tikv-jemalloc-sys` -> `hostname`/`make`/`nm`/
+///   `sh`/`uname`, or any future `needed_by` entry) requires every such tool to be granted on
+///   `host` (Rule 30: table-driven single source of truth).
+pub fn missing_native_host_tool(graph: &UnitGraph<'_>, script: UnitId, host: &str, alloc: Alloc<'_>) -> Option<&'static str> {
+    let unit = graph.units.get(script.index())?;
+    let pkg = unit.name.as_str();
+    let table = host_tools::host_tools(CLANG_JSON, host, alloc).ok()?;
+    let tools = host_tools::granted(&table, pkg, alloc);
+    if native::closure_has_crate(graph, script, "cmake", alloc) && !tools.iter().any(|tool| tool.name == "cmake") {
+        return Some("cmake");
+    }
+    if let Ok(Some(missing)) = host_tools::missing_for_target(CLANG_JSON, host, pkg, alloc) {
+        return Some(missing);
+    }
+    None
+}
+
+/// Like [`placed`], and honors the D175 zero-Wasm fast path: whenever `store` holds a native host
+/// binary record (`script.bin`, `target <host>`) for `script`, does not hold a legacy `module.wasm`
+/// record, and all required host tools are granted on `host`, upgrades a Wasm-placed script to
+/// [`Runner::Native`]. Scripts placed native by [`placed`] (`TOOLCHAIN_CLASS`, `NO_WASM_CLASS`,
+/// `NATIVE_EVERY_MODE`) NEVER silently fall back to Wasm when a host tool is missing (Rule 3):
+/// [`native_outputs`] refuses them loudly with [`NativeUnitError::MissingHostTool`].
 pub fn placed_in_store(
     store: &Path,
     graph: &UnitGraph<'_>,
@@ -72,6 +95,9 @@ pub fn placed_in_store(
 ) -> Runner {
     let base = placed(graph, script, mode, alloc);
     if matches!(base, Runner::Native { .. }) {
+        return base;
+    }
+    if missing_native_host_tool(graph, script, host, alloc).is_some() {
         return base;
     }
     let Some(unit) = graph.units.get(script.index()) else { return base };
@@ -103,15 +129,49 @@ pub fn placed_in_store(
     base
 }
 
-/// What a command gives its native scripts. Every path absolute and canonical (Seatbelt matches
-/// resolved paths).
+/// Zero-allocation, `Copy + Send + Sync` view over NUL-separated Linux runtime library search
+/// directories (`-rpath`) preserved from Nix wrapper metadata.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rpaths<'s>(pub(crate) &'s str);
+
+impl<'s> Rpaths<'s> {
+    /// Iterates each non-empty canonical rpath directory in order.
+    pub fn iter(self) -> impl Iterator<Item = &'s str> {
+        self.0.split('\0').filter(|s| !s.is_empty())
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// What a command gives its native scripts. Every path absolute and canonical (Seatbelt and
+/// Landlock match resolved paths).
 #[derive(Clone, Copy, Debug)]
 pub struct NativeSetting<'s> {
     /// The unpacked pin, `<home>/.blaze/v2/toolchain/clang/<sha256 hex>`: its name is the
     /// compiler's digest in the key.
     pub shelf: &'s str,
-    /// The macOS SDK folder, resolved once by the command.
+    /// The macOS SDK or Linux host sysroot folder, resolved once by the command.
     pub sdk: &'s str,
+    /// Optional extra read-only root for split Linux kernel headers (NixOS `linux-headers`).
+    pub sdk_extra: Option<&'s str>,
+    /// Optional split Linux libc runtime library directory (NixOS `<glibc>/lib` or FHS multiarch).
+    pub sdk_lib: Option<&'s str>,
+    /// Optional host-architecture GCC runtime directory on FHS Linux (`<sdk>/lib/gcc/<triple>/<ver>`).
+    pub sdk_gcc_lib: Option<&'s str>,
+    /// Optional resolved ELF dynamic linker path (NixOS/FHS `ld-linux-*.so.*`).
+    pub sdk_dynamic_linker: Option<&'s str>,
+    /// Optional extra runtime library search directories (`-rpath`) preserved from Nix wrappers.
+    pub sdk_rpaths: Rpaths<'s>,
+    /// Canonical list of every Linux Landlock read path hashed beyond `<sdk>/include`
+    /// (`<sdk_extra>/include`, NixOS `sdk_lib`/`sdk_rpaths`, keyed FHS libc/CRT files, external
+    /// symlink targets, and external `sdk_dynamic_linker`), matching `sdk_version` 1:1.
+    pub sdk_extra_reads: Rpaths<'s>,
+    /// The SDK's `Version` (macOS) or complete Linux host sysroot SHA-256 hex (Rule 21).
+    pub sdk_version: &'s str,
+    /// Which sysroot model `pins/clang.json` selected for the host.
+    pub sysroot: Sysroot,
     /// A folder of the command's own where packages held in records are written out and each
     /// run's `OUT_DIR` is made (`pkg/<key>`, `out/<key>`).
     pub work: &'s str,
@@ -158,6 +218,9 @@ pub enum NativeUnitError {
     PinTable { package: String, why: String },
     /// A host tool's path in the pin table is not its resolved real path (D71).
     ToolNotReal { package: String, tool: String, path: String, real: String },
+    /// The script requires a host tool (e.g. `cmake` or `perl`) that `pins/clang.json`'s
+    /// `host_tools` table does not grant for this host (D71).
+    MissingHostTool { package: String, tool: &'static str },
     /// The shelf's folder is not named by a SHA-256.
     Shelf { shelf: String },
     /// The package's or the run's folder could not be made or read.
@@ -190,6 +253,11 @@ impl std::fmt::Display for NativeUnitError {
             NativeUnitError::ToolNotReal { package, tool, path, real } => write!(
                 f,
                 "{}: host tool `{tool}` of {package}'s build script is at {path}, whose real path is {real}: the grant takes only a resolved path (D71)",
+                CLANG_PATH
+            ),
+            NativeUnitError::MissingHostTool { package, tool } => write!(
+                f,
+                "{}: the native build script of {package} requires host tool `{tool}`, which is not granted in `host_tools` for this host (D71)",
                 CLANG_PATH
             ),
             NativeUnitError::Shelf { shelf } => write!(f, "{shelf}: the C toolchain's shelf folder is not named by its SHA-256 (D69)"),
@@ -285,17 +353,22 @@ fn remove_tree_under(work: &str, rel: &str, alloc: Alloc<'_>) {
 pub(crate) struct RunWorkGuard<'w, 'a> {
     work: &'w str,
     dirs: AVec<'a, AString<'a>>,
+    external_dirs: AVec<'a, (AString<'a>, AString<'a>)>,
     files: AVec<'a, AString<'a>>,
     alloc: Alloc<'a>,
 }
 
 impl<'w, 'a> RunWorkGuard<'w, 'a> {
     pub(crate) fn new(work: &'w str, alloc: Alloc<'a>) -> Self {
-        Self { work, dirs: Vec::new_in(alloc), files: Vec::new_in(alloc), alloc }
+        Self { work, dirs: Vec::new_in(alloc), external_dirs: Vec::new_in(alloc), files: Vec::new_in(alloc), alloc }
     }
 
     pub(crate) fn push_dir(&mut self, rel: AString<'a>) {
         self.dirs.push(rel);
+    }
+
+    pub(crate) fn push_external_dir(&mut self, base: AString<'a>, rel: AString<'a>) {
+        self.external_dirs.push((base, rel));
     }
 
     pub(crate) fn push_file(&mut self, rel: AString<'a>) {
@@ -308,6 +381,9 @@ impl Drop for RunWorkGuard<'_, '_> {
         for rel in self.dirs.iter() {
             remove_tree_under(self.work, rel.as_str(), self.alloc);
         }
+        for (base, rel) in self.external_dirs.iter() {
+            remove_tree_under(base.as_str(), rel.as_str(), self.alloc);
+        }
         if !self.files.is_empty()
             && let Ok((io, root)) = native_world(Path::new(self.work))
             && let Ok(cx) = io.cx(Duration::from_secs(60), TASK_FRAME)
@@ -319,6 +395,87 @@ impl Drop for RunWorkGuard<'_, '_> {
             }
         }
     }
+}
+
+/// Stages a Linux `clang.cfg` (and optional `ld.lld` symlink when the shelf only has `bin/lld`)
+/// at a whitespace-free path for `CCC_OVERRIDE_OPTIONS` (`--config=<path>` splits on ASCII
+/// whitespace in LLVM's `applyOverrideOptions`). When `<work>/cfg/<run_key>` has no whitespace,
+/// stages directly under `work`; when `work` contains whitespace (e.g. `/home/Build User/.blaze`),
+/// stages under a private whitespace-free temp directory cleaned up on drop via `work_guard`.
+#[allow(clippy::too_many_arguments)]
+fn stage_linux_clang_cfg<'a>(
+    native: &NativeSetting<'_>,
+    run_key: &str,
+    pkg_label: &str,
+    shown_maps: &[(&str, &str)],
+    shelf: Shelf<'_>,
+    embed_runtime_paths: bool,
+    work_guard: &mut RunWorkGuard<'_, 'a>,
+    alloc: Alloc<'a>,
+) -> Result<AString<'a>, NativeUnitError> {
+    let default_rel = blaze_own::format_in!(alloc, "cfg/{run_key}");
+    let default_dir = blaze_own::format_in!(alloc, "{}/{}", native.work, default_rel.as_str());
+    let (stage_base, stage_rel): (AString<'a>, AString<'a>) = if default_dir.as_str().bytes().any(|b| b.is_ascii_whitespace()) {
+        // Derive a whitespace-free per-command discriminator from the command's jobserver fifo
+        // filename (which embeds the command PID) + `run_key` so concurrent commands never collide
+        // without ambient `std::env` or `std::process::id` reads.
+        let fifo_leaf = native
+            .jobs
+            .fifo()
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.'))
+            .unwrap_or("run");
+        let short_key = run_key.get(..16).unwrap_or(run_key);
+        let rel = blaze_own::format_in!(alloc, "blaze-clang-cfg-{fifo_leaf}-{short_key}");
+        let base = OwnString::from_str_in("/tmp", alloc);
+        work_guard.push_external_dir(OwnString::from_str_in(base.as_str(), alloc), OwnString::from_str_in(rel.as_str(), alloc));
+        (base, rel)
+    } else {
+        work_guard.push_dir(OwnString::from_str_in(default_rel.as_str(), alloc));
+        (OwnString::from_str_in(native.work, alloc), default_rel)
+    };
+    let cfg_dir = fresh_folder(stage_base.as_str(), stage_rel.as_str(), &[], pkg_label, alloc)?;
+    let failed = |why: AString<'a>| NativeUnitError::Files {
+        package: pkg_label.to_owned(),
+        folder: cfg_dir.clone(),
+        why: why.as_str().to_owned(),
+    };
+    let ld_lld_path: Option<AString<'a>> = {
+        let shelf_ld = blaze_own::format_in!(alloc, "{}/bin/ld.lld", native.shelf);
+        if Path::new(shelf_ld.as_str()).exists() {
+            Some(shelf_ld)
+        } else {
+            let shelf_lld = blaze_own::format_in!(alloc, "{}/bin/lld", native.shelf);
+            let staged_ld = blaze_own::format_in!(alloc, "{cfg_dir}/ld.lld");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(shelf_lld.as_str(), staged_ld.as_str())
+                .map_err(|e| failed(blaze_own::format_in!(alloc, "could not link ld.lld: {e}")))?;
+            Some(staged_ld)
+        }
+    };
+    let mut rpath_strs: AVec<'a, &str> = Vec::new_in(alloc);
+    for rpath in native.sdk_rpaths.iter() {
+        rpath_strs.push(rpath);
+    }
+    let link = toolchain::LinuxClangLink {
+        lib_dir: native.sdk_lib,
+        gcc_lib_dir: native.sdk_gcc_lib,
+        dynamic_linker: native.sdk_dynamic_linker,
+        rpaths: rpath_strs.as_slice(),
+        ld_lld: ld_lld_path.as_deref(),
+        embed_runtime_paths,
+    };
+    let cfg_text = toolchain::format_linux_clang_cfg(native.sdk, link, shown_maps, shelf, alloc);
+    let cfg_path = blaze_own::format_in!(alloc, "{cfg_dir}/clang.cfg");
+    let cfg_rel_file = blaze_own::format_in!(alloc, "{}/clang.cfg", stage_rel.as_str());
+    let (io, stage_root) = native_world(Path::new(stage_base.as_str())).map_err(|e| failed(blaze_own::format_in!(alloc, "{e}")))?;
+    let cx = io.cx(WORK_TREE_DEADLINE, TASK_FRAME).map_err(|_| failed(OwnString::from_str_in("its world stopped", alloc)))?;
+    let path = bstd::path::Path::new(cfg_rel_file.as_str()).map_err(|_| failed(OwnString::from_str_in("clang.cfg: not a relative path", alloc)))?;
+    let file = stage_root.create(&cx, &path).map_err(|e| failed(blaze_own::format_in!(alloc, "clang.cfg: {e}")))?;
+    file.write_at(&cx, 0, cfg_text.as_bytes(), Durable::No).map_err(|e| failed(blaze_own::format_in!(alloc, "clang.cfg: {e}")))?;
+    file.close(&cx, Durable::No).map_err(|e| failed(blaze_own::format_in!(alloc, "clang.cfg: {e}")))?;
+    Ok(cfg_path)
 }
 
 /// `work/<rel>/` made to hold exactly `files` (none when `files` is empty: an empty folder):
@@ -378,6 +535,9 @@ pub fn native_outputs<'a>(
         let because = &graph.units[because.index()];
         return Err(NativeUnitError::NoNativeSetting { package: pkg(), because: format!("{} {}", because.name.as_str(), because.version.as_str()) });
     };
+    if let Some(missing) = missing_native_host_tool(graph, script, setting.host, alloc) {
+        return Err(NativeUnitError::MissingHostTool { package: pkg(), tool: missing });
+    }
 
     // The host binary the interim builder made with exactly the unit's features.
     let features: std::vec::Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
@@ -439,8 +599,8 @@ pub fn native_outputs<'a>(
     }
 
     // The key: the compiler by its shelf digest, the SDK by its version (D69), the tools.
-    let sysroot_key = match toolchain::sysroot(CLANG_JSON, setting.host) {
-        Ok(Sysroot::MacosSdk) => {
+    let sysroot_key = match native.sysroot {
+        Sysroot::MacosSdk => {
             let text = |file: &str| -> Result<String, NativeUnitError> {
                 String::from_utf8(read_file(native.sdk, file)?).map_err(|_| NativeUnitError::Read { path: format!("{}/{file}", native.sdk), why: "it is not UTF-8".to_owned() })
             };
@@ -448,20 +608,47 @@ pub fn native_outputs<'a>(
             let (_, id) = blaze_apple_sdk::identity_of(&settings, &built).map_err(|why| NativeUnitError::Read { path: native.sdk.to_owned(), why: format!("{why}, which a native script's key holds (D69)") })?;
             blaze_own::format_in!(alloc, "macos-sdk {id}")
         }
-        Ok(Sysroot::LinuxHost) => {
-            let bytes = read_file(native.sdk, toolchain::LINUX_HOST_SYSROOT_MARKER)?;
-            let digest = hex(&blaze_sha256::digest(&bytes));
-            blaze_own::format_in!(alloc, "linux-host {digest}")
+        Sysroot::LinuxHost => {
+            // `OwnedNativeSetting::sdk_version` covers `include/features.h` (FHS `/usr`) or the
+            // full NixOS split header/lib/rpath/dynamic-linker content tree (Rule 21).
+            blaze_own::format_in!(alloc, "linux-host {}", native.sdk_version)
         }
-        Ok(Sysroot::Pinned { .. }) => return Err(pin(format!("{}: {}'s pinned sysroot is not fetched yet (D69)", CLANG_PATH, setting.host))),
-        Err(error) => return Err(pin(error.to_string())),
+        Sysroot::Pinned { .. } => return Err(pin(format!("{}: {}'s pinned sysroot is not fetched yet (D69)", CLANG_PATH, setting.host))),
     };
     let compiler = hex32(native.shelf.rsplit('/').next().unwrap_or("")).ok_or_else(|| NativeUnitError::Shelf { shelf: native.shelf.to_owned() })?;
     let parts = NativeKeyParts { compiler, target: setting.host, sysroot: sysroot_key.as_str(), host_tools: &tool_keys };
+    let probe_table = Table { rows: setting.table.as_slice() };
+    // Compute a path-independent metadata snapshot digest using guest mount spellings and fold it
+    // with `probe_table.id()` into `KeyInputs::answers` so `cargo metadata` answers (e.g. cbindgen)
+    // invalidate cached script records whenever the package's unit graph changes (Rule 21, Rule 25).
+    let metadata_digest = {
+        let seen_pkg = root.seen().mount();
+        let seen_ws = if seen_pkg.starts_with("/workspace") { "/workspace" } else { seen_pkg };
+        let guest_spec = blaze_build_script::metadata_ask::MetadataSpec {
+            graph,
+            package: serves,
+            package_dir: seen_pkg,
+            workspace_root: seen_ws,
+            target_dir: "/target",
+        };
+        let full = blaze_build_script::metadata_ask::format_metadata_json(&guest_spec, false, alloc);
+        let no_deps = blaze_build_script::metadata_ask::format_metadata_json(&guest_spec, true, alloc);
+        let mut sha = blaze_sha256::Sha256::new();
+        sha.update(full.as_bytes());
+        sha.update(b"\0");
+        sha.update(no_deps.as_bytes());
+        ContentId(sha.finish())
+    };
+    let answers_id = {
+        let mut sha = blaze_sha256::Sha256::new();
+        sha.update(&probe_table.id().0);
+        sha.update(&metadata_digest.0);
+        ContentId(sha.finish())
+    };
     let inputs = KeyInputs {
         module: module_digest,
         env: &env,
-        answers: Table::EMPTY.id(),
+        answers: answers_id,
         c_mode: CMode::Built,
         limits: RunLimits::STANDARD,
         runner: runner_key(Runner::Native { because }, &parts),
@@ -519,7 +706,6 @@ pub fn native_outputs<'a>(
     let out_dir = fresh_folder(native.work, out_rel.as_str(), &[], &pkg(), alloc)?;
     work_guard.push_dir(out_rel);
     let clang_major = toolchain::clang_major(CLANG_JSON).map_err(|e| pin(e.to_string()))?;
-    let c = CInputs { shelf: Shelf { dir: native.shelf, clang_major }, sysroot: native.sdk, out_dir: &out_dir, package: &package_dir, seen: root.seen(), macos_min: MACOS_MIN };
     // N7: the fact shim the command placed in its work folder, and this run's facts folder.
     // A native run's probes are answered from the pins through the fact shim; the questions
     // asked become reads in the wasm path's fact form (native_facts::reads).
@@ -533,7 +719,37 @@ pub fn native_outputs<'a>(
             fallback_shim.as_str()
         }
     };
-    let facts = native_facts::prepare(shim, native.work, run_key.as_str(), pins, alloc).map_err(facts_error)?;
+    let meta_manifest = blaze_own::format_in!(alloc, "{package_dir}/Cargo.toml");
+    let meta_ws = ws_root_dir.as_deref().unwrap_or(package_dir.as_str());
+    let meta_spec = blaze_build_script::metadata_ask::MetadataSpec {
+        graph,
+        package: serves,
+        package_dir: package_dir.as_str(),
+        workspace_root: meta_ws,
+        target_dir: out_dir.as_str(),
+    };
+    let meta_full_json = blaze_build_script::metadata_ask::format_metadata_json(&meta_spec, false, alloc);
+    let meta_no_deps_json = blaze_build_script::metadata_ask::format_metadata_json(&meta_spec, true, alloc);
+    let metadata_snapshot = blaze_build_script::fact_shim::MetadataSnapshot {
+        manifest_path: meta_manifest.as_str(),
+        package_dir: package_dir.as_str(),
+        target: setting.target,
+        host: setting.host,
+        full_json: meta_full_json.as_str(),
+        no_deps_json: meta_no_deps_json.as_str(),
+        digest: metadata_digest,
+    };
+    let facts = native_facts::prepare_with_probes_and_metadata(
+        shim,
+        native.work,
+        run_key.as_str(),
+        pins,
+        setting.host,
+        &probe_table,
+        Some(&metadata_snapshot),
+        alloc,
+    )
+    .map_err(facts_error)?;
     work_guard.push_dir(blaze_own::format_in!(alloc, "facts/{}", run_key.as_str()));
     work_guard.push_file(blaze_own::format_in!(alloc, "facts/{}.lock", run_key.as_str()));
     // The home's file area: each file the script leaves goes there by digest, renamed, never
@@ -566,6 +782,61 @@ pub fn native_outputs<'a>(
     for (real, shown) in laid.shown.iter() {
         dep_shown.push((real.as_str(), shown.as_str()));
     }
+    // Linux Landlock extra sysroot roots — exact 1:1 parity with `resolve_linux_sysroot`'s
+    // `sdk_version` (`<sdk_extra>/include`, NixOS `sdk_lib`/`sdk_rpaths`, keyed FHS libc/CRT
+    // files, external symlink targets, and external `sdk_dynamic_linker`) (Rule 21, Rule 30).
+    let mut sysroot_extra_reads: AVec<'a, &str> = Vec::new_in(alloc);
+    if native.sysroot == Sysroot::LinuxHost {
+        for path in native.sdk_extra_reads.iter() {
+            sysroot_extra_reads.push(path);
+        }
+    }
+    let shelf = Shelf { dir: native.shelf, clang_major };
+    let linux_clang_cfg: Option<AString<'a>> = if native.sysroot == Sysroot::LinuxHost {
+        let mut shown_maps: AVec<'a, (&str, &str)> = Vec::new_in(alloc);
+        shown_maps.push(("/out", out_dir.as_str()));
+        shown_maps.push((root.seen().mount(), package_dir.as_str()));
+        for (real, shown) in dep_shown.iter() {
+            shown_maps.push((*shown, *real));
+        }
+        shown_maps.push(("/sdk", native.sdk));
+        if let Some(extra) = native.sdk_extra {
+            shown_maps.push(("/sdk-headers", extra));
+        }
+        if let Some(lib) = native.sdk_lib {
+            shown_maps.push(("/sdk-lib", lib));
+        }
+        if let Some(gcc_lib) = native.sdk_gcc_lib {
+            shown_maps.push(("/sdk-gcc", gcc_lib));
+        }
+        for rpath in native.sdk_rpaths.iter() {
+            shown_maps.push(("/sdk-rpath", rpath));
+        }
+        shown_maps.push(("/toolchain/clang", native.shelf));
+        Some(stage_linux_clang_cfg(
+            &native,
+            run_key.as_str(),
+            &pkg(),
+            shown_maps.as_slice(),
+            shelf,
+            host_tools::runs_out_dir(&tools),
+            &mut work_guard,
+            alloc,
+        )?)
+    } else {
+        None
+    };
+    let c = CInputs {
+        shelf,
+        sysroot_kind: native.sysroot,
+        sysroot: native.sdk,
+        sysroot_extra_reads: sysroot_extra_reads.as_slice(),
+        linux_clang_cfg: linux_clang_cfg.as_deref(),
+        out_dir: &out_dir,
+        package: &package_dir,
+        seen: root.seen(),
+        macos_min: MACOS_MIN,
+    };
     let run = NativeScript {
         key: base,
         files: &area,
@@ -606,6 +877,9 @@ pub fn native_outputs<'a>(
                 laid_folders: &laid_folders,
                 shim: Some(shim),
                 pins,
+                host: setting.host,
+                table: &probe_table,
+                metadata: Some(&metadata_snapshot),
                 ran: &ran,
                 asked: &asked,
             },
@@ -763,6 +1037,9 @@ pub struct CertifyInput<'a, 's> {
     pub laid_folders: &'s [&'s str],
     pub shim: Option<&'s str>,
     pub pins: Option<&'s crate::spawn_route::FactPins>,
+    pub host: &'s str,
+    pub table: &'s Table<'s>,
+    pub metadata: Option<&'s blaze_build_script::fact_shim::MetadataSnapshot<'s>>,
     pub ran: &'s NativeScriptRun<'a>,
     pub asked: &'s native_facts::Asked,
 }
@@ -792,7 +1069,17 @@ pub fn certify_member_reads<'a>(
     cert_guard.push_dir(cert_out_rel);
     let cert_facts = match input.shim {
         Some(shim) => {
-            let f = native_facts::prepare(shim, input.work, cert_key.as_str(), input.pins, alloc).ok()?;
+            let f = native_facts::prepare_with_probes_and_metadata(
+                shim,
+                input.work,
+                cert_key.as_str(),
+                input.pins,
+                input.host,
+                input.table,
+                input.metadata,
+                alloc,
+            )
+            .ok()?;
             cert_guard.push_dir(blaze_own::format_in!(alloc, "facts/{}", cert_key.as_str()));
             cert_guard.push_file(blaze_own::format_in!(alloc, "facts/{}.lock", cert_key.as_str()));
             Some(f)
@@ -1131,5 +1418,155 @@ mod tests {
         assert_eq!(resolved("../../../outside.txt"), super::RerunTarget::Escape);
         assert_eq!(resolved("/etc/passwd"), super::RerunTarget::Escape);
         assert_eq!(resolved(""), super::RerunTarget::Escape);
+    }
+
+    #[test]
+    fn linux_reports_missing_host_tools_without_falling_back_to_wasm() {
+        const LINUX: &str = "aarch64-unknown-linux-gnu";
+        const MACOS: &str = "aarch64-apple-darwin";
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut units = AVec::new_in(alloc);
+        units.push(unit("libz-ng-sys", UnitKind::BuildScript, &[1], None)); // 0: cmake
+        units.push(unit("cmake", UnitKind::Lib, &[], None)); // 1
+        units.push(unit("sha3-asm", UnitKind::BuildScript, &[3], None)); // 2: NATIVE_EVERY_MODE (perl)
+        units.push(unit("cc", UnitKind::Lib, &[], None)); // 3
+        units.push(unit("zstd-sys", UnitKind::BuildScript, &[3], None)); // 4: cc only
+        units.push(unit("bindgen-cmake", UnitKind::BuildScript, &[1, 6], None)); // 5: no_wasm + cmake
+        units.push(unit("bindgen", UnitKind::Lib, &[], None)); // 6
+        units.push(unit("tikv-jemalloc-sys", UnitKind::BuildScript, &[3], None)); // 7: cc + needed_by sh/make/nm/hostname/uname
+        let graph = UnitGraph { units, resolver: Resolver::V3, meta: AVec::new_in(alloc), left_out: AVec::new_in(alloc) };
+
+        // Tool-dependent scripts stay on `Runner::Native` (NEVER silently downgraded to Wasm, Rule 3)
+        // and `native_outputs` refuses them loudly with `NativeUnitError::MissingHostTool` on Linux.
+        let store = std::env::temp_dir().join(format!("blaze-nu-missing-{}", std::process::id()));
+        let work = store.join("work");
+        let _ = std::fs::remove_dir_all(&store);
+        std::fs::create_dir_all(&work).expect("work");
+        let jobs = crate::jobserver::Jobserver::new(crate::jobserver::JobserverOpts {
+            work: work.to_str().expect("utf8"),
+            workers: core::num::NonZeroU32::new(1).expect("nz"),
+            id: std::process::id(),
+        })
+        .expect("jobserver");
+        let make_setting = |host: &'static str, sysroot| crate::script_unit::Setting {
+            store: store.as_path(),
+            target: host,
+            host,
+            table: std::sync::Arc::new(std::vec::Vec::new()),
+            probes: None,
+            c_probes: None,
+            c_mode: blaze_build_script::key::CMode::Built,
+            mode: Mode::Build,
+            native: Some(super::NativeSetting {
+                shelf: "/shelf",
+                sdk: "/usr",
+                sdk_extra: None,
+                sdk_lib: None,
+                sdk_gcc_lib: None,
+                sdk_dynamic_linker: None,
+                sdk_rpaths: super::Rpaths(""),
+                sdk_extra_reads: super::Rpaths(""),
+                sdk_version: "0000000000000000000000000000000000000000000000000000000000000000",
+                sysroot,
+                work: work.to_str().expect("utf8"),
+                deadline: core::time::Duration::from_secs(60),
+                jobs: &jobs,
+                shim: None,
+            }),
+            spawn_setting: std::sync::Arc::new(crate::spawn_route::SpawnSetting::off()),
+            files_digest: None,
+            deps_digest: None,
+        };
+
+        assert_eq!(placed(&graph, UnitId(0), Mode::Build, alloc), Runner::Native { because: UnitId(1) });
+        assert_eq!(placed(&graph, UnitId(2), Mode::Check, alloc), Runner::Native { because: UnitId(3) });
+        assert_eq!(placed(&graph, UnitId(7), Mode::Build, alloc), Runner::Native { because: UnitId(3) });
+        assert_eq!(super::placed_in_store(store.as_path(), &graph, UnitId(7), Mode::Build, LINUX, alloc), Runner::Native { because: UnitId(3) });
+
+        let linux_setting = make_setting(LINUX, blaze_build_script::toolchain::Sysroot::LinuxHost);
+        let run_native = |setting: &crate::script_unit::Setting<'_>, script: UnitId, because: UnitId| {
+            let tree = crate::script_sandbox::Tree::Mem {
+                files: std::sync::Arc::new(std::vec::Vec::new()),
+                submodules: std::sync::Arc::from([]),
+                git: None,
+            };
+            super::native_outputs(setting, &graph, script, script, because, tree, crate::script_sandbox::ScriptRoot::package(), &[], &[], alloc)
+        };
+        assert!(matches!(run_native(&linux_setting, UnitId(0), UnitId(1)), Err(super::NativeUnitError::MissingHostTool { tool: "cmake", .. })));
+        assert!(matches!(run_native(&linux_setting, UnitId(2), UnitId(3)), Err(super::NativeUnitError::MissingHostTool { tool: "perl", .. })));
+        assert!(matches!(run_native(&linux_setting, UnitId(7), UnitId(3)), Err(super::NativeUnitError::MissingHostTool { tool: "hostname", .. })));
+        assert!(matches!(run_native(&linux_setting, UnitId(5), UnitId(1)), Err(super::NativeUnitError::MissingHostTool { tool: "cmake", .. })));
+
+        // Control: `cc`-only `zstd-sys` on Linux and `sha3-asm` / `tikv-jemalloc-sys` on macOS
+        // proceed past the host-tool check (failing at `NoModule` on the empty test store).
+        assert!(matches!(run_native(&linux_setting, UnitId(4), UnitId(3)), Err(super::NativeUnitError::NoModule { .. })));
+        let mac_setting = make_setting(MACOS, blaze_build_script::toolchain::Sysroot::MacosSdk);
+        assert!(matches!(run_native(&mac_setting, UnitId(2), UnitId(3)), Err(super::NativeUnitError::NoModule { .. })));
+        assert!(matches!(run_native(&mac_setting, UnitId(7), UnitId(3)), Err(super::NativeUnitError::NoModule { .. })));
+
+        jobs.end().expect("end jobs");
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn stage_linux_clang_cfg_supports_whitespace_in_work_and_cleans_up_on_drop() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let base = std::env::temp_dir().join(format!("blaze home with spaces {}", std::process::id()));
+        let work = base.join(".blaze/v2/native-work/check");
+        let shelf = base.join(".blaze/v2/toolchain/clang/deadbeef");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&work).expect("work with spaces");
+        std::fs::create_dir_all(shelf.join("bin")).expect("shelf bin");
+        std::fs::write(shelf.join("bin/lld"), b"").expect("shelf lld");
+        let jobs = crate::jobserver::Jobserver::new(crate::jobserver::JobserverOpts {
+            work: work.to_str().expect("utf8"),
+            workers: core::num::NonZeroU32::new(1).expect("nz"),
+            id: std::process::id(),
+        })
+        .expect("jobserver");
+        let native = super::NativeSetting {
+            shelf: shelf.to_str().expect("utf8"),
+            sdk: "/usr",
+            sdk_extra: None,
+            sdk_lib: Some("/usr/lib/aarch64-linux-gnu"),
+            sdk_gcc_lib: Some("/usr/lib/gcc/aarch64-linux-gnu/13"),
+            sdk_dynamic_linker: None,
+            sdk_rpaths: super::Rpaths(""),
+            sdk_extra_reads: super::Rpaths(""),
+            sdk_version: "0000000000000000000000000000000000000000000000000000000000000000",
+            sysroot: blaze_build_script::toolchain::Sysroot::LinuxHost,
+            work: work.to_str().expect("utf8"),
+            deadline: core::time::Duration::from_secs(60),
+            jobs: &jobs,
+            shim: None,
+        };
+        let staged_dir_path;
+        {
+            let mut guard = super::RunWorkGuard::new(native.work, alloc);
+            let cfg_path = super::stage_linux_clang_cfg(
+                &native,
+                "0123456789abcdef0123456789abcdef",
+                "zstd-sys 2.0.0",
+                &[("/toolchain/clang", native.shelf)],
+                blaze_build_script::toolchain::Shelf { dir: native.shelf, clang_major: "23" },
+                false,
+                &mut guard,
+                alloc,
+            )
+            .unwrap_or_else(|e| panic!("whitespace home must stage clang.cfg cleanly: {e}"));
+            assert!(
+                !cfg_path.as_str().bytes().any(|b| b.is_ascii_whitespace()),
+                "staged clang.cfg path for CCC_OVERRIDE_OPTIONS must be whitespace-free: {}",
+                cfg_path.as_str()
+            );
+            let cfg_text = std::fs::read_to_string(cfg_path.as_str()).expect("read staged clang.cfg");
+            assert!(cfg_text.contains(native.shelf), "quoted shelf path with spaces must be preserved in clang.cfg: {cfg_text}");
+            assert!(cfg_text.contains("\"--gcc-install-dir=/usr/lib/gcc/aarch64-linux-gnu/13\"\n"), "gcc_lib_dir must be written: {cfg_text}");
+            staged_dir_path = std::path::Path::new(cfg_path.as_str()).parent().expect("parent").to_path_buf();
+            assert!(staged_dir_path.join("ld.lld").exists(), "ld.lld symlink staged beside clang.cfg");
+        }
+        assert!(!staged_dir_path.exists(), "RunWorkGuard drop must remove external clang.cfg staging dir");
+        jobs.end().expect("end jobs");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

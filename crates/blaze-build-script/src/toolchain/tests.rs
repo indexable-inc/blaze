@@ -42,13 +42,69 @@ fn linux_has_no_sysroot_pinned_yet() {
     assert!(refused.to_string().contains("no sysroot pinned for x86_64-unknown-linux-gnu"), "{refused}");
 }
 
-/// Linux shelves do not ship macOS-only `bin/ld64.lld` or `lib/libclang.dylib`.
+/// Linux shelves require `lib/libclang.so` (for `bindgen`/`clang-sys`) and do not require
+/// macOS-only `bin/ld64.lld` or `lib/libclang.dylib`.
 #[test]
 fn linux_shelf_members_do_not_require_macos_only_files() {
     assert!(SHELF_MEMBERS_LINUX.is_sorted());
     assert_eq!(shelf_missing_for(Sysroot::LinuxHost, |m| m != "lib/libclang.dylib" && m != "bin/ld64.lld"), None);
+    assert_eq!(shelf_missing_for(Sysroot::LinuxHost, |m| m != "lib/libclang.so"), Some("lib/libclang.so"));
     assert_eq!(shelf_missing_for(Sysroot::LinuxHost, |m| m != "bin/clang-23"), Some("bin/clang-23"));
     assert_eq!(shelf_missing_for(Sysroot::MacosSdk, |m| m != "lib/libclang.dylib"), Some("lib/libclang.dylib"));
+}
+
+#[test]
+fn format_linux_clang_cfg_gates_runtime_linker_paths() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let shelf = Shelf { dir: "/h/shelf", clang_major: "23" };
+    let rpaths = ["/nix/store/extra/lib"];
+    let base_link = super::LinuxClangLink {
+        lib_dir: Some("/nix/store/glibc/lib"),
+        gcc_lib_dir: None,
+        dynamic_linker: Some("/nix/store/glibc/lib/ld-linux-aarch64.so.1"),
+        rpaths: &rpaths,
+        ld_lld: Some("/h/shelf/bin/ld.lld"),
+        embed_runtime_paths: false,
+    };
+    let clean = super::format_linux_clang_cfg("/nix/store/glibc-dev", base_link, &[], shelf, alloc);
+    assert!(clean.as_str().contains("\"-B/nix/store/glibc/lib\"\n"));
+    assert!(clean.as_str().contains("\"-L/nix/store/glibc/lib\"\n"));
+    assert!(clean.as_str().contains("-rtlib=compiler-rt\n"));
+    assert!(!clean.as_str().contains("-Wl,-rpath,"), "default clang.cfg must not embed host rpath: {clean}");
+    assert!(!clean.as_str().contains("-Wl,--dynamic-linker="), "default clang.cfg must not embed host PT_INTERP: {clean}");
+
+    let probe = super::format_linux_clang_cfg(
+        "/nix/store/glibc-dev",
+        super::LinuxClangLink { embed_runtime_paths: true, ..base_link },
+        &[],
+        shelf,
+        alloc,
+    );
+    assert!(probe.as_str().contains("\"-Wl,-rpath,/nix/store/glibc/lib\"\n"));
+    assert!(probe.as_str().contains("\"-Wl,-rpath,/nix/store/extra/lib\"\n"));
+    assert!(probe.as_str().contains("\"-Wl,--dynamic-linker=/nix/store/glibc/lib/ld-linux-aarch64.so.1\"\n"));
+
+    // FHS Linux without `lib_dir` STILL configures `-fuse-ld=<shelf ld.lld>` when provided, and
+    // with `gcc_lib_dir` configures `--gcc-install-dir`/`-B`/`-L` for `clang++` (`libstdc++`)
+    // without overriding the host libgcc runtime with `-rtlib=compiler-rt --unwindlib=none`.
+    let fhs_with_ld = super::format_linux_clang_cfg(
+        "/usr",
+        super::LinuxClangLink {
+            lib_dir: Some("/usr/lib/aarch64-linux-gnu"),
+            gcc_lib_dir: Some("/usr/lib/gcc/aarch64-linux-gnu/13"),
+            ld_lld: Some("/h/shelf/bin/ld.lld"),
+            ..super::LinuxClangLink::default()
+        },
+        &[],
+        shelf,
+        alloc,
+    );
+    assert!(fhs_with_ld.as_str().contains("\"--sysroot=/\"\n"));
+    assert!(fhs_with_ld.as_str().contains("\"--gcc-install-dir=/usr/lib/gcc/aarch64-linux-gnu/13\"\n"));
+    assert!(fhs_with_ld.as_str().contains("\"-B/usr/lib/gcc/aarch64-linux-gnu/13\"\n"));
+    assert!(fhs_with_ld.as_str().contains("\"-L/usr/lib/gcc/aarch64-linux-gnu/13\"\n"));
+    assert!(fhs_with_ld.as_str().contains("\"-fuse-ld=/h/shelf/bin/ld.lld\"\n"));
+    assert!(!fhs_with_ld.as_str().contains("-rtlib=compiler-rt"), "FHS with gcc_lib_dir should use host libgcc/libstdc++: {fhs_with_ld}");
 }
 
 #[test]
@@ -82,7 +138,10 @@ fn bindgen_is_told_the_shelf_resource_dir() {
     let shelf = "/h/.blaze/v2/toolchain/clang/5d3179db";
     let c = CInputs {
         shelf: Shelf { dir: shelf, clang_major: major },
+        sysroot_kind: Sysroot::MacosSdk,
         sysroot: "/sdk",
+        sysroot_extra_reads: &[],
+        linux_clang_cfg: None,
         out_dir: "/o",
         package: "/p",
         seen: blaze_expand::seen::SeenRoot::Package,
@@ -94,6 +153,62 @@ fn bindgen_is_told_the_shelf_resource_dir() {
     assert_eq!(clang_major("{\"version\": \"x.1\"}"), Err(PinError::NoVersion));
     assert_eq!(clang_major("{\"version\": \"23\"}"), Err(PinError::NoVersion));
     assert_eq!(clang_major("{}"), Err(PinError::NoVersion));
+}
+
+#[test]
+fn c_env_linux_omits_macos_flags_and_sets_ccc_override_options() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let shelf = "/h/.blaze/v2/toolchain/clang/9b27cf26";
+    let cfg = "/h/.blaze/v2/native-work/blaze/cfg/k/clang.cfg";
+    let c = CInputs {
+        shelf: Shelf { dir: shelf, clang_major: "23" },
+        sysroot_kind: Sysroot::LinuxHost,
+        sysroot: "/nix/store/abc-glibc-dev",
+        sysroot_extra_reads: &["/nix/store/def-linux-headers"],
+        linux_clang_cfg: Some(cfg),
+        out_dir: "/h/work/out/k",
+        package: "/h/work/pkg/k",
+        seen: blaze_expand::seen::SeenRoot::Package,
+        macos_min: "11.0",
+    };
+    let env = c_env(&c, alloc);
+    let keys: std::vec::Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+    assert!(keys.is_sorted(), "c_env must remain sorted: {keys:?}");
+    let get = |name: &str| env.iter().find(|(k, _)| k.as_str() == name).map(|(_, v)| v.as_str());
+    assert_eq!(get("SDKROOT"), None, "Linux c_env must not emit macOS SDKROOT");
+    assert_eq!(get("MACOSX_DEPLOYMENT_TARGET"), None, "Linux c_env must not emit MACOSX_DEPLOYMENT_TARGET");
+    assert_eq!(
+        get("CCC_OVERRIDE_OPTIONS"),
+        Some("#^--config=/h/.blaze/v2/native-work/blaze/cfg/k/clang.cfg s/^-isysroot$/--sysroot/ s/^-isysroot(.+)/--sysroot=\\1/")
+    );
+    assert_eq!(
+        get("BINDGEN_EXTRA_CLANG_ARGS"),
+        Some("--sysroot=/nix/store/abc-glibc-dev -resource-dir /h/.blaze/v2/toolchain/clang/9b27cf26/lib/clang/23")
+    );
+    let cflags = get("CFLAGS").expect("CFLAGS");
+    assert!(!cflags.contains("-isysroot"), "Linux CFLAGS must not contain -isysroot: {cflags}");
+    assert!(!cflags.contains("/nix/store"), "Linux CFLAGS must be host-path-free: {cflags}");
+    assert!(!cflags.contains("/h/work"), "Linux CFLAGS must be host-path-free: {cflags}");
+    assert_eq!(cflags, get("CXXFLAGS").expect("CXXFLAGS"));
+
+    // FHS `/usr` sysroot strips `/usr` -> `--sysroot=/` and omits `CCC_OVERRIDE_OPTIONS` when no cfg staged.
+    let fhs = CInputs { sysroot: "/usr", linux_clang_cfg: None, ..c };
+    let fhs_env = c_env(&fhs, alloc);
+    let fhs_get = |name: &str| fhs_env.iter().find(|(k, _)| k.as_str() == name).map(|(_, v)| v.as_str());
+    assert_eq!(fhs_get("CCC_OVERRIDE_OPTIONS"), None);
+    assert_eq!(
+        fhs_get("BINDGEN_EXTRA_CLANG_ARGS"),
+        Some("--sysroot=/ -resource-dir /h/.blaze/v2/toolchain/clang/9b27cf26/lib/clang/23")
+    );
+
+    // Control: `Sysroot::MacosSdk` preserves macOS flags and `SDKROOT`/`MACOSX_DEPLOYMENT_TARGET`.
+    let mac = CInputs { sysroot_kind: Sysroot::MacosSdk, sysroot: "/sdk", linux_clang_cfg: None, ..c };
+    let mac_env = c_env(&mac, alloc);
+    let mac_get = |name: &str| mac_env.iter().find(|(k, _)| k.as_str() == name).map(|(_, v)| v.as_str());
+    assert_eq!(mac_get("SDKROOT"), Some("/sdk"));
+    assert_eq!(mac_get("MACOSX_DEPLOYMENT_TARGET"), Some("11.0"));
+    assert_eq!(mac_get("CCC_OVERRIDE_OPTIONS"), None);
+    assert!(mac_get("CFLAGS").expect("CFLAGS").contains("-isysroot /sdk"));
 }
 
 /// D69 (3): native for build and run; check keeps wasm but for the five that give nothing so.

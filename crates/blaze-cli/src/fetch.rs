@@ -244,6 +244,11 @@ pub struct FetchEnv<'f> {
     /// scripts' keys its identity (scripts.rs); a refusal fails only a script placed native,
     /// with its words.
     pub sdk: Result<blaze_apple_sdk::Sdk<'f>, blaze_apple_sdk::SdkRefused<'f>>,
+    /// The Linux host C library sysroot and its 32-byte content digest, resolved once at the edge
+    /// on demand when build scripts run on a `Sysroot::LinuxHost` target (rule 75; sdk.rs).
+    /// `Ok(None)` on macOS, pure-Rust commands, or when no Linux sysroot is present; `Err` when
+    /// probing or hashing a concrete host path failed.
+    pub linux_sysroot: Result<Option<crate::sdk::ResolvedLinuxHost<'f>>, &'f str>,
     /// The folder of the running blaze, read once at the edge (rule 75; main's ruling for N7):
     /// the fact shim (`blaze-fact-shim`) is looked for beside it (scripts.rs). A native script
     /// is refused naming why when it is not known.
