@@ -977,6 +977,7 @@ impl TreeRunner for ShelfTree<'_> {
             // `CXXFLAGS`, `CPPFLAGS`, `ASFLAGS`), whether set or unset: no host folder reaches
             // any C, C++, preprocessed, or assembly object's debug information (rule 25, rule 54).
             inject_prefix_map_flags(&mut vars, &shown, alloc);
+            inject_linux_sysroot_flags(&mut vars, setting.sysroot, sdk, shelf, alloc);
             for (name, value) in tool_env.iter() {
                 vars.push((name.clone_in(alloc), value.clone_in(alloc)));
             }
@@ -1126,9 +1127,59 @@ fn inject_prefix_map_flags<'a>(
     }
 }
 
+/// For `Sysroot::LinuxHost`, injects the pinned clang resource dir (`-resource-dir`) and Linux
+/// sysroot/include flags (`--sysroot=...` and, for flat NixOS roots, `-idirafter <sdk>/include`)
+/// into every variable in [`PREFIX_MAP_FLAG_VARS`] that does not already carry an explicit
+/// `--sysroot` or `-isysroot`, matching direct object compilation in [`ShelfClang`].
+fn inject_linux_sysroot_flags<'a>(
+    vars: &mut AVec<'a, (AString<'a>, AString<'a>)>,
+    sysroot: Sysroot,
+    sdk: &str,
+    shelf: &str,
+    alloc: Alloc<'a>,
+) {
+    if sysroot != Sysroot::LinuxHost {
+        return;
+    }
+    let major = blaze_build_script::toolchain::clang_major(blaze_pins::CLANG_JSON).unwrap_or("23");
+    let mut sysroot_args: AVec<'a, AString<'a>> = Vec::new_in(alloc);
+    crate::native_c::push_linux_sysroot_flags(sdk, &mut sysroot_args, alloc);
+    let mut extra: AString<'a> = String::new_in(alloc);
+    extra.push_str(" -resource-dir ");
+    extra.push_str(shelf);
+    extra.push_str("/lib/clang/");
+    extra.push_str(major);
+    for arg in sysroot_args.iter() {
+        extra.push(' ');
+        extra.push_str(arg.as_str());
+    }
+    let trimmed = extra.as_str().trim_start();
+    for flags in PREFIX_MAP_FLAG_VARS {
+        match vars.iter().rposition(|(name, _)| name.as_str() == flags) {
+            Some(at) => {
+                if let Some((_, value)) = vars.get_mut(at) {
+                    let existing = value.as_str();
+                    if existing.contains("--sysroot") || existing.contains("-isysroot") {
+                        continue;
+                    }
+                    if existing.is_empty() {
+                        value.push_str(trimmed);
+                    } else {
+                        value.push_str(extra.as_str());
+                    }
+                }
+            }
+            None => vars.push((String::from_str_in(flags, alloc), String::from_str_in(trimmed, alloc))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tree_spelling_tests {
-    use super::{AString, AVec, PREFIX_MAP_FLAG_VARS, String, Vec, inject_prefix_map_flags, shelf_program, to_guest, to_host};
+    use super::{
+        AString, AVec, PREFIX_MAP_FLAG_VARS, String, Sysroot, Vec, inject_linux_sysroot_flags, inject_prefix_map_flags,
+        shelf_program, to_guest, to_host,
+    };
 
     /// A guest folder is made its host folder where a word or a flag's letters begin with it,
     /// never inside a word or a longer name; shown again, the host folders are their guests.
@@ -1181,5 +1232,36 @@ mod tree_spelling_tests {
         assert_eq!(lookup("CPPFLAGS"), Some(expected_maps), "empty CPPFLAGS gets prefix-map without leading space");
         assert_eq!(lookup("CFLAGS"), Some(expected_maps), "unset CFLAGS receives prefix-map");
         assert_eq!(lookup("ASFLAGS"), Some(expected_maps), "unset ASFLAGS receives prefix-map");
+    }
+
+    #[test]
+    fn linux_sysroot_flags_are_injected_into_process_tree_compiler_vars() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let shelf = "/h/shelf";
+
+        // 1. Flat NixOS glibc-dev root: injects `-resource-dir`, `--sysroot=<sdk>`, and `-idirafter <sdk>/include`.
+        let mut nix_vars: AVec<'_, (AString<'_>, AString<'_>)> = Vec::new_in(alloc);
+        nix_vars.push((String::from_str_in("CFLAGS", alloc), String::from_str_in("-O2", alloc)));
+        nix_vars.push((String::from_str_in("CXXFLAGS", alloc), String::from_str_in("--sysroot=/custom", alloc)));
+        inject_linux_sysroot_flags(&mut nix_vars, Sysroot::LinuxHost, "/nix/store/abc-glibc-dev", shelf, alloc);
+        fn lookup<'a>(vars: &'a AVec<'_, (AString<'_>, AString<'_>)>, name: &str) -> Option<&'a str> {
+            vars.iter().rev().find(|(k, _)| k.as_str() == name).map(|(_, v)| v.as_str())
+        }
+        let expected_nix = "-resource-dir /h/shelf/lib/clang/23 --sysroot=/nix/store/abc-glibc-dev -idirafter /nix/store/abc-glibc-dev/include";
+        assert_eq!(lookup(&nix_vars, "CFLAGS"), Some("-O2 -resource-dir /h/shelf/lib/clang/23 --sysroot=/nix/store/abc-glibc-dev -idirafter /nix/store/abc-glibc-dev/include"));
+        assert_eq!(lookup(&nix_vars, "CPPFLAGS"), Some(expected_nix));
+        assert_eq!(lookup(&nix_vars, "ASFLAGS"), Some(expected_nix));
+        // Negative control: existing explicit `--sysroot` is preserved without duplicating flags.
+        assert_eq!(lookup(&nix_vars, "CXXFLAGS"), Some("--sysroot=/custom"));
+
+        // 2. Standard FHS `/usr` root injects `--sysroot=/` without `-idirafter`.
+        let mut fhs_vars: AVec<'_, (AString<'_>, AString<'_>)> = Vec::new_in(alloc);
+        inject_linux_sysroot_flags(&mut fhs_vars, Sysroot::LinuxHost, "/usr", shelf, alloc);
+        assert_eq!(lookup(&fhs_vars, "CFLAGS"), Some("-resource-dir /h/shelf/lib/clang/23 --sysroot=/"));
+
+        // 3. Negative control: macOS SDK does not receive Linux sysroot flags.
+        let mut mac_vars: AVec<'_, (AString<'_>, AString<'_>)> = Vec::new_in(alloc);
+        inject_linux_sysroot_flags(&mut mac_vars, Sysroot::MacosSdk, "/Library/SDKs/MacOSX.sdk", shelf, alloc);
+        assert!(mac_vars.is_empty());
     }
 }

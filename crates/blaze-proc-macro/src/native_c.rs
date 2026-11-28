@@ -527,7 +527,7 @@ fn refused<'a>(alloc: Alloc<'a>, parts: &[&str]) -> Refused<'a> {
 ///   headers live at `<sdk_host>/include/features.h`) emit `--sysroot=<sdk_host>` (preventing
 ///   ambient `/usr/include` and `/usr/local/include` lookups) plus `-idirafter <sdk_host>/include`
 ///   so Clang's `-resource-dir/include` builtin headers are searched before glibc headers.
-fn push_linux_sysroot_flags<'a>(sdk_host: &str, out: &mut AVec<'a, AString<'a>>, alloc: Alloc<'a>) {
+pub(crate) fn push_linux_sysroot_flags<'a>(sdk_host: &str, out: &mut AVec<'a, AString<'a>>, alloc: Alloc<'a>) {
     match sdk_host.strip_suffix("/usr") {
         Some("") => out.push(String::from_str_in("--sysroot=/", alloc)),
         Some(parent) => {

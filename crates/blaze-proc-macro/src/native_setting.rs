@@ -315,21 +315,74 @@ pub fn native_setting<'a>(
             String::from_str_in(version, alloc)
         }
         Sysroot::LinuxHost => {
-            let extra_version = sdk_extra.as_ref().and_then(|extra| {
-                let ver_path = text(&[extra.as_str(), "/include/linux/version.h"], alloc);
-                read_file(ver_path.as_str()).ok()
-            });
-            match extra_version {
-                Some(ver_bytes) => {
-                    let mut sha = blaze_sha256::Sha256::new();
-                    sha.update(b"blaze linux-host sysroot 1\0");
-                    sha.update(&u64::try_from(settings.len()).unwrap_or(u64::MAX).to_le_bytes());
-                    sha.update(&settings);
-                    sha.update(&u64::try_from(ver_bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
-                    sha.update(&ver_bytes);
-                    hex(&sha.finish(), alloc)
+            // Standard FHS `/usr` without split kernel headers stays keyed by `include/features.h`
+            // so we never scan unrelated packages under `/usr/include`. Flat or split sysroots
+            // (e.g. NixOS `<glibc-dev>` + `<linux-headers>`) hash every header file byte under
+            // `<sdk>/include` (and `<sdk_extra>/include` when present) in sorted relative-path
+            // order so `sdk_version` is a complete, path-independent content identity (Rule 21,
+            // Rule 25): changing any consumed header (e.g. `asm/errno.h`) invalidates C caches.
+            let is_fhs_single = sdk.as_str().ends_with("/usr") && sdk_extra.is_none();
+            if is_fhs_single {
+                hex(&blaze_sha256::digest(&settings), alloc)
+            } else {
+                let mut sha = blaze_sha256::Sha256::new();
+                sha.update(b"blaze linux-host sysroot headers 1\0");
+                let hash_tree = |sha: &mut blaze_sha256::Sha256, root: &str, tag: &[u8]| -> Result<(), NativeSettingError<'a>> {
+                    let inc_dir = text(&[root, "/include"], alloc);
+                    let listed = crate::native_script::listed_under(inc_dir.as_str()).map_err(|_| NativeSettingError::NoSdk {
+                        path: String::from_str_in(inc_dir.as_str(), alloc),
+                        error: io::Error::from(io::ErrorKind::Other),
+                    })?;
+                    sha.update(tag);
+                    sha.update(&u64::try_from(listed.len()).unwrap_or(u64::MAX).to_le_bytes());
+                    for entry in listed {
+                        let name = entry.name.as_str();
+                        let full = text(&[inc_dir.as_str(), "/", name], alloc);
+                        match entry.kind {
+                            bstd::fs::EntryKind::File => {
+                                let bytes = read_file(full.as_str())
+                                    .map_err(|error| NativeSettingError::NoSdk { path: full, error })?;
+                                sha.update(b"F");
+                                sha.update(&u64::try_from(name.len()).unwrap_or(u64::MAX).to_le_bytes());
+                                sha.update(name.as_bytes());
+                                sha.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+                                sha.update(&bytes);
+                            }
+                            bstd::fs::EntryKind::Link => {
+                                sha.update(b"L");
+                                sha.update(&u64::try_from(name.len()).unwrap_or(u64::MAX).to_le_bytes());
+                                sha.update(name.as_bytes());
+                                // Symlinks to regular files hash their target bytes; directory
+                                // symlinks (e.g. `<glibc-dev>/include/linux` -> `<linux-headers>`)
+                                // are covered by hashing `sdk_extra/include` below.
+                                match read_file(full.as_str()) {
+                                    Ok(bytes) => {
+                                        sha.update(b"f");
+                                        sha.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+                                        sha.update(&bytes);
+                                    }
+                                    Err(error) if error.kind() == io::ErrorKind::IsADirectory => {
+                                        sha.update(b"d");
+                                    }
+                                    Err(error) => {
+                                        return Err(NativeSettingError::NoSdk { path: full, error });
+                                    }
+                                }
+                            }
+                            _ => {
+                                sha.update(b"O");
+                                sha.update(&u64::try_from(name.len()).unwrap_or(u64::MAX).to_le_bytes());
+                                sha.update(name.as_bytes());
+                            }
+                        }
+                    }
+                    Ok(())
+                };
+                hash_tree(&mut sha, sdk.as_str(), b"sdk\0")?;
+                if let Some(extra) = sdk_extra.as_ref() {
+                    hash_tree(&mut sha, extra.as_str(), b"extra\0")?;
                 }
-                None => hex(&blaze_sha256::digest(&settings), alloc),
+                hex(&sha.finish(), alloc)
             }
         }
         Sysroot::Pinned { .. } => return Err(NativeSettingError::PinnedSysroot { host }),

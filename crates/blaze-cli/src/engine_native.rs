@@ -806,10 +806,13 @@ fn prepare_crates<'r, 'm: 's, 's>(
                 return Err(NativeError::Sdk { words: held(bstd::mem::format_in!(scratch, "{why}").as_str(), ask) });
             }
         },
-        Platform::LinuxArm64 => (
-            None,
-            crate::native_runner_c::TargetSdk::LinuxHost { dir: standing.resolve_linux_sysroot() },
-        ),
+        Platform::LinuxArm64 => match standing.resolve_linux_sysroot() {
+            Ok(dir) => (None, crate::native_runner_c::TargetSdk::LinuxHost { dir }),
+            Err(why) => {
+                let ask = &standing.native;
+                return Err(NativeError::Sdk { words: held(bstd::mem::format_in!(scratch, "{why}").as_str(), ask) });
+            }
+        },
     };
     // Disjoint fields: the ask and the readers are shared, the store is the one mutable borrow.
     let (ask, names, graph) = (&standing.native, standing.names, standing.graph);

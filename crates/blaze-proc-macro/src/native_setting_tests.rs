@@ -236,13 +236,19 @@ fn linux_host_native_setting_accepts_linux_shelf_and_features_h() {
     assert_eq!(owned.sdk_version.len(), 64);
 
     // NixOS split kernel headers: `<sdk>/include/linux` symlinks to a separate store root.
-    // `sdk_extra` records that root for Landlock, and `sdk_version` moves when `linux/version.h` changes.
+    // `sdk_extra` records that root for Landlock, and `sdk_version` commits to every header file
+    // byte under both `<sdk>/include` and `<sdk_extra>/include` (e.g. changing `asm/errno.h`
+    // while keeping `features.h` and `linux/version.h` identical must move `sdk_version`), while
+    // remaining path-independent across two identical copies at different directories.
     #[cfg(unix)]
     {
         let headers = home.join("linux-headers-7.2");
         fs::create_dir_all(headers.join("include/linux")).expect("linux headers dir");
+        fs::create_dir_all(headers.join("include/asm")).expect("asm headers dir");
         fs::write(headers.join("include/linux/version.h"), b"#define LINUX_VERSION_CODE 1\n").expect("version.h");
+        fs::write(headers.join("include/asm/errno.h"), b"#define EINVAL 22\n").expect("asm/errno.h");
         std::os::unix::fs::symlink(headers.join("include/linux"), sdk.join("include/linux")).expect("symlink linux");
+        std::os::unix::fs::symlink(headers.join("include/asm"), sdk.join("include/asm")).expect("symlink asm");
 
         let split_a = command_native_setting(home_s, sdk_s, "test", LINUX_HOST, alloc).unwrap_or_else(|e| panic!("{e}"));
         let expected_extra = fs::canonicalize(&headers).expect("canon headers");
@@ -250,7 +256,24 @@ fn linux_host_native_setting_accepts_linux_shelf_and_features_h() {
         assert_eq!(split_a.sdk_version.len(), 64);
         assert_ne!(split_a.sdk_version.as_str(), owned.sdk_version.as_str());
 
-        fs::write(headers.join("include/linux/version.h"), b"#define LINUX_VERSION_CODE 2\n").expect("version.h v2");
+        // Identical header bytes in a different directory produce the exact same path-independent `sdk_version`.
+        let sdk_copy = home.join("glibc-copy");
+        let headers_copy = home.join("linux-headers-copy");
+        fs::create_dir_all(sdk_copy.join("include")).expect("copy inc");
+        fs::create_dir_all(headers_copy.join("include/linux")).expect("copy linux");
+        fs::create_dir_all(headers_copy.join("include/asm")).expect("copy asm");
+        fs::write(sdk_copy.join(LINUX_HOST_SYSROOT_MARKER), b"#define __GLIBC__ 2\n").expect("copy features.h");
+        fs::write(headers_copy.join("include/linux/version.h"), b"#define LINUX_VERSION_CODE 1\n").expect("copy version.h");
+        fs::write(headers_copy.join("include/asm/errno.h"), b"#define EINVAL 22\n").expect("copy asm/errno.h");
+        std::os::unix::fs::symlink(headers_copy.join("include/linux"), sdk_copy.join("include/linux")).expect("copy symlink linux");
+        std::os::unix::fs::symlink(headers_copy.join("include/asm"), sdk_copy.join("include/asm")).expect("copy symlink asm");
+        let split_copy = command_native_setting(home_s, sdk_copy.to_str().expect("utf8"), "test", LINUX_HOST, alloc)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(split_a.sdk_version.as_str(), split_copy.sdk_version.as_str());
+
+        // Changing an arbitrary header (`asm/errno.h`) while keeping `features.h` and `linux/version.h`
+        // unchanged MUST invalidate `sdk_version`.
+        fs::write(headers.join("include/asm/errno.h"), b"#define EINVAL 22\n#define EAGAIN 11\n").expect("asm/errno.h v2");
         let split_b = command_native_setting(home_s, sdk_s, "test", LINUX_HOST, alloc).unwrap_or_else(|e| panic!("{e}"));
         assert_ne!(split_a.sdk_version.as_str(), split_b.sdk_version.as_str());
     }
