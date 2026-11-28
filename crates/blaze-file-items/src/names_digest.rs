@@ -516,13 +516,20 @@ mod tests {
             "changing #[cfg_attr(..., cfg(...))] on a tuple field around a scanned head block must move Outline::surface()"
         );
 
-        // Direct head macro call gated by `#[cfg(...)]` MUST also move `Outline::surface()`.
+        // Direct head macro call gated by `#[cfg(...)]` or raw `#[r#cfg(...)]` MUST move `Outline::surface()`.
         let call_off = "fn f(#[cfg(any())] _: [u8; make_len!()]) {}\n";
         let call_on = "fn f(#[cfg(all())] _: [u8; make_len!()]) {}\n";
         assert_ne!(
             crate::outline(call_off, Edition::E2024, alloc).surface(),
             crate::outline(call_on, Edition::E2024, alloc).surface(),
             "changing #[cfg] on a direct head macro call must move Outline::surface()"
+        );
+        let raw_off = "fn f(#[r#cfg(any())] _: [u8; { matches!(0, 0) as usize }]) {}\n";
+        let raw_on = "fn f(#[r#cfg(all())] _: [u8; { matches!(0, 0) as usize }]) {}\n";
+        assert_ne!(
+            crate::outline(raw_off, Edition::E2024, alloc).surface(),
+            crate::outline(raw_on, Edition::E2024, alloc).surface(),
+            "changing #[r#cfg] on a scanned head block param must move Outline::surface()"
         );
     }
 }

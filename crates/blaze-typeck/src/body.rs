@@ -430,6 +430,11 @@ pub struct BodyView<'b> {
     /// Canonical lexicographically-sorted [`crate::ids::RecordSchema`] for each anonymous
     /// `Expr::Record` literal, ascending by [`ExprId`].
     pub record_expr_schemas: &'b [(ExprId, crate::ids::RecordSchema)],
+    /// Owner-scoped `World::field_defaults` key for each anonymous `Expr::Record` literal whose
+    /// expected record type comes from a specific alias, parameter, return type, or inline record
+    /// type with defaults, ascending by [`ExprId`]. Absent entries fall back to
+    /// `schema.defaults_key()`.
+    pub record_expr_defaults: &'b [(ExprId, ItemKey)],
     /// Explicit written non-elided lifetimes in closure parameter type annotations
     /// (`|lock: &'static str|`, `|t: Typed<'c>|`, `|buf: &mut Vec<(A, B), Alloc<'a>>|`), sorted
     /// ascending by `(closure, param, path, own)`.
@@ -672,6 +677,12 @@ impl<'b> BodyView<'b> {
     pub(crate) fn record_expr_schema(&self, e: ExprId) -> Option<crate::ids::RecordSchema> {
         let i = self.record_expr_schemas.binary_search_by_key(&e, |&(x, _)| x).ok()?;
         self.record_expr_schemas.get(i).map(|&(_, s)| s)
+    }
+
+    /// Owner-scoped `World::field_defaults` key recorded for anonymous record literal `e`, if any.
+    pub(crate) fn record_expr_defaults_key(&self, e: ExprId) -> Option<ItemKey> {
+        let i = self.record_expr_defaults.binary_search_by_key(&e, |&(x, _)| x).ok()?;
+        self.record_expr_defaults.get(i).map(|&(_, k)| k)
     }
 
     /// The expressions directly under `e`, pushed onto `out` in source order: a block's

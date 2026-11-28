@@ -353,8 +353,8 @@ pub fn for_each_cfg_attr(text: &str, range: Range, alloc: Alloc<'_>, mut f: impl
             }
             if in_path {
                 match kind {
-                    TokenKind::Ident if !is_cfg && !is_cfg_attr => {
-                        let w = slice.get(t_start..at);
+                    TokenKind::Ident | TokenKind::RawIdent if !is_cfg && !is_cfg_attr => {
+                        let w = slice.get(t_start..at).map(|s| s.strip_prefix("r#").unwrap_or(s));
                         is_cfg = w == Some("cfg");
                         is_cfg_attr = w == Some("cfg_attr");
                         if !is_cfg && !is_cfg_attr {
@@ -476,14 +476,19 @@ pub fn for_each_cfg_attr(text: &str, range: Range, alloc: Alloc<'_>, mut f: impl
             }
             let Some(item) = frame.1.get(s..e) else { continue };
             let (is_cfg, is_cfg_attr, parens) = classify_attr_body(item);
-            if is_cfg && parens.is_some() {
+            if is_cfg
+                && let Some((ps, pe)) = parens
+                && let (Ok(ps_u32), Ok(pe_u32)) = (u32::try_from(abs_start + ps), u32::try_from(abs_start + pe))
+            {
                 f(CfgEmit::Lit("#["));
                 for &p in preds.iter() {
                     f(CfgEmit::Lit("cfg_attr("));
                     f(CfgEmit::Src(p));
                     f(CfgEmit::Lit(", "));
                 }
-                f(CfgEmit::Src(Range { start: abs_s, end: abs_e }));
+                f(CfgEmit::Lit("cfg("));
+                f(CfgEmit::Src(Range { start: ps_u32, end: pe_u32 }));
+                f(CfgEmit::Lit(")"));
                 for _ in preds.iter() {
                     f(CfgEmit::Lit(")"));
                 }
@@ -568,11 +573,13 @@ pub fn for_each_cfg_attr(text: &str, range: Range, alloc: Alloc<'_>, mut f: impl
                             && let Some(body) = slice.get(body_start..t_start)
                         {
                             let (is_cfg, is_cfg_attr, parens) = classify_attr_body(body);
-                            if is_cfg && parens.is_some() {
-                                if let (Ok(s), Ok(e)) = (u32::try_from(r_start + start), u32::try_from(r_start + at)) {
-                                    f(CfgEmit::Src(Range { start: s, end: e }));
-                                    f(CfgEmit::Lit("\n"));
-                                }
+                            if is_cfg
+                                && let Some((ps, pe)) = parens
+                                && let (Ok(s), Ok(e)) = (u32::try_from(r_start + body_start + ps), u32::try_from(r_start + body_start + pe))
+                            {
+                                f(CfgEmit::Lit("#[cfg("));
+                                f(CfgEmit::Src(Range { start: s, end: e }));
+                                f(CfgEmit::Lit(")]\n"));
                             } else if is_cfg_attr
                                 && let Some((ps, pe)) = parens
                                 && let Some(inner) = body.get(ps..pe)
@@ -3426,6 +3433,12 @@ fn h() {
         assert_eq!(render_cfg("#[cfg_attr(all(), xtool::cfg_attr(all(), cfg(any())))]").as_str(), "");
         assert_eq!(render_cfg("#[::cfg(any())]").as_str(), "");
         assert_eq!(render_cfg("#[core::cfg(any())]").as_str(), "");
+        assert_eq!(render_cfg("#[xtool::r#cfg(any())]").as_str(), "");
+        assert_eq!(render_cfg("#[xtool::r#cfg_attr(all(), r#cfg(any()))]").as_str(), "");
+        // Raw identifiers `r#cfg` and `r#cfg_attr` ARE valid builtin cfg gates.
+        assert_eq!(render_cfg("#[r#cfg(any())]").as_str(), "#[cfg(any())]\n");
+        assert_eq!(render_cfg("#[r#cfg_attr(all(), r#cfg(any()))]").as_str(), "#[cfg_attr(all(), cfg(any()))]\n");
+        assert_eq!(render_cfg("#[cfg_attr(all(), r#cfg(any()))]").as_str(), "#[cfg_attr(all(), cfg(any()))]\n");
         assert_eq!(render_cfg("#[cfg_attr(all(), cfg(any()))]").as_str(), "#[cfg_attr(all(), cfg(any()))]\n");
         assert_eq!(
             render_cfg("#[cfg_attr(all(), non_exhaustive, cfg(any()), allow(dead_code))]").as_str(),

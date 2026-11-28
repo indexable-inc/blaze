@@ -2387,6 +2387,15 @@ mod b {
 }
 fn mk_a_root() -> a::Rec { { .. } }
 fn mk_b_root() -> b::Rec { { .. } }
+fn take_a(r: a::Rec) -> isize { r.n }
+fn take_b(r: b::Rec) -> isize { r.n }
+fn both_in_one_fn(_: a::Rec, _: b::Rec) {
+    let _x: a::Rec = { .. };
+    let _y: b::Rec = { .. };
+}
+fn both_calls_in_one_fn() -> isize {
+    take_a({ .. }) + take_b({ .. })
+}
 fn main() {}
 ";
     let alloc = test_alloc();
@@ -2449,6 +2458,31 @@ fn main() {}
         let mut r2 = Records { names: &names, index: &front.index, store: &mut store, keys: &mut keys, buckets: &mut buckets, consts: None, order: BuildOrder::AsAsked };
         let got = int_of(consts.value(&mut r2, prepared, picked_dk).unwrap_or_else(|e| panic!("eval {segs:?} default: {e}")));
         assert_eq!(got, Some(expected), "{msg}");
+    }
+
+    // Round 14 P1 #1: a single function referencing BOTH `a::Rec` and `b::Rec` (via `let`
+    // annotations AND via calls `take_a({ .. }) + take_b({ .. })`) must pick `dk_a` (1) for the
+    // first record literal and `dk_b` (2) for the second without shadowing.
+    for segs in [&["both_in_one_fn"][..], &["both_calls_in_one_fn"][..]] {
+        let fn_key = lookup(Namespace::Values, segs);
+        let body = lower_fn(&names, prepared, &mut keys, &mut store, fn_key).unwrap_or_else(|e| panic!("lower {segs:?}: {e}"));
+        let view = body.lowered.view();
+        let spell = Spelling::of(&view).unwrap_or_else(|e| panic!("spell {segs:?}: {e:?}"));
+        let scope = body.scope(&spell);
+        let picked: blaze_own::AVec<'_, blaze_typeck::ItemKey> = {
+            let mut r = Records { names: &names, index: &front.index, store: &mut store, keys: &mut keys, buckets: &mut buckets, consts: Some((&mut consts, prepared)), order: BuildOrder::AsAsked };
+            let done = check_body(&mut r, &body, &scope).unwrap_or_else(|e| panic!("check {segs:?}: {e}"));
+            assert!(done.diags.is_empty(), "{segs:?} diags: {:?}", done.diags);
+            let mut out = blaze_own::AVec::new_in(alloc);
+            out.extend_from_slice(done.default_fields.column::<2>());
+            out
+        };
+        assert_eq!(picked.len(), 2, "{segs:?} must record 2 distinct default_fields entries");
+        assert_ne!(picked[0], picked[1], "{segs:?} must not collapse a::Rec and b::Rec onto one default key");
+        let mut r2 = Records { names: &names, index: &front.index, store: &mut store, keys: &mut keys, buckets: &mut buckets, consts: None, order: BuildOrder::AsAsked };
+        let v0 = int_of(consts.value(&mut r2, prepared, picked[0]).unwrap_or_else(|e| panic!("eval {segs:?}[0]: {e}")));
+        let v1 = int_of(consts.value(&mut r2, prepared, picked[1]).unwrap_or_else(|e| panic!("eval {segs:?}[1]: {e}")));
+        assert_eq!((v0, v1), (Some(1), Some(2)), "{segs:?} must evaluate a::Rec -> 1 and b::Rec -> 2 in the same function");
     }
 }
 

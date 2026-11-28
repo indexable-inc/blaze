@@ -1162,6 +1162,11 @@ pub fn h(
     #[xtool::cfg_attr(all(), cfg(any()))] _tool_cfg_attr: [u8; make_len!()],
     #[xtool::cfg(any())] _tool_cfg: [u8; make_len!()],
 ) {}
+pub fn r(
+    #[r#cfg(any())] _raw_cfg: [u8; missing!()],
+    #[r#cfg_attr(all(), r#cfg(any()))] _raw_cfg_attr: [u8; missing!()],
+    #[r#cfg(all())] _raw_enabled: [u8; make_len!()],
+) {}
 "#;
 
 static CFG_GATED_HEAD_MACRO_CALLS_TEXTS: Texts = Texts(&[&[("/user/lib.rs", CFG_GATED_HEAD_MACRO_CALLS)]]);
@@ -1210,4 +1215,18 @@ fn cfg_disabled_head_macro_calls_are_not_expanded_while_enabled_ones_are() {
             .unwrap_or_else(|e| panic!("`HeadCfgEnum` in fn `h` tool-qualified attr call {ordinal}: {e}"));
         assert_eq!(he.def.kind, DefKind::Enum);
     }
+
+    // Round 14 P1 #2: raw `#[r#cfg(any())]` and `#[r#cfg_attr(all(), r#cfg(any()))]` MUST
+    // disable `missing!()`, while sibling `#[r#cfg(all())]` at ordinal 2 stays enabled.
+    let r_item = names
+        .item_at(root, Namespace::Values, Written { kind: PathKind::Plain, segments: &["r"] }, alloc)
+        .unwrap_or_else(|e| panic!("`r`: {e}"));
+    let r_head_mod = crate::blocks::head_call_module(names.krate(0).key, r_item.def.key);
+    let r_ck = crate::task::key_of(names.krate(0).key, r_head_mod, "MacroCall", "", 2);
+    let r_en = crate::expanded_blocks::expansion_block_name(r_ck, 0, alloc);
+    let r_em = crate::task::key_of(names.krate(0).key, r_ck, "mod", r_en.as_str(), 0);
+    let re = names
+        .item_at(r_em, Namespace::Types, Written { kind: PathKind::Plain, segments: &["HeadCfgEnum"] }, alloc)
+        .unwrap_or_else(|e| panic!("`HeadCfgEnum` in fn `r` raw-cfg enabled call: {e}"));
+    assert_eq!(re.def.kind, DefKind::Enum);
 }

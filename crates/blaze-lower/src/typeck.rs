@@ -431,6 +431,7 @@ pub struct TypeckBody<'a> {
     /// Canonical lexicographically-sorted [`tc::RecordSchema`] for each anonymous `Expr::Record`,
     /// ascending by [`ExprId`].
     pub record_expr_schemas: AVec<'a, (ExprId, tc::RecordSchema)>,
+    pub record_expr_defaults: AVec<'a, (ExprId, tc::ItemKey)>,
     /// Explicit written non-elided lifetimes in closure parameter type annotations
     /// (`|lock: &'static str|`, `|t: Typed<'c>|`), sorted ascending by `(closure, param, slot)`.
     pub closure_param_regions: AVec<'a, tc::ClosureParamRegion>,
@@ -505,6 +506,7 @@ impl<'a> TypeckBody<'a> {
             expr_editions: &self.expr_editions,
             pat_editions: &self.pat_editions,
             record_expr_schemas: &self.record_expr_schemas,
+            record_expr_defaults: &self.record_expr_defaults,
             closure_param_regions: &self.closure_param_regions,
             loop_marks: &self.loop_marks,
         }
@@ -1895,6 +1897,7 @@ pub fn to_typeck<'a>(
         super_lets: crate::super_let::super_lets(view, alloc),
         const_gaps: Vec::new_in(alloc),
         record_expr_schemas: Vec::new_in(alloc),
+        record_expr_defaults: Vec::new_in(alloc),
         closure_param_regions: Vec::new_in(alloc),
         loop_marks: Vec::new_in(alloc),
         inline_fors: Vec::new_in(alloc),

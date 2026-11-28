@@ -2851,6 +2851,15 @@ pub struct Store<'n> {
     /// Structural record defaults indexed by `(module, RecordSchema::defaults_key())` for module-
     /// scoped lookups (`World::field_defaults` walking enclosing modules before fallback).
     pub record_defaults_by_module: Rows<(LibKey, ItemKey), blaze_own::Vec<Option<ItemKey>, Alloc<'static>>>,
+    /// Maps `(owner_lib, TypeId.0)` of a written `TypeRef::Record` with defaults to its unique
+    /// owner-scoped `field_defaults` key (`scoped_record_defaults_key`).
+    pub record_type_defaults: Rows<(LibKey, u32), ItemKey>,
+    /// Maps a `TypeAlias`'s library key to its owner-scoped structural record `field_defaults` key
+    /// when the alias expands to a structural record with defaults.
+    pub alias_record_defaults: Rows<LibKey, ItemKey>,
+    /// Maps a function/const/static checker key to per-parameter (`Some(idx)`) and output (`None`)
+    /// owner-scoped structural record `field_defaults` keys.
+    pub fn_record_defaults: Rows<ItemKey, blaze_own::Vec<(Option<u32>, ItemKey), Alloc<'static>>>,
     pub impls: Rows<ItemKey, ImplHead>,
     /// Trait impls whose header is lowered while one of their associated types waits on a
     /// constant ([`ProvisionalImpl`]). Visible only while that impl's `waiting_const` is on
@@ -3527,6 +3536,9 @@ impl<'n> Store<'n> {
             field_defaults: Rows::new_in(alloc),
             record_defaults_by_owner: Rows::new_in(alloc),
             record_defaults_by_module: Rows::new_in(alloc),
+            record_type_defaults: Rows::new_in(alloc),
+            alias_record_defaults: Rows::new_in(alloc),
+            fn_record_defaults: Rows::new_in(alloc),
             impls: Rows::new_in(alloc),
             provisional_impls: Rows::new_in(alloc),
             provisional_used: core::cell::RefCell::new(blaze_own::Vec::new_in(alloc)),
@@ -3612,6 +3624,9 @@ impl<'n> Store<'n> {
             field_defaults,
             record_defaults_by_owner,
             record_defaults_by_module,
+            record_type_defaults,
+            alias_record_defaults,
+            fn_record_defaults,
             impls,
             provisional_impls,
             provisional_used,
@@ -3693,6 +3708,9 @@ impl<'n> Store<'n> {
         field_defaults.clear();
         record_defaults_by_owner.clear();
         record_defaults_by_module.clear();
+        record_type_defaults.clear();
+        alias_record_defaults.clear();
+        fn_record_defaults.clear();
         impls.clear();
         provisional_impls.clear();
         provisional_used.get_mut().clear();
@@ -4237,9 +4255,17 @@ impl<'n> Store<'n> {
         None
     }
 
-    /// Resolves a type path in `v` to a `TypeAlias`'s library key (for propagating owner-scoped
-    /// structural record defaults across type aliases and spreads).
-    fn resolve_record_alias<S: NamesSource<'n>>(
+    /// Deterministic owner-scoped `field_defaults` key for structural record type `ti` inside
+    /// `owner`, keeping distinct owners/aliases/inline record types with the same `RecordSchema`
+    /// completely isolated in `Store::field_defaults`.
+    pub(super) fn scoped_record_defaults_key(owner: LibKey, schema: tc::RecordSchema, ti: u32, alloc: Alloc<'_>) -> ItemKey {
+        let label = blaze_own::format_in!(alloc, "record defaults {:016x} #{ti}", schema.0);
+        super::keys::member_key_of(checker_of(owner), MemberKind::Anon, label.as_str())
+    }
+
+    /// Resolves a type path in `v` to a `TypeAlias`'s library key (for owner-scoped structural
+    /// record defaults across type aliases and spreads).
+    pub(super) fn resolve_record_alias<S: NamesSource<'n>>(
         names: S,
         module: LibKey,
         marks: Option<TextMarks<'_>>,
@@ -4271,34 +4297,22 @@ impl<'n> Store<'n> {
         (target.kind == crate::resolve::Kind::TypeAlias && usize::try_from(target.consumed).ok() == Some(slice.len())).then_some(target.key)
     }
 
-    /// Propagates owner-scoped structural record defaults from any `TypeAlias` named in `v` onto
-    /// `owner_lib` (without overwriting defaults written directly in `owner_lib`). No-op when
-    /// `self.record_defaults_by_owner` is empty.
-    pub(super) fn propagate_record_alias_defaults<S: NamesSource<'n>>(
+    /// Returns the owner-scoped `field_defaults` key for type `ty_id` in `v` (written in
+    /// `owner_lib` / `module`) when it names either a `TypeRef::Record` registered by `owner_lib`
+    /// or a `TypeAlias` with recorded structural record defaults.
+    pub(super) fn record_default_key_for_type<S: NamesSource<'n>>(
         &self,
         names: S,
         owner_lib: LibKey,
         module: LibKey,
         marks: Option<TextMarks<'_>>,
         v: &View<'_>,
-    ) {
-        if self.record_defaults_by_owner.is_empty() {
-            return;
-        }
-        let alloc = self.tys.alloc();
-        for i in 0..v.types.len() {
-            let Ok(ti) = u32::try_from(i) else { break };
-            let Ok(lf::TypeRef::Path(p)) = v.ty(lf::TypeId(ti)) else { continue };
-            let Some(alias_lib) = Self::resolve_record_alias(names, module, marks, v, p) else { continue };
-            let mut to_copy: blaze_own::Vec<(ItemKey, blaze_own::Vec<Option<ItemKey>, Alloc<'static>>), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
-            for (&(al, rk), ds) in self.record_defaults_by_owner.iter() {
-                if al == alias_lib && !self.record_defaults_by_owner.contains_key(&(owner_lib, rk)) {
-                    to_copy.push((rk, exact_in(ds.as_slice(), alloc)));
-                }
-            }
-            for (rk, ds) in to_copy {
-                self.record_defaults_by_owner.insert((owner_lib, rk), ds);
-            }
+        ty_id: lf::TypeId,
+    ) -> Option<ItemKey> {
+        match v.ty(ty_id).ok()? {
+            lf::TypeRef::Record(_) => self.record_type_defaults.get(&(owner_lib, ty_id.0)).copied(),
+            lf::TypeRef::Path(p) => Self::resolve_record_alias(names, module, marks, v, p).and_then(|al| self.alias_record_defaults.get(&al).copied()),
+            _ => None,
         }
     }
 
@@ -5535,7 +5549,9 @@ impl<'n> Store<'n> {
             self.opaques.insert(o.key, (alias_ck, o.index));
         }
         self.register_record_defaults(names, keys, key, owner, &env, marks, v)?;
-        self.propagate_record_alias_defaults(names, key, module, marks, v);
+        if let Some(srk) = self.record_default_key_for_type(names, key, module, marks, v, lf::TypeId(t)) {
+            self.alias_record_defaults.insert(key, srk);
+        }
         self.maps.alias_defaults.insert(key, defaults);
         self.maps.aliases.insert(key, Some((generics, ty)));
         self.maps.const_params.insert(key, cs);
@@ -6531,7 +6547,6 @@ impl<'n> Store<'n> {
         sans_io |= names.in_sans_io_scope(key, module);
         let discrs = discriminants(&b, &mut self.tys, &env, v, repr, &written)?;
         self.register_record_defaults(names, keys, key, owner, &env, marks, v)?;
-        self.propagate_record_alias_defaults(names, key, module, marks, v);
         let (lifetimes, field_region_at, field_region_list) = super::borrows::freeze_field_regions(names, keys, self, ck, v, kind, &fields, self.tys.alloc())?;
         let field_regions = super::borrows::FieldRegions::new(field_region_at, field_region_list, self.tys.alloc());
         let auto_copy = is_auto_copy_pub_view(names, key, module, kind, v)?;
@@ -7235,7 +7250,9 @@ impl<'n> Store<'n> {
                         };
                         let owner_lib_for_spread = owner.map_or(lib, |(k, _)| k);
                         let base_defaults = spread_alias
-                            .and_then(|al| self.record_defaults_by_owner.get(&(al, base_rk)).map(|ds| &ds[..]))
+                            .and_then(|al| self.alias_record_defaults.get(&al).copied())
+                            .and_then(|srk| self.field_defaults.get(&srk).map(|ds| &ds[..]))
+                            .or_else(|| spread_alias.and_then(|al| self.record_defaults_by_owner.get(&(al, base_rk)).map(|ds| &ds[..])))
                             .or_else(|| self.record_defaults_for(names, Some(owner_lib_for_spread), env.module, base_rk))
                             .or_else(|| self.field_defaults.get(&base_rk).map(|ds| &ds[..]));
                         for (idx, &bnm) in base_names.iter().enumerate() {
@@ -7349,6 +7366,9 @@ impl<'n> Store<'n> {
                 defaults.push(Some(dk));
             }
             let owner_lib_rec = owner.map_or(lib, |(k, _)| k);
+            let scoped_rk = Self::scoped_record_defaults_key(owner_lib_rec, schema, ti, alloc);
+            self.field_defaults.insert(scoped_rk, exact_in(defaults.as_slice(), alloc));
+            self.record_type_defaults.insert((owner_lib_rec, ti), scoped_rk);
             self.record_defaults_by_owner.insert((owner_lib_rec, rk), exact_in(defaults.as_slice(), alloc));
             self.record_defaults_by_module.insert((env.module, rk), exact_in(defaults.as_slice(), alloc));
             self.field_defaults.insert(rk, defaults);
@@ -8000,11 +8020,33 @@ impl<'n> Store<'n> {
         }
         file_regions(self, key, filed);
         let fn_owner_lib = owner.map_or(lib, |(k, _)| k);
-        if Self::view_has_record_type(v) {
+        let has_rec = Self::view_has_record_type(v);
+        if has_rec {
             let rec_env = Env { module, params: &ps, bounds: Bounds::Done(&bounds), self_, self_assoc: self_assoc_slice, anon: &anon, consts: &cs, body: None };
             self.register_record_defaults(names, keys, fn_owner_lib, owner, &rec_env, marks, v)?;
         }
-        self.propagate_record_alias_defaults(names, fn_owner_lib, module, marks, v);
+        if has_rec || !self.alias_record_defaults.is_empty() {
+            let mut fn_recs: blaze_own::Vec<(Option<u32>, ItemKey), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+            if let Ok(param_rows) = v.rows(v.list(head::PARAMS)) {
+                for (pi, &pn) in param_rows.iter().enumerate() {
+                    if let Ok(p) = lf::Param::decode(pn)
+                        && let Some(t) = p.ty
+                        && let Some(srk) = self.record_default_key_for_type(names, fn_owner_lib, module, marks, v, t)
+                        && let Ok(pi_u32) = u32::try_from(pi)
+                    {
+                        fn_recs.push((Some(pi_u32), srk));
+                    }
+                }
+            }
+            if let Some(t) = written_ret
+                && let Some(srk) = self.record_default_key_for_type(names, fn_owner_lib, module, marks, v, t)
+            {
+                fn_recs.push((None, srk));
+            }
+            if !fn_recs.is_empty() {
+                self.fn_record_defaults.insert(key, fn_recs);
+            }
+        }
         self.fns.insert(
             key,
             FnHead {
