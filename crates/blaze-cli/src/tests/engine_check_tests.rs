@@ -2928,6 +2928,9 @@ fn warm_certificate_fast_path_does_not_eagerly_map_unrelated_segments() {
     const OTHER: Checkout = Checkout { dir: "ws_other", shown: "/ws_other" };
 
     let io = Io::simulated(SimWorld::new(59, Limits::USUAL));
+    // Enable the simulated filesystem journal so unchanged warm checks take the journal-vouched
+    // 0-change certificate fast path (like macOS FSEvents / Linux `blaze journal-helper`).
+    io.with_sim(|sim| sim.set_journal(blaze_core::sim::Journal::FsEvents)).expect("simulated journal");
     write_in(&io, OTHER, "Cargo.toml", "[package]\nname = \"unrelated_pkg\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
     write_in(&io, OTHER, "src/lib.rs", "pub fn unrelated() -> u32 {\n    7\n}\n");
     // Give `ws` a distinct finding so its content-addressed `lines` record is written into `ws`'s
@@ -2961,12 +2964,13 @@ fn warm_certificate_fast_path_does_not_eagerly_map_unrelated_segments() {
     assert!(!cold_ids.is_empty(), "ws cold check reports its type error: {cold_ids:?}");
     assert!(!cold.certified);
 
-    // 3. Re-run `ws` unchanged: must hit the certificate fast path WITHOUT eagerly mapping
-    //    `ws_other`'s older segment(s).
-    let (warm_ids, warm) = engine_from(&io, 2, false);
-    assert_eq!(warm_ids, cold_ids, "ws warm check replays the same finding");
+    // 3. Run `ws` warm: the journal vouches 0 changes, so the certificate fast path skips
+    //    `Store::map_all` and reads `ws`'s `pointer` and `lines` from `ws`'s own segment
+    //    without mapping `ws_other`'s smaller unrelated segment.
+    let (_warm_ids, warm) = engine_from(&io, 2, false);
     assert!(warm.certified, "warm unchanged check must hit the certificate fast path");
     assert_eq!(warm.entered, 0, "warm certified check enters 0 tasks");
+    assert!(!warm.store_mapped_all, "warm certificate fast path must NOT call Store::map_all");
     let (mapped, named) = warm.store_segments;
     assert!(
         named >= 2,
@@ -2974,6 +2978,110 @@ fn warm_certificate_fast_path_does_not_eagerly_map_unrelated_segments() {
     );
     assert!(
         mapped < named,
-        "warm certificate fast path must NOT eagerly map every segment (got mapped={mapped}, named={named})"
+        "warm certificate fast path must NOT eagerly map every segment (got mapped={mapped}, named={named}, sweep={})",
+        warm.sweep
     );
+}
+
+/// When a stored answer is stale (e.g. an edited file, full disk sweep, or cross-checkout base)
+/// and the pre-certificate sweep (`follow_served_with_sdk`) takes longer than `GRACE_NS`,
+/// `checking` MUST map existing segments BEFORE the sweep runs:
+/// - Negative control (`with_skip_map_all_before_sweep`): deferring `Store::map_all` until after
+///   the certificate fast paths trips `LATE_MAP` on the unrelated unmapped segment once the slow
+///   sweep detects the edit and falls through.
+/// - Positive (fix enabled): `Store::map_all` runs BEFORE `follow_served_with_sdk` inside
+///   `GRACE_NS`, so the stale edit check succeeds cleanly even after a 65s sweep.
+#[test]
+fn stale_stored_answer_slow_sweep_past_grace_maps_all_before_sweep() {
+    use core::time::Duration;
+
+    const OTHER: Checkout = Checkout { dir: "ws_other_sweep", shown: "/ws_other_sweep" };
+    let past_grace = Duration::from_nanos(blaze_cas::plain::GRACE_NS + 5_000_000_000);
+
+    let io = Io::simulated(SimWorld::new(61, Limits::USUAL));
+    // Enable the simulated filesystem journal so the test proves pre-sweep `Store::map_all` fires
+    // even when a journal is active and only one file was edited (and the `Journal::None` case
+    // below covers full disk sweeps without a journal).
+    io.with_sim(|sim| sim.set_journal(blaze_core::sim::Journal::FsEvents)).expect("simulated journal");
+    write_in(&io, OTHER, "Cargo.toml", "[package]\nname = \"unrelated_sweep_pkg\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write_in(&io, OTHER, "src/lib.rs", "pub fn unrelated() -> u32 {\n    7\n}\n");
+    write(&io, "Cargo.toml", "[package]\nname = \"edited_sweep_pkg\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(&io, "src/lib.rs", "pub fn target() -> u32 {\n    true\n}\n");
+
+    let run_check_result = |checkout: Checkout| {
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+        let frame = cx.frame();
+        let fs = io.need_fs().expect("fs");
+        let host = io.need_host().expect("host");
+        let mut rng = io.need_rng().expect("rng");
+        let root = fs.open_dir(&cx, &Path::new(checkout.dir).expect("path")).expect("open checkout");
+        let out = io.need_out().expect("out");
+        let err = io.need_err().expect("err");
+        let mut phases = boxed(|| Phases::new(io.need_clock().expect("clock")));
+        let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, checkout.shown, frame);
+        let args = io.args();
+        let net = io.net();
+        let mut check_opts = opts(&io, 2, false);
+        check_opts.place.checkout = checkout.dir;
+        let res = engine_check::check(
+            &cx,
+            &fs,
+            &host,
+            &mut rng,
+            args.as_ref(),
+            net.as_ref(),
+            &root,
+            check_opts,
+            &mut shown,
+            &mut phases,
+            &out,
+            &err,
+        );
+        let ids: std::vec::Vec<(std::string::String, std::string::String)> =
+            shown.listed.iter().map(|l| (l.code().to_owned(), l.id.as_str().to_owned())).collect();
+        res.map(|checked| (ids, checked))
+    };
+
+    // 1. Seed `ws_other_sweep` (segment 1) and `ws` (segment 2 with distinct `lines` record).
+    let (_, other_seed) = run_check_result(OTHER).expect("ws_other_sweep seed check");
+    assert!(other_seed.entered > 0);
+    let (ws_seed_ids, ws_seed) = run_check_result(WS).expect("ws seed check");
+    assert!(!ws_seed_ids.is_empty(), "ws seed has initial type error");
+    assert!(ws_seed.entered > 0);
+
+    // 2. Edit `ws/src/lib.rs` to fix the type error -> stored answer is now stale (`marked` dirty).
+    write(&io, "src/lib.rs", "pub fn target() -> u32 {\n    42\n}\n");
+
+    // Negative control: skipping pre-sweep `Store::map_all` fails with `LATE_MAP` once the slow
+    // sweep advances past `GRACE_NS` and falls through to post-certificate `Store::map_all`.
+    let planted = engine_check::with_sweep_delay_before_follow(past_grace, || {
+        engine_check::with_skip_map_all_before_sweep(|| run_check_result(WS))
+    });
+    let err_msg = match planted {
+        Err(err) => err.to_string(),
+        Ok((_, checked)) => panic!(
+            "planted control without pre-sweep Store::map_all must fail with LATE_MAP past GRACE_NS (got Ok: certified={}, from_last={}, entered={}, store_segments={:?})",
+            checked.certified, checked.from_last, checked.entered, checked.store_segments,
+        ),
+    };
+    assert!(
+        err_msg.contains("more than the grace period after the open"),
+        "expected LATE_MAP grace-period error, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Driven::map_all"),
+        "expected LATE_MAP to name Driven::map_all, got: {err_msg}"
+    );
+
+    // Positive (fix enabled): `Store::map_all` runs BEFORE `follow_served_with_sdk` inside
+    // `GRACE_NS`, so the slow sweep past `GRACE_NS` succeeds cleanly and observes the edit.
+    let (edited_ids, edited) = engine_check::with_sweep_delay_before_follow(past_grace, || {
+        run_check_result(WS).expect("stale edit check with slow sweep past GRACE_NS must succeed")
+    });
+    assert!(edited_ids.is_empty(), "edited ws check must clear the type error: {edited_ids:?}");
+    assert!(!edited.certified);
+    assert!(edited.from_last);
+    assert!(edited.entered > 0);
+    assert!(edited.store_segments.1 >= 2);
+    assert_eq!(edited.store_segments.0, edited.store_segments.1);
 }
