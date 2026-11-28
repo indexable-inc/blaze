@@ -153,8 +153,9 @@ pub(crate) fn emit_cfg_attrs(
     range: blaze_surface::Range,
     out: &mut AString<'_>,
     copied: &mut dyn FnMut(crate::crate_roots::Copied),
+    alloc: Alloc<'_>,
 ) {
-    blaze_file_items::nested::for_each_cfg_attr(text, range, |piece| match piece {
+    blaze_file_items::nested::for_each_cfg_attr(text, range, alloc, |piece| match piece {
         blaze_file_items::nested::CfgEmit::Lit(s) => out.push_str(s),
         blaze_file_items::nested::CfgEmit::Src(r) => {
             if let (Ok(start), Ok(end)) = (usize::try_from(r.start), usize::try_from(r.end))
@@ -217,8 +218,8 @@ pub(crate) fn render<'a>(
                 // `trace!`: `#[cfg(feature = "tracing")] { tracing::trace!(..); }`). The
                 // Reference, "Conditional compilation": a false `cfg` removes the thing it is on.
                 let block = nested.blocks[b as usize];
-                emit_cfg_attrs(text, block.attrs, &mut out, copied);
-                emit_cfg_attrs(text, block.elem_attrs, &mut out, copied);
+                emit_cfg_attrs(text, block.attrs, &mut out, copied, alloc);
+                emit_cfg_attrs(text, block.elem_attrs, &mut out, copied, alloc);
                 // Record the exact byte offset of the synthetic block module's name in `out`,
                 // so `resolve::make_modules` identifies synthetic blocks structurally rather than
                 // by name prefix (a user or macro module legitimately named `__blaze_block_*` is
@@ -245,8 +246,8 @@ pub(crate) fn render<'a>(
                 // attributes: a false `cfg` removes it as it removes the element (the Reference,
                 // "Conditional compilation"; tempo actor.rs:325, `#[cfg(feature = "fuzz")] let
                 // details = serde_json::json!(..);`). A statement call's path holds its own.
-                emit_cfg_attrs(text, c.attrs, &mut out, copied);
-                emit_cfg_attrs(text, c.elem_attrs, &mut out, copied);
+                emit_cfg_attrs(text, c.attrs, &mut out, copied, alloc);
+                emit_cfg_attrs(text, c.elem_attrs, &mut out, copied, alloc);
                 let r = c.range;
                 let call = &text[r.start as usize..r.end as usize];
                 copied(crate::crate_roots::Copied { from: r.start, to: u32::try_from(out.len()).unwrap_or(u32::MAX), len: r.end - r.start });

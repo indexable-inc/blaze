@@ -325,12 +325,10 @@ pub enum CfgEmit<'a> {
 }
 
 /// Calls `f` with the [`CfgEmit`] pieces of every gating outer `#[cfg(...)]` attribute (and
-/// every gating `cfg(...)` payload inside `#[cfg_attr(pred, ...)]`, recursively) found in
-/// `range`, skipping `#![...]` inner attributes and non-gating attributes or `cfg_attr`
+/// every gating `cfg(...)` payload inside `#[cfg_attr(pred, ...)]`, to arbitrary nesting depth)
+/// found in `range`, skipping `#![...]` inner attributes and non-gating attributes or `cfg_attr`
 /// payloads such as `non_exhaustive`, `derive(...)`, `allow(...)`, `doc = ...`, or `serde(...)`.
-pub fn for_each_cfg_attr(text: &str, range: Range, mut f: impl FnMut(CfgEmit<'_>)) {
-    const MAX_CFG_ATTR_DEPTH: usize = 16;
-
+pub fn for_each_cfg_attr(text: &str, range: Range, alloc: Alloc<'_>, mut f: impl FnMut(CfgEmit<'_>)) {
     /// Classifies an attribute body (`cfg(...)`, `core::cfg(...)`, `cfg_attr(...)`, etc.),
     /// returning `(is_cfg, is_cfg_attr, parens_inner_range_in_slice)` when the attribute has a
     /// balanced `(...)` argument list.
@@ -388,93 +386,111 @@ pub fn for_each_cfg_attr(text: &str, range: Range, mut f: impl FnMut(CfgEmit<'_>
         (false, false, None)
     }
 
-    /// Calls `each` with the trimmed byte range (relative to `slice`) of every non-empty
-    /// top-level comma-separated argument in `slice`.
-    fn for_each_top_arg(slice: &str, mut each: impl FnMut(usize, usize)) {
-        let mut depth = 0u32;
-        let mut arg_start = 0usize;
-        let mut at = 0usize;
-        let emit_trimmed = |s: usize, e: usize, each: &mut dyn FnMut(usize, usize)| {
-            let Some(part) = slice.get(s..e) else { return };
+    /// Returns the trimmed byte range (relative to `slice`) of the next non-empty top-level
+    /// comma-separated argument starting at `*cursor`, advancing `*cursor` past its comma.
+    fn next_top_arg(slice: &str, cursor: &mut usize) -> Option<(usize, usize)> {
+        while *cursor < slice.len() {
+            let rest = slice.get(*cursor..)?;
+            let mut depth = 0u32;
+            let mut at = 0usize;
+            let mut arg_end = rest.len();
+            let mut next_cur = slice.len();
+            let mut balanced = true;
+            for tok in tokenize(rest, FrontmatterAllowed::No, Cpu::BASELINE) {
+                let t_start = at;
+                let Ok(len) = usize::try_from(tok.len) else {
+                    *cursor = slice.len();
+                    return None;
+                };
+                at += len;
+                match tok.kind {
+                    TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => {
+                        depth = depth.saturating_add(1);
+                    }
+                    TokenKind::CloseParen | TokenKind::CloseBracket | TokenKind::CloseBrace => {
+                        if depth == 0 {
+                            balanced = false;
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    TokenKind::Comma if depth == 0 => {
+                        arg_end = t_start;
+                        next_cur = *cursor + at;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let start_base = *cursor;
+            *cursor = next_cur;
+            if !balanced || depth != 0 {
+                *cursor = slice.len();
+                return None;
+            }
+            let part = rest.get(..arg_end)?;
             let lead = part.len() - part.trim_start().len();
             let trimmed = part.trim();
             if !trimmed.is_empty() {
-                each(s + lead, s + lead + trimmed.len());
-            }
-        };
-        for tok in tokenize(slice, FrontmatterAllowed::No, Cpu::BASELINE) {
-            let t_start = at;
-            let Ok(len) = usize::try_from(tok.len) else {
-                return;
-            };
-            at += len;
-            match tok.kind {
-                TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => {
-                    depth = depth.saturating_add(1);
-                }
-                TokenKind::CloseParen | TokenKind::CloseBracket | TokenKind::CloseBrace => {
-                    depth = depth.saturating_sub(1);
-                }
-                TokenKind::Comma if depth == 0 => {
-                    emit_trimmed(arg_start, t_start, &mut each);
-                    arg_start = at;
-                }
-                _ => {}
+                return Some((start_base + lead, start_base + lead + trimmed.len()));
             }
         }
-        if depth == 0 {
-            emit_trimmed(arg_start, slice.len(), &mut each);
-        }
+        None
     }
 
-    /// Walks the arguments of a `cfg_attr(pred, payload...)` at byte offset `base` in `text`,
-    /// emitting `#[cfg_attr(p0, cfg_attr(p1, ..., cfg(...)))]` for each gating `cfg` leaf.
-    fn walk_cfg_attr(
-        text: &str,
+    /// Iteratively walks nested `cfg_attr(pred, payload...)` arguments to arbitrary depth
+    /// (bounded naturally by shrinking slice length), emitting `#[cfg_attr(p0, ..., cfg(...))]`
+    /// for each gating `cfg` leaf.
+    fn walk_cfg_attr<'t>(
         base: usize,
-        inner: &str,
-        preds: &mut [Range; MAX_CFG_ATTR_DEPTH],
-        depth: usize,
+        inner: &'t str,
+        preds: &mut AVec<'_, Range>,
+        frames: &mut AVec<'_, (usize, &'t str, usize, bool)>,
         f: &mut impl FnMut(CfgEmit<'_>),
     ) {
-        if depth >= MAX_CFG_ATTR_DEPTH {
-            return;
-        }
-        let mut got_pred = false;
-        for_each_top_arg(inner, |s, e| {
-            let (Ok(abs_s), Ok(abs_e)) = (u32::try_from(base + s), u32::try_from(base + e)) else {
-                return;
-            };
-            if !got_pred {
-                got_pred = true;
-                if let Some(slot) = preds.get_mut(depth) {
-                    *slot = Range { start: abs_s, end: abs_e };
+        preds.clear();
+        frames.clear();
+        frames.push((base, inner, 0, false));
+        while let Some(frame) = frames.last_mut() {
+            let Some((s, e)) = next_top_arg(frame.1, &mut frame.2) else {
+                let had_pred = frame.3;
+                frames.pop();
+                if had_pred {
+                    preds.pop();
                 }
-                return;
+                continue;
+            };
+            let abs_start = frame.0 + s;
+            let abs_end = frame.0 + e;
+            let (Ok(abs_s), Ok(abs_e)) = (u32::try_from(abs_start), u32::try_from(abs_end)) else {
+                continue;
+            };
+            if !frame.3 {
+                frame.3 = true;
+                preds.push(Range { start: abs_s, end: abs_e });
+                continue;
             }
-            let Some(item) = inner.get(s..e) else { return };
+            let Some(item) = frame.1.get(s..e) else { continue };
             let (is_cfg, is_cfg_attr, parens) = classify_attr_body(item);
             if is_cfg && parens.is_some() {
                 f(CfgEmit::Lit("#["));
-                if let Some(active) = preds.get(..=depth) {
-                    for &p in active {
-                        f(CfgEmit::Lit("cfg_attr("));
-                        f(CfgEmit::Src(p));
-                        f(CfgEmit::Lit(", "));
-                    }
-                    f(CfgEmit::Src(Range { start: abs_s, end: abs_e }));
-                    for _ in active {
-                        f(CfgEmit::Lit(")"));
-                    }
+                for &p in preds.iter() {
+                    f(CfgEmit::Lit("cfg_attr("));
+                    f(CfgEmit::Src(p));
+                    f(CfgEmit::Lit(", "));
+                }
+                f(CfgEmit::Src(Range { start: abs_s, end: abs_e }));
+                for _ in preds.iter() {
+                    f(CfgEmit::Lit(")"));
                 }
                 f(CfgEmit::Lit("]\n"));
             } else if is_cfg_attr
                 && let Some((ps, pe)) = parens
                 && let Some(nested_inner) = item.get(ps..pe)
             {
-                walk_cfg_attr(text, base + s + ps, nested_inner, preds, depth + 1, f);
+                frames.push((abs_start + ps, nested_inner, 0, false));
             }
-        });
+        }
     }
 
     if range.end <= range.start {
@@ -498,7 +514,8 @@ pub fn for_each_cfg_attr(text: &str, range: Range, mut f: impl FnMut(CfgEmit<'_>
     }
     let mut state = State::Idle;
     let mut at = 0usize;
-    let mut preds = [Range { start: 0, end: 0 }; MAX_CFG_ATTR_DEPTH];
+    let mut preds: AVec<'_, Range> = AVec::new_in(alloc);
+    let mut frames: AVec<'_, (usize, &str, usize, bool)> = AVec::new_in(alloc);
     for tok in tokenize(slice, FrontmatterAllowed::No, Cpu::BASELINE) {
         let t_start = at;
         let Ok(len) = usize::try_from(tok.len) else {
@@ -556,7 +573,7 @@ pub fn for_each_cfg_attr(text: &str, range: Range, mut f: impl FnMut(CfgEmit<'_>
                                 && let Some((ps, pe)) = parens
                                 && let Some(inner) = body.get(ps..pe)
                             {
-                                walk_cfg_attr(text, r_start + body_start + ps, inner, &mut preds, 0, &mut f);
+                                walk_cfg_attr(r_start + body_start + ps, inner, &mut preds, &mut frames, &mut f);
                             }
                         }
                         State::Idle
@@ -3323,17 +3340,17 @@ fn h() {
         assert_eq!(&fn_src[n.head_calls[0].attrs.start as usize..n.head_calls[0].attrs.end as usize], "#[allow(unused)] #[cfg(any())]");
         assert_eq!(&fn_src[n.head_calls[1].attrs.start as usize..n.head_calls[1].attrs.end as usize], "#[cfg(all())]");
         let mut cfgs = blaze_own::AString::new_in(heap.alloc());
-        super::for_each_cfg_attr(fn_src, n.head_calls[0].attrs, |piece| match piece {
+        super::for_each_cfg_attr(fn_src, n.head_calls[0].attrs, heap.alloc(), |piece| match piece {
             super::CfgEmit::Lit(s) => cfgs.push_str(s),
             super::CfgEmit::Src(r) => cfgs.push_str(&fn_src[r.start as usize..r.end as usize]),
         });
         assert_eq!(cfgs.as_str(), "#[cfg(any())]\n");
 
         // `cfg_attr` with only non-gating payloads emits nothing; mixed/nested `cfg_attr` emits
-        // ONLY the gating `cfg(...)` payload wrapped in its predicate(s).
+        // ONLY the gating `cfg(...)` payload wrapped in its predicate(s), even past 16 levels.
         let render_cfg = |src: &str| {
             let mut out = blaze_own::AString::new_in(heap.alloc());
-            super::for_each_cfg_attr(src, blaze_surface::Range { start: 0, end: src.len() as u32 }, |piece| match piece {
+            super::for_each_cfg_attr(src, blaze_surface::Range { start: 0, end: src.len() as u32 }, heap.alloc(), |piece| match piece {
                 super::CfgEmit::Lit(s) => out.push_str(s),
                 super::CfgEmit::Src(r) => out.push_str(&src[r.start as usize..r.end as usize]),
             });
@@ -3350,6 +3367,21 @@ fn h() {
             render_cfg("#[cfg_attr(all(), non_exhaustive, cfg_attr(any(), derive(Clone), cfg(any())))]").as_str(),
             "#[cfg_attr(all(), cfg_attr(any(), cfg(any())))]\n"
         );
+        // 20 nested `cfg_attr(all(), ...)` levels ending in `cfg(any())` must not be truncated.
+        let mut deep = blaze_own::AString::new_in(heap.alloc());
+        deep.push_str("#[");
+        for _ in 0..20 {
+            deep.push_str("cfg_attr(all(), ");
+        }
+        deep.push_str("cfg(any())");
+        for _ in 0..20 {
+            deep.push_str(")");
+        }
+        deep.push_str("]");
+        let mut expected = blaze_own::AString::new_in(heap.alloc());
+        expected.push_str(deep.as_str());
+        expected.push_str("\n");
+        assert_eq!(render_cfg(deep.as_str()).as_str(), expected.as_str());
 
         // Tuple struct fields: cfg(any()) stays on field 0 and clears on `,`.
         let tup_src = "struct T(#[cfg(any())] pub [u8; missing!()], [u8; make_len!()]);";

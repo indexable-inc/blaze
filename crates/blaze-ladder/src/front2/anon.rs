@@ -64,7 +64,8 @@ pub struct TextEdit {
 }
 
 /// Maps byte offset `pos` in a leaf-substituted expression back to its byte offset in the
-/// original unmodified expression slice.
+/// original unmodified expression slice (rounding into an edit's `orig_start` if `pos` lies
+/// inside a replaced range).
 pub(super) fn orig_offset(edits: &[TextEdit], pos: u32) -> Option<u32> {
     let mut sub_cur = 0u32;
     let mut orig_cur = 0u32;
@@ -81,15 +82,37 @@ pub(super) fn orig_offset(edits: &[TextEdit], pos: u32) -> Option<u32> {
     orig_cur.checked_add(pos.checked_sub(sub_cur)?)
 }
 
-/// Composes two non-overlapping substitution passes (`first`: `mid -> orig`, `second`: `final -> mid`)
-/// into a single sorted edit list (`final -> orig`).
+/// Exclusive end-bound counterpart to [`orig_offset`]: if `pos` equals `e.sub_start` it maps
+/// strictly before `e` (`e.orig_start`); if `e.sub_start < pos <= e.sub_end` it rounds up to
+/// `e.orig_end`.
+fn orig_offset_end(edits: &[TextEdit], pos: u32) -> Option<u32> {
+    let mut sub_cur = 0u32;
+    let mut orig_cur = 0u32;
+    for &e in edits {
+        if pos <= e.sub_start {
+            return orig_cur.checked_add(pos.checked_sub(sub_cur)?);
+        }
+        if pos <= e.sub_end {
+            return Some(e.orig_end);
+        }
+        sub_cur = e.sub_end;
+        orig_cur = e.orig_end;
+    }
+    orig_cur.checked_add(pos.checked_sub(sub_cur)?)
+}
+
+/// Composes two substitution passes (`first`: `mid -> orig`, `second`: `final -> mid`) into a
+/// single sorted, non-overlapping edit list (`final -> orig`). When a `second` edit spans over
+/// one or more `first` edits (e.g. an inherent constant `A::N` substituted inside a qualified
+/// associated constant `<[u8; A::N] as Tr>::C`), the outer `second` edit supersedes the
+/// contained `first` edits while non-overlapping `first` edits stay intact.
 pub(super) fn compose_edits(first: &[TextEdit], second: &[TextEdit], out: &mut AVec<'static, TextEdit>) -> Option<()> {
     let (mut i, mut j) = (0usize, 0usize);
     let (mut mid_cur, mut final_cur) = (0u32, 0u32);
     while let (Some(&e1), Some(&e2)) = (first.get(i), second.get(j)) {
         if e2.orig_end <= e1.sub_start {
             let orig_start = orig_offset(first, e2.orig_start)?;
-            let orig_end = orig_offset(first, e2.orig_end)?;
+            let orig_end = orig_offset_end(first, e2.orig_end)?;
             out.push(TextEdit { sub_start: e2.sub_start, sub_end: e2.sub_end, orig_start, orig_end });
             mid_cur = e2.orig_end;
             final_cur = e2.sub_end;
@@ -102,12 +125,29 @@ pub(super) fn compose_edits(first: &[TextEdit], second: &[TextEdit], out: &mut A
             out.push(TextEdit { sub_start, sub_end, orig_start: e1.orig_start, orig_end: e1.orig_end });
             i += 1;
         } else {
-            return None;
+            // `e2` overlaps `e1`: require every overlapping `first` edit to be fully contained
+            // inside `e2`'s `[orig_start, orig_end)` so bytes outside composed edits still match
+            // the original source verbatim.
+            while let Some(&inner) = first.get(i) {
+                if inner.sub_start >= e2.orig_end {
+                    break;
+                }
+                if inner.sub_start < e2.orig_start || inner.sub_end > e2.orig_end {
+                    return None;
+                }
+                i += 1;
+            }
+            let orig_start = orig_offset(first, e2.orig_start)?;
+            let orig_end = orig_offset_end(first, e2.orig_end)?;
+            out.push(TextEdit { sub_start: e2.sub_start, sub_end: e2.sub_end, orig_start, orig_end });
+            mid_cur = e2.orig_end;
+            final_cur = e2.sub_end;
+            j += 1;
         }
     }
     while let Some(&e2) = second.get(j) {
         let orig_start = orig_offset(first, e2.orig_start)?;
-        let orig_end = orig_offset(first, e2.orig_end)?;
+        let orig_end = orig_offset_end(first, e2.orig_end)?;
         out.push(TextEdit { sub_start: e2.sub_start, sub_end: e2.sub_end, orig_start, orig_end });
         mid_cur = e2.orig_end;
         final_cur = e2.sub_end;
@@ -866,6 +906,23 @@ mod tests {
         let mut merged = blaze_own::AVec::new_in(alloc);
         compose_edits(&first, &second, &mut merged).expect("disjoint passes compose");
         assert_eq!(orig_offset(&merged, 18), Some(22));
+        // Contained nested edits (e.g. `A::N` -> `2usize` inside `<[u8; 2usize] as Tr>::C` -> `7usize`)
+        // supersede the inner `first` edits while preserving non-overlapping sibling edits.
+        let nested_first = [
+            TextEdit { sub_start: 6, sub_end: 12, orig_start: 6, orig_end: 10 },
+            TextEdit { sub_start: 26, sub_end: 32, orig_start: 24, orig_end: 28 },
+        ];
+        let nested_second = [TextEdit { sub_start: 0, sub_end: 6, orig_start: 0, orig_end: 23 }];
+        let mut nested_merged = blaze_own::AVec::new_in(alloc);
+        compose_edits(&nested_first, &nested_second, &mut nested_merged).expect("contained nested edits compose");
+        assert_eq!(
+            nested_merged.as_slice(),
+            &[
+                TextEdit { sub_start: 0, sub_end: 6, orig_start: 0, orig_end: 21 },
+                TextEdit { sub_start: 9, sub_end: 15, orig_start: 24, orig_end: 28 },
+            ]
+        );
+        assert_eq!(orig_offset(&nested_merged, 16), Some(29));
         // Distinct substitution edit lists at identical (text, owner, offset, site) get distinct keys.
         let site = Some(HeadSite { line: 3, col: 5, file: Some("src/a.rs") });
         let mut sub_edits = blaze_own::AVec::new_in(alloc);

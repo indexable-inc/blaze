@@ -1154,6 +1154,7 @@ pub enum E {
 }
 pub fn g(
     #[cfg_attr(all(), cfg(any()))] _disabled: [u8; missing!()],
+    #[cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg(any())))))))))))))))))))))] _deep_disabled: [u8; missing!()],
     #[cfg_attr(any(), cfg(any()))] _kept: [u8; make_len!()],
     #[cfg_attr(all(), cfg(all()))] _enabled: [u8; make_len!()],
 ) {}
