@@ -1437,7 +1437,7 @@ impl<'n> Consts<'n> {
                     return Err(ConstFail::NotPromoted { owner: item, borrow });
                 }
                 match lowered.typeck.exprs.get(borrow.0 as usize) {
-                    Some(&tc::Expr::Ref { mutbl: tc::Mutbl::Not, operand }) => Some(operand),
+                    Some(&tc::Expr::Ref { operand, .. }) => Some(operand),
                     Some(&tc::Expr::Index { base, .. }) => {
                         // A promoted shared index base (`&[("/b", B)][..]`, `Checked::promoted`
                         // names the `Expr::Index`): the promoted value is `base` before its
@@ -1446,9 +1446,10 @@ impl<'n> Consts<'n> {
                         Some(base)
                     }
                     Some(_) => {
-                        // A promoted shared autoref (`AdjustKind::Borrow { mutbl: Not, raw: false }`
-                        // at index 0 on `borrow`): the promoted value is `borrow`'s unadjusted
-                        // value before its leading borrow and any coercions after it. Strip
+                        // A promoted autoref (`AdjustKind::Borrow { raw: false }` at index 0 —
+                        // shared autorefs or mutable empty arrays) or shared overloaded `Deref`
+                        // (`AdjustKind::Deref { overloaded: Some(Not) }` at index 0): the promoted
+                        // value is `borrow`'s unadjusted value before its leading adjustment. Strip
                         // `borrow`'s own adjustment rows from this `ConstBody`'s `checked` so the
                         // evaluator produces `borrow`'s value directly.
                         let adj_e = checked.adjusts.column::<0>();
@@ -1457,7 +1458,10 @@ impl<'n> Consts<'n> {
                         if start == end
                             || !matches!(
                                 checked.adjusts.column::<1>().get(start),
-                                Some(tc::AdjustKind::Borrow { mutbl: tc::Mutbl::Not, raw: false, .. })
+                                Some(
+                                    tc::AdjustKind::Borrow { raw: false, .. }
+                                        | tc::AdjustKind::Deref { overloaded: Some(tc::Mutbl::Not) }
+                                )
                             )
                         {
                             return Err(ConstFail::NotPromoted { owner: item, borrow });

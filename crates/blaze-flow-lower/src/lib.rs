@@ -5672,7 +5672,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         return Ok(());
                     }
                 }
-                let p = self.deref(v, ty, m, None, e)?;
+                let p = self.deref(v, ty, m, None, false, e)?;
                 self.push_place(p, ty);
                 Ok(())
             }
@@ -6152,7 +6152,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             // The Reference, "Constant promotion": a borrow the checker promoted
             // (`Checked::promoted`) is of a `'static` slot: no loan of the body's, and the
             // operand's code does not run here (the builder reads the evaluator's value).
-            Expr::Ref { mutbl: Mutbl::Not, operand } if self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok() => {
+            Expr::Ref { operand, .. } if self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok() => {
                 let ty = TyD::of(self.expr_ty(e)?);
                 let t = self.temp(ty, e)?;
                 let tp = self.place_of(t);
@@ -6473,7 +6473,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             v = match kind {
                 AdjustKind::NeverToAny => Val { at: v.at, ty: out },
                 AdjustKind::Deref { overloaded } => {
-                    let p = self.deref(v, out, overloaded == Some(Mutbl::Mut), overloaded, e)?;
+                    let promoted = i == lo
+                        && overloaded == Some(Mutbl::Not)
+                        && !matches!(self.body.exprs.get(e.ix()), Some(Expr::Ref { .. } | Expr::Index { .. }))
+                        && self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok();
+                    let p = self.deref(v, out, overloaded == Some(Mutbl::Mut), overloaded, promoted, e)?;
                     Val { at: At::Place(p), ty: out }
                 }
                 AdjustKind::Borrow { raw: true, .. } => {
@@ -6484,13 +6488,15 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     self.b.aggregate(tp, &[Operand::Copy(p)], self.span(e));
                     Val { at: At::Place(tp), ty: out }
                 }
-                // A shared autoref of a constant is a borrow of a `'static` slot, as `&C` is
-                // (`ref_done`, the Reference, "Constant promotion"): no loan of the body's.
-                // Through a temporary, `RNG.with_borrow_mut(..)` (a `thread_local!` is a `const`
-                // `LocalKey` whose methods take `&'static self`) tied the temporary's loan to
-                // `'static` (tempo test_utils.rs:32, a false E0505 and E0597).
-                AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. }
-                    if matches!(v.at, At::Const)
+                // A promoted autoref (`Checked::promoted` — shared autorefs of constants/promotable
+                // values and mutable autorefs of empty arrays `[T; 0]` such as `[].iter_mut()`) is
+                // a borrow of a `'static` slot, as `&C` is (`ref_done`, the Reference, "Constant
+                // promotion"): no loan of the body's. Through a temporary,
+                // `RNG.with_borrow_mut(..)` (a `thread_local!` is a `const` `LocalKey` whose
+                // methods take `&'static self`) tied the temporary's loan to `'static` (tempo
+                // test_utils.rs:32, a false E0505 and E0597).
+                AdjustKind::Borrow { mutbl, raw: false, .. }
+                    if (mutbl == Mutbl::Not && matches!(v.at, At::Const))
                         || (i == lo
                             && !matches!(self.body.exprs.get(e.ix()), Some(Expr::Ref { .. } | Expr::Index { .. }))
                             && self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok()) =>
@@ -6580,7 +6586,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// `*v` as a place of type `out`: a builtin deref of a reference or pointer, `DerefBox` of a
     /// `Box`, or `Deref::deref(&v)` / `DerefMut::deref_mut(&mut v)` then the builtin deref of
     /// its result (whose lifetime is the receiver's, by elision).
-    fn deref(&mut self, v: Val, out: TyD, m: bool, overloaded: Option<Mutbl>, e: ExprId) -> Result<Place, Refusal> {
+    fn deref(&mut self, v: Val, out: TyD, m: bool, overloaded: Option<Mutbl>, promoted: bool, e: ExprId) -> Result<Place, Refusal> {
         // `*b` of a `Box` is builtin whatever the type check recorded (it records the operand's
         // deref as overloaded, `Deref for Box`): the Reference, "Dereference expressions":
         // "On non-pointer types `*x` is equivalent to `*std::ops::Deref::deref(&x)`" except for
@@ -6614,9 +6620,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         let bt = self.temp(TyD { wrap: Some(mutbl), ty: v.ty.ty }, e)?;
         self.name_local(bt, Identity::Temp(e, Role::Borrow));
         // An immutable `static` item (`static S: LazyLock<Mutex<T>>`) lives in `'static` storage
-        // directly: `Deref::deref(&S)` borrows the static item itself rather than materializing
-        // a stack temporary that would drop at statement end.
-        if matches!(v.at, At::Const) && !m && self.is_immutable_static(e)? {
+        // directly, and a promoted `Freeze` non-drop `const`/rvalue (`&*TEST_DATA`,
+        // `Checked::promoted`) is promoted to a `'static` slot: `Deref::deref(&x)` borrows
+        // `'static` storage rather than materializing a stack temporary that would drop at
+        // statement end.
+        if !m && (promoted || (matches!(v.at, At::Const) && self.is_immutable_static(e)?)) {
             self.b.assign(self.place_of(bt), Operand::Const, self.span(e));
         } else {
             let p = self.as_place(v, e)?;
