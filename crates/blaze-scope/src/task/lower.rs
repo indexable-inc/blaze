@@ -3741,9 +3741,12 @@ pub fn crate_root<'t, 'a>(
     let mut cr = CrateRootBuilder::new_in(head, alloc);
     // The root's language features (the record sorts them).
     cr.features.extend_from_slice(&attrs.features);
-    // The extern prelude: the graph's, and the root's `extern crate` items (rustc adds an
-    // `extern crate` at the root to it, `extern crate self as name` too).
-    let mut externs: AVec<'a, (&'t str, ItemKey)> = AVec::from_slice_in(&plan.extern_prelude, alloc);
+    // The extern prelude: the root's non-macro `extern crate` items shadow the graph's
+    // `--extern` prelude of the same name (Reference `names.preludes.extern`), and earlier root
+    // declarations win over later ones (including the injected `std`/`core` item appended last
+    // in 2015). Put root `extern crate` bindings ahead of `plan.extern_prelude` and sort stably
+    // by name only so `dedup_by_key` never depends on `ItemKey` order.
+    let mut externs: AVec<'a, (&'t str, ItemKey)> = AVec::with_capacity_in(input.extern_crates.len() + plan.extern_prelude.len(), alloc);
     for e in input.extern_crates {
         let target = match e.target {
             ExternTarget::SelfCrate => Some(root),
@@ -3764,7 +3767,8 @@ pub fn crate_root<'t, 'a>(
             _ => {}
         }
     }
-    externs.sort();
+    externs.extend_from_slice(&plan.extern_prelude);
+    externs.sort_by(|a, b| a.0.cmp(b.0));
     externs.dedup_by_key(|it| it.0);
     cr.extern_prelude.extend_from_slice(&externs);
     cr.deps.extend_from_slice(&plan.deps);

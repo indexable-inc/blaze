@@ -37,6 +37,7 @@ mod crate_cfg_off;
 mod macro_blocks;
 mod macro_gen_dollar_crate;
 mod entry;
+mod extern_crate_shadow;
 mod failed_call;
 mod failed_record;
 mod implicit_main;
