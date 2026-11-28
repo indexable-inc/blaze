@@ -19,13 +19,48 @@
 //! run in the deterministic sandbox. Plain `std::fs` here, as native_unit's folders: these are
 //! the native runner's own folders on this machine, never a record's bytes.
 
-use std::io::Write as _;
+use std::io::{self, Read as _, Write as _};
 use std::path::Path;
 use std::sync::Arc;
 
-use blaze_build_script::fact_shim::{self, BIN_DIR, FOLDER_VAR, LOG_DIR, LOG_FILE, PINS_FILE, PROGRAMS, REFUSED_CODE, SHIM_NAME};
+use blaze_build_script::{
+    fact_shim::{
+        self, BIN_DIR, FOLDER_VAR, LOG_DIR, LOG_FILE, PINS_FILE, PROBES_FILE, PROGRAMS, REFUSED_CODE, RUSTC_PROBE_PREFIX,
+        SHIM_NAME,
+    },
+    probe::Table,
+    probe_ask::{self, Ask, Snippet},
+};
 use blaze_ids::ContentId;
 use blaze_own::{Alloc, Heap, String, Vec};
+
+const MAX_PROBE_SNIPPET_BYTES: u64 = 4 * 1024 * 1024;
+
+fn read_file(path: &Path) -> io::Result<std::vec::Vec<u8>> {
+    std::fs::read(path)
+}
+
+fn write_file(path: &str, bytes: &[u8]) -> io::Result<()> {
+    std::fs::write(path, bytes)
+}
+
+fn read_bounded<'a>(mut reader: impl io::Read, alloc: Alloc<'a>) -> io::Result<blaze_own::AVec<'a, u8>> {
+    let mut out = Vec::new_in(alloc);
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if let Some(chunk) = buf.get(..n) {
+            out.extend_from_slice(chunk);
+        }
+        if u64::try_from(out.len()).unwrap_or(u64::MAX) > MAX_PROBE_SNIPPET_BYTES {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+    }
+    Ok(out)
+}
 
 use crate::{
     fact_pins::{FactNow, fact_now},
@@ -51,7 +86,7 @@ pub fn pins_digest(pins: Option<&FactPins>, alloc: Alloc<'_>) -> ContentId {
 
 /// The exact image copied for a run, or the image the command would deploy today.
 pub fn image_digest(path: &Path) -> std::io::Result<ContentId> {
-    Ok(file_answer(&std::fs::read(path)?))
+    Ok(file_answer(&read_file(path)?))
 }
 
 const REPLY_V1: &str = "pkg-config-reply-v1\n";
@@ -96,7 +131,7 @@ fn files(path: &str) -> impl FnOnce(std::io::Error) -> NativeFactsError + '_ {
 /// placed file's real path. Called once per command at its edge so concurrent or upgraded `blaze`
 /// commands never overwrite one another's shim image mid-run.
 pub fn place_shim(work: &str, from: &str) -> Result<std::string::String, NativeFactsError> {
-    let bytes = std::fs::read(from).map_err(|e| NativeFactsError::NoShim { path: from.to_owned(), why: e.to_string() })?;
+    let bytes = read_file(Path::new(from)).map_err(|e| NativeFactsError::NoShim { path: from.to_owned(), why: e.to_string() })?;
     let digest = file_answer(&bytes);
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut hex_buf = [0u8; 64];
@@ -110,9 +145,9 @@ pub fn place_shim(work: &str, from: &str) -> Result<std::string::String, NativeF
     let folder = format!("{work}/{SHIM_IN_WORK}/{hex}");
     std::fs::create_dir_all(&folder).map_err(files(&folder))?;
     let path = format!("{folder}/{SHIM_NAME}");
-    if std::fs::read(&path).ok().as_deref() != Some(&bytes[..]) {
+    if read_file(Path::new(&path)).ok().as_deref() != Some(&bytes[..]) {
         let side = format!("{path}.new.{:p}", bytes.as_ptr());
-        std::fs::write(&side, &bytes).map_err(files(&side))?;
+        write_file(&side, &bytes).map_err(files(&side))?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&side, std::fs::Permissions::from_mode(0o755)).map_err(files(&side))?;
         std::fs::rename(&side, &path).map_err(files(&path))?;
@@ -148,8 +183,23 @@ pub struct ShimRun {
 }
 
 /// A fresh facts folder for the run keyed `key_hex` under `work`, answering from `pins`
-/// (`None`: every question is refused by name).
+/// (`None`: every question is refused by name) and an empty `rustc` probe table.
 pub fn prepare(shim: &str, work: &str, key_hex: &str, pins: Option<&FactPins>, alloc: Alloc<'_>) -> Result<ShimRun, NativeFactsError> {
+    prepare_with_probes(shim, work, key_hex, pins, "", &Table::EMPTY, alloc)
+}
+
+/// Like [`prepare`], also writing the command's keyed `rustc` probe table (`host` + `table`)
+/// into `<folder>/probes` so `blaze-fact-shim` answers `autocfg` / try-compile probes with the
+/// exact same sans-IO decider and table as the Wasm runner (Rule 1, Rule 30).
+pub fn prepare_with_probes(
+    shim: &str,
+    work: &str,
+    key_hex: &str,
+    pins: Option<&FactPins>,
+    host: &str,
+    table: &Table<'_>,
+    alloc: Alloc<'_>,
+) -> Result<ShimRun, NativeFactsError> {
     let parent = blaze_own::format_in!(alloc, "{work}/facts");
     std::fs::create_dir_all(parent.as_str()).map_err(files(parent.as_str()))?;
     // The child sees this folder on PATH. Keep it stable for a given run key, and hold the
@@ -184,7 +234,11 @@ pub fn prepare(shim: &str, work: &str, key_hex: &str, pins: Option<&FactPins>, a
     let borrowed = pins.map(FactPins::as_pins);
     fact_shim::encode_pins(borrowed.as_ref(), &mut text);
     let pins_path = format!("{folder}/{PINS_FILE}");
-    std::fs::write(&pins_path, text.as_bytes()).map_err(files(&pins_path))?;
+    write_file(&pins_path, text.as_bytes()).map_err(files(&pins_path))?;
+    let mut probes_bytes = Vec::new_in(alloc);
+    fact_shim::encode_probes(host, table, &mut probes_bytes);
+    let probes_path = blaze_own::format_in!(alloc, "{folder}/{PROBES_FILE}");
+    write_file(probes_path.as_str(), probes_bytes.as_slice()).map_err(files(probes_path.as_str()))?;
     let links = PROGRAMS.iter().map(|program| format!("{folder}/{BIN_DIR}/{program}")).collect();
     Ok(ShimRun { shim: snapshot.as_str().to_owned(), bin, log_dir, links, folder, _lease: Arc::new(lease) })
 }
@@ -218,11 +272,17 @@ pub fn reads(run: &ShimRun, pins: Option<&FactPins>, alloc: Alloc<'_>) -> Result
     let path = format!("{}/{LOG_FILE}", run.log_dir);
     // prepare() creates an empty log even when no probe runs. A missing log is a failed
     // observation; interpreting it as an empty list would certify a run on missing evidence.
-    let log = std::fs::read(&path).map_err(files(&path))?;
+    let log = read_file(Path::new(&path)).map_err(files(&path))?;
     let entries = fact_shim::log_entries(&log, alloc).map_err(|error| NativeFactsError::Log { path: path.clone(), error })?;
     let mut asked = Asked::default();
     let mut saw_image = false;
     for &(answered, logged) in entries.iter() {
+        if answered && logged.starts_with(RUSTC_PROBE_PREFIX) {
+            // Answered `rustc` try-compile probes are keyed by the command's `Table::id()` in
+            // `KeyInputs::answers` (identical to the Wasm runner); witness the shim image.
+            saw_image = true;
+            continue;
+        }
         let (subject, digest) = if let Some(text) = logged.strip_prefix(REPLY_V1) {
             let (subject, digest) = receipt(text).filter(|_| answered)
                 .ok_or_else(|| NativeFactsError::Receipt { path: path.clone(), subject: logged.to_owned() })?;
@@ -273,15 +333,52 @@ pub fn shim_main(heap: &Heap) -> i32 {
         return say_refused(&format!("`{argv0}`: no {FOLDER_VAR}: started outside blaze's native runner"));
     };
     let folder = std::path::PathBuf::from(folder);
-    let text = match std::fs::read_to_string(folder.join(PINS_FILE)) {
+    let pins_bytes = match read_file(&folder.join(PINS_FILE)) {
+        Ok(bytes) => bytes,
+        Err(e) => return say_refused(blaze_own::format_in!(alloc, "`{argv0}`: {}: {e}", folder.join(PINS_FILE).display()).as_str()),
+    };
+    let text = match core::str::from_utf8(&pins_bytes) {
         Ok(text) => text,
-        Err(e) => return say_refused(&format!("`{argv0}`: {}: {e}", folder.join(PINS_FILE).display())),
+        Err(e) => return say_refused(blaze_own::format_in!(alloc, "`{argv0}`: {}: {e}", folder.join(PINS_FILE).display()).as_str()),
     };
-    let pins = match fact_shim::decode_pins(&text) {
+    let pins = match fact_shim::decode_pins(text) {
         Ok(pins) => pins,
-        Err(e) => return say_refused(&format!("`{argv0}`: {e}")),
+        Err(e) => return say_refused(blaze_own::format_in!(alloc, "`{argv0}`: {e}").as_str()),
     };
-    let mut reply = fact_shim::ask(argv0, &args, pins.as_ref(), alloc);
+    let mut reply = if fact_shim::program_name(argv0) == "rustc"
+        && let Ok(Ask::Compile(compile)) = probe_ask::classify(&args, alloc)
+    {
+        let probes_path = folder.join(PROBES_FILE);
+        let probes_bytes = match read_file(&probes_path) {
+            Ok(bytes) => bytes,
+            Err(e) => return say_refused(blaze_own::format_in!(alloc, "`{argv0}`: {}: {e}", probes_path.display()).as_str()),
+        };
+        let (probe_host, probe_rows) = match fact_shim::decode_probes(&probes_bytes, alloc) {
+            Ok(decoded) => decoded,
+            Err(e) => return say_refused(blaze_own::format_in!(alloc, "`{argv0}`: {e}").as_str()),
+        };
+        let snippet_buf;
+        let snippet_stdin;
+        let snippet: &[u8] = match compile.input {
+            Snippet::Stdin => {
+                snippet_stdin = match read_bounded(io::stdin().lock(), alloc) {
+                    Ok(bytes) => bytes,
+                    Err(e) => return say_refused(blaze_own::format_in!(alloc, "`{argv0}`: reading probe stdin: {e}").as_str()),
+                };
+                snippet_stdin.as_slice()
+            }
+            Snippet::File(path) => {
+                snippet_buf = match read_file(Path::new(path)) {
+                    Ok(bytes) => bytes,
+                    Err(e) => return say_refused(blaze_own::format_in!(alloc, "`{argv0}`: {path}: {e}").as_str()),
+                };
+                snippet_buf.as_slice()
+            }
+        };
+        fact_shim::ask_rustc_probe(&args, snippet, probe_host, &Table { rows: probe_rows.as_slice() }, alloc)
+    } else {
+        fact_shim::ask(argv0, &args, pins.as_ref(), alloc)
+    };
     let printed = (|| -> std::io::Result<()> {
         let mut stdout = std::io::stdout().lock();
         stdout.write_all(reply.stdout.as_bytes())?;
@@ -316,4 +413,67 @@ pub fn shim_main(heap: &Heap) -> i32 {
 fn say_refused(why: &str) -> i32 {
     let _ = writeln!(std::io::stderr(), "{SHIM_NAME}: refused (D112 interim, rule 3): {why}");
     REFUSED_CODE
+}
+
+#[cfg(test)]
+mod rustc_probe_tests {
+    use super::{IMAGE_SUBJECT, LOG_FILE, PROBES_FILE, prepare_with_probes, reads};
+    use blaze_build_script::{
+        fact_shim::{self, Reply},
+        probe::{Row, Table},
+    };
+    use blaze_ids::ContentId;
+    use blaze_own::{String, Vec};
+
+    #[test]
+    fn prepare_with_probes_writes_table_and_reads_accepts_rustc_probe_entries() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let root = std::env::temp_dir().join(format!("blaze-nf-probes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp dir");
+        let fake_shim = root.join("blaze-fact-shim");
+        std::fs::write(&fake_shim, b"#!/bin/sh\n").expect("fake shim");
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).expect("work");
+
+        let rows = [Row { key: ContentId([0xab; 32]), accepted: true }];
+        let table = Table { rows: &rows };
+        let run = prepare_with_probes(
+            fake_shim.to_str().expect("utf8"),
+            work.to_str().expect("utf8"),
+            "k1",
+            None,
+            "aarch64-unknown-linux-gnu",
+            &table,
+            alloc,
+        )
+        .expect("prepare_with_probes");
+
+        let encoded = std::fs::read(format!("{}/{PROBES_FILE}", run.folder)).expect("read probes");
+        let (host, decoded) = fact_shim::decode_probes(&encoded, alloc).expect("decode probes");
+        assert_eq!(host, "aarch64-unknown-linux-gnu");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].key, ContentId([0xab; 32]));
+        assert!(decoded[0].accepted);
+
+        // Append an answered `rustc-probe\n...` log entry and verify `reads` records the shim
+        // image witness without failing `NotAFact`.
+        let mut entry = Vec::new_in(alloc);
+        let reply = Reply {
+            code: 0,
+            stdout: String::new_in(alloc),
+            stderr: String::new_in(alloc),
+            answered: true,
+            subject: String::from_str_in("rustc-probe\nababababababababababababababababababababababababababababababab", alloc),
+        };
+        fact_shim::log_entry(&reply, &mut entry);
+        std::fs::write(format!("{}/{LOG_FILE}", run.log_dir), entry.as_slice()).expect("write log");
+
+        let asked = reads(&run, None, alloc).expect("reads accepts rustc-probe");
+        assert!(asked.refused.is_empty());
+        assert_eq!(asked.reads.len(), 1);
+        assert_eq!(asked.reads[0].subject, IMAGE_SUBJECT);
+        assert!(asked.reads[0].digest.is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

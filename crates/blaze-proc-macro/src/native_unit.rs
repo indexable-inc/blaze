@@ -61,8 +61,10 @@ pub fn placed(graph: &UnitGraph<'_>, script: UnitId, mode: Mode, alloc: Alloc<'_
 /// Returns the name of a host tool that `script` requires to run natively on `host` but that
 /// `pins/clang.json`'s `host_tools` row for `host` does not grant:
 /// - a script whose closure contains `cmake` requires a granted `cmake` tool;
-/// - a script in [`toolchain::NATIVE_EVERY_MODE`] (`sha3-asm`) requires its granted host tool
-///   (`perl`).
+/// - any package for which another target row in `pins/clang.json`'s `host_tools` declares a
+///   `needed_by` tool (e.g. `sha3-asm` -> `perl`, `tikv-jemalloc-sys` -> `hostname`/`make`/`nm`/
+///   `sh`/`uname`, or any future `needed_by` entry) requires every such tool to be granted on
+///   `host` (Rule 30: table-driven single source of truth).
 pub fn missing_native_host_tool(graph: &UnitGraph<'_>, script: UnitId, host: &str, alloc: Alloc<'_>) -> Option<&'static str> {
     let unit = graph.units.get(script.index())?;
     let pkg = unit.name.as_str();
@@ -71,8 +73,8 @@ pub fn missing_native_host_tool(graph: &UnitGraph<'_>, script: UnitId, host: &st
     if native::closure_has_crate(graph, script, "cmake", alloc) && !tools.iter().any(|tool| tool.name == "cmake") {
         return Some("cmake");
     }
-    if toolchain::NATIVE_EVERY_MODE.binary_search(&pkg).is_ok() && tools.is_empty() {
-        return Some("perl");
+    if let Ok(Some(missing)) = host_tools::missing_for_target(CLANG_JSON, host, pkg, alloc) {
+        return Some(missing);
     }
     None
 }
@@ -534,10 +536,11 @@ pub fn native_outputs<'a>(
     };
     let compiler = hex32(native.shelf.rsplit('/').next().unwrap_or("")).ok_or_else(|| NativeUnitError::Shelf { shelf: native.shelf.to_owned() })?;
     let parts = NativeKeyParts { compiler, target: setting.host, sysroot: sysroot_key.as_str(), host_tools: &tool_keys };
+    let probe_table = Table { rows: setting.table.as_slice() };
     let inputs = KeyInputs {
         module: module_digest,
         env: &env,
-        answers: Table::EMPTY.id(),
+        answers: probe_table.id(),
         c_mode: CMode::Built,
         limits: RunLimits::STANDARD,
         runner: runner_key(Runner::Native { because }, &parts),
@@ -608,7 +611,7 @@ pub fn native_outputs<'a>(
             fallback_shim.as_str()
         }
     };
-    let facts = native_facts::prepare(shim, native.work, run_key.as_str(), pins, alloc).map_err(facts_error)?;
+    let facts = native_facts::prepare_with_probes(shim, native.work, run_key.as_str(), pins, setting.host, &probe_table, alloc).map_err(facts_error)?;
     work_guard.push_dir(blaze_own::format_in!(alloc, "facts/{}", run_key.as_str()));
     work_guard.push_file(blaze_own::format_in!(alloc, "facts/{}.lock", run_key.as_str()));
     // The home's file area: each file the script leaves goes there by digest, renamed, never
@@ -641,12 +644,17 @@ pub fn native_outputs<'a>(
     for (real, shown) in laid.shown.iter() {
         dep_shown.push((real.as_str(), shown.as_str()));
     }
-    // Linux Landlock extra sysroot roots (NixOS split kernel headers, libc runtime lib dir,
-    // preserved rpaths, and dynamic-linker parent directory) + staged `clang.cfg` (Rule 25, Rule 30).
+    // Linux Landlock extra sysroot roots — exact 1:1 parity with what `resolve_linux_sysroot`
+    // hashes into `sdk_version` (`<sdk_extra>/include`, `sdk_lib`, `sdk_rpaths`, and any external
+    // `sdk_dynamic_linker` file itself, never unhashed parent directories) (Rule 21, Rule 30).
+    let extra_include: Option<AString<'a>> = (native.sysroot == Sysroot::LinuxHost)
+        .then_some(native.sdk_extra)
+        .flatten()
+        .map(|extra| blaze_own::format_in!(alloc, "{extra}/include"));
     let mut sysroot_extra_reads: AVec<'a, &str> = Vec::new_in(alloc);
     if native.sysroot == Sysroot::LinuxHost {
-        if let Some(extra) = native.sdk_extra {
-            sysroot_extra_reads.push(extra);
+        if let Some(extra_inc) = extra_include.as_deref() {
+            sysroot_extra_reads.push(extra_inc);
         }
         if let Some(lib) = native.sdk_lib {
             sysroot_extra_reads.push(lib);
@@ -654,11 +662,15 @@ pub fn native_outputs<'a>(
         for rpath in native.sdk_rpaths.iter() {
             sysroot_extra_reads.push(rpath);
         }
-        if let Some(dyn_linker) = native.sdk_dynamic_linker
-            && let Some((parent, _)) = dyn_linker.rsplit_once('/')
-            && !parent.is_empty()
-        {
-            sysroot_extra_reads.push(parent);
+        if let Some(dyn_linker) = native.sdk_dynamic_linker {
+            let under_dir = |dir: &str| {
+                dyn_linker.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'))
+            };
+            let covered = native.sdk_lib.is_some_and(under_dir)
+                || native.sdk_rpaths.iter().any(under_dir);
+            if !covered {
+                sysroot_extra_reads.push(dyn_linker);
+            }
         }
     }
     let shelf = Shelf { dir: native.shelf, clang_major };
@@ -782,6 +794,8 @@ pub fn native_outputs<'a>(
                 laid_folders: &laid_folders,
                 shim: Some(shim),
                 pins,
+                host: setting.host,
+                table: &probe_table,
                 ran: &ran,
                 asked: &asked,
             },
@@ -939,6 +953,8 @@ pub struct CertifyInput<'a, 's> {
     pub laid_folders: &'s [&'s str],
     pub shim: Option<&'s str>,
     pub pins: Option<&'s crate::spawn_route::FactPins>,
+    pub host: &'s str,
+    pub table: &'s Table<'s>,
     pub ran: &'s NativeScriptRun<'a>,
     pub asked: &'s native_facts::Asked,
 }
@@ -968,7 +984,7 @@ pub fn certify_member_reads<'a>(
     cert_guard.push_dir(cert_out_rel);
     let cert_facts = match input.shim {
         Some(shim) => {
-            let f = native_facts::prepare(shim, input.work, cert_key.as_str(), input.pins, alloc).ok()?;
+            let f = native_facts::prepare_with_probes(shim, input.work, cert_key.as_str(), input.pins, input.host, input.table, alloc).ok()?;
             cert_guard.push_dir(blaze_own::format_in!(alloc, "facts/{}", cert_key.as_str()));
             cert_guard.push_file(blaze_own::format_in!(alloc, "facts/{}.lock", cert_key.as_str()));
             Some(f)
@@ -1322,20 +1338,31 @@ mod tests {
         units.push(unit("zstd-sys", UnitKind::BuildScript, &[3], None)); // 4: cc only
         units.push(unit("bindgen-cmake", UnitKind::BuildScript, &[1, 6], None)); // 5: no_wasm + cmake
         units.push(unit("bindgen", UnitKind::Lib, &[], None)); // 6
+        units.push(unit("tikv-jemalloc-sys", UnitKind::BuildScript, &[3], None)); // 7: cc + needed_by sh/make/nm/hostname/uname
         let graph = UnitGraph { units, resolver: Resolver::V3, meta: AVec::new_in(alloc), left_out: AVec::new_in(alloc) };
 
-        // On Linux, `pins/clang.json` grants neither `cmake` nor `perl`, so `cmake` scripts and
-        // `sha3-asm` stay on Wasm instead of selecting an unready native runner.
+        // On Linux, `pins/clang.json` grants neither `cmake`, `perl`, nor `tikv-jemalloc-sys`'s
+        // `sh`/`make`/`nm`/`hostname`/`uname`, so all three stay on Wasm instead of selecting an
+        // unready native runner.
         assert_eq!(super::missing_native_host_tool(&graph, UnitId(0), LINUX, alloc), Some("cmake"));
         assert_eq!(super::placed_for_host(&graph, UnitId(0), Mode::Build, LINUX, alloc), Runner::Wasm);
         assert_eq!(super::placed_for_host(&graph, UnitId(0), Mode::Check, LINUX, alloc), Runner::Wasm);
         assert_eq!(super::missing_native_host_tool(&graph, UnitId(2), LINUX, alloc), Some("perl"));
         assert_eq!(super::placed_for_host(&graph, UnitId(2), Mode::Check, LINUX, alloc), Runner::Wasm);
         assert_eq!(super::placed_for_host(&graph, UnitId(2), Mode::Build, LINUX, alloc), Runner::Wasm);
+        assert!(
+            super::missing_native_host_tool(&graph, UnitId(7), LINUX, alloc).is_some(),
+            "tikv-jemalloc-sys requires host tools not granted on Linux"
+        );
+        assert_eq!(super::placed_for_host(&graph, UnitId(7), Mode::Build, LINUX, alloc), Runner::Wasm);
+        assert_eq!(super::placed_for_host(&graph, UnitId(7), Mode::Run, LINUX, alloc), Runner::Wasm);
 
-        // Control: macOS grants `perl` to `sha3-asm`, so `sha3-asm` stays native on macOS.
+        // Control: macOS grants `perl` to `sha3-asm` and all 5 tools to `tikv-jemalloc-sys`, so
+        // both stay native on macOS.
         assert_eq!(super::missing_native_host_tool(&graph, UnitId(2), MACOS, alloc), None);
         assert_eq!(super::placed_for_host(&graph, UnitId(2), Mode::Check, MACOS, alloc), Runner::Native { because: UnitId(3) });
+        assert_eq!(super::missing_native_host_tool(&graph, UnitId(7), MACOS, alloc), None);
+        assert_eq!(super::placed_for_host(&graph, UnitId(7), Mode::Build, MACOS, alloc), Runner::Native { because: UnitId(3) });
 
         // Control: `cc`-only scripts need only the pinned clang shelf and run native on Linux in Build.
         assert_eq!(super::missing_native_host_tool(&graph, UnitId(4), LINUX, alloc), None);

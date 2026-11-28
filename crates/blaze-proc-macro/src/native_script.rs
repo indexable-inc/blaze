@@ -231,6 +231,16 @@ fn signal_name(signal: i32) -> &'static str {
     }
 }
 
+/// The primary sysroot directory granted read-only to the sandbox: on `Sysroot::LinuxHost` this
+/// is narrowed to `<sysroot>/include` (never blanket `/usr` or unhashed sibling directories) so
+/// Landlock read grants match `resolve_linux_sysroot`'s `sdk_digest` 1:1 (Rule 21).
+fn sysroot_primary_read<'a>(c: &CInputs<'_>, alloc: Alloc<'a>) -> AString<'a> {
+    if c.sysroot_kind == Sysroot::LinuxHost {
+        blaze_own::format_in!(alloc, "{}/include", c.sysroot)
+    } else {
+        String::from_str_in(c.sysroot, alloc)
+    }
+}
 /// The `OUT_DIR` and `CARGO_MANIFEST_DIR` the script is shown (what its outputs' real folders
 /// are mapped back to), each from its environment; a missing one is refused by name (rule 3).
 fn shown_folders<'e>(env: &'e Env<'_>, program: &str) -> Result<(&'e str, &'e str), NativeScriptError> {
@@ -268,6 +278,32 @@ mod d96_tests {
         assert!(matches!(shown_folders(&no_dir, "s"), Err(NativeScriptError::MissingVar { name: "CARGO_MANIFEST_DIR", .. })));
         let no_out = env(&[("CARGO_MANIFEST_DIR", "/package")]);
         assert!(matches!(shown_folders(&no_out, "s"), Err(NativeScriptError::MissingVar { name: "OUT_DIR", .. })));
+    }
+
+    #[test]
+    fn linux_sysroot_primary_read_narrows_fhs_and_nixos_to_include() {
+        use blaze_build_script::toolchain::{CInputs, Shelf, Sysroot};
+        let alloc = blaze_own::testing::heap().alloc();
+        let make = |sysroot_kind, sysroot| CInputs {
+            shelf: Shelf { dir: "/h/shelf", clang_major: "23" },
+            sysroot_kind,
+            sysroot,
+            sysroot_extra_reads: &[],
+            linux_clang_cfg: None,
+            out_dir: "/h/out",
+            package: "/h/pkg",
+            seen: blaze_expand::seen::SeenRoot::Package,
+            macos_min: "11.0",
+        };
+        assert_eq!(super::sysroot_primary_read(&make(Sysroot::LinuxHost, "/usr"), alloc).as_str(), "/usr/include");
+        assert_eq!(
+            super::sysroot_primary_read(&make(Sysroot::LinuxHost, "/nix/store/abc-glibc-dev"), alloc).as_str(),
+            "/nix/store/abc-glibc-dev/include"
+        );
+        assert_eq!(
+            super::sysroot_primary_read(&make(Sysroot::MacosSdk, "/Applications/Xcode.app/SDKs/MacOSX.sdk"), alloc).as_str(),
+            "/Applications/Xcode.app/SDKs/MacOSX.sdk"
+        );
     }
 }
 
@@ -1039,9 +1075,11 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
     if script.confined.is_none() {
         reads.push(c.package);
     }
-    reads.extend_from_slice(&[c.shelf.dir, c.sysroot]);
-    // Linux Landlock split sysroot roots (`sdk_extra`, `sdk_lib`, `sdk_rpaths`, dynamic linker
-    // parent dir) and staged `clang.cfg` folder (deduplicated below in `spellings`).
+    reads.push(c.shelf.dir);
+    let primary_sysroot_read = sysroot_primary_read(&c, alloc);
+    reads.push(primary_sysroot_read.as_str());
+    // Linux Landlock split sysroot roots (`<sdk_extra>/include`, `sdk_lib`, `sdk_rpaths`,
+    // external `sdk_dynamic_linker`) and staged `clang.cfg` folder (deduplicated in `spellings`).
     reads.extend_from_slice(c.sysroot_extra_reads);
     if let Some(cfg_dir) = linux_cfg_dir {
         reads.push(cfg_dir);
