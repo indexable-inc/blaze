@@ -18,7 +18,10 @@ use super::entry::{Texts, input};
 use crate::graph::{CrateId, Sysroot};
 use crate::names::Written;
 use crate::resolve::{CrateInput, Names, resolve_crates};
-use crate::task::{PROC_MACRO_DECLS, ProcAttr, Serial, proc_macro_decls_key};
+use crate::task::{
+    PROC_MACRO_DECLS, PROC_MACRO_DECLS_FN, PROC_MACRO_DECLS_LEN_FN, ProcAttr, Serial,
+    proc_macro_decls_fn_key, proc_macro_decls_key, proc_macro_decls_len_fn_key,
+};
 
 /// One macro of each kind, the attribute's fn named by a raw identifier, an ordinary fn between
 /// them that is in no list.
@@ -279,4 +282,141 @@ create_derive!("display", fmt::display, Display, display_derive, display);
         assert!(pos >= prev, "`_DECLS` order must match `proc_exports` order: {text}");
         prev = pos;
     }
+}
+
+/// Native targets emit the link-time C-ABI accessors `__blaze_pm_decls` and `__blaze_pm_decls_len`
+/// alongside `_DECLS` (never bound in the crate's scope), while `wasm64` and `wasm32` targets
+/// suppress them so wasm proc-macro modules have zero extra items or exports.
+#[test]
+fn link_time_decls_accessors_emit_on_native_and_stay_gated_off_on_wasm() {
+    let g = Alloc::global();
+    let implicit = Implicit {
+        std: StdIs::Rust,
+        prelude: Prelude::Rust(edition::Edition::Edition2021),
+        proc_macro: true,
+        entry: false,
+    };
+
+    // 1. Native target (`aarch64` / `linux`): emits `_DECLS`, `__blaze_pm_decls`, `__blaze_pm_decls_len`.
+    let native_cfg: &[(&str, Option<&str>)] = &[
+        ("target_arch", Some("aarch64")),
+        ("target_os", Some("linux")),
+        ("target_family", Some("unix")),
+        ("unix", None),
+    ];
+    let macros_native = CrateInput {
+        implicit,
+        cfg: native_cfg,
+        ..input("macros", "/macros/lib.rs", &[])
+    };
+    let native_crates = [input("plain", "/plain/lib.rs", &[]), macros_native];
+    let native_names = resolve_crates(
+        &native_crates,
+        Sysroot::default(),
+        &TEXTS,
+        &Serial,
+        super::SyncFrame::leaked(),
+    )
+    .unwrap_or_else(|e| panic!("resolve_crates native: {e}"));
+
+    let pm_key = native_crates[1].key;
+    assert!(text_of(&native_names, 1, proc_macro_decls_key(pm_key)).is_some());
+
+    let (fn_name, fn_text) = text_of(&native_names, 1, proc_macro_decls_fn_key(pm_key))
+        .expect("native target must emit `__blaze_pm_decls`");
+    assert_eq!(fn_name, Some(PROC_MACRO_DECLS_FN));
+    assert!(fn_text.contains("#[unsafe(export_name = \"__blaze_pm_decls\")]"), "{fn_text}");
+    assert!(
+        fn_text.contains("pub extern \"C\" fn __blaze_pm_decls() -> *const ::proc_macro::bridge::client::Client"),
+        "{fn_text}"
+    );
+    let client = "::proc_macro::bridge::client::Client::";
+    let wanted = [
+        format!("{client}expand1(crate::derive_hello)"),
+        format!("{client}expand2(crate::r#trace)"),
+        format!("{client}expand1(crate::make)"),
+    ];
+    let at: Vec<usize> = wanted
+        .iter()
+        .map(|w| fn_text.find(w.as_str()).unwrap_or_else(|| panic!("`{w}` in {fn_text}")))
+        .collect();
+    assert!(at.windows(2).all(|w| w[0] < w[1]), "declaration order: {at:?} in {fn_text}");
+    assert_eq!(fn_text.matches(client).count(), 3, "{fn_text}");
+
+    let (len_name, len_text) = text_of(&native_names, 1, proc_macro_decls_len_fn_key(pm_key))
+        .expect("native target must emit `__blaze_pm_decls_len`");
+    assert_eq!(len_name, Some(PROC_MACRO_DECLS_LEN_FN));
+    assert!(len_text.contains("#[unsafe(export_name = \"__blaze_pm_decls_len\")]"), "{len_text}");
+    assert!(len_text.contains("3usize"), "{len_text}");
+
+    // Neither accessor may be bound into the crate's scope.
+    for sym in [PROC_MACRO_DECLS_FN, PROC_MACRO_DECLS_LEN_FN] {
+        let bound = native_names.item_at(
+            native_names.root(1),
+            Namespace::Values,
+            Written { kind: PathKind::Plain, segments: &[sym] },
+            g,
+        );
+        assert!(bound.is_err(), "`{sym}` must not be nameable from the crate");
+    }
+
+    // 2. Wasm64 and wasm32 targets: `_DECLS` present, BOTH native accessors cfg'd out!
+    const WASM64_CFG: &[(&str, Option<&str>)] = &[
+        ("target_arch", Some("wasm64")),
+        ("target_os", Some("wasi")),
+        ("target_family", Some("wasm")),
+    ];
+    const WASM32_CFG: &[(&str, Option<&str>)] = &[
+        ("target_arch", Some("wasm32")),
+        ("target_os", Some("wasi")),
+        ("target_family", Some("wasm")),
+    ];
+    for (arch, wasm_cfg) in [("wasm64", WASM64_CFG), ("wasm32", WASM32_CFG)] {
+        let macros_wasm = CrateInput {
+            implicit,
+            cfg: wasm_cfg,
+            ..input("macros", "/macros/lib.rs", &[])
+        };
+        let wasm_crates = [input("plain", "/plain/lib.rs", &[]), macros_wasm];
+        let wasm_names = resolve_crates(
+            &wasm_crates,
+            Sysroot::default(),
+            &TEXTS,
+            &Serial,
+            super::SyncFrame::leaked(),
+        )
+        .unwrap_or_else(|e| panic!("resolve_crates {arch}: {e}"));
+        let k = wasm_crates[1].key;
+        assert!(text_of(&wasm_names, 1, proc_macro_decls_key(k)).is_some(), "{arch} keeps `_DECLS`");
+        assert!(
+            text_of(&wasm_names, 1, proc_macro_decls_fn_key(k)).is_none(),
+            "{arch} must NOT emit `__blaze_pm_decls`"
+        );
+        assert!(
+            text_of(&wasm_names, 1, proc_macro_decls_len_fn_key(k)).is_none(),
+            "{arch} must NOT emit `__blaze_pm_decls_len`"
+        );
+    }
+
+    // 3. Empty proc-macro crate (0 macros): valid empty slice and `0usize`.
+    const EMPTY_PM: &str = "#![no_core]\npub fn helper() {}\n";
+    static EMPTY_TEXTS: Texts = Texts(&[&[("/empty/lib.rs", EMPTY_PM)]]);
+    let empty_crates = [CrateInput {
+        implicit,
+        cfg: native_cfg,
+        ..input("empty_pm", "/empty/lib.rs", &[])
+    }];
+    let empty_names = resolve_crates(
+        &empty_crates,
+        Sysroot::default(),
+        &EMPTY_TEXTS,
+        &Serial,
+        super::SyncFrame::leaked(),
+    )
+    .unwrap_or_else(|e| panic!("resolve_crates empty: {e}"));
+    let ek = empty_crates[0].key;
+    let (_, empty_fn) = text_of(&empty_names, 0, proc_macro_decls_fn_key(ek)).expect("empty decls fn");
+    let (_, empty_len) = text_of(&empty_names, 0, proc_macro_decls_len_fn_key(ek)).expect("empty decls len fn");
+    assert!(empty_fn.contains("static DECLS: &[::proc_macro::bridge::client::Client] = &[];"), "{empty_fn}");
+    assert!(empty_len.contains("0usize"), "{empty_len}");
 }

@@ -2217,6 +2217,12 @@ const HARNESS_PATH: &str = "proc_macro_harness";
 const HARNESS_TAG: &str = "proc-macro harness";
 /// The name the harness's static is declared with (rustc's `sym::_DECLS`), never bound.
 pub const PROC_MACRO_DECLS: &str = "_DECLS";
+/// The C-ABI symbol exporting the proc-macro crate's `Client` slice base pointer for native
+/// Tier-2 proc-macro executables (bound directly at link time, zero `dlopen`/`dlsym`).
+pub const PROC_MACRO_DECLS_FN: &str = "__blaze_pm_decls";
+/// The C-ABI symbol exporting the proc-macro crate's `Client` slice length for native Tier-2
+/// proc-macro executables.
+pub const PROC_MACRO_DECLS_LEN_FN: &str = "__blaze_pm_decls_len";
 /// The static's text up to its list (the attributes rustc puts on it).
 const HARNESS_HEAD: &str =
     "#[rustc_proc_macro_decls]\n#[used]\n#[allow(deprecated)]\npub static _DECLS: &[::proc_macro::bridge::client::Client] = &[";
@@ -2241,10 +2247,7 @@ pub fn proc_macro_harness_call(krate: CrateItemKey) -> ItemKey {
     key_of(krate, root_key(krate), HARNESS_TAG, HARNESS_PATH, 0)
 }
 
-/// Formats the `#[rustc_proc_macro_decls] pub static _DECLS` text for `entries` in order.
-pub fn proc_macro_harness_text<'a>(entries: &[ProcHarnessEntry<'a>], bump: Bump<'a>) -> &'a str {
-    let mut text = BString::new_in(bump);
-    text.push_str(HARNESS_HEAD);
+fn push_harness_entries(text: &mut BString<'_>, entries: &[ProcHarnessEntry<'_>]) {
     for entry in entries {
         text.push_str(HARNESS_CLIENT);
         text.push_str(match entry.kind {
@@ -2254,7 +2257,34 @@ pub fn proc_macro_harness_text<'a>(entries: &[ProcHarnessEntry<'a>], bump: Bump<
         text.push_str(entry.fn_name);
         text.push_str("), ");
     }
+}
+
+/// Formats the `#[rustc_proc_macro_decls] pub static _DECLS` static and (on non-wasm targets)
+/// the link-time C-ABI accessors `__blaze_pm_decls` and `__blaze_pm_decls_len` for `entries`
+/// in order.
+pub fn proc_macro_harness_text<'a>(entries: &[ProcHarnessEntry<'a>], bump: Bump<'a>) -> &'a str {
+    let mut text = BString::new_in(bump);
+    text.push_str(HARNESS_HEAD);
+    push_harness_entries(&mut text, entries);
     text.push_str("];\n");
+    text.push_str(
+        "#[cfg(not(any(target_arch = \"wasm32\", target_arch = \"wasm64\")))]\n\
+         #[unsafe(export_name = \"__blaze_pm_decls\")]\n\
+         #[allow(deprecated)]\n\
+         pub extern \"C\" fn __blaze_pm_decls() -> *const ::proc_macro::bridge::client::Client {\n\
+         \x20   static DECLS: &[::proc_macro::bridge::client::Client] = &[",
+    );
+    push_harness_entries(&mut text, entries);
+    text.push_str(
+        "];\n\
+         \x20   DECLS.as_ptr()\n\
+         }\n\
+         #[cfg(not(any(target_arch = \"wasm32\", target_arch = \"wasm64\")))]\n\
+         #[unsafe(export_name = \"__blaze_pm_decls_len\")]\n\
+         pub extern \"C\" fn __blaze_pm_decls_len() -> usize {\n\
+         \x20   ",
+    );
+    let _ = core::fmt::Write::write_fmt(&mut text, format_args!("{}usize\n}}\n", entries.len()));
     text.into_bump_str()
 }
 
@@ -2265,6 +2295,18 @@ pub fn proc_macro_harness_text<'a>(entries: &[ProcHarnessEntry<'a>], bump: Bump<
 pub fn proc_macro_decls_key(krate: CrateItemKey) -> ItemKey {
     let call = proc_macro_harness_call(krate);
     key_of(krate, call, kind_tag(ItemKind::Static), PROC_MACRO_DECLS, 0)
+}
+
+/// The key of crate `krate`'s native link-time `__blaze_pm_decls` accessor fn (non-wasm targets).
+pub fn proc_macro_decls_fn_key(krate: CrateItemKey) -> ItemKey {
+    let call = proc_macro_harness_call(krate);
+    key_of(krate, call, kind_tag(ItemKind::Function), PROC_MACRO_DECLS_FN, 0)
+}
+
+/// The key of crate `krate`'s native link-time `__blaze_pm_decls_len` accessor fn (non-wasm targets).
+pub fn proc_macro_decls_len_fn_key(krate: CrateItemKey) -> ItemKey {
+    let call = proc_macro_harness_call(krate);
+    key_of(krate, call, kind_tag(ItemKind::Function), PROC_MACRO_DECLS_LEN_FN, 0)
 }
 
 /// The symbol of a hosted program's start (bstd's `guest::start`, run.md "The hosted world").

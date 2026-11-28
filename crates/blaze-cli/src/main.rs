@@ -48,6 +48,8 @@ mod proc_env_unknown_tests;
 mod proc_runner;
 mod names;
 mod native_image;
+#[allow(dead_code, reason = "wired by Tier-2 native proc-macro compiler (PR 3)")]
+mod native_pm_harness;
 mod native_runner_c;
 mod script_modules;
 mod scripts;
