@@ -1621,7 +1621,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 }
             }
             if read_owner_clauses {
-                g.reads.push(clauses_read(owner.0, &owner_regions));
+                g.reads.push(clauses_read(owner.0, &owner_regions, r.store.tys.view()));
             }
         }
         if !param_traits.is_empty() {
@@ -1691,7 +1691,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                         let t_views = if !direct.is_empty() && t_len > 0 {
                             if clauses_recorded.scan_for(&t).is_none() {
                                 clauses_recorded.push(t);
-                                g.reads.push(clauses_read(t.0, &t_regions));
+                                g.reads.push(clauses_read(t.0, &t_regions, r.store.tys.view()));
                             }
                             t_regions.clauses(t).ok()
                         } else {
@@ -1955,7 +1955,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     // item bounds, and nested alias traits so `regions.clauses` and `assoc_items` are loaded for
     // supertrait elaboration in `blaze-borrow`.
     {
-        fn push_clause_traits(stys: tc::PTys<'_>, cl: &tc::PClause, traits: &mut AVec<'_, u128>) {
+        fn push_clause_traits(stys: tc::PTys<'_>, cl: &tc::PClause, traits: &mut AVec<'_, u128>, opaques: &mut AVec<'_, u128>) {
             let (args, extra_ty) = match *cl {
                 tc::PClause::Trait { trait_: sup, args } => {
                     if traits.scan_for(&sup.0).is_none() {
@@ -1969,6 +1969,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                     }
                     (Some(args), Some(term))
                 }
+                tc::PClause::TypeOutlives { ty, .. } => (None, Some(ty)),
                 _ => (None, None),
             };
             let mut st = [tc::PTy(0); 32];
@@ -1977,34 +1978,63 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 && let Ok(list) = stys.list(args)
             {
                 for &t in list {
-                    if len < st.len() {
-                        st[len] = t;
+                    if let Some(slot) = st.get_mut(len) {
+                        *slot = t;
                         len += 1;
                     }
                 }
             }
             if let Some(t) = extra_ty
-                && len < st.len()
+                && let Some(slot) = st.get_mut(len)
             {
-                st[len] = t;
+                *slot = t;
                 len += 1;
             }
             let mut steps = 0u32;
             while len > 0 && steps < 64 {
                 len -= 1;
                 steps += 1;
-                let Ok(node) = stys.node(st[len]) else { continue };
+                let Some(&cur) = st.get(len) else { break };
+                let Ok(node) = stys.node(cur) else { continue };
                 match node {
-                    tc::PNode::Alias { trait_: at, args: al, .. }
-                    | tc::PNode::ExProj { trait_: at, args: al, .. }
-                    | tc::PNode::ExTrait(at, al) => {
+                    tc::PNode::Alias { trait_: at, args: al, .. } | tc::PNode::ExTrait(at, al) => {
                         if traits.scan_for(&at.0).is_none() {
                             traits.push(at.0);
                         }
                         if let Ok(xs) = stys.list(al) {
                             for &x in xs {
-                                if len < st.len() {
-                                    st[len] = x;
+                                if let Some(slot) = st.get_mut(len) {
+                                    *slot = x;
+                                    len += 1;
+                                }
+                            }
+                        }
+                    }
+                    tc::PNode::ExProj { trait_: at, args: al, term, .. } => {
+                        if traits.scan_for(&at.0).is_none() {
+                            traits.push(at.0);
+                        }
+                        if let Some(slot) = st.get_mut(len) {
+                            *slot = term;
+                            len += 1;
+                        }
+                        if let Ok(xs) = stys.list(al) {
+                            for &x in xs {
+                                if let Some(slot) = st.get_mut(len) {
+                                    *slot = x;
+                                    len += 1;
+                                }
+                            }
+                        }
+                    }
+                    tc::PNode::Opaque(ok, al) => {
+                        if opaques.scan_for(&ok.0).is_none() {
+                            opaques.push(ok.0);
+                        }
+                        if let Ok(xs) = stys.list(al) {
+                            for &x in xs {
+                                if let Some(slot) = st.get_mut(len) {
+                                    *slot = x;
                                     len += 1;
                                 }
                             }
@@ -2013,11 +2043,13 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                     tc::PNode::Adt(_, al)
                     | tc::PNode::Tuple(al)
                     | tc::PNode::Dynamic(al)
-                    | tc::PNode::Opaque(_, al) => {
+                    | tc::PNode::FnPtr(al, _)
+                    | tc::PNode::Record(_, al)
+                    | tc::PNode::Union(al) => {
                         if let Ok(xs) = stys.list(al) {
                             for &x in xs {
-                                if len < st.len() {
-                                    st[len] = x;
+                                if let Some(slot) = st.get_mut(len) {
+                                    *slot = x;
                                     len += 1;
                                 }
                             }
@@ -2026,13 +2058,26 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                     tc::PNode::Ref(_, x)
                     | tc::PNode::Ptr(_, x)
                     | tc::PNode::Slice(x)
-                    | tc::PNode::Array(x, _) => {
-                        if len < st.len() {
-                            st[len] = x;
+                    | tc::PNode::Array(x, _)
+                    | tc::PNode::Pat(x, _) => {
+                        if let Some(slot) = st.get_mut(len) {
+                            *slot = x;
                             len += 1;
                         }
                     }
                     _ => {}
+                }
+            }
+        }
+
+        // Gather nested traits and opaques inside `owner`'s `TypeOutlives` subjects (e.g.
+        // `where (<() as UnusedProj<'a>>::Assoc, &'b U): 'k`) so their heads, RPITIT rows,
+        // and arities are loaded before `load_declared_bounds` decomposes the subject.
+        if let Some(p) = r.store.preds.get(&owner) {
+            let stys = r.store.tys.view();
+            for cl in p.clauses.iter() {
+                if matches!(cl, tc::PClause::TypeOutlives { .. }) {
+                    push_clause_traits(stys, cl, &mut traits, &mut opaques);
                 }
             }
         }
@@ -2052,23 +2097,25 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             let stys = r.store.tys.view();
             if let Some(p) = r.store.preds.get(&tk) {
                 for cl in p.clauses.iter() {
-                    push_clause_traits(stys, cl, &mut traits);
+                    push_clause_traits(stys, cl, &mut traits, &mut opaques);
                 }
             }
             if let Some(def) = r.store.trait_defs.get(&tk) {
                 for sc in def.supertraits.iter() {
-                    push_clause_traits(stys, sc, &mut traits);
+                    push_clause_traits(stys, sc, &mut traits, &mut opaques);
                 }
                 for a in def.assoc.iter() {
                     g.assoc_items.push((tk.0, a.name, a.item));
                     if let Some(ap) = r.store.preds.get(&a.item) {
                         for ac in ap.clauses.iter() {
-                            push_clause_traits(stys, ac, &mut traits);
+                            push_clause_traits(stys, ac, &mut traits, &mut opaques);
                         }
                     }
                 }
             }
         }
+        opaques.sort_unstable();
+        opaques.dedup();
         traits.sort_unstable();
         traits.dedup();
         g.assoc_items.sort_unstable_by_key(|&(k, n, _)| (k, n));
@@ -2783,14 +2830,15 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             }
             g.reads.push(impl_read(imp, &names, &regions));
         }
+        let stys = r.store.tys.view();
         for &k in traits.iter() {
-            g.reads.push(clauses_read(k, &regions));
+            g.reads.push(clauses_read(k, &regions, stys));
         }
         for &k in opaques.iter() {
-            g.reads.push(clauses_read(k, &regions));
+            g.reads.push(clauses_read(k, &regions, stys));
         }
         for &(_, _, a_item) in g.assoc_items.iter() {
-            g.reads.push(clauses_read(a_item.0, &regions));
+            g.reads.push(clauses_read(a_item.0, &regions, stys));
         }
         // The generic shape of each head whose signature regions are filed: where its type
         // parameters stand among its positions (blaze-flow-lower generic_call.rs), counted by
@@ -2948,6 +2996,9 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 let ik = tc::ItemKey(k);
                 if let Ok(sig) = regions.sig(ik) {
                     walker.walk_ty(sig.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    if let Some(out) = sig.written_output {
+                        walker.walk_ty(out.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
                 }
                 if let Ok(cls) = regions.clauses(ik) {
                     for cv in cls {

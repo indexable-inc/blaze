@@ -225,3 +225,66 @@ fn borrow_reads_move_the_body_digest() {
 
     println!("BORROW READS: moves typeck rows equal, Token's row moved, digest moved; calls pick's head row moved, digest moved");
 }
+
+#[test]
+fn type_outlives_subject_change_moves_clauses_read_digest() {
+    const WITH_PARAM: &str = "fn main() {}
+
+fn check_outlives<'a, 'k, T>(x: &'a ())
+where
+    (&'a (), T): 'k,
+{
+    let _ = x;
+}
+";
+    const WITHOUT_PARAM: &str = "fn main() {}
+
+fn check_outlives<'a, 'k, T>(x: &'a ())
+where
+    &'a (): 'k,
+{
+    let _ = x;
+}
+";
+    let run = |text: &'static str| -> Seen {
+        let heap = blaze_own::testing::heap();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let shelf = format!("{home}/.blaze/v2/toolchain");
+        let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+        let files = [("/outlives-read/src/main.rs".to_string(), text.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("a known edition");
+        let user = UserCrate { name: "outlives_read", dir: "/outlives-read/", root: "/outlives-read/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let sources = [SourceFile { path: "src/main.rs", text }];
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
+        let mut world = ProjectWorld::new(&names, &frame, &sources, heap.alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+        let bodies = world.bodies(heap.alloc());
+        let target = bodies
+            .iter()
+            .find(|(b, _)| match b {
+                BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name) == Some("check_outlives"),
+                BodyRef::Member { name, .. } => *name == "check_outlives",
+            })
+            .map(|(b, _)| *b)
+            .expect("`check_outlives` listed");
+        let (types, borrows) = world.check_borrows(target, heap.alloc());
+        assert!(borrows.is_clean(), "`check_outlives` is borrow checked clean: {borrows:?}");
+        seen("check_outlives", &types)
+    };
+    const CLAUSES_DETAIL: u64 = 11;
+    let a = run(WITH_PARAM);
+    let b = run(WITHOUT_PARAM);
+    let a11: Vec<Read> = of_kind(&a.rows, FactKind::BorrowHead).into_iter().filter(|r| r.fact.detail == CLAUSES_DETAIL).collect();
+    let b11: Vec<Read> = of_kind(&b.rows, FactKind::BorrowHead).into_iter().filter(|r| r.fact.detail == CLAUSES_DETAIL).collect();
+    assert!(!a11.is_empty(), "clauses_read rows recorded for `check_outlives`: {a11:?}");
+    assert_eq!(keys_of(&a11), keys_of(&b11), "same BorrowHead detail-11 fact keys: {a11:?} then {b11:?}");
+    let moved: Vec<(Read, Read)> = a11.iter().zip(b11.iter()).filter(|(x, y)| x != y).map(|(x, y)| (*x, *y)).collect();
+    assert_eq!(
+        moved.len(),
+        1,
+        "changing `(&'a (), T): 'k` to `&'a (): 'k` (same slots and RHS, different subject type) must move `check_outlives`'s clauses_read digest: {a11:?} then {b11:?}"
+    );
+    assert_ne!(a.digest, b.digest, "body read digest must change when TypeOutlives subject type changes");
+}

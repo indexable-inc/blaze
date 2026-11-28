@@ -273,6 +273,44 @@ where
 {
     x
 }
+
+trait UnusedProj<'a> {
+    type Assoc;
+}
+
+impl<'a> UnusedProj<'a> for () {
+    type Assoc = u8;
+}
+
+trait UnusedDyn<'a> {}
+
+fn proj_sibling_yields_ref<'a, 'b, 'k, U>(x: &'b U) -> &'k U
+where
+    (<() as UnusedProj<'a>>::Assoc, &'b U): 'k,
+{
+    x
+}
+
+fn proj_sibling_yields_param<'a, 'b, 'k, U>(u: U, r: &'k u8) -> &'k u8
+where
+    (<() as UnusedProj<'a>>::Assoc, &'b U): 'k,
+{
+    hold(u, r)
+}
+
+fn proj_sibling_does_not_yield_proj_region<'a, 'b, 'k, U>(x: &'a str, _u: &'b U) -> &'k str
+where
+    (<() as UnusedProj<'a>>::Assoc, &'b U): 'k,
+{
+    x
+}
+
+fn dyn_sibling_yields_ref<'a, 'b, 'k, U>(x: &'b U) -> &'k U
+where
+    (&'a (dyn UnusedDyn<'a> + 'a), &'b U): 'k,
+{
+    x
+}
 ";
 
 #[test]
@@ -318,6 +356,9 @@ fn async_implied_bounds_and_concrete_type_outlives() {
         "generic_hold",
         "tuple_outlives",
         "hr_fn_ptr_free_region",
+        "proj_sibling_yields_ref",
+        "proj_sibling_yields_param",
+        "dyn_sibling_yields_ref",
     ] {
         let b = find(name);
         let (types, v) = world.check_borrows(b, heap.alloc());
@@ -345,6 +386,7 @@ fn async_implied_bounds_and_concrete_type_outlives() {
         "at_missing_bound",
         "proj_outlives_no_region",
         "hr_fn_ptr_no_region",
+        "proj_sibling_does_not_yield_proj_region",
     ] {
         let b = find(name);
         let (types, v) = world.check_borrows(b, heap.alloc());
