@@ -1234,6 +1234,14 @@ pub(crate) enum Plant {
     /// Planted bug: ignores the same-boot check before probing a lease's PID, proving the DST
     /// oracle catches cross-boot lease reaping (phase_commit_tests DST).
     ReapOtherBootPid,
+    /// Planted bug: blindly refuses commits whenever wall-clock elapsed exceeds `GRACE_NS / 2`,
+    /// ignoring empty segment sets, unchanged generation, still-retired segments, and live lease
+    /// protection (pre-fix false-positive `CommitTooSlow` control in phase_commit_tests DST).
+    CommitTooSlowBlind,
+    /// Planted bug: skips the `CommitTooSlow` unlink-safety guard completely even when a slow
+    /// unleased commit's segment was retired and unlinked by concurrent compaction (unsoundness
+    /// control in phase_commit_tests DST).
+    CommitSkipsUnlinkGuard,
 }
 
 /// What one slice of the background pass did ([`Plain::scrub_next`]).
@@ -4777,6 +4785,30 @@ impl<A: Allocator + Clone> Plain<A> {
         Ok(())
     }
 
+    /// Advances an in-flight commit's `started_ns` to `now_ns` right before the driver submits the
+    /// commit's first disk write effects, excluding pre-write CPU/mmap work (`lay_out_plan_par`,
+    /// `reused_par`) that ran before any segment file existed on disk.
+    pub fn stamp_commit_write_start(&mut self, now_ns: u64) {
+        match &mut self.phase {
+            Phase::Writing(_, why) => {
+                if let Why::Commit { started_ns, .. } = &mut **why {
+                    *started_ns = (*started_ns).max(now_ns);
+                }
+            }
+            Phase::Flipping(flip) => {
+                if let Change::Commit { started_ns, .. } = &mut flip.change {
+                    *started_ns = (*started_ns).max(now_ns);
+                }
+            }
+            Phase::LoadingBloom => {
+                if let Some(Change::Commit { started_ns, .. }) = self.bloom_parked_flip.as_mut() {
+                    *started_ns = (*started_ns).max(now_ns);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Checks `count` unique candidate commit entries (accessed via `entry_at`) against prior
     /// committed segments in `namespace`, using [`Par::for_each_mut_chunks`] when
     /// `count >= PAR_TWO_VALUES_MIN_KEYS && par.workers() > 1 && !self.maps.is_empty()`.
@@ -7492,10 +7524,64 @@ impl<A: Allocator + Clone> Plain<A> {
                     }
                     true
                 };
+                let own_live_lease_opened_ns = m
+                    .leases
+                    .iter()
+                    .find(|it| it.holder == own_nonce && is_lease_live(it))
+                    .map(|it| it.opened_ns);
+                let own_gen = self.manifest.generation;
+                let own_retired = &self.manifest.retired;
+                let seg_may_be_unlinked = |seg_id: u64| -> bool {
+                    if base_gen == own_gen {
+                        // Zero other flips landed since our manifest view: no compaction retired
+                        // or unlinked any segment of this commit.
+                        return false;
+                    }
+                    if m.segments.iter().any(|it| it.id == seg_id && it.local) {
+                        // Already live and local in the current on-disk manifest (identical
+                        // content-addressed digest).
+                        return false;
+                    }
+                    if m.retired.iter().any(|it| it.id == seg_id && !it.log) {
+                        // Even if a concurrent compaction adopted this segment as an orphan, it is
+                        // still in `m.retired` right now under the exclusive flip lock, so no flip
+                        // has removed it from `m.retired` or queued `Effect::Remove`; the flip
+                        // below atomically rescues it via `m.retired.retain`.
+                        return false;
+                    }
+                    let was_retired_before = own_retired.iter().any(|it| it.id == seg_id && !it.log);
+                    if !was_retired_before && base_gen == own_gen.saturating_add(1) {
+                        // Only one flip landed since our view and this segment was not already in
+                        // `self.manifest.retired`: a single flip can at most retire an orphan with
+                        // `since_ns = flip_now_ns`, never unlink it in the same flip
+                        // (`since_ns + GRACE_NS > flip_now_ns`).
+                        return false;
+                    }
+                    if !was_retired_before
+                        && own_live_lease_opened_ns.is_some_and(|opened| opened <= *started_ns)
+                    {
+                        // Our own lease is present and live in `m.leases` right now (and only this
+                        // process inserts/removes `own_nonce`), so it was live at every flip since
+                        // `started_ns`. Because `seg_id` was not already retired before, any
+                        // orphan retirement after `started_ns` had `since_ns >= started_ns >=
+                        // opened`, so `opened < since_ns + GRACE_NS` held at every flip and the
+                        // unlink rule prevented any process from queuing this file for unlink.
+                        return false;
+                    }
+                    true
+                };
+                let commit_too_slow = if self.plant() == Plant::CommitSkipsUnlinkGuard {
+                    false
+                } else if self.plant() == Plant::CommitTooSlowBlind {
+                    now_ns.saturating_sub(*started_ns) > GRACE_NS / 2
+                } else {
+                    now_ns.saturating_sub(*started_ns) > GRACE_NS / 2
+                        && segs.iter().any(|(seg, _)| seg_may_be_unlinked(seg.id))
+                };
                 if refused.is_some() || map_all_retry {
-                } else if now_ns.saturating_sub(*started_ns) > GRACE_NS / 2 {
-                    // A compaction may have retired its segment as named by no generation:
-                    // it is not flipped.
+                } else if commit_too_slow {
+                    // A concurrent compaction may have retired and unlinked one of this commit's
+                    // segments as an orphan while we held no lease protecting it: do not flip.
                     refused = Some(StoreError::CommitTooSlow { took_s: now_ns.saturating_sub(*started_ns) / 1_000_000_000, grace_s: GRACE_NS / 1_000_000_000 });
                 } else if let Some(&(segment, key)) = self.touches.iter().find(|(id, _)| touch_missing(id)).or_else(|| extra_carry.first())
                     && self.plant() != Plant::CarrySkipped

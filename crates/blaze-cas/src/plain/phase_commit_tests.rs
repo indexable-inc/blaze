@@ -1307,3 +1307,416 @@ fn dead_pid_same_boot_lease_reclamation_dst() {
     let reaped_boot = run(203, 1, Plant::ReapOtherBootPid);
     assert!(!reaped_boot.other_boot_lease_kept, "oracle must catch Plant::ReapOtherBootPid reaping another boot's lease");
 }
+
+/// Deterministic simulation test (Rule 43) proving the exact `CommitTooSlow` unlink-safety
+/// invariant under slow commits (`31..=300 s`, past `GRACE_NS / 2` and past `GRACE_NS`):
+///
+/// Safe commits MUST succeed without false-positive `CommitTooSlow` and leave the store 100%
+/// readable with zero lost segments:
+///   (A) Single-writer slow commit (`base_gen == own_gen`).
+///   (B) Metadata/root-only slow commit (`segs.is_empty()`) across multiple concurrent flips.
+///   (C) Multi-phase slow commit with an active lease while concurrent GC adopts the new segment
+///       as an orphan and runs again past `GRACE_NS` (Unlink Rule keeps it in `m.retired`).
+///   (D) Unleased slow commit with only one concurrent flip (`base_gen == own_gen + 1`).
+///   (F) Pre-write CPU/mmap delay excluded by `stamp_commit_write_start` across concurrent flips.
+///
+/// Genuinely unsafe commits MUST still be refused with `StoreError::CommitTooSlow`:
+///   (E) Unleased slow commit whose segment was adopted as an orphan by GC flip #1 and unlinked
+///       past `GRACE_NS` by GC flip #2 (`base_gen >= own_gen + 2`, segment absent from `m.segments`
+///       and `m.retired`, no live lease).
+///
+/// Controls:
+///   - `Plant::CommitTooSlowBlind` (pre-fix bug): fails safe scenarios (A)-(D) with false
+///     `CommitTooSlow`.
+///   - `Plant::CommitSkipsUnlinkGuard` (unsound relaxation): flips the unlinked segment in (E),
+///     caught by the fresh reader oracle (`report().lost` non-empty or missing committed record).
+#[test]
+fn slow_commit_unlink_safety_invariant_and_planted_controls() {
+    use core::time::Duration;
+
+    use blaze_core::{Driver, Effect, wait::Deadline};
+    use blaze_keyed::store::StoreError;
+    use blaze_sim::Config;
+
+    use super::core::{EffectList, GRACE_NS, Plain, ROOT_LIFE_NS};
+
+    let settle = |sim: &mut Sim, store: &mut Plain<&Frame>, effects: &mut EffectList| {
+        let mut done = core::iter::empty().collect();
+        for _ in 0..100_000u32 {
+            if !effects.is_empty() {
+                sim.submit(effects);
+            }
+            if store.ready() && effects.is_empty() && sim.in_flight() == 0 {
+                return;
+            }
+            let now = sim.now();
+            sim.poll(&mut done, Deadline::after(now, Duration::from_secs(1)));
+            let wall = sim.wall_ns();
+            for c in done.drain(..) {
+                if store.owns(c.tag) {
+                    store.complete(c, wall, effects);
+                }
+            }
+            if store.broken().is_some() {
+                return;
+            }
+        }
+        panic!("store did not settle (phase={})", store.what());
+    };
+
+    // Drive `store` until it submits `Effect::Lock`, leaving all segment writes completed on disk
+    // while holding the `Lock` effect back so another actor can interleave GC/flips.
+    let run_until_lock = |sim: &mut Sim, store: &mut Plain<&Frame>, effects: &mut EffectList| -> Effect {
+        let mut done = core::iter::empty().collect();
+        for _ in 0..100_000u32 {
+            if let Some(pos) = effects.iter().position(|e| matches!(e, Effect::Lock { .. })) {
+                let lock = effects.remove(pos);
+                if !effects.is_empty() {
+                    sim.submit(effects);
+                }
+                return lock;
+            }
+            if !effects.is_empty() {
+                sim.submit(effects);
+            }
+            assert!(sim.in_flight() > 0, "expected effects in flight before Lock (phase={})", store.what());
+            let now = sim.now();
+            sim.poll(&mut done, Deadline::after(now, Duration::from_secs(1)));
+            let wall = sim.wall_ns();
+            for c in done.drain(..) {
+                if store.owns(c.tag) {
+                    store.complete(c, wall, effects);
+                }
+            }
+            assert!(store.broken().is_none(), "store broke before Lock: {:?}", store.broken());
+        }
+        panic!("store never reached Effect::Lock");
+    };
+
+    fn open_plain<'a>(
+        sim: &mut Sim,
+        nonce: u64,
+        plant: Plant,
+        root: &'a Frame,
+        settle: &impl Fn(&mut Sim, &mut Plain<&'a Frame>, &mut EffectList),
+    ) -> Plain<&'a Frame> {
+        let mut store = Plain::planted(reached_cfg(nonce, root), root, plant);
+        let mut effects = EffectList::new();
+        store.open(&mut effects);
+        settle(sim, &mut store, &mut effects);
+        store.map_all(sim.wall_ns(), &mut effects);
+        settle(sim, &mut store, &mut effects);
+        assert!(store.broken().is_none(), "open_plain broke: {:?}", store.broken());
+        store
+    }
+
+    fn check_reader<'a>(
+        sim: &mut Sim,
+        nonce: u64,
+        expected: &[(u32, bool)],
+        root: &'a Frame,
+        settle: &impl Fn(&mut Sim, &mut Plain<&'a Frame>, &mut EffectList),
+    ) -> Result<(), &'static str> {
+        let mut reader = Plain::planted(reached_cfg(nonce, root), root, Plant::None);
+        let mut effects = EffectList::new();
+        reader.open(&mut effects);
+        settle(sim, &mut reader, &mut effects);
+        if reader.broken().is_some() {
+            return Err("fresh reader broke during open");
+        }
+        reader.map_all(sim.wall_ns(), &mut effects);
+        settle(sim, &mut reader, &mut effects);
+        if reader.broken().is_some() {
+            return Err("fresh reader broke while mapping committed segments");
+        }
+        if !reader.report().lost.is_empty() {
+            return Err("fresh reader reported lost segment(s)");
+        }
+        for &(n, should_exist) in expected {
+            let got = reader.get(&record(n)).map(|g| g.bytes);
+            if should_exist {
+                let want = value(n);
+                if got != Some(want.as_slice()) {
+                    return Err("committed record missing or mismatched on fresh reader");
+                }
+            } else if got.is_some() {
+                return Err("refused record unexpectedly present on fresh reader");
+            }
+        }
+        Ok(())
+    }
+
+    // Scenario A: single-writer slow commit (`base_gen == own_gen`, elapsed > GRACE_NS / 2).
+    let run_single_writer = |seed: u64, delay_s: u64, plant: Plant| -> (Result<(), StoreError>, Result<(), &'static str>) {
+        let root = test_root();
+        let mut sim = Sim::new(seed, Faults::default());
+        let mut w = open_plain(&mut sim, 1, plant, &root, &settle);
+        w.put(record(800_001), Namespace::LOCAL, TAG, &value(800_001)).expect("put");
+        let mut effects = EffectList::new();
+        w.commit(&[], sim.wall_ns(), &mut effects).expect("start commit");
+        let lock = run_until_lock(&mut sim, &mut w, &mut effects);
+        sim.advance(Duration::from_secs(delay_s));
+        effects.push(lock);
+        settle(&mut sim, &mut w, &mut effects);
+        let res = w.take_committed().expect("committed").map(|_| ());
+        let oracle = check_reader(&mut sim, 10, &[(800_001, res.is_ok())], &root, &settle);
+        (res, oracle)
+    };
+
+    // Scenario B: metadata/root-only slow commit (`segs.is_empty()`) across 2 concurrent flips.
+    let run_empty_segs = |seed: u64, delay_s: u64, plant: Plant| -> (Result<(), StoreError>, Result<(), &'static str>) {
+        let root = test_root();
+        let mut sim = Sim::new(seed, Faults::default());
+        let mut w = open_plain(&mut sim, 1, plant, &root, &settle);
+        w.put(record(800_010), Namespace::LOCAL, TAG, &value(800_010)).expect("put");
+        let mut effects = EffectList::new();
+        w.commit(&[], sim.wall_ns(), &mut effects).expect("commit 1");
+        settle(&mut sim, &mut w, &mut effects);
+        w.take_committed().expect("c1").expect("c1 ok");
+
+        // Root-only commit (`segs.is_empty()`), paused across 2 concurrent flips and `delay_s`.
+        w.root_for("meta.only", &[record(800_010)], ROOT_LIFE_NS).expect("root");
+        w.release_lease();
+        w.commit(&[], sim.wall_ns(), &mut effects).expect("commit 2");
+        let lock = run_until_lock(&mut sim, &mut w, &mut effects);
+
+        for flip_n in 0..2u32 {
+            let mut other = open_plain(&mut sim, 20 + u64::from(flip_n), Plant::None, &root, &settle);
+            other.put(record(800_020 + flip_n), Namespace::LOCAL, TAG, &value(800_020 + flip_n)).expect("other put");
+            let mut oe = EffectList::new();
+            other.commit(&[], sim.wall_ns(), &mut oe).expect("other commit");
+            settle(&mut sim, &mut other, &mut oe);
+            other.take_committed().expect("oc").expect("oc ok");
+        }
+        sim.advance(Duration::from_secs(delay_s));
+        effects.push(lock);
+        settle(&mut sim, &mut w, &mut effects);
+        let res = w.take_committed().expect("c2").map(|_| ());
+        let oracle = check_reader(&mut sim, 30, &[(800_010, true)], &root, &settle);
+        (res, oracle)
+    };
+
+    // Scenario C: multi-phase slow commit with an active lease while concurrent GC adopts the
+    // new segment as an orphan and runs again past `GRACE_NS` (Unlink Rule keeps it in `m.retired`).
+    let run_leased_with_gc = |seed: u64, delay_s: u64, plant: Plant| -> (Result<(), StoreError>, Result<(), &'static str>) {
+        let root = test_root();
+        let mut sim = Sim::new(seed, Faults::default());
+        let mut w = open_plain(&mut sim, 1, plant, &root, &settle);
+        w.put(record(800_101), Namespace::LOCAL, TAG, &value(800_101)).expect("put 1");
+        let mut effects = EffectList::new();
+        w.commit(&[], sim.wall_ns(), &mut effects).expect("commit 1");
+        settle(&mut sim, &mut w, &mut effects);
+        w.take_committed().expect("c1").expect("c1 ok");
+
+        // Commit 2 writes seg-2 to disk while `w` already holds a live lease in `m.leases`.
+        w.put(record(800_102), Namespace::LOCAL, TAG, &value(800_102)).expect("put 2");
+        w.root_for("leased.ans", &[record(800_101), record(800_102)], ROOT_LIFE_NS).expect("root");
+        w.release_lease();
+        w.commit(&[], sim.wall_ns(), &mut effects).expect("commit 2");
+        let lock = run_until_lock(&mut sim, &mut w, &mut effects);
+
+        // Concurrent GC slice 1 sees seg-2 on disk as an orphan and retires it (`gen + 1`).
+        {
+            let mut gc = open_plain(&mut sim, 2, Plant::None, &root, &settle);
+            let mut ge = EffectList::new();
+            assert!(gc.compact(&mut ge), "gc1 compact starts");
+            settle(&mut sim, &mut gc, &mut ge);
+            let _ = gc.take_sliced().expect("gc1 sliced");
+        }
+        // Advance past GRACE_NS (still well within LEASE_NS = 30 min) and run another commit + GC
+        // slice (`gen + 2+`); `w`'s live lease MUST keep seg-2 from being unlinked.
+        sim.advance(Duration::from_secs(delay_s.max(GRACE_NS / 1_000_000_000 + 5)));
+        {
+            let mut gc2 = open_plain(&mut sim, 3, Plant::None, &root, &settle);
+            gc2.put(record(800_103), Namespace::LOCAL, TAG, &value(800_103)).expect("gc2 put");
+            let mut ge = EffectList::new();
+            gc2.commit(&[], sim.wall_ns(), &mut ge).expect("gc2 commit");
+            settle(&mut sim, &mut gc2, &mut ge);
+            gc2.take_committed().expect("gc2 c").expect("gc2 c ok");
+        }
+
+        effects.push(lock);
+        settle(&mut sim, &mut w, &mut effects);
+        let res = w.take_committed().expect("c2").map(|_| ());
+        let oracle = check_reader(&mut sim, 40, &[(800_101, true), (800_102, res.is_ok())], &root, &settle);
+        (res, oracle)
+    };
+
+    // Scenario D: unleased slow commit with only ONE concurrent flip (`base_gen == own_gen + 1`).
+    let run_one_concurrent_flip = |seed: u64, delay_s: u64, plant: Plant| -> (Result<(), StoreError>, Result<(), &'static str>) {
+        let root = test_root();
+        let mut sim = Sim::new(seed, Faults::default());
+        // Seed generation 1 first so `w` opens on gen 1 without a lease.
+        {
+            let mut init = open_plain(&mut sim, 99, Plant::None, &root, &settle);
+            init.put(record(800_200), Namespace::LOCAL, TAG, &value(800_200)).expect("init put");
+            init.release_lease();
+            let mut ie = EffectList::new();
+            init.commit(&[], sim.wall_ns(), &mut ie).expect("init commit");
+            settle(&mut sim, &mut init, &mut ie);
+            init.take_committed().expect("ic").expect("ic ok");
+        }
+        let mut w = open_plain(&mut sim, 1, plant, &root, &settle);
+        w.put(record(800_201), Namespace::LOCAL, TAG, &value(800_201)).expect("put");
+        let mut effects = EffectList::new();
+        w.commit(&[], sim.wall_ns(), &mut effects).expect("commit");
+        let lock = run_until_lock(&mut sim, &mut w, &mut effects);
+
+        // One concurrent flip (`base_gen == own_gen + 1`), not unlinking `w`'s segment.
+        {
+            let mut other = open_plain(&mut sim, 2, Plant::None, &root, &settle);
+            other.put(record(800_202), Namespace::LOCAL, TAG, &value(800_202)).expect("other put");
+            other.release_lease();
+            let mut oe = EffectList::new();
+            other.commit(&[], sim.wall_ns(), &mut oe).expect("other commit");
+            settle(&mut sim, &mut other, &mut oe);
+            other.take_committed().expect("oc").expect("oc ok");
+        }
+        sim.advance(Duration::from_secs(delay_s));
+        effects.push(lock);
+        settle(&mut sim, &mut w, &mut effects);
+        let res = w.take_committed().expect("w c").map(|_| ());
+        let oracle = check_reader(&mut sim, 50, &[(800_200, true), (800_201, res.is_ok()), (800_202, true)], &root, &settle);
+        (res, oracle)
+    };
+
+    // Scenario E: GENUINELY UNSAFE unleased slow commit where concurrent GC adopts the new
+    // segment as an orphan in flip #1 and unlinks it past `GRACE_NS` in flip #2.
+    let run_unleased_unlinked = |seed: u64, extra_s: u64, plant: Plant| -> (Result<(), StoreError>, Result<(), &'static str>) {
+        let root = test_root();
+        let mut sim = Sim::new(seed, Faults::default());
+        {
+            let mut init = open_plain(&mut sim, 99, Plant::None, &root, &settle);
+            init.put(record(800_300), Namespace::LOCAL, TAG, &value(800_300)).expect("init put");
+            init.root_for("base.root", &[record(800_300)], ROOT_LIFE_NS).expect("base root");
+            init.release_lease();
+            let mut ie = EffectList::new();
+            init.commit(&[], sim.wall_ns(), &mut ie).expect("init commit");
+            settle(&mut sim, &mut init, &mut ie);
+            init.take_committed().expect("ic").expect("ic ok");
+        }
+        let mut w = open_plain(&mut sim, 1, plant, &root, &settle);
+        w.put(record(800_301), Namespace::LOCAL, TAG, &value(800_301)).expect("w put");
+        let mut effects = EffectList::new();
+        w.commit(&[], sim.wall_ns(), &mut effects).expect("w commit");
+        let lock = run_until_lock(&mut sim, &mut w, &mut effects);
+
+        // GC flip #1 adopts `w`'s unreferenced segment file as an orphan (`m.retired`).
+        {
+            let mut gc1 = open_plain(&mut sim, 2, Plant::None, &root, &settle);
+            let mut ge = EffectList::new();
+            assert!(gc1.compact(&mut ge), "gc1 starts");
+            settle(&mut sim, &mut gc1, &mut ge);
+            let sliced = gc1.take_sliced().expect("gc1 sliced");
+            assert!(sliced.orphans >= 1, "gc1 must adopt w's segment as orphan: {sliced:?}");
+        }
+        // Advance past GRACE_NS (no live lease exists!) and run GC flip #2 to UNLINK it.
+        sim.advance(Duration::from_secs(GRACE_NS / 1_000_000_000 + 5 + extra_s));
+        {
+            let mut gc2 = open_plain(&mut sim, 3, Plant::None, &root, &settle);
+            let mut ge = EffectList::new();
+            assert!(gc2.compact(&mut ge), "gc2 starts");
+            settle(&mut sim, &mut gc2, &mut ge);
+            let sliced = gc2.take_sliced().expect("gc2 sliced");
+            assert!(sliced.removed >= 1, "gc2 must unlink w's unleased orphan past GRACE_NS: {sliced:?}");
+        }
+
+        effects.push(lock);
+        settle(&mut sim, &mut w, &mut effects);
+        let res = match w.take_committed() {
+            Some(res) => res.map(|_| ()),
+            None => Err(w.broken().cloned().expect("w either committed or broke")),
+        };
+        let oracle = check_reader(&mut sim, 60, &[(800_300, true), (800_301, res.is_ok())], &root, &settle);
+        (res, oracle)
+    };
+
+    // Scenario F: `stamp_commit_write_start` excludes pre-write CPU/mmap delay across concurrent
+    // flips that happened BEFORE the segment file was submitted to the driver.
+    let run_pre_write_delay = |seed: u64, pre_delay_s: u64| -> (Result<(), StoreError>, Result<(), &'static str>) {
+        let root = test_root();
+        let mut sim = Sim::new(seed, Faults::default());
+        let mut w = open_plain(&mut sim, 1, Plant::None, &root, &settle);
+        w.put(record(800_401), Namespace::LOCAL, TAG, &value(800_401)).expect("w put");
+        let mut effects = EffectList::new();
+        w.commit(&[], sim.wall_ns(), &mut effects).expect("w commit");
+        // Simulate 40s+ of pre-write CPU/mmap time while 2 other writers flip BEFORE `effects`
+        // (containing the segment file write) are even submitted to `sim`.
+        for flip_n in 0..2u32 {
+            let mut other = open_plain(&mut sim, 70 + u64::from(flip_n), Plant::None, &root, &settle);
+            other.put(record(800_410 + flip_n), Namespace::LOCAL, TAG, &value(800_410 + flip_n)).expect("other put");
+            other.release_lease();
+            let mut oe = EffectList::new();
+            other.commit(&[], sim.wall_ns(), &mut oe).expect("other commit");
+            settle(&mut sim, &mut other, &mut oe);
+            other.take_committed().expect("oc").expect("oc ok");
+        }
+        sim.advance(Duration::from_secs(pre_delay_s));
+        // Stamp right before submitting write effects, as `Driven::commit_records_par` does.
+        w.stamp_commit_write_start(sim.wall_ns());
+        settle(&mut sim, &mut w, &mut effects);
+        let res = w.take_committed().expect("w c").map(|_| ());
+        let oracle = check_reader(&mut sim, 80, &[(800_401, true)], &root, &settle);
+        (res, oracle)
+    };
+
+    // Randomized DST across seeds and delays (31..=300 s).
+    blaze_sim::check(Config::cases(16), |tape| {
+        let seed = tape.next_u64("sim seed");
+        let delay_s = tape.int_in(31..=300, "delay_s");
+        let extra_s = tape.int_in(1..=120, "extra_s");
+
+        let (res_a, oracle_a) = run_single_writer(seed, delay_s, Plant::None);
+        assert!(res_a.is_ok(), "Scenario A (single-writer slow commit, {delay_s}s) must succeed: {res_a:?}");
+        assert!(oracle_a.is_ok(), "Scenario A oracle: {oracle_a:?}");
+
+        let (res_b, oracle_b) = run_empty_segs(seed.wrapping_add(1), delay_s, Plant::None);
+        assert!(res_b.is_ok(), "Scenario B (empty-segs slow commit, {delay_s}s) must succeed: {res_b:?}");
+        assert!(oracle_b.is_ok(), "Scenario B oracle: {oracle_b:?}");
+
+        let (res_c, oracle_c) = run_leased_with_gc(seed.wrapping_add(2), delay_s, Plant::None);
+        assert!(res_c.is_ok(), "Scenario C (leased slow commit with concurrent GC, {delay_s}s) must succeed: {res_c:?}");
+        assert!(oracle_c.is_ok(), "Scenario C oracle: {oracle_c:?}");
+
+        let (res_d, oracle_d) = run_one_concurrent_flip(seed.wrapping_add(3), delay_s, Plant::None);
+        assert!(res_d.is_ok(), "Scenario D (single concurrent flip, {delay_s}s) must succeed: {res_d:?}");
+        assert!(oracle_d.is_ok(), "Scenario D oracle: {oracle_d:?}");
+
+        let (res_e, oracle_e) = run_unleased_unlinked(seed.wrapping_add(4), extra_s, Plant::None);
+        assert!(
+            matches!(res_e, Err(StoreError::CommitTooSlow { .. })),
+            "Scenario E (unleased segment actually unlinked by GC) MUST fail with CommitTooSlow: {res_e:?}"
+        );
+        assert!(oracle_e.is_ok(), "Scenario E oracle (store remains healthy after refusal): {oracle_e:?}");
+
+        let (res_f, oracle_f) = run_pre_write_delay(seed.wrapping_add(5), delay_s);
+        assert!(res_f.is_ok(), "Scenario F (pre-write delay stamped at write start, {delay_s}s) must succeed: {res_f:?}");
+        assert!(oracle_f.is_ok(), "Scenario F oracle: {oracle_f:?}");
+    });
+
+    // Planted-bug control 1: `Plant::CommitTooSlowBlind` (pre-fix blind wall-clock check) falsely
+    // rejects safe scenarios A, B, C, and D.
+    for (label, (res, _)) in [
+        ("A", run_single_writer(301, 65, Plant::CommitTooSlowBlind)),
+        ("B", run_empty_segs(302, 65, Plant::CommitTooSlowBlind)),
+        ("C", run_leased_with_gc(303, 75, Plant::CommitTooSlowBlind)),
+        ("D", run_one_concurrent_flip(304, 65, Plant::CommitTooSlowBlind)),
+    ] {
+        assert!(
+            matches!(res, Err(StoreError::CommitTooSlow { .. })),
+            "Plant::CommitTooSlowBlind control must reproduce false CommitTooSlow in scenario {label}: {res:?}"
+        );
+    }
+
+    // Planted-bug control 2: `Plant::CommitSkipsUnlinkGuard` flips an unlinked segment in scenario E,
+    // leaving a corrupt manifest on disk that the fresh reader oracle MUST catch!
+    let (res_unsound, oracle_unsound) = run_unleased_unlinked(305, 10, Plant::CommitSkipsUnlinkGuard);
+    assert!(
+        !matches!(res_unsound, Err(StoreError::CommitTooSlow { .. })),
+        "Plant::CommitSkipsUnlinkGuard must skip CommitTooSlow refusal: {res_unsound:?}"
+    );
+    assert!(
+        oracle_unsound.is_err(),
+        "reader oracle MUST catch Plant::CommitSkipsUnlinkGuard flipping an unlinked segment!"
+    );
+}
