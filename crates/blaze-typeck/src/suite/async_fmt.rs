@@ -34,6 +34,8 @@ struct Items {
     count_derefs: ItemKey,
     /// `fn count_bad(x: u8, i: i32, ri: &i32, s: &str) -> Arguments`.
     count_bad: ItemKey,
+    /// `fn dual_use(d: MyDeref, b: BothDerefDisplay) -> Arguments`.
+    dual_use: ItemKey,
 }
 
 fn world() -> (Fx, Items) {
@@ -53,10 +55,16 @@ fn world() -> (Fx, Items) {
     let i32_ = fx.ty(PNode::Int(crate::ids::IntTy::I32));
     let str_ = fx.ty(PNode::Str);
     fx.imp("impl Display for u8", 0, u8_, Some((display, &[])), &[], Vec::new());
+    fx.imp("impl Display for usize", 0, usize_, Some((display, &[])), &[], Vec::new());
 
     let my_deref = fx.strukt("MyDeref", 0, &[]);
     let my_deref_t = fx.adt(my_deref, &[]);
     fx.imp("impl Deref for MyDeref", 0, my_deref_t, Some((deref, &[])), &[("Target", usize_)], Vec::new());
+
+    let both = fx.strukt("BothDerefDisplay", 0, &[]);
+    let both_t = fx.adt(both, &[]);
+    fx.imp("impl Deref for BothDerefDisplay", 0, both_t, Some((deref, &[])), &[("Target", usize_)], Vec::new());
+    fx.imp("impl Display for BothDerefDisplay", 0, both_t, Some((display, &[])), &[], Vec::new());
 
     // core's `IntoFuture` (core/src/future/into_future.rs) declares both members, and `.await`
     // projects both (rules/async_fmt.rs `expr_await`: the held future, then the output).
@@ -80,8 +88,9 @@ fn world() -> (Fx, Items) {
     let show = fx.func("show", 0, &[u8_, usize_], arguments_t, Vec::new());
     let count_derefs = fx.func("count_derefs", 0, &[u8_, ref_usize, ref_ref_usize, mut_usize, my_deref_t], arguments_t, Vec::new());
     let count_bad = fx.func("count_bad", 0, &[u8_, i32_, ref_i32, ref_str], arguments_t, Vec::new());
+    let dual_use = fx.func("dual_use", 0, &[my_deref_t, both_t], arguments_t, Vec::new());
     fx.finish();
-    (world, Items { wait, show, count_derefs, count_bad })
+    (world, Items { wait, show, count_derefs, count_bad, dual_use })
 }
 
 /// ```text
@@ -328,4 +337,43 @@ fn format_args_count_rejects_non_usize_types_with_mismatch() {
             ],
         },
     );
+}
+
+/// An argument used BOTH as a formatted value (`Display`) and as a count (`FmtTrait::Count`) must
+/// check `Display` on its original type (not on `usize`) and preserve its initial `&T` borrow
+/// before the count deref chain:
+/// - `BothDerefDisplay` (`Deref<Target = usize>` + `Display`) succeeds with
+///   `& -> &BothDerefDisplay, * -> BothDerefDisplay, *Deref -> usize, & -> &usize`.
+/// - `MyDeref` (`Deref<Target = usize>`, NO `Display`) fails with `DiagCode::Unsatisfied` (E0277),
+///   even though `usize: Display` holds.
+#[test]
+fn format_args_dual_use_checks_display_on_original_type_not_usize() {
+    let (fx, it) = world();
+    let mut b = Bb::new();
+    let d = b.param("d");
+    let both = b.param("b");
+    let e_d = b.local(d);
+    let e_both = b.local(both);
+    let fmt = b.format_args(
+        &[e_d, e_both],
+        &[
+            (0, FmtTrait::Count),
+            (0, FmtTrait::Display),
+            (1, FmtTrait::Count),
+            (1, FmtTrait::Display),
+        ],
+    );
+    let root = b.block(&[], Some(fmt));
+    let c = check_body(&fx, &b, it.dual_use, root, Plant::None, InferPlant::None);
+    expect(
+        &fx,
+        &b,
+        &c,
+        &Want {
+            exprs: &[(e_d, "MyDeref"), (e_both, "BothDerefDisplay"), (fmt, "Arguments"), (root, "Arguments")],
+            pats: &[(d, "MyDeref"), (both, "BothDerefDisplay")],
+            diags: &[(DiagCode::Unsatisfied, e_d)],
+        },
+    );
+    assert_eq!(adjusts(&fx, &c, e_both), "& -> &BothDerefDisplay, * -> BothDerefDisplay, *Deref -> usize, & -> &usize");
 }

@@ -67,6 +67,19 @@ impl Deref for Wrap {
     }
 }
 
+struct CustomDisplayWrap(usize);
+impl Deref for CustomDisplayWrap {
+    type Target = usize;
+    fn deref(&self) -> &usize {
+        &self.0
+    }
+}
+impl fmt::Display for CustomDisplayWrap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "W({})", self.0)
+    }
+}
+
 struct ParseError {
     message: String,
     line: usize,
@@ -104,6 +117,16 @@ fn ok_all_count_forms(cond: bool) -> String {
     out.push_str(&format!("{:.r$}", "abcdef"));
     out.push_str(&format!("{:.*}", r, "abcdef"));
     out
+}
+
+fn ok_dual_use_custom_display() -> String {
+    let w = CustomDisplayWrap(6);
+    format!("{w:w$}")
+}
+
+fn bad_dual_use_deref_without_display() -> String {
+    let w = Wrap(4);
+    format!("{w:w$}")
 }
 
 fn bad_i32() -> String {
@@ -144,12 +167,19 @@ fn main() {}
             .unwrap_or_else(|| panic!("missing fn `{n}` in {results:?}"))
     };
 
-    for ok in ["fmt", "ok_all_count_forms"] {
+    for ok in ["fmt", "ok_all_count_forms", "ok_dual_use_custom_display"] {
         let (_, clean, tdiags, refused, bfindings) = find(ok);
         assert!(*clean, "`{ok}` typeck diags: {tdiags:?}");
         assert!(refused.is_none(), "`{ok}` borrowck refused: {refused:?}");
         assert!(bfindings.is_empty(), "`{ok}` borrowck findings: {bfindings:?}");
     }
+
+    let (_, clean, tdiags, _, _) = find("bad_dual_use_deref_without_display");
+    assert!(!*clean, "`bad_dual_use_deref_without_display` must fail typeck");
+    assert!(
+        tdiags.iter().any(|c| c == "E0277"),
+        "`bad_dual_use_deref_without_display` expected E0277, got {tdiags:?}"
+    );
 
     for bad_ty in ["bad_i32", "bad_ref_i32", "bad_str"] {
         let (_, clean, tdiags, _, _) = find(bad_ty);
@@ -186,9 +216,27 @@ pub trait Deref {
 pub mod fmt {
     use super::*;
 
-    pub trait Display {}
+    pub trait Display {
+        fn tag(&self) -> usize;
+    }
 
-    impl Display for u32 {}
+    impl Display for u32 {
+        fn tag(&self) -> usize {
+            10
+        }
+    }
+
+    impl Display for usize {
+        fn tag(&self) -> usize {
+            100
+        }
+    }
+
+    impl<T: Display> Display for &T {
+        fn tag(&self) -> usize {
+            (**self).tag() + 1
+        }
+    }
 
     #[lang = "format_arguments"]
     pub struct Arguments {
@@ -205,7 +253,7 @@ pub mod fmt {
 
     impl Argument {
         pub fn new_display<T: Display>(x: &T) -> Argument {
-            Argument { value: unsafe { transmute(x) }, code: 1 }
+            Argument { value: x.tag(), code: 1 }
         }
 
         pub fn from_usize(x: &usize) -> Argument {
@@ -219,6 +267,11 @@ impl Deref for Wrap {
     type Target = usize;
     fn deref(&self) -> &usize {
         &self.0
+    }
+}
+impl fmt::Display for Wrap {
+    fn tag(&self) -> usize {
+        70
     }
 }
 
@@ -242,6 +295,16 @@ fn read_count(a: fmt::Arguments) -> usize {
     (*g)[1].value
 }
 
+fn read_dual(a: fmt::Arguments) -> usize {
+    let g: &[fmt::Argument; 2] = unsafe { transmute(a.args) };
+    if (*g)[0].code != 1 || (*g)[1].code != 2 {
+        return 200;
+    }
+    // Display tag + count value: if Display mistakenly used `usize::tag` (100) instead of
+    // `Wrap::tag` (70) or `<&Wrap as Display>::tag` (71), the sum will not match.
+    (*g)[0].value + (*g)[1].value
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
     let x = 5u32;
@@ -262,8 +325,14 @@ pub extern "C" fn main() -> i32 {
     let d = Wrap(6);
     let c4 = read_count(builtin # format_args("{:1$}", x, d));
 
+    // Dual-use: `d` formatted via `<Wrap as Display>` (tag 70, NOT `usize`'s 100) AND count 6.
+    let dual1 = read_dual(builtin # format_args("{0:0$}", d));
+    // Multi-step dual-use: `rd: &Wrap` formatted via `<&Wrap as Display>` (tag 71) AND count 6.
+    let rd: &Wrap = &d;
+    let dual2 = read_dual(builtin # format_args("{0:0$}", rd));
+
     let err = ParseError { column: 9 };
-    let total = c0 + c1 + c2 + c3 + c4 + err.count_val();
+    let total = c0 + c1 + c2 + c3 + c4 + err.count_val() + dual1 + dual2;
     total as i32
 }
 "#;
@@ -279,6 +348,6 @@ pub extern "C" fn main() -> i32 {
     };
     let status = run_with(&files, "src/main.rs", None, FrontChoice::New(new), blaze_own::testing::heap().shared())
         .unwrap_or_else(|e| panic!("build/run failed: {e}"));
-    // 4 (unsuffixed) + 4 (&usize) + 4 (&&usize) + 5 (&mut usize) + 6 (Deref) + 9 (ParseError) = 32.
-    assert_eq!(status, 32);
+    // 4 + 4 + 4 + 5 + 6 + 9 (counts = 32) + (70 + 6 = 76) + (71 + 6 = 77) = 185.
+    assert_eq!(status, 185);
 }

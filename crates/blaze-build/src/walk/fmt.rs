@@ -71,7 +71,7 @@ use core::alloc::Allocator;
 use blaze_lir::builder::MemAttrs;
 use blaze_lir::func::SlotKind;
 use blaze_lir::{Flags, Ty};
-use blaze_typeck::{Expr, ExprId, FmtTrait, FmtUse, List, Mutbl, Name, PNode};
+use blaze_typeck::{AdjustKind, Expr, ExprId, FmtTrait, FmtUse, List, Mutbl, Name, PNode};
 
 use super::{Repr, Shape, Task, V, Walk, malformed, unsupported};
 use crate::{Abi, BuildError, FmtPiece, Instance};
@@ -321,9 +321,84 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let list = self.body.expr_lists.get(args.range()).ok_or(malformed("a `format_args!`'s arguments past `expr_lists`"))?;
         self.work.push(Task::FormatArgs(e));
         for &a in list.iter().rev() {
-            self.work.push(Task::Eval(a));
+            if self.fmt_dual_use_arg(a).is_some() {
+                self.work.push(Task::FmtBorrow(a));
+            } else {
+                self.work.push(Task::Eval(a));
+            }
         }
         Ok(())
+    }
+
+    /// `Task::FmtBorrow(a)`: evaluates a dual-use `format_args!` argument through only its initial
+    /// shared borrow (`Borrow(Not) -> &T`), leaving `&T` on the value stack for value formatting
+    /// and for [`Self::fmt_deref_count`] to dereference to `&usize`.
+    pub(super) fn format_args_borrow(&mut self, a: ExprId) -> Result<(), BuildError> {
+        if !matches!(self.expr(a)?, Expr::Ref { .. } | Expr::Index { .. }) && self.is_promoted(a) {
+            self.promoted_ref(a)?;
+        } else {
+            self.work.push(Task::Ref);
+            self.work.push(Task::PlaceDerefs(a, 0));
+        }
+        Ok(())
+    }
+
+    /// Whether `a`'s adjustments represent a dual-use `format_args!` argument (used both as a
+    /// formatted value `&T` and as a `FmtTrait::Count` `&usize` after derefs):
+    /// `[Borrow(Not) -> &T, Deref(None) -> T, Deref_1, ..., Deref_k -> usize, Borrow(Not) -> &usize]`.
+    fn fmt_dual_use_arg(&self, a: ExprId) -> Option<(usize, usize)> {
+        let rows = self.adjust_rows(a);
+        let (start, end) = (rows.start, rows.end);
+        let kinds = self.checked.adjusts.column::<1>().get(start..end)?;
+        let [first, second, middle @ .., last] = kinds else {
+            return None;
+        };
+        if !middle.is_empty()
+            && matches!(first, AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. })
+            && matches!(second, AdjustKind::Deref { overloaded: None })
+            && matches!(last, AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. })
+            && middle.iter().all(|k| matches!(k, AdjustKind::Deref { .. }))
+        {
+            Some((start, end))
+        } else {
+            None
+        }
+    }
+
+    /// Dereferences `val_ref: &T` along a dual-use `format_args!` argument's count chain
+    /// (`adjusts[start + 2 .. end - 1]`), leaving `&usize`.
+    fn fmt_deref_count(&mut self, a: ExprId, val_ref: V, start: usize, end: usize) -> Result<V, BuildError> {
+        self.push_val(val_ref, None);
+        for row in (start + 2)..(end - 1) {
+            let n = row - start;
+            let kind = *self
+                .checked
+                .adjusts
+                .column::<1>()
+                .get(row)
+                .ok_or(malformed("a dual-use `format_args!` count adjustment past `adjusts`"))?;
+            match kind {
+                AdjustKind::Deref { overloaded: Some(_) } => self.deref_call(a, n)?,
+                AdjustKind::Deref { overloaded: None } => {
+                    let cur_t = self.ty_before(a, n)?;
+                    let repr = self.repr_at(a, cur_t)?;
+                    let v = self.pop()?;
+                    let p = self.scalar(v, Ty::PTR)?;
+                    let loaded = match repr {
+                        Repr::Ptr => self.load(Repr::Ptr, (p, 0)),
+                        Repr::Agg(_) => {
+                            let tmp = self.temp(repr);
+                            self.store(V::Place(p, 0), repr, tmp)?;
+                            V::Place(tmp.0, tmp.1)
+                        }
+                        _ => return Err(malformed("a builtin deref of a `format_args!` count that is neither a thin nor a wide pointer")),
+                    };
+                    self.push_val(loaded, None);
+                }
+                _ => return Err(malformed("a non-deref step in a dual-use `format_args!` count chain")),
+            }
+        }
+        self.pop()
     }
 
     /// The template of `e`, checked against its `uses`: per placeholder, in order, a
@@ -439,9 +514,31 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             self.hold_copy_temp(e, (arr, 0))?;
         }
         for (i, u) in in_order.enumerate() {
-            let a = *list.get(u.arg as usize).ok_or(malformed("a format use past its arguments"))?;
-            let r = refs[u.arg as usize];
-            let rt = self.adjusted_ty(a)?;
+            let arg_idx = usize::try_from(u.arg).map_err(|_| malformed("a format use past its arguments"))?;
+            let a = *list.get(arg_idx).ok_or(malformed("a format use past its arguments"))?;
+            let val_ref = *refs.get(arg_idx).ok_or(malformed("a format use past its arguments"))?;
+            let (r, rt) = if let Some((start, end)) = self.fmt_dual_use_arg(a) {
+                if u.trait_ == FmtTrait::Count {
+                    let count_ref = self.fmt_deref_count(a, val_ref, start, end)?;
+                    let count_ty = *self
+                        .checked
+                        .adjusts
+                        .column::<2>()
+                        .get(end - 1)
+                        .ok_or(malformed("a dual-use `format_args!` count type past `adjusts`"))?;
+                    (count_ref, count_ty)
+                } else {
+                    let val_ty = *self
+                        .checked
+                        .adjusts
+                        .column::<2>()
+                        .get(start)
+                        .ok_or(malformed("a dual-use `format_args!` value type past `adjusts`"))?;
+                    (val_ref, val_ty)
+                }
+            } else {
+                (val_ref, self.adjusted_ty(a)?)
+            };
             let g_ref = self.ground_ty(rt).map_err(|error| Self::ty_err(a, error))?;
             let ref_repr = self.repr(g_ref).map_err(|error| Self::ty_err(a, error))?;
             if ref_repr != Repr::Ptr {
