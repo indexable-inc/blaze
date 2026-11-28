@@ -711,7 +711,7 @@ pub fn classify_closure_env_use<'a>(
                 Some(&tc::PClause::Trait { trait_: st, .. }) if is_fn_or_mut(st) => ClosureEnvUse::FnOrFnMut,
                 Some(&tc::PClause::Trait { trait_: st, .. }) if is_fn_once(st) => match origin {
                     tc::SupertraitOrigin::Clause { expr, nth: root_nth } => check_call_fn_once_only(expr, root_nth, false),
-                    tc::SupertraitOrigin::Object => check_object_use(true),
+                    tc::SupertraitOrigin::Object { .. } => check_object_use(true),
                     tc::SupertraitOrigin::Other => ClosureEnvUse::Unknown,
                 },
                 _ => ClosureEnvUse::Unknown,

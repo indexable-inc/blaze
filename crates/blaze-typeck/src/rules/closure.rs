@@ -134,7 +134,7 @@ struct Expected {
 
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// The expected signature: inputs, and the output if known, and where it came from.
-    fn deduce_sig(&mut self, ex: Expectation) -> Result<Option<Expected>, Stop> {
+    fn deduce_sig(&mut self, closure_expr: ExprId, ex: Expectation) -> Result<Option<Expected>, Stop> {
         let Some(t) = ex.to_option() else { return Ok(None) };
         let t = self.ty.shallow_resolve(t);
         match self.view(t) {
@@ -161,7 +161,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 else {
                     return Ok(None);
                 };
-                self.object_closure_sig(t, rows, [fn_, fn_mut, fn_once], fn_once)
+                self.object_closure_sig(closure_expr, t, rows, [fn_, fn_mut, fn_once], fn_once)
             }
             _ => Ok(None),
         }
@@ -292,11 +292,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 .map(|on| (o.owner, on)),
             None => None,
         };
-        if let SupertraitOrigin::Clause { expr, .. } = sfn.origin {
-            self.record_supertrait_selections(expr, sfn.owner, sfn.owner_args, sfn.arg_pt)?;
-            if let Some(o) = out_prov {
-                self.record_supertrait_selections(expr, o.owner, o.owner_args, o.term_pt)?;
+        match sfn.origin {
+            SupertraitOrigin::Clause { expr, .. } | SupertraitOrigin::Object { expr } => {
+                self.record_supertrait_selections(expr, sfn.owner, sfn.owner_args, sfn.arg_pt)?;
+                if let Some(o) = out_prov {
+                    self.record_supertrait_selections(expr, o.owner, o.owner_args, o.term_pt)?;
+                }
             }
+            SupertraitOrigin::Other => {}
         }
         Ok(SigFrom::Supertrait { origin: sfn.origin, trait_: sfn.owner, nth, output })
     }
@@ -320,7 +323,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// Walks `root` in `types` and records each `PNode::Alias { trait_, name, args }` lowered
-    /// under `cur_args` into `self.projected` at `expr`.
+    /// under `cur_args` into `self.projected` at `expr`. Deduplicates DAG-shared nodes and returns
+    /// `Limit::Supertraits` if the walk exceeds `MAX_NODES`, never silently omitting selections.
     fn record_aliases_in(
         &mut self,
         expr: ExprId,
@@ -330,12 +334,16 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     ) -> Result<(), Stop> {
         const MAX_NODES: usize = 256;
         let mut stack: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut visited: blaze_hash::HashSet<PTy, Alloc<'a>> = blaze_hash::HashSet::new_in(self.alloc);
         stack.push(root);
         let mut steps = 0usize;
         while let Some(pt) = stack.pop() {
+            if !visited.insert(pt) {
+                continue;
+            }
             steps += 1;
             if steps > MAX_NODES {
-                break;
+                return Err(CheckError::Limit(Limit::Supertraits).into());
             }
             match types.node(pt)? {
                 PNode::Alias { trait_, name, args } => {
@@ -653,6 +661,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// row or supertrait names an `Fn*` trait at a tuple.
     fn object_closure_sig(
         &mut self,
+        closure_expr: ExprId,
         dyn_ty: Ty,
         rows: TyList,
         fn_traits: [ItemKey; 3],
@@ -704,8 +713,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         if let Some((principal, args_after_self)) = other_principal {
             let self_list = self.mk_list(&[dyn_ty])?;
             let full_args = self.concat(self_list, args_after_self)?;
-            let (found_fn, elab_out) =
-                self.elaborate_fn_supertraits(&[(principal, full_args, SupertraitOrigin::Object)], fn_traits, output_name, None)?;
+            let (found_fn, elab_out) = self.elaborate_fn_supertraits(
+                &[(principal, full_args, SupertraitOrigin::Object { expr: closure_expr })],
+                fn_traits,
+                output_name,
+                None,
+            )?;
             if let Some(sfn) = found_fn {
                 let (out, out_prov) = match elab_out {
                     Some(o) => (Some(o.ty), Some(o)),
@@ -742,7 +755,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 return self.open_async_closure(f, e, params, param_tys, ret, body);
             }
             let pats = self.body.pat_list(params)?;
-            let expected = match self.deduce_sig(f.expect)? {
+            let expected = match self.deduce_sig(e, f.expect)? {
                 some @ Some(_) => some,
                 // A regular closure may implement AsyncFnOnce by returning a future.
                 // Its body produces the future, so only the input hint applies here.
@@ -868,7 +881,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let pats = self.body.pat_list(params)?;
         let async_expected = self.async_callable_hint(f.expect)?;
         let call_expected = match async_expected {
-            None => self.deduce_sig(f.expect)?,
+            None => self.deduce_sig(e, f.expect)?,
             Some(_) => None,
         };
         let expected_kind = async_expected.or(call_expected).and_then(|x| x.kind);

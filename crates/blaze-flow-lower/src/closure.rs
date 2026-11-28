@@ -787,7 +787,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         let mut static_as_static = false;
         let call_expr = match from {
             SigFrom::Clause { expr, .. }
-            | SigFrom::Supertrait { origin: blaze_typeck::SupertraitOrigin::Clause { expr, .. }, .. } => Some(expr),
+            | SigFrom::Supertrait {
+                origin: blaze_typeck::SupertraitOrigin::Clause { expr, .. } | blaze_typeck::SupertraitOrigin::Object { expr },
+                ..
+            } => Some(expr),
             _ => None,
         };
         let mut in_env: Option<blaze_typeck::List> = None;
@@ -833,10 +836,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 (Some((in_s, in_d, None)), outs)
             }
             SigFrom::Supertrait { origin, trait_, nth, output } => {
-                if matches!(origin, blaze_typeck::SupertraitOrigin::Object) {
+                if matches!(origin, blaze_typeck::SupertraitOrigin::Object { .. }) {
                     static_as_static = true;
                 }
-                if let blaze_typeck::SupertraitOrigin::Clause { expr, .. } = origin {
+                if let Some(expr) = call_expr {
                     in_env = self.supertrait_env_args(expr, trait_, row, e)?;
                 }
                 let clauses = match facts.regions().clauses(trait_) {
@@ -850,7 +853,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     Some((out_trait, o)) => {
                         out_env = if out_trait == trait_ {
                             in_env
-                        } else if let blaze_typeck::SupertraitOrigin::Clause { expr, .. } = origin {
+                        } else if let Some(expr) = call_expr {
                             self.supertrait_env_args(expr, out_trait, row, e)?
                         } else {
                             None
@@ -2319,7 +2322,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
     /// (its method call, or the path its call names).
     pub(crate) fn sig_from_call(&self, row: usize, e: ExprId) -> Result<bool, Refusal> {
         let Some(&from) = self.ck.closures.column::<4>().get(row) else { return self.refuse(Form::Malformed, e) };
-        let SigFrom::Clause { expr, .. } = from else { return Ok(false) };
+        let expr = match from {
+            SigFrom::Clause { expr, .. }
+            | SigFrom::Supertrait { origin: blaze_typeck::SupertraitOrigin::Clause { expr, .. }, .. } => expr,
+            _ => return Ok(false),
+        };
         Ok(expr == e || matches!(self.body.exprs.get(e.ix()), Some(Expr::Call { callee, .. }) if *callee == expr))
     }
 

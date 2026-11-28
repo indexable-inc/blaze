@@ -110,9 +110,11 @@ pub enum SupertraitOrigin {
     /// Elaborated from a pending trait obligation filed by clause `nth` of the item the path or
     /// method call `expr` names (`Cause::Clause { expr, nth }`).
     Clause { expr: ExprId, nth: u32 },
-    /// Elaborated from a trait-object principal (`dyn SubTrait`): explicit `'static` regions in
-    /// the supertrait signature stay `SigSlot::Static` (matching [`SigFrom::Object`]).
-    Object,
+    /// Elaborated from a trait-object principal (`dyn SubTrait`) at closure expression `expr`:
+    /// explicit `'static` regions in the supertrait signature stay `SigSlot::Static` (matching
+    /// [`SigFrom::Object`]), and `expr` keys any supertrait / GAT selections recorded in
+    /// `Checked::selected`.
+    Object { expr: ExprId },
     /// Elaborated from a pending trait obligation with no single call clause.
     Other,
 }

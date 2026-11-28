@@ -1285,9 +1285,9 @@ fn encode_rows<'b>(c: &Checked<'_>, stalled_proved: bool, alloc: Alloc<'b>) -> R
                         p.u32(expr.0);
                         p.u32(root_nth);
                     }
-                    SupertraitOrigin::Object => {
+                    SupertraitOrigin::Object { expr } => {
                         p.u8(1);
-                        p.u32(0);
+                        p.u32(expr.0);
                         p.u32(0);
                     }
                     SupertraitOrigin::Other => {
@@ -1728,7 +1728,7 @@ impl<'r> CheckedRecord<'r> {
                     let on_root = g.u32()?;
                     let origin = match ot {
                         0 => SupertraitOrigin::Clause { expr: oe, nth: on_root },
-                        1 => SupertraitOrigin::Object,
+                        1 => SupertraitOrigin::Object { expr: oe },
                         2 => SupertraitOrigin::Other,
                         _ => return Err(g.bad(ot)),
                     };

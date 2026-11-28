@@ -449,3 +449,65 @@ fn supertrait_overflow_returns_limit_supertraits() {
         Ok(Outcome::Need(n)) => panic!("expected CheckError::Limit(Limit::Supertraits), got Ok(Need({:?}))", n.questions),
     }
 }
+
+/// A supertrait signature whose type tree exceeds `record_aliases_in`'s 256-node cap returns
+/// `CheckError::Limit(Limit::Supertraits)` rather than silently omitting alias selections.
+#[test]
+fn supertrait_alias_walk_overflow_returns_limit_supertraits() {
+    let mut world = Fx::new();
+    let fx = &mut world;
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let (p0, p1) = (fx.param(0), fx.param(1));
+    let rust_call = FnPtrHeader { abi: Abi::RustCall, safety: Safety::Safe, c_variadic: false };
+
+    let fn_once = fx.tr("FnOnce", 2, Vec::new(), &["Output"]);
+    fx.lang(LangItem::FnOnce, fn_once);
+    let out = fx.alias(fn_once, "Output", &[p0, p1]);
+    let call_once = fx.trait_fn(fn_once, "call_once", true, &[p0, p1], out);
+    fx.set_header(call_once, rust_call);
+    let sup = fx.bound(fn_once, &[p0, p1]);
+    let fn_mut = fx.tr("FnMut", 2, std::vec![sup], &[]);
+    fx.lang(LangItem::FnMut, fn_mut);
+    let sup = fx.bound(fn_mut, &[p0, p1]);
+    let fn_ = fx.tr("Fn", 2, std::vec![sup], &[]);
+    fx.lang(LangItem::Fn, fn_);
+
+    let (u32_, unit) = (fx.ty(PNode::Uint(UintTy::U32)), fx.unit());
+    // 260 distinct nested 1-tuples exceed `record_aliases_in`'s 256-node bound.
+    let mut deep = u32_;
+    for _ in 0..260 {
+        deep = fx.tuple(&[deep]);
+    }
+    let fn_bound = fx.bound(fn_, &[p0, deep]);
+    let fn_out = fx.proj(fn_once, &[p0, deep], "Output", u32_);
+    let deep_trait = fx.tr("DeepSig", 1, std::vec![fn_bound, fn_out], &[]);
+    let top_bound = fx.bound(deep_trait, &[p0]);
+    fx.func("take_deep_sig", 1, &[p0], unit, std::vec![top_bound]);
+    let caller = fx.func("caller", 0, &[], unit, Vec::new());
+    fx.finish();
+
+    let mut b = Bb::new();
+    let x = b.bind("x");
+    let val = b.int(Some(IntSuffix::Uint(UintTy::U32)));
+    let cl = b.closure(&[x], val);
+    let take = b.path(&["take_deep_sig"]);
+    let call = b.call(take, &[cl]);
+    let root = b.block(&[], Some(call));
+
+    let mut ty = InferCtx::new_in(blaze_own::Alloc::global());
+    let res = check_with(
+        &b.view(caller, root),
+        &world,
+        &mut ty,
+        &Needs::new_in(blaze_own::Alloc::global()),
+        Plant::None,
+        blaze_own::Alloc::global(),
+    );
+    match res {
+        Err(CheckError::Limit(Limit::Supertraits)) => {}
+        Err(other) => panic!("expected CheckError::Limit(Limit::Supertraits), got Err({other:?})"),
+        Ok(Outcome::Done(_)) => panic!("expected CheckError::Limit(Limit::Supertraits), got Ok(Done)"),
+        Ok(Outcome::Need(n)) => panic!("expected CheckError::Limit(Limit::Supertraits), got Ok(Need({:?}))", n.questions),
+    }
+}

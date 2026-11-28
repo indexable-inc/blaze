@@ -135,6 +135,7 @@ trait GatFn<A: Assoc>: for<'a> Fn(A::Item<'a>) -> &'a i32 {}
 impl<A: Assoc, F: for<'a> Fn(A::Item<'a>) -> &'a i32> GatFn<A> for F {}
 
 fn take_gat<A: Assoc, F: GatFn<A>>(_f: F) {}
+fn take_dyn_gat(_f: Box<dyn GatFn<Holder>>) {}
 
 fn gat_supertrait_ok() {
     take_gat::<Holder, _>(|x| x);
@@ -145,6 +146,46 @@ fn gat_supertrait_local_ref_err() {
         let y = 1;
         &y
     });
+}
+
+fn dyn_gat_supertrait_ok() {
+    take_dyn_gat(Box::new(|x| x));
+}
+
+fn dyn_gat_supertrait_local_ref_err() {
+    take_dyn_gat(Box::new(|_x| {
+        let y = 1;
+        &y
+    }));
+}
+
+trait MixedHrtb<'b>: for<'a> FnMut(&'a i32, &'b i32) -> &'b i32 {}
+impl<'b, F: for<'a> FnMut(&'a i32, &'b i32) -> &'b i32> MixedHrtb<'b> for F {}
+
+fn take_mixed_hrtb<'b, F: MixedHrtb<'b>>(_f: F, _v: &'b i32) {}
+
+fn hrtb_need_sig_ok<'b>(v: &'b i32) {
+    let mut keep: Option<&'b i32> = None;
+    take_mixed_hrtb(
+        |_a, b| {
+            keep = Some(b);
+            b
+        },
+        v,
+    );
+    let _ = keep;
+}
+
+fn hrtb_need_sig_escape_err<'b>(v: &'b i32) {
+    let mut keep: Option<&'b i32> = None;
+    take_mixed_hrtb(
+        |a, b| {
+            keep = Some(a);
+            b
+        },
+        v,
+    );
+    let _ = keep;
 }
 
 trait Consume<'a>: FnOnce() -> &'a mut i32 {}
@@ -224,6 +265,8 @@ fn closure_signatures_elaborate_supertraits_end_to_end() {
         "hrtb_dyn_supertrait_ok",
         "dyn_static_supertrait_ok",
         "gat_supertrait_ok",
+        "dyn_gat_supertrait_ok",
+        "hrtb_need_sig_ok",
         "fnonce_supertrait_consume_ok",
     ] {
         let b = find(name);
@@ -242,6 +285,8 @@ fn closure_signatures_elaborate_supertraits_end_to_end() {
     for name in [
         "hrtb_supertrait_local_ref_err",
         "gat_supertrait_local_ref_err",
+        "dyn_gat_supertrait_local_ref_err",
+        "hrtb_need_sig_escape_err",
         "fnmut_supertrait_consume_err",
     ] {
         let (bad_ty, bad_br) = world.check_borrows(find(name), alloc);
