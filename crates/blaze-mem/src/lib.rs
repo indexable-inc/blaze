@@ -124,6 +124,13 @@ pub fn page_size() -> usize {
     os::page_size()
 }
 
+/// Discards whole host pages inside `slice` back to the OS so subsequent reads fault in fresh
+/// zero pages (leaving untouched pages unallocated), and zeroes any unaligned head/tail bytes.
+/// Returns the raw OS errno on failure.
+pub fn decommit_zeroed(slice: &mut [u8]) -> Result<(), i32> {
+    os::decommit_zeroed(slice)
+}
+
 #[cfg(test)]
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;

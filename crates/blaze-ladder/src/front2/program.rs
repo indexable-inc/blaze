@@ -1587,7 +1587,7 @@ fn symbols_of<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey, valu
     let atoms = names.cfg_atoms(krate).ok_or_else(|| refuse(format!("crate {krate}'s cfg atoms are not read")))?;
     let edition = names.edition_of(krate).ok_or_else(|| refuse(format!("crate {krate}'s edition is not read")))?;
     let extensions = names.blaze_extensions(krate);
-    let sig = blaze_lower::lower_signature_with_extensions(text, edition, extensions, &mut CrateCfg(atoms), Alloc::global())
+    let sig = blaze_lower::lower_signature_with_extensions(text, edition, extensions, &mut CrateCfg::of(names, krate, atoms), Alloc::global())
         .map_err(|_| refuse(String::from("its signature needs a `cfg` the crate does not answer")))?;
     let v = sig.view();
     // A body (`{ .. }`, not `;`) is the signature lowering's own flag (blaze-lower machine.rs

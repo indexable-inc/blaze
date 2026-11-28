@@ -174,13 +174,12 @@ fn fixture(text: &str) -> Fixture {
 
 fn reader(f: &Fixture) -> NamesRecords<'static> {
     let a = alloc();
-    let frame: &'static blaze_mem::Frame = Box::leak(Box::new(
-        blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("reader frame"),
-    ));
-    let log: &'static Log<'static> = Box::leak(Box::new(Log::new(f.crate_names, a)));
-    let load: &'static Kept = Box::leak(Box::new(f.kept.clone()));
-    let records: &'static Records<'static> =
-        Box::leak(Box::new(Records::new(f.keys, load, log, frame, a)));
+    let bump = blaze_own::testing::bump();
+    let frame: &'static blaze_mem::Frame =
+        bump.alloc_val(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("reader frame"));
+    let log: &'static Log<'static> = bump.alloc_val(Log::new(f.crate_names, a));
+    let load: &'static Kept = bump.alloc_val(f.kept.clone());
+    let records: &'static Records<'static> = bump.alloc_val(Records::new(f.keys, load, log, frame, a));
     NamesRecords { records, frame, lang_crates: &LANG_CRATES, body_sources: None }
 }
 

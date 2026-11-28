@@ -824,7 +824,7 @@ pub(crate) fn classify_dep_probe_tags<'f>(
             }
             let Ok(uid) = u32::try_from(idx) else { continue };
             let unit_id = blaze_unit_graph::UnitId(uid);
-            match crate::wasm64_compile::unit_has_dep_build_scripts(graph, wasm_graph, unit_id, true) {
+            match crate::wasm64_compile::unit_has_dep_build_scripts(graph, wasm_graph, unit_id, true, probes.shared()) {
                 Ok(true) => {
                     let entry = get_planned_probe();
                     let unit_entry = match &entry {
@@ -850,7 +850,7 @@ pub(crate) fn classify_dep_probe_tags<'f>(
         {
             continue;
         }
-        match crate::wasm64_compile::unit_has_dep_build_scripts(graph, wasm_graph, script_unit, false) {
+        match crate::wasm64_compile::unit_has_dep_build_scripts(graph, wasm_graph, script_unit, false, probes.shared()) {
             Ok(true) => planned.script_modules.push((subject, get_planned_probe())),
             Ok(false) => {}
             Err(error) => planned.script_modules.push((subject, PlannedProbe::Failed(error))),
@@ -908,7 +908,7 @@ pub(crate) fn plan_dep_probe_tags_at<'f>(
     // the graph sections from the store (without making `NamesWorld` or opening toolchain shelves).
     // Propagate any `BackRefused` error cleanly instead of silently planning with empty probe tags.
     let decode_frame = if world.made().is_none() {
-        Some(Frame::with_reserve(8 << 20, bstd::mem::Tag::Other).map_err(|_| CliError::Text {
+        Some(Frame::with_reserve(64 << 20, bstd::mem::Tag::Other).map_err(|_| CliError::Text {
             what: "failed to reserve frame for MacroModule dep-probe planning",
         })?)
     } else {
@@ -1929,7 +1929,7 @@ impl<'f> ScriptsStage<'f> {
                 .map(|(_, entry)| entry);
             let (deps, expected_probes) = if module.ran_as == crate::scripts::RanAs::Wasm {
                 match (
-                    crate::wasm64_compile::unit_has_dep_build_scripts(made.graph(), made.wasm_graph(), module.script_unit, false),
+                    crate::wasm64_compile::unit_has_dep_build_scripts(made.graph(), made.wasm_graph(), module.script_unit, false, handles.env.heap.shared()),
                     planned_entry,
                 ) {
                     (_, Some(PlannedProbe::Failed(error))) => {

@@ -441,18 +441,20 @@ pub(crate) fn unit_has_dep_build_scripts(
     wasm_graph: Option<&UnitGraph<'_>>,
     root_unit: UnitId,
     is_proc_macro: bool,
+    shared: blaze_own::SharedAlloc<'static>,
 ) -> Result<bool, crate::scripts::ProbeSetupError> {
-    let shared = blaze_own::SharedAlloc::global();
     let Some(wg) = wasm_graph else {
         return Err(crate::scripts::ProbeSetupError::from_str(
             crate::scripts::ProbeErrorKind::WasmGraphMissing,
             "wasm64-blaze-wasip1 unit graph is absent; cannot classify dependency build scripts from the host graph",
+            shared,
         ));
     };
     let frame = Frame::with_reserve(1 << 20, Tag::Other).map_err(|_| {
         crate::scripts::ProbeSetupError::from_str(
             crate::scripts::ProbeErrorKind::FrameReserve,
             "failed to reserve frame for wasm64 dep build-script scan",
+            shared,
         )
     })?;
     let erased = Erased::new(&frame);
@@ -1363,7 +1365,7 @@ fn ensure_build_script_unit(
         SelfCompileError::Failed(msg.as_str().into())
     })?;
     let (deps_digest, frozen_probes) = if let Some(shared) = dep_probes.shared {
-        let has_dep_scripts = unit_has_dep_build_scripts(graph, effective_wasm_graph, script_id, false).map_err(|e| {
+        let has_dep_scripts = unit_has_dep_build_scripts(graph, effective_wasm_graph, script_id, false, shared.shared()).map_err(|e| {
             let mut msg = blaze_own::String::new_in(heap.alloc());
             let _ = write!(msg, "build-script wasm64 dep lookup of {}: {e}", unit.name.as_str());
             SelfCompileError::Failed(msg.as_str().into())
@@ -1516,7 +1518,7 @@ fn ensure_proc_macro_unit(
         SelfCompileError::Failed(msg.as_str().into())
     })?;
     let (identity, frozen_probes) = if let Some(shared) = dep_probes.shared {
-        let has_dep_scripts = unit_has_dep_build_scripts(graph, Some(graph), pm_id, true).map_err(|e| {
+        let has_dep_scripts = unit_has_dep_build_scripts(graph, Some(graph), pm_id, true, shared.shared()).map_err(|e| {
             let mut msg = blaze_own::String::new_in(heap.alloc());
             let _ = write!(msg, "proc-macro wasm64 dep lookup of {}: {e}", unit.name.as_str());
             SelfCompileError::Failed(msg.as_str().into())
@@ -1680,7 +1682,7 @@ pub(crate) fn compile_proc_macro(
             Some(expected)
         }
         (Some(shared), None) => {
-            let has_dep_scripts = unit_has_dep_build_scripts(&decoded.graph, wasm_graph_ref, pm_id, true).map_err(|e| {
+            let has_dep_scripts = unit_has_dep_build_scripts(&decoded.graph, wasm_graph_ref, pm_id, true, shared.shared()).map_err(|e| {
                 let mut msg = blaze_own::String::new_in(inputs.heap.alloc());
                 let _ = write!(msg, "proc-macro wasm64 dep lookup of {}: {e}", identity.package);
                 SelfCompileError::Failed(msg.as_str().into())
@@ -1959,7 +1961,7 @@ fn run_dep_build_script(
         SelfCompileError::Failed(bstd::mem::format_in!(&frame, "dep build-script deps digest of {}: {e}", unit.name.as_str()).as_str().into())
     })?;
     let deps_digest = if let Some(shared) = dep_probes.shared {
-        let has_dep_scripts = unit_has_dep_build_scripts(graph, Some(graph), bs_id, false).map_err(|e| {
+        let has_dep_scripts = unit_has_dep_build_scripts(graph, Some(graph), bs_id, false, shared.shared()).map_err(|e| {
             SelfCompileError::Failed(
                 bstd::mem::format_in!(&frame, "dep build-script wasm64 dep lookup of {}: {e}", unit.name.as_str())
                     .as_str()
@@ -3771,7 +3773,7 @@ mod wasm64_probe_table_tests {
     use blaze_build_script::probe_ask::{Ask, By, Rejection, Verdict, answer, classify};
     use blaze_fetch::PackView;
     use blaze_mem::{Arena, Frame, Tag};
-    use blaze_own::Erased;
+    use blaze_own::{Erased, Vec as OwnVec};
     use blaze_surface::Edition;
     use blaze_toolchain::{Role, ToolchainView};
 
@@ -3886,27 +3888,33 @@ mod wasm64_probe_table_tests {
                 let mf = blaze_toolchain::shelf::open_manifest(&mut shelf, tc_id).expect("real manifest");
                 let view = ToolchainView::open(mf.as_ref(), tc_id).expect("real view");
                 let sys = blaze_toolchain::sysroot(&view, WASM64_TARGET, false).expect("real sysroot");
-                let all: std::vec::Vec<_> = view.units(WASM64_TARGET).expect("real units").collect();
-                let mut keep = std::vec![false; all.len()];
-                let mut todo = std::vec![
+                let mut all = OwnVec::new_in(alloc);
+                all.extend(view.units(WASM64_TARGET).expect("real units"));
+                let mut keep = OwnVec::new_in(alloc);
+                keep.resize(all.len(), false);
+                let mut todo = OwnVec::new_in(alloc);
+                todo.extend_from_slice(&[
                     usize::try_from(sys.core.0).unwrap_or(0),
                     usize::try_from(sys.alloc.0).unwrap_or(0),
                     usize::try_from(sys.std.0).unwrap_or(0),
-                ];
+                ]);
                 while let Some(u) = todo.pop() {
                     if keep[u] { continue; }
                     keep[u] = true;
                     todo.extend(all[u].deps().filter_map(|(_, d)| usize::try_from(d).ok()));
                 }
-                let mut real_cfg: std::vec::Vec<_> = blaze_toolchain::target_cfg(&view, WASM64_TARGET)
-                    .expect("real cfg")
-                    .map(|(n, v)| (n.to_owned(), v.map(str::to_owned)))
-                    .collect();
+                let mut real_cfg = OwnVec::new_in(alloc);
+                real_cfg.extend(
+                    blaze_toolchain::target_cfg(&view, WASM64_TARGET)
+                        .expect("real cfg")
+                        .map(|(n, v)| (n.to_owned(), v.map(str::to_owned))),
+                );
                 real_cfg.sort_unstable();
                 real_cfg.dedup();
-                let mut real_at = std::vec![usize::MAX; all.len()];
-                let mut real_units = std::vec::Vec::new();
-                let mut real_names = std::vec::Vec::new();
+                let mut real_at = OwnVec::new_in(alloc);
+                real_at.resize(all.len(), usize::MAX);
+                let mut real_units = OwnVec::new_in(alloc);
+                let mut real_names = OwnVec::new_in(alloc);
                 let bump = erased.bump();
                 for (u, row) in all.iter().enumerate() {
                     if !keep[u] || row.kind != blaze_toolchain::UnitKind::Lib || row.for_host {
@@ -3917,11 +3925,11 @@ mod wasm64_probe_table_tests {
                     let held: &blaze_ladder::crates::ShelfFile =
                         blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(sf, &frame));
                     let pack = PackView::open_verified(held.as_ref()).expect("verified real pack");
-                    let prefix = bump.alloc_str(&std::format!("/toolchain/{u}/"));
+                    let prefix = bump.alloc_str(bstd::mem::format_in!(&frame, "/toolchain/{u}/").as_str());
                     let root_str = if krate.dir.is_empty() || row.root.starts_with(krate.dir) {
-                        std::format!("{prefix}{}", row.root)
+                        bstd::mem::format_in!(&frame, "{prefix}{}", row.root)
                     } else {
-                        std::format!("{prefix}{}/{}", krate.dir, row.root)
+                        bstd::mem::format_in!(&frame, "{prefix}{}/{}", krate.dir, row.root)
                     };
                     let mut feats: blaze_own::Vec<&str, _> = blaze_own::Vec::new_in(bump);
                     for f in row.features() {
@@ -3936,7 +3944,7 @@ mod wasm64_probe_table_tests {
                     real_units.push(TcUnit {
                         name: bump.alloc_str(krate.lib),
                         edition: Edition::E2024,
-                        root: bump.alloc_str(&root_str),
+                        root: bump.alloc_str(root_str.as_str()),
                         prefix,
                         features: feats.into_bump_slice(),
                         raw_deps: rdeps.into_bump_slice(),
@@ -3950,15 +3958,17 @@ mod wasm64_probe_table_tests {
                 for (n, v) in &real_cfg {
                     real_cfg_refs.push((n.as_str(), v.as_deref()));
                 }
-                let real_feat = scan_wasm64_feature_rows(WASM64_TARGET, &real_units, &real_at, real_cfg_refs.as_slice(), &arena, alloc)
+                let real_feat = scan_wasm64_feature_rows(WASM64_TARGET, real_units.as_slice(), real_at.as_slice(), real_cfg_refs.as_slice(), &arena, alloc)
                     .expect("scan real wasm64 toolchain");
-                let mut real_table: std::vec::Vec<_> = blaze_world::script_setting::pinned_table(
-                    WASM64_TARGET,
-                    real_names.iter().map(std::string::String::as_str),
-                    alloc,
-                )
-                .as_slice()
-                .to_vec();
+                let mut real_table = OwnVec::new_in(alloc);
+                real_table.extend_from_slice(
+                    blaze_world::script_setting::pinned_table(
+                        WASM64_TARGET,
+                        real_names.iter().map(std::string::String::as_str),
+                        alloc,
+                    )
+                    .as_slice(),
+                );
                 real_table.extend_from_slice(real_feat.as_slice());
                 real_table.sort_unstable_by_key(|r| r.key);
                 let real_got = answer(&compile, crate::graph::TRIPLE, rustix_snippet, &Table { rows: &real_table });
@@ -4570,17 +4580,55 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         );
     }
 
+    /// RAII scratch directory for unit tests in this module; removes its tree on drop.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let frame = Frame::with_reserve(64 << 10, Tag::Other).expect("scratch frame");
+            let name = bstd::mem::format_in!(&frame, "blaze-wasm64-{tag}-{}", std::process::id());
+            let path = std::env::temp_dir().join(name.as_str());
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create scratch dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn join(&self, rel: &str) -> PathBuf {
+            self.0.join(rel)
+        }
+
+        fn mkdir(&self, rel: &str) -> PathBuf {
+            let p = self.0.join(rel);
+            std::fs::create_dir_all(&p).expect("create scratch subdir");
+            p
+        }
+
+        fn write(&self, rel: &str, body: impl AsRef<[u8]>) -> PathBuf {
+            let p = self.0.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).expect("create scratch parent");
+            }
+            std::fs::write(&p, body).expect("write scratch file");
+            p
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn shared_command_probes_is_lazy_coalesced_and_threads_into_dep_script_setting() {
-        let tmp = std::env::temp_dir().join(std::format!(
-            "blaze-wasm64-dep-probes-unit-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let checkout = tmp.join("checkout");
-        let home_dir = tmp.join("home");
-        std::fs::create_dir_all(&checkout).expect("checkout dir");
-        std::fs::create_dir_all(home_dir.join(".blaze/v2")).expect("home .blaze/v2 dir");
+        let scratch = ScratchDir::new("dep-probes-unit");
+        let checkout = scratch.mkdir("checkout");
+        let home_dir = scratch.join("home");
+        scratch.mkdir("home/.blaze/v2");
 
         let io = bstd::test::native(&checkout).expect("native io");
         let cx = io
@@ -4697,7 +4745,7 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
             store: &home_dir,
             target: WASM64_TARGET,
             host: crate::graph::TRIPLE,
-            table: Arc::new(std::vec::Vec::new()),
+            table: Arc::new(Default::default()),
             probes: None,
             c_probes: first_c_probes,
             c_mode: CMode::Deferred,
@@ -4762,7 +4810,7 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         // `dep_script_spawn_setting` strips it and retains only hermetic derived-fact pins.
         let unhermetic = SpawnSetting {
             hvbox_allowed: true,
-            tools: std::vec::Vec::new(),
+            tools: Default::default(),
             userland: None,
             pins: spawn.pins.clone(),
         };
@@ -4771,16 +4819,14 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         assert!(sanitized.tools.is_empty());
         assert!(sanitized.userland.is_none());
         assert_eq!(sanitized.pins, spawn.pins);
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn dep_probe_identity_invalidates_module_and_script_keys_on_pin_or_probe_change() {
         let base_pins = blaze_proc_macro::spawn_route::FactPins {
-            clang_version_text: std::string::String::from("clang version 23.0.0"),
-            macos_product_version: std::string::String::from("15.4"),
-            macos_build_version: std::string::String::from("24E248"),
+            clang_version_text: "clang version 23.0.0".into(),
+            macos_product_version: "15.4".into(),
+            macos_build_version: "24E248".into(),
         };
         let base_ready = DepCProbeIdentity::Ready {
             clang_sha256: [0x11; 32],
@@ -4796,11 +4842,11 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         assert_eq!(base_hex, base.hex(), "DepProbeIdentity::hex must be deterministic");
 
         let mut alt_clang_ver = base_pins.clone();
-        alt_clang_ver.clang_version_text = std::string::String::from("clang version 24.0.0");
+        alt_clang_ver.clang_version_text = "clang version 24.0.0".into();
         let mut alt_macos_ver = base_pins.clone();
-        alt_macos_ver.macos_product_version = std::string::String::from("15.5");
+        alt_macos_ver.macos_product_version = "15.5".into();
         let mut alt_macos_build = base_pins.clone();
-        alt_macos_build.macos_build_version = std::string::String::from("24F74");
+        alt_macos_build.macos_build_version = "24F74".into();
 
         let variants: [(&str, DepProbeIdentity<'_>); 10] = [
             ("host", DepProbeIdentity { host: "aarch64-apple-darwin", ..base }),
@@ -4854,16 +4900,16 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         .expect("parse lock");
         let mut pm_unit = make_unit(0, "sqlx-macros", "sqlx_macros", UnitKind::ProcMacro, "2024", &[], a);
         pm_unit.version = Text::from_str_in("0.9.0", a);
-        let pm_graph = make_graph(std::vec![pm_unit], a);
+        let pm_graph = make_graph([pm_unit].into(), a);
         let locked = blaze_proc_macro::module::LockedPackages::of(&lock);
-        let git_folders = std::collections::BTreeMap::new();
+        let git_folders = Default::default();
         let base_identity = blaze_world::procs::identify(
             &lock,
             &locked,
             &git_folders,
             &pm_graph,
             &pm_graph.units[0],
-            |_| Ok(None::<std::string::String>),
+            |_| Ok(None::<&str>),
             a,
         )
         .expect("identify io")
@@ -4925,7 +4971,8 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
             }
         }
 
-        let shared = blaze_own::SharedAlloc::global();
+        let heap = blaze_own::testing::heap();
+        let shared = heap.shared();
         let make_ready = |res: Result<ContentId, &'static str>| {
             let answerer: blaze_own::Arc<dyn ProbeAnswerer + Send + Sync, blaze_own::SharedAlloc<'static>> =
                 blaze_own::Arc::new_in(FakeAnswerer(res), shared);
@@ -4947,11 +4994,10 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         let cx = io
             .cx(core::time::Duration::from_secs(10), bstd::mem::TASK_FRAME)
             .expect("sim cx");
-        let heap = blaze_own::testing::heap();
         let spawn = SpawnSetting::facts_only(blaze_proc_macro::spawn_route::FactPins {
-            clang_version_text: std::string::String::from("clang version 23.0.0"),
-            macos_product_version: std::string::String::new(),
-            macos_build_version: std::string::String::new(),
+            clang_version_text: "clang version 23.0.0".into(),
+            macos_product_version: Default::default(),
+            macos_build_version: Default::default(),
         });
         let ready_a = make_ready(Ok(ContentId([0xaa; 32])));
         let ready_b = make_ready(Ok(ContentId([0xbb; 32])));
@@ -5030,14 +5076,17 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         let err_alice = crate::scripts::ProbeSetupError::from_str(
             crate::scripts::ProbeErrorKind::CProbesOpen,
             "/home/alice/.blaze/v2: permission denied",
+            shared,
         );
         let err_bob = crate::scripts::ProbeSetupError::from_str(
             crate::scripts::ProbeErrorKind::CProbesOpen,
             "/Users/bob/.blaze/v2: missing shelf",
+            shared,
         );
         let err_other_kind = crate::scripts::ProbeSetupError::from_str(
             crate::scripts::ProbeErrorKind::SpawnPinsOpen,
             "/home/alice/.blaze/v2: permission denied",
+            shared,
         );
         assert_eq!(
             probe_error_hex(err_alice.kind),
@@ -5092,7 +5141,7 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
 
         // Mid-compile answerer mutation refusal: if the live `ProbeAnswerer::id()` changes
         // between keying and publication, `revalidate_dep_probe_setting` MUST refuse publication.
-        struct MutableAnswerer(std::sync::Arc<core::sync::atomic::AtomicU8>);
+        struct MutableAnswerer(blaze_own::Arc<core::sync::atomic::AtomicU8, blaze_own::SharedAlloc<'static>>);
         impl ProbeAnswerer for MutableAnswerer {
             fn id<'a>(&self, _alloc: Alloc<'a>) -> Result<ContentId, blaze_own::AString<'a>> {
                 Ok(ContentId([self.0.load(core::sync::atomic::Ordering::SeqCst); 32]))
@@ -5106,9 +5155,9 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
                 Err(blaze_own::AString::from_str_in("unused", alloc))
             }
         }
-        let mutable_state = std::sync::Arc::new(core::sync::atomic::AtomicU8::new(0xaa));
+        let mutable_state = blaze_own::Arc::new_in(core::sync::atomic::AtomicU8::new(0xaa), shared);
         let answerer_dyn: blaze_own::Arc<dyn ProbeAnswerer + Send + Sync, blaze_own::SharedAlloc<'static>> =
-            blaze_own::Arc::new_in(MutableAnswerer(std::sync::Arc::clone(&mutable_state)), shared);
+            blaze_own::Arc::new_in(MutableAnswerer(blaze_own::Share::share(&mutable_state)), shared);
         let records_dyn: blaze_own::Arc<dyn CProbeStore, blaze_own::SharedAlloc<'static>> =
             blaze_own::Arc::new_in(MemCProbeStore::default(), shared);
         let mutable_ready = CProbeSetting::Ready(CScriptProbes {
@@ -5159,7 +5208,7 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         )
         .expect_err("mid-compile live answerer mutation must refuse publication");
         assert!(
-            std::format!("{drift_err}").contains("refusing to publish under stale key"),
+            bstd::mem::format_in!(cx.frame(), "{drift_err}").as_str().contains("refusing to publish under stale key"),
             "unexpected drift error: {drift_err}"
         );
 
@@ -5226,7 +5275,7 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         // 6: pm_own_bs (ProcMacro, build_script = Some(1), depends on 0)
         // 7: pm_dep_ring (ProcMacro, depends on 2: ring_lib)
         let graph = make_graph(
-            std::vec![
+            [
                 make_u(0, "plain_lib", UnitKind::Lib, None, &[]),
                 make_u(1, "ring", UnitKind::BuildScript, None, &[]),
                 make_u(1, "ring", UnitKind::Lib, Some(1), &[]),
@@ -5235,26 +5284,28 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
                 make_u(4, "pm_plain", UnitKind::ProcMacro, None, &[("plain_lib", 0)]),
                 make_u(5, "pm_own_bs", UnitKind::ProcMacro, Some(1), &[("plain_lib", 0)]),
                 make_u(6, "pm_dep_ring", UnitKind::ProcMacro, None, &[("ring", 2)]),
-            ],
+            ]
+            .into(),
             a,
         );
 
+        let shared = blaze_own::testing::heap().shared();
         // Passing `None` for `wasm_graph` MUST return `Err(WasmGraphMissing)` rather than
         // silently scanning the host graph (wasm64 target-gated deps can differ from host).
-        let missing_wg = unit_has_dep_build_scripts(&graph, None, UnitId(3), false)
+        let missing_wg = unit_has_dep_build_scripts(&graph, None, UnitId(3), false, shared)
             .expect_err("missing wasm_graph must return Err instead of scanning host graph");
         assert_eq!(missing_wg.kind, crate::scripts::ProbeErrorKind::WasmGraphMissing);
 
-        assert!(!unit_has_dep_build_scripts(&graph, Some(&graph), UnitId(3), false).expect("bs_plain"));
-        assert!(unit_has_dep_build_scripts(&graph, Some(&graph), UnitId(4), false).expect("bs_with_ring"));
-        assert!(!unit_has_dep_build_scripts(&graph, Some(&graph), UnitId(5), true).expect("pm_plain"));
-        assert!(unit_has_dep_build_scripts(&graph, Some(&graph), UnitId(6), true).expect("pm_own_bs"));
-        assert!(unit_has_dep_build_scripts(&graph, Some(&graph), UnitId(7), true).expect("pm_dep_ring"));
+        assert!(!unit_has_dep_build_scripts(&graph, Some(&graph), UnitId(3), false, shared).expect("bs_plain"));
+        assert!(unit_has_dep_build_scripts(&graph, Some(&graph), UnitId(4), false, shared).expect("bs_with_ring"));
+        assert!(!unit_has_dep_build_scripts(&graph, Some(&graph), UnitId(5), true, shared).expect("pm_plain"));
+        assert!(unit_has_dep_build_scripts(&graph, Some(&graph), UnitId(6), true, shared).expect("pm_own_bs"));
+        assert!(unit_has_dep_build_scripts(&graph, Some(&graph), UnitId(7), true, shared).expect("pm_dep_ring"));
 
         // When a `wasm_graph` is supplied and does NOT contain the requested root unit,
         // `unit_has_dep_build_scripts` MUST return `Err(WasmRootMissing)` instead of falling back.
-        let empty_wasm_graph = make_graph(std::vec![make_u(0, "plain_lib", UnitKind::Lib, None, &[])], a);
-        let bs_err = unit_has_dep_build_scripts(&graph, Some(&empty_wasm_graph), UnitId(4), false)
+        let empty_wasm_graph = make_graph([make_u(0, "plain_lib", UnitKind::Lib, None, &[])].into(), a);
+        let bs_err = unit_has_dep_build_scripts(&graph, Some(&empty_wasm_graph), UnitId(4), false, shared)
             .expect_err("missing BuildScript root in wasm_graph must return Err");
         assert_eq!(bs_err.kind, crate::scripts::ProbeErrorKind::WasmRootMissing);
         assert!(
@@ -5262,7 +5313,7 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
             "error should name the missing build-script root: {}",
             bs_err.detail.as_str()
         );
-        let pm_err = unit_has_dep_build_scripts(&graph, Some(&empty_wasm_graph), UnitId(7), true)
+        let pm_err = unit_has_dep_build_scripts(&graph, Some(&empty_wasm_graph), UnitId(7), true, shared)
             .expect_err("missing ProcMacro root in wasm_graph must return Err");
         assert_eq!(pm_err.kind, crate::scripts::ProbeErrorKind::WasmRootMissing);
         assert!(
@@ -5289,13 +5340,14 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
             u
         };
         let graph = make_graph(
-            std::vec![
+            [
                 make_u(0, "plain-lib", UnitKind::Lib, None, &[]),
                 make_u(1, "ring", UnitKind::BuildScript, None, &[]),
                 make_u(1, "ring", UnitKind::Lib, Some(1), &[]),
                 make_u(2, "pm-plain", UnitKind::ProcMacro, None, &[("plain_lib", 0)]),
                 make_u(3, "pm-dep-ring", UnitKind::ProcMacro, None, &[("ring", 2)]),
-            ],
+            ]
+            .into(),
             a,
         );
         let target = blaze_unit_graph::TargetDesc::new(
@@ -5319,7 +5371,7 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         let lock = crate::fetch::Lockfile::read(lock_text, heap, &frame).expect("parse lockfile");
         let rows = crate::sweep::Rows::new_in(&frame);
         let place = crate::macros::Place { home: None, checkout: "", members: None, rows: &rows };
-        let empty_modules = std::path::Path::new("/nonexistent-blaze-test-modules-dir");
+        let empty_modules = Path::new("/nonexistent-blaze-test-modules-dir");
 
         let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(42, bstd::io::Limits::USUAL));
         let cx = io
@@ -5355,6 +5407,7 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
             crate::engine_scripts::PlannedProbe::Failed(crate::scripts::ProbeSetupError::from_str(
                 crate::scripts::ProbeErrorKind::SpawnPinsOpen,
                 "simulated spawn pin failure",
+                heap.shared(),
             )),
         )];
         let listed_fail = crate::macros::list(
@@ -5435,23 +5488,25 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         // - Unit 3: feature "with-ring" -> depends on `ring` (HAS dependency build script)
         // - Unit 4: feature "plain" -> depends on `plain-lib` (NO dependency build script)
         let graph_dep_first = make_graph(
-            std::vec![
+            [
                 make_u(0, "plain-lib", UnitKind::Lib, None, &[], &[]),
                 make_u(1, "ring", UnitKind::BuildScript, None, &[], &[]),
                 make_u(1, "ring", UnitKind::Lib, Some(1), &[], &[]),
                 make_u(2, "pm-dup", UnitKind::ProcMacro, None, &["with-ring"], &[("ring", 2)]),
                 make_u(2, "pm-dup", UnitKind::ProcMacro, None, &["plain"], &[("plain_lib", 0)]),
-            ],
+            ]
+            .into(),
             a,
         );
         let graph_plain_first = make_graph(
-            std::vec![
+            [
                 make_u(0, "plain-lib", UnitKind::Lib, None, &[], &[]),
                 make_u(1, "ring", UnitKind::BuildScript, None, &[], &[]),
                 make_u(1, "ring", UnitKind::Lib, Some(1), &[], &[]),
                 make_u(2, "pm-dup", UnitKind::ProcMacro, None, &["plain"], &[("plain_lib", 0)]),
                 make_u(2, "pm-dup", UnitKind::ProcMacro, None, &["with-ring"], &[("ring", 2)]),
-            ],
+            ]
+            .into(),
             a,
         );
 
@@ -5463,7 +5518,7 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         let lock = crate::fetch::Lockfile::read(lock_text, heap, &frame).expect("parse lockfile");
         let rows = crate::sweep::Rows::new_in(&frame);
         let place = crate::macros::Place { home: None, checkout: "", members: None, rows: &rows };
-        let empty_modules = std::path::Path::new("/nonexistent-blaze-test-modules-dir");
+        let empty_modules = Path::new("/nonexistent-blaze-test-modules-dir");
 
         let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(78, bstd::io::Limits::USUAL));
         let cx = io
@@ -5553,12 +5608,13 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         // Also verify that if the second duplicate unit fails (missing wasm root), `classify_dep_probe_tags`
         // does NOT drop its error when the first duplicate unit succeeded with `Digest`!
         let partial_wasm = make_graph(
-            std::vec![
+            [
                 make_u(0, "plain-lib", UnitKind::Lib, None, &[], &[]),
                 make_u(1, "ring", UnitKind::BuildScript, None, &[], &[]),
                 make_u(1, "ring", UnitKind::Lib, Some(1), &[], &[]),
                 make_u(2, "pm-dup", UnitKind::ProcMacro, None, &["with-ring"], &[("ring", 2)]),
-            ],
+            ]
+            .into(),
             a,
         );
         let planned_err = crate::engine_scripts::classify_dep_probe_tags(
@@ -5609,49 +5665,52 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         // 1: foo Lib (for_host=false, build_script=Some(0))
         // 2: my-macro ProcMacro (features=["macros"])
         let host_graph = make_graph(
-            std::vec![
+            [
                 make_u(1, "foo", UnitKind::BuildScript, true, None, &["std"]),
                 make_u(1, "foo", UnitKind::Lib, false, Some(0), &["std"]),
                 make_u(2, "my-macro", UnitKind::ProcMacro, true, None, &["macros"]),
-            ],
+            ]
+            .into(),
             a,
         );
 
         // Wasm graph 1: same package & kind, WRONG features (missing "std" / wrong feature "other").
         let wg_wrong_feats = make_graph(
-            std::vec![
+            [
                 make_u(1, "foo", UnitKind::BuildScript, true, None, &["other"]),
                 make_u(1, "foo", UnitKind::Lib, false, Some(0), &["other"]),
                 make_u(2, "my-macro", UnitKind::ProcMacro, true, None, &[]),
-            ],
+            ]
+            .into(),
             a,
         );
         let bs_feat_err = locate_root_in_wasm_graph(&host_graph, &wg_wrong_feats, UnitId(0), CompileMode::BuildScript, a)
             .expect_err("inexact BuildScript features in wasm_graph must be refused");
         assert!(
-            std::format!("{bs_feat_err}").contains("no exact"),
+            bstd::mem::format_in!(&frame, "{bs_feat_err}").as_str().contains("no exact"),
             "unexpected error: {bs_feat_err}"
         );
         let pm_feat_err = locate_root_in_wasm_graph(&host_graph, &wg_wrong_feats, UnitId(2), CompileMode::ProcMacro, a)
             .expect_err("inexact ProcMacro features in wasm_graph must be refused");
         assert!(
-            std::format!("{pm_feat_err}").contains("no exact"),
+            bstd::mem::format_in!(&frame, "{pm_feat_err}").as_str().contains("no exact"),
             "unexpected error: {pm_feat_err}"
         );
 
         // Wasm graph 2: same package & kind & exact features, WRONG HostFeatureSide
         // (served only by a for_host=true server -> HostFeatureSide::Host instead of Target).
         let wg_wrong_side = make_graph(
-            std::vec![
+            [
                 make_u(1, "foo", UnitKind::BuildScript, true, None, &["std"]),
                 make_u(1, "foo", UnitKind::Lib, true, Some(0), &["std"]),
-            ],
+            ]
+            .into(),
             a,
         );
         let bs_side_err = locate_root_in_wasm_graph(&host_graph, &wg_wrong_side, UnitId(0), CompileMode::BuildScript, a)
             .expect_err("wrong HostFeatureSide BuildScript in wasm_graph must be refused");
         assert!(
-            std::format!("{bs_side_err}").contains("no exact"),
+            bstd::mem::format_in!(&frame, "{bs_side_err}").as_str().contains("no exact"),
             "unexpected error: {bs_side_err}"
         );
 
@@ -5670,17 +5729,12 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
 
     #[test]
     fn lookup_cached_build_script_module_propagates_store_and_digest_errors() {
-        let base = std::env::temp_dir().join(std::format!(
-            "blaze-wasm64-cache-lookup-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).expect("create temp base");
+        let scratch = ScratchDir::new("cache-lookup");
+        let frame = Frame::with_reserve(256 << 10, Tag::Other).expect("frame");
         let heap = blaze_own::testing::heap();
 
         // 1. Clean empty store -> explicit Ok(None) cache miss.
-        let empty_store = base.join("empty-store");
-        std::fs::create_dir_all(&empty_store).expect("create empty store");
+        let empty_store = scratch.mkdir("empty-store");
         let miss = lookup_cached_build_script_module(
             &empty_store,
             "ring",
@@ -5694,9 +5748,8 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         assert!(miss.is_none());
 
         // 2. Corrupt/unreadable module store (a regular file at `build-script/modules`) -> Err.
-        let corrupt_store = base.join("corrupt-store");
-        std::fs::create_dir_all(corrupt_store.join("build-script")).expect("create corrupt parent");
-        std::fs::write(corrupt_store.join("build-script/modules"), b"not-a-dir").expect("write file");
+        let corrupt_store = scratch.join("corrupt-store");
+        scratch.write("corrupt-store/build-script/modules", b"not-a-dir");
         let store_err = lookup_cached_build_script_module(
             &corrupt_store,
             "ring",
@@ -5708,21 +5761,20 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         )
         .expect_err("unreadable/corrupt build-script module store must propagate Err");
         assert!(
-            std::format!("{store_err}").contains("looking up cached build-script module"),
+            bstd::mem::format_in!(&frame, "{store_err}").as_str().contains("looking up cached build-script module"),
             "unexpected store error: {store_err}"
         );
 
         // 3. Cached record dir present with valid identity but missing `wasm-sha256` -> Err (NOT cache miss!).
-        let rec_dir = empty_store.join("build-script/modules/cached-ring-rec");
-        std::fs::create_dir_all(&rec_dir).expect("create record dir");
         let id = blaze_toolchain::PINNED;
-        let identity = std::format!(
+        let identity = bstd::mem::format_in!(
+            &frame,
             "{}\nname ring\nversion 0.17.14\nfeatures alloc\ndeps deadbeef\ntoolchain {id}\nwasm-target {WASM64_TARGET}\n{}\nbuilder blaze-wasm64\n",
             script_unit::WASM_MODULE_HEADER,
             script_unit::shim_line(),
         );
-        std::fs::write(rec_dir.join("identity"), identity).expect("write identity");
-        std::fs::write(rec_dir.join("module.wasm"), b"\0asm\x01\0\0\0").expect("write wasm");
+        scratch.write("empty-store/build-script/modules/cached-ring-rec/identity", identity.as_str());
+        scratch.write("empty-store/build-script/modules/cached-ring-rec/module.wasm", b"\0asm\x01\0\0\0");
         let digest_err = lookup_cached_build_script_module(
             &empty_store,
             "ring",
@@ -5734,12 +5786,12 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         )
         .expect_err("missing wasm-sha256 in existing cached module dir must propagate Err");
         assert!(
-            std::format!("{digest_err}").contains("reading wasm-sha256"),
+            bstd::mem::format_in!(&frame, "{digest_err}").as_str().contains("reading wasm-sha256"),
             "unexpected digest error: {digest_err}"
         );
 
         // 4. Writing `wasm-sha256` makes lookup return Ok(Some(digest)).
-        std::fs::write(rec_dir.join("wasm-sha256"), "abcd1234\n").expect("write digest");
+        scratch.write("empty-store/build-script/modules/cached-ring-rec/wasm-sha256", "abcd1234\n");
         let hit = lookup_cached_build_script_module(
             &empty_store,
             "ring",
@@ -5752,36 +5804,26 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         .expect("valid cached module must succeed")
         .expect("valid cached module must hit");
         assert_eq!(hit.as_str(), "abcd1234");
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn member_script_files_digest_propagates_io_errors_instead_of_downgrading_to_none() {
-        let base = std::env::temp_dir().join(std::format!(
-            "blaze-wasm64-member-digest-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join("good-member")).expect("create good-member");
-        std::fs::write(
-            base.join("good-member/Cargo.toml"),
-            "[package]\nname = \"good\"\nversion = \"0.1.0\"\n",
-        )
-        .expect("write Cargo.toml");
-        std::fs::write(base.join("good-member/build.rs"), "fn main() {}\n").expect("write build.rs");
+        let scratch = ScratchDir::new("member-digest");
+        let frame = Frame::with_reserve(256 << 10, Tag::Other).expect("frame");
+        scratch.write("good-member/Cargo.toml", "[package]\nname = \"good\"\nversion = \"0.1.0\"\n");
+        scratch.write("good-member/build.rs", "fn main() {}\n");
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            std::fs::create_dir_all(base.join("unreadable-member")).expect("create unreadable-member");
-            let unreadable_manifest = base.join("unreadable-member/Cargo.toml");
-            std::fs::write(&unreadable_manifest, "[package]\nname = \"bad\"\nversion = \"0.1.0\"\n")
-                .expect("write unreadable Cargo.toml");
-            std::fs::set_permissions(&unreadable_manifest, std::fs::Permissions::from_mode(0o000))
-                .expect("chmod 000");
+            let unreadable_manifest = scratch.write(
+                "unreadable-member/Cargo.toml",
+                "[package]\nname = \"bad\"\nversion = \"0.1.0\"\n",
+            );
+            let set_mode = |m: u32| std::fs::set_permissions(&unreadable_manifest, std::fs::Permissions::from_mode(m));
+            set_mode(0o000).expect("chmod 000");
 
-            let checkout = blaze_proc_macro::script_sandbox::RealRoot::resolve(&base).expect("open checkout");
+            let checkout = blaze_proc_macro::script_sandbox::RealRoot::resolve(scratch.path()).expect("open checkout");
             let members = [
                 (LockId(1), "good-member", blaze_world::PathKind::Member),
                 (LockId(2), "unreadable-member", blaze_world::PathKind::Member),
@@ -5824,14 +5866,12 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
             )
             .expect_err("member build-script files digest I/O error must propagate");
             assert!(
-                std::format!("{err}").contains("reading build script files of unreadable-member"),
+                bstd::mem::format_in!(&frame, "{err}").as_str().contains("reading build script files of unreadable-member"),
                 "unexpected member digest error: {err}"
             );
 
-            let _ = std::fs::set_permissions(&unreadable_manifest, std::fs::Permissions::from_mode(0o644));
+            let _ = set_mode(0o644);
         }
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -6017,7 +6057,7 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         // Workspace graph with BOTH probe-free (`pm_plain`, `bs_plain`) and probe-dependent
         // (`pm_dep_ring`, `bs_with_ring`) units.
         let graph = make_graph(
-            std::vec![
+            [
                 make_u(0, "plain_lib", UnitKind::Lib, None, &[]),
                 make_u(1, "ring", UnitKind::BuildScript, None, &[]),
                 make_u(1, "ring", UnitKind::Lib, Some(1), &[]),
@@ -6025,7 +6065,8 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
                 make_u(3, "bs_with_ring", UnitKind::BuildScript, None, &[("ring", 2)]),
                 make_u(4, "pm_plain", UnitKind::ProcMacro, None, &[("plain_lib", 0)]),
                 make_u(5, "pm_dep_ring", UnitKind::ProcMacro, None, &[("ring", 2)]),
-            ],
+            ]
+            .into(),
             a,
         );
         let pm_plain_subj = crate::macros::subject(&graph.units[5]);
@@ -6128,12 +6169,8 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
 
     #[test]
     fn ensure_proc_macro_unit_rejects_drifted_probes_before_cache_hit() {
-        let tmp = std::env::temp_dir().join(std::format!(
-            "blaze-wasm64-nested-pm-drift-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).expect("create tmp");
+        let scratch = ScratchDir::new("nested-pm-drift");
+        let tmp = scratch.path();
 
         let frame = Frame::with_reserve(8 << 20, Tag::Other).expect("frame");
         let erased = Erased::new(&frame);
@@ -6146,11 +6183,12 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         };
         // Graph where nested proc-macro `pm-dep-ring` (Unit 2) depends on `ring` (Unit 1, build script Unit 0).
         let graph = make_graph(
-            std::vec![
+            [
                 make_u(0, "ring", UnitKind::BuildScript, None, &[]),
                 make_u(0, "ring", UnitKind::Lib, Some(0), &[]),
                 make_u(1, "pm-dep-ring", UnitKind::ProcMacro, None, &[("ring", 1)]),
-            ],
+            ]
+            .into(),
             a,
         );
         let lock_text = b"version = 4\n\n\
@@ -6185,7 +6223,7 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         // Pre-populate a cached module record on disk for `live_hex` (tag B) so the cache-hit path
         // would succeed if `ensure_proc_macro_unit` skipped planned-probe drift validation!
         let locked = blaze_proc_macro::module::LockedPackages::of(lock.lock);
-        let folders = blaze_world::procs::git_folders(&tmp).expect("git folders");
+        let folders = blaze_world::procs::git_folders(tmp).expect("git folders");
         let identity_b = blaze_world::procs::identify(
             lock.lock,
             &locked,
@@ -6208,7 +6246,7 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         });
         let fake_wasm = b"\0asm\x01\0\0\0";
         let fake_sha = sha256_hex(fake_wasm);
-        publish_proc_macro_module(&tmp, &mod_key, &id_text, fake_wasm, &fake_sha, &[], PROC_MACRO_DECLS_GLOBAL)
+        publish_proc_macro_module(tmp, &mod_key, &id_text, fake_wasm, &fake_sha, &[], PROC_MACRO_DECLS_GLOBAL)
             .expect("publish cached nested proc-macro module for live probe B");
 
         // Now ask `ensure_proc_macro_unit` with a DIFFERENT planned probe tag A -> MUST refuse
@@ -6216,10 +6254,10 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         let planned_a = Hex64::from_bytes([0xaa; 32]);
         assert_ne!(planned_a, live_hex);
         let producers = blaze_ids::producer::Producers::for_tests(b"nested-pm-drift");
-        let checkout = blaze_proc_macro::script_sandbox::RealRoot::resolve(&tmp).expect("real root");
+        let checkout = blaze_proc_macro::script_sandbox::RealRoot::resolve(tmp).expect("real root");
         let err = ensure_proc_macro_unit(
             &cx,
-            &tmp,
+            tmp,
             &graph,
             lock.lock,
             &checkout,
@@ -6231,44 +6269,45 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
             0,
         )
         .expect_err("ensure_proc_macro_unit must refuse drifted live probe before cache hit");
-        let msg = std::format!("{err}");
+        let msg = bstd::mem::format_in!(&frame, "{err}");
         assert!(
-            msg.contains("changed") || msg.contains("planned"),
-            "error must report planned-vs-live probe drift, got: {msg}"
+            msg.as_str().contains("changed") || msg.as_str().contains("planned"),
+            "error must report planned-vs-live probe drift, got: {}",
+            msg.as_str()
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn wasm64_compile_proc_macro_with_real_toolchain_imports_env_var_and_reads_cargo_pkg_version() {
-        let home = std::env::var("HOME").expect("HOME");
+        let frame = Frame::with_reserve(16 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let a = erased.handle();
+
+        let scratch = ScratchDir::new("pm-getenv-prod");
+        let checkout_dir = scratch.mkdir("checkout");
+        let store_dir = scratch.mkdir("store");
+        let pkg_dir = scratch.mkdir("caller_pkg");
+        let io = bstd::test::native(&checkout_dir).expect("native io");
+        let home_var = bstd::env::VarName::new("HOME").expect("HOME var name");
+        let host_env = io.need_env().expect("env");
+        let Some(home) = host_env.get(&home_var).ok().flatten() else {
+            return;
+        };
         let real_shelf = PathBuf::from(home).join(".blaze/v2/toolchain");
         let tc_id = blaze_toolchain::PINNED;
-        if !real_shelf.join(tc_id.to_string()).exists() {
+        if !real_shelf.join(bstd::mem::format_in!(&frame, "{tc_id}").as_str()).exists() {
             eprintln!("skipping wasm64_compile_proc_macro test: pinned toolchain {tc_id} not on shelf");
             return;
         }
 
-        let tmp = std::env::temp_dir().join(std::format!(
-            "blaze-wasm64-pm-getenv-prod-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let checkout_dir = tmp.join("checkout");
-        let store_dir = tmp.join("store");
-        let pkg_dir = tmp.join("caller_pkg");
-        std::fs::create_dir_all(checkout_dir.join("src")).expect("checkout src dir");
-        std::fs::create_dir_all(&store_dir).expect("store dir");
-        std::fs::create_dir_all(&pkg_dir).expect("caller pkg dir");
         #[cfg(unix)]
         std::os::unix::fs::symlink(&real_shelf, store_dir.join("toolchain")).expect("symlink toolchain");
-        std::fs::write(
-            checkout_dir.join("Cargo.toml"),
+        scratch.write(
+            "checkout/Cargo.toml",
             "[package]\nname = \"demo_pm\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\nproc-macro = true\n",
-        )
-        .expect("write Cargo.toml");
-        std::fs::write(
-            checkout_dir.join("src/lib.rs"),
+        );
+        scratch.write(
+            "checkout/src/lib.rs",
             "extern crate proc_macro;\n\
 use proc_macro::TokenStream;\n\
 \n\
@@ -6277,18 +6316,13 @@ pub fn pkg_version(_input: TokenStream) -> TokenStream {\n\
     let ver = std::env::var(\"CARGO_PKG_VERSION\").expect(\"CARGO_PKG_VERSION\");\n\
     format!(\"\\\"{ver}\\\"\").parse().expect(\"tokens\")\n\
 }\n",
-        )
-        .expect("write src/lib.rs");
-
-        let frame = Frame::with_reserve(16 << 20, Tag::Other).expect("frame");
-        let erased = Erased::new(&frame);
-        let a = erased.handle();
+        );
 
         let lock_text = "version = 4\n\n[[package]]\nname = \"demo_pm\"\nversion = \"0.1.0\"\n";
         let lock = Lock::read(lock_text.as_bytes(), a).expect("parse lock");
         let mut pm_unit = make_unit(0, "demo_pm", "demo_pm", UnitKind::ProcMacro, "2024", &[], a);
         pm_unit.root = Text::from_str_in("src/lib.rs", a);
-        let graph = make_graph(std::vec![pm_unit], a);
+        let graph = make_graph([pm_unit].into(), a);
         let checkout = blaze_proc_macro::script_sandbox::RealRoot::of_start(
             &checkout_dir,
             blaze_own::planted::NoPlant,
@@ -6297,7 +6331,6 @@ pub fn pkg_version(_input: TokenStream) -> TokenStream {\n\
         let members = [(LockId(0), "", blaze_world::PathKind::Member)];
         let producers = Producers::for_tests(b"wasm64-pm-getenv-test");
         let heap = blaze_own::testing::heap();
-        let io = bstd::test::native(&checkout_dir).expect("native io");
         let cx = io
             .cx(core::time::Duration::from_secs(120), bstd::mem::TASK_FRAME)
             .expect("cx");
@@ -6392,27 +6425,25 @@ pub fn pkg_version(_input: TokenStream) -> TokenStream {\n\
         );
 
         // Execute LIVE through `blaze_proc_macro::host::Runtime`!
-        let mod_dir = tmp.join("mod");
-        std::fs::create_dir_all(&mod_dir).expect("mod dir");
-        std::fs::write(mod_dir.join("module.wasm"), &compiled.wasm).expect("write module.wasm");
+        let mod_dir = scratch.mkdir("mod");
+        scratch.write("mod/module.wasm", &compiled.wasm);
         let digest = sha256_hex(&compiled.wasm);
         let record = blaze_proc_macro::module::ModuleRecord {
             key: digest.clone(),
-            name: std::string::String::from("demo_pm"),
-            version: std::string::String::from("0.1.0"),
+            name: "demo_pm".into(),
+            version: "0.1.0".into(),
             wasm_sha256: digest,
             macros: compiled.macros,
-            decls: std::string::String::from(PROC_MACRO_DECLS_GLOBAL),
+            decls: PROC_MACRO_DECLS_GLOBAL.into(),
             dir: mod_dir.clone(),
             compiled: mod_dir.join("compiled"),
             native_dylib: None,
         };
         let rt = blaze_proc_macro::host::Runtime::new(heap).expect("Runtime");
         let loaded = rt.load(&record).expect("load proc-macro");
-        let env = blaze_proc_macro::package_env::PackageEnv::set_only(std::vec![(
-            std::string::String::from("CARGO_PKG_VERSION"),
-            std::string::String::from("4.6.7-clap-test"),
-        )])
+        let env = blaze_proc_macro::package_env::PackageEnv::set_only(
+            [("CARGO_PKG_VERSION".into(), "4.6.7-clap-test".into())].into(),
+        )
         .expect("PackageEnv");
         let pkg = Arc::new(
             blaze_proc_macro::sandbox::Package::new(
@@ -6439,14 +6470,11 @@ pub fn pkg_version(_input: TokenStream) -> TokenStream {\n\
                 heap.alloc(),
             )
             .expect("expand demo_pm::pkg_version");
-        let rendered: std::string::String = ran
-            .produced
-            .tokens
-            .tokens()
-            .iter()
-            .map(|t| ran.produced.tokens.text_of(t))
-            .collect();
-        assert_eq!(rendered, "4.6.7-clap-test");
+        let mut rendered = blaze_own::AString::new_in(a);
+        for t in ran.produced.tokens.tokens() {
+            rendered.push_str(ran.produced.tokens.text_of(t));
+        }
+        assert_eq!(rendered.as_str(), "4.6.7-clap-test");
         assert!(
             ran.produced
                 .reads
@@ -6455,7 +6483,6 @@ pub fn pkg_version(_input: TokenStream) -> TokenStream {\n\
                 .any(|r| ran.produced.reads.subject(r) == "env:CARGO_PKG_VERSION"),
             "expected tracked env:CARGO_PKG_VERSION read"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[cfg(unix)]

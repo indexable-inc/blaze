@@ -18,7 +18,7 @@ use parser::SyntaxKind;
 
 use crate::{
     call::{AlsoCopy, CallSite, Constness, DeriveFacts},
-    cfg::{CfgAttrError, CfgPredicateError, cfg_attr_metas, cfg_predicate_at},
+    cfg::{CfgAttrError, CfgPredicateError, cfg_attr_metas_with_version, cfg_predicate_at_with_version},
     derive::{attr_call, derive_meta},
     error::StreamError,
     extent::ExtentError,
@@ -144,12 +144,19 @@ pub struct ItemAttrs<'a> {
     item: TokenStream<'a>,
     /// The token the next outer attribute starts at.
     at: usize,
+    cfg_version: bool,
 }
 
 impl<'a> ItemAttrs<'a> {
     /// The walk of `item`: an item's tokens from its first outer attribute.
     pub fn new(item: TokenStream<'a>) -> ItemAttrs<'a> {
-        ItemAttrs { item, at: 0 }
+        ItemAttrs { item, at: 0, cfg_version: false }
+    }
+
+    /// Enables RFC 2523 `#[cfg(version("..."))]` predicates when `#![feature(cfg_version)]` is active.
+    pub fn with_cfg_version(mut self, enabled: bool) -> ItemAttrs<'a> {
+        self.cfg_version = enabled;
+        self
     }
 
     /// The item as the walk has left it: the `#[cfg_attr]`s met applied, the true `#[cfg]`s
@@ -170,11 +177,12 @@ impl<'a> ItemAttrs<'a> {
             match meta_name(&self.item, &meta) {
                 "cfg_attr" => {
                     let attr = attr_copy(&self.item, at, close, meta)?;
-                    let metas = cfg_attr_metas(&attr, alloc, atom).map_err(|error| ItemAttrsError::CfgAttr { token: index(at), error })?;
+                    let metas = cfg_attr_metas_with_version(&attr, self.cfg_version, alloc, atom)
+                        .map_err(|error| ItemAttrsError::CfgAttr { token: index(at), error })?;
                     self.item = splice(&self.item, at..close + 1, &attr, &metas)?;
                 }
                 "cfg" => {
-                    if !cfg_holds(&self.item, at, meta, alloc, atom)? {
+                    if !cfg_holds(&self.item, at, meta, self.cfg_version, alloc, atom)? {
                         return Ok(NextAttr::Removed);
                     }
                     self.item = splice(&self.item, at..close + 1, &self.item, &[])?;
@@ -223,7 +231,8 @@ impl<'a> ItemAttrs<'a> {
                 continue;
             }
             let attr = attr_copy(&self.item, at, close, meta)?;
-            let metas = cfg_attr_metas(&attr, alloc, atom).map_err(|error| ItemAttrsError::CfgAttr { token: index(at), error })?;
+            let metas = cfg_attr_metas_with_version(&attr, self.cfg_version, alloc, atom)
+                .map_err(|error| ItemAttrsError::CfgAttr { token: index(at), error })?;
             self.item = splice(&self.item, at..close + 1, &attr, &metas)?;
             // `at` now starts the first attribute it left (none: the next one); none of them is
             // a `cfg_attr`, so each is passed over once.
@@ -324,7 +333,7 @@ impl<'a> ItemAttrs<'a> {
             true => AlsoCopy::Yes,
             false => AlsoCopy::No,
         };
-        let Some(input) = derive_input(&self.item, atom)? else { return Ok(None) };
+        let Some(input) = derive_input(&self.item, self.cfg_version, atom)? else { return Ok(None) };
         Ok(Some(Derives { uses, input, copy }))
     }
 }
@@ -356,6 +365,7 @@ fn cfg_holds<E>(
     item: &TokenStream<'_>,
     at: usize,
     meta: Range<usize>,
+    cfg_version: bool,
     alloc: Alloc<'_>,
     atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>,
 ) -> Result<bool, ItemAttrsError<E>> {
@@ -364,7 +374,7 @@ fn cfg_holds<E>(
         Some(end) if end < meta.end && matches!(item.tokens()[open].kind, TokenKind::Open(Delim::Paren)) => open + 1..end,
         _ => open..open,
     };
-    cfg_predicate_at(item, inside, alloc, atom).map_err(|error| ItemAttrsError::Cfg { token: index(at), error })
+    cfg_predicate_at_with_version(item, inside, cfg_version, alloc, atom).map_err(|error| ItemAttrsError::Cfg { token: index(at), error })
 }
 
 /// The first name of the meta `meta` (`cfg` of `cfg(..)`), or `""`.
@@ -450,6 +460,7 @@ struct Edit<'a> {
 /// tempo-chainspec t1545) had a walk that did cut the field at its type's comma.
 fn derive_input<'a, E>(
     item: &TokenStream<'a>,
+    cfg_version: bool,
     atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>,
 ) -> Result<Option<TokenStream<'a>>, ItemAttrsError<E>> {
     let alloc = item.allocator();
@@ -487,7 +498,7 @@ fn derive_input<'a, E>(
         }
         let owner_goes = match meta_name(item, &meta) {
             "cfg" => {
-                let holds = cfg_holds(item, at, meta, alloc, atom)?;
+                let holds = cfg_holds(item, at, meta, cfg_version, alloc, atom)?;
                 if holds {
                     edits.push(Edit { cut: attr, with: None });
                 }
@@ -495,7 +506,8 @@ fn derive_input<'a, E>(
             }
             "cfg_attr" => {
                 let copy = attr_copy(item, at, close, meta)?;
-                let metas = cfg_attr_metas(&copy, alloc, atom).map_err(|error| ItemAttrsError::CfgAttr { token: index(at), error })?;
+                let metas = cfg_attr_metas_with_version(&copy, cfg_version, alloc, atom)
+                    .map_err(|error| ItemAttrsError::CfgAttr { token: index(at), error })?;
                 // What it leaves, with any derive it leaves gone and a `cfg` it leaves applied.
                 let mut kept: AVec<'a, Range<u32>> = Vec::new_in(alloc);
                 let mut removed = false;
@@ -508,7 +520,8 @@ fn derive_input<'a, E>(
                         && meta.end - meta.start >= 2;
                     if is_cfg {
                         let inside = meta.start as usize + 2..meta.end as usize - 1;
-                        removed |= !cfg_predicate_at(&copy, inside, alloc, atom).map_err(|error| ItemAttrsError::Cfg { token: index(at), error })?;
+                        removed |= !cfg_predicate_at_with_version(&copy, inside, cfg_version, alloc, atom)
+                            .map_err(|error| ItemAttrsError::Cfg { token: index(at), error })?;
                         if removed {
                             break;
                         }

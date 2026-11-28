@@ -346,7 +346,7 @@ fn collect_rust_c_exports<'a, 'n>(
                     let mut owned = blaze_own::String::new_in(alloc);
                     if let Some(item_text) = records.signature_text_of(lib_key)
                         && (item_text.text.contains("linkage") || item_text.text.contains("link_name"))
-                        && let Ok(sig) = blaze_lower::lower_signature(item_text.text, edition, &mut CrateCfg(atoms), alloc)
+                        && let Ok(sig) = blaze_lower::lower_signature(item_text.text, edition, &mut CrateCfg::of(records, krate, atoms), alloc)
                     {
                         let v = sig.view();
                         if let Ok(attrs) = v.rows(v.list(head::ATTRS)) {
@@ -385,7 +385,7 @@ fn collect_rust_c_exports<'a, 'n>(
             if !(text.contains("no_mangle") || text.contains("export_name")) {
                 continue;
             }
-            let Ok(sig) = blaze_lower::lower_signature(text, edition, &mut CrateCfg(atoms), alloc)
+            let Ok(sig) = blaze_lower::lower_signature(text, edition, &mut CrateCfg::of(records, krate, atoms), alloc)
             else {
                 continue;
             };

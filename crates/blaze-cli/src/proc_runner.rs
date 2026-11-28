@@ -364,7 +364,7 @@ mod with_sandbox {
             // Isolate per-macro dependency-probe failures just like `Unidentified` above: a
             // failure on one dependent proc-macro never blocks unrelated proc-macros in this
             // runner; that crate gets no key here and its own `MacroModule` task reports the error.
-            let identity = match crate::wasm64_compile::unit_has_dep_build_scripts(graph, names.wasm_graph(), unit_id, true) {
+            let identity = match crate::wasm64_compile::unit_has_dep_build_scripts(graph, names.wasm_graph(), unit_id, true, side.heap.shared()) {
                 Ok(true) => match side.probes.dep_probe_identity_hex(cx) {
                     Ok(hex) => identity.with_dep_probes(hex.as_str()),
                     Err(_) => continue,

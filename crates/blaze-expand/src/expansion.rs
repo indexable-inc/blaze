@@ -161,6 +161,9 @@ pub enum ReadKind {
     ModulePath,
     /// A read a proc macro's run made, its subject the sandbox's own name for it.
     ProcMacro,
+    /// A crate-root `#![feature(..)]` gate read (e.g. `"cfg_version"`), answered as a bool so
+    /// toggling the feature invalidates kept expansions that depend on it.
+    CrateFeature,
 }
 
 /// What the read was told.
@@ -238,6 +241,7 @@ impl<'a> Reads<'a> {
                 ReadKind::File => 6,
                 ReadKind::ModulePath => 7,
                 ReadKind::ProcMacro => 8,
+                ReadKind::CrateFeature => 9,
             };
             out.put(&[kind]);
             let subject = self.subject(read);
@@ -295,7 +299,7 @@ impl Reads<'_> {
     pub fn askable(&self) -> Result<(), (usize, ReadKind)> {
         for (read, it) in self.list.iter().enumerate() {
             match it.kind {
-                ReadKind::Env | ReadKind::Cfg | ReadKind::Line | ReadKind::Column | ReadKind::File | ReadKind::ModulePath => {}
+                ReadKind::Env | ReadKind::Cfg | ReadKind::Line | ReadKind::Column | ReadKind::File | ReadKind::ModulePath | ReadKind::CrateFeature => {}
                 kind @ (ReadKind::IncludeStr | ReadKind::IncludeBytes | ReadKind::ProcMacro) => return Err((read, kind)),
             }
         }
@@ -319,6 +323,10 @@ impl Reads<'_> {
                 ReadKind::Column => place(PlaceOf::Column)?,
                 ReadKind::File => place(PlaceOf::File)?,
                 ReadKind::ModulePath => place(PlaceOf::ModulePath)?,
+                ReadKind::CrateFeature => match subject {
+                    "cfg_version" => ReadAnswer::Bool(cx.cfg_version_enabled()),
+                    _ => return Ok(Held::NotAskable { read, kind: it.kind }),
+                },
                 kind @ (ReadKind::IncludeStr | ReadKind::IncludeBytes | ReadKind::ProcMacro) => {
                     return Ok(Held::NotAskable { read, kind });
                 }

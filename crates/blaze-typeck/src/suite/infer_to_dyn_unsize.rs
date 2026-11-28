@@ -32,9 +32,8 @@
 //! - "TyCtor(`T`) to TyCtor(`U`), where TyCtor(`T`) is one of `&T`, `&mut T`, `*const T`,
 //!   `*mut T`, `Box<T>`, and where `U` can be obtained from `T` by unsized coercion".
 
-use std::vec::Vec;
-
 use super::{adjusts, check_body};
+use crate::body::{Expr, UnOp};
 use crate::diag::DiagCode;
 use crate::fixture::{Bb, Fx};
 use crate::ids::{Abi, ExprId, FnPtrHeader, LangItem, List, Mutbl, Safety, UintTy};
@@ -46,11 +45,19 @@ fn world() -> Fx {
     let mut world = Fx::new();
     let fx = &mut world;
 
-    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    let sized = fx.tr("Sized", 1, Default::default(), &[]);
     fx.lang(LangItem::Sized, sized);
-    let unsize = fx.tr("Unsize", 2, Vec::new(), &[]);
+    let copy = fx.tr("Copy", 1, Default::default(), &[]);
+    fx.lang(LangItem::Copy, copy);
+    let pointee_sized = fx.tr("PointeeSized", 1, Default::default(), &[]);
+    fx.lang(LangItem::PointeeSized, pointee_sized);
+    let pointee = fx.tr("Pointee", 1, Default::default(), &["Metadata"]);
+    fx.lang(LangItem::Pointee, pointee);
+    let dyn_metadata_k = fx.strukt("DynMetadata", 1, &[]);
+    fx.lang(LangItem::DynMetadata, dyn_metadata_k);
+    let unsize = fx.tr("Unsize", 2, Default::default(), &[]);
     fx.lang(LangItem::Unsize, unsize);
-    let coerce = fx.tr("CoerceUnsized", 2, Vec::new(), &[]);
+    let coerce = fx.tr("CoerceUnsized", 2, Default::default(), &[]);
     fx.lang(LangItem::CoerceUnsized, coerce);
 
     let (p0, p1, p2, p3) = (fx.param(0), fx.param(1), fx.param(2), fx.param(3));
@@ -59,50 +66,50 @@ fn world() -> Fx {
 
     // FnOnce / FnMut / Fn
     let rust_call = FnPtrHeader { abi: Abi::RustCall, safety: Safety::Safe, c_variadic: false };
-    let fn_once = fx.tr("FnOnce", 2, Vec::new(), &["Output"]);
+    let fn_once = fx.tr("FnOnce", 2, Default::default(), &["Output"]);
     fx.lang(LangItem::FnOnce, fn_once);
     let out = fx.alias(fn_once, "Output", &[p0, p1]);
     let call_once = fx.trait_fn(fn_once, "call_once", true, &[p0, p1], out);
     fx.set_header(call_once, rust_call);
     let sup_once = fx.bound(fn_once, &[p0, p1]);
-    let fn_mut = fx.tr("FnMut", 2, std::vec![sup_once], &[]);
+    let fn_mut = fx.tr("FnMut", 2, [sup_once].into(), &[]);
     fx.lang(LangItem::FnMut, fn_mut);
     let m_self = fx.r(Mutbl::Mut, p0);
     let call_mut = fx.trait_fn(fn_mut, "call_mut", true, &[m_self, p1], out);
     fx.set_header(call_mut, rust_call);
     let sup_mut = fx.bound(fn_mut, &[p0, p1]);
-    let fn_ = fx.tr("Fn", 2, std::vec![sup_mut], &[]);
+    let fn_ = fx.tr("Fn", 2, [sup_mut].into(), &[]);
     fx.lang(LangItem::Fn, fn_);
     let r_self = fx.r(Mutbl::Not, p0);
     let call = fx.trait_fn(fn_, "call", true, &[r_self, p1], out);
     fx.set_header(call, rust_call);
 
     // Traits: Display, Error: Display, MyTrait (not implemented by ParseIntError)
-    let display = fx.tr("Display", 1, Vec::new(), &[]);
+    let display = fx.tr("Display", 1, Default::default(), &[]);
     let display_self = fx.bound(display, &[p0]);
-    let error = fx.tr("Error", 1, std::vec![display_self], &[]);
-    let my_trait = fx.tr("MyTrait", 1, Vec::new(), &[]);
+    let error = fx.tr("Error", 1, [display_self].into(), &[]);
+    let my_trait = fx.tr("MyTrait", 1, Default::default(), &[]);
 
     // FromStr + ParseIntError + impl FromStr for u32
-    let from_str = fx.tr("FromStr", 1, Vec::new(), &["Err"]);
+    let from_str = fx.tr("FromStr", 1, Default::default(), &["Err"]);
     let pie_k = fx.strukt("ParseIntError", 0, &[]);
     let pie = fx.adt(pie_k, &[]);
-    fx.imp("impl Display for ParseIntError", 0, pie, Some((display, &[])), &[], Vec::new());
-    fx.imp("impl Error for ParseIntError", 0, pie, Some((error, &[])), &[], Vec::new());
-    fx.imp("impl FromStr for u32", 0, u32_, Some((from_str, &[])), &[("Err", pie)], Vec::new());
+    fx.imp("impl Display for ParseIntError", 0, pie, Some((display, &[])), &[], Default::default());
+    fx.imp("impl Error for ParseIntError", 0, pie, Some((error, &[])), &[], Default::default());
+    fx.imp("impl FromStr for u32", 0, u32_, Some((from_str, &[])), &[("Err", pie)], Default::default());
 
     // Box<T: ?Sized> and Pin<P> with CoerceUnsized impls
     let box_k = fx.strukt("Box", 1, &[]);
     let (box_t, box_u) = (fx.adt(box_k, &[p0]), fx.adt(box_k, &[p1]));
     let t_unsize_u = fx.bound(unsize, &[p0, p1]);
-    let box_cu = fx.imp("impl CoerceUnsized<Box<U>> for Box<T>", 2, box_t, Some((coerce, &[box_u])), &[], std::vec![t_unsize_u]);
+    let box_cu = fx.imp("impl CoerceUnsized<Box<U>> for Box<T>", 2, box_t, Some((coerce, &[box_u])), &[], [t_unsize_u].into());
     fx.unsized_param(box_cu, 0);
     fx.unsized_param(box_cu, 1);
 
     let pin_k = fx.strukt("Pin", 1, &[]);
     let (pin_p, pin_u) = (fx.adt(pin_k, &[p0]), fx.adt(pin_k, &[p1]));
     let p_cu_u = fx.bound(coerce, &[p0, p1]);
-    fx.imp("impl CoerceUnsized<Pin<U>> for Pin<P>", 2, pin_p, Some((coerce, &[pin_u])), &[], std::vec![p_cu_u]);
+    fx.imp("impl CoerceUnsized<Pin<U>> for Pin<P>", 2, pin_p, Some((coerce, &[pin_u])), &[], [p_cu_u].into());
 
     // Wide<M, P> with a binary-tree marker `M` exceeding `has_unresolved_to_dyn`'s 256-pair walk cap
     // before reaching the trailing `P = Box<?E> -> Box<dyn Display>` argument.
@@ -114,9 +121,9 @@ fn world() -> Fx {
     let wide_k = fx.strukt("Wide", 2, &[]);
     let (wide_mp, wide_mu) = (fx.adt(wide_k, &[p0, p1]), fx.adt(wide_k, &[p0, p2]));
     let p1_cu_p2 = fx.bound(coerce, &[p1, p2]);
-    fx.imp("impl CoerceUnsized<Wide<M, U>> for Wide<M, P>", 3, wide_mp, Some((coerce, &[wide_mu])), &[], std::vec![p1_cu_p2]);
+    fx.imp("impl CoerceUnsized<Wide<M, U>> for Wide<M, P>", 3, wide_mp, Some((coerce, &[wide_mu])), &[], [p1_cu_p2].into());
     let wide_tree_box_p0 = fx.adt(wide_k, &[deep_marker, box_t]);
-    fx.func("wide_box", 1, &[p0], wide_tree_box_p0, Vec::new());
+    fx.func("wide_box", 1, &[p0], wide_tree_box_p0, Default::default());
 
     // Non-DAG-shared 260-deep chain `Nest<Nest<...<T>...>>` plus parameterized DAG tree `PairTree<T>`
     // to test slice-tail identity & non-identical marker coercions (both within and past 256 nodes).
@@ -143,15 +150,30 @@ fn world() -> Fx {
     let wide_chain_p0_slice = fx.adt(wide_k, &[chain_p0, box_slice_u8]);
     let wide_chain_u32_slice = fx.adt(wide_k, &[chain_u32, box_slice_u8]);
 
-    fx.func("mk_wide_dag_slice", 1, &[], wide_dag_p0_slice, Vec::new());
-    fx.func("mk_wide_chain_slice", 1, &[], wide_chain_p0_slice, Vec::new());
+    fx.func("mk_wide_dag_slice", 1, &[], wide_dag_p0_slice, Default::default());
+    fx.func("mk_wide_chain_slice", 1, &[], wide_chain_p0_slice, Default::default());
 
     let pin_box_t = fx.adt(pin_k, &[box_t]);
-    fx.func("box_new", 1, &[p0], box_t, Vec::new());
-    fx.func("pin_new", 1, &[p0], pin_p, Vec::new());
-    fx.func("box_pin", 1, &[p0], pin_box_t, Vec::new());
+    fx.func("box_new", 1, &[p0], box_t, Default::default());
+    fx.func("pin_new", 1, &[p0], pin_p, Default::default());
+    fx.func("box_pin", 1, &[p0], pin_box_t, Default::default());
+    let ptr_const_unit = fx.ty(PNode::Ptr(Mutbl::Not, unit));
+    let ptr_mut_unit = fx.ty(PNode::Ptr(Mutbl::Mut, unit));
+    let ptr_const_p0 = fx.ty(PNode::Ptr(Mutbl::Not, p0));
     let ptr_mut_p0 = fx.ty(PNode::Ptr(Mutbl::Mut, p0));
-    fx.func("as_raw_mut", 1, &[m_self], ptr_mut_p0, Vec::new());
+    fx.func("as_raw_mut", 1, &[m_self], ptr_mut_p0, Default::default());
+
+    // ptr::from_raw_parts<T: PointeeSized>(data: *const (), metadata: <T as Pointee>::Metadata) -> *const T
+    // ptr::from_raw_parts_mut<T: PointeeSized>(data: *mut (), metadata: <T as Pointee>::Metadata) -> *mut T
+    // Box::from_raw<T: ?Sized>(raw: *mut T) -> Box<T>
+    let p0_meta = fx.alias(pointee, "Metadata", &[p0]);
+    let p0_pointee_sized = fx.bound(pointee_sized, &[p0]);
+    let frp = fx.func("from_raw_parts", 1, &[ptr_const_unit, p0_meta], ptr_const_p0, [p0_pointee_sized].into());
+    fx.unsized_fn_param(frp, 0);
+    let frpm = fx.func("from_raw_parts_mut", 1, &[ptr_mut_unit, p0_meta], ptr_mut_p0, [p0_pointee_sized].into());
+    fx.unsized_fn_param(frpm, 0);
+    let bfr = fx.func("box_from_raw", 1, &[ptr_mut_p0], box_t, Default::default());
+    fx.unsized_fn_param(bfr, 0);
 
     // Reflexive & nested-unresolved helpers:
     // fn make_ref_fn<T: ?Sized, F: FnOnce(&T) -> ()>(f: F) -> F
@@ -160,39 +182,39 @@ fn world() -> Fx {
     let args_ref_t = fx.tuple(&[r_self]);
     let f1_ref = fx.bound(fn_once, &[p1, args_ref_t]);
     let f1_ref_out = fx.proj(fn_once, &[p1, args_ref_t], "Output", unit);
-    let mrf = fx.func("make_ref_fn", 2, &[p1], p1, std::vec![f1_ref, f1_ref_out]);
+    let mrf = fx.func("make_ref_fn", 2, &[p1], p1, [f1_ref, f1_ref_out].into());
     fx.unsized_fn_param(mrf, 0);
 
     let args_box_t = fx.tuple(&[box_t]);
     let f1_box = fx.bound(fn_once, &[p1, args_box_t]);
     let f1_box_out = fx.proj(fn_once, &[p1, args_box_t], "Output", unit);
-    let mbf = fx.func("make_box_fn", 2, &[p1], p1, std::vec![f1_box, f1_box_out]);
+    let mbf = fx.func("make_box_fn", 2, &[p1], p1, [f1_box, f1_box_out].into());
     fx.unsized_fn_param(mbf, 0);
 
     let args_pin_p = fx.tuple(&[pin_p]);
     let f1_pin = fx.bound(fn_once, &[p1, args_pin_p]);
     let f1_pin_out = fx.proj(fn_once, &[p1, args_pin_p], "Output", unit);
-    fx.func("make_pin_fn", 2, &[p1], p1, std::vec![f1_pin, f1_pin_out]);
+    fx.func("make_pin_fn", 2, &[p1], p1, [f1_pin, f1_pin_out].into());
 
     // Result<T, E> with map_err<O, F: FnOnce(E) -> O>(self, op: F) -> Result<T, O>
     let (res_k, _) = fx.enum_("Result", 2, &[("Ok", &[p0]), ("Err", &[p1])]);
     let res_t_e = fx.adt(res_k, &[p0, p1]);
     let res_t_o = fx.adt(res_k, &[p0, p2]);
-    let res_imp = fx.imp("impl<T, E> Result<T, E>", 2, res_t_e, None, &[], Vec::new());
+    let res_imp = fx.imp("impl<T, E> Result<T, E>", 2, res_t_e, None, &[], Default::default());
     let args_e = fx.tuple(&[p1]);
     let f_once_e = fx.bound(fn_once, &[p3, args_e]);
     let f_out_o = fx.proj(fn_once, &[p3, args_e], "Output", p2);
-    fx.impl_fn_own(res_imp, "map_err", true, 2, &[res_t_e, p3], res_t_o, std::vec![f_once_e, f_out_o]);
+    fx.impl_fn_own(res_imp, "map_err", true, 2, &[res_t_e, p3], res_t_o, [f_once_e, f_out_o].into());
 
     // Str with parse<F: FromStr>(&self) -> Result<F, <F as FromStr>::Err>
     let str_k = fx.strukt("Str", 0, &[]);
     let str_ty = fx.adt(str_k, &[]);
     let r_str = fx.r(Mutbl::Not, str_ty);
-    let str_imp = fx.imp("impl Str", 0, str_ty, None, &[], Vec::new());
+    let str_imp = fx.imp("impl Str", 0, str_ty, None, &[], Default::default());
     let f_from_str = fx.bound(from_str, &[p0]);
     let f_err = fx.alias(from_str, "Err", &[p0]);
     let res_f_err = fx.adt(res_k, &[p0, f_err]);
-    fx.impl_fn_own(str_imp, "parse", true, 1, &[r_str], res_f_err, std::vec![f_from_str]);
+    fx.impl_fn_own(str_imp, "parse", true, 1, &[r_str], res_f_err, [f_from_str].into());
 
     // Dyn target types
     let dyn_display = {
@@ -220,17 +242,17 @@ fn world() -> Fx {
     let pin_box_dyn_my_trait = fx.adt(pin_k, &[box_dyn_my_trait]);
     let wide_box_dyn_my_trait = fx.adt(wide_k, &[deep_marker, box_dyn_my_trait]);
 
-    fx.func("takes_dyn_display", 0, &[r_dyn_display], unit, Vec::new());
-    fx.func("takes_mut_dyn_display", 0, &[m_dyn_display], unit, Vec::new());
-    fx.func("takes_ptr_const_dyn_display", 0, &[ptr_const_dyn_display], unit, Vec::new());
-    fx.func("takes_dyn_error", 0, &[r_dyn_error], unit, Vec::new());
-    fx.func("takes_dyn_my_trait", 0, &[r_dyn_my_trait], unit, Vec::new());
-    fx.func("takes_box_dyn_display", 0, &[box_dyn_display], unit, Vec::new());
-    fx.func("takes_pin_box_dyn_display", 0, &[pin_box_dyn_display], unit, Vec::new());
-    fx.func("takes_pin_box_dyn_my_trait", 0, &[pin_box_dyn_my_trait], unit, Vec::new());
-    fx.func("takes_wide_box_dyn_display", 0, &[wide_box_dyn_display], unit, Vec::new());
-    fx.func("takes_box_dyn_my_trait", 0, &[box_dyn_my_trait], unit, Vec::new());
-    fx.func("takes_wide_box_dyn_my_trait", 0, &[wide_box_dyn_my_trait], unit, Vec::new());
+    fx.func("takes_dyn_display", 0, &[r_dyn_display], unit, Default::default());
+    fx.func("takes_mut_dyn_display", 0, &[m_dyn_display], unit, Default::default());
+    fx.func("takes_ptr_const_dyn_display", 0, &[ptr_const_dyn_display], unit, Default::default());
+    fx.func("takes_dyn_error", 0, &[r_dyn_error], unit, Default::default());
+    fx.func("takes_dyn_my_trait", 0, &[r_dyn_my_trait], unit, Default::default());
+    fx.func("takes_box_dyn_display", 0, &[box_dyn_display], unit, Default::default());
+    fx.func("takes_pin_box_dyn_display", 0, &[pin_box_dyn_display], unit, Default::default());
+    fx.func("takes_pin_box_dyn_my_trait", 0, &[pin_box_dyn_my_trait], unit, Default::default());
+    fx.func("takes_wide_box_dyn_display", 0, &[wide_box_dyn_display], unit, Default::default());
+    fx.func("takes_box_dyn_my_trait", 0, &[box_dyn_my_trait], unit, Default::default());
+    fx.func("takes_wide_box_dyn_my_trait", 0, &[wide_box_dyn_my_trait], unit, Default::default());
 
     let res_u32_unit = fx.adt(res_k, &[u32_, unit]);
     for name in [
@@ -247,15 +269,27 @@ fn world() -> Fx {
         "parse_box_bad_trait",
         "parse_wide_box_bad_trait",
     ] {
-        fx.func(name, 0, &[r_str], res_u32_unit, Vec::new());
+        fx.func(name, 0, &[r_str], res_u32_unit, Default::default());
     }
-    fx.func("reflexive_ref_dyn", 0, &[r_dyn_display], unit, Vec::new());
-    fx.func("reflexive_box_dyn", 0, &[box_dyn_display], unit, Vec::new());
-    fx.func("pin_infer_to_pin_box_dyn", 0, &[pie], unit, Vec::new());
-    fx.func("pin_infer_to_pin_box_bad_trait", 0, &[pie], unit, Vec::new());
-    fx.func("id_wide_deep_slice", 0, &[wide_deep_slice], wide_deep_slice, Vec::new());
-    fx.func("unify_wide_dag_slice", 0, &[], wide_dag_u32_slice, Vec::new());
-    fx.func("unify_wide_chain_slice", 0, &[], wide_chain_u32_slice, Vec::new());
+    fx.func("reflexive_ref_dyn", 0, &[r_dyn_display], unit, Default::default());
+    fx.func("reflexive_box_dyn", 0, &[box_dyn_display], unit, Default::default());
+    fx.func("pin_infer_to_pin_box_dyn", 0, &[pie], unit, Default::default());
+    fx.func("pin_infer_to_pin_box_bad_trait", 0, &[pie], unit, Default::default());
+    fx.func("id_wide_deep_slice", 0, &[wide_deep_slice], wide_deep_slice, Default::default());
+    fx.func("unify_wide_dag_slice", 0, &[], wide_dag_u32_slice, Default::default());
+    fx.func("unify_wide_chain_slice", 0, &[], wide_chain_u32_slice, Default::default());
+
+    let meta_display = fx.adt(dyn_metadata_k, &[dyn_display]);
+    let meta_error = fx.adt(dyn_metadata_k, &[dyn_error]);
+    let meta_my_trait = fx.adt(dyn_metadata_k, &[dyn_my_trait]);
+    fx.func("from_raw_parts_ref_dyn", 0, &[ptr_const_unit, meta_display], unit, Default::default());
+    fx.func("from_raw_parts_local_ref_dyn", 0, &[ptr_const_unit, meta_display], unit, Default::default());
+    fx.func("from_raw_parts_raw_ptr_dyn", 0, &[ptr_const_unit, meta_display], unit, Default::default());
+    fx.func("from_raw_parts_box_dyn", 0, &[ptr_mut_unit, meta_display], unit, Default::default());
+    fx.func("from_raw_parts_upcast_dyn", 0, &[ptr_const_unit, meta_error], unit, Default::default());
+    fx.func("from_raw_parts_closure_deferred_meta", 0, &[ptr_const_unit, meta_display], unit, Default::default());
+    fx.func("from_raw_parts_incompatible_dyn", 0, &[ptr_const_unit, meta_my_trait], unit, Default::default());
+    fx.func("from_raw_parts_unconstrained_ambiguous", 0, &[ptr_const_unit, meta_display], unit, Default::default());
 
     fx.finish();
     world
@@ -590,5 +624,180 @@ fn identity_and_slice_coercions_with_large_markers_succeed() {
         let c = check_body(&fx, &b, fx.key_of("unify_wide_chain_slice"), root, Plant::None, InferPlant::None);
         assert!(c.diags.is_empty(), "unify_wide_chain_slice: {:?}", c.diags);
         assert_eq!(adjusts(&fx, &c, call), "");
+    }
+}
+
+/// Regression tests for `ptr::from_raw_parts` / `from_raw_parts_mut` with `DynMetadata<dyn Tr>`
+/// coerced to `&dyn Tr`, `*const dyn Tr`, or `Box<dyn Tr>` (e.g. `blaze-text/src/debug.rs:179,312`):
+/// `<?0 as Pointee>::Metadata == DynMetadata<dyn T>` combined with a deferred `?0: Unsize<dyn U>`
+/// (or `Box<?0>: CoerceUnsized<Box<dyn U>>`) uniquely determines `?0 = dyn T`.
+#[test]
+fn from_raw_parts_dyn_metadata_coerced_to_dyn_resolves_uniquely() {
+    let fx = world();
+
+    // 1. Direct `&*from_raw_parts(data, meta)` passed to `takes_dyn_display`:
+    //    exact shape of `let value: &dyn DebugForm = &*ptr::from_raw_parts(at.cast::<()>(), own);`
+    {
+        let mut b = Bb::new();
+        let data = b.param("data");
+        let meta = b.param("meta");
+        let frp = b.path(&["from_raw_parts"]);
+        let d_use = b.local(data);
+        let m_use = b.local(meta);
+        let raw = b.call(frp, &[d_use, m_use]);
+        let deref = b.e(Expr::Unary { op: UnOp::Deref, operand: raw });
+        let reborrowed = b.borrow(Mutbl::Not, deref);
+        let takes = b.path(&["takes_dyn_display"]);
+        let call = b.call(takes, &[reborrowed]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, fx.key_of("from_raw_parts_ref_dyn"), root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "direct &*from_raw_parts -> &dyn Display: {:?}", c.diags);
+    }
+
+    // 2. Intermediate local: `let p = from_raw_parts(data, meta); takes_dyn_display(&*p)`
+    {
+        let mut b = Bb::new();
+        let data = b.param("data");
+        let meta = b.param("meta");
+        let frp = b.path(&["from_raw_parts"]);
+        let d_use = b.local(data);
+        let m_use = b.local(meta);
+        let raw = b.call(frp, &[d_use, m_use]);
+        let p_pat = b.bind("p");
+        let s1 = b.let_(p_pat, None, raw);
+        let p_use = b.local(p_pat);
+        let deref = b.e(Expr::Unary { op: UnOp::Deref, operand: p_use });
+        let reborrowed = b.borrow(Mutbl::Not, deref);
+        let takes = b.path(&["takes_dyn_display"]);
+        let call = b.call(takes, &[reborrowed]);
+        let root = b.block(&[s1], Some(call));
+        let c = check_body(&fx, &b, fx.key_of("from_raw_parts_local_ref_dyn"), root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "local p; &*p -> &dyn Display: {:?}", c.diags);
+    }
+
+    // 3. Direct raw pointer: `takes_ptr_const_dyn_display(from_raw_parts(data, meta))`
+    {
+        let mut b = Bb::new();
+        let data = b.param("data");
+        let meta = b.param("meta");
+        let frp = b.path(&["from_raw_parts"]);
+        let d_use = b.local(data);
+        let m_use = b.local(meta);
+        let raw = b.call(frp, &[d_use, m_use]);
+        let takes = b.path(&["takes_ptr_const_dyn_display"]);
+        let call = b.call(takes, &[raw]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, fx.key_of("from_raw_parts_raw_ptr_dyn"), root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "from_raw_parts -> *const dyn Display: {:?}", c.diags);
+    }
+
+    // 4. Smart pointer (`CoerceUnsized`): `takes_box_dyn_display(box_from_raw(from_raw_parts_mut(data, meta)))`
+    {
+        let mut b = Bb::new();
+        let data = b.param("data");
+        let meta = b.param("meta");
+        let frpm = b.path(&["from_raw_parts_mut"]);
+        let d_use = b.local(data);
+        let m_use = b.local(meta);
+        let raw = b.call(frpm, &[d_use, m_use]);
+        let bfr = b.path(&["box_from_raw"]);
+        let boxed = b.call(bfr, &[raw]);
+        let takes = b.path(&["takes_box_dyn_display"]);
+        let call = b.call(takes, &[boxed]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, fx.key_of("from_raw_parts_box_dyn"), root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "Box::from_raw(from_raw_parts_mut) -> Box<dyn Display>: {:?}", c.diags);
+    }
+
+    // 5. Trait upcasting: `meta: DynMetadata<dyn Error>` (`Error: Display`) coerced to `&dyn Display`
+    //    must bind `?0 = dyn Error` (NOT `dyn Display`) and prove `dyn Error: Unsize<dyn Display>`.
+    {
+        let mut b = Bb::new();
+        let data = b.param("data");
+        let meta = b.param("meta");
+        let frp = b.path(&["from_raw_parts"]);
+        let d_use = b.local(data);
+        let m_use = b.local(meta);
+        let raw = b.call(frp, &[d_use, m_use]);
+        let deref = b.e(Expr::Unary { op: UnOp::Deref, operand: raw });
+        let reborrowed = b.borrow(Mutbl::Not, deref);
+        let takes = b.path(&["takes_dyn_display"]);
+        let call = b.call(takes, &[reborrowed]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, fx.key_of("from_raw_parts_upcast_dyn"), root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "DynMetadata<dyn Error> upcast to &dyn Display: {:?}", c.diags);
+        let got = adjusts(&fx, &c, reborrowed);
+        assert!(got.ends_with("unsize -> &dyn Display"), "upcast adjustments `{got}`");
+    }
+
+    // 6. Closure-deferred metadata: `let f = |m| takes_dyn_display(&*from_raw_parts(data, m)); f(meta)`
+    //    `DynMetadata<dyn Display>` is only unified with `m` AFTER `coerce_unsized` runs.
+    {
+        let mut b = Bb::new();
+        let data = b.param("data");
+        let meta = b.param("meta");
+        let m_pat = b.bind("m");
+        let frp = b.path(&["from_raw_parts"]);
+        let d_use = b.local(data);
+        let m_use = b.local(m_pat);
+        let raw = b.call(frp, &[d_use, m_use]);
+        let deref = b.e(Expr::Unary { op: UnOp::Deref, operand: raw });
+        let reborrowed = b.borrow(Mutbl::Not, deref);
+        let takes = b.path(&["takes_dyn_display"]);
+        let body = b.call(takes, &[reborrowed]);
+        let clo = b.closure(&[m_pat], body);
+        let f_pat = b.bind("f");
+        let s1 = b.let_(f_pat, None, clo);
+        let f_use = b.local(f_pat);
+        let meta_use = b.local(meta);
+        let call = b.call(f_use, &[meta_use]);
+        let root = b.block(&[s1], Some(call));
+        let c = check_body(&fx, &b, fx.key_of("from_raw_parts_closure_deferred_meta"), root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "closure-deferred DynMetadata -> &dyn Display: {:?}", c.diags);
+    }
+
+    // 7. Negative control: `meta: DynMetadata<dyn MyTrait>` coerced to `&dyn Display` MUST fail
+    //    with E0277 (`Unsatisfied`), since `dyn MyTrait` does not unsize to `dyn Display`.
+    {
+        let mut b = Bb::new();
+        let data = b.param("data");
+        let meta = b.param("meta");
+        let frp = b.path(&["from_raw_parts"]);
+        let d_use = b.local(data);
+        let m_use = b.local(meta);
+        let raw = b.call(frp, &[d_use, m_use]);
+        let deref = b.e(Expr::Unary { op: UnOp::Deref, operand: raw });
+        let reborrowed = b.borrow(Mutbl::Not, deref);
+        let takes = b.path(&["takes_dyn_display"]);
+        let call = b.call(takes, &[reborrowed]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, fx.key_of("from_raw_parts_incompatible_dyn"), root, Plant::None, InferPlant::None);
+        assert!(
+            c.diags.iter().any(|d| d.code == DiagCode::Unsatisfied),
+            "CONTROL: DynMetadata<dyn MyTrait> -> &dyn Display must fail with E0277, got {:?}",
+            c.diags
+        );
+    }
+
+    // 8. Negative control: `let _p = from_raw_parts(data, meta);` with NO unsizing to `dyn ..`
+    //    must remain ambiguous (a struct with a `dyn Display` tail has the same metadata).
+    {
+        let mut b = Bb::new();
+        let data = b.param("data");
+        let meta = b.param("meta");
+        let frp = b.path(&["from_raw_parts"]);
+        let d_use = b.local(data);
+        let m_use = b.local(meta);
+        let raw = b.call(frp, &[d_use, m_use]);
+        let p_pat = b.bind("_p");
+        let s1 = b.let_(p_pat, None, raw);
+        let unit_val = b.tuple(&[]);
+        let root = b.block(&[s1], Some(unit_val));
+        let c = check_body(&fx, &b, fx.key_of("from_raw_parts_unconstrained_ambiguous"), root, Plant::None, InferPlant::None);
+        assert!(
+            c.diags.iter().any(|d| matches!(d.code, DiagCode::CannotSatisfy | DiagCode::AnnotationsNeeded)),
+            "CONTROL: unconstrained from_raw_parts must remain ambiguous, got {:?}",
+            c.diags
+        );
     }
 }

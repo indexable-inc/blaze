@@ -1179,7 +1179,9 @@ fn refuse_predicate(
     start: usize,
 ) -> Result<(), ExpandError> {
     let token = match error {
-        CfgPredicateError::Malformed { token } | CfgPredicateError::NotTakesOne { token } => token,
+        CfgPredicateError::Malformed { token }
+        | CfgPredicateError::NotTakesOne { token }
+        | CfgPredicateError::UnstableCfgVersion { token } => token,
         CfgPredicateError::Atom(error) => return Err(error),
     };
     let at = start + token as usize;

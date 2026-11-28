@@ -92,12 +92,14 @@ mod fanotify;
 #[cfg(target_os = "macos")]
 mod footprint;
 pub mod fs;
+pub mod handle;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code, reason = "the FSEvents driver: CoreFoundation, FSEvents and dispatch calls")]
 mod fsevents;
 mod handoff;
 pub mod home;
 mod host;
+pub mod request;
 #[cfg(windows)]
 #[allow(unsafe_code, reason = "the IOCP driver: Win32 calls and the OVERLAPPEDs the kernel writes")]
 pub mod iocp;

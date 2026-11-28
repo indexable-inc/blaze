@@ -596,10 +596,21 @@ impl TypeAttrs {
     /// `remove_var`): calling it without `unsafe` is allowed in editions prior to 2024 and
     /// requires `unsafe` starting in edition 2024 (rules/unsafety.rs). Bit 24.
     pub const DEPRECATED_SAFE_2024: u32 = 1 << 24;
+    /// `#[blaze::handle]` on a struct/enum/union: an inert generational request-builder handle
+    /// token (`Handle<'io, K>`, `File`, `Dir`, `Conn`, `Child`, `Lock`) with zero executing
+    /// authority (`docs/v2/plan/design/sans-io-machines.md`, section 2). Allowed inside
+    /// `#![blaze::sans_io]` ADTs, and itself checked by `capability-in-sans-io` to store no
+    /// `#[blaze::capability]` field directly or transitively. Bit 25.
+    pub const HANDLE: u32 = 1 << 25;
 
     /// Whether this item carries `#[blaze::capability]`.
     pub const fn is_capability(self) -> bool {
         (self.0 & Self::CAPABILITY) != 0
+    }
+
+    /// Whether this item carries `#[blaze::handle]`.
+    pub const fn is_handle(self) -> bool {
+        (self.0 & Self::HANDLE) != 0
     }
 
     /// Whether this ADT is defined in a `#![blaze::sans_io]` crate/module or marked `#[blaze::sans_io]`.

@@ -714,12 +714,12 @@ impl ProbeSetupError {
         Self { kind, detail }
     }
 
-    pub(crate) fn from_str(kind: ProbeErrorKind, detail: &str) -> Self {
-        Self { kind, detail: blaze_own::String::from_str_in(detail, blaze_own::SharedAlloc::global()) }
+    pub(crate) fn from_str(kind: ProbeErrorKind, detail: &str, shared: blaze_own::SharedAlloc<'static>) -> Self {
+        Self { kind, detail: blaze_own::String::from_str_in(detail, shared) }
     }
 
     pub(crate) fn duplicate(&self) -> Self {
-        Self::from_str(self.kind, self.detail.as_str())
+        Self::from_str(self.kind, self.detail.as_str(), *self.detail.allocator())
     }
 }
 
@@ -895,7 +895,7 @@ impl CheckedHexSlot {
 /// - `fact_pins::command_spawn_setting` errors are preserved and propagated verbatim (Rule 3).
 pub(crate) struct SharedCommandProbes {
     c_probes: bstd::sync::Once<Option<blaze_proc_macro::probe_clang::CProbeSetting>>,
-    spawn_setting: bstd::sync::Once<Result<SpawnSetting, blaze_own::String<blaze_own::SharedAlloc<'static>>>>,
+    spawn_setting: bstd::sync::Once<Result<SpawnSetting, ProbeSetupError>>,
     /// Dependency-probe identity published by the completed `check` (or pinned certificate),
     /// reused by start-time proc-macro runners (`RunProcs` via `Standing`) so `run`/`test`/`export`
     /// look up the exact `MacroModule` that `check` selected and produced even if a host closure
@@ -970,6 +970,11 @@ pub(crate) struct CommandProbes<'a> {
 }
 
 impl<'a> CommandProbes<'a> {
+    /// Shared allocator handle carried by this command's resolved environment.
+    pub(crate) fn shared(&self) -> blaze_own::SharedAlloc<'static> {
+        self.env.heap.shared()
+    }
+
     /// Overrides the macOS SDK snapshot carried by this probe handle (used by start-time
     /// `RunProcs` so `run`/`test`/`export` share the exact SDK resolved by `check` without
     /// cloning `FetchEnv` handles).
@@ -1031,7 +1036,7 @@ impl<'a> CommandProbes<'a> {
     fn spawn_setting_with(
         &self,
         cx: &Cx,
-        open: impl FnOnce(&Cx) -> Result<SpawnSetting, blaze_own::String<blaze_own::SharedAlloc<'static>>>,
+        open: impl FnOnce(&Cx) -> Result<SpawnSetting, ProbeSetupError>,
     ) -> Result<&'a SpawnSetting, ProbeSetupError> {
         let shared = self.env.heap.shared();
         #[cfg(test)]
@@ -1050,10 +1055,7 @@ impl<'a> CommandProbes<'a> {
                 })?;
             return match slot {
                 Ok(setting) => Ok(setting),
-                Err(why) => Err(ProbeSetupError::new(
-                    ProbeErrorKind::SpawnPinsOpen,
-                    blaze_own::String::from_str_in(why.as_str(), shared),
-                )),
+                Err(why) => Err(why.duplicate()),
             };
         }
         let slot = self
@@ -1067,10 +1069,7 @@ impl<'a> CommandProbes<'a> {
             })?;
         match slot {
             Ok(setting) => Ok(setting),
-            Err(why) => Err(ProbeSetupError::new(
-                ProbeErrorKind::SpawnPinsOpen,
-                blaze_own::String::from_str_in(why.as_str(), shared),
-            )),
+            Err(why) => Err(why.duplicate()),
         }
     }
 
@@ -1085,13 +1084,13 @@ impl<'a> CommandProbes<'a> {
     fn spawn_setting_snapshot_with(
         &self,
         cx: &Cx,
-        open: impl FnOnce(&Cx) -> Result<SpawnSetting, blaze_own::String<blaze_own::SharedAlloc<'static>>>,
+        open: impl FnOnce(&Cx) -> Result<SpawnSetting, ProbeSetupError>,
     ) -> Result<SpawnSetting, ProbeSetupError> {
         #[cfg(test)]
         if matches!(self.inner.plant, ProbeOncePlant::SkipOnce) {
             return match open(cx) {
                 Ok(setting) => Ok(crate::wasm64_compile::dep_script_spawn_setting(Some(&setting))),
-                Err(why) => Err(ProbeSetupError::new(ProbeErrorKind::SpawnPinsOpen, why)),
+                Err(why) => Err(why),
             };
         }
         let shared = self.env.heap.shared();
@@ -1106,10 +1105,7 @@ impl<'a> CommandProbes<'a> {
             })?;
         match slot {
             Ok(setting) => Ok(crate::wasm64_compile::dep_script_spawn_setting(Some(setting))),
-            Err(why) => Err(ProbeSetupError::new(
-                ProbeErrorKind::SpawnPinsOpen,
-                blaze_own::String::from_str_in(why.as_str(), shared),
-            )),
+            Err(why) => Err(why.duplicate()),
         }
     }
 
@@ -1156,14 +1152,14 @@ impl<'a> CommandProbes<'a> {
 fn open_spawn_setting(
     env: &FetchEnv<'_>,
     shared: blaze_own::SharedAlloc<'static>,
-) -> Result<SpawnSetting, blaze_own::String<blaze_own::SharedAlloc<'static>>> {
+) -> Result<SpawnSetting, ProbeSetupError> {
     blaze_proc_macro::fact_pins::command_spawn_setting(crate::graph::TRIPLE, env.heap.alloc()).map_err(|error| {
         let mut msg = blaze_own::String::new_in(shared);
         let _ = core::fmt::Write::write_fmt(
             &mut msg,
             format_args!("the command's spawn setting (the derived facts' pins): {error}"),
         );
-        msg
+        ProbeSetupError::new(ProbeErrorKind::SpawnPinsOpen, msg)
     })
 }
 
@@ -1634,10 +1630,11 @@ fn fold_wasm_script_dep_probes<'j>(
             Ok(Some(crate::wasm64_compile::fold_dep_probes_opt(deps_digest, planned_hex.as_str(), jobs)))
         }
         Some(crate::engine_scripts::PlannedProbe::Failed(err)) => Err(err.duplicate()),
-        None => match crate::wasm64_compile::unit_has_dep_build_scripts(graph, wasm_graph, script, false)? {
+        None => match crate::wasm64_compile::unit_has_dep_build_scripts(graph, wasm_graph, script, false, probes.shared())? {
             true if planned_script_probes.is_some() => Err(ProbeSetupError::from_str(
                 ProbeErrorKind::PlannedDrift,
                 "build script has dependency build scripts at job time without a planned module probe identity",
+                probes.shared(),
             )),
             true => {
                 let probes_hex = probes.dep_probe_identity_hex(cx)?;
@@ -2050,7 +2047,7 @@ mod shared_command_probes_dst {
     use bstd::cx::Cx;
     use bstd::io::{Io, Limits, SimWorld};
 
-    use super::{FetchEnv, ProbeErrorKind, ProbeOncePlant, SharedCommandProbes};
+    use super::{FetchEnv, ProbeErrorKind, ProbeOncePlant, ProbeSetupError, SharedCommandProbes};
 
     fn sim_env<'a>(io: &Io) -> FetchEnv<'a> {
         FetchEnv {
@@ -2098,40 +2095,43 @@ mod shared_command_probes_dst {
         let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
         let cx = io
             .cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME)
-            .map_err(|e| Broke::Oracle(std::format!("sim cx failed: {e}")))?;
+            .map_err(|_| Broke::Oracle("sim cx failed".into()))?;
         let env = sim_env(&io);
         let holder = SharedCommandProbes::new_with_plant(plant);
         let probes = holder.with_env(&env);
 
         let c_inits = AtomicU32::new(0);
         let s_inits = AtomicU32::new(0);
-        let mut first_c_tag: Option<Option<std::string::String>> = None;
-        let mut first_spawn_ok: Option<std::string::String> = None;
-        let mut first_spawn_err: Option<std::string::String> = None;
+        let mut first_c_tag: Option<Option<blaze_own::AString<'_>>> = None;
+        let mut first_spawn_ok: Option<blaze_own::AString<'_>> = None;
+        let mut first_spawn_err: Option<blaze_own::AString<'_>> = None;
         let mut first_dep_hex: Option<crate::wasm64_compile::Hex64> = None;
 
+        let test_alloc = env.heap.alloc();
+        let test_shared = env.heap.shared();
         let open_c = |_cx: &Cx| -> Option<CProbeSetting> {
             let n = c_inits.fetch_add(1, Ordering::SeqCst) + 1;
             if !c_probes_present {
                 return None;
             }
             Some(CProbeSetting::Unavailable(blaze_own::Arc::from_str_in(
-                std::format!("unavail-init-{n}").as_str(),
-                SharedAlloc::global(),
+                bstd::mem::format_in!(cx.frame(), "unavail-init-{n}").as_str(),
+                test_shared,
             )))
         };
-        let open_s = |_cx: &Cx| -> Result<SpawnSetting, blaze_own::String<SharedAlloc<'static>>> {
+        let open_s = |_cx: &Cx| -> Result<SpawnSetting, ProbeSetupError> {
             let n = s_inits.fetch_add(1, Ordering::SeqCst) + 1;
             if inject_spawn_error {
-                Err(blaze_own::String::from_str_in(
-                    std::format!("injected-pin-err-{n}").as_str(),
-                    SharedAlloc::global(),
+                Err(ProbeSetupError::from_str(
+                    ProbeErrorKind::SpawnPinsOpen,
+                    bstd::mem::format_in!(cx.frame(), "injected-pin-err-{n}").as_str(),
+                    test_shared,
                 ))
             } else {
                 Ok(SpawnSetting::facts_only(blaze_proc_macro::spawn_route::FactPins {
-                    clang_version_text: std::format!("clang version 23.0.{n}"),
-                    macos_product_version: std::string::String::new(),
-                    macos_build_version: std::string::String::new(),
+                    clang_version_text: bstd::mem::format_in!(cx.frame(), "clang version 23.0.{n}").as_str().into(),
+                    macos_product_version: Default::default(),
+                    macos_build_version: Default::default(),
                 }))
             }
         };
@@ -2153,17 +2153,18 @@ mod shared_command_probes_dst {
                     c_calls += 1;
                     let got = probes
                         .c_probes_with(&cx, &open_c)
-                        .map_err(|e| Broke::Oracle(std::format!("c_probes_with failed: {e}")))?;
+                        .map_err(|e| Broke::Oracle(bstd::mem::format_in!(cx.frame(), "c_probes_with failed: {e}").as_str().into()))?;
                     let tag = match got {
                         None => None,
-                        Some(CProbeSetting::Unavailable(reason)) => Some(std::string::String::from(reason.as_ref())),
-                        Some(CProbeSetting::Ready(_)) => Some(std::string::String::from("ready")),
+                        Some(CProbeSetting::Unavailable(reason)) => Some(blaze_own::AString::from_str_in(reason.as_ref(), test_alloc)),
+                        Some(CProbeSetting::Ready(_)) => Some(blaze_own::AString::from_str_in("ready", test_alloc)),
                     };
                     if let Some(prev) = &first_c_tag {
                         if prev != &tag {
-                            return Err(Broke::Oracle(std::format!(
+                            return Err(Broke::Oracle(bstd::mem::format_in!(
+                                cx.frame(),
                                 "duplicate or divergent c_probes outcome: got {tag:?}, expected {prev:?}"
-                            )));
+                            ).as_str().into()));
                         }
                     } else {
                         first_c_tag = Some(tag);
@@ -2174,20 +2175,20 @@ mod shared_command_probes_dst {
                     match probes.spawn_setting_with(&cx, &open_s) {
                         Ok(setting) => {
                             if inject_spawn_error {
-                                return Err(Broke::Oracle(std::string::String::from(
-                                    "spawn_setting_with returned Ok under injected error",
-                                )));
+                                return Err(Broke::Oracle(
+                                    "spawn_setting_with returned Ok under injected error".into(),
+                                ));
                             }
-                            let ver = setting
-                                .pins
-                                .as_ref()
-                                .map(|p| p.clang_version_text.clone())
-                                .unwrap_or_default();
+                            let ver = blaze_own::AString::from_str_in(
+                                setting.pins.as_ref().map_or("", |p| p.clang_version_text.as_str()),
+                                test_alloc,
+                            );
                             if let Some(prev) = &first_spawn_ok {
                                 if prev != &ver {
-                                    return Err(Broke::Oracle(std::format!(
+                                    return Err(Broke::Oracle(bstd::mem::format_in!(
+                                        cx.frame(),
                                         "duplicate or divergent spawn_setting: got {ver:?}, expected {prev:?}"
-                                    )));
+                                    ).as_str().into()));
                                 }
                             } else {
                                 first_spawn_ok = Some(ver);
@@ -2195,22 +2196,25 @@ mod shared_command_probes_dst {
                         }
                         Err(err) => {
                             if !inject_spawn_error {
-                                return Err(Broke::Oracle(std::format!(
+                                return Err(Broke::Oracle(bstd::mem::format_in!(
+                                    cx.frame(),
                                     "unexpected spawn_setting_with error: {err}"
-                                )));
+                                ).as_str().into()));
                             }
                             if err.kind != ProbeErrorKind::SpawnPinsOpen {
-                                return Err(Broke::Oracle(std::format!(
+                                return Err(Broke::Oracle(bstd::mem::format_in!(
+                                    cx.frame(),
                                     "wrong ProbeErrorKind: {:?}",
                                     err.kind
-                                )));
+                                ).as_str().into()));
                             }
-                            let detail = std::string::String::from(err.detail.as_str());
+                            let detail = blaze_own::AString::from_str_in(err.detail.as_str(), test_alloc);
                             if let Some(prev) = &first_spawn_err {
                                 if prev != &detail {
-                                    return Err(Broke::Oracle(std::format!(
+                                    return Err(Broke::Oracle(bstd::mem::format_in!(
+                                        cx.frame(),
                                         "duplicate or divergent spawn error: got {detail:?}, expected {prev:?}"
-                                    )));
+                                    ).as_str().into()));
                                 }
                             } else {
                                 first_spawn_err = Some(detail);
@@ -2223,20 +2227,20 @@ mod shared_command_probes_dst {
                     match probes.spawn_setting_snapshot_with(&cx, &open_s) {
                         Ok(setting) => {
                             if inject_spawn_error {
-                                return Err(Broke::Oracle(std::string::String::from(
-                                    "spawn_setting_snapshot_with returned Ok under injected error",
-                                )));
+                                return Err(Broke::Oracle(
+                                    "spawn_setting_snapshot_with returned Ok under injected error".into(),
+                                ));
                             }
-                            let ver = setting
-                                .pins
-                                .as_ref()
-                                .map(|p| p.clang_version_text.clone())
-                                .unwrap_or_default();
+                            let ver = blaze_own::AString::from_str_in(
+                                setting.pins.as_ref().map_or("", |p| p.clang_version_text.as_str()),
+                                test_alloc,
+                            );
                             if let Some(prev) = &first_spawn_ok {
                                 if prev != &ver {
-                                    return Err(Broke::Oracle(std::format!(
+                                    return Err(Broke::Oracle(bstd::mem::format_in!(
+                                        cx.frame(),
                                         "duplicate or divergent spawn snapshot: got {ver:?}, expected {prev:?}"
-                                    )));
+                                    ).as_str().into()));
                                 }
                             } else {
                                 first_spawn_ok = Some(ver);
@@ -2244,16 +2248,18 @@ mod shared_command_probes_dst {
                         }
                         Err(err) => {
                             if !inject_spawn_error {
-                                return Err(Broke::Oracle(std::format!(
+                                return Err(Broke::Oracle(bstd::mem::format_in!(
+                                    cx.frame(),
                                     "unexpected spawn_setting_snapshot_with error: {err}"
-                                )));
+                                ).as_str().into()));
                             }
-                            let detail = std::string::String::from(err.detail.as_str());
+                            let detail = blaze_own::AString::from_str_in(err.detail.as_str(), test_alloc);
                             if let Some(prev) = &first_spawn_err {
                                 if prev != &detail {
-                                    return Err(Broke::Oracle(std::format!(
+                                    return Err(Broke::Oracle(bstd::mem::format_in!(
+                                        cx.frame(),
                                         "duplicate or divergent snapshot error: got {detail:?}, expected {prev:?}"
-                                    )));
+                                    ).as_str().into()));
                                 }
                             } else {
                                 first_spawn_err = Some(detail);
@@ -2266,13 +2272,13 @@ mod shared_command_probes_dst {
                     s_calls += 1;
                     let cp = probes
                         .c_probes_with(&cx, &open_c)
-                        .map_err(|e| Broke::Oracle(std::format!("c_probes_with failed: {e}")))?;
+                        .map_err(|e| Broke::Oracle(bstd::mem::format_in!(cx.frame(), "c_probes_with failed: {e}").as_str().into()))?;
                     match probes.spawn_setting_snapshot_with(&cx, &open_s) {
                         Ok(sp) => {
                             if inject_spawn_error {
-                                return Err(Broke::Oracle(std::string::String::from(
-                                    "dep identity saw Ok spawn setting under injected error",
-                                )));
+                                return Err(Broke::Oracle(
+                                    "dep identity saw Ok spawn setting under injected error".into(),
+                                ));
                             }
                             let hex = crate::wasm64_compile::dep_probe_identity_from_setting(
                                 &cx,
@@ -2283,14 +2289,15 @@ mod shared_command_probes_dst {
                                 env.heap.alloc(),
                                 env.heap.shared(),
                             )
-                            .map_err(|e| Broke::Oracle(std::format!("dep_probe_identity_from_setting failed: {e}")))?;
+                            .map_err(|e| Broke::Oracle(bstd::mem::format_in!(cx.frame(), "dep_probe_identity_from_setting failed: {e}").as_str().into()))?;
                             if let Some(prev) = first_dep_hex {
                                 if prev != hex {
-                                    return Err(Broke::Oracle(std::format!(
+                                    return Err(Broke::Oracle(bstd::mem::format_in!(
+                                        cx.frame(),
                                         "duplicate or divergent dep_probe_identity: got {}, expected {}",
                                         hex.as_str(),
                                         prev.as_str()
-                                    )));
+                                    ).as_str().into()));
                                 }
                             } else {
                                 first_dep_hex = Some(hex);
@@ -2298,16 +2305,18 @@ mod shared_command_probes_dst {
                         }
                         Err(err) => {
                             if !inject_spawn_error {
-                                return Err(Broke::Oracle(std::format!(
+                                return Err(Broke::Oracle(bstd::mem::format_in!(
+                                    cx.frame(),
                                     "unexpected dep identity spawn error: {err}"
-                                )));
+                                ).as_str().into()));
                             }
-                            let detail = std::string::String::from(err.detail.as_str());
+                            let detail = blaze_own::AString::from_str_in(err.detail.as_str(), test_alloc);
                             if let Some(prev) = &first_spawn_err {
                                 if prev != &detail {
-                                    return Err(Broke::Oracle(std::format!(
+                                    return Err(Broke::Oracle(bstd::mem::format_in!(
+                                        cx.frame(),
                                         "duplicate or divergent dep identity spawn error: got {detail:?}, expected {prev:?}"
-                                    )));
+                                    ).as_str().into()));
                                 }
                             } else {
                                 first_spawn_err = Some(detail);
@@ -2333,9 +2342,9 @@ mod shared_command_probes_dst {
                         cancelled_ok = res.is_ok();
                     });
                     if !cancelled_ok {
-                        return Err(Broke::Oracle(std::string::String::from(
-                            "pure c_probes=None identity unexpectedly failed under cancelled scope",
-                        )));
+                        return Err(Broke::Oracle(
+                            "pure c_probes=None identity unexpectedly failed under cancelled scope".into(),
+                        ));
                     }
                 }
             }
@@ -2343,15 +2352,17 @@ mod shared_command_probes_dst {
             // Safety invariants checked after EVERY single real production call:
             let c_count = c_inits.load(Ordering::SeqCst);
             if c_count > 1 {
-                return Err(Broke::Oracle(std::format!(
+                return Err(Broke::Oracle(bstd::mem::format_in!(
+                    cx.frame(),
                     "duplicate c_probes initialization in SharedCommandProbes: {c_count} inits"
-                )));
+                ).as_str().into()));
             }
             let s_count = s_inits.load(Ordering::SeqCst);
             if s_count > 1 {
-                return Err(Broke::Oracle(std::format!(
+                return Err(Broke::Oracle(bstd::mem::format_in!(
+                    cx.frame(),
                     "duplicate spawn_setting initialization in SharedCommandProbes: {s_count} inits"
-                )));
+                ).as_str().into()));
             }
         }
 
@@ -2359,16 +2370,18 @@ mod shared_command_probes_dst {
         let expected_c = u32::from(c_calls > 0);
         let expected_s = u32::from(s_calls > 0);
         if c_inits.load(Ordering::SeqCst) != expected_c {
-            return Err(Broke::Oracle(std::format!(
+            return Err(Broke::Oracle(bstd::mem::format_in!(
+                cx.frame(),
                 "duplicate or missing c_probes init: got {}, expected {expected_c}",
                 c_inits.load(Ordering::SeqCst)
-            )));
+            ).as_str().into()));
         }
         if s_inits.load(Ordering::SeqCst) != expected_s {
-            return Err(Broke::Oracle(std::format!(
+            return Err(Broke::Oracle(bstd::mem::format_in!(
+                cx.frame(),
                 "duplicate or missing spawn_setting init: got {}, expected {expected_s}",
                 s_inits.load(Ordering::SeqCst)
-            )));
+            ).as_str().into()));
         }
         Ok(())
     }
@@ -2398,6 +2411,7 @@ mod shared_command_probes_dst {
         let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root sim cx");
         let env = sim_env(&io);
 
+        let shared = env.heap.shared();
         // 1. Real `c_probes` initializes exactly once and returns the exact same setting.
         let holder = SharedCommandProbes::new();
         let probes = holder.with_env(&env);
@@ -2407,8 +2421,8 @@ mod shared_command_probes_dst {
                 .c_probes_with(&cx, |_| {
                     let n = c_inits.fetch_add(1, Ordering::SeqCst) + 1;
                     Some(CProbeSetting::Unavailable(blaze_own::Arc::from_str_in(
-                        std::format!("ok-{n}").as_str(),
-                        SharedAlloc::global(),
+                        bstd::mem::format_in!(cx.frame(), "ok-{n}").as_str(),
+                        shared,
                     )))
                 })
                 .expect("c_probes succeeds");
@@ -2424,9 +2438,10 @@ mod shared_command_probes_dst {
             let err = err_probes
                 .spawn_setting_snapshot_with(&cx, |_| {
                     let n = s_inits.fetch_add(1, Ordering::SeqCst) + 1;
-                    Err(blaze_own::String::from_str_in(
-                        std::format!("injected plist error #{n}").as_str(),
-                        SharedAlloc::global(),
+                    Err(ProbeSetupError::from_str(
+                        ProbeErrorKind::SpawnPinsOpen,
+                        bstd::mem::format_in!(cx.frame(), "injected plist error #{n}").as_str(),
+                        shared,
                     ))
                 })
                 .expect_err("injected spawn error must propagate");
@@ -2442,9 +2457,9 @@ mod shared_command_probes_dst {
             let _ = planted.spawn_setting_snapshot_with(&cx, |_| {
                 p_inits.fetch_add(1, Ordering::SeqCst);
                 Ok(SpawnSetting::facts_only(FactPins {
-                    clang_version_text: std::string::String::from("clang version 23.0.0"),
-                    macos_product_version: std::string::String::new(),
-                    macos_build_version: std::string::String::new(),
+                    clang_version_text: "clang version 23.0.0".into(),
+                    macos_product_version: Default::default(),
+                    macos_build_version: Default::default(),
                 }))
             });
         }
@@ -2528,7 +2543,7 @@ mod shared_command_probes_dst {
         use blaze_ids::ContentId;
         use blaze_proc_macro::probe_clang::{CProbeStore, CScriptProbes, MemCProbeStore};
 
-        struct MutableAnswerer(std::sync::Arc<core::sync::atomic::AtomicU8>);
+        struct MutableAnswerer(blaze_own::Arc<core::sync::atomic::AtomicU8, SharedAlloc<'static>>);
         impl ProbeAnswerer for MutableAnswerer {
             fn id<'a>(&self, _alloc: blaze_own::Alloc<'a>) -> Result<ContentId, blaze_own::AString<'a>> {
                 Ok(ContentId([self.0.load(Ordering::SeqCst); 32]))
@@ -2546,10 +2561,10 @@ mod shared_command_probes_dst {
         let io = Io::simulated(SimWorld::new(72, Limits::USUAL));
         let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root sim cx");
         let env = sim_env(&io);
-        let shared = SharedAlloc::global();
-        let state = std::sync::Arc::new(core::sync::atomic::AtomicU8::new(0xaa));
+        let shared = env.heap.shared();
+        let state = blaze_own::Arc::new_in(core::sync::atomic::AtomicU8::new(0xaa), shared);
         let answerer: blaze_own::Arc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> =
-            blaze_own::Arc::new_in(MutableAnswerer(std::sync::Arc::clone(&state)), shared);
+            blaze_own::Arc::new_in(MutableAnswerer(blaze_own::Share::share(&state)), shared);
         let records: blaze_own::Arc<dyn CProbeStore, SharedAlloc<'static>> =
             blaze_own::Arc::new_in(MemCProbeStore::default(), shared);
         let ready = CProbeSetting::Ready(CScriptProbes {
@@ -2578,9 +2593,9 @@ mod shared_command_probes_dst {
             .spawn_setting_with(&cx, |_| {
                 s_opens.fetch_add(1, Ordering::SeqCst);
                 Ok(SpawnSetting::facts_only(FactPins {
-                    clang_version_text: std::string::String::from("clang version 23.0.0"),
-                    macos_product_version: std::string::String::new(),
-                    macos_build_version: std::string::String::new(),
+                    clang_version_text: "clang version 23.0.0".into(),
+                    macos_product_version: Default::default(),
+                    macos_build_version: Default::default(),
                 }))
             })
             .expect("seed spawn_setting");
@@ -2622,7 +2637,7 @@ mod shared_command_probes_dst {
         use blaze_ids::ContentId;
         use blaze_proc_macro::probe_clang::{CProbeStore, CScriptProbes, MemCProbeStore};
 
-        struct MutableAnswerer(std::sync::Arc<core::sync::atomic::AtomicU8>);
+        struct MutableAnswerer(blaze_own::Arc<core::sync::atomic::AtomicU8, SharedAlloc<'static>>);
         impl ProbeAnswerer for MutableAnswerer {
             fn id<'a>(&self, _alloc: blaze_own::Alloc<'a>) -> Result<ContentId, blaze_own::AString<'a>> {
                 Ok(ContentId([self.0.load(Ordering::SeqCst); 32]))
@@ -2642,12 +2657,12 @@ mod shared_command_probes_dst {
         let fs = io.need_fs().expect("sim fs");
         let root = fs.root();
         let env = sim_env(&io);
-        let shared = SharedAlloc::global();
+        let shared = env.heap.shared();
         let frame = cx.frame();
 
-        let make_ready = |state: &std::sync::Arc<core::sync::atomic::AtomicU8>| {
+        let make_ready = |state: &blaze_own::Arc<core::sync::atomic::AtomicU8, SharedAlloc<'static>>| {
             let answerer: blaze_own::Arc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> =
-                blaze_own::Arc::new_in(MutableAnswerer(std::sync::Arc::clone(state)), shared);
+                blaze_own::Arc::new_in(MutableAnswerer(blaze_own::Share::share(state)), shared);
             let records: blaze_own::Arc<dyn CProbeStore, SharedAlloc<'static>> =
                 blaze_own::Arc::new_in(MemCProbeStore::default(), shared);
             CProbeSetting::Ready(CScriptProbes {
@@ -2682,16 +2697,16 @@ mod shared_command_probes_dst {
         assert!(!plain_followed.now.rows.iter().zip(plain_followed.was.iter()).any(|(n, w)| n.state() != *w));
 
         // 1. Seed initial stored leaf table with probe identity A (answerer 0xaa, clang 23.0.0).
-        let state = std::sync::Arc::new(core::sync::atomic::AtomicU8::new(0xaa));
+        let state = blaze_own::Arc::new_in(core::sync::atomic::AtomicU8::new(0xaa), shared);
         let holder1 = SharedCommandProbes::new();
         let probes1 = holder1.with_env(&env);
         let _ = probes1.c_probes_with(&cx, |_| Some(make_ready(&state))).expect("seed c1");
         let _ = probes1
             .spawn_setting_with(&cx, |_| {
                 Ok(SpawnSetting::facts_only(FactPins {
-                    clang_version_text: std::string::String::from("clang version 23.0.0"),
-                    macos_product_version: std::string::String::new(),
-                    macos_build_version: std::string::String::new(),
+                    clang_version_text: "clang version 23.0.0".into(),
+                    macos_product_version: Default::default(),
+                    macos_build_version: Default::default(),
                 }))
             })
             .expect("seed s1");
@@ -2713,9 +2728,9 @@ mod shared_command_probes_dst {
         let _ = probes2
             .spawn_setting_with(&cx, |_| {
                 Ok(SpawnSetting::facts_only(FactPins {
-                    clang_version_text: std::string::String::from("clang version 23.0.0"),
-                    macos_product_version: std::string::String::new(),
-                    macos_build_version: std::string::String::new(),
+                    clang_version_text: "clang version 23.0.0".into(),
+                    macos_product_version: Default::default(),
+                    macos_build_version: Default::default(),
                 }))
             })
             .expect("seed s2");
@@ -2751,9 +2766,9 @@ mod shared_command_probes_dst {
         let _ = probes3
             .spawn_setting_with(&cx, |_| {
                 Ok(SpawnSetting::facts_only(FactPins {
-                    clang_version_text: std::string::String::from("clang version 23.0.0"),
-                    macos_product_version: std::string::String::new(),
-                    macos_build_version: std::string::String::new(),
+                    clang_version_text: "clang version 23.0.0".into(),
+                    macos_product_version: Default::default(),
+                    macos_build_version: Default::default(),
                 }))
             })
             .expect("seed s3");
@@ -2778,9 +2793,9 @@ mod shared_command_probes_dst {
         let _ = probes4
             .spawn_setting_with(&cx, |_| {
                 Ok(SpawnSetting::facts_only(FactPins {
-                    clang_version_text: std::string::String::from("clang version 23.1.0"),
-                    macos_product_version: std::string::String::new(),
-                    macos_build_version: std::string::String::new(),
+                    clang_version_text: "clang version 23.1.0".into(),
+                    macos_product_version: Default::default(),
+                    macos_build_version: Default::default(),
                 }))
             })
             .expect("seed s4");
@@ -2804,7 +2819,7 @@ mod shared_command_probes_dst {
         use blaze_ids::ContentId;
         use blaze_proc_macro::probe_clang::{CProbeStore, CScriptProbes, MemCProbeStore};
 
-        struct MutableAnswerer(std::sync::Arc<core::sync::atomic::AtomicU8>);
+        struct MutableAnswerer(blaze_own::Arc<core::sync::atomic::AtomicU8, SharedAlloc<'static>>);
         impl ProbeAnswerer for MutableAnswerer {
             fn id<'a>(&self, _alloc: blaze_own::Alloc<'a>) -> Result<ContentId, blaze_own::AString<'a>> {
                 Ok(ContentId([self.0.load(Ordering::SeqCst); 32]))
@@ -2825,7 +2840,7 @@ mod shared_command_probes_dst {
         let clock = io.need_clock().expect("sim clock");
         let err = io.need_err().expect("sim err");
         let env = sim_env(&io);
-        let shared = SharedAlloc::global();
+        let shared = env.heap.shared();
         let home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
         let heap = blaze_own::testing::heap();
         let alloc = heap.shared();
@@ -2895,10 +2910,10 @@ mod shared_command_probes_dst {
         let stored = crate::engine_answer::Stored::new(&stood_root, &snap, &headers, pages::Check::Store, alloc);
 
         // Live host answerer has ALREADY drifted to 0xbb before the pinned launch runs!
-        let drifted_state = std::sync::Arc::new(core::sync::atomic::AtomicU8::new(0xbb));
+        let drifted_state = blaze_own::Arc::new_in(core::sync::atomic::AtomicU8::new(0xbb), shared);
         let make_drifted_ready = || {
             let answerer: blaze_own::Arc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> =
-                blaze_own::Arc::new_in(MutableAnswerer(std::sync::Arc::clone(&drifted_state)), shared);
+                blaze_own::Arc::new_in(MutableAnswerer(blaze_own::Share::share(&drifted_state)), shared);
             let records: blaze_own::Arc<dyn CProbeStore, SharedAlloc<'static>> =
                 blaze_own::Arc::new_in(MemCProbeStore::default(), shared);
             CProbeSetting::Ready(CScriptProbes {
@@ -2996,7 +3011,7 @@ mod shared_command_probes_dst {
         use blaze_ids::ContentId;
         use blaze_proc_macro::probe_clang::{CProbeStore, CScriptProbes, MemCProbeStore};
 
-        struct MutableAnswerer(std::sync::Arc<core::sync::atomic::AtomicU8>);
+        struct MutableAnswerer(blaze_own::Arc<core::sync::atomic::AtomicU8, SharedAlloc<'static>>);
         impl ProbeAnswerer for MutableAnswerer {
             fn id<'a>(&self, _alloc: blaze_own::Alloc<'a>) -> Result<ContentId, blaze_own::AString<'a>> {
                 Ok(ContentId([self.0.load(Ordering::SeqCst); 32]))
@@ -3014,15 +3029,15 @@ mod shared_command_probes_dst {
         let io = Io::simulated(SimWorld::new(75, Limits::USUAL));
         let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root sim cx");
         let env = sim_env(&io);
-        let shared = SharedAlloc::global();
-        let state = std::sync::Arc::new(core::sync::atomic::AtomicU8::new(0xaa));
+        let shared = env.heap.shared();
+        let state = blaze_own::Arc::new_in(core::sync::atomic::AtomicU8::new(0xaa), shared);
 
         let holder = SharedCommandProbes::new();
         let check_probes = holder.with_env(&env);
         let _ = check_probes
             .c_probes_with(&cx, |_| {
                 let answerer: blaze_own::Arc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> =
-                    blaze_own::Arc::new_in(MutableAnswerer(std::sync::Arc::clone(&state)), shared);
+                    blaze_own::Arc::new_in(MutableAnswerer(blaze_own::Share::share(&state)), shared);
                 let records: blaze_own::Arc<dyn CProbeStore, SharedAlloc<'static>> =
                     blaze_own::Arc::new_in(MemCProbeStore::default(), shared);
                 Some(CProbeSetting::Ready(CScriptProbes {
@@ -3040,9 +3055,9 @@ mod shared_command_probes_dst {
         let _ = check_probes
             .spawn_setting_with(&cx, |_| {
                 Ok(SpawnSetting::facts_only(FactPins {
-                    clang_version_text: std::string::String::from("clang version 23.0.0"),
-                    macos_product_version: std::string::String::new(),
-                    macos_build_version: std::string::String::new(),
+                    clang_version_text: "clang version 23.0.0".into(),
+                    macos_product_version: Default::default(),
+                    macos_build_version: Default::default(),
                 }))
             })
             .expect("seed spawn_setting");
@@ -3109,12 +3124,14 @@ mod shared_command_probes_dst {
                             // old and new words (nor an unverified in-flight write).
                             let valid = observed == prev || observed == Some(next);
                             if !valid || (prev.is_some() && prev != Some(next)) {
-                                mid_err = Some(Broke::Oracle(std::format!(
+                                let frame = bstd::mem::Frame::new(bstd::mem::Tag::Other).expect("frame");
+                                mid_err = Some(Broke::Oracle(bstd::mem::format_in!(
+                                    &frame,
                                     "mid-write seqlock read returned {:?} while transitioning {:?} -> {:?}",
-                                    observed.map(|h| std::string::String::from(h.as_str())),
-                                    prev.map(|h| std::string::String::from(h.as_str())),
+                                    observed.map(|h| blaze_own::AString::from_str_in(h.as_str(), blaze_own::testing::heap().alloc())),
+                                    prev.map(|h| blaze_own::AString::from_str_in(h.as_str(), blaze_own::testing::heap().alloc())),
                                     next.as_str(),
-                                )));
+                                ).as_str().into()));
                             }
                         }
                     });
@@ -3130,23 +3147,27 @@ mod shared_command_probes_dst {
                 2 => {
                     let got = slot.load();
                     if got != expected {
-                        return Err(Broke::Oracle(std::format!(
+                        let frame = bstd::mem::Frame::new(bstd::mem::Tag::Other).expect("frame");
+                        return Err(Broke::Oracle(bstd::mem::format_in!(
+                            &frame,
                             "load() returned {:?}, expected {:?}",
-                            got.map(|h| std::string::String::from(h.as_str())),
-                            expected.map(|h| std::string::String::from(h.as_str())),
-                        )));
+                            got.map(|h| blaze_own::AString::from_str_in(h.as_str(), blaze_own::testing::heap().alloc())),
+                            expected.map(|h| blaze_own::AString::from_str_in(h.as_str(), blaze_own::testing::heap().alloc())),
+                        ).as_str().into()));
                     }
                 }
                 _ => {
                     let got = slot
                         .try_load_once()
-                        .map_err(|()| Broke::Oracle(std::string::String::from("quiescent try_load_once unexpectedly retried")))?;
+                        .map_err(|()| Broke::Oracle("quiescent try_load_once unexpectedly retried".into()))?;
                     if got != expected {
-                        return Err(Broke::Oracle(std::format!(
+                        let frame = bstd::mem::Frame::new(bstd::mem::Tag::Other).expect("frame");
+                        return Err(Broke::Oracle(bstd::mem::format_in!(
+                            &frame,
                             "quiescent try_load_once returned {:?}, expected {:?}",
-                            got.map(|h| std::string::String::from(h.as_str())),
-                            expected.map(|h| std::string::String::from(h.as_str())),
-                        )));
+                            got.map(|h| blaze_own::AString::from_str_in(h.as_str(), blaze_own::testing::heap().alloc())),
+                            expected.map(|h| blaze_own::AString::from_str_in(h.as_str(), blaze_own::testing::heap().alloc())),
+                        ).as_str().into()));
                     }
                 }
             }
@@ -3332,7 +3353,7 @@ mod shared_command_probes_dst {
         use blaze_ids::ContentId;
         use blaze_proc_macro::probe_clang::{CProbeStore, CScriptProbes, MemCProbeStore};
 
-        struct MutableAnswerer(std::sync::Arc<core::sync::atomic::AtomicU8>);
+        struct MutableAnswerer(blaze_own::Arc<core::sync::atomic::AtomicU8, SharedAlloc<'static>>);
         impl ProbeAnswerer for MutableAnswerer {
             fn id<'a>(&self, _alloc: blaze_own::Alloc<'a>) -> Result<ContentId, blaze_own::AString<'a>> {
                 Ok(ContentId([self.0.load(Ordering::SeqCst); 32]))
@@ -3350,7 +3371,7 @@ mod shared_command_probes_dst {
         let io = Io::simulated(SimWorld::new(80, Limits::USUAL));
         let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root sim cx");
         let env = sim_env(&io);
-        let shared = SharedAlloc::global();
+        let shared = env.heap.shared();
         let frame = cx.frame();
         let erased = blaze_own::Erased::new(frame);
         let a = erased.handle();
@@ -3392,13 +3413,13 @@ mod shared_command_probes_dst {
             left_out: blaze_own::Vec::new_in(a),
         };
 
-        let state = std::sync::Arc::new(core::sync::atomic::AtomicU8::new(0xaa));
+        let state = blaze_own::Arc::new_in(core::sync::atomic::AtomicU8::new(0xaa), shared);
         let holder = SharedCommandProbes::new();
         let probes = holder.with_env(&env);
         let _ = probes
             .c_probes_with(&cx, |_| {
                 let answerer: blaze_own::Arc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> =
-                    blaze_own::Arc::new_in(MutableAnswerer(std::sync::Arc::clone(&state)), shared);
+                    blaze_own::Arc::new_in(MutableAnswerer(blaze_own::Share::share(&state)), shared);
                 let records: blaze_own::Arc<dyn CProbeStore, SharedAlloc<'static>> =
                     blaze_own::Arc::new_in(MemCProbeStore::default(), shared);
                 Some(CProbeSetting::Ready(CScriptProbes {
@@ -3416,9 +3437,9 @@ mod shared_command_probes_dst {
         let _ = probes
             .spawn_setting_with(&cx, |_| {
                 Ok(SpawnSetting::facts_only(FactPins {
-                    clang_version_text: std::string::String::from("clang version 23.0.0"),
-                    macos_product_version: std::string::String::new(),
-                    macos_build_version: std::string::String::new(),
+                    clang_version_text: "clang version 23.0.0".into(),
+                    macos_product_version: Default::default(),
+                    macos_build_version: Default::default(),
                 }))
             })
             .expect("seed spawn");

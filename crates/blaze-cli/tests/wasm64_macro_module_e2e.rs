@@ -42,6 +42,17 @@ fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+fn read_bytes(path: &Path) -> Vec<u8> {
+    std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+fn dir_entry_count(dir: &Path) -> Option<usize> {
+    let io = bstd::test::native(dir).ok()?;
+    let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).ok()?;
+    let fs = io.need_fs().ok()?;
+    Some(fs.root().own_entries(&cx).ok()?.len())
+}
+
 fn macos_sdkroot() -> Option<String> {
     if !cfg!(target_os = "macos") {
         return None;
@@ -222,10 +233,10 @@ fn pure_rust_build_script_self_compiles_runs_deterministically_and_invalidates_o
     );
     let mods_a = published_modules(&home_a.join(".blaze/v2/build-script/modules"));
     assert_eq!(mods_a.len(), 1, "expected 1 published wasm64 build-script module: {mods_a:?}");
-    let wasm_a = std::fs::read(mods_a[0].1.join("module.wasm")).expect("read module.wasm");
+    let wasm_a = read_bytes(&mods_a[0].1.join("module.wasm"));
     let checked = check_wasm64(&wasm_a).expect("published build.rs module must be valid wasm64");
     assert!(checked.memory64, "build.rs module must use memory64");
-    let identity_a = std::fs::read_to_string(mods_a[0].1.join("identity")).expect("read identity");
+    let identity_a = String::from_utf8(read_bytes(&mods_a[0].1.join("identity"))).expect("utf8 identity");
     assert!(identity_a.contains("wasm-target wasm64-blaze-wasip1"), "identity missing wasm-target:\n{identity_a}");
     assert!(identity_a.contains("deps "), "identity missing build-dep digest:\n{identity_a}");
     assert!(
@@ -247,12 +258,12 @@ fn pure_rust_build_script_self_compiles_runs_deterministically_and_invalidates_o
     let mods_b = published_modules(&home_b.join(".blaze/v2/build-script/modules"));
     assert_eq!(mods_b.len(), 1);
     assert_eq!(mods_a[0].0, mods_b[0].0, "build-script module key must be workspace-path & UnitId independent");
-    let wasm_b = std::fs::read(mods_b[0].1.join("module.wasm")).expect("read module.wasm b");
+    let wasm_b = read_bytes(&mods_b[0].1.join("module.wasm"));
     assert_eq!(wasm_a, wasm_b, "self-compiled wasm64 build.rs bytes must be byte-identical across workspaces (Rule 25)");
 
     // 4. Key completeness (Rule 21): editing the path build-dependency invalidates the module key
     //    and recompiles `build.rs` with the updated value.
-    std::fs::write(ws_a.join("build_helper/src/lib.rs"), "pub fn magic() -> u32 { 99 }\n").expect("edit build_helper");
+    write_files(&ws_a, &[("build_helper/src/lib.rs", "pub fn magic() -> u32 { 99 }\n")]);
     let (ok_run2, run_out2) = run_app(&ws_a, &home_a, "run2", "app");
     assert!(ok_run2 && run_out2.contains("RESULT=99:self_compiled_ok"), "blaze run after build_helper edit failed:\n{run_out2}");
     let mods_a2 = published_modules(&home_a.join(".blaze/v2/build-script/modules"));
@@ -369,7 +380,7 @@ fn pure_rust_proc_macro_derive_attr_fn_like_with_path_dep_self_compiles_and_runs
     );
     let mods_a = published_modules(&home_a.join(".blaze/v2/proc-macro/modules"));
     assert_eq!(mods_a.len(), 1, "expected 1 published wasm64 proc-macro module: {mods_a:?}");
-    let wasm_a = std::fs::read(mods_a[0].1.join("module.wasm")).expect("read module.wasm");
+    let wasm_a = read_bytes(&mods_a[0].1.join("module.wasm"));
     let checked = check_wasm64(&wasm_a).expect("published proc-macro module must be valid wasm64");
     assert!(checked.memory64, "proc-macro module must use memory64");
 
@@ -390,16 +401,15 @@ fn pure_rust_proc_macro_derive_attr_fn_like_with_path_dep_self_compiles_and_runs
     let mods_b = published_modules(&home_b.join(".blaze/v2/proc-macro/modules"));
     assert_eq!(mods_b.len(), 1);
     assert_eq!(mods_a[0].0, mods_b[0].0, "proc-macro key must be workspace-path & UnitId independent");
-    let wasm_b = std::fs::read(mods_b[0].1.join("module.wasm")).expect("read module.wasm b");
+    let wasm_b = read_bytes(&mods_b[0].1.join("module.wasm"));
     assert_eq!(wasm_a, wasm_b, "self-compiled wasm64 proc-macro bytes must be byte-identical across workspaces (Rule 25)");
 
     // 4. Key completeness (Rule 21): editing `mac_helper/src/lib.rs` (a path dep under the
     //    proc-macro crate) invalidates the module key and recompiles `mac`.
-    std::fs::write(
-        ws_a.join("mac_helper/src/lib.rs"),
-        "pub const OFFSET: u32 = 10;\npub const ATTR_VAL: u32 = 11;\n",
-    )
-    .expect("edit mac_helper");
+    write_files(
+        &ws_a,
+        &[("mac_helper/src/lib.rs", "pub const OFFSET: u32 = 10;\npub const ATTR_VAL: u32 = 11;\n")],
+    );
     let (ok_run2, run_out2) = run_app(&ws_a, &home_a, "run2", "app");
     assert!(ok_run2 && run_out2.contains("PM=Widget:11:50"), "blaze run after mac_helper edit failed:\n{run_out2}");
     let mods_a2 = published_modules(&home_a.join(".blaze/v2/proc-macro/modules"));
@@ -435,7 +445,7 @@ fn tier2_native_build_script_and_unresolved_ffi_fail_with_typed_errors() {
         "expected typed Tier-2 FFI error naming symbol:\n{out_ffi}"
     );
     assert!(!out_ffi.contains("toolrun.sh"), "error must not suggest toolrun.sh:\n{out_ffi}");
-    let _ = std::fs::remove_dir_all(base_ffi);
+    cleanup(&base_ffi);
 
     // 2. Tier-2 native build script (`cc` build-dependency on a known native-every-mode crate
     //    `sha3-asm`) with empty module store fails with a typed Tier-2 native error, no toolrun.sh.
@@ -459,7 +469,7 @@ fn tier2_native_build_script_and_unresolved_ffi_fail_with_typed_errors() {
         "expected typed Tier-2 native error naming crate:\n{out_nat}"
     );
     assert!(!out_nat.contains("toolrun.sh"), "Tier-2 native error must not suggest toolrun.sh:\n{out_nat}");
-    let _ = std::fs::remove_dir_all(base_nat);
+    cleanup(&base_nat);
 }
 
 /// Blocker C4 end-to-end proof: a build script depends on `rustix_like`, whose host-OS
@@ -634,18 +644,20 @@ fn main() {
 
     // 3. Rule 21 cache invalidation: editing `fake_errno/src/lib.rs` (a wasm64-only dep NOT in the
     //    host Linux UnitGraph!) must invalidate `app/build.rs`'s module key and recompile.
-    std::fs::write(
-        ws.join("fake_errno/src/lib.rs"),
-        "#[cfg(all(target_os = \"wasi\", feature = \"std\"))]\npub fn errno_val() -> u32 {\n    let base: fake_libc::mode_t = fake_libc::mode_val();\n    base + 55\n}\n",
-    )
-    .expect("edit fake_errno");
+    write_files(
+        &ws,
+        &[(
+            "fake_errno/src/lib.rs",
+            "#[cfg(all(target_os = \"wasi\", feature = \"std\"))]\npub fn errno_val() -> u32 {\n    let base: fake_libc::mode_t = fake_libc::mode_val();\n    base + 55\n}\n",
+        )],
+    );
     let (ok_run2, run_out2) = run_app(&ws, &home, "run2", "app");
     assert!(
         ok_run2 && run_out2.contains("WASI_TARGET_DEPS=255"),
         "editing wasm64-only dep fake_errno must invalidate build.rs module:\n{run_out2}"
     );
 
-    let _ = std::fs::remove_dir_all(base);
+    cleanup(&base);
 }
 
 #[test]
@@ -756,11 +768,13 @@ version = "0.1.0"
 
     // 3. Removing `wasi_extra` from sibling `app_b/Cargo.toml` (without editing `app_a` or
     //    `Cargo.lock`!) must invalidate `app_a/build.rs`'s cached module (`77 + 100 = 177`)!
-    std::fs::write(
-        ws.join("app_b/Cargo.toml"),
-        "[package]\nname = \"app_b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[build-dependencies]\nshared_dep = { path = \"../shared_dep\", features = [\"extra_flag\"] }\n\n[target.'cfg(target_os = \"wasi\")'.build-dependencies]\next_wasi_dep = { path = \"../ext_wasi_dep\" }\n",
-    )
-    .expect("remove wasi_extra from app_b");
+    write_files(
+        &ws,
+        &[(
+            "app_b/Cargo.toml",
+            "[package]\nname = \"app_b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[build-dependencies]\nshared_dep = { path = \"../shared_dep\", features = [\"extra_flag\"] }\n\n[target.'cfg(target_os = \"wasi\")'.build-dependencies]\next_wasi_dep = { path = \"../ext_wasi_dep\" }\n",
+        )],
+    );
     let (ok_a2, out_a2) = run_app(&ws, &home, "run_a2", "app_a");
     assert!(
         ok_a2 && out_a2.contains("UNIFIED=177"),
@@ -769,15 +783,14 @@ version = "0.1.0"
 
     // 4. Editing excluded direct WASI-only build-dep `ext_wasi_dep/src/lib.rs` must invalidate
     //    `app_b/build.rs` even though `ext_wasi_dep` is absent from the host Linux `UnitGraph` (`77 + 415 = 492`).
-    std::fs::write(ws.join("ext_wasi_dep/src/lib.rs"), "pub fn ext_val() -> u32 { 415 }\n")
-        .expect("edit ext_wasi_dep");
+    write_files(&ws, &[("ext_wasi_dep/src/lib.rs", "pub fn ext_val() -> u32 { 415 }\n")]);
     let (ok_b2, out_b2) = run_app(&ws, &home, "run_b2", "app_b");
     assert!(
         ok_b2 && out_b2.contains("EXCLUDED=492"),
         "editing excluded direct wasi-only build-dep must invalidate app_b/build.rs:\n{out_b2}"
     );
 
-    let _ = std::fs::remove_dir_all(base);
+    cleanup(&base);
 }
 
 #[test]
@@ -876,9 +889,7 @@ fn proc_macro_dep_build_script_runs_clang_version_and_c_probe_in_wasm64() {
     // Check whether the host's pinned clang shelf was linked into `fresh_home` (Linux live C probe).
     let has_clang_shelf = cfg!(target_os = "linux")
         && home.join(".blaze/v2/toolchain/clang").is_dir()
-        && std::fs::read_dir(home.join(".blaze/v2/toolchain/clang"))
-            .ok()
-            .is_some_and(|mut it| it.next().is_some());
+        && dir_entry_count(&home.join(".blaze/v2/toolchain/clang")).is_some_and(|n| n > 0);
 
     let run_c_probe_block = if has_clang_shelf {
         r##"
@@ -987,7 +998,7 @@ version = "0.1.0"
     );
     let mods = published_modules(&home.join(".blaze/v2/proc-macro/modules"));
     assert_eq!(mods.len(), 1, "expected 1 published wasm64 proc-macro module: {mods:?}");
-    let wasm = std::fs::read(mods[0].1.join("module.wasm")).expect("read module.wasm");
+    let wasm = read_bytes(&mods[0].1.join("module.wasm"));
     let checked = check_wasm64(&wasm).expect("published proc-macro module must be valid wasm64");
     assert!(checked.memory64, "proc-macro module must use memory64");
 
@@ -999,10 +1010,8 @@ version = "0.1.0"
 
     if has_clang_shelf {
         let probe_cache_dir = home.join(".blaze/v2/build-script/records/c-probe");
-        let cached = std::fs::read_dir(&probe_cache_dir)
-            .unwrap_or_else(|e| panic!("expected c-probe cache dir {}: {e}", probe_cache_dir.display()))
-            .filter_map(Result::ok)
-            .count();
+        let cached = dir_entry_count(&probe_cache_dir)
+            .unwrap_or_else(|| panic!("expected c-probe cache dir {}", probe_cache_dir.display()));
         assert!(
             cached >= 1,
             "expected at least 1 cached c-probe record under {}",

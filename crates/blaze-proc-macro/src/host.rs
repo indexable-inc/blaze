@@ -992,52 +992,15 @@ pub(crate) const SERVED_SEED: &[&str] = &["abi_version", "decommit"];
 
 /// Discards whole host pages inside `slice` back to the OS so subsequent reads fault in fresh
 /// zero pages (leaving untouched pages unallocated), and zeroes any unaligned head/tail bytes.
-#[allow(unsafe_code)]
 pub(crate) fn decommit_guest_range(slice: &mut [u8]) -> Result<(), Stop> {
-    if slice.is_empty() {
-        return Ok(());
-    }
-    // SAFETY: `sysconf(_SC_PAGESIZE)` reads an immutable host kernel constant.
-    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
-        .ok()
-        .filter(|&n| n.is_power_of_two())
-        .ok_or_else(|| Stop("host page size is not a valid power of two".to_owned()))?;
-    let base = slice.as_mut_ptr().addr();
-    let end = base.saturating_add(slice.len());
-    let aligned_start = base.checked_next_multiple_of(page).unwrap_or(end);
-    let aligned_end = end & !(page - 1);
-    if aligned_start >= aligned_end {
-        slice.fill(0);
-        return Ok(());
-    }
-    let head = aligned_start - base;
-    let body_len = aligned_end - aligned_start;
-    if let Some(prefix) = slice.get_mut(..head) {
-        prefix.fill(0);
-    }
-    if let Some(suffix) = slice.get_mut(head + body_len..) {
-        suffix.fill(0);
-    }
-    #[cfg(target_os = "linux")]
-    let flags = libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE;
-    #[cfg(not(target_os = "linux"))]
-    let flags = libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON;
-    // SAFETY:
-    // - `slice` is exclusively borrowed from Wasmtime's linear memory (`data_and_store_mut`), so
-    //   no other reference or thread accesses `[base, end)` during this call.
-    // - `aligned_start..aligned_end` is a page-aligned subrange strictly inside `slice`, backed by
-    //   Wasmtime's private `PROT_READ | PROT_WRITE` linear-memory reservation.
-    // - `MAP_FIXED | MAP_PRIVATE | MAP_ANON` with `PROT_READ | PROT_WRITE` atomically replaces
-    //   those pages with fresh zero-on-demand anonymous pages, dropping physical pages (including
-    //   any CoW file-backed initial data pages) while preserving Wasmtime's mapping permissions.
-    let mapped = unsafe {
-        let ptr = slice.as_mut_ptr().add(head).cast::<libc::c_void>();
-        libc::mmap(ptr, body_len, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0)
-    };
-    if mapped == libc::MAP_FAILED {
-        return Err(Stop(format!("`blaze_seed.decommit` failed: {}", IoError::last_os_error())));
-    }
-    Ok(())
+    blaze_mem::decommit_zeroed(slice).map_err(|errno| {
+        let mut msg = Default::default();
+        let _ = core::fmt::Write::write_fmt(
+            &mut msg,
+            format_args!("`blaze_seed.decommit` failed: {}", IoError::from_raw_os_error(errno)),
+        );
+        Stop(msg)
+    })
 }
 
 /// Defines `blaze_seed` imports ([`SERVED_SEED`], [`REFUSED_SEED`], [`UNSERVED_SEED`]) with

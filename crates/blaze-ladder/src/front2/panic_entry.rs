@@ -145,7 +145,7 @@ pub fn declares<'n, S: NamesSource<'n>>(names: S, store: &Store<'_>, key: ItemKe
     // Over records an unanswered fact is in the source's log; the crate is refused here.
     let atoms = names.cfg_atoms(krate).ok_or(Refused::NoCrate)?;
     let edition = names.edition_of(krate).ok_or(Refused::NoCrate)?;
-    let sig = blaze_lower::lower_signature(local.text, edition, &mut CrateCfg(atoms), alloc).map_err(|_| Refused::Attrs)?;
+    let sig = blaze_lower::lower_signature(local.text, edition, &mut CrateCfg::of(names, krate, atoms), alloc).map_err(|_| Refused::Attrs)?;
     let v = sig.view();
     for &n in v.rows(v.list(head::ATTRS)).map_err(|_| Refused::Attrs)? {
         let a = v.attr(n).map_err(|_| Refused::Attrs)?;
