@@ -138,11 +138,13 @@ pub trait SourceTexts<'a> {
 
     /// The macros the built module of the proc-macro crate at `krate` declares to the host:
     /// what the crate exports, declared at its root in place of its text's `#[proc_macro*]`
-    /// attributes. `None`: no module is held, and the text is read. The list is a function of
-    /// the module, whose key [`SourceTexts::proc_macro_key`] is made from.
-    fn proc_exports(&self, krate: usize) -> Option<&'a [ProcExport<'a>]> {
+    /// attributes. `Ok(None)`: no runner or unregistered crate, and the text is read.
+    /// `Err(why)`: a registered proc-macro module is missing or unreadable and resolution stops
+    /// with [`NamesError::ProcExports`] instead of silently falling back to text (rule 3).
+    /// The list is a function of the module, whose key [`SourceTexts::proc_macro_key`] is made from.
+    fn proc_exports(&self, krate: usize) -> Result<Option<&'a [ProcExport<'a>]>, &'a str> {
         let _ = krate;
-        None
+        Ok(None)
     }
 
     /// Runs the proc macro `def` (a definition of a crate [`SourceTexts::proc_macro_key`] gave)
@@ -791,6 +793,9 @@ pub enum NamesError<'a> {
     /// The crate root's `#![recursion_limit]` attribute is malformed (not an unsigned decimal
     /// integer string literal).
     InvalidRecursionLimit { krate: &'a str, attr: &'a str },
+    /// A registered proc-macro crate's compiled module was missing or unreadable, so its
+    /// exports could not be read (rule 3: never fall back silently to parsing source text).
+    ProcExports { krate: &'a str, why: &'a str },
     /// Two items' keys begin with the same 16 bytes (a checker key's, front2 keys.rs
     /// `checker_of`), so [`Names::key_beginning`] could not say which one a checker key names
     /// (rule 21: two values under one key is a refusal; the fix is the key). `first` and
@@ -822,6 +827,9 @@ impl fmt::Display for NamesError<'_> {
             NamesError::TreeRecord { krate, error } => write!(f, "crate `{krate}`: its module tree record: {error:?}"),
             NamesError::InvalidRecursionLimit { krate, attr } => {
                 write!(f, "crate `{krate}`: malformed `#![{attr}]`: recursion limit must be an unsigned integer string literal")
+            }
+            NamesError::ProcExports { krate, why } => {
+                write!(f, "crate `{krate}`: its proc-macro module exports could not be read: {why}")
             }
             NamesError::KeyBeginning { first, second } => {
                 write!(f, "items {first:?} and {second:?}: their keys begin with the same 16 bytes, so a checker key cannot name one (rule 21, keys-cover-every-input)")
@@ -2018,18 +2026,22 @@ pub struct BodyReads<'a> {
 
 /// Why a held body's blocks were not solved, naming the body (rules 3, 19).
 #[derive(Clone, Debug)]
-pub enum BodySolveError {
+pub enum BodySolveError<'a> {
     /// The crate's module tree record, which places every walked module for the body solve,
     /// does not read.
     TreeRecord { body: ItemKey, error: crate::tree_record::TreeRecordError },
+    /// The proc-macro crate's compiled module was missing or unreadable, so its exports
+    /// could not be read (rule 3: never fall back silently to parsing source text).
+    ProcExports { body: ItemKey, krate: &'a str, why: &'a str },
     /// The cell core wrote no scopes for the body's blocks.
     Cells { body: ItemKey, error: crate::cells::Unwritten },
 }
 
-impl fmt::Display for BodySolveError {
+impl fmt::Display for BodySolveError<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BodySolveError::TreeRecord { body, error } => write!(f, "body {body:?}: the crate's module tree record: {error:?}"),
+            BodySolveError::ProcExports { body, krate, why } => write!(f, "body {body:?}: crate `{krate}`: its proc-macro module exports could not be read: {why}"),
             BodySolveError::Cells { body, error } => write!(f, "body {body:?}: its blocks: {error}"),
         }
     }
@@ -2077,7 +2089,7 @@ pub fn solve_held_body<'a, S: SourceTexts<'a>>(
     sources: &S,
     prepares: &'a Prepares<'a>,
     alloc: Bump<'a>,
-) -> Result<BodySolved<'a>, BodySolveError> {
+) -> Result<BodySolved<'a>, BodySolveError<'a>> {
     let tree = ReadTree::of(c, alloc).map_err(|error| BodySolveError::TreeRecord { body: body.src.key, error })?;
     solve_held_body_in(&tree, deps, input, source, body, sources, prepares, alloc)
 }
@@ -2124,7 +2136,7 @@ pub fn solve_held_body_in<'a, S: SourceTexts<'a>>(
     sources: &S,
     prepares: &'a Prepares<'a>,
     alloc: Bump<'a>,
-) -> Result<BodySolved<'a>, BodySolveError> {
+) -> Result<BodySolved<'a>, BodySolveError<'a>> {
     solve_held_body_scratch(tree, deps, input, source, body, sources, prepares, &crate::task::Scratch::kept, alloc)
 }
 
@@ -2143,7 +2155,7 @@ pub fn solve_held_body_scratch<'a, S: SourceTexts<'a>>(
     prepares: &'a Prepares<'a>,
     hook: crate::task::ScratchHook<'_>,
     bump: Bump<'a>,
-) -> Result<BodySolved<'a>, BodySolveError> {
+) -> Result<BodySolved<'a>, BodySolveError<'a>> {
     let alloc = bump.alloc();
     let c = tree.names;
     let at = body.src.key;
@@ -2166,6 +2178,14 @@ pub fn solve_held_body_scratch<'a, S: SourceTexts<'a>>(
     } else {
         FileSet::over(&c.files[..], tree.files, alloc)
     };
+    let listed = if input.implicit.proc_macro {
+        sources
+            .proc_exports(source)
+            .map_err(|why| BodySolveError::ProcExports { body: at, krate: input.name, why })?
+            .is_some()
+    } else {
+        false
+    };
     let run = Run::new_in(files, prepares, alloc);
     let base = Base {
         index: source,
@@ -2182,7 +2202,7 @@ pub fn solve_held_body_scratch<'a, S: SourceTexts<'a>>(
         record: Some(record),
         built: &built,
         sources,
-        listed: input.implicit.proc_macro && sources.proc_exports(source).is_some(),
+        listed,
         proc_macro: false,
         kept: &kept,
         blocks: BlocksAt::Body,
@@ -2358,7 +2378,11 @@ fn walked_files<'a, S: SourceTexts<'a>, P: Par>(
 
     // Each walked module's own text, lowered.
     par.stage(crate::task::Stage::Lower);
-    let listed = if input.implicit.proc_macro { sources.proc_exports(index) } else { None };
+    let listed = if input.implicit.proc_macro {
+        sources.proc_exports(index).map_err(|why| NamesError::ProcExports { krate: input.name, why })?
+    } else {
+        None
+    };
     // The root's attributes first: its `#![register_tool]`s are the crate's tools, which every
     // module's lowering reads to know an item's taker (names-attr-3).
     let root = set.at(root_file as usize);
@@ -2555,7 +2579,11 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
     }
 
     par.stage(crate::task::Stage::Lower);
-    let listed = if input.implicit.proc_macro { sources.proc_exports(index) } else { None };
+    let listed = if input.implicit.proc_macro {
+        sources.proc_exports(index).map_err(|why| NamesError::ProcExports { krate: input.name, why })?
+    } else {
+        None
+    };
     let (tools, attrs) = if root_member {
         let root = set.at(tree.modules[0].file as usize);
         let attrs = file_attrs(cfg, &root.outline, root.text, alloc);

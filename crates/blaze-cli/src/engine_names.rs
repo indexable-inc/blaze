@@ -750,21 +750,19 @@ impl<'f> NamesStage<'f> {
                         clock.names_admitted(name, crates[at].input.name)
                     });
                     let script = names.script_of(at).map(|script| lookup(&self.made, name, script, failed_out)).transpose()?;
-                    let macro_module = {
-                        use blaze_world::crate_list::CrateGraph as _;
-                        let list = names.list();
-                        if list.proc_macro(at) {
-                            let mm = Name::new(Kind::MacroModule, crate::macros::subject_of(list.package(at), list.version(at)));
-                            self.made.binary_search_by_key(&mm, |(n, _)| *n).ok().and_then(|idx| self.made[idx].1).map(|(key, out)| Input { name: mm, at: key, out })
-                        } else {
-                            None
-                        }
-                    };
-                    let gate = match (runner, world.refusal(at), script) {
-                        (Err(words), _, _) => Err(Blocked::Runner(words)),
-                        (_, Some(why), _) => Err(Blocked::Shelf(why)),
-                        (_, _, Some((input, true))) => Err(Blocked::Script(input.name)),
-                        (Ok(procs), None, _) => Ok(procs),
+                    let macro_module = macro_module_input(&self.made, names.list(), at, failed_out);
+                    let gate = match (runner, world.refusal(at), script, macro_module) {
+                        (Err(words), _, _, _) => Err(Blocked::Runner(words)),
+                        (_, Some(why), _, _) => Err(Blocked::Shelf(why)),
+                        (_, _, Some((input, true)), _) => Err(Blocked::Script(input.name)),
+                        (_, _, _, Some((input, true))) => Err(Blocked::MacroModule(input.name)),
+                        (Ok(procs), None, _, _) => match procs.and_then(|p| p.exports_of(at).err()) {
+                            Some(error) => {
+                                let krate = crates.get(at).map_or("", |c| c.input.name);
+                                Err(Blocked::ProcModule(blaze_own::format_in!(&own, "crate `{krate}`: {error}").into_bump_str()))
+                            }
+                            None => Ok(procs),
+                        },
                     };
                     let script_bytes = match (gate.is_ok(), script) {
                         (true, Some((input, _))) => {
@@ -823,7 +821,7 @@ impl<'f> NamesStage<'f> {
                             let scratch = blaze_own::Erased::new(cx.frame());
                             let mut deps = inputs.dependencies(at, name, scratch.handle())?;
                             let fail = |why, words| WorkerAnswer {
-                                done: crate::engine_tasks::failed_with(task, failure_reads(&deps, None, script, alloc), alloc),
+                                done: crate::engine_tasks::failed_with(task, failure_reads(&deps, None, script, macro_module, alloc), alloc),
                                 result: Err((TaskFailure { name, why }, words)),
                                 scope_bytes: crate::names::metered::ScopeBytes::default(),
                             };
@@ -836,7 +834,11 @@ impl<'f> NamesStage<'f> {
                                     let why = Why::Refused { what: "a crate the toolchain shelf cannot build", rule: crate::names::RULE };
                                     return Ok(fail(why, Some(blaze_own::format_in!(alloc, "crate `{}`: {reason}", crates[at].input.name))));
                                 }
-                                Err(Blocked::Script(on)) => return Ok(fail(Why::Waited { on }, None)),
+                                Err(Blocked::Script(on)) | Err(Blocked::MacroModule(on)) => return Ok(fail(Why::Waited { on }, None)),
+                                Err(Blocked::ProcModule(message)) => {
+                                    let why = Why::Refused { what: "a proc-macro crate's compiled module is unavailable", rule: crate::names::RULE };
+                                    return Ok(fail(why, Some(blaze_own::String::from_str_in(message, alloc))));
+                                }
                                 Ok(procs) => procs,
                             };
                             for dep in &mut deps {
@@ -850,7 +852,7 @@ impl<'f> NamesStage<'f> {
                                     Mapped::Unreadable(why) => {
                                         let words = blaze_own::format_in!(alloc, "crate `{}`: the record of its dependency `{}`: {why}", crates[at].input.name, crates[g].input.name);
                                         let failed = TaskFailure { name, why: Why::Refused { what: "a dependency's record", rule: crate::names::RULE } };
-                                        return Ok(WorkerAnswer { done: crate::engine_tasks::failed_with(task, failure_reads(&deps, None, script, alloc), alloc), result: Err((failed, Some(words))), scope_bytes: crate::names::metered::ScopeBytes::default() });
+                                        return Ok(WorkerAnswer { done: crate::engine_tasks::failed_with(task, failure_reads(&deps, None, script, macro_module, alloc), alloc), result: Err((failed, Some(words))), scope_bytes: crate::names::metered::ScopeBytes::default() });
                                     }
                                 }
                             }
@@ -859,7 +861,7 @@ impl<'f> NamesStage<'f> {
                         });
                         shown.end(board.now(clock));
                         Ok::<_, Infallible>((result, crate::engine_times::ns(began.since_start()), crate::engine_times::ns(clock.now().since_start()), cx.frame().committed() as u64))
-                    }), at, script, {
+                    }), at, script, macro_module, {
                         #[cfg(test)] { end_tick }
                         #[cfg(not(test))] { () }
                     }));
@@ -870,12 +872,12 @@ impl<'f> NamesStage<'f> {
             #[cfg(test)]
             if schedule_test::reverse_delivery() { running.reverse(); }
             #[cfg(test)]
-            if running.iter().any(|(_, _, _, _, end)| end.is_some_and(|tick| tick > 0)) {
-                running.sort_unstable_by_key(|(i, _, _, _, end)| (*end, tasks[*i].planned.name));
+            if running.iter().any(|(_, _, _, _, _, end)| end.is_some_and(|tick| tick > 0)) {
+                running.sort_unstable_by_key(|(i, _, _, _, _, end)| (*end, tasks[*i].planned.name));
             }
             let mut stopped = None;
             let mut error = None;
-            for (i, handle, at, script, _end_tick) in running {
+            for (i, handle, at, script, macro_module, _end_tick) in running {
                 let task = &tasks[i];
                 let name = task.planned.name;
                 match handle.join(&cx) {
@@ -900,7 +902,7 @@ impl<'f> NamesStage<'f> {
                                     Ok(deps) => deps,
                                     Err(why) => { error.get_or_insert(why.into()); continue; }
                                 };
-                                let reads = failure_reads(&deps, None, script, alloc);
+                                let reads = failure_reads(&deps, None, script, macro_module, alloc);
                                 answered.push((i, Completion {
                                     done: crate::engine_tasks::failed_with(task, reads, alloc),
                                     result: Err(Failure { failure: TaskFailure { name, why: Why::Panicked { used: committed, limit: crate::names::SCOPE_FRAME as u64 } }, words: None }),
@@ -1526,7 +1528,7 @@ impl<'j, 'a: 'j> WaitingName<'j, 'a> {
             let start = crate::engine_times::ns(clock.now().since_start());
             let shown = board.show(Stage::Names, label, 0, board.now(clock));
             let failure = |why, words| WorkerAnswer {
-                done: crate::engine_tasks::failed_with(&task, failure_reads(job.deps, job.uncommitted_snap.as_deref(), script, alloc), alloc),
+                done: crate::engine_tasks::failed_with(&task, failure_reads(job.deps, job.uncommitted_snap.as_deref(), script, job.macro_module, alloc), alloc),
                 result: Err((TaskFailure { name, why }, words)),
                 scope_bytes: crate::names::metered::ScopeBytes::default(),
             };
@@ -1712,22 +1714,17 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         #[cfg(test)]
         if let Some(clock) = crate::engine_scripts::runner_clock() { clock.names_entered(name, krate); }
         let script = names.script_of(at).map(|script| lookup(&stage.made, name, script, stage.failed_out)).transpose()?;
-        let macro_module = {
-            use blaze_world::crate_list::CrateGraph as _;
-            let list = names.list();
-            if list.proc_macro(at) {
-                let mm = Name::new(Kind::MacroModule, crate::macros::subject_of(list.package(at), list.version(at)));
-                stage.made.binary_search_by_key(&mm, |(n, _)| *n).ok().and_then(|idx| stage.made[idx].1).map(|(key, out)| Input { name: mm, at: key, out })
-            } else {
-                None
-            }
-        };
+        let macro_module = macro_module_input(&stage.made, names.list(), at, stage.failed_out);
         let refused = |what| Why::Refused { what, rule: crate::names::RULE };
-        let mut gate = match (runner, world.refusal(at), script) {
-            (Err(words), _, _) => Err((refused("the proc-macro runner could not be made"), Some(blaze_own::String::from_str_in(words, alloc)))),
-            (_, Some(reason), _) => Err((refused("a crate the toolchain shelf cannot build"), Some(blaze_own::format_in!(alloc, "crate `{krate}`: {reason}")))),
-            (_, _, Some((input, true))) => Err((Why::Waited { on: input.name }, None)),
-            (Ok(procs), None, _) => Ok(procs),
+        let mut gate = match (runner, world.refusal(at), script, macro_module) {
+            (Err(words), _, _, _) => Err((refused("the proc-macro runner could not be made"), Some(blaze_own::String::from_str_in(words, alloc)))),
+            (_, Some(reason), _, _) => Err((refused("a crate the toolchain shelf cannot build"), Some(blaze_own::format_in!(alloc, "crate `{krate}`: {reason}")))),
+            (_, _, Some((input, true)), _) => Err((Why::Waited { on: input.name }, None)),
+            (_, _, _, Some((input, true))) => Err((Why::Waited { on: input.name }, None)),
+            (Ok(procs), None, _, _) => match proc_module_gate(procs, at, krate, alloc) {
+                Some(blocked) => Err(blocked),
+                None => Ok(procs),
+            },
         };
         let script_bytes = match (gate.is_ok(), script) {
             (true, Some((input, _))) => Some((input, self.frame.alloc(work::payload(cx, store, &input, self.frame)?).payload())),
@@ -1993,6 +1990,24 @@ enum Blocked<'j> {
     Runner(&'j str),
     Shelf(&'j blaze_scope::units::UnitsError<'j>),
     Script(Name),
+    MacroModule(Name),
+    ProcModule(&'j str),
+}
+
+/// Checks whether a proc-macro crate's registered module in `procs` is unavailable (missing or
+/// unreadable), returning a typed `Why::Refused` gate error instead of letting `CrateScope`
+/// silently fall back to parsing source text (rule 3).
+fn proc_module_gate<'a>(
+    procs: Option<&crate::proc_runner::ProcRunner<'_>>,
+    at: usize,
+    krate: &str,
+    alloc: SharedAlloc<'a>,
+) -> Option<(Why, Option<blaze_own::String<SharedAlloc<'a>>>)> {
+    let error = procs?.exports_of(at).err()?;
+    Some((
+        Why::Refused { what: "a proc-macro crate's compiled module is unavailable", rule: crate::names::RULE },
+        Some(blaze_own::format_in!(alloc, "crate `{krate}`: {error}")),
+    ))
 }
 
 /// The input `name` (a dependency's names or the crate's script) as made so far. A name not in
@@ -2004,6 +2019,27 @@ fn lookup(made: &[(Name, Option<(Key, ContentId)>)], task: Name, name: Name, fai
     let value = made[i].1;
     let (at, out) = value.unwrap_or((Key::default(), failed));
     Ok((Input { name, at, out }, value.is_none()))
+}
+
+/// Returns the settled `Kind::MacroModule` input for proc-macro crate `at`, paired with whether
+/// that `MacroModule` task failed (`absent = true`, recorded as `ABSENT` so a subsequent module
+/// compile success wakes this `CrateScope`, rule 21).
+fn macro_module_input(
+    made: &[(Name, Option<(Key, ContentId)>)],
+    list: &blaze_world::crate_list::CrateList<'_>,
+    at: usize,
+    failed_out: ContentId,
+) -> Option<(Input, bool)> {
+    use blaze_world::crate_list::CrateGraph as _;
+    if !list.proc_macro(at) {
+        return None;
+    }
+    let mm = Name::new(Kind::MacroModule, crate::macros::subject_of(list.package(at), list.version(at)));
+    let idx = made.binary_search_by_key(&mm, |(n, _)| *n).ok()?;
+    Some(match made.get(idx)?.1 {
+        Some((key, out)) => (Input { name: mm, at: key, out }, false),
+        None => (Input { name: mm, at: Key::default(), out: failed_out }, true),
+    })
 }
 
 fn input_cell(input: Input, absent: bool) -> (CellId, ContentId) {
@@ -2025,11 +2061,13 @@ fn failure_reads<'a>(
     deps: &[Dependency<'_>],
     snap: Option<&crate::store::StoreSnapshot>,
     script: Option<(Input, bool)>,
+    macro_module: Option<(Input, bool)>,
     alloc: SharedAlloc<'a>,
 ) -> SVec<'a, (CellId, ContentId)> {
-    let mut reads = SVec::with_capacity_in(deps.len() + usize::from(script.is_some()), alloc);
+    let mut reads = SVec::with_capacity_in(deps.len() + usize::from(script.is_some()) + usize::from(macro_module.is_some()), alloc);
     reads.extend(deps.iter().map(|dep| dep_input_cell(dep, snap)));
     reads.extend(script.map(|(input, absent)| input_cell(input, absent)));
+    reads.extend(macro_module.map(|(input, absent)| input_cell(input, absent)));
     reads
 }
 
@@ -2038,9 +2076,10 @@ fn failure_reads_verified<'a>(
     verified: &[Option<Verified<'_>>],
     snap: Option<&crate::store::StoreSnapshot>,
     script: Option<(Input, bool)>,
+    macro_module: Option<(Input, bool)>,
     alloc: SharedAlloc<'a>,
 ) -> SVec<'a, (CellId, ContentId)> {
-    let mut reads = SVec::with_capacity_in(deps.len() + usize::from(script.is_some()), alloc);
+    let mut reads = SVec::with_capacity_in(deps.len() + usize::from(script.is_some()) + usize::from(macro_module.is_some()), alloc);
     for (dep, checked) in deps.iter().zip(verified.iter()) {
         if checked.is_some() {
             reads.push(dep_input_cell(dep, snap));
@@ -2049,6 +2088,7 @@ fn failure_reads_verified<'a>(
         }
     }
     reads.extend(script.map(|(input, absent)| input_cell(input, absent)));
+    reads.extend(macro_module.map(|(input, absent)| input_cell(input, absent)));
     reads
 }
 
@@ -2060,10 +2100,11 @@ struct Job<'j, 'd> {
     /// Short-lived snapshot keeping any `ExportRef::InSnapshot` arena alive for this job alone.
     uncommitted_snap: Option<crate::store::SharedSnapshot>,
     script: Option<(Input, &'j [u8])>,
-    /// For a proc-macro crate, its settled `Kind::MacroModule` task so any change to its compiled
-    /// module (including edits to its body or path dependencies) wakes this `CrateScope` and
-    /// refreshes the `proc_macro_key` embedded in its `items`/`exports` records (Rule 21).
-    macro_module: Option<Input>,
+    /// For a proc-macro crate, its settled `Kind::MacroModule` task (with `absent = true` if the
+    /// module build failed) so any change to its compiled module (or a failed module later
+    /// succeeding) wakes this `CrateScope` and refreshes both `proc_macro_key` and module-derived
+    /// `proc_exports` (Rule 21).
+    macro_module: Option<(Input, bool)>,
     home: Option<&'j str>,
     env: Option<EnvLent<'j, 'j>>,
     packs: crate::job_texts::SyncPacks<'j>,
@@ -2239,7 +2280,7 @@ impl Job<'_, '_> {
             }
         }
         if let Some(words) = first_bad {
-            let reads = failure_reads_verified(self.deps, &verified_deps, snap_ref, script_input.map(|s| (s, false)), alloc);
+            let reads = failure_reads_verified(self.deps, &verified_deps, snap_ref, script_input.map(|s| (s, false)), self.macro_module, alloc);
             return Ok(WorkerAnswer {
                 done: crate::engine_tasks::failed_with(task, reads, alloc),
                 result: Err((TaskFailure { name, why: Why::Refused { what: "a dependency's record", rule: crate::names::RULE } }, Some(words))),
@@ -2247,7 +2288,7 @@ impl Job<'_, '_> {
             });
         }
         let refuse = |what, words| WorkerAnswer {
-            done: crate::engine_tasks::failed_with(task, failure_reads(self.deps, snap_ref, script_input.map(|s| (s, false)), alloc), alloc),
+            done: crate::engine_tasks::failed_with(task, failure_reads(self.deps, snap_ref, script_input.map(|s| (s, false)), self.macro_module, alloc), alloc),
             result: Err((TaskFailure { name, why: Why::Refused { what, rule: crate::names::RULE } }, Some(words))),
             scope_bytes: crate::names::metered::ScopeBytes::default(),
         };
@@ -2475,7 +2516,7 @@ fn unseen_file(task: Name, read: Name, krate: &str, path: &str, heap: SharedAllo
 }
 
 #[expect(clippy::too_many_arguments, reason = "one resolved crate and the inputs it was handed")]
-fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>, resolved: Resolved, ok: bool, unresolved: u32, oracle: Option<OracleCrate>, deps: &[Dependency<'_>], dep_exports: &[Verified<'_>], snap: Option<&crate::store::StoreSnapshot>, script: Option<Input>, macro_module: Option<Input>, outlined: &[Outlined<'_>], found: FoundBy, alloc: SharedAlloc<'a>, scratch: blaze_own::Alloc<'_>, bump: blaze_own::Bump<'_>, heap: SharedAlloc<'static>) -> Result<WorkerAnswer<'a>, WorkerError> {
+fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>, resolved: Resolved, ok: bool, unresolved: u32, oracle: Option<OracleCrate>, deps: &[Dependency<'_>], dep_exports: &[Verified<'_>], snap: Option<&crate::store::StoreSnapshot>, script: Option<Input>, macro_module: Option<(Input, bool)>, outlined: &[Outlined<'_>], found: FoundBy, alloc: SharedAlloc<'a>, scratch: blaze_own::Alloc<'_>, bump: blaze_own::Bump<'_>, heap: SharedAlloc<'static>) -> Result<WorkerAnswer<'a>, WorkerError> {
     let name = task.planned.name;
     // A file this crate found and its worker outlined (which may upgrade a walk `DATA_FILE` to a
     // Rust outline), else one the request's outlines hold.
@@ -2600,9 +2641,9 @@ fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>,
         record.reads.push((input.name, input.out));
         reads.push(input_cell(input, false));
     }
-    if let Some(input) = macro_module {
+    if let Some((input, absent)) = macro_module {
         record.reads.push((input.name, input.out));
-        reads.push(input_cell(input, false));
+        reads.push(input_cell(input, absent));
     }
     reads.sort_unstable_by_key(|row| row.0);
     reads.dedup_by_key(|row| row.0);
@@ -3330,5 +3371,166 @@ impl WaveInputs<'_, '_> {
         }
         deps.sort_unstable_by_key(|dep| dep.index);
         Ok(deps)
+    }
+}
+
+#[cfg(test)]
+mod proc_macro_reads_tests {
+    use super::*;
+
+    fn encode_test_list<'a>(alloc: blaze_own::Alloc<'a>) -> blaze_own::AVec<'a, u8> {
+        use blaze_world::crate_list::{HEADER_LEN, NONE, ROW, VERSION};
+
+        let mut str_heap = blaze_own::AVec::new_in(alloc);
+        let mut put_str = |s: &str| -> [u8; 8] {
+            let off = u32::try_from(str_heap.len()).unwrap();
+            let len = u32::try_from(s.len()).unwrap();
+            str_heap.extend_from_slice(s.as_bytes());
+            let mut out = [0u8; 8];
+            out[..4].copy_from_slice(&off.to_le_bytes());
+            out[4..].copy_from_slice(&len.to_le_bytes());
+            out
+        };
+        let specs = [
+            (0x11u8, "askama_macros", "askama_macros", "0.15.6", 1u8), // PROC_MACRO = 1
+            (0x22u8, "askama", "askama", "0.15.6", 0u8),
+        ];
+        let mut rows = blaze_own::AVec::with_capacity_in(specs.len() * ROW, alloc);
+        for &(key_byte, name, pkg, version, flags) in &specs {
+            let start = rows.len();
+            rows.extend_from_slice(&[key_byte; 32]); // key
+            rows.extend_from_slice(&put_str(name)); // name
+            rows.extend_from_slice(&put_str("/1/src/lib.rs")); // root
+            rows.extend_from_slice(&put_str("/1/")); // shown_from
+            rows.extend_from_slice(&0u32.to_le_bytes()); // deps start
+            rows.extend_from_slice(&0u32.to_le_bytes()); // deps count
+            rows.push(0); // Side::Target
+            rows.push(flags);
+            rows.extend_from_slice(&[0u8; 34]); // no script
+            rows.extend_from_slice(&put_str(name)); // crate_name
+            rows.extend_from_slice(&put_str(pkg)); // package
+            rows.extend_from_slice(&put_str(version)); // version
+            rows.extend_from_slice(&put_str("")); // bin
+            rows.extend_from_slice(&put_str("")); // member dir
+            rows.extend_from_slice(&[1u8, 0, 0, 0]); // ENV_PACKAGE
+            for _ in 0..8 {
+                rows.extend_from_slice(&put_str("")); // meta
+            }
+            rows.extend_from_slice(&put_str("")); // bin_exes
+            assert_eq!(rows.len() - start, ROW);
+        }
+        let mut out = blaze_own::AVec::with_capacity_in(HEADER_LEN + rows.len() + specs.len() * 4 + str_heap.len(), alloc);
+        out.extend_from_slice(b"BZCL");
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&u32::try_from(specs.len()).unwrap().to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&u32::try_from(str_heap.len()).unwrap().to_le_bytes());
+        for _ in 0..5 {
+            out.extend_from_slice(&NONE.to_le_bytes());
+        }
+        for _ in 0..6 {
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
+        out.extend_from_slice(&rows);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&str_heap);
+        out
+    }
+
+    /// Rule 21: a proc-macro crate's `CrateScope` records its `MacroModule` cell read on BOTH
+    /// module success (changing with the module digest) and module failure (`ABSENT`, so a later
+    /// compile success wakes `CrateScope`), and proc-macro `CrateScope` sources are distinct from
+    /// non-proc-macro sources so pre-fix cached records invalidate cleanly.
+    #[test]
+    fn macro_module_input_and_proc_macro_source_key_cover_module_state() {
+        let heap = blaze_own::testing::heap();
+        let bytes = encode_test_list(heap.alloc());
+        let list = blaze_world::crate_list::CrateList::open(&bytes).expect("valid test CrateList");
+        let mm = Name::new(Kind::MacroModule, crate::macros::subject_of("askama_macros", "0.15.6"));
+        let failed_out = work::failed_out();
+
+        // Non-proc-macro crate never binds a MacroModule read.
+        let out_a = ContentId([0xaa; 32]);
+        let out_b = ContentId([0xbb; 32]);
+        let made_a = [(mm, Some((Key::default(), out_a)))];
+        assert!(macro_module_input(&made_a, &list, 1, failed_out).is_none(), "non-proc-macro crate has no MacroModule input");
+
+        // Proc-macro crate binds its MacroModule digest; a different module digest moves the cell read.
+        let (in_a, absent_a) = macro_module_input(&made_a, &list, 0, failed_out).expect("succeeded MacroModule");
+        assert!(!absent_a);
+        assert_eq!(input_cell(in_a, absent_a), (CellId { of: mm, cell: WHOLE }, out_a));
+
+        let made_b = [(mm, Some((Key::default(), out_b)))];
+        let (in_b, absent_b) = macro_module_input(&made_b, &list, 0, failed_out).expect("changed MacroModule");
+        assert!(!absent_b);
+        assert_eq!(input_cell(in_b, absent_b), (CellId { of: mm, cell: WHOLE }, out_b));
+        assert_ne!(input_cell(in_a, absent_a), input_cell(in_b, absent_b), "different MacroModule digests must invalidate CrateScope");
+
+        // Failed MacroModule binds ABSENT so a subsequent compile success wakes CrateScope.
+        let made_failed = [(mm, None)];
+        let (in_fail, absent_fail) = macro_module_input(&made_failed, &list, 0, failed_out).expect("failed MacroModule");
+        assert!(absent_fail);
+        assert_eq!(in_fail.out, failed_out);
+        assert_eq!(input_cell(in_fail, absent_fail), (CellId { of: mm, cell: WHOLE }, blaze_drive::key::ABSENT));
+        assert_ne!(
+            input_cell(in_fail, absent_fail),
+            input_cell(in_a, absent_a),
+            "transitioning MacroModule from failed (ABSENT) to succeeded must wake CrateScope"
+        );
+
+        // Proc-macro `CrateScope` source key differs from non-proc-macro source key for the same crate key.
+        let key = blaze_id::CrateItemKey(ContentId([0x11; 32]));
+        assert_ne!(
+            crate::names::crate_scope_source(key, true),
+            crate::names::crate_scope_source(key, false),
+            "proc-macro CrateScope source must move off pre-fix cached records"
+        );
+
+        // Failed `MacroModule` blocks `CrateScope` (`failure_reads` records `ABSENT` so recovery wakes it).
+        let reads_fail = failure_reads(&[], None, None, Some((in_fail, absent_fail)), heap.shared());
+        assert_eq!(reads_fail.as_slice(), &[(CellId { of: mm, cell: WHOLE }, blaze_drive::key::ABSENT)]);
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn proc_module_gate_refuses_unavailable_registered_module_without_text_fallback() {
+        use blaze_expand::ProcKind;
+        use blaze_id::CrateItemKey;
+        use blaze_proc_macro::module::{Exported, ModuleError, ModuleRecord};
+
+        let heap = blaze_own::testing::heap();
+        let env = crate::proc_runner::TestProcEnv::new(heap);
+        let loaded = ModuleRecord {
+            key: std::string::String::from("ok"),
+            name: std::string::String::from("askama_macros"),
+            version: std::string::String::from("0.15.6"),
+            wasm_sha256: std::string::String::from("00"),
+            macros: std::vec![Exported { index: 0, kind: ProcKind::Derive, name: "Template".into(), helpers: std::vec!["template".into()] }],
+            decls: std::string::String::from("_DECLS"),
+            dir: std::path::PathBuf::new(),
+            compiled: std::path::PathBuf::new(),
+            native_dylib: None,
+        };
+        let runner = env.runner(std::vec![
+            (0, CrateItemKey(ContentId([1; 32])), "askama_macros", Ok(loaded)),
+            (
+                1,
+                CrateItemKey(ContentId([2; 32])),
+                "missing_macros",
+                Err(ModuleError::Missing { name: "missing_macros".into(), version: "0.1.0".into(), key: "missing".into() }),
+            ),
+        ]);
+
+        assert!(proc_module_gate(Some(&runner), 0, "askama_macros", heap.shared()).is_none(), "loaded module passes gate");
+        assert!(proc_module_gate(Some(&runner), 9, "regular_crate", heap.shared()).is_none(), "unregistered non-proc-macro crate passes gate");
+        assert!(proc_module_gate(None, 0, "askama_macros", heap.shared()).is_none(), "no runner passes gate");
+
+        let (why, words) = proc_module_gate(Some(&runner), 1, "missing_macros", heap.shared())
+            .expect("missing registered proc-macro module must be refused at gate");
+        assert!(matches!(why, Why::Refused { what: "a proc-macro crate's compiled module is unavailable", .. }));
+        let msg = words.expect("refusal message");
+        assert!(msg.as_str().contains("missing_macros"), "refusal message must name the crate: {}", msg.as_str());
     }
 }

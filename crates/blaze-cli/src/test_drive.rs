@@ -2160,7 +2160,7 @@ pub(crate) type Done = (Worker, Result<SVec<'static, u8>, CodeRefusal>);
 #[derive(Clone, Copy)]
 pub(crate) enum ProcsSide<'p> {
     None,
-    Made(&'p crate::proc_runner::ProcRunner<'static>),
+    Made(&'p crate::proc_runner::ProcRunner<'p>),
     ByNeed,
 }
 
