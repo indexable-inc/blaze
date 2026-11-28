@@ -87,24 +87,19 @@ pub enum LitKind {
     /// A literal the lexer refused, kept so its error is reported where it is used.
     Err,
     /// A doc comment (`///`, `//!`, `/** */`, `/*! */`) desugared to `#[doc = r"..."]` with
-    /// minimal `#` count: matches `LitKind::StrRaw(n)` in declarative `macro_rules!`, skips as a
-    /// comment when written directly in a `macro_rules!` matcher, and escapes to cooked
-    /// `LitKind::Str` at the proc-macro server boundary (matching `rustc_expand`'s
-    /// `proc_macro_server.rs`).
+    /// minimal `#` count (saturated at `u8::MAX`, matching `rustc_ast/src/tokenstream.rs`):
+    /// matches `LitKind::StrRaw(n)` in declarative `macro_rules!`, skips as a comment when
+    /// written directly in a `macro_rules!` matcher, and escapes to cooked `LitKind::Str` at the
+    /// proc-macro server boundary (matching `rustc_expand`'s `proc_macro_server.rs`).
     DocStrRaw(u8),
-    /// A doc comment whose body cannot be represented as a raw string literal (bare `\r` or `"`
-    /// followed by ≥255 `#`s), already escaped like `LitKind::Str`, carrying doc-comment
-    /// provenance for matchers and proc-macro import.
-    DocStr,
 }
 
 impl LitKind {
     /// The literal kind as declarative macros and source rendering see it:
-    /// `DocStrRaw(n)` is `StrRaw(n)` and `DocStr` is `Str`.
+    /// `DocStrRaw(n)` is `StrRaw(n)`.
     pub const fn without_doc_provenance(self) -> LitKind {
         match self {
             LitKind::DocStrRaw(hashes) => LitKind::StrRaw(hashes),
-            LitKind::DocStr => LitKind::Str,
             other => other,
         }
     }
@@ -123,7 +118,6 @@ impl LitKind {
             LitKind::CStrRaw(hashes) => [9, hashes],
             LitKind::Err => [10, 0],
             LitKind::DocStrRaw(hashes) => [11, hashes],
-            LitKind::DocStr => [12, 0],
         }
     }
 }
@@ -1137,32 +1131,27 @@ fn literal_parts(text: &str) -> (LitKind, &str, &str) {
     (lit, inside, if suffix == "_" { "" } else { suffix })
 }
 
-/// The minimal raw-string `#` count `n` such that `r#...#"text"#...#` lexes back to `text`,
-/// or `None` when `text` cannot be represented as a raw string literal (contains a bare `\r`, or
-/// a `"` followed by 255 or more `#`s, exceeding Rust's 255-hash raw-string limit).
-fn raw_str_hashes(text: &str) -> Option<u8> {
+/// The minimal raw-string `#` count `n` (saturated at `u8::MAX`, matching `rustc_ast`'s
+/// `tokenstream.rs` doc-comment desugaring) such that no `"` followed by `n` `#`s occurs in
+/// `text`.
+fn raw_str_hashes(text: &str) -> u8 {
     let mut bytes = text.bytes().peekable();
-    let mut needed: Option<u8> = None;
+    let mut needed = 0u8;
     while let Some(byte) = bytes.next() {
-        match byte {
-            b'\r' => return None,
-            b'"' => {
-                let mut hashes = 0u8;
-                while bytes.next_if_eq(&b'#').is_some() {
-                    hashes = hashes.checked_add(1)?;
-                }
-                let next = hashes.checked_add(1)?;
-                needed = Some(needed.map_or(next, |cur| cur.max(next)));
+        if byte == b'"' {
+            let mut hashes = 0u8;
+            while bytes.next_if_eq(&b'#').is_some() {
+                hashes = hashes.saturating_add(1);
             }
-            _ => {}
+            needed = needed.max(hashes.saturating_add(1));
         }
     }
-    Some(needed.unwrap_or(0))
+    needed
 }
 
 /// The doc comment `token` as the attribute it stands for, `#[doc = r"..."]` (`#![..]` when
-/// inner), matching rustc's raw-string desugaring (falling back to cooked `LitKind::Str` only
-/// when a raw string cannot represent the body); `None` if it is not a doc comment's text.
+/// inner), unconditionally desugared to `LitKind::DocStrRaw(n)` matching `rustc_ast`; `None` if
+/// it is not a doc comment's text.
 fn doc_comment(
     out: &mut TokenStream<'_>,
     scratch: &mut blaze_own::AString<'_>,
@@ -1172,7 +1161,8 @@ fn doc_comment(
     ctx: Ctx,
 ) -> Option<Result<(), StreamError>> {
     // A line comment's token ends before its LF, so its break's CR is no part of it; inside, each
-    // CR LF is one LF of the value (parser::line_break).
+    // CR LF is one LF of the value (parser::line_break). Bare CRs in doc comments are already
+    // refused by `parser::LexedStr::new`.
     let token = match token.starts_with("//") {
         true => parser::line_break::line_comment_text(token, followed_by_lf),
         false => token,
@@ -1188,18 +1178,7 @@ fn doc_comment(
     } else {
         body
     };
-    let (lit_kind, lit_text) = match raw_str_hashes(normalized) {
-        Some(hashes) => (LitKind::DocStrRaw(hashes), normalized),
-        None => {
-            scratch.clear();
-            for piece in parser::line_break::without_break_crs(body) {
-                for char in piece.escape_debug() {
-                    scratch.push(char);
-                }
-            }
-            (LitKind::DocStr, scratch.as_str())
-        }
-    };
+    let lit_kind = LitKind::DocStrRaw(raw_str_hashes(normalized));
     let write = |out: &mut TokenStream<'_>| -> Result<(), StreamError> {
         out.punct('#', Spacing::Alone, ctx)?;
         if inner {
@@ -1209,7 +1188,7 @@ fn doc_comment(
         out.push(TokenKind::Ident { raw: Raw::No, spacing: Spacing::Alone }, "doc", ctx)?;
         out.punct('=', Spacing::Alone, ctx)?;
         let kind = TokenKind::Literal { kind: lit_kind, suffix_len: 0, spacing: Spacing::Alone };
-        out.push(kind, lit_text, ctx)?;
+        out.push(kind, normalized, ctx)?;
         out.close(Delim::Bracket, ctx)
     };
     Some(write(out))

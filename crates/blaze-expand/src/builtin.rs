@@ -892,7 +892,7 @@ fn format_args(
         };
         match args.atom(first.clone()) {
             Atom::Lit {
-                kind: kind @ (LitKind::Str | LitKind::StrRaw(_) | LitKind::DocStr | LitKind::DocStrRaw(_)),
+                kind: kind @ (LitKind::Str | LitKind::StrRaw(_) | LitKind::DocStrRaw(_)),
                 text,
                 suffix_len: 0,
                 negative: false,
@@ -900,7 +900,7 @@ fn format_args(
             } => {
                 let mut with_newline = Buf::new_in(out.alloc);
                 match kind {
-                    LitKind::Str | LitKind::DocStr => with_newline.push_str(text),
+                    LitKind::Str => with_newline.push_str(text),
                     _ => literal::escape_str(text, &mut with_newline),
                 }
                 with_newline.push_str("\\n");

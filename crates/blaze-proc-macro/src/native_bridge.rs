@@ -406,7 +406,7 @@ pub fn encode_flat_tree_json(stream: &TokenStream<'_>, span_offset: u32) -> Stri
                     LitKind::Char => 2,
                     LitKind::Integer => 3,
                     LitKind::Float => 4,
-                    LitKind::Str | LitKind::DocStr | LitKind::DocStrRaw(_) => 5,
+                    LitKind::Str | LitKind::DocStrRaw(_) => 5,
                     LitKind::StrRaw(h) => 6 | ((h as u32) << 8),
                     LitKind::ByteStr => 7,
                     LitKind::ByteStrRaw(h) => 8 | ((h as u32) << 8),

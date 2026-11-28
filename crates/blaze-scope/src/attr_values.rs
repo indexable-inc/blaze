@@ -635,7 +635,7 @@ impl<'q, 'r, 'a, C: ExpandCx> Driver<'q, 'r, 'a, C> {
         let token = stream.tokens()[lo];
         match token.kind {
             TokenKind::Literal {
-                kind: LitKind::Str | LitKind::StrRaw(_) | LitKind::DocStr | LitKind::DocStrRaw(_),
+                kind: LitKind::Str | LitKind::StrRaw(_) | LitKind::DocStrRaw(_),
                 suffix_len: 0,
                 ..
             } => {
@@ -644,7 +644,7 @@ impl<'q, 'r, 'a, C: ExpandCx> Driver<'q, 'r, 'a, C> {
                 attr_literal(&text, self.edition, self.bump).map_err(|_| self.refused(ValueWhy::Escape))
             }
             TokenKind::Literal {
-                kind: LitKind::Str | LitKind::StrRaw(_) | LitKind::DocStr | LitKind::DocStrRaw(_),
+                kind: LitKind::Str | LitKind::StrRaw(_) | LitKind::DocStrRaw(_),
                 ..
             } => Err(self.refused(ValueWhy::Suffixed)),
             _ => Err(self.refused(ValueWhy::NotAString)),

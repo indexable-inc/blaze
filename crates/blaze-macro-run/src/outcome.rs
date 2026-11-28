@@ -36,7 +36,7 @@ use blaze_expand::{
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::bridge::{Field, Malformed, Reader, Writer, index, wide};
-use crate::call::{FORMAT, has_text, put_kind, put_origin, read_kind, read_origin};
+use crate::call::{FORMAT, has_text, put_kind, put_origin, read_origin, read_outcome_kind};
 use crate::server::{ServerError, is_punct, level_of, write_literal};
 
 const EXPANDED: u8 = 0;
@@ -285,7 +285,7 @@ pub(crate) fn decode<'a>(
     let mut text_total = 0usize;
     for at in 0..count {
         let at = index(at);
-        let kind = read_kind(&mut r).map_err(m)?;
+        let kind = read_outcome_kind(&mut r).map_err(m)?;
         let origin = read_origin(&mut r).map_err(m)?;
         let text = if has_text(kind) { r.str().map_err(m)? } else { "" };
         if !check.allowed(origin) {

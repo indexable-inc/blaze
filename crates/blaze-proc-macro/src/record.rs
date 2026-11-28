@@ -693,7 +693,6 @@ fn lit_bytes(kind: LitKind) -> [u8; 2] {
         LitKind::CStrRaw(n) => [9, n],
         LitKind::Err => [10, 0],
         LitKind::DocStrRaw(n) => [11, n],
-        LitKind::DocStr => [12, 0],
     }
 }
 
@@ -711,7 +710,6 @@ fn lit_of(tag: u8, n: u8) -> Option<LitKind> {
         9 => LitKind::CStrRaw(n),
         10 => LitKind::Err,
         11 => LitKind::DocStrRaw(n),
-        12 => LitKind::DocStr,
         _ => return None,
     })
 }
@@ -780,8 +778,9 @@ fn stream_pieces(stream: &TokenStream<'_>, mut out: impl FnMut(&[u8])) {
 /// `CARGO_MANIFEST_DIR` back to virtual mount root in emitted string literals (D60/D96). 5: native
 /// bridge materializes all safe relative files of `Files::Listed` into `$CARGO_MANIFEST_DIR`, not
 /// only `Cargo.toml`. 6: native bridge preserves non-invisible root subtree delimiters
-/// (`Paren`/`Brace`/`Bracket`) in `FlatTree` replies (e.g. `paste::paste! {{ ... }}`).
-pub const HOST_VERSION: u32 = 6;
+/// (`Paren`/`Brace`/`Bracket`) in `FlatTree` replies (e.g. `paste::paste! {{ ... }}`). 7: doc
+/// comments carry provenance (`LitKind::DocStrRaw`) and arrive as cooked `LitKind::Str` literals.
+pub const HOST_VERSION: u32 = 7;
 
 /// The base of `call`'s record: computed from text, before the run.
 pub fn base_key(module_wasm_sha256: &str, export: &Exported, edition: Edition, call: &ProcCall<'_>) -> ContentId {

@@ -543,28 +543,19 @@ impl<'a> Server<'a> {
                     let ch = u8::try_from(char).map_err(|_| ServerError::Call(Malformed::Tag(Field::Char, 0)))?;
                     Tok::Punct { ch, joint: spacing == Spacing::Joint, span: self.span(side.span(i, i))? }
                 }
-                TokenKind::Literal { kind: LitKind::DocStrRaw(_), suffix_len, .. } => {
-                    let split = text.len().checked_sub(wide(suffix_len)).ok_or(ServerError::Call(Malformed::Short(Field::Str)))?;
-                    let (body, suffix) = text.split_at_checked(split).ok_or(ServerError::Call(Malformed::NotUtf8))?;
-                    let mut escaped = blaze_own::AString::new_in(self.alloc);
-                    for ch in body.escape_debug() {
-                        escaped.push(ch);
-                    }
-                    let sym = self.sym(escaped.as_str())?;
-                    let suffix = if suffix.is_empty() { None } else { Some(self.sym(suffix)?) };
-                    Tok::Literal { kind: LitKind::Str, sym, suffix, span: self.span(side.span(i, i))? }
-                }
-                TokenKind::Literal { kind: LitKind::DocStr, suffix_len, .. } => {
-                    let split = text.len().checked_sub(wide(suffix_len)).ok_or(ServerError::Call(Malformed::Short(Field::Str)))?;
-                    let (body, suffix) = text.split_at_checked(split).ok_or(ServerError::Call(Malformed::NotUtf8))?;
-                    let sym = self.sym(body)?;
-                    let suffix = if suffix.is_empty() { None } else { Some(self.sym(suffix)?) };
-                    Tok::Literal { kind: LitKind::Str, sym, suffix, span: self.span(side.span(i, i))? }
-                }
                 TokenKind::Literal { kind, suffix_len, .. } => {
                     let split = text.len().checked_sub(wide(suffix_len)).ok_or(ServerError::Call(Malformed::Short(Field::Str)))?;
                     let (body, suffix) = text.split_at_checked(split).ok_or(ServerError::Call(Malformed::NotUtf8))?;
-                    let sym = self.sym(body)?;
+                    let (kind, sym) = match kind {
+                        LitKind::DocStrRaw(_) => {
+                            let mut escaped = blaze_own::AString::new_in(self.alloc);
+                            for ch in body.escape_debug() {
+                                escaped.push(ch);
+                            }
+                            (LitKind::Str, self.sym(escaped.as_str())?)
+                        }
+                        other => (other, self.sym(body)?),
+                    };
                     let suffix = if suffix.is_empty() { None } else { Some(self.sym(suffix)?) };
                     Tok::Literal { kind, sym, suffix, span: self.span(side.span(i, i))? }
                 }
@@ -1227,7 +1218,7 @@ pub(crate) fn write_literal(out: &mut AVec<'_, u8>, kind: LitKind, inside: &str,
         LitKind::Byte => quoted(out, b"b", b'\'', 0, inside),
         LitKind::Char => quoted(out, b"", b'\'', 0, inside),
         LitKind::Integer | LitKind::Float | LitKind::Err => out.extend_from_slice(inside.as_bytes()),
-        LitKind::Str | LitKind::DocStr => quoted(out, b"", b'"', 0, inside),
+        LitKind::Str => quoted(out, b"", b'"', 0, inside),
         LitKind::StrRaw(n) | LitKind::DocStrRaw(n) => quoted(out, b"r", b'"', n, inside),
         LitKind::ByteStr => quoted(out, b"b", b'"', 0, inside),
         LitKind::ByteStrRaw(n) => quoted(out, b"br", b'"', n, inside),

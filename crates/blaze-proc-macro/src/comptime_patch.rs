@@ -339,7 +339,7 @@ fn write_literal(out: &mut String, kind: LitKind, text: &str, suffix_len: u32) {
         LitKind::Byte => ("b", 0u8, "'"),
         LitKind::Char => ("", 0, "'"),
         LitKind::Integer | LitKind::Float | LitKind::Err => ("", 0, ""),
-        LitKind::Str | LitKind::DocStr => ("", 0, "\""),
+        LitKind::Str => ("", 0, "\""),
         LitKind::ByteStr => ("b", 0, "\""),
         LitKind::CStr => ("c", 0, "\""),
         LitKind::StrRaw(h) | LitKind::DocStrRaw(h) => ("r", h, "\""),
@@ -3256,7 +3256,7 @@ fn eval_paste_group(stream: &TokenStream<'_>, start: usize, end: usize) -> Optio
             TokenKind::Literal { kind, .. } => {
                 let t = stream.text_at(i);
                 match kind {
-                    LitKind::Str | LitKind::StrRaw(_) | LitKind::DocStr | LitKind::DocStrRaw(_) => t.to_owned(),
+                    LitKind::Str | LitKind::StrRaw(_) | LitKind::DocStrRaw(_) => t.to_owned(),
                     LitKind::Integer => t.to_owned(),
                     _ => return None,
                 }

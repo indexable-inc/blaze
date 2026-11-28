@@ -2952,8 +2952,8 @@ fn doc_comment_desugars_to_str_raw_with_minimal_hashes() {
     assert_doc_lit("/// has \\n backslash\n", false, LitKind::DocStrRaw(0), Some(" has \\n backslash"));
     assert_doc_lit("/** a\r\nb */", false, LitKind::DocStrRaw(0), Some(" a\nb "));
 
-    // 254 hashes after `"` needs 255 hashes (the u8 maximum for raw strings); 255 hashes after `"`
-    // cannot be represented as `StrRaw(u8)` and falls back to cooked `LitKind::DocStr`.
+    // 254 hashes after `"` needs 255 hashes (the u8 maximum for raw strings); 255+ hashes after `"`
+    // saturates at `DocStrRaw(255)` (preserving the raw literal kind, matching `rustc_ast/src/tokenstream.rs`).
     let mut hashes_254 = blaze_own::AString::new_in(alloc);
     hashes_254.push_str("/// \"");
     for _ in 0..254 {
@@ -2967,16 +2967,75 @@ fn doc_comment_desugars_to_str_raw_with_minimal_hashes() {
     }
     assert_doc_lit(hashes_254.as_str(), false, LitKind::DocStrRaw(255), Some(want_254.as_str()));
 
-    let mut hashes_255 = blaze_own::AString::new_in(alloc);
-    hashes_255.push_str("/// \"");
-    for _ in 0..255 {
-        hashes_255.push('#');
+    for n in [255usize, 256] {
+        let mut src = blaze_own::AString::new_in(alloc);
+        src.push_str("/// \"");
+        for _ in 0..n {
+            src.push('#');
+        }
+        src.push('\n');
+        let mut want = blaze_own::AString::new_in(alloc);
+        want.push_str(" \"");
+        for _ in 0..n {
+            want.push('#');
+        }
+        let stream = lex(src.as_str(), Edition::E2021, alloc).expect("255+ hashes doc lexes");
+        let tok = stream.tokens()[4];
+        assert_eq!(
+            tok.kind,
+            TokenKind::Literal { kind: LitKind::DocStrRaw(255), suffix_len: 0, spacing: Spacing::Alone },
+            "{n} hashes after `\"` must saturate at DocStrRaw(255)"
+        );
+        assert_eq!(stream.text_at(4), want.as_str());
+        // Forwarding through `macro_rules!` must preserve raw `StrRaw(255)`, never cooked `Str`.
+        let forward = rules("($($t:tt)*) => { $($t)* };", 1);
+        let forwarded = call_fn(&forward, src.as_str(), &TestCx::new());
+        assert_eq!(
+            forwarded.tokens.tokens()[4].kind,
+            TokenKind::Literal { kind: LitKind::StrRaw(255), suffix_len: 0, spacing: Spacing::Alone },
+            "forwarded {n}-hash doc comment must remain StrRaw(255)"
+        );
+        assert_eq!(forwarded.tokens.text_at(4), want.as_str());
     }
-    hashes_255.push('\n');
-    assert_doc_lit(hashes_255.as_str(), false, LitKind::DocStr, None);
 
     // Bare `\r` (not followed by `\n`) in a doc comment is refused by the lexer, matching rustc.
     assert!(lex("/** bare\rcr */", Edition::E2021, alloc).is_err());
+}
+
+#[test]
+fn previous_expansion_schema_4_is_refused() {
+    use blaze_format::{Part, Record, Slice, Writer, WriterOpts, schema_of};
+    let alloc = blaze_own::testing::heap().alloc();
+    let v4 = schema_of(&[
+        Part::Str("blaze-expand Expansion"),
+        Part::U64(4),
+        Part::Schema(<[Slice<u8>; 15] as Record>::SCHEMA),
+    ]);
+    assert_ne!(v4, blaze_expand::EXPANSION_SCHEMA);
+    let mut w = Writer::new(WriterOpts { schema: v4, alloc, capacity: None });
+    let root: [Slice<u8>; 15] = [Slice::EMPTY; 15];
+    let at = w.push(&root);
+    let bytes = w.finish(at);
+    let aligned = Aligned::copy_from(&bytes);
+    assert!(matches!(Expansion::<'static>::read_record(&aligned, alloc), Err(blaze_expand::RecordError::Format(_))));
+}
+
+#[test]
+fn previous_stream_schema_2_is_refused() {
+    use blaze_format::{Part, Record, Slice, Writer, WriterOpts, schema_of};
+    let alloc = blaze_own::testing::heap().alloc();
+    let v2 = schema_of(&[
+        Part::Str("blaze-expand TokenStream"),
+        Part::U64(2),
+        Part::Schema(<[Slice<u8>; 14] as Record>::SCHEMA),
+    ]);
+    assert_ne!(v2, blaze_expand::STREAM_SCHEMA);
+    let mut w = Writer::new(WriterOpts { schema: v2, alloc, capacity: None });
+    let root: [Slice<u8>; 14] = [Slice::EMPTY; 14];
+    let at = w.push(&root);
+    let bytes = w.finish(at);
+    let aligned = Aligned::copy_from(&bytes);
+    assert!(matches!(TokenStream::read_record(&aligned, alloc), Err(blaze_expand::RecordError::Format(_))));
 }
 
 /// Exact `ctor-1.0.13` pattern (`__parse_feature_input!` in `ctor-1.0.13/src/macros/features.rs`):

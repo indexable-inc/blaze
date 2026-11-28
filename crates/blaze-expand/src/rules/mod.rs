@@ -952,10 +952,10 @@ impl<'d, 'f> Compiler<'_, 'd, 'f> {
     /// `#[doc = r" attr"]` or `#[doc = "..."]` attribute — regardless of whitespace such as
     /// `# [ doc = r" attr" ]` — is real matcher tokens (ctor 1.0.13's `__parse_feature_input!`).
     ///
-    /// `tokens::doc_comment` marks desugared doc comments with `LitKind::DocStrRaw(_)` /
-    /// `LitKind::DocStr`; explicit attributes always lex to `LitKind::StrRaw(_)` / `LitKind::Str`.
-    /// Gives the cursor after a desugared doc comment, `None` for an explicit attribute or
-    /// anything else. A `$` fragment inside the brackets is not one: it binds.
+    /// `tokens::doc_comment` marks desugared doc comments with `LitKind::DocStrRaw(_)`; explicit
+    /// attributes always lex to `LitKind::StrRaw(_)` / `LitKind::Str`. Gives the cursor after a
+    /// desugared doc comment, `None` for an explicit attribute or anything else. A `$` fragment
+    /// inside the brackets is not one: it binds.
     fn doc_attr_end(&self, c: Cur<'f>) -> Option<Cur<'f>> {
         let mut at = c;
         if !self.expect_char(&mut at, &['#']) {
@@ -973,7 +973,7 @@ impl<'d, 'f> Compiler<'_, 'd, 'f> {
         let lit = eq
             && matches!(
                 self.next(&mut inside).map(|tok| self.def.kind(tok)),
-                Some(TokenKind::Literal { kind: LitKind::DocStr | LitKind::DocStrRaw(_), .. })
+                Some(TokenKind::Literal { kind: LitKind::DocStrRaw(_), .. })
             );
         (lit && inside.is_empty()).then_some(at)
     }
@@ -1324,7 +1324,7 @@ pub(crate) fn write_literal(
         LitKind::Byte => ("b", 0, "'"),
         LitKind::Char => ("", 0, "'"),
         LitKind::Integer | LitKind::Float | LitKind::Err => ("", 0, ""),
-        LitKind::Str | LitKind::DocStr => ("", 0, "\""),
+        LitKind::Str => ("", 0, "\""),
         LitKind::ByteStr => ("b", 0, "\""),
         LitKind::CStr => ("c", 0, "\""),
         LitKind::StrRaw(hashes) | LitKind::DocStrRaw(hashes) => ("r", hashes, "\""),

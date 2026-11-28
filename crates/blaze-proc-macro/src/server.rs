@@ -261,7 +261,7 @@ fn lit_write(w: &mut Writer<'_>, kind: LitKind) {
         LitKind::Char => w.u8(1),
         LitKind::Integer => w.u8(2),
         LitKind::Float => w.u8(3),
-        LitKind::Str | LitKind::DocStr => w.u8(4),
+        LitKind::Str => w.u8(4),
         LitKind::StrRaw(n) | LitKind::DocStrRaw(n) => {
             w.u8(5);
             w.u8(n);
@@ -320,7 +320,7 @@ fn write_literal(out: &mut String, kind: LitKind, sym: &str, suffix: &str) {
         LitKind::Byte => out.push_str(&format!("b'{sym}'")),
         LitKind::Char => out.push_str(&format!("'{sym}'")),
         LitKind::Integer | LitKind::Float | LitKind::Err => out.push_str(sym),
-        LitKind::Str | LitKind::DocStr => {
+        LitKind::Str => {
             out.push('"');
             out.push_str(sym);
             out.push('"');
@@ -514,7 +514,6 @@ impl Server {
                             }
                             (LitKind::Str, self.sym(escaped.as_str())?)
                         }
-                        LitKind::DocStr => (LitKind::Str, self.sym(body)?),
                         other => (other, self.sym(body)?),
                     };
                     let suffix = if suffix.is_empty() { None } else { Some(self.sym(suffix)?) };

@@ -106,7 +106,8 @@ pub const EXPANSION_SCHEMA: SchemaHash = blaze_format::schema_of(&[
     // 3: the root's last slot is the expansion's token record (drive.md D122), 2026-11-17. A
     // record of an earlier version fails `open_as` and is made again (rule 26).
     // 4: `Mark` carries `local_inner` (bit 6 of Contexts flags) and `blaze-tokens` FORM 2, 2026-11-27.
-    Part::U64(4),
+    // 5: doc-comment provenance (`LitKind::DocStrRaw`, tag 11), 2026-11-28.
+    Part::U64(5),
     Part::Schema(<ExpansionRoot as Record>::SCHEMA),
 ]);
 
@@ -196,7 +197,6 @@ fn lit_bits(kind: LitKind) -> (u32, u8) {
         LitKind::CStrRaw(hashes) => (9, hashes),
         LitKind::Err => (10, 0),
         LitKind::DocStrRaw(hashes) => (11, hashes),
-        LitKind::DocStr => (12, 0),
     }
 }
 
@@ -395,7 +395,8 @@ pub fn stream_record_id(bytes: &[u8]) -> ContentId {
 pub const STREAM_SCHEMA: SchemaHash = blaze_format::schema_of(&[
     Part::Str("blaze-expand TokenStream"),
     // 2: `Mark` carries `local_inner` (bit 6 of Contexts flags), 2026-11-27.
-    Part::U64(2),
+    // 3: doc-comment provenance (`LitKind::DocStrRaw`, tag 11), 2026-11-28.
+    Part::U64(3),
     Part::Schema(<Root as Record>::SCHEMA),
 ]);
 
@@ -709,7 +710,6 @@ fn lit_of(tag: u32, hashes: u8) -> Option<LitKind> {
         9 => LitKind::CStrRaw(hashes),
         10 => LitKind::Err,
         11 => LitKind::DocStrRaw(hashes),
-        12 => LitKind::DocStr,
         _ => return None,
     })
 }

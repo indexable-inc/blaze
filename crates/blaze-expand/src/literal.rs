@@ -104,7 +104,7 @@ pub(crate) fn bytes_piece(
             });
             refused.map_or(Ok(()), Err)
         }
-        LitKind::Char | LitKind::Str | LitKind::StrRaw(_) | LitKind::DocStr | LitKind::DocStrRaw(_) => {
+        LitKind::Char | LitKind::Str | LitKind::StrRaw(_) | LitKind::DocStrRaw(_) => {
             Err(LitError::CharOrStr)
         }
         LitKind::Integer => Err(LitError::NumberAlone),
@@ -126,7 +126,7 @@ pub(crate) fn byte_element(kind: LitKind, text: &str, suffix_len: u32) -> Result
             let value = integer_value(without_suffix(text, suffix_len))?;
             u8::try_from(value).map_err(|_| LitError::NotAU8)
         }
-        LitKind::Char | LitKind::Str | LitKind::StrRaw(_) | LitKind::DocStr | LitKind::DocStrRaw(_) => {
+        LitKind::Char | LitKind::Str | LitKind::StrRaw(_) | LitKind::DocStrRaw(_) => {
             Err(LitError::CharOrStr)
         }
         LitKind::Byte
@@ -268,7 +268,7 @@ pub(crate) fn string_value(
 ) -> Result<(), LitError> {
     let body = without_suffix(text, suffix_len);
     match kind {
-        LitKind::Str | LitKind::DocStr => unescape_str(body, out),
+        LitKind::Str => unescape_str(body, out),
         LitKind::StrRaw(_) | LitKind::DocStrRaw(_) => raw_str(body, out),
         LitKind::Byte
         | LitKind::Char
@@ -292,7 +292,7 @@ pub(crate) fn concat_piece(
 ) -> Result<(), LitError> {
     let body = without_suffix(text, suffix_len);
     match kind {
-        LitKind::Str | LitKind::StrRaw(_) | LitKind::DocStr | LitKind::DocStrRaw(_) => {
+        LitKind::Str | LitKind::StrRaw(_) | LitKind::DocStrRaw(_) => {
             string_value(kind, text, suffix_len, out)
         }
         LitKind::Char => {

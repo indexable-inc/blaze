@@ -50,7 +50,7 @@ use crate::{
 };
 
 /// This form's magic: the set's version. A step of the layout steps it.
-pub const MAGIC: [u8; 8] = *b"BZXSET4\0";
+pub const MAGIC: [u8; 8] = *b"BZXSET5\0";
 /// The first form: one whole expansion record per entry. Detected and rebuilt
 /// ([`KeptError::OldForm`]), never misread.
 pub const MAGIC_V1: [u8; 8] = *b"BZXSET1\0";
@@ -60,6 +60,9 @@ pub const MAGIC_V2: [u8; 8] = *b"BZXSET2\0";
 /// The third form: before `Mark::local_inner` (bit 6 of Contexts flags). Detected and rebuilt,
 /// never misread.
 pub const MAGIC_V3: [u8; 8] = *b"BZXSET3\0";
+/// The fourth form: before doc-comment provenance (`LitKind::DocStrRaw`, tag 11). Detected and
+/// rebuilt, never misread.
+pub const MAGIC_V4: [u8; 8] = *b"BZXSET4\0";
 
 /// The atom builder's hash seed. It only spreads the builder's lookups: no byte of a set
 /// depends on it ([`AtomsBuilder`]), so it is a constant, not an input.
@@ -144,7 +147,7 @@ impl<'k> KeptSet<'k> {
         if bytes.len() < 8 {
             return Err(KeptError::Short { what: "its magic" });
         }
-        if bytes[..8] == MAGIC_V1 || bytes[..8] == MAGIC_V2 || bytes[..8] == MAGIC_V3 {
+        if bytes[..8] == MAGIC_V1 || bytes[..8] == MAGIC_V2 || bytes[..8] == MAGIC_V3 || bytes[..8] == MAGIC_V4 {
             return Err(KeptError::OldForm);
         }
         if bytes[..8] != MAGIC {
