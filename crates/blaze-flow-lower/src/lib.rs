@@ -3807,6 +3807,166 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         false
     }
 
+    /// Whether `o` is a higher-ranked (`Region::Late`) binder origin of a `fn(...) -> ...` pointer
+    /// type (not constrained to any non-`'static` free lifetime placeholder), so it is not an
+    /// outlives component of `for<'r> fn(&'r u8): 'target`.
+    fn is_fn_ptr_late_origin(&self, o: Origin) -> bool {
+        if !self.facts.fn_binders() || self.b.is_placeholder(o) {
+            return false;
+        }
+        let is_uni_late = |x: Origin| {
+            self.uni.iter().any(|&(r, uo)| uo == x && matches!(r, Region::Late { .. }))
+        };
+        if is_uni_late(o) {
+            return true;
+        }
+        let static_o = self.uni.iter().find(|&&(r, _)| r == Region::Static).map(|&(_, uo)| uo);
+        let Ok(n_origs) = usize::try_from(self.b.origins_len()) else {
+            return false;
+        };
+        if o.index() >= n_origs {
+            return false;
+        }
+        let subsets = self.b.subset_edges();
+        let mut visited: Vec<bool, A> = Vec::with_capacity_in(n_origs, self.alloc);
+        visited.resize(n_origs, false);
+        let mut stack: Vec<Origin, A> = Vec::new_in(self.alloc);
+        if let Some(slot) = visited.get_mut(o.index()) {
+            *slot = true;
+        }
+        stack.push(o);
+        let mut saw_late = false;
+        while let Some(cur) = stack.pop() {
+            if is_uni_late(cur) {
+                saw_late = true;
+            }
+            for &(_, from, into) in subsets {
+                let nb = if from == cur {
+                    into
+                } else if into == cur {
+                    from
+                } else {
+                    continue;
+                };
+                if self.b.is_placeholder(nb) {
+                    if Some(nb) != static_o {
+                        return false;
+                    }
+                    continue;
+                }
+                if let Some(slot) = visited.get_mut(nb.index())
+                    && !*slot
+                {
+                    *slot = true;
+                    stack.push(nb);
+                }
+            }
+        }
+        saw_late
+    }
+
+    /// Verifies that every free-region origin component of `arg_ty` (at flattened offset
+    /// `start_off` inside `origs`) outlives `target`, skipping higher-ranked `Region::Late`
+    /// binder origins inside `PNode::FnPtr` while still requiring free regions (e.g. `'short` in
+    /// `fn(&'short u8)`) to outlive `target`, matching rustc's RFC 1214 outlives rules.
+    fn arg_origins_outlive_known(
+        &self,
+        arg_ty: PTy,
+        start_off: u32,
+        origs: &[Origin],
+        target: Origin,
+        e: ExprId,
+    ) -> Result<bool, Refusal> {
+        let mut stack: Vec<(PTy, u32, bool), A> = Vec::new_in(self.alloc);
+        stack.push((arg_ty, start_off, false));
+        let mut steps = 0u32;
+        while let Some((t, cur_off, in_fn_ptr)) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse(Form::Bound, e);
+            }
+            let check_origin = |pos: u32| -> bool {
+                let Some(&o) = usize::try_from(pos).ok().and_then(|ix| origs.get(ix)) else {
+                    return false;
+                };
+                if in_fn_ptr && self.is_fn_ptr_late_origin(o) {
+                    return true;
+                }
+                self.origin_outlives_known(o, target)
+            };
+            match self.node(t, e)? {
+                PNode::Ref(_, inner) => {
+                    if !check_origin(cur_off) {
+                        return Ok(false);
+                    }
+                    let Some(next) = cur_off.checked_add(1) else {
+                        return Ok(false);
+                    };
+                    stack.push((inner, next, in_fn_ptr));
+                }
+                PNode::Ptr(_, inner) | PNode::Slice(inner) | PNode::Array(inner, _) | PNode::Pat(inner, _) => {
+                    stack.push((inner, cur_off, in_fn_ptr));
+                }
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => {
+                    let mut c_off = cur_off;
+                    for &el in self.list(l, e)? {
+                        let n = self.npos(el, e)?;
+                        stack.push((el, c_off, in_fn_ptr));
+                        let Some(next) = c_off.checked_add(n) else {
+                            return Ok(false);
+                        };
+                        c_off = next;
+                    }
+                }
+                PNode::FnPtr(l, _) => {
+                    let mut c_off = cur_off;
+                    for &el in self.list(l, e)? {
+                        let n = self.npos(el, e)?;
+                        stack.push((el, c_off, true));
+                        let Some(next) = c_off.checked_add(n) else {
+                            return Ok(false);
+                        };
+                        c_off = next;
+                    }
+                }
+                PNode::Adt(k, l) => {
+                    let lts = self.adt_facts(k, e)?.lifetimes;
+                    for j in 0..lts {
+                        let Some(pos) = cur_off.checked_add(j) else {
+                            return Ok(false);
+                        };
+                        if !check_origin(pos) {
+                            return Ok(false);
+                        }
+                    }
+                    let Some(mut c_off) = cur_off.checked_add(lts) else {
+                        return Ok(false);
+                    };
+                    for &a in self.list(l, e)? {
+                        let n = self.npos(a, e)?;
+                        stack.push((a, c_off, in_fn_ptr));
+                        let Some(next) = c_off.checked_add(n) else {
+                            return Ok(false);
+                        };
+                        c_off = next;
+                    }
+                }
+                _ => {
+                    let n = self.npos(t, e)?;
+                    for j in 0..n {
+                        let Some(pos) = cur_off.checked_add(j) else {
+                            return Ok(false);
+                        };
+                        if !check_origin(pos) {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// Verifies that every extra [`CopyOutlives`] obligation on an ADT at `(adt_ty, adt_off)`
     /// inside `origs` holds under `known_edges()`.
     fn check_copy_outlives(
@@ -3857,17 +4017,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     for &prev in args.get(..arg_ix).unwrap_or(&[]) {
                         off = off.saturating_add(self.npos(prev, e)?);
                     }
-                    let arg_npos = self.npos(arg_ty, e)?;
-                    for j in 0..arg_npos {
-                        let Some(pos) = adt_off.checked_add(off).and_then(|x| x.checked_add(j)) else {
-                            return Ok(false);
-                        };
-                        let Some(&o) = usize::try_from(pos).ok().and_then(|ix| origs.get(ix)) else {
-                            return Ok(false);
-                        };
-                        if !self.origin_outlives_known(o, os) {
-                            return Ok(false);
-                        }
+                    let Some(arg_start) = adt_off.checked_add(off) else {
+                        return Ok(false);
+                    };
+                    if !self.arg_origins_outlive_known(arg_ty, arg_start, origs, os, e)? {
+                        return Ok(false);
                     }
                     let mut params: Vec<u32, A> = Vec::new_in(self.alloc);
                     if self.outlives_components(arg_ty, e, &mut params, true)? {

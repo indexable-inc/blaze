@@ -1989,6 +1989,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             match ex {
                 Expr::Local(q) if q == target => return true,
                 Expr::Paren(i)
+                | Expr::Unary { op: blaze_typeck::UnOp::Deref, operand: i }
                 | Expr::Field { base: i, .. }
                 | Expr::TupleField { base: i, .. }
                 | Expr::Index { base: i, .. } => stack.push(i),
@@ -2018,10 +2019,17 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         false
     }
 
-    /// Whether any assignment inside the subtree rooted at `root` (excluding `skip_assign`)
-    /// writes to local `target`.
-    fn expr_subtree_writes_local(&self, root: ExprId, target: PatId, skip_assign: Option<ExprId>) -> bool {
-        use blaze_typeck::Stmt;
+    /// Whether any assignment or mutable borrow (`&mut`, `&raw mut`, or implicit mutable
+    /// auto-borrow/deref adjustment) inside the subtree rooted at `root` (excluding `skip_assign`
+    /// and a mutable auto-borrow on `skip_use` itself) can mutate or overwrite local `target`.
+    fn expr_subtree_writes_local(
+        &self,
+        root: ExprId,
+        target: PatId,
+        skip_assign: Option<ExprId>,
+        skip_use: Option<ExprId>,
+    ) -> bool {
+        use blaze_typeck::{AdjustKind, Stmt};
         let mut stack: Vec<ExprId, A> = Vec::new_in(self.alloc);
         stack.push(root);
         let mut steps = 0usize;
@@ -2031,6 +2039,16 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             if steps > max_steps {
                 return true;
             }
+            if skip_use != Some(cur) {
+                let (lo, hi) = self.adjust_rows(cur);
+                if self.ck.adjusts.column::<1>().get(lo..hi).is_some_and(|ks| {
+                    ks.iter()
+                        .any(|k| matches!(k, AdjustKind::Borrow { mutbl: Mutbl::Mut, .. } | AdjustKind::Deref { overloaded: Some(Mutbl::Mut) }))
+                }) && self.assign_lhs_writes_local(cur, target)
+                {
+                    return true;
+                }
+            }
             let Some(&ex) = self.body.exprs.get(cur.ix()) else { continue };
             match ex {
                 Expr::Assign { lhs, rhs } | Expr::AssignOp { lhs, rhs, .. } => {
@@ -2039,6 +2057,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     }
                     stack.push(lhs);
                     stack.push(rhs);
+                }
+                Expr::Ref { mutbl: Mutbl::Mut, operand } | Expr::RawRef { mutbl: Mutbl::Mut, operand } => {
+                    if self.assign_lhs_writes_local(operand, target) {
+                        return true;
+                    }
+                    stack.push(operand);
                 }
                 Expr::Paren(i)
                 | Expr::Field { base: i, .. }
@@ -2146,18 +2170,24 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         false
     }
 
-    /// Whether a statement `stmt_id` contains an assignment writing to `target`.
-    fn stmt_writes_local(&self, stmt_id: blaze_typeck::StmtId, target: PatId, skip_assign: Option<ExprId>) -> bool {
+    /// Whether a statement `stmt_id` contains an assignment or mutable borrow writing to `target`.
+    fn stmt_writes_local(
+        &self,
+        stmt_id: blaze_typeck::StmtId,
+        target: PatId,
+        skip_assign: Option<ExprId>,
+        skip_use: Option<ExprId>,
+    ) -> bool {
         use blaze_typeck::Stmt;
         let Some(st) = self.body.stmts.get(stmt_id.ix()) else {
             return false;
         };
         match *st {
             Stmt::Let { init, else_, .. } => {
-                init.is_some_and(|i| self.expr_subtree_writes_local(i, target, skip_assign))
-                    || else_.is_some_and(|el| self.expr_subtree_writes_local(el, target, skip_assign))
+                init.is_some_and(|i| self.expr_subtree_writes_local(i, target, skip_assign, skip_use))
+                    || else_.is_some_and(|el| self.expr_subtree_writes_local(el, target, skip_assign, skip_use))
             }
-            Stmt::Expr { expr, .. } => self.expr_subtree_writes_local(expr, target, skip_assign),
+            Stmt::Expr { expr, .. } => self.expr_subtree_writes_local(expr, target, skip_assign, skip_use),
             Stmt::Item => false,
         }
     }
@@ -2241,13 +2271,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         // Walk from `use_expr` up to `self.body.root`.
         let mut child = use_expr;
         let max_depth = self.body.exprs.len().saturating_add(1);
+        let skip_use = Some(use_expr);
         for _ in 0..max_depth {
             if child == self.body.root {
                 return false;
             }
             let Some(parent) = self.direct_expr_parent(child) else {
                 // Unreachable from `body.root`: fall back conservatively to scanning the whole body.
-                return self.expr_subtree_writes_local(self.body.root, target, skip_assign);
+                return self.expr_subtree_writes_local(self.body.root, target, skip_assign, skip_use);
             };
             let Some(&pex) = self.body.exprs.get(parent.ix()) else {
                 return true;
@@ -2255,19 +2286,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             match pex {
                 Expr::Loop { .. } => {
                     // Loop back-edge: any write anywhere in the loop body can reach `use_expr`.
-                    if self.expr_subtree_writes_local(parent, target, skip_assign) {
+                    if self.expr_subtree_writes_local(parent, target, skip_assign, skip_use) {
                         return true;
                     }
                 }
                 Expr::Closure { .. } | Expr::AsyncBlock { .. } => {
                     // A closure/async body can run at any later point in the enclosing fn.
-                    return self.expr_subtree_writes_local(self.body.root, target, skip_assign);
+                    return self.expr_subtree_writes_local(self.body.root, target, skip_assign, skip_use);
                 }
                 Expr::Block { stmts, tail, .. } => {
                     if let Some(ss) = self.body.stmt_lists.get(stmts.range()) {
                         if tail == Some(child) {
                             for &s in ss {
-                                if self.stmt_writes_local(s, target, skip_assign) {
+                                if self.stmt_writes_local(s, target, skip_assign, skip_use) {
                                     return true;
                                 }
                             }
@@ -2277,14 +2308,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                                 match *st {
                                     Stmt::Let { init, .. } if init == Some(child) => break,
                                     Stmt::Let { init, else_, .. } if else_ == Some(child) => {
-                                        if init.is_some_and(|i| self.expr_subtree_writes_local(i, target, skip_assign)) {
+                                        if init.is_some_and(|i| self.expr_subtree_writes_local(i, target, skip_assign, skip_use)) {
                                             return true;
                                         }
                                         break;
                                     }
                                     Stmt::Expr { expr, .. } if expr == child => break,
                                     _ => {
-                                        if self.stmt_writes_local(s, target, skip_assign) {
+                                        if self.stmt_writes_local(s, target, skip_assign, skip_use) {
                                             return true;
                                         }
                                     }
@@ -2294,7 +2325,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     }
                 }
                 Expr::Binary { lhs, rhs, .. } | Expr::Index { base: lhs, index: rhs } if rhs == child => {
-                    if self.expr_subtree_writes_local(lhs, target, skip_assign) {
+                    if self.expr_subtree_writes_local(lhs, target, skip_assign, skip_use) {
                         return true;
                     }
                 }
@@ -2303,22 +2334,31 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     // `lhs`. The store to `lhs` itself executes after both operands, so it never
                     // precedes a use inside `rhs` or `lhs`. When `child == lhs`, `rhs` has
                     // already executed and may contain writes to `target`.
-                    if lhs == child && self.expr_subtree_writes_local(rhs, target, skip_assign) {
+                    if lhs == child && self.expr_subtree_writes_local(rhs, target, skip_assign, skip_use) {
                         return true;
                     }
                 }
                 Expr::AssignOp { lhs, rhs, .. } => {
-                    // The store to `lhs` executes after both operands evaluate, so it never
-                    // precedes a use inside `rhs` or `lhs`. Check the sibling operand's subtree
-                    // conservatively since primitive vs overloaded compound assignment order
-                    // differs.
-                    let other = if lhs == child { rhs } else { lhs };
-                    if self.expr_subtree_writes_local(other, target, skip_assign) {
+                    // Primitive compound assignments evaluate `rhs` first, then `lhs`, then store
+                    // into `lhs` (matching `Expr::Assign`). Overloaded compound assignments
+                    // (`AddAssign::add_assign(&mut lhs, rhs)`) evaluate `lhs` before `rhs`.
+                    let is_primitive = self.ck.callees.column::<0>().iter().all(|&x| x != parent)
+                        && self.expr_ty(lhs).ok().and_then(|t| self.tys.node(t).ok()).is_some_and(|n| {
+                            matches!(n, PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) | PNode::Bool)
+                        })
+                        && self.expr_ty(rhs).ok().and_then(|t| self.tys.node(t).ok()).is_some_and(|n| {
+                            matches!(n, PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) | PNode::Bool)
+                        });
+                    if is_primitive {
+                        if lhs == child && self.expr_subtree_writes_local(rhs, target, skip_assign, skip_use) {
+                            return true;
+                        }
+                    } else if rhs == child && self.expr_subtree_writes_local(lhs, target, skip_assign, skip_use) {
                         return true;
                     }
                 }
                 Expr::Repeat { elem, count, .. } if count == Some(child) => {
-                    if self.expr_subtree_writes_local(elem, target, skip_assign) {
+                    if self.expr_subtree_writes_local(elem, target, skip_assign, skip_use) {
                         return true;
                     }
                 }
@@ -2328,14 +2368,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                             if el == child {
                                 break;
                             }
-                            if self.expr_subtree_writes_local(el, target, skip_assign) {
+                            if self.expr_subtree_writes_local(el, target, skip_assign, skip_use) {
                                 return true;
                             }
                         }
                     }
                 }
                 Expr::Call { callee, args } if callee != child => {
-                    if self.expr_subtree_writes_local(callee, target, skip_assign) {
+                    if self.expr_subtree_writes_local(callee, target, skip_assign, skip_use) {
                         return true;
                     }
                     if let Some(es) = self.body.expr_lists.get(args.range()) {
@@ -2343,14 +2383,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                             if a == child {
                                 break;
                             }
-                            if self.expr_subtree_writes_local(a, target, skip_assign) {
+                            if self.expr_subtree_writes_local(a, target, skip_assign, skip_use) {
                                 return true;
                             }
                         }
                     }
                 }
                 Expr::MethodCall { receiver, args, .. } if receiver != child => {
-                    if self.expr_subtree_writes_local(receiver, target, skip_assign) {
+                    if self.expr_subtree_writes_local(receiver, target, skip_assign, skip_use) {
                         return true;
                     }
                     if let Some(es) = self.body.expr_lists.get(args.range()) {
@@ -2358,7 +2398,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                             if a == child {
                                 break;
                             }
-                            if self.expr_subtree_writes_local(a, target, skip_assign) {
+                            if self.expr_subtree_writes_local(a, target, skip_assign, skip_use) {
                                 return true;
                             }
                         }
@@ -2370,7 +2410,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                             if a == child {
                                 break;
                             }
-                            if self.expr_subtree_writes_local(a, target, skip_assign) {
+                            if self.expr_subtree_writes_local(a, target, skip_assign, skip_use) {
                                 return true;
                             }
                         }
@@ -2384,7 +2424,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                                 found_in_fields = true;
                                 break;
                             }
-                            if self.expr_subtree_writes_local(f.expr, target, skip_assign) {
+                            if self.expr_subtree_writes_local(f.expr, target, skip_assign, skip_use) {
                                 return true;
                             }
                         }
@@ -2394,19 +2434,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     }
                 }
                 Expr::If { cond, then, else_ } if then == child || else_ == Some(child) => {
-                    if self.expr_subtree_writes_local(cond, target, skip_assign) {
+                    if self.expr_subtree_writes_local(cond, target, skip_assign, skip_use) {
                         return true;
                     }
                 }
                 Expr::Match { scrutinee, arms } if scrutinee != child => {
-                    if self.expr_subtree_writes_local(scrutinee, target, skip_assign) {
+                    if self.expr_subtree_writes_local(scrutinee, target, skip_assign, skip_use) {
                         return true;
                     }
                     if let Some(as_) = self.body.arms.get(arms.range()) {
                         for arm in as_ {
                             if arm.body == child
                                 && let Some(g) = arm.guard
-                                && self.expr_subtree_writes_local(g, target, skip_assign)
+                                && self.expr_subtree_writes_local(g, target, skip_assign, skip_use)
                             {
                                 return true;
                             }

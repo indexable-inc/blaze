@@ -1404,9 +1404,21 @@ pub(super) enum InstCopyOwned<'a> {
     Unknown,
 }
 
+#[derive(Clone, Copy)]
+enum ReqRegs<'r> {
+    Exact(&'r [Region]),
+    Mapped(&'r [Option<u32>]),
+    Unchecked,
+}
+
 enum ImplMatch<'a> {
     Selected { imp: tc::ItemKey, subst: AVec<'a, tc::PTy>, trait_arg_count: usize },
-    SelectedIfOutlives { outlives: AVec<'a, blaze_flow_lower::CopyOutlives> },
+    SelectedIfOutlives {
+        imp: tc::ItemKey,
+        subst: AVec<'a, tc::PTy>,
+        trait_arg_count: usize,
+        outlives: AVec<'a, blaze_flow_lower::CopyOutlives>,
+    },
     None,
     OutlivesUnproven,
     Unknown,
@@ -2232,7 +2244,7 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
             }
         }
         let ImplMatch::Selected { imp, subst, trait_arg_count } =
-            self.select_impl(r, langs, trait_, &norm_args, Some(&[]), norm_depth + 1, budget)
+            self.select_impl(r, langs, trait_, &norm_args, ReqRegs::Exact(&[]), norm_depth + 1, budget)
         else {
             return None;
         };
@@ -2275,12 +2287,22 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                 }
             }
             h.u32(u32::try_from(head.assoc.len()).unwrap_or(u32::MAX));
+            let reader = store.regions.reader(store.work_alloc());
             for &(name, ty) in head.assoc.iter() {
                 h.u64(name.0);
                 let mut hb = MOST_DROP_NODES;
                 hash_pty_structural(stys, ty, &mut h, &mut hb, &mut stack);
+                if let Ok(acol) = reader.impl_assoc(imp, name) {
+                    h.tag(1);
+                    let asl = acol.as_slice();
+                    h.u32(u32::try_from(asl.len()).unwrap_or(u32::MAX));
+                    for &r in asl {
+                        hash_region(&mut h, r);
+                    }
+                } else {
+                    h.tag(0);
+                }
             }
-            let reader = store.regions.reader(store.work_alloc());
             if let Ok((self_col, trait_col)) = reader.impl_header(imp) {
                 h.tag(1);
                 let sl = self_col.as_slice();
@@ -2374,7 +2396,7 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
         langs: super::BorrowLangs,
         trait_: tc::ItemKey,
         args: &[tc::PTy],
-        req_regs: Option<&[Region]>,
+        req_regs: ReqRegs<'_>,
         norm_depth: u32,
         budget: &mut u32,
     ) -> ImplMatch<'a> {
@@ -2423,7 +2445,7 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
         }
         self.active_goals.push((trait_, self_ty));
         let mut matched: Option<(tc::ItemKey, AVec<'a, tc::PTy>, usize)> = None;
-        let mut matched_outlives: Option<AVec<'a, blaze_flow_lower::CopyOutlives>> = None;
+        let mut matched_outlives: Option<(tc::ItemKey, AVec<'a, tc::PTy>, usize, AVec<'a, blaze_flow_lower::CopyOutlives>)> = None;
         let mut saw_unknown = false;
         let mut saw_outlives_unproven = false;
         let after_self = &args[1..];
@@ -2502,7 +2524,7 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
             let mut header_obs: AVec<'a, blaze_flow_lower::CopyOutlives> = AVec::new_in(self.alloc);
             if self.strict_outlives {
                 let top_copy_slot_pos = if norm_depth == 1
-                    && req_regs.is_some_and(|rr| rr.is_empty())
+                    && matches!(req_regs, ReqRegs::Exact(&[]))
                     && let Some(pat_self) = r.store.impls.get(&imp).map(|h| h.self_ty)
                 {
                     let mut pos: AVec<'a, u32> = AVec::new_in(self.alloc);
@@ -2556,7 +2578,7 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                     }
                 };
                 let regs_ok = match req_regs {
-                    Some(rr) => {
+                    ReqRegs::Exact(rr) => {
                         let reader = r.store.regions.reader(r.store.work_alloc());
                         match reader.impl_header(imp) {
                             Ok((self_col, Some(tcol))) => {
@@ -2574,7 +2596,87 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                             Err(_) => false,
                         }
                     }
-                    None => false,
+                    ReqRegs::Mapped(mapped) => {
+                        let reader = r.store.regions.reader(r.store.work_alloc());
+                        match reader.impl_header(imp) {
+                            Ok((self_col, Some(tcol))) => {
+                                let sc = self_col.as_slice();
+                                let tc = tcol.as_slice();
+                                if !check_self_col(sc, &mut header_obs)
+                                    || tc.len() != mapped.len().saturating_add(sc.len())
+                                    || tc.get(mapped.len()..) != Some(sc)
+                                {
+                                    false
+                                } else {
+                                    let trait_regs = tc.get(..mapped.len()).unwrap_or(&[]);
+                                    let mut ok = true;
+                                    for (j, (&imp_r, &req_slot)) in trait_regs.iter().zip(mapped.iter()).enumerate() {
+                                        match imp_r {
+                                            Region::Static => {
+                                                if let Some(slot) = req_slot {
+                                                    let ob = blaze_flow_lower::CopyOutlives::SlotEqOwner {
+                                                        slot,
+                                                        owner_region: u32::MAX,
+                                                    };
+                                                    if header_obs.scan_for(&ob).is_none() {
+                                                        header_obs.push(ob);
+                                                    }
+                                                }
+                                            }
+                                            Region::Param(_) => {
+                                                if sc.contains(&imp_r) {
+                                                    ok = false;
+                                                    break;
+                                                }
+                                                if let Some(prev_i) =
+                                                    trait_regs.get(..j).and_then(|pref| pref.iter().position(|r| *r == imp_r))
+                                                {
+                                                    let Some(&prev_slot) = mapped.get(prev_i) else {
+                                                        ok = false;
+                                                        break;
+                                                    };
+                                                    match (prev_slot, req_slot) {
+                                                        (None, None) => {}
+                                                        (None, Some(s)) | (Some(s), None) => {
+                                                            let ob = blaze_flow_lower::CopyOutlives::SlotEqOwner {
+                                                                slot: s,
+                                                                owner_region: u32::MAX,
+                                                            };
+                                                            if header_obs.scan_for(&ob).is_none() {
+                                                                header_obs.push(ob);
+                                                            }
+                                                        }
+                                                        (Some(s1), Some(s2)) if s1 != s2 => {
+                                                            let ob1 = blaze_flow_lower::CopyOutlives::Region { long: s1, short: s2 };
+                                                            let ob2 = blaze_flow_lower::CopyOutlives::Region { long: s2, short: s1 };
+                                                            if header_obs.scan_for(&ob1).is_none() {
+                                                                header_obs.push(ob1);
+                                                            }
+                                                            if header_obs.scan_for(&ob2).is_none() {
+                                                                header_obs.push(ob2);
+                                                            }
+                                                        }
+                                                        (Some(_), Some(_)) => {}
+                                                    }
+                                                }
+                                            }
+                                            Region::Late { .. } => {
+                                                ok = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    ok
+                                }
+                            }
+                            Ok((self_col, None)) => {
+                                let sc = self_col.as_slice();
+                                mapped.is_empty() && check_self_col(sc, &mut header_obs)
+                            }
+                            Err(_) => false,
+                        }
+                    }
+                    ReqRegs::Unchecked => false,
                 };
                 if !regs_ok {
                     saw_outlives_unproven = true;
@@ -2591,7 +2693,7 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                     if header_obs.is_empty() {
                         matched = Some((imp, subst, trait_arg_count));
                     } else {
-                        matched_outlives = Some(header_obs);
+                        matched_outlives = Some((imp, subst, trait_arg_count, header_obs));
                     }
                 }
                 Truth::TrueIfOutlives(mut obs) => {
@@ -2604,7 +2706,7 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                             obs.push(ob);
                         }
                     }
-                    matched_outlives = Some(obs);
+                    matched_outlives = Some((imp, subst, trait_arg_count, obs));
                 }
                 Truth::False => {}
                 Truth::OutlivesUnproven => saw_outlives_unproven = true,
@@ -2621,10 +2723,15 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
             (Some((imp, subst, trait_arg_count)), None, true) if self.impl_has_no_default(r, imp) => {
                 ImplMatch::Selected { imp, subst, trait_arg_count }
             }
-            (None, Some(outlives), false) => ImplMatch::SelectedIfOutlives { outlives },
+            (None, Some((imp, subst, trait_arg_count, outlives)), false) => {
+                ImplMatch::SelectedIfOutlives { imp, subst, trait_arg_count, outlives }
+            }
+            (None, Some((imp, subst, trait_arg_count, outlives)), true) if self.impl_has_no_default(r, imp) => {
+                ImplMatch::SelectedIfOutlives { imp, subst, trait_arg_count, outlives }
+            }
             (None, None, false) if saw_outlives_unproven => ImplMatch::OutlivesUnproven,
             (None, None, false) if shape != tc::Shape::Param => ImplMatch::None,
-            (None, None, _) if self.strict_outlives && req_regs.is_none_or(|rr| !rr.is_empty()) => ImplMatch::OutlivesUnproven,
+            (None, None, _) if self.strict_outlives && !matches!(req_regs, ReqRegs::Exact(&[])) => ImplMatch::OutlivesUnproven,
             _ => ImplMatch::Unknown,
         }
     }
@@ -3209,8 +3316,24 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                                 extra_outlives.push(ob);
                             }
                         }
+                    } else if ambiguous {
+                        any_unknown = true;
                     } else {
-                        any_outlives_unproven = true;
+                        // Also consult concrete trait impls when no owner clause matched (e.g.
+                        // `impl<'a> Marker<'a> for Concrete` under `impl<'a, T: Marker<'a>> Copy`).
+                        match self.select_impl(r, langs, *ct, &norm_args, ReqRegs::Mapped(mapped), norm_depth + 1, budget) {
+                            ImplMatch::Selected { .. } => {}
+                            ImplMatch::SelectedIfOutlives { outlives, .. } => {
+                                for &ob in outlives.iter() {
+                                    if extra_outlives.scan_for(&ob).is_none() {
+                                        extra_outlives.push(ob);
+                                    }
+                                }
+                            }
+                            ImplMatch::None => return Truth::False,
+                            ImplMatch::OutlivesUnproven => any_outlives_unproven = true,
+                            ImplMatch::Unknown => any_unknown = true,
+                        }
                     }
                 }
                 InstClause::ProjMapped(pt, pn, pargs, pterm, mapped) => {
@@ -3235,6 +3358,7 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                     }
                     let mut matched_obs: Option<AVec<'a, blaze_flow_lower::CopyOutlives>> = None;
                     let mut ambiguous = false;
+                    let mut saw_owner_unknown = false;
                     for op_ix in 0..self.owner_projs.len() {
                         let Some((opt, opn, opargs, opterm, oregs)) = self.owner_projs.get(op_ix) else { break };
                         let Some(or) = oregs.as_deref() else { continue };
@@ -3269,6 +3393,7 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                             continue;
                         }
                         let Some(norm_opterm) = self.normalize_deep(r, langs, opterm, norm_depth + 1, budget) else {
+                            saw_owner_unknown = true;
                             continue;
                         };
                         if norm_opterm != norm_term {
@@ -3289,8 +3414,96 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                                 extra_outlives.push(ob);
                             }
                         }
+                    } else if ambiguous || saw_owner_unknown {
+                        any_unknown = true;
                     } else {
-                        any_outlives_unproven = true;
+                        // Consult concrete impls when no owner projection matched (e.g.
+                        // `impl<'a> Has<'a> for Concrete { type Out = u8; }`).
+                        match self.select_impl(r, langs, *pt, &norm_args, ReqRegs::Mapped(mapped), norm_depth + 1, budget) {
+                            ImplMatch::Selected { imp, subst, trait_arg_count } => {
+                                let assoc_ty = r.store.impls.get(&imp).and_then(|head| {
+                                    head.assoc.iter().find(|&&(n, _)| n == *pn).map(|&(_, t)| t)
+                                });
+                                let assoc_regs_empty = r
+                                    .store
+                                    .regions
+                                    .reader(r.store.work_alloc())
+                                    .impl_assoc(imp, *pn)
+                                    .is_ok_and(|c| c.as_slice().is_empty());
+                                if let Some(aty) = assoc_ty {
+                                    let mut full_subst: AVec<'a, tc::PTy> =
+                                        AVec::with_capacity_in(subst.len() + norm_args.len(), self.alloc);
+                                    full_subst.extend_from_slice(&subst);
+                                    if let Some(gat_args) = norm_args.get(1 + trait_arg_count..) {
+                                        full_subst.extend_from_slice(gat_args);
+                                    }
+                                    let stys = r.store.tys.view();
+                                    let norm_assoc = self
+                                        .copy_from_table(stys, aty, Some(&full_subst), 0, budget)
+                                        .and_then(|inst| self.normalize_deep(r, langs, inst, norm_depth + 1, budget));
+                                    match norm_assoc {
+                                        Some(na) if na == norm_term && assoc_regs_empty => {}
+                                        Some(na)
+                                            if na != norm_term
+                                                && self.is_concrete_normalized(na)
+                                                && self.is_concrete_normalized(norm_term) =>
+                                        {
+                                            return Truth::False;
+                                        }
+                                        Some(_) if !assoc_regs_empty => any_outlives_unproven = true,
+                                        _ => any_unknown = true,
+                                    }
+                                } else {
+                                    any_unknown = true;
+                                }
+                            }
+                            ImplMatch::SelectedIfOutlives { imp, subst, trait_arg_count, outlives } => {
+                                let assoc_ty = r.store.impls.get(&imp).and_then(|head| {
+                                    head.assoc.iter().find(|&&(n, _)| n == *pn).map(|&(_, t)| t)
+                                });
+                                let assoc_regs_empty = r
+                                    .store
+                                    .regions
+                                    .reader(r.store.work_alloc())
+                                    .impl_assoc(imp, *pn)
+                                    .is_ok_and(|c| c.as_slice().is_empty());
+                                if let Some(aty) = assoc_ty {
+                                    let mut full_subst: AVec<'a, tc::PTy> =
+                                        AVec::with_capacity_in(subst.len() + norm_args.len(), self.alloc);
+                                    full_subst.extend_from_slice(&subst);
+                                    if let Some(gat_args) = norm_args.get(1 + trait_arg_count..) {
+                                        full_subst.extend_from_slice(gat_args);
+                                    }
+                                    let stys = r.store.tys.view();
+                                    let norm_assoc = self
+                                        .copy_from_table(stys, aty, Some(&full_subst), 0, budget)
+                                        .and_then(|inst| self.normalize_deep(r, langs, inst, norm_depth + 1, budget));
+                                    match norm_assoc {
+                                        Some(na) if na == norm_term && assoc_regs_empty => {
+                                            for &ob in outlives.iter() {
+                                                if extra_outlives.scan_for(&ob).is_none() {
+                                                    extra_outlives.push(ob);
+                                                }
+                                            }
+                                        }
+                                        Some(na)
+                                            if na != norm_term
+                                                && self.is_concrete_normalized(na)
+                                                && self.is_concrete_normalized(norm_term) =>
+                                        {
+                                            return Truth::False;
+                                        }
+                                        Some(_) if !assoc_regs_empty => any_outlives_unproven = true,
+                                        _ => any_unknown = true,
+                                    }
+                                } else {
+                                    any_unknown = true;
+                                }
+                            }
+                            ImplMatch::None => return Truth::False,
+                            ImplMatch::OutlivesUnproven => any_outlives_unproven = true,
+                            ImplMatch::Unknown => any_unknown = true,
+                        }
                     }
                 }
                 InstClause::Proj(pt, pn, pargs, pterm) => {
@@ -3531,9 +3744,13 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                 Ok(_) | Err(_) => return Truth::Unknown,
             }
         }
-        match self.select_impl(r, langs, trait_, &args, req_regs, norm_depth + 1, budget) {
+        let req = match req_regs {
+            Some(rr) => ReqRegs::Exact(rr),
+            None => ReqRegs::Unchecked,
+        };
+        match self.select_impl(r, langs, trait_, &args, req, norm_depth + 1, budget) {
             ImplMatch::Selected { .. } => Truth::True,
-            ImplMatch::SelectedIfOutlives { outlives } => Truth::TrueIfOutlives(outlives),
+            ImplMatch::SelectedIfOutlives { outlives, .. } => Truth::TrueIfOutlives(outlives),
             ImplMatch::None => Truth::False,
             ImplMatch::OutlivesUnproven => Truth::OutlivesUnproven,
             ImplMatch::Unknown => Truth::Unknown,

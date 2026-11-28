@@ -883,6 +883,79 @@ fn copy_proj_region_wrong_out_err<'a, T: Has<'a, Out = u16>>(p: ProjToken<'a, T>
     let _ = (a, b);
 }
 
+struct ConcreteHas;
+impl<'a> Has<'a> for ConcreteHas {
+    type Out = u8;
+}
+
+struct ConcreteHasWrong;
+impl<'a> Has<'a> for ConcreteHasWrong {
+    type Out = u16;
+}
+
+struct StaticOnlyHas;
+impl Has<'static> for StaticOnlyHas {
+    type Out = u8;
+}
+
+fn copy_mapped_proj_concrete_impl_ok<'a>(p: ProjToken<'a, ConcreteHas>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_mapped_proj_static_impl_ok(p: ProjToken<'static, StaticOnlyHas>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_mapped_proj_concrete_wrong_out_err<'a>(p: ProjToken<'a, ConcreteHasWrong>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_mapped_proj_static_impl_short_err<'short>(p: ProjToken<'short, StaticOnlyHas>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+#[derive(Clone, Copy)]
+struct ConcreteMarker;
+impl<'a> Marker<'a> for ConcreteMarker {}
+
+fn copy_mapped_trait_concrete_impl_ok<'a>(p: MarkedLt<'a, ConcreteMarker>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_outlives_fn_ptr_hrtb_ok(t: OutlivesToken<'static, fn(&u8)>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+fn copy_outlives_fn_ptr_same_lt_ok<'a>(t: OutlivesToken<'a, fn(&'a u8)>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+fn copy_outlives_fn_ptr_free_short_err<'short>(t: OutlivesToken<'static, fn(&'short u8)>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+fn copy_outlives_fn_ptr_param_err<T>(t: OutlivesToken<'static, fn(T)>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
 fn dyn_expect_destructuring_reassign_err(
     s: Vec<Reader>,
     non_static: (Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool + Send + Sync>>, u32),
@@ -929,6 +1002,60 @@ fn dyn_expect_reassigned_in_own_lhs_after_rhs_err(
         1
     };
     let _ = arr;
+}
+
+fn dyn_expect_primitive_assign_op_rhs_ok(
+    static_r: Vec<Reader>,
+    non_static: Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool + Send + Sync>>,
+) {
+    let mut r = static_r;
+    let mut arr = [0u8; 1];
+    arr[{
+        r = non_static;
+        0
+    }] += {
+        r.push(Box::new(move |link| link.downcast()));
+        1
+    };
+    let _ = (arr, r);
+}
+
+fn dyn_expect_primitive_assign_op_lhs_after_rhs_err(
+    static_r: Vec<Reader>,
+    non_static: Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool + Send + Sync>>,
+) {
+    let mut r = static_r;
+    let mut arr = [0u8; 1];
+    arr[{
+        r.push(Box::new(move |link| link.downcast()));
+        0
+    }] += {
+        r = non_static;
+        1
+    };
+    let _ = (arr, r);
+}
+
+fn overwrite_vec<T>(slot: &mut Vec<T>, next: Vec<T>) {
+    *slot = next;
+}
+
+fn dyn_expect_mut_ref_overwrite_err(
+    static_r: Vec<Reader>,
+    non_static: Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool + Send + Sync>>,
+) {
+    let mut r = static_r;
+    overwrite_vec(&mut r, non_static);
+    r.push(Box::new(move |link| link.downcast()));
+}
+
+fn dyn_expect_mut_method_extend_err(
+    static_r: Vec<Reader>,
+    non_static: Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool + Send + Sync>>,
+) {
+    let mut r = static_r;
+    r.extend(non_static);
+    r.push(Box::new(move |link| link.downcast()));
 }
 
 fn dyn_expect_reassigned_in_loop_err(
@@ -1320,6 +1447,7 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         "dyn_expect_long_alias_chain_ok",
         "dyn_expect_reassigned_after_use_ok",
         "dyn_expect_reassigned_in_own_rhs_ok",
+        "dyn_expect_primitive_assign_op_rhs_ok",
         "fn_ptr_expect_deep_parens_ok",
         "copy_proj_shared_ok",
         "copy_proj_generic_tuple_shared_ok",
@@ -1338,6 +1466,11 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         "copy_nested_after_param_ok",
         "copy_supertrait_region_ok",
         "copy_proj_region_ok",
+        "copy_mapped_proj_concrete_impl_ok",
+        "copy_mapped_proj_static_impl_ok",
+        "copy_mapped_trait_concrete_impl_ok",
+        "copy_outlives_fn_ptr_hrtb_ok",
+        "copy_outlives_fn_ptr_same_lt_ok",
         "PROMOTED_OUTLIVES",
     ] {
         let body = find(ok_fn);
@@ -1361,6 +1494,9 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         "dyn_expect_destructuring_reassign_err",
         "dyn_expect_reassigned_in_loop_err",
         "dyn_expect_reassigned_in_own_lhs_after_rhs_err",
+        "dyn_expect_primitive_assign_op_lhs_after_rhs_err",
+        "dyn_expect_mut_ref_overwrite_err",
+        "dyn_expect_mut_method_extend_err",
     ] {
         let body = find(err_fn);
         let (types, v) = world.check_borrows(body, heap.alloc());
@@ -1409,6 +1545,10 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         "copy_supertrait_region_mismatch_err",
         "copy_proj_region_mismatch_err",
         "copy_proj_region_wrong_out_err",
+        "copy_mapped_proj_concrete_wrong_out_err",
+        "copy_mapped_proj_static_impl_short_err",
+        "copy_outlives_fn_ptr_free_short_err",
+        "copy_outlives_fn_ptr_param_err",
     ] {
         let body = find(err_fn);
         let (types, v) = world.check_borrows(body, heap.alloc());
