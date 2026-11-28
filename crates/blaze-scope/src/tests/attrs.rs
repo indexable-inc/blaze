@@ -73,19 +73,93 @@ fn a_comment_inside_a_cfg_predicate_is_whitespace() {
 #[test]
 fn cfg_version_predicate_evaluates_against_pinned_release() {
     let g = blaze_own::Alloc::global();
-    let cfg = crate::task::Cfg::from_atoms(&[("rust_nightly", None)], g);
+    // Gate OFF by default: `version(..)` is unread (`None`) whether it would hold or not.
+    let gated = crate::task::Cfg::from_atoms(&[("rust_nightly", None)], g);
+    assert_eq!(gated.eval("version(\"1.76\")"), None);
+    assert_eq!(gated.eval("version(\"99.0\")"), None);
+    assert_eq!(gated.eval("not(version(\"99.0\"))"), None);
+    assert_eq!(gated.eval("all(false, version(\"99.0\"))"), None);
+
+    // Gate ON: decodes cooked escapes, line continuations, and raw strings before version comparison.
+    let cfg = gated.with_cfg_version(true);
     assert_eq!(cfg.eval("version(\"1.76\")"), Some(true));
     assert_eq!(cfg.eval("version(\"1.76.0\")"), Some(true));
     assert_eq!(cfg.eval("version(\"1.76\",)"), Some(true));
+    assert_eq!(cfg.eval("version(\"\\x31.76\")"), Some(true));
+    assert_eq!(cfg.eval("version(\"1.\\\n  76\")"), Some(true));
+    assert_eq!(cfg.eval("version(r\"1.76\")"), Some(true));
+    assert_eq!(cfg.eval("version(r#\"1.76\"#)"), Some(true));
     assert_eq!(cfg.eval("version(\"99.0\")"), Some(false));
     assert_eq!(cfg.eval("not(version(\"99.0\"))"), Some(true));
     assert_eq!(cfg.eval("not(version(\"1.76\"))"), Some(false));
     assert_eq!(cfg.eval("version(\"..\")"), Some(false));
     assert_eq!(cfg.eval("all(rust_nightly, version(\"1.76\"))"), Some(true));
-    // Negative controls: malformed `version(..)` and unknown calls remain unread (`None`).
+    // Negative controls: malformed `version(..)`, bad escapes, and unknown calls remain unread (`None`).
     assert_eq!(cfg.eval("version()"), None);
     assert_eq!(cfg.eval("version(123)"), None);
+    assert_eq!(cfg.eval("version(\"\\q\")"), None);
     assert_eq!(cfg.eval("version(\"1.76\", \"1.77\")"), None);
     assert_eq!(cfg.eval("version(rust_nightly)"), None);
     assert_eq!(cfg.eval("unknown_call(\"foo\")"), None);
+}
+
+#[test]
+fn cfg_version_feature_gate_enforced_in_crate_scope() {
+    use crate::resolve::NamesNote;
+    use crate::task::LowerNoteKind;
+
+    const GATED_OFF: &str = "#![no_core]
+#[cfg(version(\"1.76\"))]
+pub struct Kept;
+#[cfg(version(\"99.0\"))]
+pub struct Dropped;
+";
+    const GATED_ON: &str = "#![no_core]
+#![cfg_attr(rust_nightly, feature(cfg_version))]
+#[cfg(version(\"1.76\"))]
+pub struct Kept;
+#[cfg(version(\"\\x31.76\"))]
+pub struct Escaped;
+#[cfg(version(\"99.0\"))]
+pub struct Dropped;
+";
+    const DISABLED_OUTER: &str = "#![no_core]
+#![cfg_attr(rust_nightly, feature(cfg_version))]
+#[cfg(rust_nightly)]
+mod nightly_only {
+    #[cfg(version(\"1.76\"))]
+    pub struct Inner;
+}
+#[cfg(rust_nightly)]
+#[cfg(version(\"1.76\"))]
+pub struct StackedSkipped;
+";
+
+    // 1. Without `#![feature(cfg_version)]`: both true and false `version(..)` emit UnstableCfgVersion.
+    static T_OFF: Texts = Texts(&[&[("/off/lib.rs", GATED_OFF)]]);
+    let crates_off = [input("off", "/off/lib.rs", &[])];
+    let names_off = resolved(&crates_off, &T_OFF);
+    let gated_notes = names_off
+        .notes(0)
+        .iter()
+        .filter(|n| matches!(n, NamesNote::Lower(l) if matches!(l.kind, LowerNoteKind::UnstableCfgVersion)))
+        .count();
+    assert_eq!(gated_notes, 2, "expected 2 UnstableCfgVersion notes (both true and false predicates): {:?}", names_off.notes(0));
+
+    // 2. With `#![cfg_attr(rust_nightly, feature(cfg_version))]` active: zero gate notes, Kept + Escaped declared, Dropped stripped.
+    static T_ON: Texts = Texts(&[&[("/on/lib.rs", GATED_ON)]]);
+    let mut c_on = input("on", "/on/lib.rs", &[]);
+    c_on.cfg = &[("rust_nightly", None)];
+    let names_on = resolved(&[c_on], &T_ON);
+    assert!(names_on.notes(0).is_empty(), "expected no notes with feature(cfg_version): {:?}", names_on.notes(0));
+    let g = blaze_own::Alloc::global();
+    assert!(names_on.item_at(names_on.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments: &["Kept"] }, g).is_ok());
+    assert!(names_on.item_at(names_on.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments: &["Escaped"] }, g).is_ok());
+    assert!(names_on.item_at(names_on.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments: &["Dropped"] }, g).is_err());
+
+    // 3. Inactive outer `#[cfg(rust_nightly)]` strips the inner `#[cfg(version("1.76"))]` before gate checking.
+    static T_DIS: Texts = Texts(&[&[("/dis/lib.rs", DISABLED_OUTER)]]);
+    let crates_dis = [input("dis", "/dis/lib.rs", &[])];
+    let names_dis = resolved(&crates_dis, &T_DIS);
+    assert!(names_dis.notes(0).is_empty(), "disabled outer cfg must not trigger cfg_version gate: {:?}", names_dis.notes(0));
 }

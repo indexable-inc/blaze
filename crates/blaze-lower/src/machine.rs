@@ -3382,19 +3382,24 @@ impl<'t, 'c, 'a, 's> Machine<'t, 'c, 'a, 's> {
                 CfgAnswer::No => CfgAnswer::Yes,
                 CfgAnswer::Need => CfgAnswer::Need,
             },
-            Some("version") if !bad && total_args == 1 => match version_str.and_then(|sr| lit::str_body(sr.of(self.text()))) {
-                Some(spec) => {
-                    if blaze_pins::cfg_version_holds(spec) {
-                        CfgAnswer::Yes
-                    } else {
+            Some("version") if !bad && total_args == 1 => {
+                match version_str.and_then(|sr| blaze_expand::eval_cfg_version_literal(sr.of(self.text()))) {
+                    Some(holds) => {
+                        if !self.cfg.as_deref().is_some_and(Cfg::cfg_version_enabled) {
+                            self.diag(DiagKind::UnstableCfgVersion, r);
+                            CfgAnswer::No
+                        } else if holds {
+                            CfgAnswer::Yes
+                        } else {
+                            CfgAnswer::No
+                        }
+                    }
+                    None => {
+                        self.diag(DiagKind::Syntax, r);
                         CfgAnswer::No
                     }
                 }
-                None => {
-                    self.diag(DiagKind::Syntax, r);
-                    CfgAnswer::No
-                }
-            },
+            }
             _ => {
                 // rustc refuses an unknown or malformed predicate; so does the lowering, by a diagnostic.
                 self.diag(DiagKind::Syntax, r);

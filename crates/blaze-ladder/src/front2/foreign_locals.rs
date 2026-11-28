@@ -202,6 +202,7 @@ pub fn declared<'t, 'a>(block: &'t str, edition: Edition, cfg: &mut dyn Cfg, all
 /// `#[cfg]` and `cfg!` is read by.
 fn attr_keeps(attr: &str, kind: AttrKind, edition: Edition, cfg: &mut dyn Cfg, alloc: Alloc<'_>) -> Result<bool, Refused> {
     let tokens = blaze_expand::lex(attr, edition, alloc).map_err(|_| Refused::CfgForm)?;
+    let cfg_version = cfg.cfg_version_enabled();
     let mut atom = |name: &str, value: Option<&str>| match cfg.atom(name, value) {
         CfgAnswer::Yes => Ok(true),
         CfgAnswer::No => Ok(false),
@@ -209,7 +210,9 @@ fn attr_keeps(attr: &str, kind: AttrKind, edition: Edition, cfg: &mut dyn Cfg, a
     };
     let predicate = |e: CfgPredicateError<()>| match e {
         CfgPredicateError::Atom(()) => Refused::CfgAtom,
-        CfgPredicateError::Malformed { .. } | CfgPredicateError::NotTakesOne { .. } => Refused::CfgForm,
+        CfgPredicateError::Malformed { .. }
+        | CfgPredicateError::NotTakesOne { .. }
+        | CfgPredicateError::UnstableCfgVersion { .. } => Refused::CfgForm,
     };
     let list = tokens.tokens();
     let index = |at: usize| u32::try_from(at).map_err(|_| Refused::CfgForm);
@@ -227,7 +230,7 @@ fn attr_keeps(attr: &str, kind: AttrKind, edition: Edition, cfg: &mut dyn Cfg, a
             one.push(index(2)?..index(last)?);
             one
         }
-        AttrKind::CfgAttr => blaze_expand::cfg_attr_metas(&tokens, alloc, &mut atom).map_err(|e| match e {
+        AttrKind::CfgAttr => blaze_expand::cfg_attr_metas_with_version(&tokens, cfg_version, alloc, &mut atom).map_err(|e| match e {
             CfgAttrError::Predicate(p) => predicate(p),
             CfgAttrError::NotCfgAttr | CfgAttrError::NoPredicate { .. } => Refused::CfgForm,
         })?,
@@ -249,7 +252,7 @@ fn attr_keeps(attr: &str, kind: AttrKind, edition: Edition, cfg: &mut dyn Cfg, a
             }
             continue;
         }
-        if !blaze_expand::cfg_predicate_at(&tokens, start + 2..end - 1, alloc, &mut atom).map_err(predicate)? {
+        if !blaze_expand::cfg_predicate_at_with_version(&tokens, start + 2..end - 1, cfg_version, alloc, &mut atom).map_err(predicate)? {
             return Ok(false);
         }
     }

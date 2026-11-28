@@ -244,6 +244,7 @@ pub struct Top<'a> {
 pub struct Reading<'a, 'c> {
     pub edition: Edition,
     pub atoms: &'c [(&'c str, Option<&'c str>)],
+    pub cfg_version: bool,
     pub alloc: Alloc<'a>,
 }
 
@@ -392,7 +393,7 @@ impl<'a, 'c> Walker<'a, 'c> {
         if !(sig.contains("no_mangle") || sig.contains("export_name") || sig.contains("cfg")) {
             return Ok(Read::On { symbol: None });
         }
-        let low = blaze_lower::lower_signature(item_text, self.reading.edition, &mut CrateCfg(self.reading.atoms), self.reading.alloc).map_err(|_| Bad::Cfg)?;
+        let low = blaze_lower::lower_signature(item_text, self.reading.edition, &mut CrateCfg::with_version(self.reading.atoms, self.reading.cfg_version), self.reading.alloc).map_err(|_| Bad::Cfg)?;
         let v = low.view();
         if v.cfg_out() {
             return Ok(Read::Off);
@@ -525,7 +526,7 @@ impl<'a, 'c> Walker<'a, 'c> {
                 NestedKind::ExternBlock => {
                     // Its fns and statics are rows of this block (locals.rs `Locals::keep`):
                     // counted for the ordinals; a foreign item is never an export.
-                    let decls = match super::foreign_locals::declared(item_text, self.reading.edition, &mut CrateCfg(self.reading.atoms), alloc) {
+                    let decls = match super::foreign_locals::declared(item_text, self.reading.edition, &mut CrateCfg::with_version(self.reading.atoms, self.reading.cfg_version), alloc) {
                         Ok((_, decls)) => decls,
                         Err(r) => {
                             let path = self.out.path(at, "extern", alloc)?;
@@ -642,7 +643,8 @@ fn walk_top<'n, S: NamesSource<'n>>(names: S, key: LibKey, alloc: Alloc<'n>) -> 
         return Err(Front2Refusal::Attrs { function: Box::from(name), why: Box::from("crate 0's key, edition or cfg was not read by the names source") });
     };
     let top = Top { text: it.text, name, library: Some((crate_key, key)) };
-    let walked = walk(top, Reading { edition, atoms, alloc }).map_err(|r| rule_refusal(name, r))?;
+    let cfg_version = names.has_feature(0, "cfg_version").unwrap_or(false);
+    let walked = walk(top, Reading { edition, atoms, cfg_version, alloc }).map_err(|r| rule_refusal(name, r))?;
     Ok(Some((walked, name)))
 }
 
@@ -726,7 +728,7 @@ mod tests {
                     }\n";
         let top = Top { text, name: "outer", library: None };
         let alloc = blaze_own::testing::heap().alloc();
-        let walked = walk(top, Reading { edition: Edition::E2021, atoms: MAC, alloc }).unwrap_or_else(|e| panic!("refused: {e}"));
+        let walked = walk(top, Reading { edition: Edition::E2021, atoms: MAC, cfg_version: false, alloc }).unwrap_or_else(|e| panic!("refused: {e}"));
         let mut symbols: std::vec::Vec<&str> = walked.exports.iter().map(|e| e.symbol).collect();
         symbols.sort_unstable();
         assert_eq!(symbols, ["in_impl", "one", "two"]);

@@ -259,7 +259,7 @@ impl<'n> DefinitionSearch<'n, '_> {
         } else {
             blaze_lower::ItemContext::TopLevel
         };
-        blaze_lower::lower_signature_in_context(text, self.record.edition(), context, &mut super::heads::CrateCfg(atoms), self.alloc)
+        blaze_lower::lower_signature_in_context(text, self.record.edition(), context, &mut super::heads::CrateCfg::of(self.names, krate, atoms), self.alloc)
             .map_err(|_| missing("a readable signature"))
     }
 

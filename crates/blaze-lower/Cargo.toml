@@ -33,8 +33,6 @@ blaze-expand.workspace = true
 # `Names::macro_definition`: `scoped::Scoped`, a body call's path resolved in its module, any
 # crate (a read of the names already made: no IO).
 blaze-scope.workspace = true
-# `cfg_version_holds`: RFC 2523 `#[cfg(version("..."))]` against the pinned rustc release.
-blaze-pins.workspace = true
 parser.workspace = true
 
 [dev-dependencies]

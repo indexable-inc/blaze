@@ -39,7 +39,7 @@ pub(crate) fn findings(c: &CrateNames<'_>, kept: SharedAlloc<'static>) -> blaze_
             WalkNote::NeitherFile { at, rs, mod_rs, .. } => (blaze_drive::task::MODULE_FILE_MISSING_RULE, *at, [rs.as_str(), mod_rs.as_str()]),
             WalkNote::PathFileNotFound { at, path } => (blaze_drive::task::PATH_FILE_MISSING_RULE, *at, [path.as_str(), ""]),
             // Not a missing file: the walk's own limits and choices, each its own matter.
-            WalkNote::BothFiles { .. } | WalkNote::TooManyModules { .. } | WalkNote::PathValueRefused { .. } => continue,
+            WalkNote::BothFiles { .. } | WalkNote::TooManyModules { .. } | WalkNote::PathValueRefused { .. } | WalkNote::UnstableCfgVersion { .. } => continue,
         };
         let Some(file) = c.files.get(at.file as usize).copied() else { continue };
         if !file.path.starts_with("/0/") {

@@ -217,6 +217,44 @@ pub fn decode_name_value_str(rest: &str, mut push: impl FnMut(char)) -> bool {
     ok
 }
 
+/// Decodes one unsuffixed Rust string literal token (`"..."` or `r#"..."#`, NOT byte/C-string)
+/// using Rust's lexer and string unescaper, feeding each decoded `char` to `push` in order.
+/// Returns `false` if `token_text` is not a single unsuffixed string literal or contains a fatal
+/// escape error.
+pub fn decode_str_literal(token_text: &str, mut push: impl FnMut(char)) -> bool {
+    use rustc_lexer::{FrontmatterAllowed, LiteralKind as L, TokenKind as K};
+    let mut tokens = rustc_lexer::tokenize(token_text, FrontmatterAllowed::No);
+    let Some(token) = tokens.next() else { return false };
+    if tokens.next().is_some() {
+        return false;
+    }
+    let K::Literal { kind, suffix_start } = token.kind else { return false };
+    if suffix_start != token.len {
+        return false;
+    }
+    let (raw, start, tail) = match kind {
+        L::Str { terminated: true } => (false, 1usize, 1usize),
+        L::RawStr { n_hashes: Some(n) } => (true, 2 + usize::from(n), 1 + usize::from(n)),
+        _ => return false,
+    };
+    let Some(body_end) = token_text.len().checked_sub(tail) else { return false };
+    let Some(body) = token_text.get(start..body_end) else { return false };
+    let mut ok = true;
+    if raw {
+        parser::unescape::check_raw_str(body, |_, unit| match unit {
+            Ok(ch) => push(ch),
+            Err(_) => ok = false,
+        });
+    } else {
+        parser::unescape::unescape_str(body, |_, unit| match unit {
+            Ok(ch) => push(ch),
+            Err(error) if error.is_fatal() => ok = false,
+            Err(_) => {}
+        });
+    }
+    ok
+}
+
 /// The value of a string literal (`"…"` or `r#"…"#`), whose tt text is `text`, appended.
 pub(crate) fn string_value(
     kind: LitKind,

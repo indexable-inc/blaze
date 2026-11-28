@@ -136,7 +136,7 @@ fn read_decl_attrs<'n, 'a, S: NamesSource<'n>>(
     let atoms = names.cfg_atoms(krate).ok_or(())?;
     let edition = names.edition_of(krate).ok_or(())?;
     let extensions = names.blaze_extensions(krate);
-    let sig = blaze_lower::lower_signature_with_extensions(text, edition, extensions, &mut CrateCfg(atoms), alloc)
+    let sig = blaze_lower::lower_signature_with_extensions(text, edition, extensions, &mut CrateCfg::of(names, krate, atoms), alloc)
         .map_err(|_| ())?;
     let v = sig.view();
     let mut link_name: Option<AString<'a>> = None;
@@ -246,7 +246,7 @@ fn exports_symbol<'n, 'a, S: NamesSource<'n>>(
     let atoms = names.cfg_atoms(krate).ok_or_else(unread)?;
     let edition = names.edition_of(krate).ok_or_else(unread)?;
     let extensions = names.blaze_extensions(krate);
-    let sig = blaze_lower::lower_signature_with_extensions(text, edition, extensions, &mut CrateCfg(atoms), alloc)
+    let sig = blaze_lower::lower_signature_with_extensions(text, edition, extensions, &mut CrateCfg::of(names, krate, atoms), alloc)
         .map_err(|_| attrs_err())?;
     let v = sig.view();
     if v.cfg_out() {

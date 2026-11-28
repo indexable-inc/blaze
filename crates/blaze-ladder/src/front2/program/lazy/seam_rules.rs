@@ -681,7 +681,8 @@ impl<'n> Anchor<'n> {
                     Some(cfg) => cfg,
                     None => {
                         let atoms = names.cfg_atoms(krate).ok_or(PositionGap::NoFile)?;
-                        cfg.insert(blaze_scope::task::Cfg::from_atoms(atoms, alloc))
+                        let cfg_version = names.has_feature(krate, "cfg_version").unwrap_or(false);
+                        cfg.insert(blaze_scope::task::Cfg::from_atoms(atoms, alloc).with_cfg_version(cfg_version))
                     }
                 };
                 Ok(cfg.eval(pred) == Some(true))

@@ -614,6 +614,12 @@ pub enum CfgAnswer {
 /// off, as written: an escape stays an escape).
 pub trait Cfg {
     fn atom(&mut self, name: &str, value: Option<&str>) -> CfgAnswer;
+
+    /// Whether `#![feature(cfg_version)]` is enabled at the crate root (RFC 2523).
+    /// Defaults to `false`, enforcing the unstable feature gate unless the crate opts in.
+    fn cfg_version_enabled(&self) -> bool {
+        false
+    }
 }
 
 /// The outcome of a `cfg!` predicate (an expander host's `ExpandCx::cfg`) under `cfg`, the
@@ -621,12 +627,13 @@ pub trait Cfg {
 /// not known yet, or tokens that are no predicate, are refused by name, never guessed.
 pub fn cfg_outcome(predicate: &blaze_expand::TokenStream<'_>, cfg: &mut dyn Cfg, alloc: Alloc<'_>) -> Result<bool, blaze_expand::HostError> {
     let refused = blaze_expand::HostError { ask: blaze_expand::HostAsk::Cfg, why: blaze_expand::HostWhy::Refused };
+    let cfg_version = cfg.cfg_version_enabled();
     let mut atom = |name: &str, value: Option<&str>| match cfg.atom(name, value) {
         CfgAnswer::Yes => Ok(true),
         CfgAnswer::No => Ok(false),
         CfgAnswer::Need => Err(()),
     };
-    blaze_expand::cfg_predicate(predicate, alloc, &mut atom).map_err(|_| refused)
+    blaze_expand::cfg_predicate_with_version(predicate, cfg_version, alloc, &mut atom).map_err(|_| refused)
 }
 
 /// A lowering that met `cfg` atoms, or identifier patterns' names ([`ValueName::Need`]), not

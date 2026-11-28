@@ -11,7 +11,7 @@ use blaze_own::{AVec, Alloc};
 
 use crate::{
     builtin::stringified,
-    cfg::{CfgPredicateError, cfg_predicate},
+    cfg::{CfgPredicateError, cfg_predicate_with_version},
     def::{MacroDefinition, ProcKind},
     error::ExpandError,
     expansion::{ProcLevel, ReadAnswer, ReadKind, Reads, TokenOrigin},
@@ -28,6 +28,11 @@ pub trait ExpandCx {
 
     /// The outcome of the cfg `predicate` for the crate the call is in.
     fn cfg(&self, predicate: &TokenStream<'_>) -> Result<bool, HostError>;
+
+    /// Whether `#![feature(cfg_version)]` is active in the crate the call is in (RFC 2523).
+    fn cfg_version_enabled(&self) -> bool {
+        false
+    }
 
     /// The file `path` names, as written in the call, from the file of the call.
     fn include(&self, path: &str, how: IncludeAs) -> Result<Included<'_>, HostError>;
@@ -143,7 +148,7 @@ impl<'x, 'a, C: ExpandCx> Recorder<'x, 'a, C> {
     pub(crate) fn cfg(&mut self, predicate: &TokenStream<'_>) -> Result<bool, CfgPredicateError<ExpandError>> {
         let Recorder { cx, reads, edition, scratch } = self;
         let (cx, root, scratch) = (*cx, Ctx::root(*edition), *scratch);
-        cfg_predicate(predicate, scratch, &mut |name, value| -> Result<bool, ExpandError> {
+        cfg_predicate_with_version(predicate, cx.cfg_version_enabled(), scratch, &mut |name, value| -> Result<bool, ExpandError> {
             let mut atom = TokenStream::new_in(scratch);
             atom.ident(name, root)?;
             if let Some(value) = value {

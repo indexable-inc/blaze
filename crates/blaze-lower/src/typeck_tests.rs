@@ -2185,6 +2185,9 @@ fn cfg_version_starlark_map_simd_converts_to_typeck() {
                 crate::CfgAnswer::No
             }
         }
+        fn cfg_version_enabled(&self) -> bool {
+            self.0
+        }
     }
 
     let heap = blaze_own::testing::heap();

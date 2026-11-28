@@ -2057,6 +2057,10 @@ pub enum DiagKind {
     /// [`AsmRule`] (`asm.rs`). Encoded with the tag `DIAG_KINDS.len()` and the rule's code in
     /// `c`.
     Asm(AsmRule),
+    /// `#[cfg(version("..."))]` used without `#![feature(cfg_version)]` (E0658, RFC 2523).
+    /// Encoded at tag `DIAG_KINDS.len() + 1` so existing tags `0..=DIAG_KINDS.len()` keep their
+    /// persisted meaning.
+    UnstableCfgVersion,
 }
 
 /// A diagnostic, at a range of the record (its position: [`crate::View::site`]).
@@ -2083,6 +2087,7 @@ impl Diag {
     pub(crate) fn encode(self) -> Node {
         let (code, rule) = match self.kind {
             DiagKind::Asm(rule) => (DIAG_KINDS.len() as u16, rule.code()),
+            DiagKind::UnstableCfgVersion => (u16::try_from(DIAG_KINDS.len().saturating_add(1)).unwrap_or(u16::MAX), NONE),
             kind => (DIAG_KINDS.iter().position(|k| *k == kind).map_or(0, |i| i as u16), NONE),
         };
         Node { a: self.range.raw().start, b: self.range.raw().end, c: rule, ..Node::of(code) }
@@ -2091,6 +2096,8 @@ impl Diag {
     pub(crate) fn decode(n: Node, lens: Lens) -> Result<Diag, BadRow> {
         let kind = if n.tag as usize == DIAG_KINDS.len() {
             DiagKind::Asm(AsmRule::of_code(n.c).ok_or(bad("diags", n.tag))?)
+        } else if usize::from(n.tag) == DIAG_KINDS.len() + 1 {
+            DiagKind::UnstableCfgVersion
         } else {
             *DIAG_KINDS.get(n.tag as usize).ok_or(bad("diags", n.tag))?
         };
