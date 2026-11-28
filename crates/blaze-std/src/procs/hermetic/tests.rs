@@ -396,3 +396,75 @@ fn a_spec_has_one_spelling() {
     assert_eq!(fault(opts(&[], ClockSpec::NeverAsks, Some(1))), Some(Fault::StepsNotMetered));
     assert_eq!(fault(opts(&[("SOURCE_DATE_EPOCH", "5")], ClockSpec::Fixed { unix_secs: 5 }, None)), None);
 }
+
+#[test]
+fn fs_err_to_fault_preserves_distinct_stopped_reasons_instead_of_collapsing_to_errno_110() {
+    use blaze_core::DirName;
+    use crate::Stopped;
+    use crate::fs::{FsError, FsKind, FsOp};
+
+    let make = |kind| FsError { op: FsOp::Open, path: DirName::Root, kind };
+
+    let cases = [
+        Stopped::Deadline { span: "elf.open", at: Duration::from_secs(30) },
+        Stopped::Cancelled { span: "elf.open" },
+        Stopped::Stalled { span: "elf.open", polls: 64 },
+        Stopped::OutOfMemory { arena: "task", asked: 4096 },
+    ];
+    for expected in cases {
+        let fault = super::fs_err_to_fault("open elf inode record", make(FsKind::Stopped(expected.clone())));
+        assert_eq!(
+            fault,
+            Fault::HostStopped { call: "open elf inode record", why: expected.clone() },
+            "Stopped reason must be preserved verbatim, never collapsed to Host {{ code: 110 }}"
+        );
+        assert_ne!(
+            fault,
+            Fault::Host { call: "open elf inode record", code: 110 },
+            "Stopped must not collapse to opaque errno 110"
+        );
+        assert_eq!(
+            fault.rule(),
+            super::Rule::BoundedProgress,
+            "HostStopped belongs to Rule::BoundedProgress"
+        );
+        let rendered = alloc::format!("{}", super::HermeticError::new("clang-23", fault));
+        assert!(rendered.contains("HostStopped"), "rendered error missing HostStopped: {rendered}");
+        assert!(rendered.contains("open elf inode record"), "rendered error missing call name: {rendered}");
+    }
+
+    // Distinct Stopped reasons must remain distinguishable from each other.
+    let f_deadline = super::fs_err_to_fault(
+        "open elf inode record",
+        make(FsKind::Stopped(Stopped::Deadline { span: "s", at: Duration::from_secs(1) })),
+    );
+    let f_cancelled = super::fs_err_to_fault(
+        "open elf inode record",
+        make(FsKind::Stopped(Stopped::Cancelled { span: "s" })),
+    );
+    let f_stalled = super::fs_err_to_fault(
+        "open elf inode record",
+        make(FsKind::Stopped(Stopped::Stalled { span: "s", polls: 8 })),
+    );
+    let f_oom = super::fs_err_to_fault(
+        "open elf inode record",
+        make(FsKind::Stopped(Stopped::OutOfMemory { arena: "a", asked: 16 })),
+    );
+    assert_ne!(f_deadline, f_cancelled);
+    assert_ne!(f_deadline, f_stalled);
+    assert_ne!(f_deadline, f_oom);
+    assert_ne!(f_cancelled, f_stalled);
+
+    // Non-Stopped filesystem errors still map to Fault::Host with their POSIX errno and Rule::NoFallback.
+    let f_not_found = super::fs_err_to_fault("open elf inode record", make(FsKind::NotFound));
+    assert_eq!(f_not_found, Fault::Host { call: "open elf inode record", code: 2 });
+    assert_eq!(f_not_found.rule(), super::Rule::NoFallback);
+    assert_eq!(
+        super::fs_err_to_fault("open elf inode record", make(FsKind::IsADirectory)),
+        Fault::Host { call: "open elf inode record", code: 21 }
+    );
+    assert_eq!(
+        super::fs_err_to_fault("open elf inode record", make(FsKind::NotADirectory)),
+        Fault::Host { call: "open elf inode record", code: 20 }
+    );
+}

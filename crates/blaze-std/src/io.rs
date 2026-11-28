@@ -963,6 +963,19 @@ impl Io {
         self.limits
     }
 
+    /// Whether `self` and `other` share the same underlying driver world (and therefore the same
+    /// driver poll lock).
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn shares_world(&self, other: &Io) -> bool {
+        match (&self.reach, &other.reach) {
+            (Reach::Shared { world: a, .. }, Reach::Shared { world: b, .. }) => core::ptr::eq(&**a, &**b),
+            (Reach::Hosted, Reach::Hosted) => true,
+            _ => false,
+        }
+    }
+
     /// The root context: named `main`, never cancelled, ending `budget` from now on the
     /// driver's clock, with a frame of its own that hands out at most `scratch` bytes
     /// ([`crate::mem::TASK_FRAME`] is the usual value; it is named at the call, never
