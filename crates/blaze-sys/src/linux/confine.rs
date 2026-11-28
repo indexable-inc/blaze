@@ -222,6 +222,14 @@ pub mod deny {
     pub const EPERM: [u32; 19] = [41, 101, 310, 311, 165, 166, 155, 272, 308, 428, 429, 430, 432, 321, 298, 425, 250, 248, 249];
     #[cfg(target_arch = "aarch64")]
     pub const EPERM: [u32; 19] = [198, 117, 270, 271, 40, 39, 41, 97, 268, 428, 429, 430, 432, 280, 241, 425, 219, 217, 218];
+    /// External process-signaling syscalls (`kill`, `tkill`, `tgkill`, `pidfd_send_signal`,
+    /// `rt_sigqueueinfo`, `rt_tgsigqueueinfo`) denied with `EPERM` when signal isolation is
+    /// enforced in seccomp (covering Linux kernels with Landlock ABI 3–5 where
+    /// `LANDLOCK_SCOPE_SIGNAL` is unavailable, and defense-in-depth on ABI >= 6).
+    #[cfg(target_arch = "x86_64")]
+    pub const SIGNALS_EPERM: [u32; 6] = [62, 200, 234, 424, 129, 297];
+    #[cfg(target_arch = "aarch64")]
+    pub const SIGNALS_EPERM: [u32; 6] = [129, 130, 131, 424, 138, 240];
     /// `clone`.
     #[cfg(target_arch = "x86_64")]
     pub const CLONE: u32 = 56;
@@ -254,10 +262,25 @@ const fn jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
 #[blaze::noalloc]
 #[blaze::nopanic]
 pub fn build(filter: Filter, out: &mut [SockFilter; MOST_FILTER]) -> &[SockFilter] {
+    build_scoped(filter, false, out)
+}
+
+/// Like [`build`], additionally denying process-signaling syscalls ([`deny::SIGNALS_EPERM`]) with
+/// `EPERM` when `deny_signals` is `true` so a confined single-process worker cannot signal
+/// external same-UID host processes even on Linux kernels with Landlock ABI 3–5.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn build_scoped(
+    filter: Filter,
+    deny_signals: bool,
+    out: &mut [SockFilter; MOST_FILTER],
+) -> &[SockFilter] {
     let mut at = 0;
     let mut put = |instruction: SockFilter| {
-        out[at] = instruction;
-        at += 1;
+        if let Some(slot) = out.get_mut(at) {
+            *slot = instruction;
+            at += 1;
+        }
     };
     put(stmt(LD_W_ABS, DATA_ARCH));
     put(jump(JEQ_K, AUDIT_ARCH, 1, 0));
@@ -270,6 +293,12 @@ pub fn build(filter: Filter, out: &mut [SockFilter; MOST_FILTER]) -> &[SockFilte
     for nr in deny::EPERM {
         put(jump(JEQ_K, nr, 0, 1));
         put(stmt(RET_K, RET_ERRNO | EPERM));
+    }
+    if deny_signals {
+        for nr in deny::SIGNALS_EPERM {
+            put(jump(JEQ_K, nr, 0, 1));
+            put(stmt(RET_K, RET_ERRNO | EPERM));
+        }
     }
     if !filter.processes {
         for nr in deny::FORKS {
@@ -285,7 +314,7 @@ pub fn build(filter: Filter, out: &mut [SockFilter; MOST_FILTER]) -> &[SockFilte
         put(stmt(RET_K, RET_ERRNO | EPERM));
     }
     put(stmt(RET_K, RET_ALLOW));
-    &out[..at]
+    out.get(..at).unwrap_or(&[])
 }
 
 /// Compiles a domain-based Classic-BPF seccomp filter for `allowed` on the current Linux
@@ -1066,7 +1095,7 @@ pub fn enter_test_sandbox(
 mod tests {
     use super::{
         CURRENT_SECCOMP_ARCH, Filter, MOST_FILTER, RET_ALLOW, SockFilter, build,
-        build_domain_filter, build_test,
+        build_domain_filter, build_scoped, build_test, deny,
     };
     use crate::effects::{DomainMask, compile_seccomp_bpf};
 
@@ -1086,7 +1115,20 @@ mod tests {
         for processes in [false, true] {
             let mut out = [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; MOST_FILTER];
             check_well_formed(build(Filter { processes }, &mut out));
+            let mut scoped = [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; MOST_FILTER];
+            check_well_formed(build_scoped(Filter { processes }, true, &mut scoped));
         }
+        assert_eq!(
+            deny::SIGNALS_EPERM,
+            [
+                u32::try_from(libc::SYS_kill).expect("SYS_kill"),
+                u32::try_from(libc::SYS_tkill).expect("SYS_tkill"),
+                u32::try_from(libc::SYS_tgkill).expect("SYS_tgkill"),
+                u32::try_from(libc::SYS_pidfd_send_signal).expect("SYS_pidfd_send_signal"),
+                u32::try_from(libc::SYS_rt_sigqueueinfo).expect("SYS_rt_sigqueueinfo"),
+                u32::try_from(libc::SYS_rt_tgsigqueueinfo).expect("SYS_rt_tgsigqueueinfo"),
+            ]
+        );
         let mut test_out = [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; MOST_FILTER];
         check_well_formed(build_test(&mut test_out));
     }

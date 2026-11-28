@@ -587,9 +587,8 @@ impl<'r> ProcMacros<'r> {
         if let Some(ref native_bin) = module.native_bin {
             let listed_dir: Option<blaze_own::AString<'_>>;
             let member_joined;
-            let member_rel_buf: Option<blaze_own::AString<'_>>;
-            let (raw_manifest_dir, raw_workspace_root, manifest_rel): (Option<&Path>, Option<&Path>, &Path) = match &package.files {
-                crate::sandbox::Files::Folder(dir) => (Some(dir.as_path()), None, Path::new("")),
+            let (raw_manifest_dir, raw_workspace_root): (Option<&Path>, Option<&Path>) = match &package.files {
+                crate::sandbox::Files::Folder(dir) => (Some(dir.as_path()), None),
                 crate::sandbox::Files::Member { workspace, root } => {
                     let seen = root.seen().to_string();
                     let rel = seen.strip_prefix("/workspace").unwrap_or("").trim_start_matches('/');
@@ -599,12 +598,10 @@ impl<'r> ProcMacros<'r> {
                         workspace.as_path()
                     };
                     if rel.is_empty() {
-                        (Some(base), Some(base), Path::new(""))
+                        (Some(base), Some(base))
                     } else {
                         member_joined = base.join(rel);
-                        member_rel_buf = Some(blaze_own::AString::from_str_in(rel, alloc));
-                        let rel_path = member_rel_buf.as_deref().map_or(Path::new(""), Path::new);
-                        (Some(member_joined.as_path()), Some(base), rel_path)
+                        (Some(member_joined.as_path()), Some(base))
                     }
                 }
                 crate::sandbox::Files::Listed(listed) => {
@@ -638,7 +635,7 @@ impl<'r> ProcMacros<'r> {
                     let base_dir = native_manifest_stage_root();
                     let seq = self.stage_seq.fetch_add(1, Ordering::Relaxed);
                     listed_dir = materialize_listed_in(&base_dir, &package.files, seq, alloc);
-                    (listed_dir.as_deref().map(Path::new), None, Path::new(""))
+                    (listed_dir.as_deref().map(Path::new), None)
                 }
             };
             let canon_str = |p: &Path| -> Option<blaze_own::AString<'_>> {
@@ -649,34 +646,19 @@ impl<'r> ProcMacros<'r> {
             let canon_bin = fs::canonicalize(native_bin).unwrap_or_else(|_| native_bin.to_path_buf());
             let canon_manifest = raw_manifest_dir.and_then(&canon_str);
             let canon_workspace = raw_workspace_root.and_then(&canon_str);
-            // Grant ONLY the exact scoped roots that we also snapshot 1:1 into `Produced.reads`:
-            // - the crate's own `manifest_dir`,
-            // - for workspace sub-members, `<workspace>/.sqlx` (if present) and `<workspace>/Cargo.toml`
-            //   (if present), never exposing `.git/`, `target/`, or unrelated workspace crates.
-            let ws_sqlx = raw_workspace_root
-                .filter(|_| !manifest_rel.as_os_str().is_empty())
-                .map(|w| w.join(".sqlx"))
-                .filter(|p| p.is_dir())
-                .and_then(|p| canon_str(&p));
-            let ws_manifest = raw_workspace_root
-                .filter(|_| !manifest_rel.as_os_str().is_empty())
-                .map(|w| w.join("Cargo.toml"))
-                .filter(|p| p.is_file())
-                .and_then(|p| canon_str(&p));
-
+            // Grant the full served tree root read-only (for `Files::Member`, the full workspace
+            // root so sibling reads like `../shared/schema.sql` match Wasm's `/workspace` view;
+            // for `Files::Folder`/`Files::Listed`, the package root) and snapshot that exact root
+            // (`Path::new("")`) pre+post in `NativeBinServer::expand` (marking uncacheable if the
+            // bounded snapshot cap is exceeded or any file mutates mid-expansion).
             let mut read_roots: blaze_own::AVec<'_, &str> = blaze_own::AVec::new_in(alloc);
             let mut granted_rel_roots: blaze_own::AVec<'_, &Path> = blaze_own::AVec::new_in(alloc);
-            if let Some(ref m) = canon_manifest {
+            if let Some(ref ws) = canon_workspace {
+                read_roots.push(ws.as_str());
+                granted_rel_roots.push(Path::new(""));
+            } else if let Some(ref m) = canon_manifest {
                 read_roots.push(m.as_str());
-                granted_rel_roots.push(manifest_rel);
-            }
-            if let Some(ref s) = ws_sqlx {
-                read_roots.push(s.as_str());
-                granted_rel_roots.push(Path::new(".sqlx"));
-            }
-            if let Some(ref wm) = ws_manifest {
-                read_roots.push(wm.as_str());
-                granted_rel_roots.push(Path::new("Cargo.toml"));
+                granted_rel_roots.push(Path::new(""));
             }
             let paths = crate::native_bin::NativePaths {
                 manifest_dir: canon_manifest.as_deref(),

@@ -14,7 +14,7 @@
 //!   tree (by `..` or a link) stops the run with [`ProcLimit::Paths`], naming the path.
 //! - Standard output and error are dropped.
 
-use std::{ffi::{OsStr, OsString}, fs, io::ErrorKind, os::unix::ffi::OsStrExt, path::{Component, Path, PathBuf}};
+use std::{ffi::{OsStr, OsString}, fs, io::{ErrorKind, Read as _}, os::unix::ffi::OsStrExt, path::{Component, Path, PathBuf}};
 
 use blaze_expand::ProcLimit;
 use blaze_ids::ContentId;
@@ -367,8 +367,120 @@ pub struct Sandbox {
     pub(crate) env_refused: Option<EnvRefused>,
 }
 
+static READ_DOMAIN: blaze_ids::Domain = blaze_ids::Domain::new("blaze proc-macro read");
+
 fn digest(bytes: &[u8]) -> ContentId {
-    ContentId::of("blaze proc-macro read", bytes)
+    ContentId::of_domain(&READ_DOMAIN, bytes)
+}
+
+enum StreamDigest {
+    Digest(ContentId),
+    Absent,
+    Exceeded,
+}
+
+enum LinkDigest {
+    Digest(ContentId),
+    Uncacheable,
+}
+
+impl Files {
+    /// Streams a file's bytes into the same domain-separated BLAKE3 hasher as [`digest`] using a
+    /// fixed 16 KiB stack buffer, enforcing per-file (`max_file_bytes`) and cumulative
+    /// (`remaining_total_bytes`) byte caps without ever loading the full file into memory.
+    fn stream_digest(
+        &self,
+        rel: &Path,
+        max_file_bytes: u64,
+        remaining_total_bytes: &mut u64,
+    ) -> Result<StreamDigest, ()> {
+        match self {
+            Files::Folder(root) | Files::Member { workspace: root, .. } => {
+                let real = match self.real(root, rel).map_err(|_| ())? {
+                    Real::Found(real, _) => real,
+                    Real::Missing | Real::Loop => return Ok(StreamDigest::Absent),
+                };
+                let mut file = match fs::File::open(&real) {
+                    Ok(f) => f,
+                    Err(err) if err.kind() == ErrorKind::NotFound => return Ok(StreamDigest::Absent),
+                    Err(_) => return Err(()),
+                };
+                let meta_len = file.metadata().map_err(|_| ())?.len();
+                if meta_len > max_file_bytes || meta_len > *remaining_total_bytes {
+                    return Ok(StreamDigest::Exceeded);
+                }
+                let mut hasher = blaze_ids::Hasher::of(&READ_DOMAIN);
+                let mut buf = [0u8; 16 * 1024];
+                let mut file_read: u64 = 0;
+                loop {
+                    let n = match file.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                        Err(_) => return Err(()),
+                    };
+                    let n_u64 = u64::try_from(n).map_err(|_| ())?;
+                    file_read = file_read.saturating_add(n_u64);
+                    if file_read > max_file_bytes || file_read > *remaining_total_bytes {
+                        return Ok(StreamDigest::Exceeded);
+                    }
+                    if let Some(chunk) = buf.get(..n) {
+                        hasher.update(chunk);
+                    }
+                }
+                *remaining_total_bytes = remaining_total_bytes.saturating_sub(file_read);
+                Ok(StreamDigest::Digest(hasher.finish()))
+            }
+            Files::Listed(files) => {
+                let Some(rel) = rel.to_str() else {
+                    return Ok(StreamDigest::Absent);
+                };
+                if self.submodule_covering(rel).is_some() {
+                    return Err(());
+                }
+                let Ok(at) = files.binary_search_by(|(path, _)| path.as_str().cmp(rel)) else {
+                    return Ok(StreamDigest::Absent);
+                };
+                let Some((_, listed)) = files.get(at) else {
+                    return Ok(StreamDigest::Absent);
+                };
+                let slice = listed.as_slice();
+                let len_u64 = u64::try_from(slice.len()).map_err(|_| ())?;
+                if len_u64 > max_file_bytes || len_u64 > *remaining_total_bytes {
+                    return Ok(StreamDigest::Exceeded);
+                }
+                *remaining_total_bytes = remaining_total_bytes.saturating_sub(len_u64);
+                Ok(StreamDigest::Digest(digest(slice)))
+            }
+        }
+    }
+
+    /// Computes the machine-independent `link:` target digest of symlink `rel` matching
+    /// [`answer_now`] 1:1, or returns [`LinkDigest::Uncacheable`] if the symlink cannot be read or
+    /// points outside the served tree.
+    fn read_link_digest(&self, rel: &Path) -> LinkDigest {
+        match self {
+            Files::Folder(root) | Files::Member { workspace: root, .. } => {
+                if rel.as_os_str().is_empty() || rel.is_absolute() {
+                    return LinkDigest::Uncacheable;
+                }
+                let (Some(parent), Some(name)) = (rel.parent(), rel.file_name()) else {
+                    return LinkDigest::Uncacheable;
+                };
+                match self.real(root, parent) {
+                    Ok(Real::Found(parent_real, top)) => match fs::read_link(parent_real.join(name)) {
+                        Ok(target) => match normalize_link_target(&top, &target) {
+                            Some((is_abs, norm)) => LinkDigest::Digest(link_target_digest(is_abs, &norm)),
+                            None => LinkDigest::Uncacheable,
+                        },
+                        Err(_) => LinkDigest::Uncacheable,
+                    },
+                    _ => LinkDigest::Uncacheable,
+                }
+            }
+            Files::Listed(_) => LinkDigest::Uncacheable,
+        }
+    }
 }
 
 /// A folder's entries, sorted by name.
@@ -600,47 +712,65 @@ impl Sandbox {
         }
     }
 
-    /// Records every directory listing (`dir:<rel>`), regular file (`file:<rel>`), and symlink
-    /// (`lstat:<rel>` + target) beneath `rel_root` (relative to the package's served tree root)
-    /// into [`Self::reads`], using the exact same digests that [`answer_now`] recomputes on cache
-    /// validation. Used by Tier-2 confined `native.bin` workers whose OS sandbox permits direct
-    /// read-only `std::fs` access inside the granted tree so adding, deleting, or editing ANY
-    /// readable file invalidates cached expansions (rule 21).
+    /// Deterministically snapshots every directory listing (`dir:<rel>`), regular file
+    /// (`file:<rel>`), and symlink (`lstat:<rel>`, `link:<rel>`, plus followed target) beneath
+    /// `rel_roots` (relative to the package's served tree root), using the exact same digests that
+    /// [`answer_now`] recomputes on cache validation and streaming file contents in a bounded
+    /// stack buffer.
     ///
-    /// Returns `Ok(true)` when the entire subtree fit within `max_entries` and is safe to cache,
-    /// `Ok(false)` when `max_entries` was exceeded (caller must NOT cache an incomplete snapshot),
-    /// or `Err(())` if a symlink escaped the served tree.
-    pub(crate) fn record_granted_tree(&mut self, rel_root: &Path, max_entries: usize) -> Result<bool, ()> {
-        let mut stack = blaze_own::Vec::new_in(blaze_own::SharedAlloc::global());
+    /// Returns `Some(reads)` when every granted root fit within `max_entries`, `max_file_bytes`,
+    /// and `max_total_bytes` and contained no symlink escaping the served tree or pointing to a
+    /// directory. Returns `None` when any cap or uncacheable entry is encountered so the caller
+    /// never caches an incomplete or unsound snapshot (rule 18 & rule 21).
+    pub(crate) fn snapshot_granted_roots(
+        &self,
+        rel_roots: &[&Path],
+        max_entries: usize,
+        max_file_bytes: u64,
+        max_total_bytes: u64,
+    ) -> Option<blaze_own::Vec<Read, blaze_own::SharedAlloc<'static>>> {
+        let shared = blaze_own::SharedAlloc::global();
+        let mut out = blaze_own::Vec::new_in(shared);
+        let mut stack = blaze_own::Vec::new_in(shared);
         let mut visited: usize = 0;
+        let mut remaining_bytes: u64 = max_total_bytes;
 
-        match self.package.files.find(rel_root, true) {
-            Ok(Some(Found::Folder)) => {
-                stack.push(rel_root.to_path_buf());
+        let push_read = |out: &mut blaze_own::Vec<Read, blaze_own::SharedAlloc<'static>>,
+                         subject,
+                         digest| {
+            if !out.iter().any(|it| it.subject == subject) {
+                out.push(Read { subject, digest });
             }
-            Ok(Some(Found::File(_))) => {
-                let bytes = self.package.files.bytes(rel_root).map_err(|_| ())?;
-                self.record(Self::subject("file", rel_root), bytes.as_deref().map(digest));
-                return Ok(true);
+        };
+
+        for &rel_root in rel_roots {
+            match self.package.files.find(rel_root, false) {
+                Ok(Some(Found::Folder)) => {
+                    stack.push(rel_root.to_path_buf());
+                }
+                Ok(Some(Found::File(_))) => {
+                    match self.package.files.stream_digest(rel_root, max_file_bytes, &mut remaining_bytes) {
+                        Ok(StreamDigest::Digest(id)) => push_read(&mut out, Self::subject("file", rel_root), Some(id)),
+                        Ok(StreamDigest::Absent) => push_read(&mut out, Self::subject("file", rel_root), None),
+                        Ok(StreamDigest::Exceeded) | Err(()) => return None,
+                    }
+                }
+                Ok(Some(Found::Link(_) | Found::Loop)) => return None,
+                Ok(None) => {
+                    push_read(&mut out, Self::subject("stat", rel_root), None);
+                }
+                Err(_) => return None,
             }
-            Ok(Some(Found::Link(_) | Found::Loop)) => {
-                return Ok(false);
-            }
-            Ok(None) => {
-                self.record(Self::subject("stat", rel_root), None);
-                return Ok(true);
-            }
-            Err(_) => return Err(()),
         }
 
         while let Some(dir_rel) = stack.pop() {
-            let (canon, entries) = self.package.files.listing(&dir_rel).map_err(|_| ())?;
+            let (canon, entries) = self.package.files.listing(&dir_rel).ok()?;
             let list_digest = listing_digest(&canon, &entries);
-            self.record(Self::subject("dir", &dir_rel), Some(list_digest));
+            push_read(&mut out, Self::subject("dir", &dir_rel), Some(list_digest));
             for (name_bytes, filetype) in entries {
                 visited = visited.saturating_add(1);
                 if visited > max_entries {
-                    return Ok(false);
+                    return None;
                 }
                 let child_rel = if dir_rel.as_os_str().is_empty() {
                     PathBuf::from(OsStr::from_bytes(&name_bytes))
@@ -650,11 +780,18 @@ impl Sandbox {
                 match filetype {
                     Filetype::Directory => stack.push(child_rel),
                     Filetype::RegularFile => {
-                        let bytes = self.package.files.bytes(&child_rel).map_err(|_| ())?;
-                        self.record(Self::subject("file", &child_rel), bytes.as_deref().map(digest));
+                        match self.package.files.stream_digest(&child_rel, max_file_bytes, &mut remaining_bytes) {
+                            Ok(StreamDigest::Digest(id)) => {
+                                push_read(&mut out, Self::subject("file", &child_rel), Some(id));
+                            }
+                            Ok(StreamDigest::Absent) => {
+                                push_read(&mut out, Self::subject("file", &child_rel), None);
+                            }
+                            Ok(StreamDigest::Exceeded) | Err(()) => return None,
+                        }
                     }
                     Filetype::SymbolicLink => {
-                        let lstat = self.package.files.find(&child_rel, false).map_err(|_| ())?;
+                        let lstat = self.package.files.find(&child_rel, false).ok()?;
                         let lstat_dig = match lstat {
                             Some(Found::Link(size)) => Some(stat_digest(Filetype::SymbolicLink, size)),
                             Some(Found::File(size)) => Some(stat_digest(Filetype::RegularFile, size)),
@@ -662,24 +799,60 @@ impl Sandbox {
                             Some(Found::Loop) => Some(stat_digest(Filetype::Unknown, 0)),
                             None => None,
                         };
-                        self.record(Self::subject("lstat", &child_rel), lstat_dig);
+                        push_read(&mut out, Self::subject("lstat", &child_rel), lstat_dig);
+                        match self.package.files.read_link_digest(&child_rel) {
+                            LinkDigest::Digest(id) => {
+                                push_read(&mut out, Self::subject("link", &child_rel), Some(id));
+                            }
+                            LinkDigest::Uncacheable => return None,
+                        }
                         match self.package.files.find(&child_rel, true) {
                             Ok(Some(Found::File(_))) => {
-                                let bytes = self.package.files.bytes(&child_rel).map_err(|_| ())?;
-                                self.record(Self::subject("file", &child_rel), bytes.as_deref().map(digest));
+                                match self.package.files.stream_digest(
+                                    &child_rel,
+                                    max_file_bytes,
+                                    &mut remaining_bytes,
+                                ) {
+                                    Ok(StreamDigest::Digest(id)) => {
+                                        push_read(&mut out, Self::subject("file", &child_rel), Some(id));
+                                    }
+                                    Ok(StreamDigest::Absent) => {
+                                        push_read(&mut out, Self::subject("file", &child_rel), None);
+                                    }
+                                    Ok(StreamDigest::Exceeded) | Err(()) => return None,
+                                }
                             }
-                            Ok(Some(Found::Folder)) => return Ok(false),
-                            Ok(_) => {}
-                            Err(_) => return Err(()),
+                            Ok(Some(Found::Loop)) => {
+                                push_read(
+                                    &mut out,
+                                    Self::subject("stat", &child_rel),
+                                    Some(stat_digest(Filetype::Unknown, 0)),
+                                );
+                                push_read(&mut out, Self::subject("file", &child_rel), None);
+                            }
+                            Ok(None) => {
+                                push_read(&mut out, Self::subject("stat", &child_rel), None);
+                                push_read(&mut out, Self::subject("file", &child_rel), None);
+                            }
+                            Ok(Some(Found::Folder | Found::Link(_))) | Err(_) => return None,
                         }
                     }
-                    _ => {
-                        return Ok(false);
-                    }
+                    _ => return None,
                 }
             }
         }
-        Ok(true)
+        Some(out)
+    }
+
+    /// Appends a verified granted-tree snapshot's reads into [`Self::reads`], deduplicating by
+    /// subject.
+    pub(crate) fn record_reads(
+        &mut self,
+        reads: blaze_own::Vec<Read, blaze_own::SharedAlloc<'static>>,
+    ) {
+        for read in reads {
+            self.record(read.subject, read.digest);
+        }
     }
 
     /// Formats a path read subject (`kind:rel`, or `kind-hex:<hex>` when `rel` is not UTF-8).

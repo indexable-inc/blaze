@@ -1228,6 +1228,8 @@ enum PublishPlant {
     SkipStageDirSync,
     #[cfg(test)]
     RenameBeforeDigest,
+    #[cfg(test)]
+    SkipRaceLoserParentSync,
 }
 
 trait PublishFs {
@@ -1236,7 +1238,12 @@ trait PublishFs {
     fn write_and_sync_file(&mut self, path: &Path, bytes: &[u8], executable: bool) -> Result<(), IoError>;
     fn sync_dir(&mut self, path: &Path) -> Result<(), IoError>;
     fn rename(&mut self, from: &Path, to: &Path) -> Result<(), IoError>;
-    fn is_file(&self, path: &Path) -> bool;
+    fn read_file(
+        &self,
+        path: &Path,
+        out: &mut blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>,
+    ) -> Result<(), IoError>;
+    fn is_executable(&self, path: &Path) -> bool;
 }
 
 struct OsPublishFs;
@@ -1271,9 +1278,90 @@ impl PublishFs for OsPublishFs {
         fs::rename(from, to)
     }
 
-    fn is_file(&self, path: &Path) -> bool {
-        path.is_file()
+    fn read_file(
+        &self,
+        path: &Path,
+        out: &mut blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>,
+    ) -> Result<(), IoError> {
+        let mut file = File::open(path)?;
+        out.clear();
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            let n = match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            };
+            if let Some(chunk) = buf.get(..n) {
+                out.extend_from_slice(chunk);
+            }
+        }
+        Ok(())
     }
+
+    fn is_executable(&self, path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            fs::metadata(path)
+                .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            path.is_file()
+        }
+    }
+}
+
+fn verify_published_dir(
+    fs_ops: &dyn PublishFs,
+    final_dir: &Path,
+    key: &str,
+) -> Result<(), ModuleError> {
+    let shared = blaze_own::SharedAlloc::global();
+    let mut buf = blaze_own::Vec::new_in(shared);
+    for required in ["identity", "macros", "decls"] {
+        let path = final_dir.join(required);
+        fs_ops
+            .read_file(&path, &mut buf)
+            .map_err(|error| ModuleError::Io { path, error })?;
+    }
+    let digest_path = final_dir.join(BIN_SHA256_FILENAME);
+    fs_ops
+        .read_file(&digest_path, &mut buf)
+        .map_err(|error| ModuleError::Io { path: digest_path, error })?;
+    let held_str = core::str::from_utf8(buf.as_slice()).unwrap_or("").trim();
+    if !is_valid_sha256_hex(held_str) {
+        return Err(ModuleError::Digest {
+            key: key.into(),
+            held: held_str.into(),
+            found: "malformed bin-sha256".into(),
+        });
+    }
+    let mut held = blaze_own::String::new_in(shared);
+    held.push_str(held_str);
+
+    let bin_path = final_dir.join(NATIVE_BIN_FILENAME);
+    if !fs_ops.is_executable(&bin_path) {
+        return Err(ModuleError::Digest {
+            key: key.into(),
+            held: held.as_str().into(),
+            found: "native.bin missing or not executable".into(),
+        });
+    }
+    fs_ops
+        .read_file(&bin_path, &mut buf)
+        .map_err(|error| ModuleError::Io { path: bin_path, error })?;
+    let found = sha256_hex(buf.as_slice());
+    if found.as_str() != held.as_str() {
+        return Err(ModuleError::Digest {
+            key: key.into(),
+            held: held.as_str().into(),
+            found,
+        });
+    }
+    Ok(())
 }
 
 struct PublishPayload<'a> {
@@ -1289,6 +1377,7 @@ fn publish_native_bin_dir(
     modules_dir: &Path,
     stage: &Path,
     final_dir: &Path,
+    key: &str,
     payload: &PublishPayload<'_>,
     plant: PublishPlant,
 ) -> Result<(), ModuleError> {
@@ -1355,11 +1444,23 @@ fn publish_native_bin_dir(
         }
         Err(error) => {
             let _ = fs_ops.remove_dir_all(stage);
-            let race_ok = matches!(error.kind(), ErrorKind::AlreadyExists | ErrorKind::DirectoryNotEmpty)
-                && fs_ops.is_file(&final_dir.join(BIN_SHA256_FILENAME));
-            if !race_ok {
+            if !matches!(error.kind(), ErrorKind::AlreadyExists | ErrorKind::DirectoryNotEmpty) {
                 return Err(ModuleError::Io { path: final_dir.to_path_buf(), error });
             }
+            // A concurrent winner may have renamed `final_dir` into place without yet syncing
+            // `modules_dir`. Persist `modules_dir` and verify the complete on-disk record before
+            // returning `Ok` so a crash immediately after cannot lose the published module.
+            #[cfg(test)]
+            let skip_race_parent_sync = plant == PublishPlant::SkipRaceLoserParentSync;
+            #[cfg(not(test))]
+            let skip_race_parent_sync = false;
+            if !skip_race_parent_sync {
+                fs_ops.sync_dir(modules_dir).map_err(|sync_err| ModuleError::Io {
+                    path: modules_dir.to_path_buf(),
+                    error: sync_err,
+                })?;
+            }
+            verify_published_dir(fs_ops, final_dir, key)?;
         }
     }
     Ok(())
@@ -1433,7 +1534,7 @@ pub fn write_native_bin_module(
     };
 
     let mut os_fs = OsPublishFs;
-    publish_native_bin_dir(&mut os_fs, &modules_dir, &stage, &final_dir, &payload, PublishPlant::None)?;
+    publish_native_bin_dir(&mut os_fs, &modules_dir, &stage, &final_dir, key.as_str(), &payload, PublishPlant::None)?;
     read_module_by_key(store, key.as_str().into(), id.name, id.version)
 }
 
@@ -1676,6 +1777,11 @@ mod header_tests {
             volatile: SimDisk,
             durable: SimDisk,
             synced_dirs: BTreeSet<PathBuf>,
+            /// For each renamed directory awaiting parent `sync_dir`, holds the exact files whose
+            /// directory entries were durable in the staging directory at the moment of `rename`.
+            /// (Syncing `modules_dir` persists the renamed entry itself, NOT unsynced files added
+            /// inside `final_dir` after rename.)
+            renamed_durable_files: BTreeMap<PathBuf, Vec<(PathBuf, SimFile)>>,
             op_count: usize,
             fail_at: Option<usize>,
             crash_at: Option<usize>,
@@ -1691,6 +1797,7 @@ mod header_tests {
                     volatile: SimDisk::default(),
                     durable: SimDisk::default(),
                     synced_dirs: BTreeSet::new(),
+                    renamed_durable_files: BTreeMap::new(),
                     op_count: 0,
                     fail_at,
                     crash_at,
@@ -1728,6 +1835,7 @@ mod header_tests {
                 self.volatile.dirs.retain(|d| !d.starts_with(path));
                 self.volatile.files.retain(|f, _| !f.starts_with(path));
                 self.synced_dirs.remove(path);
+                self.renamed_durable_files.remove(path);
                 Ok(())
             }
 
@@ -1749,15 +1857,24 @@ mod header_tests {
                 if self.volatile.dirs.contains(path) {
                     self.durable.dirs.insert(path.to_path_buf());
                 }
-                // Persist direct children of `path` into `durable`.
+                // Persist direct child files of `path` into `durable`.
                 for (fpath, file) in &self.volatile.files {
                     if fpath.parent() == Some(path) {
                         self.durable.files.insert(fpath.clone(), file.clone());
                     }
                 }
+                // Persist direct child directories of `path` into `durable`; for a renamed child
+                // dir, ONLY files already synced in its staging dir before rename become durable
+                // when the parent dir is synced (unsynced post-rename additions require syncing
+                // the child dir itself).
                 for dpath in &self.volatile.dirs {
                     if dpath.parent() == Some(path) {
                         self.durable.dirs.insert(dpath.clone());
+                        if let Some(durable_children) = self.renamed_durable_files.get(dpath) {
+                            for (fpath, file) in durable_children {
+                                self.durable.files.insert(fpath.clone(), file.clone());
+                            }
+                        }
                     }
                 }
                 Ok(())
@@ -1782,25 +1899,39 @@ mod header_tests {
                 for (new_p, f) in &moved_files {
                     self.volatile.files.insert(new_p.clone(), f.clone());
                 }
-                // Model power-loss visibility of the rename: directory rename becomes durable on
-                // disk (or immediately upon journal flush), bringing along ONLY files whose stage
-                // dir was synced beforehand (unless `drop_unsynced_rename_children` is false).
-                self.durable.dirs.insert(to.to_path_buf());
-                if stage_was_synced || !self.drop_unsynced_rename_children {
-                    for (new_p, f) in moved_files {
-                        self.durable.files.insert(new_p, f);
-                    }
-                }
+                // Directory rename is only durable once the parent directory (`modules_dir`) is
+                // synced; and even then, only files whose staging directory had been synced before
+                // rename survive power loss.
+                let durable_children = if stage_was_synced || !self.drop_unsynced_rename_children {
+                    moved_files
+                } else {
+                    Vec::new()
+                };
+                self.renamed_durable_files.insert(to.to_path_buf(), durable_children);
                 Ok(())
             }
 
-            fn is_file(&self, path: &Path) -> bool {
-                self.volatile.files.contains_key(path)
+            fn read_file(
+                &self,
+                path: &Path,
+                out: &mut blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>,
+            ) -> Result<(), IoError> {
+                let Some(file) = self.volatile.files.get(path) else {
+                    return Err(IoError::new(ErrorKind::NotFound, "not found"));
+                };
+                out.clear();
+                out.extend_from_slice(&file.bytes);
+                Ok(())
+            }
+
+            fn is_executable(&self, path: &Path) -> bool {
+                self.volatile.files.get(path).is_some_and(|f| f.exec)
             }
         }
 
         let modules_dir = PathBuf::from("/store/proc-macro/modules");
         let stage = modules_dir.join(".tmp-key-1-0");
+        let stage_b = modules_dir.join(".tmp-key-2-0");
         let final_dir = modules_dir.join("key-native-1");
         let bin_bytes = b"\x7fELF-crash-dst-native-bin";
         let expected_digest = sha256_hex(bin_bytes);
@@ -1847,7 +1978,7 @@ mod header_tests {
         let run_matrix = |plant: PublishPlant| -> Result<(), String> {
             // 1. Clean publish must succeed and satisfy oracle with must_exist=true.
             let mut clean = SimCrashFs::new(None, None, true);
-            publish_native_bin_dir(&mut clean, &modules_dir, &stage, &final_dir, &payload, plant)
+            publish_native_bin_dir(&mut clean, &modules_dir, &stage, &final_dir, "key-native-1", &payload, plant)
                 .map_err(|e| format!("clean publish failed: {e}"))?;
             check_durable_oracle(&clean.durable, true)?;
             let total_ops = clean.op_count;
@@ -1855,21 +1986,52 @@ mod header_tests {
             // 2. Inject I/O error at EVERY op index 0..total_ops.
             for fail_at in 0..total_ops {
                 let mut fs_sim = SimCrashFs::new(Some(fail_at), None, true);
-                let _ = publish_native_bin_dir(&mut fs_sim, &modules_dir, &stage, &final_dir, &payload, plant);
+                let _ = publish_native_bin_dir(&mut fs_sim, &modules_dir, &stage, &final_dir, "key-native-1", &payload, plant);
                 check_durable_oracle(&fs_sim.durable, false)?;
             }
 
             // 3. Inject power-loss crash at EVERY op index 0..=total_ops.
             for crash_at in 0..=total_ops {
                 let mut fs_sim = SimCrashFs::new(None, Some(crash_at), true);
-                let res = publish_native_bin_dir(&mut fs_sim, &modules_dir, &stage, &final_dir, &payload, plant);
+                let res = publish_native_bin_dir(&mut fs_sim, &modules_dir, &stage, &final_dir, "key-native-1", &payload, plant);
                 check_durable_oracle(&fs_sim.durable, res.is_ok())?;
             }
+
+            // 4. Two-writer race interleaving: Writer A writes & syncs its stage and renames into
+            //    `final_dir` WITHOUT yet calling `sync_dir(modules_dir)`; Writer B runs and hits
+            //    `DirectoryNotEmpty`, then power loss occurs immediately after Writer B returns Ok!
+            let mut race_fs = SimCrashFs::new(None, None, true);
+            race_fs.create_dir_all(&modules_dir).expect("mkdir modules");
+            race_fs.create_dir_all(&stage).expect("mkdir stage A");
+            race_fs.write_and_sync_file(&stage.join("identity"), payload.identity, false).expect("id");
+            race_fs.write_and_sync_file(&stage.join("macros"), payload.macros, false).expect("macros");
+            race_fs.write_and_sync_file(&stage.join("decls"), payload.decls_line, false).expect("decls");
+            race_fs.write_and_sync_file(&stage.join(NATIVE_BIN_FILENAME), payload.bin_bytes, true).expect("bin");
+            race_fs.write_and_sync_file(&stage.join(BIN_SHA256_FILENAME), payload.digest_line, false).expect("sha");
+            race_fs.sync_dir(&stage).expect("sync stage A");
+            race_fs.rename(&stage, &final_dir).expect("writer A rename");
+            // Writer A paused BEFORE `sync_dir(modules_dir)` -> `durable` does NOT have `final_dir` yet!
+            assert!(!race_fs.durable.dirs.contains(&final_dir));
+            publish_native_bin_dir(&mut race_fs, &modules_dir, &stage_b, &final_dir, "key-native-1", &payload, plant)
+                .map_err(|e| format!("writer B race-loser failed: {e}"))?;
+            // Immediate crash after Writer B returned Ok -> `final_dir` MUST be durable!
+            check_durable_oracle(&race_fs.durable, true)?;
+
             Ok(())
         };
 
-        // Clean implementation passes every failure & crash point.
+        // Clean implementation passes every failure, crash, and 2-writer race point.
         run_matrix(PublishPlant::None).expect("clean publish DST must pass");
+
+        // Race-loser MUST fail closed when an existing `final_dir` is incomplete/corrupt (missing `macros`).
+        let mut corrupt_fs = SimCrashFs::new(None, None, true);
+        corrupt_fs.create_dir_all(&final_dir).expect("mkdir final");
+        corrupt_fs.write_and_sync_file(&final_dir.join(BIN_SHA256_FILENAME), payload.digest_line, false).expect("sha");
+        corrupt_fs.write_and_sync_file(&final_dir.join(NATIVE_BIN_FILENAME), payload.bin_bytes, true).expect("bin");
+        assert!(
+            publish_native_bin_dir(&mut corrupt_fs, &modules_dir, &stage_b, &final_dir, "key-native-1", &payload, PublishPlant::None).is_err(),
+            "race-loser must reject incomplete pre-existing final_dir missing identity/macros/decls"
+        );
 
         // Planted-bug control 1: skipping stage dir sync MUST fail the crash oracle.
         assert!(
@@ -1881,6 +2043,12 @@ mod header_tests {
         assert!(
             run_matrix(PublishPlant::RenameBeforeDigest).is_err(),
             "DST must catch PublishPlant::RenameBeforeDigest"
+        );
+
+        // Planted-bug control 3: skipping parent dir sync on race-loser MUST fail the 2-writer race oracle.
+        assert!(
+            run_matrix(PublishPlant::SkipRaceLoserParentSync).is_err(),
+            "DST must catch PublishPlant::SkipRaceLoserParentSync"
         );
     }
 

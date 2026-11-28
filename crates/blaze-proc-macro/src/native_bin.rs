@@ -65,6 +65,18 @@ pub const DEFAULT_WORKER_MEMORY_BUDGET: u64 = 8 << 30;
 /// roots before marking the expansion uncacheable (rule 18 & rule 21).
 pub const MAX_GRANTED_SNAPSHOT_ENTRIES: usize = 16_384;
 
+/// Maximum bytes streamed from any single regular file during a granted-root snapshot before
+/// marking the expansion uncacheable (rule 18: bounded memory and I/O).
+pub const MAX_GRANTED_SNAPSHOT_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Maximum cumulative bytes streamed across all files during a granted-root snapshot before
+/// marking the expansion uncacheable (rule 18: bounded memory and I/O).
+pub const MAX_GRANTED_SNAPSHOT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Maximum retained capacity of `inbox`/`outbox` on an idle pooled worker; buffers that grew past
+/// this threshold during a large expansion are released before returning the worker to the pool.
+pub const IDLE_BUFFER_CAP_LIMIT: usize = 64 * 1024;
+
 /// Output of one Tier-2 `native.bin` expansion, together with whether its granted-tree read
 /// snapshot completed within bounds and is therefore safe to persist in the expansion cache.
 pub struct NativeBinExpand<'a> {
@@ -82,6 +94,9 @@ pub struct NativeBinConfig {
     pub max_idle_per_key: usize,
     pub max_total_idle: usize,
     pub worker_budget: Budget,
+    pub snapshot_max_entries: usize,
+    pub snapshot_max_file_bytes: u64,
+    pub snapshot_max_total_bytes: u64,
 }
 
 impl NativeBinConfig {
@@ -97,6 +112,9 @@ impl NativeBinConfig {
             memory: DEFAULT_WORKER_MEMORY_BUDGET,
             steps: None,
         },
+        snapshot_max_entries: MAX_GRANTED_SNAPSHOT_ENTRIES,
+        snapshot_max_file_bytes: MAX_GRANTED_SNAPSHOT_FILE_BYTES,
+        snapshot_max_total_bytes: MAX_GRANTED_SNAPSHOT_TOTAL_BYTES,
     };
 }
 
@@ -447,6 +465,25 @@ impl<T: NativeBinTransport> NativeBinServer<T> {
         self.transport
     }
 
+    /// Releases oversized `inbox`/`outbox` buffers before returning this worker to an idle pool so
+    /// a single large expansion never pins multi-megabyte allocations on idle pooled workers.
+    pub fn trim_idle_buffers(&mut self) {
+        let shared = SharedAlloc::global();
+        self.inbox.clear();
+        if self.inbox.capacity() > IDLE_BUFFER_CAP_LIMIT {
+            self.inbox = OwnVec::new_in(shared);
+        }
+        self.outbox.clear();
+        if self.outbox.capacity() > IDLE_BUFFER_CAP_LIMIT {
+            self.outbox = OwnVec::new_in(shared);
+        }
+    }
+
+    #[cfg(test)]
+    fn buffer_capacities(&self) -> (usize, usize) {
+        (self.inbox.capacity(), self.outbox.capacity())
+    }
+
     /// Sends a best-effort `Shutdown` frame and synchronously kills & reaps the worker.
     pub fn shutdown(mut self) {
         self.outbox.clear();
@@ -575,6 +612,21 @@ impl<T: NativeBinTransport> NativeBinServer<T> {
             .map_err(server_err_to_call_error)?;
         let deadline = Deadline::after(self.transport.now(), self.config.call_timeout);
 
+        // Snapshot all granted read-only roots BEFORE running the worker (bounded by entry count,
+        // per-file bytes, and total bytes). After the worker returns, we snapshot again and only
+        // cache when BOTH snapshots succeed and are identical — preventing a mid-expansion file
+        // edit from binding post-edit digests to pre-edit generated tokens (rule 21).
+        let pre_snapshot = if granted_rel_roots.is_empty() {
+            Some(OwnVec::new_in(SharedAlloc::global()))
+        } else {
+            sandbox.snapshot_granted_roots(
+                granted_rel_roots,
+                self.config.snapshot_max_entries,
+                self.config.snapshot_max_file_bytes,
+                self.config.snapshot_max_total_bytes,
+            )
+        };
+
         self.send_msg(
             &HostMsg::Expand { index: export.index, kind: export.kind, input: &run_input },
             deadline,
@@ -677,26 +729,29 @@ impl<T: NativeBinTransport> NativeBinServer<T> {
             }
         }
 
-        // Record every file, directory listing, and symlink inside every Landlock/Seatbelt-granted
-        // read-only root so direct `std::fs` reads made by the worker never produce stale cache
-        // entries when any permitted file is edited, added, or deleted (rule 21).
-        let mut cacheable = true;
-        for &rel_root in granted_rel_roots {
-            match sandbox.record_granted_tree(rel_root, MAX_GRANTED_SNAPSHOT_ENTRIES) {
-                Ok(true) => {}
-                Ok(false) => cacheable = false,
-                Err(()) => {
-                    return Err(CallError::Limit {
-                        limit: ProcLimit::Paths,
-                        why: fmt_err(format_args!(
-                            "granted read-only root contains a symlink escaping the served package tree"
-                        ))
-                        .as_str()
-                        .into(),
-                    });
-                }
+        // Re-snapshot every granted read-only root AFTER the worker finishes and require an exact
+        // match with `pre_snapshot` before attaching the reads and marking the expansion cacheable
+        // (rule 21: any mid-expansion edit, add, delete, or symlink retarget forces `cacheable = false`).
+        let cacheable = if let Some(pre) = pre_snapshot {
+            let post_snapshot = if granted_rel_roots.is_empty() {
+                Some(OwnVec::new_in(SharedAlloc::global()))
+            } else {
+                sandbox.snapshot_granted_roots(
+                    granted_rel_roots,
+                    self.config.snapshot_max_entries,
+                    self.config.snapshot_max_file_bytes,
+                    self.config.snapshot_max_total_bytes,
+                )
+            };
+            if post_snapshot.as_ref() == Some(&pre) {
+                sandbox.record_reads(pre);
+                true
+            } else {
+                false
             }
-        }
+        } else {
+            false
+        };
 
         let mut reads = Reads::new_in(alloc);
         for read in &sandbox.reads {
@@ -1021,6 +1076,7 @@ impl NativeBinPool {
         );
         match result {
             Ok(produced) => {
+                worker.trim_idle_buffers();
                 let evicted = crate::host::lock(&self.core).release(key, worker, true);
                 if let Some(old) = evicted {
                     old.shutdown();
@@ -1709,6 +1765,331 @@ mod tests {
             Err(e) => e,
         };
         assert!(matches!(err, CallError::Refused(ref msg) if msg.contains("leaked host checkout path")));
+        srv.shutdown();
+        h.join().expect("join");
+    }
+
+    #[test]
+    fn loopback_marks_uncacheable_when_file_mutates_mid_expansion() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let dir = std::env::temp_dir().join(format!("blaze-native-bin-mid-edit-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".sqlx")).expect("mkdir");
+        std::fs::write(dir.join(".sqlx/q1.json"), b"{\"sql\":\"SELECT 1\"}").expect("q1");
+
+        let pkg = Arc::new(
+            Package::new(Files::Folder(dir.clone()), PackageEnv::set_only(Vec::new()).expect("env"))
+                .expect("Package"),
+        );
+        let export = Exported { index: 0, kind: ProcKind::FnLike, name: "q".to_owned(), helpers: Vec::new() };
+        let input = lex("", Edition::E2021, alloc).expect("lex");
+        let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok("src/lib.rs") };
+
+        let target_file = dir.join(".sqlx/q1.json");
+        let (mut srv, h) = run_loopback_peer(
+            move |mut fd| {
+                let mut buf = Vec::new();
+                let _ = read_host_frame(&mut fd, &mut buf);
+                write_child_msg(&mut fd, &ChildMsg::HelloAck { magic: MAGIC, version: PROTO_VERSION });
+                let _ = read_host_frame(&mut fd, &mut buf);
+                // Simulate concurrent external edit between pre-snapshot and post-snapshot!
+                std::fs::write(&target_file, b"{\"sql\":\"SELECT 999\"}").expect("mid-edit");
+                let mut out_bytes = Vec::new();
+                let mut ww = WireWriter { out: &mut out_bytes };
+                ww.ok(true);
+                ww.some(false);
+                write_child_msg(&mut fd, &ChildMsg::Output { bytes: &out_bytes });
+                let _ = read_host_frame(&mut fd, &mut buf);
+            },
+            NativeBinConfig::STANDARD,
+        );
+        let dir_str = dir.to_str().expect("utf8");
+        let paths = NativePaths { manifest_dir: Some(dir_str), workspace_root: None };
+        let exp = srv
+            .expand(
+                &export,
+                &call,
+                Edition::E2021,
+                Sandbox::new(Arc::clone(&pkg)),
+                Limits::STANDARD,
+                paths,
+                &[Path::new("")],
+                heap.alloc(),
+                alloc,
+            )
+            .expect("expand succeeds even when uncacheable");
+        assert!(!exp.cacheable, "mid-expansion file mutation MUST set cacheable=false");
+        srv.shutdown();
+        h.join().expect("join");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loopback_tracks_symlink_link_target_retarget_with_identical_len_and_bytes() {
+        use std::os::unix::fs::symlink;
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let dir = std::env::temp_dir().join(format!("blaze-native-bin-symlink-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // Two target files with EQUAL path lengths and IDENTICAL contents.
+        std::fs::write(dir.join("a.sql"), b"SELECT 42").expect("a.sql");
+        std::fs::write(dir.join("b.sql"), b"SELECT 42").expect("b.sql");
+        symlink("a.sql", dir.join("link.sql")).expect("symlink a");
+
+        let pkg = Arc::new(
+            Package::new(Files::Folder(dir.clone()), PackageEnv::set_only(Vec::new()).expect("env"))
+                .expect("Package"),
+        );
+        let export = Exported { index: 0, kind: ProcKind::FnLike, name: "q".to_owned(), helpers: Vec::new() };
+        let input = lex("", Edition::E2021, alloc).expect("lex");
+        let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok("src/lib.rs") };
+
+        let (mut srv, h) = run_loopback_peer(
+            |mut fd| {
+                let mut buf = Vec::new();
+                let _ = read_host_frame(&mut fd, &mut buf);
+                write_child_msg(&mut fd, &ChildMsg::HelloAck { magic: MAGIC, version: PROTO_VERSION });
+                let _ = read_host_frame(&mut fd, &mut buf);
+                let mut out_bytes = Vec::new();
+                let mut ww = WireWriter { out: &mut out_bytes };
+                ww.ok(true);
+                ww.some(false);
+                write_child_msg(&mut fd, &ChildMsg::Output { bytes: &out_bytes });
+                let _ = read_host_frame(&mut fd, &mut buf);
+            },
+            NativeBinConfig::STANDARD,
+        );
+        let dir_str = dir.to_str().expect("utf8");
+        let exp = srv
+            .expand(
+                &export,
+                &call,
+                Edition::E2021,
+                Sandbox::new(Arc::clone(&pkg)),
+                Limits::STANDARD,
+                NativePaths { manifest_dir: Some(dir_str), workspace_root: None },
+                &[Path::new("")],
+                heap.alloc(),
+                alloc,
+            )
+            .expect("expand");
+        assert!(exp.cacheable);
+        srv.shutdown();
+        h.join().expect("join");
+
+        let all_reads_hold = |pkg: &Package, reads: &Reads<'_>| -> bool {
+            reads.list().iter().all(|entry| {
+                let subj = reads.subject(entry);
+                let Ok(now) = crate::hook::read_now(pkg, subj) else { return false };
+                now == entry.answer
+            })
+        };
+        assert!(
+            exp.produced.reads.list().iter().any(|e| exp.produced.reads.subject(e) == "link:link.sql"),
+            "granted-tree snapshot must record `link:link.sql` digest"
+        );
+        assert!(all_reads_hold(&pkg, &exp.produced.reads), "initial symlink must hold");
+
+        // Retarget symlink to `b.sql` (same target length AND same bytes!) — `link:link.sql` MUST invalidate!
+        std::fs::remove_file(dir.join("link.sql")).expect("rm link");
+        symlink("b.sql", dir.join("link.sql")).expect("symlink b");
+        assert!(
+            !all_reads_hold(&pkg, &exp.produced.reads),
+            "retargeting symlink to equal-length path with identical content must invalidate reads"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loopback_marks_uncacheable_when_snapshot_byte_cap_exceeded() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let dir = std::env::temp_dir().join(format!("blaze-native-bin-byte-cap-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // Write a 4 KiB file and set snapshot_max_file_bytes = 1024 so streaming short-circuits.
+        std::fs::write(dir.join("big.bin"), vec![0xABu8; 4096]).expect("big.bin");
+
+        let pkg = Arc::new(
+            Package::new(Files::Folder(dir.clone()), PackageEnv::set_only(Vec::new()).expect("env"))
+                .expect("Package"),
+        );
+        let export = Exported { index: 0, kind: ProcKind::FnLike, name: "q".to_owned(), helpers: Vec::new() };
+        let input = lex("", Edition::E2021, alloc).expect("lex");
+        let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok("src/lib.rs") };
+
+        let cfg = NativeBinConfig {
+            snapshot_max_file_bytes: 1024,
+            snapshot_max_total_bytes: 2048,
+            ..NativeBinConfig::STANDARD
+        };
+        let (mut srv, h) = run_loopback_peer(
+            |mut fd| {
+                let mut buf = Vec::new();
+                let _ = read_host_frame(&mut fd, &mut buf);
+                write_child_msg(&mut fd, &ChildMsg::HelloAck { magic: MAGIC, version: PROTO_VERSION });
+                let _ = read_host_frame(&mut fd, &mut buf);
+                let mut out_bytes = Vec::new();
+                let mut ww = WireWriter { out: &mut out_bytes };
+                ww.ok(true);
+                ww.some(false);
+                write_child_msg(&mut fd, &ChildMsg::Output { bytes: &out_bytes });
+                let _ = read_host_frame(&mut fd, &mut buf);
+            },
+            cfg,
+        );
+        let dir_str = dir.to_str().expect("utf8");
+        let exp = srv
+            .expand(
+                &export,
+                &call,
+                Edition::E2021,
+                Sandbox::new(Arc::clone(&pkg)),
+                Limits::STANDARD,
+                NativePaths { manifest_dir: Some(dir_str), workspace_root: None },
+                &[Path::new("")],
+                heap.alloc(),
+                alloc,
+            )
+            .expect("expand succeeds");
+        assert!(!exp.cacheable, "exceeding snapshot byte cap MUST set cacheable=false");
+        srv.shutdown();
+        h.join().expect("join");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loopback_workspace_member_tracks_sibling_relative_read() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let ws = std::env::temp_dir().join(format!("blaze-native-bin-ws-member-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join("crates/app/src")).expect("mkdir app");
+        std::fs::create_dir_all(ws.join("crates/shared")).expect("mkdir shared");
+        std::fs::write(ws.join("crates/app/Cargo.toml"), b"[package]\nname=\"app\"\n").expect("app toml");
+        std::fs::write(ws.join("crates/shared/schema.sql"), b"CREATE TABLE t (id INT);").expect("schema");
+
+        let root = crate::script_sandbox::ScriptRoot::member("crates/app").expect("member root");
+        let pkg = Arc::new(
+            Package::new(
+                Files::Member { workspace: ws.clone(), root },
+                PackageEnv::set_only(Vec::new()).expect("env"),
+            )
+            .expect("Package"),
+        );
+        let export = Exported { index: 0, kind: ProcKind::FnLike, name: "q".to_owned(), helpers: Vec::new() };
+        let input = lex("", Edition::E2021, alloc).expect("lex");
+        let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok("crates/app/src/lib.rs") };
+
+        let (mut srv, h) = run_loopback_peer(
+            |mut fd| {
+                let mut buf = Vec::new();
+                let _ = read_host_frame(&mut fd, &mut buf);
+                write_child_msg(&mut fd, &ChildMsg::HelloAck { magic: MAGIC, version: PROTO_VERSION });
+                let _ = read_host_frame(&mut fd, &mut buf);
+                // Query CARGO_MANIFEST_DIR -> must receive "." (zero host paths)
+                write_child_msg(&mut fd, &ChildMsg::EnvVar { name: "CARGO_MANIFEST_DIR" });
+                let rep = read_host_frame(&mut fd, &mut buf).expect("env rep");
+                assert_eq!(decode_host_body(&rep).expect("env"), HostMsg::EnvVal { value: Some(".") });
+                let mut out_bytes = Vec::new();
+                let mut ww = WireWriter { out: &mut out_bytes };
+                ww.ok(true);
+                ww.some(false);
+                write_child_msg(&mut fd, &ChildMsg::Output { bytes: &out_bytes });
+                let _ = read_host_frame(&mut fd, &mut buf);
+            },
+            NativeBinConfig::STANDARD,
+        );
+        let app_dir = ws.join("crates/app");
+        let exp = srv
+            .expand(
+                &export,
+                &call,
+                Edition::E2021,
+                Sandbox::new(Arc::clone(&pkg)),
+                Limits::STANDARD,
+                NativePaths {
+                    manifest_dir: Some(app_dir.to_str().expect("utf8")),
+                    workspace_root: Some(ws.to_str().expect("utf8")),
+                },
+                &[Path::new("")],
+                heap.alloc(),
+                alloc,
+            )
+            .expect("expand");
+        assert!(exp.cacheable);
+        srv.shutdown();
+        h.join().expect("join");
+
+        let all_reads_hold = |pkg: &Package, reads: &Reads<'_>| -> bool {
+            reads.list().iter().all(|entry| {
+                let subj = reads.subject(entry);
+                let Ok(now) = crate::hook::read_now(pkg, subj) else { return false };
+                now == entry.answer
+            })
+        };
+        assert!(all_reads_hold(&pkg, &exp.produced.reads), "initial workspace member must hold");
+        // Mutating sibling `../shared/schema.sql` MUST invalidate cached reads!
+        std::fs::write(ws.join("crates/shared/schema.sql"), b"CREATE TABLE t (id BIGINT);").expect("edit schema");
+        assert!(
+            !all_reads_hold(&pkg, &exp.produced.reads),
+            "editing workspace sibling `../shared/schema.sql` must invalidate cached reads"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn trim_idle_buffers_drops_oversized_capacity() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let big_env = "x".repeat(IDLE_BUFFER_CAP_LIMIT * 2);
+        let pkg = make_test_package(&[("BIG_ENV", big_env.as_str())], &[]);
+        let export = Exported { index: 0, kind: ProcKind::FnLike, name: "big".to_owned(), helpers: Vec::new() };
+        let input = lex("", Edition::E2021, alloc).expect("lex");
+        let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok("src/lib.rs") };
+
+        let (mut srv, h) = run_loopback_peer(
+            |mut fd| {
+                let mut buf = Vec::new();
+                let _ = read_host_frame(&mut fd, &mut buf);
+                write_child_msg(&mut fd, &ChildMsg::HelloAck { magic: MAGIC, version: PROTO_VERSION });
+                let _ = read_host_frame(&mut fd, &mut buf);
+                // Request BIG_ENV so host `outbox` grows past IDLE_BUFFER_CAP_LIMIT.
+                write_child_msg(&mut fd, &ChildMsg::EnvVar { name: "BIG_ENV" });
+                let _ = read_host_frame(&mut fd, &mut buf);
+                // Return a large panic message (> IDLE_BUFFER_CAP_LIMIT) so `inbox` also grows past cap.
+                let big_msg = "p".repeat(IDLE_BUFFER_CAP_LIMIT * 2);
+                write_child_msg(&mut fd, &ChildMsg::Panic { message: &big_msg });
+                let _ = read_host_frame(&mut fd, &mut buf);
+            },
+            NativeBinConfig::STANDARD,
+        );
+        let exp = srv
+            .expand(
+                &export,
+                &call,
+                Edition::E2021,
+                Sandbox::new(pkg),
+                Limits::STANDARD,
+                NativePaths::default(),
+                &[],
+                heap.alloc(),
+                alloc,
+            )
+            .expect("expand");
+        assert!(!exp.produced.diagnostics.is_empty(), "expected panic diagnostic");
+        let (in_before, out_before) = srv.buffer_capacities();
+        assert!(in_before > IDLE_BUFFER_CAP_LIMIT, "inbox should have grown past limit: {in_before}");
+        assert!(out_before > IDLE_BUFFER_CAP_LIMIT, "outbox should have grown past limit: {out_before}");
+
+        srv.trim_idle_buffers();
+        let (in_after, out_after) = srv.buffer_capacities();
+        assert!(in_after <= IDLE_BUFFER_CAP_LIMIT, "inbox capacity must shrink: {in_after}");
+        assert!(out_after <= IDLE_BUFFER_CAP_LIMIT, "outbox capacity must shrink: {out_after}");
+
         srv.shutdown();
         h.join().expect("join");
     }

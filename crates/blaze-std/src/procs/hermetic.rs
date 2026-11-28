@@ -1801,9 +1801,10 @@ pub fn confinement<'a, 's>(spec: &'s HermeticSpec<'s>, files: &'s dyn RootFiles,
 }
 
 /// Prepares a strictly read-only Linux Landlock + seccomp confinement (zero writable directories,
-/// `socket()` denied with `EPERM`, subprocess spawning denied while `clone(CLONE_THREAD)` /
-/// `epoll` / `eventfd2` / `pipe2` / `futex` / `getrandom` stay allowed) for a persistent served
-/// worker running `program` with read-only access to `read_roots` and its ELF runtime closure.
+/// `socket()` denied with `EPERM`, subprocess spawning and external process signaling denied while
+/// `clone(CLONE_THREAD)` / `epoll` / `eventfd2` / `pipe2` / `futex` / `getrandom` stay allowed)
+/// for a persistent served worker running `program` with read-only access to `read_roots` and its
+/// ELF runtime closure.
 #[cfg(target_os = "linux")]
 pub fn prepare_read_only(
     program: &str,
@@ -1811,15 +1812,19 @@ pub fn prepare_read_only(
     budget: Budget,
     alloc: Alloc<'_>,
 ) -> Result<PreparedConfine, Fault> {
+    if budget.steps.is_some() {
+        return Err(Fault::StepsNotMetered);
+    }
     let plan = Plan::read_only(program, read_roots, &landlock::SYSTEM, alloc)?;
-    landlock::prepare_with_exec(&plan, budget, false, None, Some(alloc))
+    landlock::prepare_with_exec(&plan, budget, false, true, None, Some(alloc))
 }
 
 /// Starts `spec` as a confined served child speaking bidirectional framed IPC over
 /// [`super::CHILD_FD`] with strictly read-only access to `read_roots` (zero writable directories,
-/// zero network, zero subprocess spawning):
-/// - Linux: prepares Landlock + seccomp (`Filter { processes: false }`, `RLIMIT_CPU`, `RLIMIT_AS`,
-///   `RLIMIT_CORE=0`) via [`prepare_read_only`] and starts via [`Spawner::start_served_confined`].
+/// zero network, zero subprocess spawning, zero external process signaling):
+/// - Linux: prepares Landlock + seccomp (`Filter { processes: false }`, signal syscalls denied
+///   with `EPERM` even on Landlock ABI 3–5, `RLIMIT_CPU`, `RLIMIT_AS`, `RLIMIT_CORE=0`) via
+///   [`prepare_read_only`] and starts via [`Spawner::start_served_confined`].
 /// - macOS: renders a read-only Seatbelt SBPL profile denying `process-fork`, starts the worker in
 ///   its own process group (`own_group: true`) via `/usr/bin/sandbox-exec` +
 ///   [`Spawner::start_served`], and callers enforce `budget` continuously via
@@ -1832,6 +1837,9 @@ pub fn start_served_read_only(
     budget: Budget,
     alloc: Alloc<'_>,
 ) -> Result<super::Started<super::Served>, Fault> {
+    if budget.steps.is_some() {
+        return Err(Fault::StepsNotMetered);
+    }
     if budget.cpu.is_zero() || budget.memory == 0 {
         return Err(Fault::Host { call: "start_served_read_only (zero budget)", code: 22 });
     }

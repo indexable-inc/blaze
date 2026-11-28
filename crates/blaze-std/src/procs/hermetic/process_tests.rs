@@ -467,6 +467,7 @@ fn run_served_confined_child() {
             let inside = lines.next().expect("inside path");
             let outside = lines.next().expect("outside path");
             let write_target = lines.next().expect("write path");
+            let parent_pid: i32 = lines.next().expect("parent pid").parse().expect("pid int");
 
             let r_in = match std::fs::read(inside) {
                 Ok(b) if b == b"inside" => "ok",
@@ -488,8 +489,20 @@ fn run_served_confined_child() {
                 Err(blaze_sys::Errno::Perm) => "eperm",
                 Err(_) => "other_err",
             };
+            let sig = match blaze_sys::linux::kill(parent_pid, 0) {
+                Ok(()) => "allowed",
+                Err(blaze_sys::Errno::Perm) => "eperm",
+                Err(_) => "other_err",
+            };
+            let panic_caught = if std::panic::catch_unwind(|| panic!("contained")).is_err() {
+                "ok"
+            } else {
+                "missed"
+            };
             let thr = std::thread::spawn(|| 40u32 + 2u32).join().expect("thread join");
-            std::format!("read_inside={r_in};read_outside={r_out};write_inside={w_in};socket_inet={sock};thread={thr}")
+            std::format!(
+                "read_inside={r_in};read_outside={r_out};write_inside={w_in};socket_inet={sock};kill_parent={sig};panic_caught={panic_caught};thread={thr}"
+            )
         };
         let reply_bytes = reply.as_bytes();
         let reply_len = u32::try_from(reply_bytes.len()).expect("reply len");
@@ -561,11 +574,12 @@ fn start_served_confined_enforces_readonly_landlock_and_seccomp_over_child_fd() 
         core::str::from_utf8(&inbox[PREFIX..len]).expect("utf8 reply").into()
     };
 
-    let req = std::format!("{inside_file}\n{outside_file}\n{write_target}");
+    let parent_pid = std::process::id();
+    let req = std::format!("{inside_file}\n{outside_file}\n{write_target}\n{parent_pid}");
     let reply = send_and_recv(&mut child, &req);
     assert_eq!(
         reply,
-        "read_inside=ok;read_outside=eacces;write_inside=eacces;socket_inet=eperm;thread=42",
+        "read_inside=ok;read_outside=eacces;write_inside=eacces;socket_inet=eperm;kill_parent=eperm;panic_caught=ok;thread=42",
         "unexpected confined child report: {reply}"
     );
     // Second round-trip proves persistent bidirectional IPC over CHILD_FD stays healthy.
@@ -573,4 +587,49 @@ fn start_served_confined_enforces_readonly_landlock_and_seccomp_over_child_fd() 
 
     let reaped = child.kill().expect("kill and reap confined child");
     assert!(matches!(reaped.exit, crate::procs::Exit::Signaled(_) | crate::procs::Exit::Exited(_)));
+}
+
+#[test]
+fn start_served_read_only_rejects_unmetered_steps_budget() {
+    use crate::{
+        args::ArgList,
+        env::Vars,
+        io::{Io, Limits, NativeWorld},
+        mem::TASK_FRAME,
+        procs::{Input, Output, ParentDeath, RunSpec, Streams},
+    };
+
+    let io = Io::native(NativeWorld {
+        root: Path::new("/"),
+        threads: 1,
+        env: Vars::given(StdVec::new()),
+        args: ArgList::given(StdVec::new()),
+        host_name: alloc::sync::Arc::from(""),
+        seed: Some(0),
+        above: 0,
+        limits: Limits::USUAL,
+    })
+    .expect("native world");
+    let spawner = io.need_host().expect("host").spawner().expect("spawner");
+    let cx = io.cx(Duration::from_secs(5), TASK_FRAME).expect("cx");
+    let exe = this_binary();
+    let spec = RunSpec {
+        program: &exe,
+        arg0: None,
+        args: &[],
+        env: &[],
+        dir: "/",
+        streams: Streams { stdin: Input::Null, stdout: Output::Null, stderr: Output::Null },
+        own_group: false,
+        parent_death: ParentDeath::Channel,
+    };
+
+    for steps in [Some(100), Some(0)] {
+        let budget = Budget { cpu: Duration::from_secs(5), memory: 1 << 30, steps };
+        let res = super::start_served_read_only(&spawner, &cx, &spec, &[], budget, heap());
+        assert!(
+            matches!(res, Err(Fault::StepsNotMetered)),
+            "expected StepsNotMetered for steps={steps:?}"
+        );
+    }
 }
