@@ -310,8 +310,11 @@ pub struct Plan<'a, 'r> {
     /// The tests that passed the filter, in the order asked; `by_test` indexes them by id.
     rows: AVec<'a, Row<'r>>,
     by_test: AVec<'a, (TestId, usize)>,
-    /// Rows waiting to start, sorted so the next to start is LAST: (priority, reversed id order).
-    queue: AVec<'a, (u64, TestId, usize)>,
+    /// Rows waiting to start, sorted so the next to start is LAST: `(priority, usize::MAX - at)`.
+    /// Equal-priority ties (notably cold runs where every test has `priority == u64::MAX`) break by
+    /// `asked` order so tests from the same suite stay grouped instead of scattering randomly by
+    /// `TestId` hash across all suites at once.
+    queue: AVec<'a, (u64, usize)>,
     running: u32,
     filtered: u32,
     decided: bool,
@@ -456,16 +459,18 @@ impl<'a, 'r> Plan<'a, 'r> {
         let row = &mut self.rows[at];
         row.missed = missed;
         row.state = State::Queued;
-        // The next to start is last: the longest last run (unknown first), then the least id.
-        let entry = (row.priority, TestId(invert(&row.test.0)), at);
-        let slot = self.queue.partition_point(|queued| (queued.0, queued.1) < (entry.0, entry.1));
+        // The next to start is last: the longest last run (unknown first), then the earliest asked
+        // row so cold multi-suite runs stay grouped by suite instead of thrashing code workers.
+        let entry = (row.priority, usize::MAX - at);
+        let slot = self.queue.partition_point(|queued| *queued < entry);
         self.queue.insert_shift(slot, entry);
     }
 
     /// Starts queued runs while fewer than `width` run.
     fn pump(&mut self, now: Nanos, out: &mut AVec<'_, Effect>) {
         while self.running < self.config.width {
-            let Some((_, _, at)) = self.queue.pop() else { break };
+            let Some((_, rev_at)) = self.queue.pop() else { break };
+            let at = usize::MAX - rev_at;
             let deadline = now.after(self.config.deadline);
             self.rows[at].state = State::Running { started: now, deadline };
             self.running += 1;
@@ -590,13 +595,4 @@ pub fn judge(should_panic: ShouldPanic<'_>, exit: Exit<'_>) -> Result<(), Failur
         (_, Exit::Killed) => Err(Failure::TimedOut { after: Nanos(0) }),
         (_, Exit::NoReport { code }) => Err(Failure::NoReport { code }),
     }
-}
-
-/// The bytes' complement: sorts ids in reverse, so the least id is last in the queue.
-fn invert(bytes: &[u8; 32]) -> [u8; 32] {
-    let mut out = [0; 32];
-    for (to, from) in out.iter_mut().zip(bytes) {
-        *to = !*from;
-    }
-    out
 }
