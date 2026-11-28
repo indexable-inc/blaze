@@ -842,11 +842,12 @@ pub fn classify_script_tree_in<'a>(
     tree: &Tree,
     root: &ScriptRoot,
     unit_root: &str,
+    cfg: blaze_build_script::native::ScriptCfg<'_>,
     require_root: bool,
     alloc: Alloc<'a>,
     mut on_file: impl FnMut(&str, &str),
 ) -> Result<Option<blaze_build_script::native::NativeSourceReason>, blaze_own::AString<'a>> {
-    blaze_build_script::native::source_tree_requires_native(unit_root, alloc, |rel, is_root, visit| {
+    blaze_build_script::native::source_tree_requires_native(unit_root, cfg, alloc, |rel, is_root, visit| {
         let mut tree_path = blaze_own::AString::new_in(alloc);
         match root.seen() {
             blaze_expand::seen::SeenRoot::Package => tree_path.push_str(rel),
@@ -952,7 +953,10 @@ fn resolve_tree_runner(
     if matches!(base, Runner::Native { .. }) {
         return Ok(base);
     }
-    let source_reason = classify_script_tree_in(tree, root, unit.root.as_str(), false, alloc, |_, _| {}).map_err(|why| {
+    let mut feats: blaze_own::AVec<'_, &str> = blaze_own::Vec::with_capacity_in(unit.features.len(), alloc);
+    feats.extend(unit.features.iter().map(|f| f.as_str()));
+    let cfg = blaze_build_script::native::ScriptCfg::from_host_triple(setting.host, Some(feats.as_slice()));
+    let source_reason = classify_script_tree_in(tree, root, unit.root.as_str(), cfg, false, alloc, |_, _| {}).map_err(|why| {
         UnitScriptError::ScriptSource {
             package: blaze_own::AString::from_str_in(&package(unit), Alloc::global()),
             why: blaze_own::AString::from_str_in(why.as_str(), Alloc::global()),

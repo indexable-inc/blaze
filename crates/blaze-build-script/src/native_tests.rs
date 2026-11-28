@@ -8,8 +8,8 @@ use edition::PackageEdition;
 
 use crate::native::{
     Closure, MAX_SCRIPT_FILES, NO_WASM_CLASS, NativeSourceReason, PackageSource, Runner,
-    ScriptSourceError, closure, closure_with_source, placement_with_source,
-    source_requires_native, source_tree_requires_native,
+    ScriptCfg, ScriptSourceError, closure, closure_with_source, placement_with_source,
+    source_requires_native, source_requires_native_with_cfg, source_tree_requires_native,
 };
 use crate::toolchain::Mode;
 
@@ -266,20 +266,19 @@ fn negative_controls_stay_wasm() {
     "#;
     assert_eq!(source_requires_native(inner_cfg_mod), None);
 
-    // 5. CARGO_CFG_TARGET_FAMILY env check and dtolnay's cfg!(target_os = "linux") cleanup check
-    //    (anyhow, proc-macro2, thiserror) MUST stay Wasm.
-    let env_and_dtolnay_linux_check = r#"
+    // 5. CARGO_CFG_TARGET_FAMILY env check and identical host-vs-WASI cfg! checks stay Wasm.
+    let env_and_same_cfgs = r#"
         fn main() {
             let fam = std::env::var("CARGO_CFG_TARGET_FAMILY").unwrap_or_default();
             if fam == "unix" {
                 println!("cargo:rustc-cfg=is_unix");
             }
-            if cfg!(target_os = "linux") || cfg!(windows) || cfg!(any(unix, target_os = "wasi")) {
+            if cfg!(windows) || cfg!(any(unix, target_os = "wasi")) {
                 println!("ok");
             }
         }
     "#;
-    assert_eq!(source_requires_native(env_and_dtolnay_linux_check), None);
+    assert_eq!(source_requires_native(env_and_same_cfgs), None);
 
     // 6. Comments (line + nested block comments) and string / raw-string / byte-string / char literals
     //    (including libsqlite3-sys's raw_line(r#"extern "C" { ... "#)).
@@ -494,30 +493,229 @@ fn negated_and_diverging_cfg_macros_and_crate_level_cfg_classify_native() {
         );
     }
 
-    // Crate-level `#![cfg(...)]` gating the script to Unix/Linux/not-wasm must classify Native.
-    for src in [
-        "#![cfg(unix)]\nfn main() {}",
-        "#![cfg(target_os = \"linux\")]\nfn main() {}",
-        "#![cfg(not(target_family = \"wasm\"))]\nfn main() {}",
-        "#![cfg(all(unix, feature = \"foo\"))]\nfn main() {}",
+    let linux_arm = ScriptCfg::from_host_triple("aarch64-unknown-linux-gnu", Some(&[]));
+    let macos_arm = ScriptCfg::from_host_triple("aarch64-apple-darwin", Some(&[]));
+
+    // Crate-level `#![cfg(...)]` gating the script to the active host must classify Native.
+    for (cfg, src) in [
+        (linux_arm, "#![cfg(unix)]\nfn main() {}"),
+        (linux_arm, "#![cfg(target_os = \"linux\")]\nfn main() {}"),
+        (macos_arm, "#![cfg(target_os = \"macos\")]\nfn main() {}"),
+        (linux_arm, "#![cfg(not(target_family = \"wasm\"))]\nfn main() {}"),
+        (
+            ScriptCfg::from_host_triple("aarch64-unknown-linux-gnu", Some(&["foo"])),
+            "#![cfg(all(unix, feature = \"foo\"))]\nfn main() {}",
+        ),
     ] {
         assert_eq!(
-            source_requires_native(src),
+            source_requires_native_with_cfg(src, cfg),
             Some(NativeSourceReason::HostFamilyCfg),
             "expected crate-level HostFamilyCfg for: {src}"
         );
     }
 
-    // Crate-level `#![cfg(windows)]` is dead on both supported Unix hosts and WASI -> None.
-    assert_eq!(source_requires_native("#![cfg(windows)]\nfn main() {}"), None);
+    // Crate-level `#![cfg(...)]` that is false on BOTH host and WASI stays None.
+    assert_eq!(source_requires_native_with_cfg("#![cfg(windows)]\nfn main() {}", linux_arm), None);
+    assert_eq!(source_requires_native_with_cfg("#![cfg(test)]\nfn main() {}", linux_arm), None);
+    assert_eq!(source_requires_native_with_cfg("#![cfg(target_os = \"macos\")]\nfn main() {}", linux_arm), None);
+    assert_eq!(source_requires_native_with_cfg("#![cfg(target_os = \"linux\")]\nfn main() {}", macos_arm), None);
+}
+
+#[test]
+fn concrete_host_cfg_and_unit_features_and_test_cfg() {
+    let linux_arm = ScriptCfg::from_host_triple("aarch64-unknown-linux-gnu", Some(&[]));
+    let macos_arm = ScriptCfg::from_host_triple("aarch64-apple-darwin", Some(&[]));
+    let linux_native_feat = ScriptCfg::from_host_triple("aarch64-unknown-linux-gnu", Some(&["native"]));
+
+    // 1. Concrete host `target_os`, `target_arch`, `target_env`, `target_vendor` diverge on matching host,
+    //    and stay Wasm on non-matching host.
+    assert_eq!(
+        source_requires_native_with_cfg("fn main() { if cfg!(target_os = \"linux\") {} }", linux_arm),
+        Some(NativeSourceReason::HostFamilyCfg)
+    );
+    assert_eq!(
+        source_requires_native_with_cfg("fn main() { if cfg!(target_os = \"linux\") {} }", macos_arm),
+        None
+    );
+    assert_eq!(
+        source_requires_native_with_cfg("fn main() { if cfg!(target_os = \"macos\") {} }", macos_arm),
+        Some(NativeSourceReason::HostFamilyCfg)
+    );
+    assert_eq!(
+        source_requires_native_with_cfg("fn main() { if cfg!(target_os = \"macos\") {} }", linux_arm),
+        None
+    );
+    assert_eq!(
+        source_requires_native_with_cfg("fn main() { if cfg!(target_arch = \"aarch64\") {} }", linux_arm),
+        Some(NativeSourceReason::HostFamilyCfg)
+    );
+    assert_eq!(
+        source_requires_native_with_cfg("fn main() { if cfg!(target_arch = \"x86_64\") {} }", linux_arm),
+        None
+    );
+    assert_eq!(
+        source_requires_native_with_cfg("fn main() { if cfg!(target_env = \"gnu\") {} }", linux_arm),
+        Some(NativeSourceReason::HostFamilyCfg)
+    );
+    assert_eq!(
+        source_requires_native_with_cfg("fn main() { if cfg!(target_env = \"gnu\") {} }", macos_arm),
+        None
+    );
+    assert_eq!(
+        source_requires_native_with_cfg("fn main() { if cfg!(target_env = \"\") {} }", linux_arm),
+        Some(NativeSourceReason::HostFamilyCfg)
+    );
+    assert_eq!(
+        source_requires_native_with_cfg("fn main() { if cfg!(target_env = \"\") {} }", macos_arm),
+        None
+    );
+    assert_eq!(
+        source_requires_native_with_cfg("fn main() { if cfg!(all(target_os = \"linux\", debug_assertions)) {} }", linux_arm),
+        Some(NativeSourceReason::HostFamilyCfg)
+    );
+    assert_eq!(
+        source_requires_native_with_cfg("fn main() { if cfg!(all(target_os = \"linux\", feature = \"native\")) {} }", linux_arm),
+        None
+    );
+    assert_eq!(
+        source_requires_native_with_cfg("fn main() { if cfg!(all(target_os = \"linux\", feature = \"native\")) {} }", linux_native_feat),
+        Some(NativeSourceReason::HostFamilyCfg)
+    );
+
+    // 2. `#[cfg(test)]` and disabled `#[cfg(feature = "native")]` exclude items & submodules.
+    let gated_items = r#"
+        #[cfg(test)]
+        fn test_helper() {
+            use std::os::unix::io::AsRawFd;
+            extern "C" { fn ioctl(); }
+        }
+        #[cfg(feature = "native")]
+        fn native_helper() {
+            use std::os::unix::fs::MetadataExt;
+        }
+        fn main() {}
+    "#;
+    assert_eq!(source_requires_native_with_cfg(gated_items, linux_arm), None);
+    assert_eq!(
+        source_requires_native_with_cfg(gated_items, linux_native_feat),
+        Some(NativeSourceReason::HostOsStd)
+    );
+}
+
+#[test]
+fn macro_rules_resolution_respects_lexical_scope_and_macro_use() {
+    // 1. Sibling modules defining the same macro name: invoking WASI-safe `b::m!` MUST NOT
+    //    activate uninvoked native `a::m!`.
+    let sibling_modules = r#"
+        mod a {
+            macro_rules! m {
+                () => { use std::os::unix::fs::MetadataExt; };
+            }
+        }
+        mod b {
+            macro_rules! m {
+                () => {};
+            }
+            pub fn f() {
+                m!();
+            }
+        }
+        fn main() {
+            b::f();
+        }
+    "#;
+    assert_eq!(source_requires_native(sibling_modules), None);
+
+    // 2. External/unrelated qualified macro call `log::warn!` MUST NOT match a local `macro_rules! warn`.
+    let qualified_external = r#"
+        mod a {
+            macro_rules! warn {
+                () => { extern "C" { fn f(); } };
+            }
+        }
+        fn main() {
+            log::warn!("ok");
+        }
+    "#;
+    assert_eq!(source_requires_native(qualified_external), None);
+
+    // 3. Same-scope & inner-scope shadowing: shadowed native macro stays Wasm.
+    let shadowed = r#"
+        macro_rules! m {
+            () => { use std::os::unix::fs::MetadataExt; };
+        }
+        macro_rules! m {
+            () => {};
+        }
+        fn main() {
+            m!();
+        }
+    "#;
+    assert_eq!(source_requires_native(shadowed), None);
+
+    let inner_shadowed = r#"
+        macro_rules! m {
+            () => { extern "C" { fn f(); } };
+        }
+        fn main() {
+            macro_rules! m {
+                () => {};
+            }
+            m!();
+        }
+    "#;
+    assert_eq!(source_requires_native(inner_shadowed), None);
+
+    // 4. `#[macro_use] mod a` exports `a`'s macro to its parent scope -> Native!
+    let macro_use_mod = r#"
+        #[macro_use]
+        mod a {
+            macro_rules! m {
+                () => { use std::os::unix::fs::MetadataExt; };
+            }
+        }
+        fn main() {
+            m!();
+        }
+    "#;
+    assert_eq!(source_requires_native(macro_use_mod), Some(NativeSourceReason::HostOsStd));
+
+    // 5. Inner `#![macro_use]` inside `mod a` exports `a`'s macro -> Native!
+    let inner_macro_use = r#"
+        mod a {
+            #![macro_use]
+            macro_rules! m {
+                () => { extern "C" { fn f(); } };
+            }
+        }
+        fn main() {
+            m!();
+        }
+    "#;
+    assert_eq!(source_requires_native(inner_macro_use), Some(NativeSourceReason::ExternC));
+
+    // 6. Qualified local call `a::m!()` resolves into `mod a` -> Native!
+    let qualified_local = r#"
+        mod a {
+            macro_rules! m {
+                () => { use std::os::unix::io::AsRawFd; };
+            }
+            pub(crate) use m;
+        }
+        fn main() {
+            a::m!();
+        }
+    "#;
+    assert_eq!(source_requires_native(qualified_local), Some(NativeSourceReason::HostOsStd));
 }
 
 #[test]
 fn source_tree_inspects_submodules_path_attr_and_include_files() {
     let alloc = Alloc::global();
 
-    let scan = |files: &[(&str, &str)]| -> Result<Option<NativeSourceReason>, ScriptSourceError<'static, &'static str>> {
-        source_tree_requires_native("build.rs", alloc, |rel, _is_root, visit| {
+    let linux_arm = ScriptCfg::from_host_triple("aarch64-unknown-linux-gnu", Some(&[]));
+    let scan_with = |cfg: ScriptCfg<'_>, files: &[(&str, &str)]| -> Result<Option<NativeSourceReason>, ScriptSourceError<'static, &'static str>> {
+        source_tree_requires_native("build.rs", cfg, alloc, |rel, _is_root, visit| {
             if let Some((_, text)) = files.iter().find(|(p, _)| *p == rel) {
                 visit(text);
                 Ok(true)
@@ -526,6 +724,7 @@ fn source_tree_inspects_submodules_path_attr_and_include_files() {
             }
         })
     };
+    let scan = |files: &[(&str, &str)]| scan_with(linux_arm, files);
 
     // 1. `mod host;` -> `host.rs` using std::os::unix
     assert_eq!(
@@ -583,7 +782,7 @@ fn source_tree_inspects_submodules_path_attr_and_include_files() {
     );
 
     // 7. Read error propagation: caller error is returned, never collapsed to Wasm.
-    let err = source_tree_requires_native("build.rs", alloc, |_rel, _is_root, _visit| -> Result<bool, &'static str> {
+    let err = source_tree_requires_native("build.rs", linux_arm, alloc, |_rel, _is_root, _visit| -> Result<bool, &'static str> {
         Err("corrupt pack")
     });
     assert_eq!(err, Err(ScriptSourceError::Read("corrupt pack")));
@@ -638,7 +837,73 @@ fn source_tree_inspects_submodules_path_attr_and_include_files() {
         Ok(None)
     );
 
-    // 11. Exceeding MAX_SCRIPT_FILES (256) returns typed ScriptSourceError::TooManyFiles rather
+    // 11. Escaped ordinary string literals in `include!("host\x2ers")` and
+    //     `#[path = "helpers\u{2f}probe\x2ers"] mod probe;` decode before path resolution,
+    //     while raw strings `r#"host\x2ers"#` remain undecoded.
+    assert_eq!(
+        scan(&[
+            ("build.rs", "include!(\"host\\x2ers\");\nfn main() {}"),
+            ("host.rs", "use std::os::unix::io::AsRawFd;"),
+        ]),
+        Ok(Some(NativeSourceReason::HostOsStd))
+    );
+    assert_eq!(
+        scan(&[
+            ("build.rs", "#[path = \"helpers\\u{2f}probe\\x2ers\"]\nmod probe;\nfn main() {}"),
+            ("helpers/probe.rs", "extern \"C\" { fn ioctl(); }"),
+        ]),
+        Ok(Some(NativeSourceReason::ExternC))
+    );
+    assert_eq!(
+        scan(&[
+            ("build.rs", "include!(r#\"host\\x2ers\"#);\nfn main() {}"),
+            ("host.rs", "use std::os::unix::io::AsRawFd;"),
+        ]),
+        Ok(None)
+    );
+
+    // 12. `#[cfg(test)] mod tests;` and disabled `#[cfg(feature = "native")] mod native;` are
+    //     excluded and NOT followed; enabled `feature = "native"` IS followed.
+    assert_eq!(
+        scan(&[
+            ("build.rs", "#[cfg(test)]\nmod tests;\n#[cfg(feature = \"native\")]\nmod native;\nfn main() {}"),
+            ("tests.rs", "use std::os::unix::io::AsRawFd;"),
+            ("native.rs", "extern \"C\" { fn ioctl(); }"),
+        ]),
+        Ok(None)
+    );
+    let linux_with_native = ScriptCfg::from_host_triple("aarch64-unknown-linux-gnu", Some(&["native"]));
+    assert_eq!(
+        scan_with(
+            linux_with_native,
+            &[
+                ("build.rs", "#[cfg(test)]\nmod tests;\n#[cfg(feature = \"native\")]\nmod native;\nfn main() {}"),
+                ("tests.rs", "use std::os::unix::io::AsRawFd;"),
+                ("native.rs", "extern \"C\" { fn ioctl(); }"),
+            ]
+        ),
+        Ok(Some(NativeSourceReason::ExternC))
+    );
+
+    // 13. Cross-file lexical macro scoping: non-`#[macro_use]` external `mod a;` defining `m!`
+    //     MUST NOT be activated by sibling `mod b;` defining & calling its own WASI-safe `m!`.
+    assert_eq!(
+        scan(&[
+            ("build.rs", "mod a;\nmod b;\nfn main() { b::f(); }"),
+            ("a.rs", "macro_rules! m { () => { use std::os::unix::fs::MetadataExt; }; }"),
+            ("b.rs", "macro_rules! m { () => {}; }\npub fn f() { m!(); }"),
+        ]),
+        Ok(None)
+    );
+    assert_eq!(
+        scan(&[
+            ("build.rs", "mod a;\nfn main() { m!(); }"),
+            ("a.rs", "#![macro_use]\nmacro_rules! m { () => { use std::os::unix::fs::MetadataExt; }; }"),
+        ]),
+        Ok(Some(NativeSourceReason::HostOsStd))
+    );
+
+    // 14. Exceeding MAX_SCRIPT_FILES (256) returns typed ScriptSourceError::TooManyFiles rather
     //     than silently treating an incomplete scan as Wasm-safe.
     let mut chain: std::vec::Vec<(std::string::String, std::string::String)> = std::vec::Vec::new();
     chain.push(("build.rs".to_owned(), "include!(\"f1.rs\");\nfn main() {}".to_owned()));
@@ -651,7 +916,7 @@ fn source_tree_inspects_submodules_path_attr_and_include_files() {
         };
         chain.push((format!("f{i}.rs"), body));
     }
-    let over_limit = source_tree_requires_native("build.rs", alloc, |rel, _is_root, visit| -> Result<bool, &'static str> {
+    let over_limit = source_tree_requires_native("build.rs", linux_arm, alloc, |rel, _is_root, visit| -> Result<bool, &'static str> {
         if let Some((_, text)) = chain.iter().find(|(p, _)| p == rel) {
             visit(text);
             Ok(true)

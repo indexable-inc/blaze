@@ -1883,6 +1883,9 @@ fn make_world<'f>(
                 base_ran_as
             } else {
                 let shown_from = world.crates.get(at).map(|krate| krate.input.shown_from).unwrap_or("");
+                let mut feat_buf: blaze_own::AVec<'_, &str> = blaze_own::AVec::with_capacity_in(script.features.len(), heap);
+                feat_buf.extend(script.features.iter().map(|feature| feature.as_str()));
+                let script_cfg = blaze_build_script::native::ScriptCfg::from_host_triple(crate::graph::TRIPLE, Some(feat_buf.as_slice()));
                 let source_reason = classify_script_source_in_world(
                     &span_cx,
                     &reader.root,
@@ -1892,6 +1895,7 @@ fn make_world<'f>(
                     script.name.as_str(),
                     shown_from,
                     script.root.as_str(),
+                    script_cfg,
                     &io_scratch,
                 )?;
                 let placed = crate::scripts::placement(Some(home), graph, Some(lock), script_id, source_reason, heap);
@@ -1985,7 +1989,7 @@ fn script_source_error(package: &str, path: &str, why: &str) -> NamesError {
 ///
 /// Refuses missing root files, corrupt/unreadable pack entries, missing lazy packs, and
 /// non-UTF-8 files with [`NamesError::ScriptSource`] instead of silently assuming Wasm.
-#[expect(clippy::too_many_arguments, reason = "world source classifier over checkout, fs, packs, lazy_trees, package, shown_from, root, and scratch")]
+#[expect(clippy::too_many_arguments, reason = "world source classifier over checkout, fs, packs, lazy_trees, package, shown_from, root, cfg, and scratch")]
 fn classify_script_source_in_world<'s>(
     cx: &Cx,
     checkout: &Dir<ReadOnly>,
@@ -1995,6 +1999,7 @@ fn classify_script_source_in_world<'s>(
     package: &str,
     shown_from: &str,
     script_root: &str,
+    cfg: blaze_build_script::native::ScriptCfg<'_>,
     scratch: &'s Frame,
 ) -> Result<Option<blaze_build_script::native::NativeSourceReason>, NamesError> {
     let Some(rest) = shown_from.strip_prefix('/') else {
@@ -2026,7 +2031,7 @@ fn classify_script_source_in_world<'s>(
         }
     };
 
-    blaze_build_script::native::source_tree_requires_native(script_root, alloc, |rel, is_root, visit| {
+    blaze_build_script::native::source_tree_requires_native(script_root, cfg, alloc, |rel, is_root, visit| {
         let full = if dir.is_empty() {
             blaze_own::String::from_str_in(rel, alloc)
         } else {
@@ -2679,29 +2684,31 @@ mod unresolved_tests {
         let ro = root_rw.read_only();
         let scratch = bstd::mem::Frame::new(bstd::mem::Tag::Other).expect("scratch");
 
+        let cfg = blaze_build_script::native::ScriptCfg::from_host_triple(crate::graph::TRIPLE, Some(&[]));
+
         // Missing root file MUST return Err(NamesError::ScriptSource), NOT Ok(None).
-        let missing = super::classify_script_source_in_world(&cx, &ro, &fs, &[], None, "missing-pkg", "/0/missing/", "build.rs", &scratch);
+        let missing = super::classify_script_source_in_world(&cx, &ro, &fs, &[], None, "missing-pkg", "/0/missing/", "build.rs", cfg, &scratch);
         assert!(
             matches!(missing, Err(super::NamesError::ScriptSource { ref package, .. }) if package == "missing-pkg"),
             "missing build.rs must refuse with NamesError::ScriptSource: {missing:?}"
         );
 
         // Non-UTF-8 build.rs MUST return Err(NamesError::ScriptSource), NOT Ok(None).
-        let non_utf8 = super::classify_script_source_in_world(&cx, &ro, &fs, &[], None, "bad-utf8", "/0/bad_utf8/", "build.rs", &scratch);
+        let non_utf8 = super::classify_script_source_in_world(&cx, &ro, &fs, &[], None, "bad-utf8", "/0/bad_utf8/", "build.rs", cfg, &scratch);
         assert!(
             matches!(non_utf8, Err(super::NamesError::ScriptSource { ref package, ref why, .. }) if package == "bad-utf8" && why.contains("UTF-8")),
             "non-UTF-8 build.rs must refuse with NamesError::ScriptSource: {non_utf8:?}"
         );
 
         // Out-of-range pack tree index MUST return Err(NamesError::ScriptSource).
-        let missing_pack = super::classify_script_source_in_world(&cx, &ro, &fs, &[], None, "packed", "/5/", "build.rs", &scratch);
+        let missing_pack = super::classify_script_source_in_world(&cx, &ro, &fs, &[], None, "packed", "/5/", "build.rs", cfg, &scratch);
         assert!(
             matches!(missing_pack, Err(super::NamesError::ScriptSource { ref package, .. }) if package == "packed"),
             "missing pack must refuse with NamesError::ScriptSource: {missing_pack:?}"
         );
 
         // Positive control: submodule with std::os::unix classifies Native.
-        let submod = super::classify_script_source_in_world(&cx, &ro, &fs, &[], None, "submod", "/0/submod/", "build.rs", &scratch);
+        let submod = super::classify_script_source_in_world(&cx, &ro, &fs, &[], None, "submod", "/0/submod/", "build.rs", cfg, &scratch);
         assert_eq!(submod.expect("submod ok"), Some(blaze_build_script::native::NativeSourceReason::HostOsStd));
     }
 }

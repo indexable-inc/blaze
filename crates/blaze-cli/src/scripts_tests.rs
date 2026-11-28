@@ -273,7 +273,7 @@ fn scripts_placement_parity_with_proc_macro_and_tree_source() {
             UnitId(4),
             &[(
                 "build.rs",
-                "macro_rules! ffi { () => { extern \"C\" { fn f(); } }; } #[cfg(unix)] let x = { use std::os::unix::fs::MetadataExt; 1 }; fn main() { let _ = r#\"extern \"C\" {\"#; if cfg!(target_os = \"linux\") {} }",
+                "macro_rules! ffi { () => { extern \"C\" { fn f(); } }; } #[cfg(unix)] let x = { use std::os::unix::fs::MetadataExt; 1 }; #[cfg(test)] mod tests { use std::os::unix::io::AsRawFd; } fn main() { let _ = r#\"extern \"C\" {\"#; if cfg!(windows) {} }",
             )],
             RanAs::Wasm,
         ),
@@ -291,7 +291,8 @@ fn scripts_placement_parity_with_proc_macro_and_tree_source() {
     for &(script_id, files, expected) in cases {
         let tree = mem_tree_with_submodules(files.iter().map(|(p, s)| (*p, s.as_bytes())), [], "", None);
         let root = ScriptRoot::package();
-        let source_reason = classify_script_tree_in(&tree, &root, "build.rs", true, alloc.clone(), |_, _| {})
+        let script_cfg = blaze_build_script::native::ScriptCfg::from_host_triple(crate::graph::TRIPLE, Some(&[]));
+        let source_reason = classify_script_tree_in(&tree, &root, "build.rs", script_cfg, true, alloc.clone(), |_, _| {})
             .expect("build.rs tree must classify without error");
 
         let via_cli = placement(Some(empty_home), &graph, Some(&lock), script_id, source_reason, alloc.clone());

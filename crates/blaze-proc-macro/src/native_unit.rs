@@ -69,14 +69,15 @@ pub fn placed_with_source(
     script_source: Option<&str>,
     alloc: Alloc<'_>,
 ) -> Runner {
-    placed_with_lock_and_source(
-        graph,
-        None,
-        script,
-        mode,
-        script_source.and_then(native::source_requires_native),
-        alloc,
-    )
+    let source_reason = script_source.and_then(|src| {
+        let mut feats: blaze_own::AVec<'_, &str> = blaze_own::Vec::new_in(alloc);
+        if let Some(unit) = graph.units.get(script.index()) {
+            feats.extend(unit.features.iter().map(|f| f.as_str()));
+        }
+        let cfg = native::ScriptCfg { features: Some(feats.as_slice()), ..native::ScriptCfg::current_host() };
+        native::source_requires_native_with_cfg(src, cfg)
+    });
+    placed_with_lock_and_source(graph, None, script, mode, source_reason, alloc)
 }
 
 /// Source-qualified and source-tree-aware placement: when `lock` is `Some`, qualifies
@@ -132,16 +133,15 @@ pub fn placed_in_store_with_source(
     script_source: Option<&str>,
     alloc: Alloc<'_>,
 ) -> Runner {
-    placed_in_store_with_lock_and_source(
-        store,
-        graph,
-        None,
-        script,
-        mode,
-        host,
-        script_source.and_then(native::source_requires_native),
-        alloc,
-    )
+    let source_reason = script_source.and_then(|src| {
+        let mut feats: blaze_own::AVec<'_, &str> = blaze_own::Vec::new_in(alloc);
+        if let Some(unit) = graph.units.get(script.index()) {
+            feats.extend(unit.features.iter().map(|f| f.as_str()));
+        }
+        let cfg = native::ScriptCfg::from_host_triple(host, Some(feats.as_slice()));
+        native::source_requires_native_with_cfg(src, cfg)
+    });
+    placed_in_store_with_lock_and_source(store, graph, None, script, mode, host, source_reason, alloc)
 }
 
 /// Source-qualified and source-tree-aware store placement (rules 3, 30, 54).

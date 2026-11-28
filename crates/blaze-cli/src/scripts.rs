@@ -147,12 +147,13 @@ fn classify_script_source_in_files<'s>(
     checkout: &Dir<bstd::fs::ReadOnly>,
     files: &Files<'_>,
     script_root: &str,
+    cfg: blaze_build_script::native::ScriptCfg<'_>,
     scratch: &'s Frame,
 ) -> Result<(Option<blaze_build_script::native::NativeSourceReason>, [u8; 32]), &'s str> {
     let erased = blaze_own::Erased::new(scratch);
     let alloc = erased.handle();
     let mut hasher = blaze_proc_macro::module::FilesHasher::new();
-    let reason = blaze_build_script::native::source_tree_requires_native(script_root, alloc, |rel, is_root, visit| {
+    let reason = blaze_build_script::native::source_tree_requires_native(script_root, cfg, alloc, |rel, is_root, visit| {
         match files {
             Files::Member { dir } | Files::External { dir } => {
                 let full = if dir.is_empty() {
@@ -1668,11 +1669,15 @@ pub(crate) fn job<'f: 'j, 'j>(
         let (runner, source_snap) = if matches!(base_runner, Runner::Native { .. }) {
             (base_runner, None)
         } else {
+            let mut feat_buf: blaze_own::AVec<'_, &str> = blaze_own::AVec::with_capacity_in(unit.features.len(), erased.handle());
+            feat_buf.extend(unit.features.iter().map(|feature| feature.as_str()));
+            let script_cfg = blaze_build_script::native::ScriptCfg::from_host_triple(crate::graph::TRIPLE, Some(feat_buf.as_slice()));
             let (reason, fingerprint) = match classify_script_source_in_files(
                 &cx,
                 &root.read_only(),
                 &files,
                 unit.root.as_str(),
+                script_cfg,
                 &io_scratch,
             ) {
                 Ok(classified) => classified,
@@ -1912,7 +1917,10 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
     // rather than silently running Native under a Wasm key (or vice versa).
     if let Some((planned_reason, planned_fingerprint)) = job.planned_source {
         let mut hasher = blaze_proc_macro::module::FilesHasher::new();
-        let live_reason = match script_unit::classify_script_tree_in(&tree, &root, unit.root.as_str(), true, alloc, |rel, text| {
+        let mut feat_buf: blaze_own::AVec<'_, &str> = blaze_own::AVec::with_capacity_in(unit.features.len(), alloc);
+        feat_buf.extend(unit.features.iter().map(|feature| feature.as_str()));
+        let script_cfg = blaze_build_script::native::ScriptCfg::from_host_triple(crate::graph::TRIPLE, Some(feat_buf.as_slice()));
+        let live_reason = match script_unit::classify_script_tree_in(&tree, &root, unit.root.as_str(), script_cfg, true, alloc, |rel, text| {
             hasher.update_file(rel, text.as_bytes());
         }) {
             Ok(reason) => reason,
