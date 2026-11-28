@@ -624,7 +624,10 @@ pub fn has_macro_call(text: &str) -> bool {
         if attr_depth > 0 {
             match kind {
                 TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => {
-                    attr_depth = attr_depth.saturating_add(1);
+                    let Some(next) = attr_depth.checked_add(1) else {
+                        return true;
+                    };
+                    attr_depth = next;
                 }
                 TokenKind::CloseParen | TokenKind::CloseBracket | TokenKind::CloseBrace => {
                     attr_depth -= 1;
@@ -961,7 +964,10 @@ pub(crate) fn digest_body_blocks(text: &str, alloc: Alloc<'_>, feed: &mut impl F
         if attr_depth > 0 {
             match kind {
                 TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => {
-                    attr_depth = attr_depth.saturating_add(1);
+                    let Some(next) = attr_depth.checked_add(1) else {
+                        return true;
+                    };
+                    attr_depth = next;
                 }
                 TokenKind::CloseParen | TokenKind::CloseBracket | TokenKind::CloseBrace => {
                     attr_depth -= 1;
@@ -1006,7 +1012,10 @@ pub(crate) fn digest_body_blocks(text: &str, alloc: Alloc<'_>, feed: &mut impl F
                     continue;
                 }
                 TokenKind::Comma => {
-                    comma_count = comma_count.saturating_add(1);
+                    let Some(next) = comma_count.checked_add(1) else {
+                        return true;
+                    };
+                    comma_count = next;
                 }
                 _ => {}
             }
@@ -1025,7 +1034,10 @@ pub(crate) fn digest_body_blocks(text: &str, alloc: Alloc<'_>, feed: &mut impl F
                 }
                 _ => {
                     if !rec.in_arg {
-                        rec.arg_count = rec.arg_count.saturating_add(1);
+                        let Some(next) = rec.arg_count.checked_add(1) else {
+                            return true;
+                        };
+                        rec.arg_count = next;
                         rec.in_arg = true;
                     }
                 }
@@ -1131,7 +1143,10 @@ pub(crate) fn digest_body_blocks(text: &str, alloc: Alloc<'_>, feed: &mut impl F
                     block_count += 1;
                     FrameKind::Brace { block }
                 } else {
-                    arg_brace_depth = arg_brace_depth.saturating_add(1);
+                    let Some(next) = arg_brace_depth.checked_add(1) else {
+                        return true;
+                    };
+                    arg_brace_depth = next;
                     FrameKind::Brace { block: NO_BLOCK }
                 }
             } else {
@@ -3494,5 +3509,22 @@ fn h() {
         assert_eq!(n.head_calls.len(), 2);
         assert_eq!(&gen_src[n.head_calls[0].attrs.start as usize..n.head_calls[0].attrs.end as usize], "#[cfg(any())]");
         assert_eq!(n.head_calls[1].attrs.start, n.head_calls[1].attrs.end);
+    }
+
+    #[test]
+    fn digest_body_blocks_hashes_whole_when_comma_count_overflows_u16() {
+        let heap = blaze_own::testing::heap();
+        let mut text = blaze_own::AString::new_in(heap.alloc());
+        text.push_str("fn many(");
+        for _ in 0..=usize::from(u16::MAX) {
+            text.push_str("_: u8,");
+        }
+        text.push_str("#[cfg(any())] _: [u8; core::mem::size_of::<u8>()], _: [u8; core::mem::size_of::<u8>()]) { println!(); }");
+        let mut fed = 0usize;
+        let hash_whole = super::digest_body_blocks(text.as_str(), heap.alloc(), &mut |bytes| {
+            fed += bytes.len();
+        });
+        assert!(hash_whole, "comma_count exceeding u16::MAX must fall back to hashing the item whole instead of saturating");
+        assert_eq!(fed, 0, "returning true must not emit partial digest bytes");
     }
 }

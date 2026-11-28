@@ -1286,6 +1286,9 @@ impl<'a> Hashes<'a> {
             }
             let mut h = StableHasher::new("term shape");
             crate::portable::hash_node_shape(&node, &mut h);
+            if matches!(node, crate::portable::PNode::Record(..)) {
+                h.u64(t.record_defaults_tag(PTy(n)));
+            }
             for c in &self.kids {
                 let d = self.memo.get(&(tab, *c)).copied().ok_or(CheckError::Malformed(Malformed::TypeOrder { node: n, child: *c }))?;
                 h.u64(d);

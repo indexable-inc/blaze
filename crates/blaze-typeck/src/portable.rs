@@ -530,8 +530,12 @@ impl<'a> PTys<'a> {
 impl ContentHash for PTys<'_> {
     fn hash_into(&self, h: &mut StableHasher) {
         h.u64(self.len() as u64);
-        for n in self.nodes() {
+        for (i, n) in self.nodes().enumerate() {
             hash_node(n, h);
+            if matches!(n, PNode::Record(..)) {
+                let tag = u32::try_from(i).map_or(0, |idx| self.record_defaults_tag(PTy(idx)));
+                h.u64(tag);
+            }
         }
         h.u64(self.lists_len() as u64);
         for t in self.lists() {
