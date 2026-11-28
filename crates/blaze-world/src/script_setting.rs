@@ -225,6 +225,9 @@ mod setup {
         /// edge has no setting (no SDK, no shim beside it); a script placed native then fails
         /// with it, never run as wasm (D112).
         pub native: Result<NativeRunOpts<'a, 's>, R>,
+        /// Pre-opened command spawn setting (derived-fact pins) to share with wasm64 dependency
+        /// build-script keying and execution; when `None`, opened here via `command_spawn_setting`.
+        pub spawn: Option<SpawnSetting>,
         pub alloc: Alloc<'a>,
     }
 
@@ -286,10 +289,13 @@ mod setup {
             tool: ContentId,
             records: &mut S,
         ) -> Result<ScriptSetup<'a, R>, ScriptSetupError<'w, 'a, S::Error>> {
-            let ScriptSetupOpts { world, target, macro_target, native, alloc } = opts;
+            let ScriptSetupOpts { world, target, macro_target, native, spawn, alloc } = opts;
             let table = probe_table(world, Side::Target, target, tool, records, alloc).map_err(ScriptSetupError::Table)?;
             let macro_table = probe_table(world, Side::Macro, macro_target, tool, records, alloc).map_err(ScriptSetupError::Table)?;
-            let spawn = command_spawn_setting(target, alloc).map_err(ScriptSetupError::Spawn)?;
+            let spawn = match spawn {
+                Some(existing) => existing,
+                None => command_spawn_setting(target, alloc).map_err(ScriptSetupError::Spawn)?,
+            };
             let native = match native {
                 Ok(opts) => NativeRun::new(opts).map_err(NativeRefused::Open),
                 Err(why) => Err(NativeRefused::Caller(why)),

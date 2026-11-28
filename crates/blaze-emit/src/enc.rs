@@ -751,6 +751,11 @@ pub(crate) const fn brk(imm16: u32) -> u32 {
     0xd420_0000 | (imm16 << 5)
 }
 
+/// `svc #imm16` (C6.2.337: supervisor call).
+pub(crate) const fn svc(imm16: u32) -> u32 {
+    0xd400_0001 | ((imm16 & 0xffff) << 5)
+}
+
 /// True iff `w` is an unconditional AArch64 control-transfer or trap instruction
 /// (`b`, `ret`, `br`, `brk`, or `udf`) that never falls through to the next word.
 pub(crate) const fn is_unconditional_terminator(w: u32) -> bool {

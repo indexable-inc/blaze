@@ -634,6 +634,8 @@ fn spawn_probe_accepts_out_dir_subdir_and_refuses_escapes() {
     let records: OwnArc<dyn CProbeStore, SharedAlloc<'static>> = OwnArc::new_in(MemCProbeStore::default(), shared);
     let c_probes = CProbeSetting::Ready(CScriptProbes {
         answerer,
+        #[cfg(target_os = "linux")]
+        hermetic: None,
         records,
         sdk_dir: OwnArc::from_str_in("", shared),
         sdk_id: OwnArc::from_str_in("", shared),

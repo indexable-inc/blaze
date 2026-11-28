@@ -17,12 +17,12 @@ use blaze_own::{AString, AVec, Alloc, String, Vec};
 use parser::SyntaxKind;
 
 use crate::{
-    call::{AlsoCopy, Constness, DeriveFacts},
+    call::{AlsoCopy, CallSite, Constness, DeriveFacts},
     cfg::{CfgAttrError, CfgPredicateError, cfg_attr_metas, cfg_predicate_at},
     derive::{attr_call, derive_meta},
     error::StreamError,
     extent::ExtentError,
-    tokens::{Delim, TokenKind, TokenStream, index},
+    tokens::{Ctx, Delim, Edition, TokenKind, TokenStream, index},
 };
 
 /// Why an item's attributes leave no answer.
@@ -85,6 +85,22 @@ pub struct AttrCall<'a> {
     /// they are the first `derives_taken` of [`ItemAttrs::derives`]' uses on the same item, in
     /// order, and run before the macro (its caller runs them; the macro never sees them).
     pub derives_taken: usize,
+    /// The context of the attribute's path, imported into [`AttrCall::item`] (`None` for
+    /// [`ItemAttrs::implicit_call`], where no attribute in the item names the call).
+    pub site_ctx: Option<Ctx>,
+}
+
+impl AttrCall<'_> {
+    /// The [`CallSite`] of this attribute call, with `ctx` in [`AttrCall::item`].
+    pub fn call_site(&self, fallback_edition: Edition) -> CallSite {
+        match self.site_ctx {
+            Some(ctx) => {
+                let edition = self.item.edition_of(ctx);
+                CallSite { edition, panic_edition: edition, ctx }
+            }
+            None => CallSite::root(fallback_edition),
+        }
+    }
 }
 
 /// One path of a `#[derive(..)]` or `#[derive_const(..)]`, in order.
@@ -111,6 +127,15 @@ impl Derives<'_> {
     /// The facts of the derive `u`: whether the item also derives `Copy`, and its constness.
     pub fn facts(&self, u: &DeriveUse<'_>) -> DeriveFacts {
         DeriveFacts { copy: self.copy, constness: u.constness }
+    }
+
+    /// The [`CallSite`] of the derive at `use_index` in [`Derives::uses`], with its path's
+    /// context imported into [`Derives::input`].
+    pub fn call_site(&mut self, use_index: usize, fallback_edition: Edition) -> Result<CallSite, StreamError> {
+        let Some(used) = self.uses.get(use_index) else {
+            return Ok(CallSite::root(fallback_edition));
+        };
+        CallSite::from_path(&used.tokens, 0..used.tokens.len(), &mut self.input, fallback_edition)
     }
 }
 
@@ -183,7 +208,7 @@ impl<'a> ItemAttrs<'a> {
     /// expansion, as written).
     pub fn implicit_call<E>(mut self, atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>) -> Result<AttrCall<'a>, ItemAttrsError<E>> {
         self.apply_later_cfg_attrs(0, atom)?;
-        Ok(AttrCall { args: None, item: self.item, derives_taken: 0 })
+        Ok(AttrCall { args: None, item: self.item, derives_taken: 0, site_ctx: None })
     }
 
     /// Each `#[cfg_attr(..)]` among the outer attributes from token `from` on replaced in place
@@ -220,9 +245,10 @@ impl<'a> ItemAttrs<'a> {
         let alloc = self.item.allocator();
         let (start, end) = (attr.start as usize, attr.end as usize);
         let tokens = attr_copy(&self.item, start, end - 1, meta_at(&self.item, start + 1, end - 1))?;
-        let args = match attr_call(&tokens).and_then(|(_, args)| args) {
-            Some(r) => Some(tokens.copy_in(r.start as usize..r.end as usize, alloc)?),
-            None => None,
+        let (path_range, args) = match attr_call(&tokens) {
+            Some((path, Some(r))) => (Some(path), Some(tokens.copy_in(r.start as usize..r.end as usize, alloc)?)),
+            Some((path, None)) => (Some(path), None),
+            None => (None, None),
         };
         let mut item = TokenStream::new_in(alloc);
         let mut derives_taken = 0;
@@ -243,7 +269,17 @@ impl<'a> ItemAttrs<'a> {
         for t in (at..start).chain(end..self.item.len()) {
             item.push_from(&self.item, t)?;
         }
-        Ok(AttrCall { args, item, derives_taken })
+        let site_ctx = match path_range {
+            Some(path) => match usize::try_from(path.start).ok().zip(usize::try_from(path.end).ok()) {
+                Some((s, e)) => match crate::call::path_ctx_in(&tokens, s..e) {
+                    Some(ctx) => Some(item.import_ctx(&tokens, ctx)?),
+                    None => None,
+                },
+                None => None,
+            },
+            None => None,
+        };
+        Ok(AttrCall { args, item, derives_taken, site_ctx })
     }
 
     /// Whether the attribute `attr` (a [`NextAttr::Call`]'s, tokens of [`ItemAttrs::item`]) is

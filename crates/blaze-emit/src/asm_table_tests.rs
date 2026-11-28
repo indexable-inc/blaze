@@ -142,6 +142,14 @@ fn rows_match_the_a64_layouts() {
         // Cache maintenance (`sys #3, c7, c11/c5, #1, Xt`).
         ("dc cvau, x0",             0xd50b_7b20),
         ("ic ivau, x7",             0xd50b_7527),
+        // Exception generation and conditional set (Linux/macOS raw syscalls & naked traps).
+        ("svc 0",                   0xd400_0001),
+        ("svc #0",                  0xd400_0001),
+        ("svc #0x80",               0xd400_1001),
+        ("brk #0",                  0xd420_0000),
+        ("brk #1",                  0xd420_0020),
+        ("cset x0, cs",             0x9a9f_37e0),
+        ("cset w3, eq",             0x1a9f_17e3),
     ];
     for &(statement, expected) in rows {
         let got = word(statement).unwrap_or_else(|e| panic!("{statement:?} refused: {e:?}"));
@@ -183,7 +191,10 @@ fn refusals_name_the_token() {
         ("pacib x0, xzr", "`xzr` as `pacib`'s modifier (31 is `sp` there; the zero modifier is `pacizb`)", "xzr"),
         ("dsb foo", "a barrier option `dmb` and `dsb` have not", "foo"),
         ("bl foo", "expected a decimal local label followed by `b` or `f`", "foo"),
-        ("svc #0", "a mnemonic the baseline tier's assembler has no row for", "svc"),
+        ("svc #65536", "a `svc` immediate outside 0..=65535", "#65536"),
+        ("brk #-1", "a `brk` immediate outside 0..=65535", "#-1"),
+        ("cset x0, al", "a condition outside `eq`..`le` (`al` and `nv` are not taken)", "al"),
+        ("hvc #0", "a mnemonic the baseline tier's assembler has no row for", "hvc"),
     ];
     for &(statement, why, token) in cases {
         match word(statement) {

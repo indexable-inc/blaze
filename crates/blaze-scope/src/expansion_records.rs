@@ -46,12 +46,13 @@ use crate::resolve::CrateNames;
 
 /// The domain an expansion record's key is the digest of its bytes in. Its number moves with
 /// [`RECORD_FORM`].
-pub const RECORD_DOMAIN: &str = "blaze-scope expansion record 2";
+pub const RECORD_DOMAIN: &str = "blaze-scope expansion record 3";
 static RECORDS: Domain = Domain::new(RECORD_DOMAIN);
-static DEDUP: Domain = Domain::new("blaze-scope expansion dedup 2");
+static DEDUP: Domain = Domain::new("blaze-scope expansion dedup 3");
 
-/// An expansion record's form (form 2 adds optional RFC 8878 zstd compression of the payload).
-pub const RECORD_FORM: u32 = 2;
+/// An expansion record's form (form 2 adds optional RFC 8878 zstd compression of the payload;
+/// form 3 widens `OriginColumn` `TextMark` rows from 76 to 84 bytes with `hygiene: u64`).
+pub const RECORD_FORM: u32 = 3;
 /// An expansion record's head: form, text length, column length, flags (`0` raw, `1` zstd, `2` delta-columnar + zstd).
 pub const RECORD_HEAD: usize = 16;
 const FLAG_RAW: u32 = 0;

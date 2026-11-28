@@ -123,7 +123,8 @@ impl ReadKind {
             | LeafKind::HomeListing
             | LeafKind::MacroFiles
             | LeafKind::MacroFile
-            | LeafKind::MacroFolder => None,
+            | LeafKind::MacroFolder
+            | LeafKind::DepProbes => None,
         }
     }
 

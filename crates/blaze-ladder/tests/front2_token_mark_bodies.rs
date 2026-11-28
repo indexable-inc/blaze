@@ -878,3 +878,502 @@ pub fn local_semi_err() -> u8 {
     assert!(errors.is_empty(), "the records filed {errors:?}");
     assert!(failed.is_empty(), "cfg_aliases bodies that did not check clean: {failed:?}");
 }
+
+/// End-to-end `CallSite.ctx` hygiene across `blaze-scope` -> `blaze-lower` -> `blaze-ladder`
+/// (exact `Snafu` pattern + nested `macro_rules!` -> `#[derive]`, `#[attr]`, item fn-like proc
+/// macro, body-level proc macro, plus `def_site`/`mixed_site` negative controls) over BOTH solved
+/// `Names` and `Records`.
+#[test]
+fn call_site_ctx_hygiene_for_macro_generated_derive_attr_fn_like_and_body_calls() {
+    use blaze_expand::{
+        HostAsk, HostError, HostWhy, MacroDefinition, ProcCall, ProcKind, Produced, Reads,
+        TokenOrigin, Transparency, lex,
+    };
+    use blaze_own::AVec;
+    use blaze_unit_graph::{Implicit, Prelude, StdIs};
+
+    const PROC_CRATE: &str = "#![no_core]
+#[proc_macro_derive(SnafuCallSite)]
+pub fn snafu_call_site(input: TokenStream) -> TokenStream { input }
+#[proc_macro_derive(SnafuDefSite)]
+pub fn snafu_def_site(input: TokenStream) -> TokenStream { input }
+#[proc_macro_derive(SnafuMixedSite)]
+pub fn snafu_mixed_site(input: TokenStream) -> TokenStream { input }
+#[proc_macro_attribute]
+pub fn inject_host_read(_attr: TokenStream, item: TokenStream) -> TokenStream { item }
+#[proc_macro]
+pub fn emit_item_with_host(input: TokenStream) -> TokenStream { input }
+#[proc_macro]
+pub fn body_read_call_site(input: TokenStream) -> TokenStream { input }
+#[proc_macro]
+pub fn body_read_def_site(input: TokenStream) -> TokenStream { input }
+";
+
+    const DEP_MACROS: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+
+#[lang = \"sized\"]
+pub trait Sized {}
+
+#[macro_export]
+macro_rules! make_err {
+    () => {
+        #[derive(procs::SnafuCallSite)]
+        pub enum TakeoverError {
+            ReplicaDown { host: u32 },
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! wrap_make_err {
+    () => {
+        $crate::make_err_nested!();
+    };
+}
+
+#[macro_export]
+macro_rules! make_err_nested {
+    () => {
+        #[derive(procs::SnafuCallSite)]
+        pub enum NestedError {
+            ReplicaDown { host: u32 },
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! make_err_neg_def {
+    () => {
+        #[derive(procs::SnafuDefSite)]
+        pub enum DefSiteErr {
+            ReplicaDown { host: u32 },
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! make_err_neg_mixed {
+    () => {
+        #[derive(procs::SnafuMixedSite)]
+        pub enum MixedSiteErr {
+            ReplicaDown { host: u32 },
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! make_attr_fn {
+    () => {
+        #[procs::inject_host_read]
+        pub fn attr_fn() -> u32 {
+            let host: u32 = 11u32;
+            0u32
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! make_fn_like_item {
+    () => {
+        procs::emit_item_with_host!(host);
+    };
+}
+
+#[macro_export]
+macro_rules! make_body_macro_fn {
+    () => {
+        pub fn body_call_ok() -> u32 {
+            let host: u32 = 19u32;
+            procs::body_read_call_site!()
+        }
+        pub fn body_call_neg_def() -> u32 {
+            let host: u32 = 19u32;
+            procs::body_read_def_site!()
+        }
+    };
+}
+";
+
+    const APP: &str = "#![feature(no_core)]
+#![no_core]
+#![no_main]
+
+dep::make_err!();
+dep::wrap_make_err!();
+dep::make_err_neg_def!();
+dep::make_err_neg_mixed!();
+dep::make_attr_fn!();
+dep::make_fn_like_item!();
+dep::make_body_macro_fn!();
+";
+
+    const PROC_PATH: &str = "/procs/src/lib.rs";
+    const DEP_PATH: &str = "/dep/src/lib.rs";
+    const APP_PATH: &str = "/app/src/main.rs";
+    const RUNNER: CrateItemKey = CrateItemKey(ContentId([0x5A; 32]));
+
+    struct ProcWorld;
+    impl SourceTexts<'static> for ProcWorld {
+        fn read(&self, krate: usize, path: &str) -> Option<&'static str> {
+            match (krate, path) {
+                (0, APP_PATH) => Some(APP),
+                (1, DEP_PATH) => Some(DEP_MACROS),
+                (2, PROC_PATH) => Some(PROC_CRATE),
+                _ => None,
+            }
+        }
+
+        fn proc_macro_key(&self, krate: usize) -> Option<CrateItemKey> {
+            (krate == 2).then_some(RUNNER)
+        }
+
+        fn run_proc_macro<'b>(
+            &self,
+            _: usize,
+            def: &MacroDefinition<'_>,
+            call: ProcCall<'_>,
+            alloc: Alloc<'b>,
+        ) -> Result<Produced<'b>, HostError> {
+            let refused = HostError { ask: HostAsk::ProcMacro, why: HostWhy::Refused };
+            let find_tok = |want: &str| -> Option<u32> {
+                (0..call.input.len())
+                    .find(|&i| call.input.text_at(i) == want)
+                    .and_then(|i| u32::try_from(i).ok())
+            };
+            let emit_with_host_ref = |src: &str, host_idx: u32, ref_transparency: Transparency| -> Result<Produced<'b>, HostError> {
+                let tokens = lex(src, blaze_expand::Edition::E2021, alloc).map_err(|_| refused)?;
+                let mut origins = AVec::new_in(alloc);
+                let mut host_seen = 0u32;
+                for i in 0..tokens.len() {
+                    if tokens.text_at(i) == "host" {
+                        host_seen += 1;
+                        if host_seen == 1 {
+                            origins.push(TokenOrigin::Input(host_idx));
+                        } else {
+                            origins.push(TokenOrigin::Made(ref_transparency));
+                        }
+                    } else {
+                        origins.push(TokenOrigin::Made(Transparency::Transparent));
+                    }
+                }
+                Ok(Produced { tokens, origins, reads: Reads::new_in(alloc), diagnostics: AVec::new_in(alloc), text: AVec::new_in(alloc) })
+            };
+            match (call.kind, def.proc_name()) {
+                (ProcKind::Derive, Some(name @ ("SnafuCallSite" | "SnafuDefSite" | "SnafuMixedSite"))) => {
+                    let made_t = match name {
+                        "SnafuCallSite" => Transparency::Transparent,
+                        "SnafuDefSite" => Transparency::Opaque,
+                        _ => Transparency::SemiOpaque,
+                    };
+                    let enum_idx = (0..call.input.len())
+                        .find(|&i| call.input.text_at(i) == "enum")
+                        .and_then(|i| u32::try_from(i + 1).ok())
+                        .ok_or(refused)?;
+                    let enum_name = call.input.text_at(usize::try_from(enum_idx).map_err(|_| refused)?);
+                    let host_idx = find_tok("host").ok_or(refused)?;
+                    let fn_name = match enum_name {
+                        "TakeoverError" => "fmt_takeover",
+                        "NestedError" => "fmt_nested",
+                        "DefSiteErr" => "fmt_def_site",
+                        "MixedSiteErr" => "fmt_mixed_site",
+                        _ => return Err(refused),
+                    };
+                    // Emit:
+                    //   pub fn <fn_name>(e: &<Enum>) -> u32 {
+                    //       match *e { <Enum>::ReplicaDown { ref host } => *host }
+                    //   }
+                    // where `host` in `ref host` is `TokenOrigin::Input(host_idx)` (exact Snafu
+                    // pattern) and `host` in `*host` is `TokenOrigin::Made(made_t)`.
+                    let src = format!(
+                        "pub fn {fn_name}(e: &{enum_name}) -> u32 {{ match *e {{ {enum_name}::ReplicaDown {{ ref host }} => *host }} }}"
+                    );
+                    emit_with_host_ref(&src, host_idx, made_t)
+                }
+                (ProcKind::Attr, Some("inject_host_read")) => {
+                    let host_idx = find_tok("host").ok_or(refused)?;
+                    emit_with_host_ref(
+                        "pub fn attr_fn() -> u32 { let host: u32 = 11u32; host }",
+                        host_idx,
+                        Transparency::Transparent,
+                    )
+                }
+                (ProcKind::FnLike, Some("emit_item_with_host")) => {
+                    let host_idx = find_tok("host").ok_or(refused)?;
+                    emit_with_host_ref(
+                        "pub fn fn_like_item() -> u32 { let host: u32 = 23u32; host }",
+                        host_idx,
+                        Transparency::Transparent,
+                    )
+                }
+                (ProcKind::FnLike, Some("body_read_call_site")) => {
+                    let tokens = lex("host", blaze_expand::Edition::E2021, alloc).map_err(|_| refused)?;
+                    let mut origins = AVec::new_in(alloc);
+                    origins.extend(tokens.tokens().iter().map(|_| TokenOrigin::Made(Transparency::Transparent)));
+                    Ok(Produced { tokens, origins, reads: Reads::new_in(alloc), diagnostics: AVec::new_in(alloc), text: AVec::new_in(alloc) })
+                }
+                (ProcKind::FnLike, Some("body_read_def_site")) => {
+                    let tokens = lex("host", blaze_expand::Edition::E2021, alloc).map_err(|_| refused)?;
+                    let mut origins = AVec::new_in(alloc);
+                    origins.extend(tokens.tokens().iter().map(|_| TokenOrigin::Made(Transparency::Opaque)));
+                    Ok(Produced { tokens, origins, reads: Reads::new_in(alloc), diagnostics: AVec::new_in(alloc), text: AVec::new_in(alloc) })
+                }
+                _ => Err(refused),
+            }
+        }
+    }
+
+    let rust = PackageEdition { syntax: edition::Edition::Edition2021, blaze: None };
+    let lib = implicit(rust, &blaze_unit_graph::UnitKind::Lib);
+    let proc_implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: true, entry: false };
+    const CFG: &[(&str, Option<&str>)] = &[];
+    const APP_DEPS: &[(&str, usize)] = &[("dep", 1), ("procs", 2)];
+    let crates = [
+        CrateInput {
+            name: "app",
+            key: CrateItemKey(ContentId::of("front2_callsite_ctx app", b"app")),
+            edition: syntax_of(rust),
+            implicit: lib,
+            root: APP_PATH,
+            shown_from: "/app/",
+            features: &[],
+            deps: APP_DEPS,
+            cfg: CFG,
+            script: None,
+        },
+        CrateInput {
+            name: "dep",
+            key: CrateItemKey(ContentId::of("front2_callsite_ctx dep", b"dep")),
+            edition: syntax_of(rust),
+            implicit: lib,
+            root: DEP_PATH,
+            shown_from: "/dep/",
+            features: &[],
+            deps: &[],
+            cfg: CFG,
+            script: None,
+        },
+        CrateInput {
+            name: "procs",
+            key: CrateItemKey(ContentId::of("front2_callsite_ctx procs", b"procs")),
+            edition: syntax_of(rust),
+            implicit: proc_implicit,
+            root: PROC_PATH,
+            shown_from: "/procs/",
+            features: &[],
+            deps: &[],
+            cfg: CFG,
+            script: None,
+        },
+    ];
+    let crate_names: &'static [&'static str] = &["app", "dep", "procs"];
+    let keys: &'static [CrateItemKey] = Vec::leak(crates.iter().map(|c| c.key).collect());
+    static WORLD: ProcWorld = ProcWorld;
+    let body_sources: &'static dyn blaze_ladder::front2::body_host::BodySources =
+        Box::leak(Box::new(blaze_ladder::front2::body_host::Sourced(&WORLD)));
+    let names = resolve_crates(&crates, Sysroot::default(), &WORLD, &Serial, blaze_own::testing::bump())
+        .unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    assert!(names.notes(0).is_empty(), "app scope notes must be empty: {:?}", names.notes(0));
+
+    let fn_key = |name: &str| {
+        Paths { names: &names }
+            .path(names.root(0), false, &[name], Ns::Value)
+            .unwrap_or_else(|e| panic!("`{name}` from app root: {e:?}"))
+            .key
+    };
+    let positive_fns = [
+        ("fmt_takeover", Asked::Free(fn_key("fmt_takeover"))),
+        ("fmt_nested", Asked::Free(fn_key("fmt_nested"))),
+        ("attr_fn", Asked::Free(fn_key("attr_fn"))),
+        ("fn_like_item", Asked::Free(fn_key("fn_like_item"))),
+        ("body_call_ok", Asked::Free(fn_key("body_call_ok"))),
+    ];
+    let negative_fns = [
+        ("fmt_def_site", Asked::Free(fn_key("fmt_def_site")), "OpaqueWithoutModule"),
+        ("fmt_mixed_site", Asked::Free(fn_key("fmt_mixed_site")), "UnresolvedPath"),
+        ("body_call_neg_def", Asked::Free(fn_key("body_call_neg_def")), "OpaqueWithoutModule"),
+    ];
+
+    let mut failed = Vec::new();
+    let sources = [SourceFile { path: "src/main.rs", text: APP }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+    {
+        let mut front = Front2::new(&names, &frame, &sources, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+        let prepared = Prepares::new_in(blaze_own::testing::bump());
+        let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::testing::heap().alloc());
+        store.sources = Some(body_sources);
+        for &(name, f) in &positive_fns {
+            let got = checked(&names, prepared, &mut front.keys, &front.index, &mut store, f);
+            if got != "clean" {
+                failed.push(format!("{name} (names): {got}"));
+            }
+        }
+        for &(name, f, expect) in &negative_fns {
+            let got = checked(&names, prepared, &mut front.keys, &front.index, &mut store, f);
+            assert!(got.contains(expect), "{name} (names) must fail with {expect}, got: {got}");
+        }
+    }
+
+    let (records, frame) = reader(keys, crate_names, kept_of(&names));
+    let mut front = Front2::from_records(records, frame, &[0, 1, 2]).unwrap_or_else(|e| panic!("front2 over records: {e}"));
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::testing::heap().alloc());
+    store.sources = Some(body_sources);
+    for &(name, f) in &positive_fns {
+        let got = checked(records, prepared, &mut front.keys, &front.index, &mut store, f);
+        if got != "clean" {
+            failed.push(format!("{name} (records): {got}"));
+        }
+    }
+    for &(name, f, expect) in &negative_fns {
+        let got = checked(records, prepared, &mut front.keys, &front.index, &mut store, f);
+        assert!(got.contains(expect), "{name} (records) must fail with {expect}, got: {got}");
+    }
+    let errors: Vec<String> = records.errors().iter().map(|e| e.to_string()).collect();
+    assert!(errors.is_empty(), "the records filed {errors:?}");
+    assert!(failed.is_empty(), "positive CallSite.ctx bodies failed: {failed:?}");
+}
+
+/// Recursive `macro_rules!` local hygiene on `TextMark` (`prost::encoding::varint!` pattern):
+/// Arm 1 emits a recursive call to Arm 2 passing its own `value` identifier (`to_uint64(value)`
+/// and `from_uint64(value)`), while Arm 2 declares parameter `value: &mut $ty`, binds
+/// `let $from_uint64_value: u64 = 42u64;`, and assigns `*value = $from_uint64;` (plus passes both
+/// `value`s through a body-level helper `id!($e)` to prove `lex_marked` + `as_outer_mark()`
+/// preserves Arm 1 vs Arm 2 distinctness).
+///
+/// Negative control: `varint_same_arm!` binds `let value: u64 = 42u64;` and derefs `*value` in
+/// the SAME expansion arm and MUST fail with `CantDeref` (E0614).
+#[test]
+fn recursive_macro_rules_varint_local_hygiene_isolates_arms() {
+    const VARINT_ROOT: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = \"pointee_sized\"]
+pub trait PointeeSized {}
+#[lang = \"meta_sized\"]
+pub trait MetaSized: PointeeSized {}
+#[lang = \"sized\"]
+pub trait Sized: MetaSized {}
+#[lang = \"deref\"]
+pub trait Deref: PointeeSized {
+    #[lang = \"deref_target\"]
+    type Target: PointeeSized;
+    fn deref(&self) -> &Self::Target;
+}
+#[lang = \"deref_mut\"]
+pub trait DerefMut: Deref + PointeeSized {
+    fn deref_mut(&mut self) -> &mut Self::Target;
+}
+
+macro_rules! id {
+    ($e:expr) => { $e };
+}
+
+macro_rules! varint {
+    ($ty:ty, $proto_ty:ident) => (
+        varint!($ty, $proto_ty,
+                to_uint64(value) { *value as u64 },
+                from_uint64(value) { value as $ty });
+    );
+    ($ty:ty, $proto_ty:ident,
+     to_uint64($to_uint64_value:ident) $to_uint64:expr,
+     from_uint64($from_uint64_value:ident) $from_uint64:expr) => (
+        pub mod $proto_ty {
+            pub fn to_u64(value: &$ty) -> u64 {
+                let $to_uint64_value = value;
+                $to_uint64
+            }
+            pub fn merge(value: &mut $ty) {
+                let $from_uint64_value: u64 = 42u64;
+                *value = $from_uint64;
+            }
+            pub fn merge_via_inner_macro(value: &mut $ty) {
+                let $from_uint64_value: u64 = 42u64;
+                *id!(value) = id!($from_uint64);
+            }
+        }
+    );
+}
+
+macro_rules! varint_same_arm {
+    ($ty:ty, $proto_ty:ident) => (
+        pub mod $proto_ty {
+            pub fn merge(value: &mut $ty) {
+                let value: u64 = 42u64;
+                *value = value as $ty;
+            }
+        }
+    );
+}
+
+varint!(i32, int32);
+varint_same_arm!(i32, bad_int32);
+";
+    const VARINT_PATH: &str = "/varint_app/src/main.rs";
+    struct VarintFiles;
+    impl SourceTexts<'static> for VarintFiles {
+        fn read(&self, krate: usize, path: &str) -> Option<&'static str> {
+            (krate == 0 && path == VARINT_PATH).then_some(VARINT_ROOT)
+        }
+    }
+
+    let rust = PackageEdition { syntax: edition::Edition::Edition2021, blaze: None };
+    let lib = implicit(rust, &blaze_unit_graph::UnitKind::Lib);
+    const CFG: &[(&str, Option<&str>)] = &[];
+    let crates = [CrateInput {
+        name: "varint_app",
+        key: CrateItemKey(ContentId::of("front2_token_mark_bodies varint", b"varint_app")),
+        edition: syntax_of(rust),
+        implicit: lib,
+        root: VARINT_PATH,
+        shown_from: "/varint_app/",
+        features: &[],
+        deps: &[],
+        cfg: CFG,
+        script: None,
+    }];
+    let crate_names: &'static [&'static str] = &["varint_app"];
+    let keys: &'static [CrateItemKey] = Vec::leak(crates.iter().map(|c| c.key).collect());
+    let names = resolve_crates(&crates, Sysroot::default(), &VarintFiles, &Serial, blaze_own::testing::bump())
+        .unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    assert!(names.notes(0).is_empty(), "varint_app scope notes must be empty: {:?}", names.notes(0));
+
+    let fn_key = |segments: &[&str]| {
+        Paths { names: &names }
+            .path(names.root(0), false, segments, Ns::Value)
+            .unwrap_or_else(|e| panic!("`{segments:?}` from varint_app root: {e:?}"))
+            .key
+    };
+    let positive_fns = [
+        ("int32::to_u64", Asked::Free(fn_key(&["int32", "to_u64"]))),
+        ("int32::merge", Asked::Free(fn_key(&["int32", "merge"]))),
+        ("int32::merge_via_inner_macro", Asked::Free(fn_key(&["int32", "merge_via_inner_macro"]))),
+    ];
+    let bad_merge = Asked::Free(fn_key(&["bad_int32", "merge"]));
+
+    let mut failed = Vec::new();
+    let sources = [SourceFile { path: "src/main.rs", text: VARINT_ROOT }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+    {
+        let mut front = Front2::new(&names, &frame, &sources, Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
+        let solved = rows(&names, &front.index, &mut front.keys, front.frame, front.index.lang("sized"), &positive_fns, &mut failed);
+        let prepared = Prepares::new_in(blaze_own::testing::bump());
+        let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+        let bad = checked(&names, prepared, &mut front.keys, &front.index, &mut store, bad_merge);
+        println!("front2_token_mark_bodies varint names: {solved}; bad_int32::merge: {bad}");
+        assert!(bad.contains("CantDeref"), "same-arm shadowing must fail with CantDeref (E0614) over names, got: {bad}");
+    }
+
+    let (records, frame) = reader(keys, crate_names, kept_of(&names));
+    let mut front = Front2::from_records(records, frame, &[0]).unwrap_or_else(|e| panic!("front2 over records: {e}"));
+    let over_records = rows(records, &front.index, &mut front.keys, front.frame, front.index.lang("sized"), &positive_fns, &mut failed);
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
+    let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+    let bad_rec = checked(records, prepared, &mut front.keys, &front.index, &mut store, bad_merge);
+    println!("front2_token_mark_bodies varint records: {over_records}; bad_int32::merge: {bad_rec}");
+    assert!(bad_rec.contains("CantDeref"), "same-arm shadowing must fail with CantDeref (E0614) over records, got: {bad_rec}");
+    let errors: Vec<String> = records.errors().iter().map(|e| e.to_string()).collect();
+    assert!(errors.is_empty(), "the records filed {errors:?}");
+    assert!(failed.is_empty(), "recursive varint bodies failed: {failed:?}");
+}

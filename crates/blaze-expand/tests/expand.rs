@@ -2105,41 +2105,48 @@ fn non_transparent_mark_skips_transparent_and_preserves_semi_opaque_and_opaque()
     let transparent_2024_over_semi_2021 = stream.context(CtxNode { parent: semi_2021_ctx, mark: transparent_2024 }).expect("ctx");
     let transparent_over_opaque = stream.context(CtxNode { parent: opaque_ctx, mark: transparent_a }).expect("ctx");
 
-    use blaze_expand::origin_column::TextMark;
+    use blaze_expand::{local_hygiene, origin_column::TextMark};
+    let this = ContentId([99; 32]);
+    let semi_h = local_hygiene(&stream, semi_ctx, this);
+    let semi_2021_h = local_hygiene(&stream, semi_2021_ctx, this);
+    let opaque_h = local_hygiene(&stream, opaque_ctx, this);
+    assert_ne!(semi_h, 0);
+    assert_ne!(semi_2021_h, 0);
+    assert_ne!(opaque_h, 0);
     assert_eq!(stream.non_transparent_mark(root), None);
-    assert_eq!(stream.text_mark(root), None);
+    assert_eq!(stream.text_mark_of(root, this), None);
     assert_eq!(stream.node(only_transparent).map(|n| n.mark), Some(transparent_a));
     assert_eq!(stream.hygiene(only_transparent).mark, None);
     assert_eq!(stream.non_transparent_mark(only_transparent), None);
-    assert_eq!(stream.text_mark(only_transparent), Some(TextMark::of(transparent_a)));
+    assert_eq!(stream.text_mark_of(only_transparent, this), Some(TextMark::of(transparent_a)));
     assert_eq!(stream.non_transparent_mark(semi_ctx), Some(semi_b));
-    assert_eq!(stream.text_mark(semi_ctx), Some(TextMark::of(semi_b)));
+    assert_eq!(stream.text_mark_of(semi_ctx, this), Some(TextMark { hygiene: semi_h, ..TextMark::of(semi_b) }));
     assert_eq!(stream.non_transparent_mark(opaque_ctx), Some(opaque_c));
-    assert_eq!(stream.text_mark(opaque_ctx), Some(TextMark::of(opaque_c)));
+    assert_eq!(stream.text_mark_of(opaque_ctx, this), Some(TextMark { hygiene: opaque_h, ..TextMark::of(opaque_c) }));
     assert_eq!(stream.node(transparent_over_semi).map(|n| n.mark), Some(transparent_a));
     assert_eq!(stream.hygiene(transparent_over_semi).mark, Some(semi_b));
     assert_eq!(stream.non_transparent_mark(transparent_over_semi), Some(semi_b));
     // Nested E2021 Transparent over E2024 SemiOpaque keeps SemiOpaque hygiene + E2021 edition.
     assert_eq!(
-        stream.text_mark(transparent_over_semi),
-        Some(TextMark { site: semi_b.site, transparency: Transparency::SemiOpaque, edition: Edition::E2021, local_inner: false })
+        stream.text_mark_of(transparent_over_semi, this),
+        Some(TextMark { site: semi_b.site, transparency: Transparency::SemiOpaque, edition: Edition::E2021, local_inner: false, hygiene: semi_h })
     );
     // Reverse nesting: E2024 Transparent over E2021 SemiOpaque keeps SemiOpaque hygiene + E2024 edition.
     assert_eq!(
-        stream.text_mark(transparent_2024_over_semi_2021),
-        Some(TextMark { site: semi_b_2021.site, transparency: Transparency::SemiOpaque, edition: Edition::E2024, local_inner: false })
+        stream.text_mark_of(transparent_2024_over_semi_2021, this),
+        Some(TextMark { site: semi_b_2021.site, transparency: Transparency::SemiOpaque, edition: Edition::E2024, local_inner: false, hygiene: semi_2021_h })
     );
-    // `TextMark::local_hygiene()` depends only on `(site, transparency)`, not `edition`.
+    // `TextMark::local_hygiene()` depends only on `(site, transparency, hygiene)`, not `edition`.
     assert_eq!(
-        TextMark::of(semi_b).local_hygiene(),
-        stream.text_mark(transparent_over_semi).expect("mark").local_hygiene(),
+        stream.text_mark_of(semi_ctx, this).expect("mark").local_hygiene(),
+        stream.text_mark_of(transparent_over_semi, this).expect("mark").local_hygiene(),
     );
     assert_eq!(stream.node(transparent_over_opaque).map(|n| n.mark), Some(transparent_a));
     assert_eq!(stream.hygiene(transparent_over_opaque).mark, Some(opaque_c));
     assert_eq!(stream.non_transparent_mark(transparent_over_opaque), Some(opaque_c));
     assert_eq!(
-        stream.text_mark(transparent_over_opaque),
-        Some(TextMark { site: opaque_c.site, transparency: Transparency::Opaque, edition: Edition::E2021, local_inner: false })
+        stream.text_mark_of(transparent_over_opaque, this),
+        Some(TextMark { site: opaque_c.site, transparency: Transparency::Opaque, edition: Edition::E2021, local_inner: false, hygiene: opaque_h })
     );
 
     // `body_words` uses `text_mark`: preserves innermost `Transparent` edition while keeping
@@ -2168,14 +2175,14 @@ fn non_transparent_mark_skips_transparent_and_preserves_semi_opaque_and_opaque()
 
 #[test]
 fn include_text_mark_and_body_words_preserve_caller_edition() {
-    use blaze_expand::{CtxNode, Mark, Transparency, body_words, origin_column::TextMark};
+    use blaze_expand::{CtxNode, Mark, Transparency, body_words, local_hygiene, origin_column::TextMark};
     let alloc = blaze_own::testing::heap().alloc();
     let cx = TestCx {
         files: &[("inc.rs", b"match self { Self::A(ref mut x) => *x }")],
         ..TestCx::new()
     };
 
-    // 1. E2024 `include!` invoked from E2021 caller -> `text_mark` and `body_words` carry `None`
+    // 1. E2024 `include!` invoked from E2021 caller -> `text_mark_of` and `body_words` carry `None`
     //    (falling back to caller E2021, never the built-in macro's E2024).
     let def_2024 = MacroDefinition::builtin_fn(
         BuiltinFn::Include,
@@ -2190,13 +2197,13 @@ fn include_text_mark_and_body_words_preserve_caller_edition() {
     let exp_2021 = done(expand(&def_2024, &call_2021, &cx, alloc));
     assert!(exp_2021.diagnostics.is_empty(), "{:?}", exp_2021.diagnostics);
     for i in 0..exp_2021.tokens.len() {
-        assert_eq!(exp_2021.text_mark(i), None, "E2024 include! in E2021 caller must leave text_mark None");
+        assert_eq!(exp_2021.text_mark_of(i, ContentId([1; 32])), None, "E2024 include! in E2021 caller must leave text_mark_of None");
         assert_eq!(exp_2021.hygiene(i).edition, Edition::E2021);
     }
     let bw_2021 = body_words(&exp_2021.tokens, ContentId([1; 32]), alloc);
     assert!(bw_2021.words.iter().all(|w| w.mark.is_none()));
 
-    // 2. E2021 `include!` invoked from E2024 caller -> `text_mark` and `body_words` carry `None`
+    // 2. E2021 `include!` invoked from E2024 caller -> `text_mark_of` and `body_words` carry `None`
     //    (falling back to caller E2024, never the built-in macro's E2021).
     let def_2021 = MacroDefinition::builtin_fn(
         BuiltinFn::Include,
@@ -2211,7 +2218,7 @@ fn include_text_mark_and_body_words_preserve_caller_edition() {
     let exp_2024 = done(expand(&def_2021, &call_2024, &cx, alloc));
     assert!(exp_2024.diagnostics.is_empty(), "{:?}", exp_2024.diagnostics);
     for i in 0..exp_2024.tokens.len() {
-        assert_eq!(exp_2024.text_mark(i), None, "E2021 include! in E2024 caller must leave text_mark None");
+        assert_eq!(exp_2024.text_mark_of(i, ContentId([2; 32])), None, "E2021 include! in E2024 caller must leave text_mark_of None");
         assert_eq!(exp_2024.hygiene(i).edition, Edition::E2024);
     }
     let bw_2024 = body_words(&exp_2024.tokens, ContentId([2; 32]), alloc);
@@ -2241,7 +2248,7 @@ fn include_text_mark_and_body_words_preserve_caller_edition() {
     let exp_trans = done(expand(&def_2021, &trans_call, &cx, alloc));
     assert!(exp_trans.diagnostics.is_empty(), "{:?}", exp_trans.diagnostics);
     for i in 0..exp_trans.tokens.len() {
-        assert_eq!(exp_trans.text_mark(i), None, "include! inside Transparent proc-macro must inherit caller root E2024");
+        assert_eq!(exp_trans.text_mark_of(i, ContentId([3; 32])), None, "include! inside Transparent proc-macro must inherit caller root E2024");
         assert_eq!(exp_trans.hygiene(i).edition, Edition::E2024);
     }
 
@@ -2277,8 +2284,10 @@ fn include_text_mark_and_body_words_preserve_caller_edition() {
     );
     let exp_layered = done(expand(&def_2024, &layered_call, &cx, alloc));
     assert!(exp_layered.diagnostics.is_empty(), "{:?}", exp_layered.diagnostics);
+    let layered_key = ContentId([4; 32]);
     for i in 0..exp_layered.tokens.len() {
-        assert_eq!(exp_layered.text_mark(i), Some(TextMark::of(semi_mark)));
+        let want_h = local_hygiene(&exp_layered.tokens, exp_layered.tokens.tokens()[i].ctx, layered_key);
+        assert_eq!(exp_layered.text_mark_of(i, layered_key), Some(TextMark { hygiene: want_h, ..TextMark::of(semi_mark) }));
     }
 }
 
@@ -2287,24 +2296,27 @@ fn lex_marked_preserves_transparent_edition_without_folding_dollar_crate() {
     use blaze_expand::{Transparency, origin_column::TextMark};
     let alloc = blaze_own::testing::heap().alloc();
     let site = DefSite { krate: CrateItemKey(ContentId([41; 32])), module: None };
-    let transparent_2021 = TextMark { site, transparency: Transparency::Transparent, edition: Edition::E2021, local_inner: false };
-    let semi_2021 = TextMark { site, transparency: Transparency::SemiOpaque, edition: Edition::E2021, local_inner: false };
+    let transparent_2021 = TextMark { site, transparency: Transparency::Transparent, edition: Edition::E2021, local_inner: false, hygiene: 0 };
+    let semi_2021 = TextMark { site, transparency: Transparency::SemiOpaque, edition: Edition::E2021, local_inner: false, hygiene: 0 };
 
     let text = "$crate::Foo";
     // Transparent mark: `$` and `crate` remain two tokens (same as unmarked), while preserving
-    // the transparent mark's edition via `text_mark`.
+    // the transparent mark's edition via `text_mark_of`.
     let ts_trans = blaze_expand::lex_marked(text, Edition::E2024, &|_| Some(transparent_2021), alloc).expect("lex transparent");
     assert_eq!(ts_trans.len(), 5, "transparent `$crate::Foo` stays `$`, `crate`, `:`, `:`, `Foo`");
     assert!(matches!(ts_trans.tokens()[0].kind, TokenKind::Punct { char: '$', .. }));
     assert_eq!(ts_trans.text_at(1), "crate");
-    assert_eq!(ts_trans.text_mark(ts_trans.tokens()[0].ctx), Some(transparent_2021));
+    assert_eq!(ts_trans.text_mark_of(ts_trans.tokens()[0].ctx, ContentId::default()), Some(transparent_2021));
     assert_eq!(ts_trans.non_transparent_mark(ts_trans.tokens()[0].ctx), None);
 
     // Control: SemiOpaque mark folds `$` + `crate` into one `$crate` identifier.
     let ts_semi = blaze_expand::lex_marked(text, Edition::E2024, &|_| Some(semi_2021), alloc).expect("lex semi");
     assert_eq!(ts_semi.len(), 4, "semi-opaque `$crate::Foo` folds to `$crate`, `:`, `:`, `Foo`");
     assert_eq!(ts_semi.text_at(0), "$crate");
-    assert_eq!(ts_semi.text_mark(ts_semi.tokens()[0].ctx), Some(semi_2021));
+    assert_eq!(
+        ts_semi.text_mark_of(ts_semi.tokens()[0].ctx, ContentId::default()),
+        Some(TextMark { hygiene: semi_2021.local_hygiene(), ..semi_2021 })
+    );
 }
 
 #[test]
@@ -2367,13 +2379,15 @@ fn nested_transparent_proc_macro_over_semi_opaque_call_site_preserves_innermost_
     let call_1 = Call::fn_like(&input_2024, CallSite { edition: Edition::E2024, panic_edition: Edition::E2024, ctx: semi_2024_ctx });
     let exp_1 = done(expand(&proc_2021, &call_1, &EmitRefMut(Edition::E2021), alloc));
     assert!(exp_1.diagnostics.is_empty(), "{:?}", exp_1.diagnostics);
-    let want_1 = TextMark { site: semi_2024.site, transparency: Transparency::SemiOpaque, edition: Edition::E2021, local_inner: false };
+    let key_1 = ContentId([0x61; 32]);
+    let h_1 = blaze_expand::local_hygiene(&exp_1.tokens, exp_1.tokens.tokens()[0].ctx, key_1);
+    let want_1 = TextMark { site: semi_2024.site, transparency: Transparency::SemiOpaque, edition: Edition::E2021, local_inner: false, hygiene: h_1 };
     for i in 0..exp_1.tokens.len() {
-        assert_eq!(exp_1.text_mark(i), Some(want_1));
+        assert_eq!(exp_1.text_mark_of(i, key_1), Some(want_1));
         assert_eq!(exp_1.non_transparent_mark(i), Some(semi_2024));
     }
-    let bw_1 = body_words(&exp_1.tokens, ContentId([0x61; 32]), alloc);
-    assert!(bw_1.words.iter().all(|w| w.mark == Some(want_1) && w.hygiene != 0));
+    let bw_1 = body_words(&exp_1.tokens, key_1, alloc);
+    assert!(bw_1.words.iter().all(|w| w.mark == Some(want_1) && w.hygiene == h_1 && w.hygiene != 0));
 
     // Direction 2: E2024 transparent proc-macro invoked from E2021 SemiOpaque `macro_rules!` ctx.
     let proc_2024 = MacroDefinition::proc_macro(
@@ -2399,13 +2413,15 @@ fn nested_transparent_proc_macro_over_semi_opaque_call_site_preserves_innermost_
     let call_2 = Call::fn_like(&input_2021, CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: semi_2021_ctx });
     let exp_2 = done(expand(&proc_2024, &call_2, &EmitRefMut(Edition::E2024), alloc));
     assert!(exp_2.diagnostics.is_empty(), "{:?}", exp_2.diagnostics);
-    let want_2 = TextMark { site: semi_2021.site, transparency: Transparency::SemiOpaque, edition: Edition::E2024, local_inner: false };
+    let key_2 = ContentId([0x62; 32]);
+    let h_2 = blaze_expand::local_hygiene(&exp_2.tokens, exp_2.tokens.tokens()[0].ctx, key_2);
+    let want_2 = TextMark { site: semi_2021.site, transparency: Transparency::SemiOpaque, edition: Edition::E2024, local_inner: false, hygiene: h_2 };
     for i in 0..exp_2.tokens.len() {
-        assert_eq!(exp_2.text_mark(i), Some(want_2));
+        assert_eq!(exp_2.text_mark_of(i, key_2), Some(want_2));
         assert_eq!(exp_2.non_transparent_mark(i), Some(semi_2021));
     }
-    let bw_2 = body_words(&exp_2.tokens, ContentId([0x62; 32]), alloc);
-    assert!(bw_2.words.iter().all(|w| w.mark == Some(want_2) && w.hygiene != 0));
+    let bw_2 = body_words(&exp_2.tokens, key_2, alloc);
+    assert!(bw_2.words.iter().all(|w| w.mark == Some(want_2) && w.hygiene == h_2 && w.hygiene != 0));
 }
 
 #[test]
@@ -2580,4 +2596,285 @@ fn local_inner_mark_stamps_def_tokens_and_survives_metavar_forwarding_and_record
     let bw = body_words(&wrapper_exp.tokens, ContentId([0x77; 32]), alloc);
     let ic_word = bw.words.iter().find(|w| &bw.text[w.text.0 as usize..w.text.1 as usize] == "inner_code").expect("inner_code word");
     assert_eq!(ic_word.mark.map(|m| (m.site.krate, m.local_inner)), Some((dep_krate, true)));
+}
+
+#[test]
+fn call_site_ctx_from_derive_attr_fn_like_and_call_key_hygiene() {
+    use blaze_expand::{
+        ItemAttrs, NextAttr, ProcCall, ProcKind, Produced, Reads, Transparency, body_words,
+        call_key, local_hygiene,
+    };
+    use blaze_own::AVec;
+
+    struct EmitHost(Transparency);
+    impl ExpandCx for EmitHost {
+        fn cfg(&self, _: &TokenStream<'_>) -> Result<bool, HostError> {
+            Err(HostError { ask: HostAsk::Cfg, why: HostWhy::Refused })
+        }
+        fn env(&self, _: &str) -> Result<Option<&str>, HostError> {
+            Err(HostError { ask: HostAsk::Env, why: HostWhy::Refused })
+        }
+        fn include(&self, _: &str, _: IncludeAs) -> Result<Included<'_>, HostError> {
+            Err(HostError { ask: HostAsk::Include, why: HostWhy::Refused })
+        }
+        fn place(&self, _: PlaceOf) -> Result<Place<'_>, HostError> {
+            Err(HostError { ask: HostAsk::Place, why: HostWhy::Refused })
+        }
+        fn run_proc_macro<'a>(
+            &self,
+            _: &MacroDefinition<'_>,
+            call: ProcCall<'_>,
+            alloc: Alloc<'a>,
+        ) -> Result<Produced<'a>, HostError> {
+            // Find `host` in input to echo as `TokenOrigin::Input`, and synthesize a second
+            // `host` with `self.0` (`Transparent` = call_site, `SemiOpaque` = mixed_site,
+            // `Opaque` = def_site).
+            let host_at = (0..call.input.len())
+                .find(|&i| call.input.text_at(i) == "host")
+                .map(|i| u32::try_from(i).expect("short"));
+            let mut out = TokenStream::new_in(alloc);
+            let mut origins = AVec::new_in(alloc);
+            if let Some(at) = host_at {
+                out.ident("host", Ctx::root(Edition::E2021)).expect("push");
+                origins.push(TokenOrigin::Input(at));
+            }
+            out.ident("host", Ctx::root(Edition::E2021)).expect("push");
+            origins.push(TokenOrigin::Made(self.0));
+            Ok(Produced {
+                tokens: out,
+                origins,
+                reads: Reads::new_in(alloc),
+                diagnostics: AVec::new_in(alloc),
+                text: AVec::new_in(alloc),
+            })
+        }
+    }
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let outer_krate = CrateItemKey(ContentId([0xA1; 32]));
+    let inner_krate = CrateItemKey(ContentId([0xA2; 32]));
+    let proc_krate = CrateItemKey(ContentId([0xA3; 32]));
+
+    // 1. Nested `outer!()` -> `inner!()` -> `#[derive(Snafu)] enum E { A { host: u32 } }`:
+    //    `Derives::call_site` imports the full parent chain into `derives.input`, so a
+    //    `Transparent` (`Span::call_site()`) token emitted by the derive matches `local_hygiene`
+    //    and `text_mark` of the input `host` token, while `Opaque` (`def_site`) and `SemiOpaque`
+    //    (`mixed_site`) stay hygienically isolated!
+    let inner_def = MacroDefinition::rules(
+        lex("() => { #[derive(Snafu)] enum E { A { host: u32 } } };", Edition::E2024, alloc).expect("lex"),
+        DefAt { site: DefSite { krate: inner_krate, module: None }, edition: Edition::E2024, ..at(0xA2) },
+    );
+    let outer_def = MacroDefinition::rules(
+        lex("() => { inner!(); };", Edition::E2021, alloc).expect("lex"),
+        DefAt { site: DefSite { krate: outer_krate, module: None }, edition: Edition::E2021, ..at(0xA1) },
+    );
+    let outer_exp = done(expand(&outer_def, &Call::fn_like(&TokenStream::new_in(alloc), CallSite::root(Edition::E2024)), &TestCx::new(), alloc));
+    let mut outer_sealed = outer_exp.tokens.clone_in(alloc);
+    let outer_key = ContentId([0xB1; 32]);
+    outer_sealed.seal(outer_key);
+
+    // Extract `inner!()` call site via `CallSite::before_open`.
+    let open = (0..outer_sealed.len()).find(|&i| matches!(outer_sealed.tokens()[i].kind, TokenKind::Open(Delim::Paren))).expect("open");
+    let close = outer_sealed.close_of(open).expect("close");
+    let mut inner_args = outer_sealed.copy_in(open + 1..close, alloc).expect("copy args");
+    let inner_site = CallSite::before_open(&outer_sealed, open, &mut inner_args, Edition::E2024).expect("before_open");
+    assert_eq!(inner_site.edition, Edition::E2021, "fn-like call site takes path token's edition");
+    assert_eq!(inner_args.non_transparent_mark(inner_site.ctx).map(|m| m.site.krate), Some(outer_krate));
+
+    let inner_exp = done(expand(&inner_def, &Call::fn_like(&inner_args, inner_site), &TestCx::new(), alloc));
+    let mut inner_sealed = inner_exp.tokens.clone_in(alloc);
+    let inner_key = ContentId([0xB2; 32]);
+    inner_sealed.seal(inner_key);
+
+    let mut derives = ItemAttrs::new(inner_sealed)
+        .derives(&mut |_, _| Ok::<bool, ()>(true))
+        .expect("derives")
+        .expect("item stays");
+    let derive_site = derives.call_site(0, Edition::E2021).expect("derive call_site");
+    assert_eq!(derive_site.edition, Edition::E2024, "derive call site takes derive path token's edition");
+    assert_eq!(derives.input.non_transparent_mark(derive_site.ctx).map(|m| m.site.krate), Some(inner_krate));
+
+    let derive_def = MacroDefinition::proc_macro(
+        proc_krate,
+        ProcKind::Derive,
+        "Snafu",
+        &[],
+        DefAt { site: DefSite { krate: proc_krate, module: None }, edition: Edition::E2021, ..at(0xA3) },
+        alloc,
+    )
+    .expect("proc derive");
+
+    let call_call_site = Call::derive(&derives.input, DeriveFacts::PLAIN, derive_site);
+    let this_key = ContentId([0xB3; 32]);
+
+    // Transparent (`Span::call_site()`): matches `Input` `host` in both `local_hygiene` and `TextMark::local_hygiene`!
+    let exp_trans = done(expand(&derive_def, &call_call_site, &EmitHost(Transparency::Transparent), alloc));
+    let h_input = local_hygiene(&exp_trans.tokens, exp_trans.tokens.tokens()[0].ctx, this_key);
+    let h_made = local_hygiene(&exp_trans.tokens, exp_trans.tokens.tokens()[1].ctx, this_key);
+    assert_ne!(h_input, 0);
+    assert_eq!(h_made, h_input, "Span::call_site() must share local_hygiene with enclosing macro_rules! input token");
+    assert_eq!(
+        exp_trans.text_mark_of(1, this_key).expect("made mark").local_hygiene(),
+        exp_trans.text_mark_of(0, this_key).expect("input mark").local_hygiene(),
+        "Span::call_site() TextMark::local_hygiene must match enclosing macro_rules! input token"
+    );
+    let bw = body_words(&exp_trans.tokens, this_key, alloc);
+    assert_eq!(bw.words[0].hygiene, bw.words[1].hygiene);
+
+    // Negative controls: `Opaque` (`def_site`) and `SemiOpaque` (`mixed_site`) MUST NOT match!
+    for neg in [Transparency::Opaque, Transparency::SemiOpaque] {
+        let exp_neg = done(expand(&derive_def, &call_call_site, &EmitHost(neg), alloc));
+        let h_in = local_hygiene(&exp_neg.tokens, exp_neg.tokens.tokens()[0].ctx, this_key);
+        let h_out = local_hygiene(&exp_neg.tokens, exp_neg.tokens.tokens()[1].ctx, this_key);
+        assert_ne!(h_out, h_in, "{neg:?} proc-macro token must stay hygienically isolated from input `host`");
+        assert_ne!(
+            exp_neg.text_mark_of(1, this_key).expect("neg mark").local_hygiene(),
+            exp_neg.text_mark_of(0, this_key).expect("input mark").local_hygiene(),
+            "{neg:?} TextMark::local_hygiene must stay isolated from input `host`"
+        );
+    }
+
+    // 2. Attribute macro (`ItemAttrs::attr_call`): imports attribute path ctx into `made.item`.
+    let attr_emitter = MacroDefinition::rules(
+        lex("() => { #[my_attr] fn f() { let host = 1; } };", Edition::E2021, alloc).expect("lex"),
+        DefAt { site: DefSite { krate: inner_krate, module: None }, edition: Edition::E2021, ..at(0xA2) },
+    );
+    let attr_exp = done(expand(&attr_emitter, &Call::fn_like(&TokenStream::new_in(alloc), CallSite::root(Edition::E2024)), &TestCx::new(), alloc));
+    let mut attr_sealed = attr_exp.tokens.clone_in(alloc);
+    attr_sealed.seal(ContentId([0xB4; 32]));
+    let mut walk = ItemAttrs::new(attr_sealed);
+    let NextAttr::Call { attr, .. } = walk.next(&mut |_, _| Ok::<bool, ()>(true)).expect("next") else {
+        panic!("expected attr call");
+    };
+    let made = walk.attr_call(attr).expect("attr_call");
+    let attr_site = made.call_site(Edition::E2024);
+    assert_eq!(attr_site.edition, Edition::E2021);
+    assert_eq!(made.item.non_transparent_mark(attr_site.ctx).map(|m| m.site.krate), Some(inner_krate));
+
+    // 3. Key hygiene (Rule 21): two calls with identical token text & input stream but different
+    //    `CallSite.ctx` produce distinct `call_key`s!
+    let mut shared_input = lex("host", Edition::E2021, alloc).expect("lex");
+    let mark_a = blaze_expand::Mark {
+        of: MarkOf::Outer(ContentId([0xC1; 32])),
+        transparency: Transparency::SemiOpaque,
+        edition: Edition::E2021,
+        site: DefSite { krate: outer_krate, module: None },
+        local_inner: false,
+    };
+    let mark_b = blaze_expand::Mark {
+        of: MarkOf::Outer(ContentId([0xC2; 32])),
+        transparency: Transparency::SemiOpaque,
+        edition: Edition::E2021,
+        site: DefSite { krate: inner_krate, module: None },
+        local_inner: false,
+    };
+    let ctx_a = shared_input.context(blaze_expand::CtxNode { parent: Ctx::root(Edition::E2021), mark: mark_a }).expect("ctx_a");
+    let ctx_b = shared_input.context(blaze_expand::CtxNode { parent: Ctx::root(Edition::E2021), mark: mark_b }).expect("ctx_b");
+    let fn_proc = MacroDefinition::proc_macro(
+        proc_krate,
+        ProcKind::FnLike,
+        "emit",
+        &[],
+        DefAt { site: DefSite { krate: proc_krate, module: None }, edition: Edition::E2021, ..at(0xA3) },
+        alloc,
+    )
+    .expect("fn proc");
+    let key_root = call_key(&fn_proc, &Call::fn_like(&shared_input, CallSite::root(Edition::E2021)));
+    let key_a = call_key(&fn_proc, &Call::fn_like(&shared_input, CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: ctx_a }));
+    let key_b = call_key(&fn_proc, &Call::fn_like(&shared_input, CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: ctx_b }));
+    assert_ne!(key_root, key_a, "root CallSite.ctx vs outer mark A must yield distinct call_key");
+    assert_ne!(key_a, key_b, "outer mark A vs outer mark B must yield distinct call_key");
+
+    // 4. `Call::check` (Rule 74): refuses a `CallSite.ctx` that does not belong to `Call::input()`.
+    let empty_input = TokenStream::new_in(alloc);
+    let bad_call = Call::fn_like(&empty_input, CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: ctx_a });
+    assert!(
+        matches!(
+            expand(&fn_proc, &bad_call, &EmitHost(Transparency::Transparent), alloc),
+            Err(blaze_expand::ExpandError::Stream { stream: Some(blaze_expand::Stream::Input), error: blaze_expand::StreamError::NoSuchContext { .. } })
+        ),
+        "Call::check must refuse a CallSite.ctx not in Call::input()"
+    );
+}
+
+#[test]
+fn recursive_macro_rules_text_mark_preserves_distinct_local_hygiene() {
+    use blaze_expand::{call_key, lex_marked, local_hygiene};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let varint_def = MacroDefinition::rules(
+        lex(
+            "($ty:ty, $proto_ty:ident) => ( \
+                 varint!($ty, $proto_ty, from_uint64(value) { value as $ty }); \
+             ); \
+             ($ty:ty, $proto_ty:ident, from_uint64($from_val:ident) $from_expr:expr) => ( \
+                 pub fn merge(value: &mut $ty) { let $from_val = 42u64; *value = $from_expr; } \
+             );",
+            Edition::E2021,
+            alloc,
+        )
+        .expect("varint def lexes"),
+        DefAt {
+            site: DefSite { krate: CrateItemKey(ContentId([0x55; 32])), module: Some(ItemKey(ContentId([0x56; 32]))) },
+            edition: Edition::E2021,
+            export: Export::Local,
+            local_inner: LocalInner::No,
+            transparency: None,
+        },
+    );
+
+    // Expansion 1: `varint!(i32, int32)` matches Arm 1 and emits Arm 2 invocation.
+    let call1_input = lex("i32, int32", Edition::E2021, alloc).expect("call1 input");
+    let call1 = Call::fn_like(&call1_input, CallSite::root(Edition::E2021));
+    let key1 = call_key(&varint_def, &call1).0;
+    let exp1 = done(expand(&varint_def, &call1, &TestCx::new(), alloc));
+    assert!(exp1.diagnostics.is_empty(), "{:?}", exp1.diagnostics);
+    let mut sealed1 = exp1.tokens.clone_in(alloc);
+    sealed1.seal(key1);
+
+    // Expansion 2: extract `varint!(...)` args from Expansion 1 and expand Arm 2.
+    let open = (0..sealed1.len()).find(|&i| matches!(sealed1.tokens()[i].kind, TokenKind::Open(Delim::Paren))).expect("open");
+    let close = sealed1.close_of(open).expect("close");
+    let mut call2_input = sealed1.copy_in(open + 1..close, alloc).expect("copy args");
+    let call2_site = CallSite::before_open(&sealed1, open, &mut call2_input, Edition::E2021).expect("before_open");
+    let call2 = Call::fn_like(&call2_input, call2_site);
+    let key2 = call_key(&varint_def, &call2).0;
+    assert_ne!(key1, key2);
+    let exp2 = done(expand(&varint_def, &call2, &TestCx::new(), alloc));
+    assert!(exp2.diagnostics.is_empty(), "{:?}", exp2.diagnostics);
+
+    // Locate the 4 occurrences of `value` in Arm 2's output:
+    //   [0] `value: &mut i32` (Arm 2 template)
+    //   [1] `let value = 42u64;` (Arm 1 template via `$from_val`)
+    //   [2] `*value` (Arm 2 template)
+    //   [3] `value as i32` (Arm 1 template via `$from_expr`)
+    let value_positions: std::vec::Vec<usize> = (0..exp2.tokens.len())
+        .filter(|&i| exp2.tokens.text_at(i) == "value")
+        .collect();
+    assert_eq!(value_positions.len(), 4, "expected 4 `value` tokens, got {value_positions:?}");
+
+    let m_param = exp2.text_mark_of(value_positions[0], key2).expect("param mark");
+    let m_let = exp2.text_mark_of(value_positions[1], key2).expect("let mark");
+    let m_deref = exp2.text_mark_of(value_positions[2], key2).expect("deref mark");
+    let m_cast = exp2.text_mark_of(value_positions[3], key2).expect("cast mark");
+
+    // Same macro definition => identical `(site, transparency, edition, local_inner)`.
+    assert_eq!((m_param.site, m_param.transparency, m_param.edition, m_param.local_inner), (m_let.site, m_let.transparency, m_let.edition, m_let.local_inner));
+    // Arm 2 tokens match each other; Arm 1 tokens match each other; Arm 1 != Arm 2!
+    assert_eq!(m_param, m_deref);
+    assert_eq!(m_let, m_cast);
+    assert_ne!(m_param.hygiene, m_let.hygiene, "Arm 1 and Arm 2 must carry distinct hygiene");
+    assert_ne!(m_param.as_outer_mark().of, m_let.as_outer_mark().of);
+    assert_ne!(m_param.local_hygiene(), m_let.local_hygiene());
+    assert_eq!(m_param.local_hygiene(), m_deref.local_hygiene());
+    assert_eq!(m_let.local_hygiene(), m_cast.local_hygiene());
+
+    // `lex_marked` round-trip preserves exact bit-for-bit `body::local_hygiene == TextMark::local_hygiene()`.
+    let relexed_param = lex_marked("value", Edition::E2021, &|_| Some(m_param), alloc).expect("relex param");
+    let relexed_let = lex_marked("value", Edition::E2021, &|_| Some(m_let), alloc).expect("relex let");
+    let h_relex_param = local_hygiene(&relexed_param, relexed_param.tokens()[0].ctx, ContentId([0x77; 32]));
+    let h_relex_let = local_hygiene(&relexed_let, relexed_let.tokens()[0].ctx, ContentId([0x77; 32]));
+    assert_eq!(h_relex_param, m_param.local_hygiene());
+    assert_eq!(h_relex_let, m_let.local_hygiene());
+    assert_ne!(h_relex_param, h_relex_let);
 }

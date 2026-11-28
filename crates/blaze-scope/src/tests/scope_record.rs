@@ -576,3 +576,18 @@ fn an_in_place_record_opens_and_answers_with_no_allocation() {
         bytes.len()
     );
 }
+
+#[test]
+fn previous_scope_version_9_is_rejected() {
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
+    let root = key("root", 0);
+    let parts = base("prev_v9", root);
+    let mut bytes = write(&parts, g).unwrap_or_else(|e| panic!("write: {e}")).to_vec();
+    bytes[4..8].copy_from_slice(&9u32.to_le_bytes());
+    let aligned_bytes = aligned(&bytes, bump);
+    assert!(
+        matches!(Verified::check(aligned_bytes), Err(RecordRead::NotThisRecord)),
+        "version-9 CrateScope record must be rejected as NotThisRecord"
+    );
+}

@@ -505,3 +505,61 @@ fn a_field_and_a_mut_self_method_of_an_element_go_through_index_mut() {
     assert_eq!(run_rows(&built), 220108);
     let _ = built;
 }
+
+/// `<Widget as Index<&u64>>::index` on the host: dereferences `k: &u64`, increments `calls`,
+/// and returns `&self.data[*k as usize]`.
+#[cfg(target_arch = "aarch64")]
+extern "C" fn host_index_by_ref(this: *mut u64, k: *const u64) -> *const u64 {
+    // SAFETY: `this` points to a live `Widget` and `k` points to a live `u64` (< 4).
+    unsafe {
+        *this.add(4) += 1;
+        this.add(*k as usize)
+    }
+}
+
+/// Overloaded indexing whose index argument is deref-coerced (`w[kk]` with `kk: &&u64` coerced
+/// to `&u64` for `impl Index<&u64> for Widget`): `blaze-build` applies the adjustments recorded
+/// on the index expression (`Task::Eval(index)`) and instantiates `Index::index` at the adjusted
+/// index type (`&u64`, never `&&u64`).
+#[test]
+fn an_overloaded_index_lowers_coerced_index_argument_adjustments() {
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], U64);
+    let array = w.array(U64, 4);
+    w.strukt(10, "Widget", &[("data", array), ("calls", U64)]);
+    w.reprs.push((WIDGET, ReprAttrs { c: true, ..ReprAttrs::RUST }));
+    let widget = PNode::Adt(WIDGET, List::EMPTY);
+    let r_widget = w.ref_(Mutbl::Not, widget);
+    let r_u64 = w.ref_(Mutbl::Not, U64);
+    w.func(12, "widget_index_ref", &[r_widget, r_u64], r_u64);
+    w.index_impl(widget, r_u64, U64, INDEX_FN);
+
+    let mut b = BodyBuf::new();
+    let (wp, k, rk, rrk) = (b.bind("w"), b.bind("k"), b.bind("rk"), b.bind("rrk"));
+    let lit = widget_lit(&mut b);
+    let two = b.int(2, Some(IntSuffix::Uint(UintTy::U64)));
+    let k_e = b.local(k);
+    let rk_init = b.e(Expr::Ref { mutbl: Mutbl::Not, operand: k_e });
+    let rk_e = b.local(rk);
+    let rrk_init = b.e(Expr::Ref { mutbl: Mutbl::Not, operand: rk_e });
+    let w_e = b.local(wp);
+    let rrk_e = b.local(rrk);
+    let indexed = b.index(w_e, rrk_e);
+    let root = b.block(
+        &[
+            Stmt::Let { pat: wp, ty: None, init: Some(lit), else_: None },
+            Stmt::Let { pat: k, ty: None, init: Some(two), else_: None },
+            Stmt::Let { pat: rk, ty: None, init: Some(rk_init), else_: None },
+            Stmt::Let { pat: rrk, ty: None, init: Some(rrk_init), else_: None },
+        ],
+        Some(indexed),
+    );
+    let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    assert!(built.refs.iter().any(|i| i.item == INDEX_FN), "the build calls `Index::index`");
+    #[cfg(target_arch = "aarch64")]
+    {
+        let host = [(INDEX_FN, host_index_by_ref as *const () as usize as u64)];
+        assert_eq!(run_native_with(&host, &[(MAIN, None, &built)]), 30);
+    }
+    let _ = built;
+}

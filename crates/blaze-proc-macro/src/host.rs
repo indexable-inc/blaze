@@ -69,7 +69,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, File},
     hash::{Hash as _, Hasher as _},
-    io::{ErrorKind, Write as _},
+    io::{Error as IoError, ErrorKind, Write as _},
     os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
     sync::{
@@ -849,7 +849,11 @@ fn imports<W: HostWidth>(l: &mut Linker<Host>) -> wasmtime::Result<()> {
         })
     })?;
     refused_wasi::<W>(l)?;
-    refused_build_script::<W>(l)
+    refused_build_script::<W>(l)?;
+    if W::WASI_MODULE == WASI_64 {
+        refused_seed(l)?;
+    }
+    Ok(())
 }
 
 /// The WASI module a 32-bit proc macro imports from (`wasm32-wasip1`).
@@ -955,6 +959,137 @@ fn refused_build_script<W: HostWidth>(l: &mut Linker<Host>) -> wasmtime::Result<
     l.func_wrap(bs, "reply", |mut c: Caller<'_, Host>, _: W::Ptr| -> wasmtime::Result<()> {
         with(&mut c, |_, _| Err(Stop("proc macros may not spawn subprocesses".to_owned())))
     })?;
+    Ok(())
+}
+
+/// The `blaze_seed` filesystem-mutation calls a `wasm64-blaze-wasip1` proc macro may import
+/// through `library/wasi_rt` (e.g. `napi-derive` linking `remove_dir`), none of which the
+/// read-only proc-macro sandbox permits (rule 9): each is defined so the module loads, and a
+/// call answers `EPERM` without touching the host filesystem.
+pub(crate) const REFUSED_SEED: &[&str] = &[
+    "create_dir",
+    "fd_set_times",
+    "hard_link",
+    "pwrite",
+    "remove_dir",
+    "rename",
+    "set_len",
+    "set_times",
+    "symlink",
+    "sync",
+    "unlink",
+];
+
+/// The `blaze_seed` calls the proc-macro sandbox permits in kind but does not serve (`pread`:
+/// the sandbox's reads are `fd_read`, matching `fd_pread` in [`UNSERVED_WASI`]). A call answers
+/// `ENOTSUP`.
+pub(crate) const UNSERVED_SEED: &[&str] = &["pread"];
+
+/// The non-filesystem `blaze_seed` calls the proc-macro host serves safely inside the sandbox
+/// (`abi_version` answers [`blaze_wasi::seed::VERSION`]; `decommit` returns whole guest pages to
+/// the OS and zeroes any unaligned edge bytes).
+pub(crate) const SERVED_SEED: &[&str] = &["abi_version", "decommit"];
+
+/// Discards whole host pages inside `slice` back to the OS so subsequent reads fault in fresh
+/// zero pages (leaving untouched pages unallocated), and zeroes any unaligned head/tail bytes.
+#[allow(unsafe_code)]
+pub(crate) fn decommit_guest_range(slice: &mut [u8]) -> Result<(), Stop> {
+    if slice.is_empty() {
+        return Ok(());
+    }
+    // SAFETY: `sysconf(_SC_PAGESIZE)` reads an immutable host kernel constant.
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .ok()
+        .filter(|&n| n.is_power_of_two())
+        .ok_or_else(|| Stop("host page size is not a valid power of two".to_owned()))?;
+    let base = slice.as_mut_ptr().addr();
+    let end = base.saturating_add(slice.len());
+    let aligned_start = base.checked_next_multiple_of(page).unwrap_or(end);
+    let aligned_end = end & !(page - 1);
+    if aligned_start >= aligned_end {
+        slice.fill(0);
+        return Ok(());
+    }
+    let head = aligned_start - base;
+    let body_len = aligned_end - aligned_start;
+    if let Some(prefix) = slice.get_mut(..head) {
+        prefix.fill(0);
+    }
+    if let Some(suffix) = slice.get_mut(head + body_len..) {
+        suffix.fill(0);
+    }
+    #[cfg(target_os = "linux")]
+    let flags = libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE;
+    #[cfg(not(target_os = "linux"))]
+    let flags = libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON;
+    // SAFETY:
+    // - `slice` is exclusively borrowed from Wasmtime's linear memory (`data_and_store_mut`), so
+    //   no other reference or thread accesses `[base, end)` during this call.
+    // - `aligned_start..aligned_end` is a page-aligned subrange strictly inside `slice`, backed by
+    //   Wasmtime's private `PROT_READ | PROT_WRITE` linear-memory reservation.
+    // - `MAP_FIXED | MAP_PRIVATE | MAP_ANON` with `PROT_READ | PROT_WRITE` atomically replaces
+    //   those pages with fresh zero-on-demand anonymous pages, dropping physical pages (including
+    //   any CoW file-backed initial data pages) while preserving Wasmtime's mapping permissions.
+    let mapped = unsafe {
+        let ptr = slice.as_mut_ptr().add(head).cast::<libc::c_void>();
+        libc::mmap(ptr, body_len, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0)
+    };
+    if mapped == libc::MAP_FAILED {
+        return Err(Stop(format!("`blaze_seed.decommit` failed: {}", IoError::last_os_error())));
+    }
+    Ok(())
+}
+
+/// Defines `blaze_seed` imports ([`SERVED_SEED`], [`REFUSED_SEED`], [`UNSERVED_SEED`]) with
+/// their 64-bit ABI signatures ([`blaze_wasi::seed`]) for `wasm64-blaze-wasip1` proc macros
+/// whose `library/wasi_rt` links filesystem helpers (e.g. `napi-derive`).
+///
+/// The proc-macro sandbox is strictly read-only (rule 9): every filesystem mutation answers
+/// `EPERM` without touching the host, `pread` answers `ENOTSUP` (matching `fd_pread`),
+/// `abi_version` answers [`blaze_wasi::seed::VERSION`], and `decommit` discards whole guest
+/// linear-memory pages back to the OS and zeroes any unaligned edges (trapping on out-of-bounds).
+/// Seed-only fiber calls (`fiber_*`) stay undefined so modules requiring them fail at
+/// instantiation.
+fn refused_seed(l: &mut Linker<Host>) -> wasmtime::Result<()> {
+    let seed = blaze_wasi::seed::MODULE;
+    let perm = i32::from(blaze_wasi::Errno::PERM.0);
+    let notsup = i32::from(blaze_wasi::Errno::NOTSUP.0);
+    // () -> i32
+    l.func_wrap(seed, "abi_version", || -> u32 { blaze_wasi::seed::VERSION })?;
+    // (ptr, len) -> ()
+    l.func_wrap(seed, "decommit", |mut c: Caller<'_, Host>, ptr: u64, len: u64| {
+        with(&mut c, |mem, _| {
+            let size = mem.len();
+            let range = ptr
+                .checked_add(len)
+                .and_then(|end| Some(usize::try_from(ptr).ok()?..usize::try_from(end).ok()?))
+                .and_then(|range| mem.get_mut(range));
+            let Some(slice) = range else {
+                return Err(Stop::from(blaze_wasi::Fault::OutsideMemory { ptr, len, size }));
+            };
+            decommit_guest_range(slice)
+        })
+    })?;
+    // (path, len) -> i32
+    for name in ["create_dir", "remove_dir", "unlink"] {
+        l.func_wrap(seed, name, move |_: u64, _: u64| -> i32 { perm })?;
+    }
+    // (from, from_len, to, to_len) -> i32
+    for name in ["rename", "hard_link", "symlink"] {
+        l.func_wrap(seed, name, move |_: u64, _: u64, _: u64, _: u64| -> i32 { perm })?;
+    }
+    // (path, len, follow, atime, mtime) -> i32
+    l.func_wrap(seed, "set_times", move |_: u64, _: u64, _: u32, _: u64, _: u64| -> i32 { perm })?;
+    // (fd, atime, mtime) -> i32
+    l.func_wrap(seed, "fd_set_times", move |_: u32, _: u64, _: u64| -> i32 { perm })?;
+    // (fd, len) -> i32
+    l.func_wrap(seed, "set_len", move |_: u32, _: u64| -> i32 { perm })?;
+    // (fd, data_only) -> i32
+    l.func_wrap(seed, "sync", move |_: u32, _: u32| -> i32 { perm })?;
+    // (fd, buf, len, offset, out) -> i32
+    for (name, errno) in [("pread", notsup), ("pwrite", perm)] {
+        l.func_wrap(seed, name, move |_: u32, _: u64, _: u64, _: u64, _: u64| -> i32 { errno })?;
+    }
     Ok(())
 }
 

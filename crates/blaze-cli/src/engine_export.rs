@@ -3540,7 +3540,9 @@ fn export_program<'f>(
     let lent = standing.lent;
     let typed = crate::engine_body_record::TypedFrom { cx, lent, records: standing.records(), alloc: heap.alloc() };
     let env = &facts.fetch_env;
-    let inputs = RunProcs { cx, root, snapshot: found.snapshot(), graph: standing.graph, env, frame };
+    let sdk = standing.sdk_for_procs();
+    let probes = standing.probes_for_procs();
+    let inputs = RunProcs { cx, root, snapshot: found.snapshot(), graph: standing.graph, env, sdk, probes, frame };
     let maker_procs = crate::job_texts::MadeOnce::new(|| inputs.make());
     let procs = crate::job_texts::Procs::ByNeed(&maker_procs);
 

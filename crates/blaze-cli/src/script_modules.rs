@@ -91,6 +91,29 @@ pub(crate) fn part_source(graph_source: ContentId, subject: ContentId) -> Conten
     ContentId::of(SOURCE_DOMAIN, &source)
 }
 
+/// The lookup's part source when the build script's `wasm64-blaze-wasip1` closure executes
+/// dependency build scripts: mixes `probes_hex` into `part_source` so derived-fact pin or live
+/// C-probe answerer changes invalidate the `MacroModule` task itself (rules 21 and 60).
+pub(crate) fn part_source_with_dep_probes(
+    graph_source: ContentId,
+    subject: ContentId,
+    probes_hex: &str,
+) -> ContentId {
+    let mut buf = [0u8; 128];
+    if let Some(dst) = buf.get_mut(..32) {
+        dst.copy_from_slice(&graph_source.0);
+    }
+    if let Some(dst) = buf.get_mut(32..64) {
+        dst.copy_from_slice(&subject.0);
+    }
+    let bytes = probes_hex.as_bytes();
+    let take = bytes.len().min(64);
+    if let (Some(dst), Some(src)) = (buf.get_mut(64..64 + take), bytes.get(..take)) {
+        dst.copy_from_slice(src);
+    }
+    ContentId::of(SOURCE_DOMAIN, &buf)
+}
+
 /// A module lookup a crate's script reads: its subject, the world index of the crate reading
 /// it, and the script unit's package, version, features, and digests (from the graph, held to the
 /// end of the command with the names world). Made in names.rs `world`.
@@ -117,6 +140,10 @@ pub(crate) struct Wanted<'w> {
     pub features: &'w [&'w str],
     pub files: Option<&'w str>,
     pub deps: Option<&'w str>,
+    /// Planned dependency-probe identity frozen during planning (when this build script's
+    /// `wasm64-blaze-wasip1` closure executes dependency build scripts), verified again before
+    /// publishing on a cache miss (Rule 21).
+    pub expected_probes: Option<crate::wasm64_compile::Hex64>,
 }
 
 /// One build-script module lookup & on-miss `wasm64` self-compile: looks up
@@ -137,7 +164,7 @@ pub(crate) fn run<'b>(
         return Ok(Did::Hole(refused("no home: the module store is under it"), "the build-script module store is under the home, and HOME is not set"));
     };
     let store = std::path::Path::new(home).join(".blaze/v2");
-    let Wanted { script_unit, ran_as, package, version, features, files, deps } = wanted;
+    let Wanted { script_unit, ran_as, package, version, features, files, deps, expected_probes } = wanted;
     let host = crate::graph::TRIPLE;
     let (found, digest_file) = match ran_as {
         RanAs::Wasm => (blaze_proc_macro::script_unit::module_of_files_and_deps(&store, package, version, features, files, deps), "wasm-sha256"),
@@ -156,7 +183,7 @@ pub(crate) fn run<'b>(
             && let Some(inputs) = compile
         {
             let _compile_cx = cx.span("script module: self-compile build.rs to wasm64");
-            match crate::wasm64_compile::compile_build_script(&store, inputs, script_unit, package, version, features, deps) {
+            match crate::wasm64_compile::compile_build_script(cx, &store, inputs, script_unit, package, version, features, deps, expected_probes) {
                 Ok(wasm_sha256) => {
                     let mut made = Made::new_in(name, held);
                     made.out = ContentId::of(OUT_DOMAIN, wasm_sha256.trim().as_bytes());
