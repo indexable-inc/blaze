@@ -3103,3 +3103,217 @@ fn main() {}
     }
     expect("cross-crate type macro with $crate hygiene and local enum", &got, &[true, false, true, false, true, false]);
 }
+
+/// Regression for PR #2810 (`MarkMiss::NotInText` on `syn 2.0.119`'s `Option<Token![struct]>`):
+/// when a struct field or fn return type wraps a cross-crate type macro emitting `$crate::...`
+/// tokens inside non-macro outer paths (`Option<...>`, `Result<..., E>`, `$crate::OuterWrap<...>`),
+/// `Builder::marks` must cover only the non-expansion text (`ret_text` / `text`) while
+/// `Builder::expanded_marks` carries the expansion buffer's marks—both in plain files and inside
+/// macro-generated items, and even when `Builder::owner` is `None` (no const block).
+#[test]
+fn outer_path_wrapping_type_macro_does_not_fail_mark_not_in_text_and_keeps_const_marks() {
+    use blaze_id::CrateItemKey;
+    use blaze_ids::ContentId;
+    use blaze_scope::graph::{CrateId, Sysroot};
+    use blaze_scope::resolve::{SourceTexts, resolve_crates};
+
+    struct WithDep<'t> {
+        base: &'t blaze_ladder::crates::Texts<'t>,
+        dep: usize,
+        files: &'t [(&'t str, &'t str)],
+    }
+
+    impl<'t> SourceTexts<'t> for WithDep<'t> {
+        fn read(&self, krate: usize, path: &str) -> Option<&'t str> {
+            if krate == self.dep {
+                return self.files.iter().find(|(p, _)| *p == path).map(|(_, t)| *t);
+            }
+            self.base.read(krate, path)
+        }
+    }
+
+    const DEP: &str = "
+pub struct TokStruct;
+pub struct OuterWrap<T>(pub T);
+pub const N: usize = 4;
+pub const OUTER_N: usize = 6;
+
+#[macro_export]
+macro_rules! tok {
+    (struct) => { $crate::TokStruct };
+}
+
+#[macro_export]
+macro_rules! plain_arr {
+    () => { [u8; $crate::N] };
+}
+
+#[macro_export]
+macro_rules! gen_syn_like {
+    () => {
+        pub struct GenStruct {
+            pub kw: Option<$crate::tok!(struct)>,
+            pub wrapped: $crate::OuterWrap<$crate::tok!(struct)>,
+            pub arr: $crate::plain_arr!(),
+        }
+
+        pub fn gen_parse(_input: ParseStream) -> Result<Option<$crate::tok!(struct)>, ()> {
+            Ok(Some($crate::TokStruct))
+        }
+
+        pub fn gen_outer_and_inner_const() -> ($crate::OuterWrap<$crate::plain_arr!()>, [u8; $crate::OUTER_N]) {
+            ($crate::OuterWrap([0u8; 4]), [0u8; 6])
+        }
+    };
+}
+";
+
+    const APP: &str = "
+// Distinct local constants to prove `$crate::N` (4) and `$crate::OUTER_N` (6) resolve in `dep`.
+pub const N: usize = 99;
+pub const OUTER_N: usize = 88;
+pub struct ParseStream;
+
+pub struct PlainStruct {
+    pub kw: Option<dep::tok!(struct)>,
+    pub arr: dep::plain_arr!(),
+}
+
+pub type PlainAlias = dep::plain_arr!();
+
+pub fn plain_parse(_input: ParseStream) -> Result<Option<dep::tok!(struct)>, ()> {
+    Ok(Some(dep::TokStruct))
+}
+
+pub fn plain_arr_ret() -> Option<dep::plain_arr!()> {
+    Some([0u8; 4])
+}
+
+dep::gen_syn_like!();
+
+fn plain_struct_ok(s: PlainStruct) -> (Option<dep::TokStruct>, [u8; 4]) {
+    (s.kw, s.arr)
+}
+fn plain_struct_bad(s: PlainStruct) -> Option<u8> {
+    s.kw
+}
+fn plain_alias_ok(a: PlainAlias) -> [u8; 4] {
+    a
+}
+fn plain_alias_bad(a: PlainAlias) -> [u8; 99] {
+    a
+}
+fn plain_parse_ok(p: ParseStream) -> Result<Option<dep::TokStruct>, ()> {
+    plain_parse(p)
+}
+fn plain_parse_bad(p: ParseStream) -> Result<Option<u8>, ()> {
+    plain_parse(p)
+}
+fn plain_arr_ret_ok() -> Option<[u8; 4]> {
+    plain_arr_ret()
+}
+fn plain_arr_ret_bad() -> Option<[u8; 5]> {
+    plain_arr_ret()
+}
+fn gen_struct_ok(g: GenStruct) -> (Option<dep::TokStruct>, dep::OuterWrap<dep::TokStruct>, [u8; 4]) {
+    (g.kw, g.wrapped, g.arr)
+}
+fn gen_struct_bad(g: GenStruct) -> [u8; 99] {
+    g.arr
+}
+fn gen_parse_ok(p: ParseStream) -> Result<Option<dep::TokStruct>, ()> {
+    gen_parse(p)
+}
+fn gen_both_ok() -> (dep::OuterWrap<[u8; 4]>, [u8; 6]) {
+    gen_outer_and_inner_const()
+}
+fn gen_both_bad() -> (dep::OuterWrap<[u8; 4]>, [u8; 88]) {
+    gen_outer_and_inner_const()
+}
+fn main() {}
+";
+
+    let alloc = test_alloc();
+    let tc = open_toolchain();
+    let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
+    let user_files = [("/user/src/main.rs".to_string(), APP.to_string())];
+    let dep_files = [("/dep/src/lib.rs", DEP)];
+    let user = UserCrate { name: "user", dir: "/user/", root: "/user/src/main.rs", files: &user_files, edition, panic: blaze_build::Panic::Unwind };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let mut crates = inputs.crates();
+    let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(u32::try_from(i).expect("few crates")));
+    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd"), proc_macro: at("proc_macro") };
+    let dep_at = crates.len();
+    let user_deps: [(&str, usize); 1] = [("dep", dep_at)];
+    let (cfg, crate_edition, implicit) = (crates[0].cfg, crates[0].edition, crates[0].implicit);
+    crates[0].deps = &user_deps;
+    crates.push(blaze_scope::resolve::CrateInput {
+        name: "dep",
+        key: CrateItemKey(ContentId([0x66; 32])),
+        edition: crate_edition,
+        implicit,
+        root: "/dep/src/lib.rs",
+        shown_from: "/dep/",
+        features: &[],
+        deps: &[],
+        cfg,
+        script: None,
+    });
+    let texts = WithDep { base: &inputs.texts, dep: dep_at, files: &dep_files };
+    let names = resolve_crates(&crates, sysroot, &texts, &blaze_scope::task::Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let sources = [SourceFile { path: "src/main.rs", text: APP }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+    let mut front = Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
+    let mut store = Store::new(front.index.lang("sized"), &frame, alloc);
+    let (mut buckets, mut consts) = (None, Consts::default());
+    let cases = [
+        ("plain_struct_ok", true),
+        ("plain_struct_bad", false),
+        ("plain_alias_ok", true),
+        ("plain_alias_bad", false),
+        ("plain_parse_ok", true),
+        ("plain_parse_bad", false),
+        ("plain_arr_ret_ok", true),
+        ("plain_arr_ret_bad", false),
+        ("gen_struct_ok", true),
+        ("gen_struct_bad", false),
+        ("gen_parse_ok", true),
+        ("gen_both_ok", true),
+        ("gen_both_bad", false),
+    ];
+    let mut got = blaze_own::AVec::new_in(alloc);
+    let mut wants = blaze_own::AVec::new_in(alloc);
+    for &(n, want) in &cases {
+        let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &[n] }, alloc).unwrap_or_else(|e| panic!("`{n}`: {e}"));
+        let k = found.whole(1).unwrap_or_else(|| panic!("`{n}` not named")).key;
+        let mut lens = 0;
+        let outcome = loop {
+            match lower_fn(&names, prepared, &mut front.keys, &mut store, k) {
+                Err(BodyError::Convert { why: Some(Why::NeedConst(c, _)), .. }) | Err(BodyError::Head { error: HeadError::Item(_, Why::NeedConst(c, _)), .. }) if lens < MOST_LENS => {
+                    lens += 1;
+                    let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
+                    if let Err(e) = eval_len(&mut records, c) {
+                        break format!("not lowered: {e}");
+                    }
+                }
+                Err(e) => break format!("not lowered: {e}"),
+                Ok(body) => {
+                    let view = body.lowered.view();
+                    let spell = Spelling::of(&view).unwrap_or_else(|e| panic!("spelling `{n}`: {e:?}"));
+                    let scope = body.scope(&spell);
+                    let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
+                    break match check_body(&mut records, &body, &scope) {
+                        Ok(done) if done.diags.is_empty() => "clean".to_string(),
+                        Ok(done) => format!("diags {:?}", done.diags),
+                        Err(CheckFail::Diags { diags, .. }) => format!("diags {diags:?}"),
+                        Err(e) => format!("not checked: {e}"),
+                    };
+                }
+            }
+        };
+        got.push((n.to_string(), outcome));
+        wants.push(want);
+    }
+    expect("outer path wrapping type macro with $crate marks", &got, &wants);
+}

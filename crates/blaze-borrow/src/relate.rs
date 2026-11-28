@@ -2265,20 +2265,23 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                                 if self.alias_assumed_outlives(cur, region)? {
                                     continue;
                                 }
-                                // Builtin `<async { .. } as Future>::Output`: when the future's
-                                // output type carries zero lifetime slots (e.g. `()` or a bare
-                                // type parameter `T`), normalize straight to `output` so its
-                                // outlives bound does not constrain the future's own captures.
+                                // Builtin `<async { .. } as Future>::Output` (and `<async { .. } as IntoFuture>::Output`):
+                                // slice the future's trailing `count(output)` output slots so
+                                // `F::Output: 'r` constrains only `Output`'s slots (and any
+                                // captures linked to them by `coroutine.rs`'s requirements), never
+                                // unrelated captures of `F`.
                                 let kids = self.kids_of(cur)?;
                                 if kids.len() == 1
+                                    && name == blaze_typeck::Name::of("Output")
+                                    && (self.selected.is_future_trait(trait_) || self.selected.is_into_future_trait(trait_))
                                     && let Ok(own) = self.own(cur)
                                     && let Some((_, rest)) = cur.slots.split(own)
                                     && let Ok((subj, _)) = self.kid(cur, &kids, rest, 0)
-                                    && let Ok(Resolved::Side(subj)) = self.resolve(subj)
-                                    && let Ok(PNode::Future(_, output, _)) = self.node(subj)
+                                    && let Ok(Resolved::Side(raw_subj)) = self.resolve(subj)
                                 {
-                                    let out_side = Side { ty: output, slots: Slots::Caller(crate::SlotRange::EMPTY) };
-                                    if self.fits(out_side).is_ok() {
+                                    let subj = self.try_normalize_subject(raw_subj, d);
+                                    if let Ok(PNode::Future(_, output, _)) = self.node(subj) {
+                                        let out_side = self.future_output_side(cur.ty, subj, output)?;
                                         enter = Some((out_side, d + 1));
                                         continue;
                                     }
@@ -4540,6 +4543,17 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         Ok(false)
     }
 
+    /// Slice the trailing `count(output)` output slots off an async-block
+    /// `PNode::Future(_, output, _)` (`SLOTS` layout: capture slots first, then `output`'s slots).
+    fn future_output_side(&self, at: PTy, subject: Side<'c>, output: PTy) -> Result<Side<'c>, Refused> {
+        self.fits(subject)?;
+        let n = self.tab(subject.slots).count(output).map_err(|u| self.count_err(u))?;
+        let total = subject.slots.len().ok_or(self.malformed(at, Bad::StepBound))?;
+        let cap_len = total.checked_sub(n).ok_or(self.malformed(at, Bad::ColumnLength { want: n, got: total }))?;
+        let (_, out_slots) = subject.slots.split(cap_len).ok_or(self.malformed(at, Bad::StepBound))?;
+        Ok(Side { ty: output, slots: out_slots })
+    }
+
     /// Try to normalize an `Alias` or `ExProj` (with `want_arg_count` arguments `[Self, A..]`)
     /// from non-impl sources: builtin `FnOnce::Output`, caller `ExProj` bounds + supertraits,
     /// `Dynamic` `ExProj` predicates, `Opaque` bounds, or `Alias` trait bounds.
@@ -4567,29 +4581,10 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         if want_arg_count == 1
             && let PNode::Future(_, output, _) = self.node(subject)?
         {
-            if name == blaze_typeck::Name::of("Output") {
-                if let Ok(n) = self.types.count(output) {
-                    if n == SlotCount::ZERO {
-                        return Ok(Some(Side { ty: output, slots: Slots::Caller(crate::SlotRange::EMPTY) }));
-                    }
-                    if n.get() <= 64
-                        && let Some(env) = self.envs.impl_env(n.get(), 0)
-                    {
-                        let cap_len = subject.slots.len().map_or(0, SlotCount::get);
-                        for k in 0..n.get() {
-                            let o = self.out.fresh(Kind::Existential);
-                            self.envs.bind_reg(env, k, Reg::Origin(o)).map_err(|w| self.malformed(want.ty, w))?;
-                            // Discharge `coroutine.rs`'s assumption that every captured region
-                            // of the async block outlives every output region slot.
-                            for u in 0..cap_len {
-                                if let RegAt::Known(cap_r) = self.slot(subject, u)? {
-                                    self.outlives(want.ty, cap_r, Reg::Origin(o))?;
-                                }
-                            }
-                        }
-                        return Ok(Some(Side { ty: output, slots: Slots::CallerFresh { env, start: 0, len: n } }));
-                    }
-                }
+            if name == blaze_typeck::Name::of("Output")
+                && (self.selected.is_future_trait(trait_) || self.selected.is_into_future_trait(trait_))
+            {
+                return Ok(Some(self.future_output_side(want.ty, subject, output)?));
             } else if name == blaze_typeck::Name::of("IntoFuture") && self.selected.is_into_future_trait(trait_) {
                 return Ok(Some(subject));
             }

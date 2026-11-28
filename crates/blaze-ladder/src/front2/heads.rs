@@ -5527,7 +5527,7 @@ impl<'n> Store<'n> {
         let mut cs = blaze_own::Vec::new_in(alloc);
         let marks = self.marks(names, key, v.item())?;
         let owner = Self::head_owner_item(names, key);
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None };
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None, expanded_marks: None };
         let own = own_generics(&b, &mut self.tys, module, v, 1, &mut ps, &mut cs)?;
         let me = intern(&mut self.tys, PNode::Param(0))?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Ty(me, None), self_assoc: &[], anon: &[], consts: &cs, body: None };
@@ -5564,7 +5564,7 @@ impl<'n> Store<'n> {
         let mut cs = blaze_own::Vec::new_in(a);
         let marks = self.marks(names, key, v.item())?;
         let owner = Self::head_owner_item(names, key);
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None };
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None, expanded_marks: None };
         let generics = own_generics(&b, &mut self.tys, module, v, 0, &mut ps, &mut cs)?;
         // A free `type T;` with no type is an extern type (the Reference, "Type aliases": a
         // free alias without a type is an error, so the only accepted form is a foreign item:
@@ -5629,7 +5629,7 @@ impl<'n> Store<'n> {
         let mut cs = blaze_own::Vec::new_in(alloc);
         let marks = self.marks(names, key, v.item())?;
         let owner = Self::head_owner_item(names, key);
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None };
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None, expanded_marks: None };
         let g = own_generics(&b, &mut self.tys, module, v, 0, &mut ps, &mut cs)?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs, body: None };
         let mut defaults = blaze_own::Vec::new_in(alloc);
@@ -5735,7 +5735,7 @@ impl<'n> Store<'n> {
         let mut cs = blaze_own::Vec::new_in(alloc);
         let marks = self.marks(names, key, v.item())?;
         let owner = Self::head_owner_item(names, key);
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None };
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None, expanded_marks: None };
         let own = own_generics(&b, &mut self.tys, module, v, 1, &mut ps, &mut cs)?;
         // The trait's bounds are lowered after its head (they may name the trait): a default
         // written with `T::X` is refused as not yet readable, never as not found.
@@ -5868,7 +5868,7 @@ impl<'n> Store<'n> {
         for _ in 0..16u32 {
             bounds.clear();
             let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Trait(key), self_assoc: &[], anon: &[], consts: &cs, body: None };
-            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner: trait_owner, owner_key: Some(checker_of(key)), expanded: None };
+            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner: trait_owner, owner_key: Some(checker_of(key)), expanded: None, expanded_marks: None };
             match b.param_bounds_in(&mut self.tys, &env, &v, 1, &mut bounds) {
                 Ok(()) => break,
                 Err(Why::Need(dep)) => {
@@ -5908,7 +5908,7 @@ impl<'n> Store<'n> {
                     let mut idx = base;
                     let cenv = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
                     let m_owner = Self::head_owner_member(m.lib, m.detail, m.text);
-                    let cb = Builder { resolver: Paths { names }, heads: &self.maps, marks: m_marks, owner: m_owner, owner_key: Some(checker_of(m.lib)), expanded: None };
+                    let cb = Builder { resolver: Paths { names }, heads: &self.maps, marks: m_marks, owner: m_owner, owner_key: Some(checker_of(m.lib)), expanded: None, expanded_marks: None };
                     for &n in rows {
                         match lf::GenericParam::decode(n) {
                             Ok(lf::GenericParam::Lifetime { .. }) => {}
@@ -5976,7 +5976,7 @@ impl<'n> Store<'n> {
                 let mut ap = Preds::new_in(ap_scope);
                 let own_env = Env { module, params: &own_ps, bounds: Bounds::Done(&bounds), self_: SelfTy::Trait(key), self_assoc: &[], anon: &[], consts: &own_cs, body: None };
                 let m_owner = Self::head_owner_member(m.lib, m.detail, m.text);
-                let b = Builder { resolver: Paths { names }, heads: &self.maps, marks: m_marks, owner: m_owner, owner_key: Some(checker_of(m.lib)), expanded: None };
+                let b = Builder { resolver: Paths { names }, heads: &self.maps, marks: m_marks, owner: m_owner, owner_key: Some(checker_of(m.lib)), expanded: None, expanded_marks: None };
                 match b.assoc_ty_bounds(&mut self.tys, &own_env, &mv, alias, self.sized, &mut ap) {
                     Ok(()) => {
                         let laid = match lay_listed(&b, &mut self.tys, &own_env, &mv, (&ap, &[]), SelfGiven::NONE, Captures::NONE, alloc) {
@@ -6031,7 +6031,7 @@ impl<'n> Store<'n> {
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Trait(key), self_assoc: &[], anon: &[], consts: &cs, body: None };
         let marks = self.marks(names, key, v.item())?;
         let owner = Self::head_owner_item(names, key);
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None };
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None, expanded_marks: None };
         let mut bounds = blaze_own::Vec::new_in(alloc);
         b.param_bounds_in(&mut self.tys, &env, v, 1, &mut bounds)?;
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
@@ -6213,7 +6213,7 @@ impl<'n> Store<'n> {
                         let item = keys.member(ck, MemberKind::Type, m.name).map_err(&why_key)?;
                         let marks = super::item_site::member_marks(names, key, m.written_by, m.text).map_err(MarksLost::why)?;
                         let owner = Self::head_owner_member(m.lib, m.detail, m.text);
-                        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(m.lib)), expanded: None };
+                        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(m.lib)), expanded: None, expanded_marks: None };
                         let default = match mv.head_opt(head::TY) {
                             Some(t) => Some(b.ty(&mut self.tys, &env, mv, lf::TypeId(t))?),
                             None => None,
@@ -6281,7 +6281,7 @@ impl<'n> Store<'n> {
                         consts.push((Name::of(m.name), mk));
                         let marks = super::item_site::member_marks(names, key, m.written_by, m.text).map_err(MarksLost::why)?;
                         let owner = Self::head_owner_member(m.lib, m.detail, m.text);
-                        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(m.lib)), expanded: None };
+                        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(m.lib)), expanded: None, expanded_marks: None };
                         let mut cp = Preds::new_in(scope.clone_in(alloc));
                         cp.inherit(&inherited);
                         let ra = self.tys.alloc();
@@ -6359,7 +6359,7 @@ impl<'n> Store<'n> {
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Ty(self_ty, None), self_assoc: &[], anon: &[], consts: &cs, body: None };
         let marks = self.marks(names, key, v.item())?;
         let owner = Self::head_owner_item(names, key);
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None };
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None, expanded_marks: None };
         let mut bounds = blaze_own::Vec::new_in(alloc);
         b.param_bounds_in(&mut self.tys, &env, v, 0, &mut bounds)?;
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
@@ -6729,7 +6729,7 @@ impl<'n> Store<'n> {
         let mut cs = blaze_own::Vec::new_in(alloc);
         let marks = self.marks(names, key, v.item())?;
         let owner = Self::head_owner_item(names, key);
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None };
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None, expanded_marks: None };
         let generics = own_generics(&b, &mut self.tys, module, v, 0, &mut ps, &mut cs)?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs, body: None };
         // The self type FIRST, then the bounds with `Self` known: the Reference, "Paths",
@@ -6871,7 +6871,7 @@ impl<'n> Store<'n> {
                         let t = mv.head_opt(head::TY).ok_or(Why::Unsupported("an associated type with no type", whole))?;
                         let marks = super::item_site::member_marks(names, key, m.written_by, m.text).map_err(MarksLost::why)?;
                         let owner = Self::head_owner_member(m.lib, m.detail, m.text);
-                        let mb = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(m.lib)), expanded: None };
+                        let mb = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(m.lib)), expanded: None, expanded_marks: None };
                         let written_t = lf::TypeId(t);
                         let mut own_ps = blaze_own::Vec::new_in(alloc);
                         let mut own_cs = blaze_own::Vec::new_in(alloc);
@@ -6923,7 +6923,7 @@ impl<'n> Store<'n> {
         self.put_parse_scratch(scratch);
         let env = Env { self_assoc: &assoc, ..env };
         let mut preds = Preds::new_in(scope.clone_in(alloc));
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(ck), expanded: None };
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(ck), expanded: None, expanded_marks: None };
         b.predicates(&mut self.tys, &env, v, 0, None, self.sized, &mut preds)?;
         for (cond_key, head_owner, prefix) in Self::file_where_consts(names, &mut self.tys, &self.locals, &mut self.anon_marks, &self.fns, &self.preds, ck, key, owner, b.marks, module, v, &env, &bounds, generics, keys, &mut preds)? {
             self.locals.file_head_anon(cond_key, head_owner, None, &[], prefix);
@@ -6975,7 +6975,7 @@ impl<'n> Store<'n> {
                             let t = mv.head_opt(head::TY).ok_or(Why::Unsupported("an associated type with no type", whole))?;
                             let marks = super::item_site::member_marks(names, key, m_written_by, m_text).map_err(MarksLost::why)?;
                             let owner = Self::head_owner_member(m_lib, ItemDetail::TypeAlias, m_text);
-                            let mb = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(m_lib)), expanded: None };
+                            let mb = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(m_lib)), expanded: None, expanded_marks: None };
                             let written_t = lf::TypeId(t);
                             let mut own_lifetimes = false;
                             for &row in mv.rows(mv.list(head::GENERICS))? {
@@ -7108,7 +7108,7 @@ impl<'n> Store<'n> {
             let t = cv.head_opt(head::TY).ok_or(Why::Unsupported("an associated constant with no type", at))?;
             let marks = super::item_site::member_marks(names, key, written_by, text).map_err(MarksLost::why)?;
             let owner = Self::head_owner_member(member_lib, member_detail, text);
-            let cb = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(member_lib)), expanded: None };
+            let cb = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(member_lib)), expanded: None, expanded_marks: None };
             // An associated constant has no generics of its own: the impl's lifetimes.
             let mut cp = Preds::new_in(scope.clone_in(scope.alloc()));
             cp.inherit(clauses);
@@ -7294,7 +7294,7 @@ impl<'n> Store<'n> {
             if !has_default && !has_spread {
                 continue;
             }
-            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(tag_owner), expanded: None };
+            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(tag_owner), expanded: None, expanded_marks: None };
             let mut merged: blaze_own::Vec<(&str, Name, DefaultEntry), Alloc<'_>> = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
             let mut inherited_any = false;
             let mut spread_ok = true;
@@ -7462,7 +7462,7 @@ impl<'n> Store<'n> {
             None => Self::head_owner_member(owner_lib, detail, text),
         };
         let declared = {
-            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(key), expanded: None };
+            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(key), expanded: None, expanded_marks: None };
             own_generics(&b, &mut self.tys, outer.module, v, parent, &mut ps, &mut cs)?
         };
         // Each `impl Trait` parameter type is one more own type parameter, after the declared
@@ -7533,25 +7533,34 @@ impl<'n> Store<'n> {
             return Err(Why::Program("a fn's container's bounds were not lowered before the fn".into(), Range::new(0, 0)));
         };
         let mut bounds = exact_in(outer_bounds, alloc);
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(key), expanded: None };
-        // The return type's builder: an expanded return type is a text of its own, read at the
-        // fn's module; the item's marks are not its tokens', while enclosing head ownership is
-        // carried through `ExpandedOwner` so item-declaring const blocks in the expansion resolve
-        // to the `blaze-scope` expansion block modules created under the direct head call.
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(key), expanded: None, expanded_marks: None };
+        // The return type's builder: keep `marks` strictly for `rv`'s non-expansion buffer
+        // (`ret_text` when expanded, which is inside `marks.text` for macro-written fns and
+        // unmarked for file items), and carry `exp_marks` over `x.view().expanded` in
+        // `expanded_marks` so non-expansion paths (`Option`, `Result`) never query the expansion
+        // buffer's column while constant expressions inside the expansion keep `$crate` marks.
+        // Enclosing head ownership is carried through `ExpandedOwner` so item-declaring const
+        // blocks in the expansion resolve to the `blaze-scope` expansion block modules created
+        // under the direct head call.
         let exp_marks = expanded.as_ref().and_then(|(_, x)| x.expansion_marks());
+        let ret_marks = match &expanded {
+            Some((ret_text, _)) => marks.filter(|m| blaze_scope::expansion_origins::offset_in(m.text, ret_text).is_some()),
+            None => marks,
+        };
         let ret_expanded = match (&expanded, owner) {
             (Some((ret_text, x)), Some((item, owner_text))) => blaze_scope::expansion_origins::offset_in(owner_text, ret_text).map(|base_offset| {
-                super::types::ExpandedOwner { item, owner_text, base_offset, view: x.view(), marks: exp_marks }
+                super::types::ExpandedOwner { item, owner_text, base_offset, view: x.view() }
             }),
             _ => None,
         };
         let rb = Builder {
             resolver: Paths { names },
             heads: &self.maps,
-            marks: if expanded.is_some() { exp_marks } else { marks },
+            marks: ret_marks,
             owner,
             owner_key: Some(key),
             expanded: ret_expanded,
+            expanded_marks: exp_marks,
         };
         // A LOCAL fn's, const's or static's signature stands in the block it is declared in
         // (the Reference, "Statements", "Item declarations": its scope is the block's), so a
@@ -8857,7 +8866,7 @@ pub struct B;
             let row = v.rows(v.list(head::PARAMS)).expect("params")[0];
             let p = lf::Param::decode(row).expect("param");
             let ty_id = p.ty.expect("param type");
-            let b = Builder { resolver: Paths { names }, heads: &store.maps, marks: None, owner: None, owner_key: None, expanded: None };
+            let b = Builder { resolver: Paths { names }, heads: &store.maps, marks: None, owner: None, owner_key: None, expanded: None, expanded_marks: None };
             b.ty(&mut store.tys, &env, &v, ty_id).unwrap_or_else(|e| panic!("Builder::ty `{sig_text}`: {e:?}"))
         };
 
