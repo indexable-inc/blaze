@@ -13,12 +13,14 @@
 //! - [`record`]: the expansion record: keyed by the module's wasm digest, the macro, the kind
 //!   and the input, with the reads as its read-list.
 
-#![feature(allocator_api)]
+#![feature(allocator_api, register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
 
 // Without `runtime`: a module's identity and key, the module store's lookup, the expansion
 // record's key and lookup. A command that only asks whether a module or an answer is kept
 // links no Wasmtime.
 pub mod comptime_patch;
+pub mod machine;
 pub mod module;
 pub mod package_env;
 pub mod parts;

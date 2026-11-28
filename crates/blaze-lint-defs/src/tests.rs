@@ -70,8 +70,9 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     // (The refinement gate, `blaze::refinement`, is the one more; plus `blaze::magic_slice_len`,
     // `blaze::bool_as_int`, `blaze::manual_slice_idioms`, `blaze::test_ambient_leak`,
     // `blaze::mut_for_uniq_borrow`, `blaze::parallel_vecs`, `blaze::cost_contract`,
-    // `blaze::capability_in_sans_io`, and `blaze::local_borrow_across_do`.)
-    assert_eq!(blaze_lints().len(), 267);
+    // `blaze::capability_in_sans_io`, `blaze::local_borrow_across_do`, and
+    // `blaze::suspend_in_sans_io`.)
+    assert_eq!(blaze_lints().len(), 268);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =
@@ -137,6 +138,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         "blaze::cost_contract",
         "blaze::capability_in_sans_io",
         "blaze::local_borrow_across_do",
+        "blaze::suspend_in_sans_io",
         // A dependency doing what the workspace did not grant it.
         "blaze::dependency_capability",
         "blaze::dependency_unsafe",

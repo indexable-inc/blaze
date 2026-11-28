@@ -1,6 +1,6 @@
 //! The cold Code pool for one request. Construct it with [`CodePool::new`]. On each turn:
 //!
-//! 1. Call [`CodePool::wait`] for the named wait and its absolute deadline on the driver's
+//! 1. Call [`CodePool::next_wait`] for the named wait and its absolute deadline on the driver's
 //!    clock. Receive one child, store, producer or worker event, or a tick at the deadline.
 //!    `None` ends the request after the last child exits and outstanding work drains.
 //! 2. Call [`CodePool::step`] with the time, event and an empty, reusable action buffer.
@@ -283,7 +283,7 @@ impl<'a> CodePool<'a> {
 
     /// The first child's head demand names the critical wait. With no waiter, outstanding
     /// operations still need draining, including builds whose last interested child has exited.
-    pub fn wait(&self) -> Option<(Wait, Time)> {
+    pub fn next_wait(&self) -> Option<(Wait, Time)> {
         let waiting = self.children.iter().find_map(|c| c.pending.front().and_then(|(id, _)| self.row_wait(*id)))
             .or_else(|| self.frontier.first().and_then(|&id| self.row_wait(id)))
             .or_else(|| self.children.iter().position(|c| c.live).map(|i| Wait::Child(Child(i))))
@@ -351,7 +351,7 @@ impl<'a> CodePool<'a> {
     }
 
     pub fn step(&mut self, now: Time, event: Event<'_>, out: &mut SVec<'_, Action>) -> Result<(), Error> {
-        if now.0 >= self.opts.deadline.0 && let Some((waiting, deadline)) = self.wait() {
+        if now.0 >= self.opts.deadline.0 && let Some((waiting, deadline)) = self.next_wait() {
             return Err(Error::Deadline { waiting, deadline });
         }
         match event {

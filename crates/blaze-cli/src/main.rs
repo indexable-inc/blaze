@@ -673,10 +673,92 @@ fn choice(word: &str) -> Result<Choice, CliError> {
 #[global_allocator]
 static HEAP: blaze_mem::counted::Counted = blaze_mem::counted::Counted;
 
+/// Release version embedded at build time (`BLAZE_RELEASE` in release CI, else `CARGO_PKG_VERSION`).
+const BLAZE_VERSION: &str = match option_env!("BLAZE_RELEASE") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
+/// Formats `blaze-<version>` into a NUL-terminated fixed buffer fitting within `max_bytes`
+/// (31 bytes for macOS XNU `pbi_name`, 15 bytes for Linux `TASK_COMM_LEN - 1`).
+///
+/// When `blaze-<version>` exceeds `max_bytes` (e.g. calver `0.20261128.0` on Linux's 15-byte
+/// `comm` limit), compacts a leading `0.20` prefix so `0.20261128.0` becomes `blaze-261128.0`
+/// (14 bytes, preserving year, month, day, and patch instead of truncating the day/patch).
+const fn build_process_name(version: &str, max_bytes: usize) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    let limit = if max_bytes < 63 { max_bytes } else { 63 };
+    let prefix = b"blaze-";
+    let v = version.as_bytes();
+    // Strip leading `v` if present (`v0.20261128.0` -> `0.20261128.0`).
+    let mut v_start = 0usize;
+    if v.len() > 1 && v[0] == b'v' && v[1].is_ascii_digit() {
+        v_start = 1;
+    }
+    let v_len = v.len() - v_start;
+    if prefix.len() + v_len > limit
+        && v_len >= 5
+        && v[v_start] == b'0'
+        && v[v_start + 1] == b'.'
+        && v[v_start + 2] == b'2'
+        && v[v_start + 3] == b'0'
+        && v[v_start + 4].is_ascii_digit()
+    {
+        v_start += 4;
+    }
+    let mut i = 0usize;
+    while i < prefix.len() && i < limit {
+        out[i] = prefix[i];
+        i += 1;
+    }
+    let mut j = v_start;
+    while j < v.len() && i < limit {
+        let b = v[j];
+        if b != 0 {
+            out[i] = b;
+            i += 1;
+        }
+        j += 1;
+    }
+    out[i] = 0;
+    out
+}
+
+#[cfg(target_os = "linux")]
+const PROCESS_NAME_MAX: usize = 15;
+#[cfg(not(target_os = "linux"))]
+const PROCESS_NAME_MAX: usize = 31;
+
+const PROCESS_NAME_BYTES: [u8; 64] = build_process_name(BLAZE_VERSION, PROCESS_NAME_MAX);
+
+fn set_versioned_process_name() {
+    if let Ok(name) = core::ffi::CStr::from_bytes_until_nul(&PROCESS_NAME_BYTES) {
+        blaze_sys::set_process_name(name);
+    }
+}
+
 fn main() -> bstd::entry::Exit {
+    set_versioned_process_name();
     // The process's heap is a grant bstd's entry hands `main` (D102, D120), never reached for
     // here or below: every allocator under the command is its handle, a frame, or an arena.
     bstd::entry::run_with_heap_at(bstd::entry::Os::process(), telemetry_level, |cx, io, heap| run(cx, io, heap))
+}
+
+#[cfg(test)]
+mod process_name_tests {
+    use super::build_process_name;
+
+    fn as_str(buf: &[u8; 64]) -> &str {
+        core::ffi::CStr::from_bytes_until_nul(buf).expect("nul-terminated").to_str().expect("utf8")
+    }
+
+    #[test]
+    fn process_name_includes_full_version_on_macos_and_compacts_calver_on_linux() {
+        assert_eq!(as_str(&build_process_name("0.20261128.0", 31)), "blaze-0.20261128.0");
+        assert_eq!(as_str(&build_process_name("v0.20261128.0", 31)), "blaze-0.20261128.0");
+        assert_eq!(as_str(&build_process_name("0.20261128.0", 15)), "blaze-261128.0");
+        assert_eq!(as_str(&build_process_name("0.2.0", 15)), "blaze-0.2.0");
+    }
 }
 
 /// The run's telemetry level, chosen before the runtime starts (D178): `--stats` among the
@@ -769,7 +851,7 @@ fn command(
         "--help" | "-h" => return print_help(cx, None, out),
         "help" => return print_help(cx, args.get(2), out),
         "--version" | "-V" | "version" => {
-            let ver = option_env!("BLAZE_RELEASE").unwrap_or(env!("CARGO_PKG_VERSION"));
+            let ver = BLAZE_VERSION;
             let tc = include_str!("../../../pins/toolchain").trim();
             out.line(cx, format_args!("blaze {ver} ({tc})"))?;
             return Ok(Status::OK);

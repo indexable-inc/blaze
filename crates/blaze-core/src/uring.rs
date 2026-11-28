@@ -93,6 +93,16 @@ const OP_FSYNC: u8 = 3;
 /// `fsync_flags` of an `IORING_OP_FSYNC`: the file's data and what a read of it needs (its
 /// length), as `fdatasync` ([`crate::Effect::Barrier`]).
 const IORING_FSYNC_DATASYNC: u32 = 1;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "direct PlannedSqe -> Sqe lowering for registered-buffer reads")
+)]
+const OP_READ_FIXED: u8 = 4;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "direct PlannedSqe -> Sqe lowering for registered-buffer writes")
+)]
+const OP_WRITE_FIXED: u8 = 5;
 const OP_POLL_ADD: u8 = 6;
 const OP_ACCEPT: u8 = 13;
 const OP_ASYNC_CANCEL: u8 = 14;
@@ -223,7 +233,7 @@ const LETTING_GO: Duration = Duration::from_secs(5);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct Sqe {
+pub(crate) struct Sqe {
     opcode: u8,
     flags: u8,
     ioprio: u16,
@@ -238,6 +248,66 @@ struct Sqe {
     splice_fd_in: i32,
     addr3: u64,
     pad: u64,
+}
+
+/// Applies a platform-independent [`crate::request::PlannedSqe`] directly onto a Linux kernel
+/// `io_uring` [`Sqe`], mapping opcodes, `IOSQE_*` flags, fixed-file slot, fixed-buffer index,
+/// offset, and transfer length.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "direct PlannedSqe -> Sqe lowering ready for ring submission")
+)]
+pub(crate) fn apply_planned_sqe(plan: &crate::request::PlannedSqe, sqe: &mut Sqe) {
+    use crate::request::{SqeFlags, SqeOpcode};
+
+    sqe.opcode = match plan.opcode {
+        SqeOpcode::OpenAt => OP_OPENAT,
+        SqeOpcode::Read => OP_READ,
+        SqeOpcode::ReadFixed => OP_READ_FIXED,
+        SqeOpcode::Write => OP_WRITE,
+        SqeOpcode::WriteFixed => OP_WRITE_FIXED,
+        SqeOpcode::Fsync => OP_FSYNC,
+        SqeOpcode::Close => OP_CLOSE,
+        SqeOpcode::RenameAt => OP_RENAMEAT,
+        SqeOpcode::Statx => OP_STATX,
+        SqeOpcode::Connect => OP_CONNECT,
+        SqeOpcode::Accept => OP_ACCEPT,
+        SqeOpcode::Send => OP_SEND,
+        SqeOpcode::Recv => OP_RECV,
+        SqeOpcode::PollAdd => OP_POLL_ADD,
+    };
+
+    let mut flags: u8 = 0;
+    if plan.flags.contains(SqeFlags::FIXED_FILE) {
+        flags |= SQE_FIXED_FILE;
+    }
+    if plan.flags.contains(SqeFlags::IO_LINK) {
+        flags |= SQE_IO_LINK;
+    }
+    if plan.flags.contains(SqeFlags::BUFFER_SELECT) {
+        flags |= SQE_BUFFER_SELECT;
+    }
+    sqe.flags = flags;
+
+    if let Some(slot) = plan.fd_slot {
+        sqe.fd = slot.0 as i32;
+    }
+    if let Some(idx) = plan.buf_index {
+        sqe.buf_index = idx.0;
+    }
+    sqe.off = plan.offset;
+    sqe.len = plan.len;
+}
+
+/// Lowers a platform-independent [`crate::request::PlannedSqe`] into a fresh Linux kernel [`Sqe`].
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "direct PlannedSqe -> Sqe lowering ready for ring submission")
+)]
+pub(crate) fn sqe_from_plan(plan: &crate::request::PlannedSqe) -> Sqe {
+    let mut sqe = Sqe::default();
+    apply_planned_sqe(plan, &mut sqe);
+    sqe
 }
 
 #[repr(C)]
@@ -5859,5 +5929,173 @@ mod tests {
             assert!(because.contains(cause), "{text}");
             assert!(how.contains(fix), "{text}");
         }
+    }
+
+    #[test]
+    fn sqe_from_plan_lowers_typed_requests_to_kernel_sqes() {
+        use blaze_machine::{Chain, ChainOutcome, Handler, Perform};
+        use blaze_own::testing::heap;
+        use blaze_own::with_brand;
+
+        use crate::handle::{ExitKind, FixedFileSlot, TaskId};
+        use crate::request::{
+            ByteLen, ByteOffset, DirectFsHandler, DmaBuf, FixedBufIndex, InMemoryDirectFs,
+            OpenOpts, PlannedSqe, ReadIntoOpts, SqeFlags, SqeOpcode, WriteFromOpts,
+            plan_chain_write_flush, plan_read_into, plan_stat, plan_write_from,
+        };
+
+        let h = heap();
+        let mut fs = InMemoryDirectFs::new(h.alloc());
+        let path = FileName::new("sqe-plan.bin").unwrap();
+
+        with_brand(|brand| {
+            let mut handler = DirectFsHandler::new(&mut fs, TaskId(701), brand, h.alloc());
+            let root = handler.root();
+            let dir_slot = root.id().fixed_file_slot();
+
+            // 1. `plan_stat` -> `IORING_OP_STATX` with `IOSQE_FIXED_FILE` on the dir slot.
+            let stat_req = root.stat(path.clone());
+            let stat_sqe = super::sqe_from_plan(&plan_stat(&stat_req));
+            assert_eq!(stat_sqe.opcode, super::OP_STATX);
+            assert_eq!(stat_sqe.flags, super::SQE_FIXED_FILE);
+            assert_eq!(stat_sqe.fd, dir_slot.0 as i32);
+            assert_eq!(stat_sqe.buf_index, 0);
+            assert_eq!(stat_sqe.off, 0);
+            assert_eq!(stat_sqe.len, 0);
+            assert_eq!(
+                handler
+                    .perform(stat_req, |p| match p {
+                        Perform::Answered(res) => res,
+                        _ => unreachable!(),
+                    })
+                    .unwrap(),
+                Ok(None)
+            );
+
+            let file = handler
+                .perform(
+                    root.open_write(OpenOpts { path: path.clone(), create: true, truncate: true }),
+                    |p| match p {
+                        Perform::Answered(res) => res,
+                        _ => unreachable!(),
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            let file_slot = file.fixed_file_slot();
+
+            // 2. `plan_write_from` (unregistered buffer -> `IORING_OP_WRITE`).
+            let write_req = file.write_from(WriteFromOpts {
+                at: ByteOffset(16),
+                buf: DmaBuf::from_slice_in(b"hello-uring", h.alloc()),
+            });
+            let write_sqe = super::sqe_from_plan(&plan_write_from(&write_req));
+            assert_eq!(write_sqe.opcode, super::OP_WRITE);
+            assert_eq!(write_sqe.flags, super::SQE_FIXED_FILE);
+            assert_eq!(write_sqe.fd, file_slot.0 as i32);
+            assert_eq!(write_sqe.buf_index, 0);
+            assert_eq!(write_sqe.off, 16);
+            assert_eq!(write_sqe.len, 11);
+            let written = handler
+                .perform(write_req, |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                })
+                .unwrap()
+                .unwrap();
+            written.release();
+
+            // 3. `plan_read_into` (registered fixed buffer -> `IORING_OP_READ_FIXED`).
+            let read_req = file.read_into(ReadIntoOpts {
+                at: ByteOffset(16),
+                buf: DmaBuf::with_capacity_in(ByteLen(64), h.alloc())
+                    .with_registered_index(FixedBufIndex(7)),
+            });
+            let read_sqe = super::sqe_from_plan(&plan_read_into(&read_req));
+            assert_eq!(read_sqe.opcode, super::OP_READ_FIXED);
+            assert_eq!(read_sqe.flags, super::SQE_FIXED_FILE);
+            assert_eq!(read_sqe.fd, file_slot.0 as i32);
+            assert_eq!(read_sqe.buf_index, 7);
+            assert_eq!(read_sqe.off, 16);
+            assert_eq!(read_sqe.len, 64);
+            let filled = handler
+                .perform(read_req, |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(filled.buf.as_slice(), b"hello-uring");
+            filled.buf.release();
+
+            // 4. `plan_chain_write_flush` -> `[OP_WRITE_FIXED | FIXED_FILE | IO_LINK, OP_FSYNC | FIXED_FILE]`.
+            let chain_req = Chain::new(
+                file.write_from(WriteFromOpts {
+                    at: ByteOffset(0),
+                    buf: DmaBuf::from_slice_in(b"chained-payload!", h.alloc())
+                        .with_registered_index(FixedBufIndex(3)),
+                }),
+                file.flush(),
+            );
+            let [chain_write_plan, chain_flush_plan] = plan_chain_write_flush(&chain_req);
+            let chain_write_sqe = super::sqe_from_plan(&chain_write_plan);
+            let mut chain_flush_sqe = super::Sqe { user_data: 0xDEAD_BEEF, ..super::Sqe::default() };
+            super::apply_planned_sqe(&chain_flush_plan, &mut chain_flush_sqe);
+
+            assert_eq!(chain_write_sqe.opcode, super::OP_WRITE_FIXED);
+            assert_eq!(chain_write_sqe.flags, super::SQE_FIXED_FILE | super::SQE_IO_LINK);
+            assert_eq!(chain_write_sqe.fd, file_slot.0 as i32);
+            assert_eq!(chain_write_sqe.buf_index, 3);
+            assert_eq!(chain_write_sqe.off, 0);
+            assert_eq!(chain_write_sqe.len, 16);
+
+            assert_eq!(chain_flush_sqe.opcode, super::OP_FSYNC);
+            assert_eq!(chain_flush_sqe.flags, super::SQE_FIXED_FILE);
+            assert_eq!(chain_flush_sqe.fd, file_slot.0 as i32);
+            assert_eq!(chain_flush_sqe.buf_index, 0);
+            assert_eq!(chain_flush_sqe.off, 0);
+            assert_eq!(chain_flush_sqe.len, 0);
+            assert_eq!(chain_flush_sqe.user_data, 0xDEAD_BEEF);
+
+            let flushed_file = match handler
+                .perform(chain_req, |p| match p {
+                    Perform::Answered(out) => out,
+                    _ => unreachable!(),
+                })
+                .unwrap()
+            {
+                ChainOutcome::Both(Ok(buf), Ok((f, _proof))) => {
+                    buf.release();
+                    f
+                }
+                other => panic!("expected ChainOutcome::Both(Ok, Ok), got {other:?}"),
+            };
+            assert_eq!(
+                handler
+                    .perform(flushed_file.close(), |p| match p {
+                        Perform::Answered(res) => res,
+                        _ => unreachable!(),
+                    })
+                    .unwrap(),
+                Ok(())
+            );
+            assert_eq!(handler.finish_task(ExitKind::Normal), Ok(0));
+        });
+
+        // 5. Verify `BUFFER_SELECT` flag and network opcodes lower to the exact Linux constants.
+        let recv_plan = PlannedSqe {
+            opcode: SqeOpcode::Recv,
+            flags: SqeFlags::FIXED_FILE | SqeFlags::BUFFER_SELECT,
+            fd_slot: Some(FixedFileSlot(12)),
+            buf_index: Some(FixedBufIndex(2)),
+            offset: 0,
+            len: 4096,
+        };
+        let recv_sqe = super::sqe_from_plan(&recv_plan);
+        assert_eq!(recv_sqe.opcode, super::OP_RECV);
+        assert_eq!(recv_sqe.flags, super::SQE_FIXED_FILE | super::SQE_BUFFER_SELECT);
+        assert_eq!(recv_sqe.fd, 12);
+        assert_eq!(recv_sqe.buf_index, 2);
+        assert_eq!(recv_sqe.len, 4096);
     }
 }

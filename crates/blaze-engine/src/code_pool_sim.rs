@@ -311,8 +311,8 @@ impl<'g> Run<'g> {
 
     fn ended(&self) -> Result<(), Broke> {
         let drained = self.jobs.is_empty() && self.owners.is_empty() && self.pool.queue.is_empty()
-            && self.pool.frontier.is_empty() && self.pool.children.iter().all(|c| c.pending.is_empty()) && self.pool.wait().is_none();
-        oracle(drained, || format!("work survived exit: {:?}", self.pool.wait()))
+            && self.pool.frontier.is_empty() && self.pool.children.iter().all(|c| c.pending.is_empty()) && self.pool.next_wait().is_none();
+        oracle(drained, || format!("work survived exit: {:?}", self.pool.next_wait()))
     }
 }
 
@@ -461,7 +461,7 @@ fn a_producer_wait_keeps_the_request_deadline() {
     for (i, (event, waiting)) in steps.into_iter().enumerate() {
         out.clear();
         pool.step(Time(i as u64 + 1), event, &mut out).unwrap();
-        assert_eq!(pool.wait(), Some((waiting, deadline)));
+        assert_eq!(pool.next_wait(), Some((waiting, deadline)));
     }
     out.clear();
     assert_eq!(pool.step(deadline, Event::Tick, &mut out), Err(Error::Deadline { waiting: Wait::Producer { key: k, producer }, deadline }));

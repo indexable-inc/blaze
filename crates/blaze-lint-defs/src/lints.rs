@@ -595,4 +595,7 @@ pub(super) const BLAZE: &[Lint] = &[
     // No local borrow held across a `.do` suspension point, checked by blaze-typeck's `local-borrow-across-do` rule.
     l("blaze::local_borrow_across_do", Deny, "detects a reference to a local variable held live across a `.do` suspension point")
         .externally_loaded(),
+    // No `.do` suspension point inside a `#![blaze::sans_io]` body, checked by blaze-typeck's `suspend-in-sans-io` rule.
+    l("blaze::suspend_in_sans_io", Deny, "detects a `.do` suspension point inside a `#![blaze::sans_io]` body")
+        .externally_loaded(),
 ];

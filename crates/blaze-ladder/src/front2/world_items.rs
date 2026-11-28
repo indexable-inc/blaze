@@ -1228,7 +1228,11 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
             });
         }
         if let Some(f) = self.store.fns.get(&item) {
-            return Ok(super::fn_attrs::fn_type_attrs(f));
+            let mut attrs = super::fn_attrs::fn_type_attrs(f);
+            if self.names.in_sans_io_scope(f.lib, f.module) {
+                attrs = TypeAttrs(attrs.0 | TypeAttrs::SANS_IO);
+            }
+            return Ok(attrs);
         }
         if self.store.ctors.contains_key(&item) {
             return Ok(TypeAttrs(0));

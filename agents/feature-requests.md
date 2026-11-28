@@ -146,3 +146,7 @@ Format for new entries:
 - **Kind**: `language` + `diagnostic`
 - **Friction / Bug**: Passing a closure `|ans: A| ans` or `|perf| ...` to a method taking `impl FnOnce(Perform<R::Answer<'_>>) -> Out` inside a function with a higher-ranked GAT bound `where R: for<'s> Request<Answer<'s> = A>` triggers `Lower(Refusal { form: ClosureSigUnaligned { part: 0, why: BinderHidden } })`, leaving the body `Typed` (borrow check refused) and blocked from `blaze test` execution even though `core::convert::identity` and non-HRTB associated types (`RecordableRequest`) pass `Clean`.
 - **Request**: Support aligning closure parameter signatures across higher-ranked GAT equality bounds (`for<'s> R: Trait<Assoc<'s> = T>`) in `blaze-body-lower` so borrow checking completes cleanly without requiring callers to factor out a non-closure function item or helper trait.
+
+## 2026-11-28 — `PartialEq for CStr` (`SlicePartialEq<[i8]>` with `poly::OpaqueThin`) SIGSEGV in `blaze test`
+- **Observed**: Comparing `&CStr == c"..."` inside `blaze-sys::macos::tests::set_process_name_updates_proc_name_and_getprogname` under `blaze test` triggered SIGSEGV in `core::slice::cmp::SlicePartialEq::equal_same_length [Int(I8), poly::OpaqueThin]` (while `prog.to_bytes() == b"..."` over `[u8]` passed cleanly).
+- **Request**: Fix polymorphic `SlicePartialEq` / `BytewiseEq` lowering for `[i8]` (`CStr::eq`) so `&CStr == &CStr` executes cleanly under `blaze run` / `blaze test`.

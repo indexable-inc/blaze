@@ -508,6 +508,32 @@ pub mod cold {
         fn waitid(idtype: c_uint, id: u32, info: *mut c_void, options: c_int) -> c_int;
         /// pthread/qos.h; `qos_class_t` is a `c_uint`.
         fn pthread_set_qos_class_self_np(class: c_uint, relative: c_int) -> c_int;
+        /// pthread.h; sets the calling thread's name (shown in `sample`, Instruments, crash reports).
+        fn pthread_setname_np(name: *const c_char) -> c_int;
+        /// stdlib.h; updates the process's BSD progname and XNU `proc_name` (`pbi_name`, up to 31 bytes).
+        fn setprogname(progname: *const c_char);
+        /// stdlib.h; returns the process's current BSD progname.
+        fn getprogname() -> *const c_char;
+        /// libproc.h; reads XNU `pbi_name` for `pid`.
+        fn proc_name(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
+    }
+}
+
+/// Sets the calling process's name on macOS via `setprogname` (which updates XNU's `proc_name` /
+/// `pbi_name`, displayed by Activity Monitor) and sets the main thread's name via
+/// `pthread_setname_np` (displayed by `sample`, Instruments, and crash reports).
+///
+/// Requires a `'static` NUL-terminated string because macOS `getprogname` retains the pointer
+/// passed to `setprogname`.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn set_process_name(name: &'static CStr) {
+    let ptr = name.as_ptr();
+    // SAFETY: `name` is a valid `'static` NUL-terminated C string, so it outlives the process for
+    // `getprogname()` aliasing, and `pthread_setname_np` copies it into the thread structure.
+    unsafe {
+        cold::setprogname(ptr);
+        let _ = cold::pthread_setname_np(ptr);
     }
 }
 
@@ -963,5 +989,28 @@ mod tests {
         assert_eq!(sysctl_u32(c"hw.optional.arm.FEAT_NO_SUCH_FEATURE"), Ok(None));
         // 64 bits into 32: the kernel's `ENOMEM` for the short buffer, or `Inval` for the size.
         assert!(sysctl_u32(c"hw.memsize").is_err(), "hw.memsize is 64 bits");
+    }
+
+    #[test]
+    fn set_process_name_updates_proc_name_and_getprogname() {
+        set_process_name(c"blaze-0.20261128.0");
+        let mut buf = [0u8; 64];
+        // SAFETY: `getpid` is always safe; `proc_name` writes at most `buf.len()` bytes into `buf`.
+        let (len, prog) = unsafe {
+            let pid = libc::getpid();
+            let len = cold::proc_name(pid, buf.as_mut_ptr().cast(), buf.len() as u32);
+            let prog = CStr::from_ptr(cold::getprogname());
+            (len, prog)
+        };
+        assert_eq!(prog.to_bytes(), b"blaze-0.20261128.0");
+        assert!(len > 0, "proc_name returned {len}");
+        let observed = &buf[..len as usize];
+        // Unsandboxed processes update XNU `pbi_name` (`proc_name`) directly via `setprogname`;
+        // under `blaze test`'s Seatbelt sandbox (`blaze-launcher`), `sysctl-write` is confined.
+        assert!(
+            observed == b"blaze-0.20261128.0" || observed == b"blaze-launcher",
+            "unexpected proc_name: {:?}",
+            core::str::from_utf8(observed),
+        );
     }
 }

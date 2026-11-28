@@ -265,7 +265,7 @@ fn scenario(tape: &Tape, plant: Plant) -> Result<(), Broken<Invariant>> {
             relayed(sim.relay.exited(now, Child(child)))?;
         }
     }
-    match sim.relay.wait() {
+    match sim.relay.next_wait() {
         None => Ok(()),
         Some(_) => Err(Broken::Oracle(Invariant::Survived)),
     }
@@ -314,7 +314,7 @@ fn one_childs_long_make_never_holds_anothers_answer() {
             _ => {
                 assert_eq!(jobs.len(), 1, "one worker was given two makes");
                 assert!(!relay.ready(Child(1)), "child 1 was answered with no worker to make it");
-                assert!(matches!(relay.wait(), Some((Wait::Pool(PoolWait::Build { .. }) | Wait::Code { .. }, _))), "{:?}", relay.wait());
+                assert!(matches!(relay.next_wait(), Some((Wait::Pool(PoolWait::Build { .. }) | Wait::Code { .. }, _))), "{:?}", relay.next_wait());
             }
         }
     }
@@ -329,7 +329,7 @@ fn a_late_ask_is_answered_late_and_withdrawn() {
     let opts = Options { alloc: alloc(), hash_seed: 3, children: 1, workers: 1, asks: 4, deadline: DEADLINE, code_wait: 10, most_bytes: 1 << 20 };
     let mut relay: Relay<'static, Order, Refusal> = Relay::new(Time(0), opts).expect("a relay");
     relay.ask(Time(1), Child(0), Some(key_of(4)), Affinity(0), one(0, 4, 0)).expect("child 0 asks");
-    assert_eq!(relay.wait(), Some((Wait::Code { child: Child(0), key: key_of(4) }, Time(11))));
+    assert_eq!(relay.next_wait(), Some((Wait::Code { child: Child(0), key: key_of(4) }, Time(11))));
     let (worker, _, order) = relay.job().expect("the make");
     relay.tick(Time(10)).expect("a tick");
     assert!(!relay.ready(Child(0)), "answered before its deadline");
@@ -343,7 +343,7 @@ fn a_late_ask_is_answered_late_and_withdrawn() {
     assert!(!relay.ready(Child(0)), "a withdrawn child was answered");
     relay.exited(Time(13), Child(0)).expect("the driver ends it");
     assert_eq!(relay.exited(Time(14), Child(0)), Err(RelayError::ExitedChild(Child(0))));
-    assert_eq!(relay.wait(), None);
+    assert_eq!(relay.next_wait(), None);
 }
 
 #[test]

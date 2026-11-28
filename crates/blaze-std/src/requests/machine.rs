@@ -336,6 +336,8 @@ struct Active<'a> {
     recv_chunk: usize,
     alloc: Alloc<'a>,
     plant: HttpExchangePlant,
+    await_eof: bool,
+    range_unchecked: bool,
     parser: blaze_h1::Response<Alloc<'a>>,
     body: Vec<u8, Alloc<'a>>,
 }
@@ -396,9 +398,26 @@ impl<'a> HttpExchangeMachine<'a> {
             recv_chunk: opts.recv_chunk,
             alloc: opts.alloc,
             plant: opts.plant,
+            await_eof: false,
+            range_unchecked: false,
             parser,
             body,
         })
+    }
+
+    /// Creates an exchange machine for a connection whose HTTP/1.1 request bytes have already
+    /// been sent, starting directly in the receive phase ([`HttpStepReq::RecvWithTimeout`]) and
+    /// verifying that the peer closes cleanly after the response ends (rejecting any trailing
+    /// bytes as [`blaze_h1::Why::AfterEnd`]).
+    ///
+    /// `range_unchecked` is a test-only planted-bug control (`false` in production).
+    pub fn for_connected_recv(opts: HttpExchangeOpts<'a>, range_unchecked: bool) -> Self {
+        let mut machine = Self::new(0, opts);
+        if let HttpExchangeMachine::Init(active) = &mut machine {
+            active.await_eof = true;
+            active.range_unchecked = range_unchecked;
+        }
+        machine
     }
 
     /// Encodes `head` + `body` with [`encode_request_in`] and builds the matching
@@ -476,6 +495,23 @@ impl<'a> HttpExchangeMachine<'a> {
             ),
             RaceOutcome::First(Ok(chunk)) => {
                 let next_reads = reads + 1;
+                if active.parser.is_done() {
+                    // Only reached when `await_eof` is true after the response finished:
+                    // anything other than peer EOF is a byte the answer did not promise.
+                    return if chunk.is_empty() {
+                        Self::close_with_ok(active, range_out)
+                    } else {
+                        let err = blaze_h1::Error {
+                            at: active.parser.body_len(),
+                            why: blaze_h1::Why::AfterEnd,
+                        };
+                        Self::close_with_err(
+                            active.conn,
+                            HttpExchangeError::Protocol(err),
+                            active.plant,
+                        )
+                    };
+                }
                 if chunk.is_empty() {
                     return match active.parser.closed() {
                         Ok(()) => Self::close_with_ok(active, range_out),
@@ -496,6 +532,7 @@ impl<'a> HttpExchangeMachine<'a> {
                     checked_range = true;
                     if let Some(asked) = active.range
                         && !blaze_h1::is_redirect(active.parser.status())
+                        && !active.range_unchecked
                     {
                         match active.parser.ranged(asked) {
                             Ok(cr) => range_out = Some(cr),
@@ -532,7 +569,7 @@ impl<'a> HttpExchangeMachine<'a> {
                                 active.plant,
                             );
                         }
-                        if fed.done {
+                        if fed.done && (!active.await_eof || next_reads >= active.reads_most) {
                             Self::close_with_ok(active, range_out)
                         } else if next_reads >= active.reads_most {
                             Self::close_with_err(
@@ -572,6 +609,13 @@ impl<'a> Machine for HttpExchangeMachine<'a> {
         match self {
             HttpExchangeMachine::Init(active) => {
                 if active.req_len == 0 {
+                    if active.reads_most == 0 {
+                        return Self::close_with_err(
+                            active.conn,
+                            HttpExchangeError::Unending { reads: 0 },
+                            active.plant,
+                        );
+                    }
                     let req = HttpStepReq::RecvWithTimeout {
                         conn: active.conn,
                         max_bytes: active.recv_chunk,
@@ -961,6 +1005,121 @@ impl blaze_machine::Handler<HttpStepReq> for NetHttpHandler<'_, '_> {
                     Err(_) => Err(TransportError::CloseFailed),
                 };
                 Ok(deliver(Perform::Answered(HttpStepAns::Closed(res))))
+            }
+        }
+    }
+}
+
+/// Receive-side [`blaze_machine::Handler`]`<`[`HttpStepReq`]`>` adapter borrowing an already-sent
+/// [`crate::net::Conn`] for [`HttpExchangeMachine::for_connected_recv`].
+///
+/// Does not take ownership of or close `conn` on [`HttpStepReq::Close`] (the caller owns the
+/// linear [`crate::net::Conn`] and finishes it via [`crate::net::Conn::finish`]), and preserves
+/// the exact [`crate::net::NetError`] on transport failure so [`super::Http::over`] surfaces full
+/// [`crate::net::NetError`] diagnostics.
+pub struct BorrowedConnHttpHandler<'cx, 'c> {
+    cx: &'cx crate::cx::Cx,
+    conn: &'c crate::net::Conn,
+    expected: ConnHandle,
+    received: crate::mem::Bytes<'cx>,
+    closed: bool,
+    last_net_err: Option<crate::net::NetError>,
+}
+
+impl<'cx, 'c> BorrowedConnHttpHandler<'cx, 'c> {
+    /// Wraps a borrowed, already-sent [`crate::net::Conn`] bound to `expected`.
+    #[inline]
+    pub fn new(cx: &'cx crate::cx::Cx, conn: &'c crate::net::Conn, expected: ConnHandle) -> Self {
+        Self { cx, conn, expected, received: cx.bytes(), closed: false, last_net_err: None }
+    }
+
+    /// Returns `true` once [`HttpStepReq::Close`] has been acknowledged by the machine.
+    #[inline]
+    pub const fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Takes the underlying [`crate::net::NetError`] captured on a non-timeout receive failure.
+    #[inline]
+    pub fn take_net_error(&mut self) -> Option<crate::net::NetError> {
+        self.last_net_err.take()
+    }
+
+    fn step_cx(&self, timeout: Duration) -> crate::cx::Cx {
+        let deadline = blaze_core::wait::Deadline::after(self.cx.io().now(), timeout);
+        self.cx.until(deadline)
+    }
+}
+
+impl blaze_machine::Handler<HttpStepReq> for BorrowedConnHttpHandler<'_, '_> {
+    type Error = NetHttpHandlerError;
+
+    fn perform<Out>(
+        &mut self,
+        request: HttpStepReq,
+        deliver: impl FnOnce(blaze_machine::Perform<HttpStepAns<'_>>) -> Out,
+    ) -> Result<Out, Self::Error> {
+        use blaze_machine::Perform;
+
+        match request {
+            HttpStepReq::Send { conn, offset, len, .. } => {
+                if conn != self.expected {
+                    return Err(NetHttpHandlerError::UnknownHandle {
+                        expected: self.expected,
+                        got: conn,
+                    });
+                }
+                if self.closed {
+                    return Err(NetHttpHandlerError::AlreadyClosed { conn });
+                }
+                Err(NetHttpHandlerError::SendOutOfBounds { offset, len, wire_len: 0 })
+            }
+            HttpStepReq::RecvWithTimeout { conn, max_bytes, timeout } => {
+                if conn != self.expected {
+                    return Err(NetHttpHandlerError::UnknownHandle {
+                        expected: self.expected,
+                        got: conn,
+                    });
+                }
+                if self.closed {
+                    return Err(NetHttpHandlerError::AlreadyClosed { conn });
+                }
+                let wait = self.step_cx(timeout);
+                let own_timeout = wait.deadline() != self.cx.deadline();
+                self.received.clear();
+                match self.conn.recv(&wait, max_bytes, &mut self.received) {
+                    Ok(_) => Ok(deliver(Perform::Answered(HttpStepAns::RecvOrTimeout(
+                        RaceOutcome::First(Ok(self.received.as_slice())),
+                    )))),
+                    Err(err) => match &err.kind {
+                        crate::net::NetKind::Stopped(crate::Stopped::Deadline { .. })
+                            if own_timeout =>
+                        {
+                            Ok(deliver(Perform::Answered(HttpStepAns::RecvOrTimeout(
+                                RaceOutcome::Second(()),
+                            ))))
+                        }
+                        _ => {
+                            self.last_net_err = Some(err);
+                            Ok(deliver(Perform::Answered(HttpStepAns::RecvOrTimeout(
+                                RaceOutcome::First(Err(TransportError::ReadFailed)),
+                            ))))
+                        }
+                    },
+                }
+            }
+            HttpStepReq::Close { conn } => {
+                if conn != self.expected {
+                    return Err(NetHttpHandlerError::UnknownHandle {
+                        expected: self.expected,
+                        got: conn,
+                    });
+                }
+                if self.closed {
+                    return Err(NetHttpHandlerError::AlreadyClosed { conn });
+                }
+                self.closed = true;
+                Ok(deliver(Perform::Answered(HttpStepAns::Closed(Ok(())))))
             }
         }
     }
@@ -1751,5 +1910,126 @@ mod tests {
         handler2.finish().expect("finish unclosed NetHttpHandler");
         server_conn2.finish(&cx).expect("server finish 2");
         listener.close(&cx).expect("listener close");
+    }
+
+    /// Verifies [`HttpExchangeMachine::for_connected_recv`] + [`BorrowedConnHttpHandler`] reject
+    /// trailing bytes after response end (`Why::AfterEnd`), extract `Location`, and honor the
+    /// `range_unchecked` planted-bug switch.
+    #[test]
+    fn for_connected_recv_checks_eof_location_and_range_unchecked() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let conn = test_conn();
+
+        // 1. Trailing bytes in a second receive after `Content-Length` end -> `Why::AfterEnd`.
+        let mut trailing_script = Script::new_in(alloc);
+        trailing_script.expect_answer(
+            HttpStepReq::RecvWithTimeout { conn, max_bytes: CHUNK, timeout: TIMEOUT },
+            HttpScriptAns::recv(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"),
+        );
+        trailing_script.expect_answer(
+            HttpStepReq::RecvWithTimeout { conn, max_bytes: CHUNK, timeout: TIMEOUT },
+            HttpScriptAns::recv(b"extra"),
+        );
+        trailing_script.expect_answer(HttpStepReq::Close { conn }, HttpScriptAns::closed_ok());
+
+        let m = HttpExchangeMachine::for_connected_recv(
+            HttpExchangeOpts {
+                conn,
+                method: Method::Get,
+                range: None,
+                body_most: 4096,
+                reads_most: 8,
+                wait_most: TIMEOUT,
+                recv_chunk: CHUNK,
+                alloc,
+                plant: HttpExchangePlant::None,
+            },
+            false,
+        );
+        let res = drive(&mut trailing_script, &mut (), m, DriveOpts { max_steps: 16 });
+        assert!(
+            matches!(
+                res,
+                Err(DriveError::Machine(HttpExchangeError::Protocol(blaze_h1::Error {
+                    why: blaze_h1::Why::AfterEnd,
+                    ..
+                })))
+            ),
+            "expected AfterEnd on trailing bytes, got {res:?}"
+        );
+        assert_eq!(trailing_script.finish(), Ok(()));
+
+        // 2. Clean redirect response followed by EOF returns `Location` and closes linearly.
+        let mut redir_script = Script::new_in(alloc);
+        redir_script.expect_answer(
+            HttpStepReq::RecvWithTimeout { conn, max_bytes: CHUNK, timeout: TIMEOUT },
+            HttpScriptAns::recv(
+                b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/next\r\nContent-Length: 0\r\n\r\n",
+            ),
+        );
+        redir_script.expect_answer(
+            HttpStepReq::RecvWithTimeout { conn, max_bytes: CHUNK, timeout: TIMEOUT },
+            HttpScriptAns::recv_eof(),
+        );
+        redir_script.expect_answer(HttpStepReq::Close { conn }, HttpScriptAns::closed_ok());
+
+        let m = HttpExchangeMachine::for_connected_recv(
+            HttpExchangeOpts {
+                conn,
+                method: Method::Get,
+                range: None,
+                body_most: 4096,
+                reads_most: 8,
+                wait_most: TIMEOUT,
+                recv_chunk: CHUNK,
+                alloc,
+                plant: HttpExchangePlant::None,
+            },
+            false,
+        );
+        let out = drive(&mut redir_script, &mut (), m, DriveOpts { max_steps: 16 })
+            .expect("redirect succeeds");
+        assert_eq!(out.status, 302);
+        assert_eq!(
+            out.location.as_ref().map(|v| v.as_slice()),
+            Some(b"http://127.0.0.1/next".as_slice())
+        );
+        assert_eq!(redir_script.finish(), Ok(()));
+
+        // 3. `range_unchecked = true` skips `Content-Range` validation for the planted control.
+        let asked = Range { first: 0, last: Some(3) };
+        let mut plant_script = Script::new_in(alloc);
+        plant_script.expect_answer(
+            HttpStepReq::RecvWithTimeout { conn, max_bytes: CHUNK, timeout: TIMEOUT },
+            HttpScriptAns::recv(
+                b"HTTP/1.1 206 Partial\r\nContent-Range: bytes 5-8/100\r\nContent-Length: 4\r\n\r\nWXYZ",
+            ),
+        );
+        plant_script.expect_answer(
+            HttpStepReq::RecvWithTimeout { conn, max_bytes: CHUNK, timeout: TIMEOUT },
+            HttpScriptAns::recv_eof(),
+        );
+        plant_script.expect_answer(HttpStepReq::Close { conn }, HttpScriptAns::closed_ok());
+
+        let m = HttpExchangeMachine::for_connected_recv(
+            HttpExchangeOpts {
+                conn,
+                method: Method::Get,
+                range: Some(asked),
+                body_most: 4096,
+                reads_most: 8,
+                wait_most: TIMEOUT,
+                recv_chunk: CHUNK,
+                alloc,
+                plant: HttpExchangePlant::None,
+            },
+            true,
+        );
+        let out = drive(&mut plant_script, &mut (), m, DriveOpts { max_steps: 16 })
+            .expect("range_unchecked skips mismatch");
+        assert_eq!(out.status, 206);
+        assert_eq!(out.range, None);
+        assert_eq!(out.body.as_slice(), b"WXYZ");
+        assert_eq!(plant_script.finish(), Ok(()));
     }
 }

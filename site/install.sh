@@ -285,15 +285,46 @@ fi
 
 # Each program is copied beside its place and renamed into it, so that a daemon running the
 # one before goes on running it, and is replaced by the next command.
+# `blaze` itself is installed under a versioned filename (`blaze-<version>`) with an atomic
+# `blaze -> blaze-<version>` symlink so macOS Activity Monitor, `top`, `ps`, and crash reports
+# show the exact version in the process name while sibling binaries stay beside it in `$bin`.
 put() {
     cp "$1" "$bin/.$2.blaze-new"
     chmod 755 "$bin/.$2.blaze-new"
     mv -f "$bin/.$2.blaze-new" "$bin/$2"
 }
+blaze_ver=""
+if [ -n "$tag" ]; then
+    blaze_ver="${tag#v}"
+elif [ -x "$unpacked/blaze" ]; then
+    blaze_ver=$("$unpacked/blaze" --version 2>/dev/null | awk '{print $2; exit}' || true)
+fi
+case "$blaze_ver" in
+    [0-9]*)
+        step "installing blaze-$blaze_ver (linked from blaze)"
+        put "$unpacked/blaze" "blaze-$blaze_ver"
+        rm -f "$bin/.blaze.blaze-new"
+        ln -s "blaze-$blaze_ver" "$bin/.blaze.blaze-new"
+        mv -f "$bin/.blaze.blaze-new" "$bin/blaze"
+        for stale in "$bin"/blaze-[0-9]*; do
+            if [ -f "$stale" ] && [ "$(basename "$stale")" != "blaze-$blaze_ver" ]; then
+                rm -f "$stale"
+            fi
+        done
+        ;;
+    *)
+        step "installing blaze"
+        put "$unpacked/blaze" "blaze"
+        ;;
+esac
 for program in "$unpacked"/*; do
+    base=$(basename "$program")
+    case "$base" in
+        blaze | blaze-[0-9]*) continue ;;
+    esac
     if [ -f "$program" ] && [ -x "$program" ]; then
-        step "installing $(basename "$program")"
-        put "$program" "$(basename "$program")"
+        step "installing $base"
+        put "$program" "$base"
     fi
 done
 # The explorer core the daemon serves the page, read from beside its binary (a release before

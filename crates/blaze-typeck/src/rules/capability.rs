@@ -369,6 +369,28 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         Ok(())
     }
+
+    /// Body-level `suspend-in-sans-io` check after the end sequence: rejects any `.do`
+    /// suspension point inside a `#![blaze::sans_io]` body (unless marked `#[blaze::capability]`)
+    /// with [`TypedFinding::SuspendInSansIo`].
+    pub(crate) fn suspend_in_sans_io(&mut self) -> Result<(), Stop> {
+        // Zero-cost fast path: skip immediately if this body contains no `.do` expressions.
+        if !self.body.exprs.iter().any(|x| matches!(x, Expr::Do(_))) {
+            return Ok(());
+        }
+        let owner = self.body.owner;
+        let attrs = self.reads.attrs(owner)?;
+        if !attrs.is_sans_io() || attrs.is_capability() {
+            return Ok(());
+        }
+        for (i, &x) in self.body.exprs.iter().enumerate() {
+            if matches!(x, Expr::Do(_)) {
+                let at = self.range_of(At::Expr(ExprId(i as u32)));
+                self.typed_findings.push(TypedFinding::SuspendInSansIo { owner, at });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One type-level violation of `#![blaze::sans_io]` or an explicit syscall policy on a body

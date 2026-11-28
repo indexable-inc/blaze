@@ -179,3 +179,28 @@ macro_rules! unbuilt {
 }
 #[cfg(any(target_os = "macos", windows))]
 pub(crate) use unbuilt;
+
+/// Sets the calling process's OS-visible name so system monitors (macOS Activity Monitor,
+/// `top`/`htop`/`ps`, crash reports, and profilers) identify the exact binary version.
+///
+/// - **macOS:** updates XNU `proc_name` (`pbi_name`, up to 31 bytes) via `setprogname` and the
+///   calling thread's name via `pthread_setname_np`. Takes `&'static CStr` because macOS
+///   `getprogname` retains the pointer passed to `setprogname`.
+/// - **Linux:** calls `prctl(PR_SET_NAME)` (updating `/proc/self/comm`, up to 15 bytes).
+/// - **Other targets:** no-op.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn set_process_name(name: &'static core::ffi::CStr) {
+    #[cfg(target_os = "macos")]
+    {
+        macos::set_process_name(name);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = linux::prctl(linux::Prctl::Name(name));
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = name;
+    }
+}

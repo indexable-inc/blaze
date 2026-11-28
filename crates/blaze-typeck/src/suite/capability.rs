@@ -415,3 +415,68 @@ fn sans_io_effect_and_syscall_sound_check() {
         );
     }
 }
+
+#[test]
+fn body_check_emits_suspend_in_sans_io_for_do_inside_sans_io_body() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, vec![], &[]);
+    fx.lang(LangItem::Sized, sized);
+    let copy = fx.tr("Copy", 1, vec![], &[]);
+    fx.lang(LangItem::Copy, copy);
+
+    let u8_ = fx.u8();
+    fx.imp("impl Copy for u8", 0, u8_, Some((copy, &[])), &[], vec![]);
+
+    let request = fx.tr("Request", 1, vec![], &["Answer"]);
+    fx.lang(LangItem::Request, request);
+
+    let ping = fx.strukt("Ping", 0, &[]);
+    let ping_t = fx.adt(ping, &[]);
+    fx.imp("impl Request for Ping", 0, ping_t, Some((request, &[])), &[("Answer", u8_)], vec![]);
+
+    let sans_io_fn = fx.func("sans_io_suspend", 0, &[ping_t], u8_, vec![]);
+    fx.set_attrs(sans_io_fn, TypeAttrs(TypeAttrs::SANS_IO));
+
+    let driver_fn = fx.func("driver_suspend", 0, &[ping_t], u8_, vec![]);
+
+    let cap_fn = fx.func("cap_suspend", 0, &[ping_t], u8_, vec![]);
+    fx.set_attrs(cap_fn, TypeAttrs(TypeAttrs::SANS_IO | TypeAttrs::CAPABILITY));
+
+    fx.finish();
+
+    let make_do_body = || {
+        let mut b = Bb::new();
+        let req = b.param("req");
+        let e0 = b.local(req);
+        let e1 = b.do_expr(e0);
+        let root = b.block(&[], Some(e1));
+        (b, root)
+    };
+
+    // 1. `#![blaze::sans_io]` body with `.do` emits `TypedFinding::SuspendInSansIo`.
+    let (b1, root1) = make_do_body();
+    let c1 = check_body(&fx, &b1, sans_io_fn, root1, Plant::None, InferPlant::None);
+    assert!(c1.diags.is_empty(), "no type errors: {:?}", c1.diags);
+    assert!(c1.suspends, "body with `.do` must mark suspends == true");
+    assert_eq!(c1.findings.len(), 1, "expected 1 suspend-in-sans-io finding, got {:?}", c1.findings);
+    assert_eq!(c1.findings[0].lint(), "suspend-in-sans-io");
+    assert!(
+        matches!(c1.findings[0], TypedFinding::SuspendInSansIo { owner, .. } if owner == sans_io_fn),
+        "unexpected finding: {:?}",
+        c1.findings[0],
+    );
+
+    // 2. Non-sans-IO driver body with `.do` passes cleanly with 0 findings.
+    let (b2, root2) = make_do_body();
+    let c2 = check_body(&fx, &b2, driver_fn, root2, Plant::None, InferPlant::None);
+    assert!(c2.diags.is_empty(), "no type errors: {:?}", c2.diags);
+    assert!(c2.suspends);
+    assert!(c2.findings.is_empty(), "non-sans-IO body must emit 0 findings, got {:?}", c2.findings);
+
+    // 3. `#[blaze::capability]` body inside `#![blaze::sans_io]` with `.do` is exempt.
+    let (b3, root3) = make_do_body();
+    let c3 = check_body(&fx, &b3, cap_fn, root3, Plant::None, InferPlant::None);
+    assert!(c3.diags.is_empty(), "no type errors: {:?}", c3.diags);
+    assert!(c3.suspends);
+    assert!(c3.findings.is_empty(), "capability body must emit 0 findings, got {:?}", c3.findings);
+}
