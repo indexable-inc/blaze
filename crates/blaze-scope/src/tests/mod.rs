@@ -374,7 +374,19 @@ impl World {
     }
 
     pub(crate) fn extern_crate(&mut self, at: ItemKey, target: ExternTarget<N>, rename: Rename<N>, vis: V) {
-        self.d(at).extern_crates.push(ExternCrateDecl { target, rename, vis: vis.decl() });
+        let pos = self.next_pos(at);
+        self.d(at).extern_crates.push(ExternCrateDecl { target, rename, vis: vis.decl(), macro_use: crate::MacroUse::None, pos });
+    }
+
+    pub(crate) fn extern_crate_macro_use(&mut self, at: ItemKey, target: ExternTarget<N>, rename: Rename<N>, vis: V) {
+        let pos = self.next_pos(at);
+        self.d(at).extern_crates.push(ExternCrateDecl { target, rename, vis: vis.decl(), macro_use: crate::MacroUse::All, pos });
+    }
+
+    pub(crate) fn extern_crate_macro_use_only(&mut self, at: ItemKey, target: ExternTarget<N>, rename: Rename<N>, vis: V, names: &[N]) {
+        let pos = self.next_pos(at);
+        let list = blaze_own::AVec::from_slice_in(names, blaze_own::testing::heap().alloc());
+        self.d(at).extern_crates.push(ExternCrateDecl { target, rename, vis: vis.decl(), macro_use: crate::MacroUse::Only(list), pos });
     }
 
     /// `macro_rules! name`.

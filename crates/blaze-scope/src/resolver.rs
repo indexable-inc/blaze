@@ -629,7 +629,7 @@ pub struct Resolver<'a, N> {
     pub(crate) implicit_prelude: bool,
     pub(crate) extern_prelude: AVec<'a, (N, ItemKey)>,
     pub(crate) deps: AVec<'a, Dep<N>>,
-    pub(crate) macro_use: AVec<'a, ItemKey>,
+    pub(crate) macro_use: AVec<'a, crate::MacroUseCrate<'a, N>>,
     pub(crate) prelude: Option<ItemKey>,
     /// The crate root's `#![blaze::arbitrary_ints]`: `u24`, `i80` are builtin types here.
     pub(crate) arbitrary_ints: bool,
@@ -700,7 +700,11 @@ impl<'a, N: Name> Resolver<'a, N> {
         // name twice, where a record cannot) still gives one result.
         extern_prelude.sort_unstable();
         let deps = Vec::from_slice_in(&cr.deps, alloc);
-        let macro_use = Vec::from_slice_in(&cr.macro_use, alloc);
+        let mut macro_use = Vec::with_capacity_in(cr.macro_use.len(), alloc);
+        for entry in cr.macro_use.iter() {
+            let only = entry.only.as_ref().map(|names| AVec::from_slice_in(names, alloc));
+            macro_use.push(crate::MacroUseCrate { root: entry.root, only });
+        }
         let tools = Vec::from_slice_in(&cr.tools, alloc);
         let mut builtin_attrs = Vec::from_slice_in(&cr.builtin_attrs, alloc);
         builtin_attrs.sort_unstable();

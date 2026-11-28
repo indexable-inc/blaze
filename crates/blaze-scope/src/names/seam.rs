@@ -40,8 +40,11 @@ pub trait RootRead<N>: Copy {
     fn head(self) -> CrateRootHead;
     /// The root module the extern prelude names `name`.
     fn extern_crate(self, name: N) -> Option<ItemKey>;
-    /// The `i`th crate of the `#[macro_use]` prelude, by its root module.
-    fn macro_use(self, i: usize) -> Option<ItemKey>;
+    /// Number of entries in the `#[macro_use]` prelude.
+    fn macro_use_len(self) -> usize;
+    /// The `i`th entry of the `#[macro_use]` prelude: its crate root and whether its allowlist
+    /// admits `name`.
+    fn macro_use(self, i: usize, name: N) -> Option<(ItemKey, bool)>;
     /// The `#[macro_export]` macro written in source named `name`.
     fn macro_export(self, name: N) -> Option<(ItemKey, MacroShapes)>;
 }
@@ -141,8 +144,13 @@ impl<'w, N: Name> RootRead<N> for &'w CrateRootBuilder<'w, N> {
         Some(self.extern_prelude[at].1)
     }
 
-    fn macro_use(self, i: usize) -> Option<ItemKey> {
-        self.macro_use.get(i).copied()
+    fn macro_use_len(self) -> usize {
+        self.macro_use.len()
+    }
+
+    fn macro_use(self, i: usize, name: N) -> Option<(ItemKey, bool)> {
+        let entry = self.macro_use.get(i)?;
+        Some((entry.root, entry.allows(name.as_ref())))
     }
 
     fn macro_export(self, name: N) -> Option<(ItemKey, MacroShapes)> {
@@ -161,8 +169,12 @@ impl<'w, N: Name> RootRead<N> for CrateRootView<'w> {
         CrateRootView::extern_crate(&self, name.as_ref())
     }
 
-    fn macro_use(self, i: usize) -> Option<ItemKey> {
-        self.macro_use_at(i)
+    fn macro_use_len(self) -> usize {
+        CrateRootView::macro_use_len(&self)
+    }
+
+    fn macro_use(self, i: usize, name: N) -> Option<(ItemKey, bool)> {
+        self.macro_use_at(i, name.as_ref())
     }
 
     fn macro_export(self, name: N) -> Option<(ItemKey, MacroShapes)> {

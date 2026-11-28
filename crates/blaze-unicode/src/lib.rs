@@ -33,7 +33,7 @@ mod width;
 mod tests;
 
 pub use grapheme::{Graphemes, graphemes};
-pub use nfd::{Nfd, combining_class, nfd, nfd_chars};
+pub use nfd::{Nfd, combining_class, eq_canonical, nfd, nfd_chars};
 pub use width::{char_width, str_width};
 
 /// The Unicode version of the identifier and emoji tables, the lexer's: rustc's pinned

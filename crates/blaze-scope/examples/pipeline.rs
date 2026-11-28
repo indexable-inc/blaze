@@ -1714,7 +1714,9 @@ impl<'a> Lower<'a> {
                     Rename::To("_") => Rename::Underscore,
                     other => other,
                 };
-                self.out.decls.extern_crates.push(ExternCrateDecl { target, rename, vis });
+                let pos = self.next_pos();
+                let macro_use = if attrs.macro_use { blaze_surface::MacroUse::All } else { blaze_surface::MacroUse::None };
+                self.out.decls.extern_crates.push(ExternCrateDecl { target, rename, vis, macro_use, pos });
             }
             ItemDetail::ExternBlock { .. } => self.items(Some(idx)),
             ItemDetail::MacroRules { exported } => {

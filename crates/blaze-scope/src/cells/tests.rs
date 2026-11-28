@@ -620,7 +620,7 @@ fn a_stalled_outside_call_is_marked_before_the_stall() {
     let mut w = World::new();
     let root = w.root(1, Edition::E2021);
     let other = w.root(5, Edition::E2021);
-    w.cr(root).macro_use.push(other);
+    w.cr(root).macro_use.push(crate::MacroUseCrate::all(other));
     let m = w.module(root, "m", V::Pub);
     w.glob(m, "self::k", V::Priv);
     let call = w.call(m, "mx", crate::CallShape::FnLike);
@@ -974,7 +974,7 @@ fn the_macro_use_prelude_reads_the_dependencys_exports() {
     let mac = w.rules_with(dep, "mac", true);
     w.cr(dep).macro_exports.push(("mac", mac, crate::MacroShapes::FN_LIKE));
     w.dep(root, "e", dep);
-    w.cr(root).macro_use.push(dep);
+    w.cr(root).macro_use.push(crate::MacroUseCrate::all(dep));
     let call = w.call(root, "mac", crate::CallShape::FnLike);
     let nope = w.call(root, "nope", crate::CallShape::FnLike);
     let ok = with_dep(&w, root, dep, CellPlant::None);
@@ -1941,7 +1941,7 @@ fn a_blocks_call_reads_its_modules_named_import_before_the_prelude() {
         w.cr(dep).macro_exports.push(("format", format, crate::MacroShapes::FN_LIKE));
         w.cr(dep).macro_exports.push(("other", other, crate::MacroShapes::FN_LIKE));
         w.dep(root, "e", dep);
-        w.cr(root).macro_use.push(dep);
+        w.cr(root).macro_use.push(crate::MacroUseCrate::all(dep));
         if renamed {
             w.use_as(root, "e::other", "format", V::Priv);
         }
@@ -1950,10 +1950,12 @@ fn a_blocks_call_reads_its_modules_named_import_before_the_prelude() {
         let call = w.call(block, "format", crate::CallShape::FnLike);
         (w, root, dep, call, format, other)
     };
-    let called = |c: &Cells<'static, N>, call: ItemKey| match c.call_outcome(call) {
-        Some(Outcome::Called(d)) => Some(d.key),
-        _ => None,
-    };
+    fn called(c: &Cells<'_, N>, call: ItemKey) -> Option<ItemKey> {
+        match c.call_outcome(call) {
+            Some(Outcome::Called(d)) => Some(d.key),
+            _ => None,
+        }
+    }
     let (w, root, dep, call, _, other) = world(true);
     let ok = with_dep(&w, root, dep, CellPlant::None);
     assert_eq!(called(&ok, call), Some(other), "the module's `use e::other as format;`: {:?}", ok.call_outcome(call));
@@ -2036,10 +2038,12 @@ fn many_mutually_globbed_modules_with_unresolved_calls_converge_quickly() {
 /// `GlobVsOuter` ambiguity is still reported.
 #[test]
 fn a_blocks_call_with_unrelated_glob_reads_its_modules_named_import_before_the_prelude() {
-    let called = |c: &Cells<'static, N>, call: ItemKey| match c.call_outcome(call) {
-        Some(Outcome::Called(d)) => Some(d.key),
-        _ => None,
-    };
+    fn called(c: &Cells<'_, N>, call: ItemKey) -> Option<ItemKey> {
+        match c.call_outcome(call) {
+            Some(Outcome::Called(d)) => Some(d.key),
+            _ => None,
+        }
+    }
 
     // Positive 1: unrelated module glob (only binds a struct and a private macro of the same name).
     {
@@ -2051,7 +2055,7 @@ fn a_blocks_call_with_unrelated_glob_reads_its_modules_named_import_before_the_p
         w.cr(dep).macro_exports.push(("assert_eq", std_assert, crate::MacroShapes::FN_LIKE));
         w.cr(dep).macro_exports.push(("pretty_assert_eq", pretty_assert, crate::MacroShapes::FN_LIKE));
         w.dep(root, "e", dep);
-        w.cr(root).macro_use.push(dep);
+        w.cr(root).macro_use.push(crate::MacroUseCrate::all(dep));
         w.use_as(root, "e::pretty_assert_eq", "assert_eq", V::Priv);
 
         let unrelated = w.module(root, "unrelated", V::Pub);
@@ -2077,7 +2081,7 @@ fn a_blocks_call_with_unrelated_glob_reads_its_modules_named_import_before_the_p
         w.cr(dep).macro_exports.push(("assert_eq", std_assert, crate::MacroShapes::FN_LIKE));
         w.cr(dep).macro_exports.push(("pretty_assert_eq", pretty_assert, crate::MacroShapes::FN_LIKE));
         w.dep(root, "e", dep);
-        w.cr(root).macro_use.push(dep);
+        w.cr(root).macro_use.push(crate::MacroUseCrate::all(dep));
         w.use_as(root, "e::pretty_assert_eq", "assert_eq", V::Priv);
         w.item(root, "MyEnum", Namespace::Types, crate::DefKind::Enum, V::Pub);
 
@@ -2100,7 +2104,7 @@ fn a_blocks_call_with_unrelated_glob_reads_its_modules_named_import_before_the_p
         w.cr(dep).macro_exports.push(("assert_eq", std_assert, crate::MacroShapes::FN_LIKE));
         w.cr(dep).macro_exports.push(("pretty_assert_eq", pretty_assert, crate::MacroShapes::FN_LIKE));
         w.dep(root, "e", dep);
-        w.cr(root).macro_use.push(dep);
+        w.cr(root).macro_use.push(crate::MacroUseCrate::all(dep));
 
         let bar = w.module(root, "bar", V::Pub);
         w.use_as(bar, "e::pretty_assert_eq", "assert_eq", V::Pub);
@@ -2157,7 +2161,7 @@ fn macro2_at_dep_root_is_excluded_from_macro_use_prelude() {
 
     w.dep(root, "other", other);
     w.dep(root, "std_like", std_like);
-    w.cr(root).macro_use.push(std_like);
+    w.cr(root).macro_use.push(crate::MacroUseCrate::all(std_like));
     w.cr(root).head.prelude = Some(std_prelude);
 
     let parent = w.module(root, "parent", V::Priv);
@@ -2215,4 +2219,289 @@ fn macro2_at_dep_root_is_excluded_from_macro_use_prelude() {
     );
     assert_eq!(called(call_explicit), Some(std_assert_matches), "explicit std_like::assert_matches! must still resolve: {:?}", c.call_outcome(call_explicit));
     assert_eq!(called(call_imported), Some(std_assert_matches), "use std_like::assert_matches; must still resolve: {:?}", c.call_outcome(call_imported));
+}
+
+/// Macro-written root `#[macro_use] extern crate` (including `as _`) adds the dependency to the
+/// `#[macro_use]` prelude and wakes macro calls waiting in sibling items and child modules,
+/// producing the same outcome in both forward and backward schedules.
+#[test]
+fn macro_expanded_macro_use_extern_crate_wakes_calls_forward_and_backward() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let dep = w.root(2, Edition::E2021);
+    let mac = w.rules_with(dep, "doctest", true);
+    w.cr(dep).macro_exports.push(("doctest", mac, crate::MacroShapes::FN_LIKE));
+    w.dep(root, "doc_comment", dep);
+
+    let sub = w.module(root, "sub", V::Pub);
+    let sub_call = w.call(sub, "doctest", crate::CallShape::FnLike);
+    w.rules(root, "if_hyper");
+    let root_call = w.call(root, "if_hyper", crate::CallShape::FnLike);
+    w.extern_crate_macro_use(root_call, crate::ExternTarget::Dep("doc_comment"), crate::Rename::Underscore, V::Priv);
+    let in_exp_call = w.call(root_call, "doctest", crate::CallShape::FnLike);
+
+    let d = cells_of(&w, dep, CellPlant::None);
+    let d_dep = SolvedDep { cells: core::cell::RefCell::new(d), krate: crate::tests::crate_key(2), root: dep };
+    let expand = |call: ItemKey, _: crate::Def| {
+        w.expanded.borrow_mut().insert(call);
+    };
+    for backward in [false, true] {
+        w.expanded.borrow_mut().clear();
+        let mut c = Cells::load_with(&w, root, Some(&d_dep), blaze_own::testing::heap().alloc()).expect("load root");
+        c.backward = backward;
+        c.run(&w, &expand, &[]).expect("run root");
+        assert!(
+            matches!(c.call_outcome(sub_call), Some(Outcome::Called(d)) if d.key == mac),
+            "backward={backward}: sub `doctest!` should wake and resolve: {:?}",
+            c.call_outcome(sub_call)
+        );
+        assert!(
+            matches!(c.call_outcome(in_exp_call), Some(Outcome::Called(d)) if d.key == mac),
+            "backward={backward}: expansion `doctest!` should resolve: {:?}",
+            c.call_outcome(in_exp_call)
+        );
+        assert_eq!(&c.macro_use.iter().map(|s| s.root).collect::<Vec<_>>()[..], &[dep][..], "backward={backward}: macro_use");
+        assert!(c.outer.macro_use_changed, "backward={backward}: macro_use_changed");
+    }
+}
+
+/// Schedule-independence + canonical source order + selective allowlists in `Cells`:
+/// 1. A child module calling `dup!()` when `dup` already exists in the standard prelude (or an
+///    earlier `#[macro_use]` crate) MUST wait while crate-root expansions remain, so a macro-written
+///    `#[macro_use] extern crate dep2;` shadows the prelude/earlier crate identically under both
+///    forward and backward schedules.
+/// 2. An earlier root expansion `emit_dep1!()` followed by a later root-text `#[macro_use] extern
+///    crate dep2;` preserves canonical order `[dep1, dep2]` (later `dep2` shadows `dep1`) under
+///    both forward and backward schedules; likewise two root expansions `emit_dep1!(); emit_dep2!();`.
+/// 3. Selective `#[macro_use(allowed)] extern crate dep;` admits `allowed!` and excludes `excluded!`.
+#[test]
+fn macro_expanded_macro_use_outer_shadowing_order_and_allowlist_forward_and_backward() {
+    struct TwoDeps(SolvedDep, SolvedDep);
+    impl super::DepNames<N> for TwoDeps {
+        fn has_module(&self, module: ItemKey) -> bool {
+            self.0.has_module(module) || self.1.has_module(module)
+        }
+        fn name_in(&self, module: ItemKey, ns: Namespace, name: N) -> super::DepAnswer {
+            if self.0.has_module(module) {
+                self.0.name_in(module, ns, name)
+            } else {
+                self.1.name_in(module, ns, name)
+            }
+        }
+        fn crate_root(&self, krate: blaze_id::CrateItemKey) -> Option<ItemKey> {
+            self.0.crate_root(krate).or_else(|| self.1.crate_root(krate))
+        }
+        fn has_enum(&self, key: ItemKey) -> bool {
+            self.0.has_enum(key) || self.1.has_enum(key)
+        }
+    }
+
+    fn called(c: &Cells<'_, N>, call: ItemKey) -> Option<ItemKey> {
+        match c.call_outcome(call) {
+            Some(Outcome::Called(d)) => Some(d.key),
+            _ => None,
+        }
+    }
+
+    // Case 1: Child module calls `dup!()` matching standard prelude AND shadowed by root macro expansion.
+    {
+        let mut w = World::new();
+        let root = w.root(1, Edition::E2021);
+        let dep1 = w.root(2, Edition::E2021);
+        let dep2 = w.root(3, Edition::E2021);
+        let prelude = w.module(dep1, "prelude", V::Pub);
+        let prelude_dup = w.item(prelude, "dup", Namespace::Macros, crate::DefKind::Macro(crate::MacroShapes::FN_LIKE), V::Pub);
+        let dep2_dup = w.rules_with(dep2, "dup", true);
+        let dep2_excluded = w.rules_with(dep2, "excluded", true);
+        w.cr(dep2).macro_exports.push(("dup", dep2_dup, crate::MacroShapes::FN_LIKE));
+        w.cr(dep2).macro_exports.push(("excluded", dep2_excluded, crate::MacroShapes::FN_LIKE));
+        w.dep(root, "dep2", dep2);
+        w.cr(root).head.prelude = Some(prelude);
+
+        let sub = w.module(root, "sub", V::Pub);
+        let sub_dup = w.call(sub, "dup", crate::CallShape::FnLike);
+        let sub_excluded = w.call(sub, "excluded", crate::CallShape::FnLike);
+        w.rules(root, "emit_dep2");
+        let root_call = w.call(root, "emit_dep2", crate::CallShape::FnLike);
+        w.extern_crate_macro_use_only(root_call, crate::ExternTarget::Dep("dep2"), crate::Rename::Same, V::Priv, &["dup"]);
+
+        let deps = TwoDeps(
+            SolvedDep { cells: core::cell::RefCell::new(cells_of(&w, dep1, CellPlant::None)), krate: crate::tests::crate_key(2), root: dep1 },
+            SolvedDep { cells: core::cell::RefCell::new(cells_of(&w, dep2, CellPlant::None)), krate: crate::tests::crate_key(3), root: dep2 },
+        );
+        let expand = |call: ItemKey, _: crate::Def| {
+            w.expanded.borrow_mut().insert(call);
+        };
+        for backward in [false, true] {
+            w.expanded.borrow_mut().clear();
+            let mut c = Cells::load_with(&w, root, Some(&deps), blaze_own::testing::heap().alloc()).expect("load");
+            c.backward = backward;
+            c.run(&w, &expand, &[]).expect("run");
+            assert_eq!(called(&c, sub_dup), Some(dep2_dup), "backward={backward}: dep2::dup must shadow prelude::dup ({prelude_dup:?})");
+            assert_eq!(
+                c.call_outcome(sub_excluded),
+                Some(Outcome::Failed(Unresolved::NotFound)),
+                "backward={backward}: excluded! must not be imported by #[macro_use(dup)]"
+            );
+        }
+    }
+
+    // Case 2: Earlier root expansion `emit_dep1!()` followed by later root-text `#[macro_use] extern crate dep2;`.
+    // Canonical order is `[dep1, dep2]`, so later `dep2::dup` shadows `dep1::dup` in both schedules.
+    {
+        let mut w = World::new();
+        let root = w.root(1, Edition::E2021);
+        let dep1 = w.root(2, Edition::E2021);
+        let dep2 = w.root(3, Edition::E2021);
+        let dep1_dup = w.rules_with(dep1, "dup", true);
+        let dep2_dup = w.rules_with(dep2, "dup", true);
+        w.cr(dep1).macro_exports.push(("dup", dep1_dup, crate::MacroShapes::FN_LIKE));
+        w.cr(dep2).macro_exports.push(("dup", dep2_dup, crate::MacroShapes::FN_LIKE));
+        w.dep(root, "dep1", dep1);
+        w.dep(root, "dep2", dep2);
+        // Root-text `#[macro_use] extern crate dep2;` is preloaded in `CrateRoot` AND present in root decls after `emit_dep1!`.
+        w.cr(root).macro_use.push(crate::MacroUseCrate::all(dep2));
+
+        w.rules(root, "emit_dep1");
+        let emit1 = w.call(root, "emit_dep1", crate::CallShape::FnLike);
+        w.extern_crate_macro_use(emit1, crate::ExternTarget::Dep("dep1"), crate::Rename::Same, V::Priv);
+        w.extern_crate_macro_use(root, crate::ExternTarget::Dep("dep2"), crate::Rename::Same, V::Priv);
+        let sub = w.module(root, "sub", V::Pub);
+        let sub_dup = w.call(sub, "dup", crate::CallShape::FnLike);
+
+        let deps = TwoDeps(
+            SolvedDep { cells: core::cell::RefCell::new(cells_of(&w, dep1, CellPlant::None)), krate: crate::tests::crate_key(2), root: dep1 },
+            SolvedDep { cells: core::cell::RefCell::new(cells_of(&w, dep2, CellPlant::None)), krate: crate::tests::crate_key(3), root: dep2 },
+        );
+        let expand = |call: ItemKey, _: crate::Def| {
+            w.expanded.borrow_mut().insert(call);
+        };
+        for backward in [false, true] {
+            w.expanded.borrow_mut().clear();
+            let mut c = Cells::load_with(&w, root, Some(&deps), blaze_own::testing::heap().alloc()).expect("load");
+            c.backward = backward;
+            c.run(&w, &expand, &[]).expect("run");
+            assert_eq!(&c.macro_use.iter().map(|s| s.root).collect::<Vec<_>>()[..], &[dep1, dep2][..], "backward={backward}: order [dep1, dep2]");
+            assert_eq!(called(&c, sub_dup), Some(dep2_dup), "backward={backward}: later root-text dep2 must shadow earlier expanded dep1");
+        }
+    }
+
+    // Case 3: Two root expansions `emit_dep1!(); emit_dep2!();`: canonical order `[dep1, dep2]`,
+    // later `dep2::dup` shadows `dep1::dup` in both forward and backward schedules.
+    {
+        let mut w = World::new();
+        let root = w.root(1, Edition::E2021);
+        let dep1 = w.root(2, Edition::E2021);
+        let dep2 = w.root(3, Edition::E2021);
+        let dep1_dup = w.rules_with(dep1, "dup", true);
+        let dep2_dup = w.rules_with(dep2, "dup", true);
+        w.cr(dep1).macro_exports.push(("dup", dep1_dup, crate::MacroShapes::FN_LIKE));
+        w.cr(dep2).macro_exports.push(("dup", dep2_dup, crate::MacroShapes::FN_LIKE));
+        w.dep(root, "dep1", dep1);
+        w.dep(root, "dep2", dep2);
+
+        w.rules(root, "emit");
+        let emit1 = w.call(root, "emit", crate::CallShape::FnLike);
+        w.extern_crate_macro_use(emit1, crate::ExternTarget::Dep("dep1"), crate::Rename::Same, V::Priv);
+        let emit2 = w.call(root, "emit", crate::CallShape::FnLike);
+        w.extern_crate_macro_use(emit2, crate::ExternTarget::Dep("dep2"), crate::Rename::Same, V::Priv);
+        let sub = w.module(root, "sub", V::Pub);
+        let sub_dup = w.call(sub, "dup", crate::CallShape::FnLike);
+
+        let deps = TwoDeps(
+            SolvedDep { cells: core::cell::RefCell::new(cells_of(&w, dep1, CellPlant::None)), krate: crate::tests::crate_key(2), root: dep1 },
+            SolvedDep { cells: core::cell::RefCell::new(cells_of(&w, dep2, CellPlant::None)), krate: crate::tests::crate_key(3), root: dep2 },
+        );
+        let expand = |call: ItemKey, _: crate::Def| {
+            w.expanded.borrow_mut().insert(call);
+        };
+        for backward in [false, true] {
+            w.expanded.borrow_mut().clear();
+            let mut c = Cells::load_with(&w, root, Some(&deps), blaze_own::testing::heap().alloc()).expect("load");
+            c.backward = backward;
+            c.run(&w, &expand, &[]).expect("run");
+            assert_eq!(&c.macro_use.iter().map(|s| s.root).collect::<Vec<_>>()[..], &[dep1, dep2][..], "backward={backward}: order [dep1, dep2]");
+            assert_eq!(called(&c, sub_dup), Some(dep2_dup), "backward={backward}: later expanded dep2 must shadow earlier expanded dep1");
+        }
+    }
+
+    // Case 4: Two crate-root calls BOTH resolving through an outer prelude macro (`emit!()` and
+    // `dup!()`): when `emit!()` precedes `dup!()` and emits `#[macro_use] extern crate dep2;`
+    // exporting `dup!`, `dup!()` must resolve to `dep2::dup` (not stale `prelude::dup`) in BOTH
+    // forward and backward schedules; when `dup!()` precedes `emit!()`, revalidation records an
+    // R6 `MoreExpandedVsOuter` ambiguity rather than silently leaving `dup!()` bound to stale
+    // `prelude::dup`.
+    {
+        // 4a: `emit!(); dup!();` at crate root.
+        let mut w = World::new();
+        let root = w.root(1, Edition::E2021);
+        let dep1 = w.root(2, Edition::E2021);
+        let dep2 = w.root(3, Edition::E2021);
+        let prelude = w.module(dep1, "prelude", V::Pub);
+        let prelude_emit = w.item(prelude, "emit", Namespace::Macros, crate::DefKind::Macro(crate::MacroShapes::FN_LIKE), V::Pub);
+        let prelude_dup = w.item(prelude, "dup", Namespace::Macros, crate::DefKind::Macro(crate::MacroShapes::FN_LIKE), V::Pub);
+        let dep2_dup = w.rules_with(dep2, "dup", true);
+        w.cr(dep2).macro_exports.push(("dup", dep2_dup, crate::MacroShapes::FN_LIKE));
+        w.dep(root, "dep2", dep2);
+        w.cr(root).head.prelude = Some(prelude);
+
+        let emit_call = w.call(root, "emit", crate::CallShape::FnLike);
+        w.extern_crate_macro_use(emit_call, crate::ExternTarget::Dep("dep2"), crate::Rename::Same, V::Priv);
+        let dup_call = w.call(root, "dup", crate::CallShape::FnLike);
+
+        let deps = TwoDeps(
+            SolvedDep { cells: core::cell::RefCell::new(cells_of(&w, dep1, CellPlant::None)), krate: crate::tests::crate_key(2), root: dep1 },
+            SolvedDep { cells: core::cell::RefCell::new(cells_of(&w, dep2, CellPlant::None)), krate: crate::tests::crate_key(3), root: dep2 },
+        );
+        let expand = |call: ItemKey, _: crate::Def| {
+            w.expanded.borrow_mut().insert(call);
+        };
+        for backward in [false, true] {
+            w.expanded.borrow_mut().clear();
+            let mut c = Cells::load_with(&w, root, Some(&deps), blaze_own::testing::heap().alloc()).expect("load");
+            c.backward = backward;
+            c.run(&w, &expand, &[]).expect("run");
+            assert_eq!(called(&c, emit_call), Some(prelude_emit), "backward={backward}: emit!");
+            assert_eq!(called(&c, dup_call), Some(dep2_dup), "backward={backward}: root dup! must see dep2::dup (not prelude::dup {prelude_dup:?})");
+            assert!(c.r6.is_empty(), "backward={backward}: unexpected r6 {:?}", c.r6);
+        }
+
+        // 4b: `dup!(); emit!();` at crate root -> `dup!` took `prelude::dup` before `emit!` added
+        // `dep2::dup`; revalidation catches the ambiguity identically in forward & backward schedules.
+        let mut w = World::new();
+        let root = w.root(1, Edition::E2021);
+        let dep1 = w.root(2, Edition::E2021);
+        let dep2 = w.root(3, Edition::E2021);
+        let prelude = w.module(dep1, "prelude", V::Pub);
+        let _prelude_emit = w.item(prelude, "emit", Namespace::Macros, crate::DefKind::Macro(crate::MacroShapes::FN_LIKE), V::Pub);
+        let _prelude_dup = w.item(prelude, "dup", Namespace::Macros, crate::DefKind::Macro(crate::MacroShapes::FN_LIKE), V::Pub);
+        let dep2_dup = w.rules_with(dep2, "dup", true);
+        w.cr(dep2).macro_exports.push(("dup", dep2_dup, crate::MacroShapes::FN_LIKE));
+        w.dep(root, "dep2", dep2);
+        w.cr(root).head.prelude = Some(prelude);
+
+        let dup_call = w.call(root, "dup", crate::CallShape::FnLike);
+        let emit_call = w.call(root, "emit", crate::CallShape::FnLike);
+        w.extern_crate_macro_use(emit_call, crate::ExternTarget::Dep("dep2"), crate::Rename::Same, V::Priv);
+
+        let deps = TwoDeps(
+            SolvedDep { cells: core::cell::RefCell::new(cells_of(&w, dep1, CellPlant::None)), krate: crate::tests::crate_key(2), root: dep1 },
+            SolvedDep { cells: core::cell::RefCell::new(cells_of(&w, dep2, CellPlant::None)), krate: crate::tests::crate_key(3), root: dep2 },
+        );
+        let expand = |call: ItemKey, _: crate::Def| {
+            w.expanded.borrow_mut().insert(call);
+        };
+        for backward in [false, true] {
+            w.expanded.borrow_mut().clear();
+            let mut c = Cells::load_with(&w, root, Some(&deps), blaze_own::testing::heap().alloc()).expect("load");
+            c.backward = backward;
+            c.run(&w, &expand, &[]).expect("run");
+            let dup_id = c.call_ids[&dup_call];
+            assert!(
+                c.r6.get(&dup_id).is_some_and(|e| e.kind == crate::AmbiguityKind::MoreExpandedVsOuter && e.name == "dup"),
+                "backward={backward}: expected MoreExpandedVsOuter r6 on dup!, got {:?}",
+                c.r6
+            );
+        }
+    }
 }

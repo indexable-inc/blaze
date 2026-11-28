@@ -478,8 +478,13 @@ fn lexical<'w, N: Name, W: World<N>>(
         // `through`: `in_source` here, `read_name` there; the `#[macro_export]` rows first are
         // the records' index of the root's own macros (an exported macro is the root's binding
         // for other crates, crate_scope.rs), read without a walk.
-        let mut i = 0;
-        while let Some(krate_root) = root.macro_use(i) {
+        for i in (0..root.macro_use_len()).rev() {
+            let Some((krate_root, allowed)) = root.macro_use(i, name) else {
+                continue;
+            };
+            if !allowed {
+                continue;
+            }
             let Some(other) = world.root_of(krate_root) else { return Err(Why::NotRead { module: krate_root, layer: Unheld::MacroUse }) };
             if let Some((key, shapes)) = other.macro_export(name)
                 && shapes.in_macro_use_prelude()
@@ -497,7 +502,6 @@ fn lexical<'w, N: Name, W: World<N>>(
             {
                 return Ok(p.def);
             }
-            i += 1;
         }
     }
     if ns == Namespace::Types {

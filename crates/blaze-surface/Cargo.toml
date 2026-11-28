@@ -29,6 +29,8 @@ blaze-format.workspace = true
 blaze-hash.workspace = true
 # `Vec`: every builder's rows, in the allocator its caller names.
 blaze-own.workspace = true
+# `eq_canonical`: Rust's Unicode canonical equivalence for selective `#[macro_use(..)]` allowlists.
+blaze-unicode.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true

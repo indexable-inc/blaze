@@ -14,11 +14,12 @@ use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::column::{
-    Column, RecordBytes, Strings, Text, check_increasing, check_text, finish_with, key_of_word,
-    key_word, text_of,
+    Column, RecordBytes, Strings, Text, at_of_record, check_increasing, check_text, count,
+    finish_with, key_of_word, key_word, text_of, wide,
 };
 use crate::error::BuildError;
-use crate::kind::{Edition, MacroShapes};
+use crate::kind::{Edition, MacroShapes, Range};
+use crate::path::NameListView;
 
 mod in_place;
 
@@ -58,6 +59,52 @@ pub struct Dep<N> {
 // SAFETY: keys, and a name that is `Portable` when `N` is.
 unsafe impl<N: Portable> Portable for Dep<N> {}
 
+/// One crate in the `#[macro_use]` prelude: its root module and an optional allowlist of macro
+/// names (`None` = bare `#[macro_use]`, every exported macro; `Some(names)` =
+/// `#[macro_use(name1, name2, ...)]`).
+#[derive(Clone, Debug)]
+pub struct MacroUseCrate<'a, N> {
+    pub root: ItemKey,
+    pub only: Option<AVec<'a, N>>,
+}
+
+impl<'a, N> MacroUseCrate<'a, N> {
+    /// Bare `#[macro_use]`: every exported macro of `root`.
+    pub fn all(root: ItemKey) -> MacroUseCrate<'a, N> {
+        MacroUseCrate { root, only: None }
+    }
+
+    /// Selective `#[macro_use(names..)]`: only the named exported macros of `root`.
+    pub fn only(root: ItemKey, names: AVec<'a, N>) -> MacroUseCrate<'a, N> {
+        MacroUseCrate { root, only: Some(names) }
+    }
+}
+
+impl<N: AsRef<str>> MacroUseCrate<'_, N> {
+    /// Whether this entry admits the macro `name` (under Rust's Unicode canonical equivalence).
+    pub fn allows(&self, name: &str) -> bool {
+        match &self.only {
+            None => true,
+            Some(names) => names.iter().any(|n| blaze_unicode::eq_canonical(n.as_ref(), name)),
+        }
+    }
+}
+
+impl<'b, N: PartialEq> PartialEq<MacroUseCrate<'b, N>> for MacroUseCrate<'_, N> {
+    fn eq(&self, other: &MacroUseCrate<'b, N>) -> bool {
+        if self.root != other.root {
+            return false;
+        }
+        match (&self.only, &other.only) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a[..] == b[..],
+            _ => false,
+        }
+    }
+}
+
+impl<N: Eq> Eq for MacroUseCrate<'_, N> {}
+
 /// One crate's root record as a working form. [`CrateRootBuilder::write`] writes it as a
 /// [`CrateRoot`] record and [`CrateRootBuilder::from`] reads it back, equal when its lists were
 /// sorted as the record sorts them.
@@ -69,9 +116,9 @@ pub struct CrateRootBuilder<'a, N> {
     pub extern_prelude: AVec<'a, (N, ItemKey)>,
     /// Every dependency by name, sorted: what an `extern crate` and a `$crate` resolve against.
     pub deps: AVec<'a, Dep<N>>,
-    /// The root modules of the crates under `#[macro_use] extern crate` (std's or core's
-    /// injected one included), whose exported macros are the `#[macro_use]` prelude, in order.
-    pub macro_use: AVec<'a, ItemKey>,
+    /// The crates under `#[macro_use] extern crate` (std's or core's injected one included),
+    /// each with its optional allowlist, in expanded source order.
+    pub macro_use: AVec<'a, MacroUseCrate<'a, N>>,
     /// The crate's `#[macro_export]` `macro_rules!` written in source (not macro-expanded),
     /// sorted by name: they are bindings of the root's scope, each with its call shapes.
     pub macro_exports: AVec<'a, (N, ItemKey, MacroShapes)>,
@@ -108,7 +155,8 @@ impl<'b, N: PartialEq> PartialEq<CrateRootBuilder<'b, N>> for CrateRootBuilder<'
         self.head == other.head
             && self.extern_prelude[..] == other.extern_prelude[..]
             && self.deps[..] == other.deps[..]
-            && self.macro_use[..] == other.macro_use[..]
+            && self.macro_use.len() == other.macro_use.len()
+            && self.macro_use.iter().zip(other.macro_use.iter()).all(|(a, b)| a == b)
             && self.macro_exports[..] == other.macro_exports[..]
             && self.tools[..] == other.tools[..]
             && self.builtin_attrs[..] == other.builtin_attrs[..]
@@ -146,19 +194,34 @@ blaze_format::record! {
 }
 
 blaze_format::record! {
+    /// One `#[macro_use] extern crate` entry: its crate root and optional selective allowlist.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) struct MacroUseRow: 1 {
+        pub(crate) root: ContentId,
+        pub(crate) names: Range,
+        pub(crate) all: bool,
+        pub(crate) pad: u8,
+        pub(crate) pad2: u16,
+    }
+}
+
+blaze_format::record! {
     #[derive(Clone, Copy, Debug)]
     /// 4: `features`, the root's `#![feature(..)]` names (a version-3 record is refused by
     /// `open`, and its crate's names are made again).
     /// 5: `recursion_limit`, the crate's effective `#![recursion_limit = "N"]` (a version-4
     /// record is refused by `open`, and its crate's names are made again).
-    pub(crate) struct CrateRootRoot: 5 {
+    /// 6: `macro_use` carries selective `#[macro_use(name1, name2)]` allowlists (`MacroUseRow`
+    /// + `macro_use_names`).
+    pub(crate) struct CrateRootRoot: 6 {
         pub(crate) krate: ContentId,
         pub(crate) root_module: ContentId,
         pub(crate) root_file: ContentId,
         pub(crate) prelude: ContentId,
         pub(crate) externs: Slice<NamedKeyRow>,
         pub(crate) deps: Slice<DepRow>,
-        pub(crate) macro_use: Slice<ContentId>,
+        pub(crate) macro_use: Slice<MacroUseRow>,
+        pub(crate) macro_use_names: Slice<Text>,
         pub(crate) macro_exports: Slice<ExportRow>,
         pub(crate) tools: Slice<Text>,
         pub(crate) builtin_attrs: Slice<Text>,
@@ -233,13 +296,43 @@ impl<N: AsRef<str>> CrateRootBuilder<'_, N> {
         let tools = names(&self.tools, &mut strings)?;
         let builtin_attrs = names(&self.builtin_attrs, &mut strings)?;
         let features = names(&self.features, &mut strings)?;
-        let macro_use = Vec::from_iter_in(self.macro_use.iter().map(|key| key.0), alloc);
+        let mut macro_use = Vec::with_capacity_in(self.macro_use.len(), alloc);
+        let mut macro_use_names = Vec::new_in(alloc);
+        for entry in self.macro_use.iter() {
+            match &entry.only {
+                None => macro_use.push(MacroUseRow {
+                    root: entry.root.0,
+                    names: Range::new(0, 0),
+                    all: true,
+                    pad: 0,
+                    pad2: 0,
+                }),
+                Some(list) => {
+                    let order = sorted_order(list, |name| (name.as_ref(), zero), None, alloc)?;
+                    let start = count(macro_use_names.len(), TABLE)?;
+                    for &at in order.iter() {
+                        if let Some(name) = list.get(at) {
+                            macro_use_names.push(strings.push(name.as_ref(), TABLE)?);
+                        }
+                    }
+                    let end = count(macro_use_names.len(), TABLE)?;
+                    macro_use.push(MacroUseRow {
+                        root: entry.root.0,
+                        names: Range::new(start, end),
+                        all: false,
+                        pad: 0,
+                        pad2: 0,
+                    });
+                }
+            }
+        }
 
         let mut out = Writer::new(WriterOpts { schema: <CrateRootRoot as Record>::SCHEMA, alloc: alloc, capacity: None });
         let text = Column::push(&mut out, strings.bytes());
         let externs = Column::push(&mut out, &externs);
         let deps = Column::push(&mut out, &deps);
         let macro_use = Column::push(&mut out, &macro_use);
+        let macro_use_names = Column::push(&mut out, &macro_use_names);
         let macro_exports = Column::push(&mut out, &macro_exports);
         let tools = Column::push(&mut out, &tools);
         let builtin_attrs = Column::push(&mut out, &builtin_attrs);
@@ -253,6 +346,7 @@ impl<N: AsRef<str>> CrateRootBuilder<'_, N> {
             externs: externs.slice(at, offset_of!(CrateRootRoot, externs)),
             deps: deps.slice(at, offset_of!(CrateRootRoot, deps)),
             macro_use: macro_use.slice(at, offset_of!(CrateRootRoot, macro_use)),
+            macro_use_names: macro_use_names.slice(at, offset_of!(CrateRootRoot, macro_use_names)),
             macro_exports: macro_exports.slice(at, offset_of!(CrateRootRoot, macro_exports)),
             tools: tools.slice(at, offset_of!(CrateRootRoot, tools)),
             builtin_attrs: builtin_attrs.slice(at, offset_of!(CrateRootRoot, builtin_attrs)),
@@ -274,7 +368,10 @@ impl<'a, 'b> CrateRootBuilder<'b, &'a str> {
         let mut out = CrateRootBuilder::new_in(view.head(), alloc);
         out.extern_prelude.extend(view.externs());
         out.deps.extend(view.deps());
-        out.macro_use.extend(view.macro_use());
+        out.macro_use.extend(view.macro_use_entries().map(|(root, only)| MacroUseCrate {
+            root,
+            only: only.map(|list| list.to_vec_in(alloc)),
+        }));
         out.macro_exports.extend(view.macro_exports());
         out.tools.extend(view.tools());
         out.builtin_attrs.extend(view.builtin_attrs());
@@ -289,7 +386,8 @@ pub struct CrateRootView<'a> {
     head: CrateRootHead,
     externs: &'a [NamedKeyRow],
     deps: &'a [DepRow],
-    macro_use: &'a [ContentId],
+    macro_use: &'a [MacroUseRow],
+    macro_use_names: &'a [Text],
     macro_exports: &'a [ExportRow],
     tools: &'a [Text],
     builtin_attrs: &'a [Text],
@@ -305,12 +403,32 @@ impl<'a> CrateRootView<'a> {
         let strings = root.strings.as_str(buffer)?;
         let externs = root.externs.follow(buffer)?;
         let deps = root.deps.follow(buffer)?;
+        let macro_use = root.macro_use.follow(buffer)?;
+        let macro_use_names = root.macro_use_names.follow(buffer)?;
         let macro_exports = root.macro_exports.follow(buffer)?;
         let tools = root.tools.follow(buffer)?;
         let builtin_attrs = root.builtin_attrs.follow(buffer)?;
         let features = root.features.follow(buffer)?;
         for row in externs {
             check_text(strings, row.name, row, buffer)?;
+        }
+        for text in macro_use_names {
+            check_text(strings, *text, text, buffer)?;
+        }
+        for row in macro_use {
+            let valid = row.pad == 0
+                && row.pad2 == 0
+                && if row.all {
+                    row.names.start == 0 && row.names.end == 0
+                } else {
+                    row.names.start <= row.names.end && wide(row.names.end) <= macro_use_names.len()
+                };
+            if !valid {
+                return Err(FormatError::Invalid {
+                    at: at_of_record(row, buffer),
+                    what: "a macro_use row past its record's names or with non-zero padding",
+                });
+            }
         }
         for row in macro_exports {
             check_text(strings, row.name, row, buffer)?;
@@ -343,7 +461,8 @@ impl<'a> CrateRootView<'a> {
             },
             externs,
             deps,
-            macro_use: root.macro_use.follow(buffer)?,
+            macro_use,
+            macro_use_names,
             macro_exports,
             tools,
             builtin_attrs,
@@ -387,7 +506,20 @@ impl<'a> CrateRootView<'a> {
 
     /// The `#[macro_use]` prelude's crates' root modules, in order.
     pub fn macro_use(&self) -> impl ExactSizeIterator<Item = ItemKey> + use<'a> {
-        self.macro_use.iter().map(|key| ItemKey(*key))
+        self.macro_use.iter().map(|row| ItemKey(row.root))
+    }
+
+    /// The `#[macro_use]` prelude's entries in order: each crate's root module and optional
+    /// selective allowlist (`None` = bare `#[macro_use]`, all exported macros).
+    pub fn macro_use_entries(&self) -> impl ExactSizeIterator<Item = (ItemKey, Option<NameListView<'a>>)> + use<'a> {
+        let (names, strings) = (self.macro_use_names, self.strings);
+        self.macro_use.iter().map(move |row| {
+            let only = (!row.all).then(|| {
+                let slice = names.get(row.names.to_usize()).unwrap_or(&[]);
+                NameListView::new(slice, strings)
+            });
+            (ItemKey(row.root), only)
+        })
     }
 
     /// The `#[macro_export]` macros written in source, by name.

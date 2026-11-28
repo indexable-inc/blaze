@@ -797,10 +797,18 @@ fn root_digest(record: &NamesRecord<'_>) -> ContentId {
     for dep in root.deps() {
         h.std(&dep);
     }
-    // Inherent, named: [`RootRead::macro_use`] takes an index and would be picked first.
-    h.update(&(CrateRootView::macro_use(&root).len() as u64).to_le_bytes());
-    for key in CrateRootView::macro_use(&root) {
+    h.update(&(root.macro_use_entries().len() as u64).to_le_bytes());
+    for (key, only) in root.macro_use_entries() {
         h.id(&key.0);
+        match only {
+            None => {
+                h.update(&[0]);
+            }
+            Some(list) => {
+                h.update(&[1]);
+                names(&mut h, list.iter());
+            }
+        }
     }
     h.update(&(root.macro_exports().len() as u64).to_le_bytes());
     for export in root.macro_exports() {
@@ -1261,8 +1269,12 @@ impl<N, R: RootRead<N>> RootRead<N> for LoggedRoot<R> {
         self.0.extern_crate(name)
     }
 
-    fn macro_use(self, i: usize) -> Option<ItemKey> {
-        self.0.macro_use(i)
+    fn macro_use_len(self) -> usize {
+        self.0.macro_use_len()
+    }
+
+    fn macro_use(self, i: usize, name: N) -> Option<(ItemKey, bool)> {
+        self.0.macro_use(i, name)
     }
 
     fn macro_export(self, name: N) -> Option<(ItemKey, MacroShapes)> {

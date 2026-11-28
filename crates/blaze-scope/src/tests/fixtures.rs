@@ -306,7 +306,7 @@ pub(crate) fn negative() -> (World, Negative) {
     let prelude = w.module(std_root, "prelude", V::Pub);
     w.item(prelude, "pm", Namespace::Macros, DefKind::Macro(crate::MacroShapes::FN_LIKE), V::Pub);
     let root = w.root(1, Edition::E2021);
-    w.cr(root).macro_use.push(dep_root);
+    w.cr(root).macro_use.push(crate::MacroUseCrate::all(dep_root));
     w.cr(root).head.prelude = Some(prelude);
     w.call(root, "pm", CallShape::FnLike);
     (w, Negative { root, dep_root, prelude })

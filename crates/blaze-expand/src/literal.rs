@@ -259,6 +259,40 @@ pub fn decode_str_literal(token_text: &str, mut push: impl FnMut(char)) -> bool 
     ok
 }
 
+/// Extracts the single Rust identifier (regular or raw `r#...`, including full Unicode XID
+/// identifiers) from one comma-separated entry of an attribute meta list (such as
+/// `#[macro_use(π, r#match, /* comment */ café)]`), borrowing directly from `part`.
+/// Returns `None` if `part` is empty or does not consist of a single identifier token surrounded
+/// only by whitespace/comments.
+pub fn meta_list_ident(part: &str) -> Option<&str> {
+    use rustc_lexer::{FrontmatterAllowed, TokenKind as K};
+    let mut offset = 0usize;
+    let mut found: Option<&str> = None;
+    for token in rustc_lexer::tokenize(part, FrontmatterAllowed::No) {
+        let len = usize::try_from(token.len).ok()?;
+        let end = offset.checked_add(len)?;
+        let slice = part.get(offset..end)?;
+        offset = end;
+        match token.kind {
+            K::Whitespace | K::LineComment { .. } | K::BlockComment { terminated: true, .. } => {}
+            K::Ident => {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(slice);
+            }
+            K::RawIdent => {
+                if found.is_some() {
+                    return None;
+                }
+                found = slice.strip_prefix("r#");
+            }
+            _ => return None,
+        }
+    }
+    found
+}
+
 /// The value of a string literal (`"…"` or `r#"…"#`), whose tt text is `text`, appended.
 pub(crate) fn string_value(
     kind: LitKind,

@@ -1976,6 +1976,7 @@ dependencies = [
  "blaze-sim",
  "blaze-surface",
  "blaze-toolchain",
+ "blaze-unicode",
  "blaze-unit-graph",
  "blaze-zstd",
  "edition",
@@ -2255,6 +2256,7 @@ dependencies = [
  "blaze-id",
  "blaze-own",
  "blaze-sim",
+ "blaze-unicode",
 ]
 
 [[package]]

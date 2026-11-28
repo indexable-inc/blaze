@@ -19,16 +19,17 @@ use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::column::{
-    Column, NONE, RecordBytes, Strings, Text, at_of, at_of_record, check_text, finish_with,
-    key_of_word, key_word, text_of,
+    Column, NONE, RecordBytes, Strings, Text, at_of, at_of_record, check_text, count, finish_with,
+    key_of_word, key_word, text_of, wide,
 };
 use crate::error::BuildError;
 use crate::kind::{
-    CallRole, CallShape, Def, DefKind, DefKindTag, MacroShapes, Namespace, WrittenVis, WrittenVisTag,
-    byte_enum,
+    CallRole, CallShape, Def, DefKind, DefKindTag, MacroShapes, Namespace, Range, WrittenVis,
+    WrittenVisTag, byte_enum,
 };
 use crate::path::{
-    ExternTarget, Path, PathRow, PathTable, PathView, Paths, Rename, RenameTag, UseForm,
+    ExternTarget, MacroUse, MacroUseTag, NameListView, Path, PathRow, PathTable, PathView, Paths,
+    Rename, RenameTag, UseForm,
 };
 
 /// An item the module declares itself, in one namespace (a tuple struct is two of these). `P`
@@ -63,14 +64,19 @@ pub struct UseDecl<N, P> {
     pub pos: u32,
 }
 
-/// An `extern crate` item. What it adds to the extern prelude and the `#[macro_use]` prelude
-/// at the crate root is in the crate's root record; here it is only the binding in its own
-/// module.
+/// An `extern crate` item. At the crate root it also contributes to the extern prelude (and
+/// when `macro_use` is set, to the `#[macro_use]` prelude), including when written by a macro
+/// expansion.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct ExternCrateDecl<N, P> {
+pub struct ExternCrateDecl<N, P, L> {
     pub target: ExternTarget<N>,
     pub rename: Rename<N>,
     pub vis: WrittenVis<P>,
+    /// `#[macro_use]` / `#[macro_use(a, b)]`: at the crate root, imports the dependency's exported
+    /// macros (all, or only the listed names) into the `#[macro_use]` prelude.
+    pub macro_use: MacroUse<L>,
+    /// Its place in the fragment's source order (unique among the fragment's ordered entries).
+    pub pos: u32,
 }
 
 /// A `macro_rules!` definition, in the fragment's source order. A `#[macro_export]` one
@@ -127,7 +133,7 @@ pub struct DeclsBuilder<'a, N> {
     pub items: AVec<'a, DeclaredItem<N, Path<'a, N>>>,
     pub mods: AVec<'a, ChildModDecl<N, Path<'a, N>>>,
     pub uses: AVec<'a, UseDecl<N, Path<'a, N>>>,
-    pub extern_crates: AVec<'a, ExternCrateDecl<N, Path<'a, N>>>,
+    pub extern_crates: AVec<'a, ExternCrateDecl<N, Path<'a, N>, AVec<'a, N>>>,
     pub macro_rules: AVec<'a, MacroRulesDecl<N>>,
     pub calls: AVec<'a, MacroCallDecl<Path<'a, N>>>,
 }
@@ -147,13 +153,24 @@ impl<'b, N: PartialEq> PartialEq<DeclsBuilder<'b, N>> for DeclsBuilder<'_, N> {
                 _ => false,
             }
         }
+        fn macro_use_eq<N: PartialEq>(a: &MacroUse<AVec<'_, N>>, b: &MacroUse<AVec<'_, N>>) -> bool {
+            match (a, b) {
+                (MacroUse::None, MacroUse::None) | (MacroUse::All, MacroUse::All) => true,
+                (MacroUse::Only(x), MacroUse::Only(y)) => x[..] == y[..],
+                _ => false,
+            }
+        }
         same(&self.items, &other.items, |a, b| a.name == b.name && a.ns == b.ns && a.def == b.def && vis(&a.vis, &b.vis))
             && same(&self.mods, &other.mods, |a, b| {
                 a.name == b.name && a.module == b.module && vis(&a.vis, &b.vis) && a.macro_use == b.macro_use && a.pos == b.pos
             })
             && same(&self.uses, &other.uses, |a, b| a.path == b.path && a.leaf == b.leaf && vis(&a.vis, &b.vis) && a.pos == b.pos)
             && same(&self.extern_crates, &other.extern_crates, |a, b| {
-                a.target == b.target && a.rename == b.rename && vis(&a.vis, &b.vis)
+                a.target == b.target
+                    && a.rename == b.rename
+                    && vis(&a.vis, &b.vis)
+                    && macro_use_eq(&a.macro_use, &b.macro_use)
+                    && a.pos == b.pos
             })
             && self.macro_rules[..] == other.macro_rules[..]
             && same(&self.calls, &other.calls, |a, b| {
@@ -234,14 +251,16 @@ blaze_format::record! {
 
 blaze_format::record! {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub(crate) struct ExternCrateRow: 1 {
+    pub(crate) struct ExternCrateRow: 3 {
         pub(crate) target: Text,
         pub(crate) rename: Text,
         pub(crate) vis_path: u32,
+        pub(crate) pos: u32,
+        pub(crate) macro_use_names: Range,
         pub(crate) target_tag: ExternTargetTag,
         pub(crate) rename_tag: RenameTag,
         pub(crate) vis: WrittenVisTag,
-        pub(crate) pad: u8,
+        pub(crate) macro_use: MacroUseTag,
     }
 }
 
@@ -272,7 +291,7 @@ blaze_format::record! {
 
 blaze_format::record! {
     #[derive(Clone, Copy, Debug)]
-    pub(crate) struct ModuleDeclsRoot: 1 {
+    pub(crate) struct ModuleDeclsRoot: 2 {
         pub(crate) module: ContentId,
         pub(crate) krate: ContentId,
         pub(crate) parent: ContentId,
@@ -285,6 +304,7 @@ blaze_format::record! {
         pub(crate) calls: Slice<CallRow>,
         pub(crate) paths: Slice<PathRow>,
         pub(crate) segments: Slice<Text>,
+        pub(crate) macro_use_names: Slice<Text>,
         pub(crate) strings: Slice<u8>,
         pub(crate) has_name: bool,
         pub(crate) no_implicit_prelude: bool,
@@ -383,6 +403,7 @@ impl<N: AsRef<str>> DeclsBuilder<'_, N> {
             uses.push(UseRow { rename, path, vis_path, pos: u.pos, form, rename_tag, types_only, vis });
         }
         let mut externs = Vec::with_capacity_in(self.extern_crates.len(), alloc);
+        let mut macro_use_names = Vec::new_in(alloc);
         for ec in self.extern_crates.iter() {
             let (target_tag, target) = match &ec.target {
                 ExternTarget::Dep(name) => (ExternTargetTag::Dep, strings.push(name.as_ref(), TABLE)?),
@@ -391,7 +412,29 @@ impl<N: AsRef<str>> DeclsBuilder<'_, N> {
             let (rename_tag, name) = ec.rename.as_ref().split();
             let rename = text_or_none(name, &mut strings)?;
             let (vis, vis_path) = vis_row(&ec.vis, &mut paths, &mut strings, TABLE)?;
-            externs.push(ExternCrateRow { target, rename, vis_path, target_tag, rename_tag, vis, pad: 0 });
+            let (macro_use, range) = match &ec.macro_use {
+                MacroUse::None => (MacroUseTag::None, Range::new(0, 0)),
+                MacroUse::All => (MacroUseTag::All, Range::new(0, 0)),
+                MacroUse::Only(names) => {
+                    let start = count(macro_use_names.len(), TABLE)?;
+                    for name in names.iter() {
+                        macro_use_names.push(strings.push(name.as_ref(), TABLE)?);
+                    }
+                    let end = count(macro_use_names.len(), TABLE)?;
+                    (MacroUseTag::Only, Range::new(start, end))
+                }
+            };
+            externs.push(ExternCrateRow {
+                target,
+                rename,
+                vis_path,
+                pos: ec.pos,
+                macro_use_names: range,
+                target_tag,
+                rename_tag,
+                vis,
+                macro_use,
+            });
         }
         let mut rules = Vec::with_capacity_in(self.macro_rules.len(), alloc);
         for mr in self.macro_rules.iter() {
@@ -419,6 +462,7 @@ impl<N: AsRef<str>> DeclsBuilder<'_, N> {
         let calls = Column::push(&mut out, &calls);
         let path_rows = Column::push(&mut out, &paths.rows);
         let segments = Column::push(&mut out, &paths.segments);
+        let macro_use_names = Column::push(&mut out, &macro_use_names);
         Ok(finish_with(out, |at| ModuleDeclsRoot {
             module: module.0,
             krate: info.krate.0,
@@ -432,6 +476,7 @@ impl<N: AsRef<str>> DeclsBuilder<'_, N> {
             calls: calls.slice(at, offset_of!(ModuleDeclsRoot, calls)),
             paths: path_rows.slice(at, offset_of!(ModuleDeclsRoot, paths)),
             segments: segments.slice(at, offset_of!(ModuleDeclsRoot, segments)),
+            macro_use_names: macro_use_names.slice(at, offset_of!(ModuleDeclsRoot, macro_use_names)),
             strings: text.slice(at, offset_of!(ModuleDeclsRoot, strings)),
             has_name: info.name.is_some(),
             no_implicit_prelude: info.no_implicit_prelude,
@@ -459,6 +504,8 @@ impl<'a, 'b> DeclsBuilder<'b, &'a str> {
             target: ec.target,
             rename: ec.rename,
             vis: ec.vis.map(path),
+            macro_use: ec.macro_use.map(|list| list.to_vec_in(alloc)),
+            pos: ec.pos,
         }));
         out.macro_rules.extend(view.macro_rules());
         out.calls.extend(view.calls().map(|c| MacroCallDecl {
@@ -485,6 +532,7 @@ pub struct ModuleDeclsView<'a> {
     rules: &'a [RulesRow],
     calls: &'a [CallRow],
     paths: Paths<'a>,
+    macro_use_names: &'a [Text],
     strings: &'a str,
 }
 
@@ -494,6 +542,10 @@ impl<'a> ModuleDeclsView<'a> {
         let root = blaze_format::open::<ModuleDeclsRoot>(buffer)?;
         let strings = root.strings.as_str(buffer)?;
         let paths = Paths::read(root.paths.follow(buffer)?, root.segments.follow(buffer)?, strings, buffer)?;
+        let macro_use_names = root.macro_use_names.follow(buffer)?;
+        for text in macro_use_names {
+            check_text(strings, *text, text, buffer)?;
+        }
         check_text(strings, root.name, blaze_format::Verified::get(root), buffer)?;
         let items = root.items.follow(buffer)?;
         for row in items {
@@ -516,6 +568,17 @@ impl<'a> ModuleDeclsView<'a> {
             check_text(strings, row.target, row, buffer)?;
             check_text(strings, row.rename, row, buffer)?;
             check_vis(&paths, row.vis, row.vis_path, row, buffer)?;
+            let range = row.macro_use_names;
+            let valid = match row.macro_use {
+                MacroUseTag::Only => range.start <= range.end && wide(range.end) <= macro_use_names.len(),
+                MacroUseTag::None | MacroUseTag::All => range.start == 0 && range.end == 0,
+            };
+            if !valid {
+                return Err(FormatError::Invalid {
+                    at: at_of_record(row, buffer),
+                    what: "an extern crate macro_use allowlist range past its record's names",
+                });
+            }
         }
         let rules = root.rules.follow(buffer)?;
         for row in rules {
@@ -540,6 +603,7 @@ impl<'a> ModuleDeclsView<'a> {
             rules,
             calls,
             paths,
+            macro_use_names,
             strings,
         })
     }
@@ -594,8 +658,8 @@ impl<'a> ModuleDeclsView<'a> {
     }
 
     /// The `extern crate` items, in source order.
-    pub fn extern_crates(&self) -> impl ExactSizeIterator<Item = ExternCrateDecl<&'a str, PathView<'a>>> + use<'a> {
-        let (strings, paths) = (self.strings, self.paths);
+    pub fn extern_crates(&self) -> impl ExactSizeIterator<Item = ExternCrateDecl<&'a str, PathView<'a>, NameListView<'a>>> + use<'a> {
+        let (strings, paths, macro_use_names) = (self.strings, self.paths, self.macro_use_names);
         self.externs.iter().map(move |row| ExternCrateDecl {
             target: match row.target_tag {
                 ExternTargetTag::Dep => ExternTarget::Dep(text_of(strings, row.target)),
@@ -603,6 +667,15 @@ impl<'a> ModuleDeclsView<'a> {
             },
             rename: Rename::join(row.rename_tag, || text_of(strings, row.rename)),
             vis: vis_of(&paths, row.vis, row.vis_path),
+            macro_use: match row.macro_use {
+                MacroUseTag::None => MacroUse::None,
+                MacroUseTag::All => MacroUse::All,
+                MacroUseTag::Only => {
+                    let slice = macro_use_names.get(row.macro_use_names.to_usize()).unwrap_or(&[]);
+                    MacroUse::Only(NameListView::new(slice, strings))
+                }
+            },
+            pos: row.pos,
         })
     }
 
