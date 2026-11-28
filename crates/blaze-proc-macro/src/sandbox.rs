@@ -215,11 +215,12 @@ impl Files {
     }
 
     fn find(&self, rel: &Path, follow: bool) -> Result<Option<Found>, String> {
+        let mount = self.seen().mount();
         match self {
             Files::Folder(root) | Files::Member { workspace: root, .. } => {
                 if follow {
                     return Ok(match self.real(root, rel)? {
-                        Real::Found(real, _) => stat_of(&real, true),
+                        Real::Found(real, top) => stat_of(&real, true, &top, mount),
                         Real::Loop => Some(Found::Loop),
                         Real::Missing => None,
                     });
@@ -233,20 +234,20 @@ impl Files {
                 }
                 if rel.is_absolute() {
                     return Ok(match self.real(root, rel)? {
-                        Real::Found(real, _) => stat_of(&real, true),
+                        Real::Found(real, top) => stat_of(&real, true, &top, mount),
                         Real::Loop => Some(Found::Loop),
                         Real::Missing => None,
                     });
                 }
                 let (Some(parent), Some(name)) = (rel.parent(), rel.file_name()) else {
                     return Ok(match self.real(root, rel)? {
-                        Real::Found(real, _) => stat_of(&real, true),
+                        Real::Found(real, top) => stat_of(&real, true, &top, mount),
                         Real::Loop => Some(Found::Loop),
                         Real::Missing => None,
                     });
                 };
                 Ok(match self.real(root, parent)? {
-                    Real::Found(parent_real, _) => stat_of(&parent_real.join(name), false),
+                    Real::Found(parent_real, top) => stat_of(&parent_real.join(name), false, &top, mount),
                     Real::Loop => Some(Found::Loop),
                     Real::Missing => None,
                 })
@@ -407,11 +408,30 @@ fn stat_digest(filetype: Filetype, size: u64) -> ContentId {
     digest(&bytes)
 }
 
-fn stat_of(path: &Path, follow: bool) -> Option<Found> {
+/// Virtualized byte length of a symlink target: relative targets keep their byte length;
+/// absolute in-tree targets report the length of their virtual `{mount}/{rel}` pathname so
+/// `lstat` sizes and digests are independent of the host checkout path; out-of-tree absolute
+/// targets report `0`.
+fn virtual_link_len(top: &Path, mount: &str, path: &Path, fallback: u64) -> u64 {
+    let Ok(target) = fs::read_link(path) else {
+        return fallback;
+    };
+    let len = match normalize_link_target(top, &target) {
+        Some((false, rel)) => rel.as_os_str().as_encoded_bytes().len(),
+        Some((true, norm)) => {
+            let n = norm.as_os_str().as_encoded_bytes().len();
+            if n == 0 { mount.len() } else { mount.len() + 1 + n }
+        }
+        None => return 0,
+    };
+    u64::try_from(len).unwrap_or(u64::MAX)
+}
+
+fn stat_of(path: &Path, follow: bool, top: &Path, mount: &str) -> Option<Found> {
     let meta = if follow { std::fs::metadata(path) } else { std::fs::symlink_metadata(path) }.ok()?;
     let ft = meta.file_type();
     Some(if ft.is_symlink() {
-        Found::Link(meta.len())
+        Found::Link(virtual_link_len(top, mount, path, meta.len()))
     } else if ft.is_dir() {
         Found::Folder
     } else {
@@ -449,19 +469,43 @@ fn decode_hex_path(hex: &str) -> Option<PathBuf> {
 }
 
 /// Canonical in-tree normalization of a symlink `target` relative to `top`: absolute targets
-/// inside `top` are stripped to their `top`-relative path (machine-independent); absolute targets
-/// outside `top` return `None`.
+/// inside `top` (including dangling targets under a host-symlinked workspace root) are stripped
+/// to their `top`-relative path (machine-independent); absolute targets outside `top` or climbing
+/// above `top` return `None`.
 fn normalize_link_target(top: &Path, target: &Path) -> Option<(bool, PathBuf)> {
-    if target.is_absolute() {
-        let in_top = target
-            .strip_prefix(top)
-            .ok()
-            .map(Path::to_path_buf)
-            .or_else(|| fs::canonicalize(target).ok().and_then(|c| c.strip_prefix(top).ok().map(Path::to_path_buf)))?;
-        Some((true, in_top))
-    } else {
-        Some((false, target.to_path_buf()))
+    if !target.is_absolute() {
+        return Some((false, target.to_path_buf()));
     }
+    let mut comps = target.components();
+    let mut tail = [Component::CurDir; 0].to_vec();
+    let canon = loop {
+        if let Ok(canon) = fs::canonicalize(comps.as_path()) {
+            break canon;
+        }
+        let comp = comps.next_back()?;
+        tail.push(comp);
+    };
+    let base = canon.strip_prefix(top).ok()?;
+    let mut out = base.to_path_buf();
+    let mut depth = base.components().count();
+    for comp in tail.into_iter().rev() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                out.push("..");
+            }
+            Component::Normal(seg) => {
+                depth += 1;
+                out.push(seg);
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some((true, out))
 }
 
 /// Deterministic digest of a normalized symlink target (`is_abs`, `target`), independent of
@@ -700,51 +744,65 @@ impl Sandbox {
             }
             parts.push(seg);
             let is_intermediate = !pending.is_empty() || has_trailing_slash;
-            if is_intermediate && parts.len() > 1 && parts.first().map(OsString::as_os_str) == Some(mount_name)
-                && let Some(top_dir) = &top
-            {
+            if is_intermediate && parts.len() > 1 && parts.first().map(OsString::as_os_str) == Some(mount_name) {
                 let mut cur_rel = PathBuf::new();
                 for s in parts.iter().skip(1) {
                     cur_rel.push(s);
                 }
-                let cur_disk = top_dir.join(&cur_rel);
-                match fs::symlink_metadata(&cur_disk) {
-                    Ok(meta) => {
-                        if meta.file_type().is_symlink() {
-                            hops += 1;
-                            if hops > MAX_SYMLINK_HOPS {
-                                self.record(Self::subject("lstat", &cur_rel), Some(stat_digest(Filetype::SymbolicLink, meta.len())));
-                                return Ok(Err(Errno::LOOP));
-                            }
-                            let Ok(target) = fs::read_link(&cur_disk) else {
-                                return Ok(Err(Errno::IO));
-                            };
-                            let link_shown = cur_rel.to_string_lossy().into_owned();
-                            let Some((is_abs, norm)) = normalize_link_target(top_dir, &target) else {
-                                return Err(self.refuse(format!("opened {mount}/{link_shown}, a link out of {mount}, the tree the macro is served")));
-                            };
-                            self.record(Self::subject("link", &cur_rel), Some(link_target_digest(is_abs, &norm)));
-                            last_link = Some(cur_rel);
-                            parts.pop();
-                            if is_abs {
-                                parts.truncate(1);
-                            }
-                            for part in norm.as_os_str().as_encoded_bytes().split(|&b| b == b'/').rev() {
-                                if !part.is_empty() {
-                                    pending.push(OsStr::from_bytes(part).to_os_string());
+                if let Some(top_dir) = &top {
+                    let cur_disk = top_dir.join(&cur_rel);
+                    match fs::symlink_metadata(&cur_disk) {
+                        Ok(meta) => {
+                            if meta.file_type().is_symlink() {
+                                hops += 1;
+                                if hops > MAX_SYMLINK_HOPS {
+                                    let len = virtual_link_len(top_dir, mount, &cur_disk, meta.len());
+                                    self.record(Self::subject("lstat", &cur_rel), Some(stat_digest(Filetype::SymbolicLink, len)));
+                                    return Ok(Err(Errno::LOOP));
                                 }
+                                let Ok(target) = fs::read_link(&cur_disk) else {
+                                    return Ok(Err(Errno::IO));
+                                };
+                                let link_shown = cur_rel.to_string_lossy().into_owned();
+                                let Some((is_abs, norm)) = normalize_link_target(top_dir, &target) else {
+                                    return Err(self.refuse(format!("opened {mount}/{link_shown}, a link out of {mount}, the tree the macro is served")));
+                                };
+                                self.record(Self::subject("link", &cur_rel), Some(link_target_digest(is_abs, &norm)));
+                                last_link = Some(cur_rel);
+                                parts.pop();
+                                if is_abs {
+                                    parts.truncate(1);
+                                }
+                                for part in norm.as_os_str().as_encoded_bytes().split(|&b| b == b'/').rev() {
+                                    if !part.is_empty() {
+                                        pending.push(OsStr::from_bytes(part).to_os_string());
+                                    }
+                                }
+                            } else if !meta.file_type().is_dir() {
+                                self.record(Self::subject("stat", &cur_rel), Some(stat_digest(Filetype::RegularFile, meta.len())));
+                                return Ok(Err(Errno::NOTDIR));
                             }
-                        } else if !meta.file_type().is_dir() {
-                            self.record(Self::subject("stat", &cur_rel), Some(stat_digest(Filetype::RegularFile, meta.len())));
+                        }
+                        Err(err) if err.kind() == ErrorKind::NotFound => {
+                            self.record(Self::subject("lstat", &cur_rel), None);
+                            return Ok(Err(Errno::NOENT));
+                        }
+                        Err(err) if err.kind() == ErrorKind::NotADirectory => return Ok(Err(Errno::NOTDIR)),
+                        Err(_) => return Ok(Err(Errno::IO)),
+                    }
+                } else if matches!(&self.package.files, Files::Listed(_)) {
+                    match self.package.files.find(&cur_rel, true).map_err(|why| self.refuse(why))? {
+                        Some(Found::Folder) => {}
+                        Some(Found::File(size)) => {
+                            self.record(Self::subject("stat", &cur_rel), Some(stat_digest(Filetype::RegularFile, size)));
                             return Ok(Err(Errno::NOTDIR));
                         }
+                        None => {
+                            self.record(Self::subject("lstat", &cur_rel), None);
+                            return Ok(Err(Errno::NOENT));
+                        }
+                        Some(Found::Link(_) | Found::Loop) => return Ok(Err(Errno::LOOP)),
                     }
-                    Err(err) if err.kind() == ErrorKind::NotFound => {
-                        self.record(Self::subject("lstat", &cur_rel), None);
-                        return Ok(Err(Errno::NOENT));
-                    }
-                    Err(err) if err.kind() == ErrorKind::NotADirectory => return Ok(Err(Errno::NOTDIR)),
-                    Err(_) => return Ok(Err(Errno::IO)),
                 }
             }
         }
@@ -1006,7 +1064,11 @@ mod seen_tests {
         let root = ScriptRoot::member("crates/m").unwrap_or_else(|e| panic!("{e}"));
         let member = Package::new(Files::Member { workspace: PathBuf::from("/nonexistent-ws"), root }, PackageEnv::default()).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(member.cwd(), "/workspace/crates/m");
-        let dependency = Package::new(Files::Listed(Arc::from(Vec::new())), PackageEnv::default()).unwrap_or_else(|e| panic!("{e}"));
+        let dependency = Package::new(
+            Files::Listed(Arc::from([(String::from("src/lib.rs"), super::ListedBytes::Static(b""))])),
+            PackageEnv::default(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(dependency.cwd(), "/package");
         let mut sandbox = Sandbox::new(Arc::new(member));
         assert_eq!(
@@ -1992,5 +2054,113 @@ mod dir_fd_tests {
         assert_eq!(link_a.digest, link_b.digest, "absolute in-tree symlink digest must be checkout-path independent");
         assert_eq!(answer_now(&pkg_a, &link_a.subject), Ok(link_a.digest));
         assert_eq!(answer_now(&pkg_b, &link_b.subject), Ok(link_b.digest));
+    }
+
+    /// Codex Round 5 P2 #1 (`Files::Listed` intermediate validation): traversing `..` through a
+    /// regular file (`Cargo.toml/../src/lib.rs`) returns `Errno::NOTDIR` and through a missing
+    /// directory (`missing/../src/lib.rs`) returns `Errno::NOENT`, while a real directory
+    /// (`src/../Cargo.toml`) succeeds.
+    #[test]
+    fn listed_tree_rejects_file_and_missing_intermediates_before_dotdot() {
+        let listed = Files::Listed(Arc::from([
+            (String::from("Cargo.toml"), ListedBytes::Static(b"[package]\nname = \"dep\"\n")),
+            (String::from("src/lib.rs"), ListedBytes::Static(b"pub fn lib() {}\n")),
+        ]));
+        let pkg = Arc::new(Package::new(listed, PackageEnv::default()).unwrap_or_else(|e| panic!("{e}")));
+        let mut sandbox = Sandbox::new(Arc::clone(&pkg));
+        let root_fd = sandbox.open(ROOT_FD, b"/package", READ_ONLY).expect("not stopped").expect("package root");
+
+        assert_eq!(sandbox.open(root_fd, b"Cargo.toml/../src/lib.rs", READ_ONLY).expect("not stopped"), Err(Errno::NOTDIR));
+        assert_eq!(sandbox.path_stat(root_fd, b"Cargo.toml/../src/lib.rs", true).expect("not stopped"), Err(Errno::NOTDIR));
+        assert_eq!(sandbox.open(root_fd, b"missing/../src/lib.rs", READ_ONLY).expect("not stopped"), Err(Errno::NOENT));
+        assert_eq!(sandbox.path_stat(root_fd, b"missing/../src/lib.rs", true).expect("not stopped"), Err(Errno::NOENT));
+
+        // Positive control: `src/../Cargo.toml` goes through real directory `src` and succeeds.
+        let m_fd = sandbox.open(root_fd, b"src/../Cargo.toml", READ_ONLY).expect("not stopped").expect("src/../Cargo.toml opens");
+        assert_eq!(read_all(&mut sandbox, m_fd), b"[package]\nname = \"dep\"\n");
+        for read in &sandbox.reads {
+            assert_eq!(answer_now(&pkg, &read.subject), Ok(read.digest), "parity for {}", read.subject);
+        }
+    }
+
+    /// Codex Round 5 P2 #2 (dangling absolute targets under symlinked workspace roots): when the
+    /// served workspace root is reached through a host symlink `/checkout-alias -> /real-ws`, an
+    /// absolute dangling in-tree symlink `dangling_abs -> /checkout-alias/missing` resolves inside
+    /// the tree and returns `Errno::NOENT` (NOT an out-of-sandbox refusal), while an absolute
+    /// dangling symlink outside the workspace is still refused.
+    #[cfg(unix)]
+    #[test]
+    fn dangling_absolute_link_under_symlinked_workspace_root_returns_enoent() {
+        use std::os::unix::fs::symlink;
+
+        let tree = make_workspace("symlinked_ws_root");
+        let alias_root = tree.base.join("checkout-alias");
+        symlink(&tree.ws, &alias_root).expect("host symlink to ws");
+        let parts = tree.ws.join("crates/m/parts");
+        symlink(alias_root.join("missing"), parts.join("dangling_in_tree")).expect("dangling in-tree abs link");
+        symlink(tree.base.join("outside/missing"), parts.join("dangling_outside")).expect("dangling out-of-tree abs link");
+
+        let root = ScriptRoot::member("crates/m").unwrap_or_else(|e| panic!("{e}"));
+        let pkg = Arc::new(
+            Package::new(Files::Member { workspace: alias_root, root }, PackageEnv::default())
+                .unwrap_or_else(|e| panic!("{e}")),
+        );
+        let mut sandbox = Sandbox::new(Arc::clone(&pkg));
+        let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
+
+        // Intermediate dangling absolute target inside symlinked workspace root -> ENOENT, NOT refused!
+        assert_eq!(sandbox.open(dir_fd, b"dangling_in_tree/child.rs", READ_ONLY).expect("must not refuse in-tree dangling link"), Err(Errno::NOENT));
+        assert!(sandbox.refused.is_none());
+        for read in &sandbox.reads {
+            assert_eq!(answer_now(&pkg, &read.subject), Ok(read.digest), "parity for {}", read.subject);
+        }
+
+        // Security control: dangling absolute target outside the workspace is STILL refused!
+        let Err(stop) = sandbox.open(dir_fd, b"dangling_outside/child.rs", READ_ONLY) else {
+            panic!("out-of-tree dangling absolute symlink must be refused");
+        };
+        assert!(stop.0.contains("a link out of /workspace"), "{}", stop.0);
+        assert!(matches!(sandbox.refused, Some((ProcLimit::Paths, _))));
+    }
+
+    /// Codex Round 5 P2 #3 (virtualized absolute symlink length in `lstat`): two identical
+    /// workspaces at different-length host checkout paths with an absolute in-tree symlink
+    /// `abs_link -> <root>/crates/m/parts/sub` return the exact same `path_stat(..., false).size`
+    /// (`"/workspace/crates/m/parts/sub".len()`) and the exact same `lstat:` digest.
+    #[cfg(unix)]
+    #[test]
+    fn absolute_in_tree_symlink_reports_identical_lstat_size_and_digest_across_checkouts() {
+        use std::os::unix::fs::symlink;
+
+        let tree_a = make_workspace("lstat_a");
+        let tree_b = make_workspace("lstat_beta_with_a_much_longer_checkout_directory_name");
+        let target_a = std::fs::canonicalize(&tree_a.ws).expect("canon a").join("crates/m/parts/sub");
+        let target_b = std::fs::canonicalize(&tree_b.ws).expect("canon b").join("crates/m/parts/sub");
+        assert_ne!(target_a.as_os_str().len(), target_b.as_os_str().len());
+        symlink(&target_a, tree_a.ws.join("crates/m/parts/abs_link")).expect("abs link a");
+        symlink(&target_b, tree_b.ws.join("crates/m/parts/abs_link")).expect("abs link b");
+        symlink(tree_a.base.join("outside/secret.txt"), tree_a.ws.join("crates/m/parts/abs_escape")).expect("abs escape");
+
+        let (pkg_a, mut sb_a) = member_sandbox(&tree_a);
+        let (pkg_b, mut sb_b) = member_sandbox(&tree_b);
+        let fd_a = sb_a.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir a");
+        let fd_b = sb_b.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir b");
+
+        let st_a = sb_a.path_stat(fd_a, b"abs_link", false).expect("not stopped").expect("lstat a");
+        let st_b = sb_b.path_stat(fd_b, b"abs_link", false).expect("not stopped").expect("lstat b");
+        assert_eq!(st_a.filetype, Filetype::SymbolicLink);
+        assert_eq!(st_a.size, b"/workspace/crates/m/parts/sub".len() as u64);
+        assert_eq!(st_a.size, st_b.size, "virtualized symlink size must be identical across checkout paths");
+
+        let read_a = sb_a.reads.iter().find(|r| r.subject == "lstat:crates/m/parts/abs_link").expect("lstat a");
+        let read_b = sb_b.reads.iter().find(|r| r.subject == "lstat:crates/m/parts/abs_link").expect("lstat b");
+        assert_eq!(read_a.digest, read_b.digest, "lstat digest must be identical across checkout paths");
+        assert_eq!(answer_now(&pkg_a, &read_a.subject), Ok(read_a.digest));
+        assert_eq!(answer_now(&pkg_b, &read_b.subject), Ok(read_b.digest));
+
+        // Security control: out-of-tree absolute symlink reports size 0 (never leaks host path length).
+        let st_out = sb_a.path_stat(fd_a, b"abs_escape", false).expect("not stopped").expect("lstat abs_escape");
+        assert_eq!(st_out.filetype, Filetype::SymbolicLink);
+        assert_eq!(st_out.size, 0, "out-of-tree absolute symlink must not leak host path length");
     }
 }
