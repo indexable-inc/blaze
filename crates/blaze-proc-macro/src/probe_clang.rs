@@ -263,6 +263,10 @@ impl c_tasks_probe::ProbeCache for CacheAdapter<'_> {
 #[derive(Clone)]
 pub struct CScriptProbes {
     pub answerer: OwnArc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>>,
+    /// Optional cancellation-aware Linux hermetic probe handle backing [`Self::answerer_id_in_cx`]
+    /// so live runtime-closure scans respect caller cancellation and deadlines.
+    #[cfg(target_os = "linux")]
+    pub hermetic: Option<OwnArc<HermeticClangProbe, SharedAlloc<'static>>>,
     pub records: OwnArc<dyn CProbeStore, SharedAlloc<'static>>,
     /// Configured host SDK directory (`""` when no SDK is active), verified against child
     /// `SDKROOT` overrides before canonicalizing a probe (rule 21).
@@ -273,6 +277,129 @@ pub struct CScriptProbes {
     pub sdk_digest: [u8; 32],
     /// Host pinned clang archive SHA-256 (verified in `cc-probe` read revalidation).
     pub clang_sha256: [u8; 32],
+}
+
+impl CScriptProbes {
+    /// Computes the live answerer identity bounded by the caller's `cx` cancellation and deadline
+    /// rather than spawning a fresh root context (rule 18).
+    pub fn answerer_id_in_cx<'a>(
+        &self,
+        cx: &bstd::cx::Cx,
+        alloc: Alloc<'a>,
+    ) -> Result<ContentId, AString<'a>> {
+        if cx.check().is_err() {
+            return Err(own_str("c-probe answerer identity cancelled", alloc));
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(hermetic) = &self.hermetic {
+            return hermetic.live_strategy_id(cx, alloc);
+        }
+        self.answerer.id(alloc)
+    }
+
+    /// Returns a view of this probe runner bound to the caller `cx`'s cancellation lineage and
+    /// deadline so C compiler probes executed by a build script stop immediately on cancellation
+    /// or an earlier caller deadline rather than draining an independent 30-second probe budget.
+    pub fn with_cx(&self, cx: &bstd::cx::Cx) -> Self {
+        let shared = SharedAlloc::global();
+        let bound = cx.bound();
+        #[cfg(target_os = "linux")]
+        let answerer: OwnArc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> = match &self.hermetic {
+            Some(hermetic) => OwnArc::new_in(BoundHermetic { inner: hermetic.share(), bound }, shared),
+            None => OwnArc::new_in(BoundAnswerer { inner: blaze_own::Share::share(&self.answerer), bound }, shared),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let answerer: OwnArc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> =
+            OwnArc::new_in(BoundAnswerer { inner: blaze_own::Share::share(&self.answerer), bound }, shared);
+        Self {
+            answerer,
+            #[cfg(target_os = "linux")]
+            hermetic: self.hermetic.as_ref().map(blaze_own::Share::share),
+            records: blaze_own::Share::share(&self.records),
+            sdk_dir: blaze_own::Share::share(&self.sdk_dir),
+            sdk_id: blaze_own::Share::share(&self.sdk_id),
+            sdk_digest: self.sdk_digest,
+            clang_sha256: self.clang_sha256,
+        }
+    }
+}
+
+struct BoundAnswerer {
+    inner: OwnArc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>>,
+    bound: bstd::cx::CxBound,
+}
+
+impl ProbeAnswerer for BoundAnswerer {
+    fn id<'a>(&self, alloc: Alloc<'a>) -> Result<ContentId, AString<'a>> {
+        match self.bound.check() {
+            Ok(()) => self.inner.id(alloc),
+            Err(bstd::Stopped::Cancelled { .. }) => Err(own_str("c-probe answerer identity cancelled", alloc)),
+            Err(bstd::Stopped::Deadline { .. }) => Err(own_str("c-probe answerer identity deadline exhausted", alloc)),
+            Err(other) => Err(own_fmt(format_args!("c-probe answerer identity stopped: {other}"), alloc)),
+        }
+    }
+
+    fn answer<'a, 'b>(
+        &self,
+        probe: &c_tasks_probe::CanonicalProbe<'_, '_>,
+        input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+        alloc: Alloc<'a>,
+    ) -> Result<c_tasks_probe::ProbeAnswer<'a>, AString<'a>> {
+        match self.bound.check() {
+            Ok(()) => self.inner.answer(probe, input_bytes, alloc),
+            Err(bstd::Stopped::Cancelled { .. }) => Err(own_str("c-probe cancelled", alloc)),
+            Err(bstd::Stopped::Deadline { .. }) => Err(own_str("c-probe deadline exhausted", alloc)),
+            Err(other) => Err(own_fmt(format_args!("c-probe stopped: {other}"), alloc)),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct BoundHermetic {
+    inner: OwnArc<HermeticClangProbe, SharedAlloc<'static>>,
+    bound: bstd::cx::CxBound,
+}
+
+#[cfg(target_os = "linux")]
+impl ProbeAnswerer for BoundHermetic {
+    fn id<'a>(&self, alloc: Alloc<'a>) -> Result<ContentId, AString<'a>> {
+        let cx = self.bound.child_on(&self.inner.io, self.inner.deadline, bstd::mem::TASK_FRAME).map_err(|stopped| {
+            match stopped {
+                bstd::Stopped::Cancelled { .. } => own_str("c-probe answerer identity cancelled", alloc),
+                bstd::Stopped::Deadline { .. } => own_str("c-probe answerer identity deadline exhausted", alloc),
+                other => own_fmt(format_args!("c-probe answerer identity stopped: {other}"), alloc),
+            }
+        })?;
+        self.inner.live_strategy_id(&cx, alloc)
+    }
+
+    fn answer<'a, 'b>(
+        &self,
+        probe: &CanonicalProbe<'_, '_>,
+        input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+        alloc: Alloc<'a>,
+    ) -> Result<ProbeAnswer<'a>, AString<'a>> {
+        self.inner.answer_with_bound(Some(&self.bound), probe, input_bytes, alloc)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct SharedHermetic(OwnArc<HermeticClangProbe, SharedAlloc<'static>>);
+
+#[cfg(target_os = "linux")]
+impl ProbeAnswerer for SharedHermetic {
+    fn id<'a>(&self, alloc: Alloc<'a>) -> Result<ContentId, AString<'a>> {
+        self.0.id(alloc)
+    }
+
+    fn answer<'a, 'b>(
+        &self,
+        probe: &CanonicalProbe<'_, '_>,
+        input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+        alloc: Alloc<'a>,
+    ) -> Result<ProbeAnswer<'a>, AString<'a>> {
+        self.0.answer(probe, input_bytes, alloc)
+    }
 }
 
 impl blaze_own::Share for CScriptProbes {}
@@ -293,6 +420,14 @@ impl CProbeSetting {
         match self {
             CProbeSetting::Ready(probes) => Some(probes),
             CProbeSetting::Unavailable(_) => None,
+        }
+    }
+
+    /// Returns a view of this probe setting bound to the caller `cx`'s cancellation and deadline.
+    pub fn with_cx(&self, cx: &bstd::cx::Cx) -> Self {
+        match self {
+            CProbeSetting::Ready(probes) => CProbeSetting::Ready(probes.with_cx(cx)),
+            CProbeSetting::Unavailable(why) => CProbeSetting::Unavailable(blaze_own::Share::share(why)),
         }
     }
 }
@@ -624,21 +759,12 @@ impl HermeticClangProbe {
     ///   execute that exact verified snapshot with zero TOCTOU.
     fn ensure_verified<'a>(
         &self,
+        bound: Option<&bstd::cx::CxBound>,
         clock: &bstd::clock::Clock,
         began: bstd::clock::Instant,
         alloc: Alloc<'a>,
     ) -> Result<VerifiedClang, AString<'a>> {
-        let remaining = || -> Option<Duration> {
-            let elapsed = clock.now().since(began).unwrap_or(Duration::ZERO);
-            self.deadline.checked_sub(elapsed).filter(|d| !d.is_zero())
-        };
-        let Some(rem) = remaining() else {
-            return Err(own_str("c-probe clang verification timed out before starting", alloc));
-        };
-        let verify_cx = self
-            .io
-            .cx(rem, bstd::mem::TASK_FRAME)
-            .map_err(|_| own_str("c-probe verify context stopped", alloc))?;
+        let (verify_cx, _rem) = self.make_cx(bound, clock, began, "before clang verification", alloc)?;
         let shared = SharedAlloc::global();
         self.verify_flight
             .ask(&verify_cx, (), |vcx| {
@@ -769,8 +895,18 @@ pub fn open_command_c_probes<'a>(
         let sdk_dir: OwnArc<str, SharedAlloc<'static>> = OwnArc::from_str_in(sdk_dir_str, shared);
         let sdk_id: OwnArc<str, SharedAlloc<'static>> = OwnArc::from_str_in(sdk_str, shared);
         let sdk_digest = facts::sdk_id_digest(sdk_str);
-        let answerer: OwnArc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> = OwnArc::new_in(hermetic, shared);
-        CProbeSetting::Ready(CScriptProbes { answerer, records, sdk_dir, sdk_id, sdk_digest, clang_sha256 })
+        let hermetic_arc = OwnArc::new_in(hermetic, shared);
+        let answerer: OwnArc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> =
+            OwnArc::new_in(SharedHermetic(blaze_own::Share::share(&hermetic_arc)), shared);
+        CProbeSetting::Ready(CScriptProbes {
+            answerer,
+            hermetic: Some(hermetic_arc),
+            records,
+            sdk_dir,
+            sdk_id,
+            sdk_digest,
+            clang_sha256,
+        })
     }
 }
 
@@ -953,6 +1089,108 @@ impl HermeticClangProbe {
             alloc,
         )
     }
+    fn make_cx<'a>(
+        &self,
+        bound: Option<&bstd::cx::CxBound>,
+        clock: &bstd::clock::Clock,
+        began: bstd::clock::Instant,
+        stage: &str,
+        alloc: Alloc<'a>,
+    ) -> Result<(bstd::cx::Cx, Duration), AString<'a>> {
+        let elapsed = clock.now().since(began).unwrap_or(Duration::ZERO);
+        let Some(probe_rem) = self.deadline.checked_sub(elapsed).filter(|d| !d.is_zero()) else {
+            return Err(own_fmt(format_args!("c-probe deadline exhausted {stage}"), alloc));
+        };
+        match bound {
+            Some(b) => {
+                let rem = b.remaining(probe_rem).map_err(|stopped| match stopped {
+                    bstd::Stopped::Cancelled { .. } => own_fmt(format_args!("c-probe cancelled {stage}"), alloc),
+                    bstd::Stopped::Deadline { .. } => own_fmt(format_args!("c-probe deadline exhausted {stage}"), alloc),
+                    other => own_fmt(format_args!("c-probe stopped {stage}: {other}"), alloc),
+                })?;
+                let cx = b.child_on(&self.io, rem, bstd::mem::TASK_FRAME).map_err(|stopped| match stopped {
+                    bstd::Stopped::Cancelled { .. } => own_fmt(format_args!("c-probe cancelled {stage}"), alloc),
+                    bstd::Stopped::Deadline { .. } => own_fmt(format_args!("c-probe deadline exhausted {stage}"), alloc),
+                    other => own_fmt(format_args!("c-probe stopped {stage}: {other}"), alloc),
+                })?;
+                Ok((cx, rem))
+            }
+            None => {
+                let cx = self
+                    .io
+                    .cx(probe_rem, bstd::mem::TASK_FRAME)
+                    .map_err(|_| own_fmt(format_args!("c-probe context stopped {stage}"), alloc))?;
+                Ok((cx, probe_rem))
+            }
+        }
+    }
+
+    /// Executes `probe` bounded by the caller's `cx` cancellation lineage and deadline (as well as
+    /// this probe's own cap) so cancelled callers stop immediately without spawning clang.
+    pub fn answer_in_cx<'a, 'b>(
+        &self,
+        cx: &bstd::cx::Cx,
+        probe: &CanonicalProbe<'_, '_>,
+        input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+        alloc: Alloc<'a>,
+    ) -> Result<ProbeAnswer<'a>, AString<'a>> {
+        let bound = cx.bound();
+        self.answer_with_bound(Some(&bound), probe, input_bytes, alloc)
+    }
+
+    fn answer_with_bound<'a, 'b>(
+        &self,
+        bound: Option<&bstd::cx::CxBound>,
+        probe: &CanonicalProbe<'_, '_>,
+        input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+        alloc: Alloc<'a>,
+    ) -> Result<ProbeAnswer<'a>, AString<'a>> {
+        if let Some(b) = bound {
+            b.check().map_err(|stopped| match stopped {
+                bstd::Stopped::Cancelled { .. } => own_str("c-probe cancelled before starting", alloc),
+                bstd::Stopped::Deadline { .. } => own_str("c-probe deadline exhausted before starting", alloc),
+                other => own_fmt(format_args!("c-probe stopped before starting: {other}"), alloc),
+            })?;
+        }
+        let clock = self
+            .io
+            .need_clock()
+            .map_err(|m| own_fmt(format_args!("c-probe clock: {}", m.capability), alloc))?;
+        let probe_began = clock.now();
+        let (init_cx, _) = self.make_cx(bound, &clock, probe_began, "before work dir setup", alloc)?;
+        let work_root = self.ensure_work_dir(&init_cx, alloc)?;
+        let verified = self.ensure_verified(bound, &clock, probe_began, alloc)?;
+
+        let (stage_cx, _) = self.make_cx(bound, &clock, probe_began, "before staging", alloc)?;
+        let (dir_name, task_rel, task_dir) = make_unique_task_dir(&work_root, &clock, &stage_cx, alloc)?;
+        let task_real = own_fmt(format_args!("{}/{}", self.work_root.as_str(), dir_name.as_str()), alloc);
+        let guard = TaskDirGuard { io: &self.io, work_root: &work_root, task_rel, cleaned: false };
+
+        let run_res = self.run_in_task_dir(
+            bound,
+            probe,
+            input_bytes,
+            &verified,
+            &clock,
+            probe_began,
+            &stage_cx,
+            &task_dir,
+            task_real.as_str(),
+            alloc,
+        );
+        // Cleanup runs on a short uncancelled context so already-created temporary task folders
+        // are always removed even when the caller cancelled mid-probe.
+        let cleanup_elapsed = clock.now().since(probe_began).unwrap_or(Duration::ZERO);
+        let cleanup_rem = self.deadline.checked_sub(cleanup_elapsed).filter(|d| !d.is_zero());
+        let cleanup_res = match cleanup_rem {
+            Some(rem) => match self.io.cx(rem, bstd::mem::TASK_FRAME) {
+                Ok(cleanup_cx) => guard.cleanup(&cleanup_cx, alloc),
+                Err(_) => Err(own_str("c-probe cleanup context stopped", alloc)),
+            },
+            None => Err(own_str("c-probe deadline exhausted before cleanup", alloc)),
+        };
+        finish_with_cleanup(run_res, cleanup_res, alloc)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -973,55 +1211,7 @@ impl ProbeAnswerer for HermeticClangProbe {
         input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
         alloc: Alloc<'a>,
     ) -> Result<ProbeAnswer<'a>, AString<'a>> {
-        let clock = self
-            .io
-            .need_clock()
-            .map_err(|m| own_fmt(format_args!("c-probe clock: {}", m.capability), alloc))?;
-        let probe_began = clock.now();
-        let remaining = || -> Option<Duration> {
-            let elapsed = clock.now().since(probe_began).unwrap_or(Duration::ZERO);
-            self.deadline.checked_sub(elapsed).filter(|d| !d.is_zero())
-        };
-        let Some(init_rem) = remaining() else {
-            return Err(own_str("c-probe deadline exhausted before work dir setup", alloc));
-        };
-        let init_cx = self
-            .io
-            .cx(init_rem, bstd::mem::TASK_FRAME)
-            .map_err(|_| own_str("c-probe work dir context stopped", alloc))?;
-        let work_root = self.ensure_work_dir(&init_cx, alloc)?;
-        let verified = self.ensure_verified(&clock, probe_began, alloc)?;
-
-        let Some(stage_rem) = remaining() else {
-            return Err(own_str("c-probe deadline exhausted before staging", alloc));
-        };
-        let stage_cx = self
-            .io
-            .cx(stage_rem, bstd::mem::TASK_FRAME)
-            .map_err(|_| own_str("c-probe stage context stopped", alloc))?;
-        let (dir_name, task_rel, task_dir) = make_unique_task_dir(&work_root, &clock, &stage_cx, alloc)?;
-        let task_real = own_fmt(format_args!("{}/{}", self.work_root.as_str(), dir_name.as_str()), alloc);
-        let guard = TaskDirGuard { io: &self.io, work_root: &work_root, task_rel, cleaned: false };
-
-        let run_res = self.run_in_task_dir(
-            probe,
-            input_bytes,
-            &verified,
-            &clock,
-            &remaining,
-            &stage_cx,
-            &task_dir,
-            task_real.as_str(),
-            alloc,
-        );
-        let cleanup_res = match remaining() {
-            Some(cleanup_rem) => match self.io.cx(cleanup_rem, bstd::mem::TASK_FRAME) {
-                Ok(cleanup_cx) => guard.cleanup(&cleanup_cx, alloc),
-                Err(_) => Err(own_str("c-probe cleanup context stopped", alloc)),
-            },
-            None => Err(own_str("c-probe deadline exhausted before cleanup", alloc)),
-        };
-        finish_with_cleanup(run_res, cleanup_res, alloc)
+        self.answer_with_bound(None, probe, input_bytes, alloc)
     }
 }
 
@@ -1050,11 +1240,12 @@ impl HermeticClangProbe {
     #[expect(clippy::too_many_arguments, reason = "internal helper factoring result-bearing cleanup around probe execution")]
     fn run_in_task_dir<'a, 'b>(
         &self,
+        bound: Option<&bstd::cx::CxBound>,
         probe: &CanonicalProbe<'_, '_>,
         input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
         verified: &VerifiedClang,
         clock: &bstd::clock::Clock,
-        remaining: &dyn Fn() -> Option<Duration>,
+        probe_began: bstd::clock::Instant,
         stage_cx: &bstd::cx::Cx,
         task_dir: &bstd::fs::Dir<bstd::fs::ReadWrite>,
         task_real: &str,
@@ -1165,13 +1356,7 @@ impl HermeticClangProbe {
             .need_clock()
             .map_err(|m| own_fmt(format_args!("c-probe clock: {}", m.capability), alloc))?;
         let hermetic = Hermetic::new(HermeticCapOpts { spawner, clock: driver_clock });
-        let Some(run_rem) = remaining() else {
-            return Err(own_str("c-probe deadline exhausted during clang verification", alloc));
-        };
-        let cx = self
-            .io
-            .cx(run_rem, bstd::mem::TASK_FRAME)
-            .map_err(|_| own_str("c-probe context stopped", alloc))?;
+        let (cx, run_rem) = self.make_cx(bound, clock, probe_began, "before clang execution", alloc)?;
 
         let exec_path = self.clang_path.as_str();
         let spec = HermeticSpec::new(HermeticOpts {
@@ -1212,13 +1397,7 @@ impl HermeticClangProbe {
             _ => own_fmt(format_args!("c-probe hermetic run failed: {:?} ({:?})", e.fault, e.rule), alloc),
         })?;
 
-        let Some(post_rem) = remaining() else {
-            return Err(own_str("c-probe deadline exhausted before post-exec runtime closure revalidation", alloc));
-        };
-        let post_cx = self
-            .io
-            .cx(post_rem, bstd::mem::TASK_FRAME)
-            .map_err(|_| own_str("c-probe post-exec context stopped", alloc))?;
+        let (post_cx, _) = self.make_cx(bound, clock, probe_began, "before post-exec runtime closure revalidation", alloc)?;
         let post_id = self.live_strategy_id(&post_cx, alloc)?;
         if post_id != probe.answerer_id {
             return Err(own_str("host runtime closure changed during probe execution (rule 21)", alloc));
@@ -1715,6 +1894,8 @@ mod tests {
         assert!(store_err.as_str().contains("already held"), "unexpected store error: {store_err}");
         let failing_probes = super::CScriptProbes {
             answerer: blaze_own::Arc::new_in(StubAnswerer, super::SharedAlloc::global()),
+            #[cfg(target_os = "linux")]
+            hermetic: None,
             records: blaze_own::Arc::new_in(FailingCProbeStore, super::SharedAlloc::global()),
             sdk_dir: blaze_own::Arc::from_str_in("", super::SharedAlloc::global()),
             sdk_id: blaze_own::Arc::from_str_in("macos-sdk-15.2", super::SharedAlloc::global()),
@@ -2052,7 +2233,7 @@ mod tests {
             });
             entered_rx.recv().expect("holder entered flight compute");
             let began = clock.now();
-            let Err(err) = dummy.ensure_verified(&clock, began, alloc) else {
+            let Err(err) = dummy.ensure_verified(None, &clock, began, alloc) else {
                 panic!("must time out waiting on single-flight verification");
             };
             assert!(err.as_str().contains("timed out"), "unexpected error: {err}");
@@ -3201,6 +3382,8 @@ mod tests {
         let shared = super::SharedAlloc::global();
         let probes = super::CScriptProbes {
             answerer: super::OwnArc::new_in(FailingAnswerer, shared),
+            #[cfg(target_os = "linux")]
+            hermetic: None,
             records: super::OwnArc::new_in(EmptyStore, shared),
             sdk_dir: super::OwnArc::from_str_in("", shared),
             sdk_id: super::OwnArc::from_str_in("", shared),
@@ -3888,5 +4071,178 @@ mod tests {
         assert!(e_rc.contains("racy-clean oracle"), "unexpected: {e_rc}");
         let e_st = run_validation(InodeRecordPlant::SkipStampCheck).expect_err("must catch SkipStampCheck");
         assert!(e_st.contains("wrong-stamp oracle"), "unexpected: {e_st}");
+    }
+
+    #[test]
+    fn c_probe_propagates_caller_cancellation_and_deadline_without_spawning_clang() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use blaze_build_script::c_tasks_probe::{
+            self, CanonicalProbe, ProbeAnswer, ProbeAnswerer,
+        };
+        use blaze_ids::ContentId;
+        use blaze_own::{AString, Alloc, Arc as OwnArc, SharedAlloc};
+
+        struct CountingAnswerer {
+            id_calls: std::sync::Arc<AtomicUsize>,
+            answer_calls: std::sync::Arc<AtomicUsize>,
+        }
+        impl ProbeAnswerer for CountingAnswerer {
+            fn id<'a>(&self, _alloc: Alloc<'a>) -> Result<ContentId, AString<'a>> {
+                self.id_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ContentId([0xaa; 32]))
+            }
+            fn answer<'a, 'b>(
+                &self,
+                _probe: &CanonicalProbe<'_, '_>,
+                _input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+                alloc: Alloc<'a>,
+            ) -> Result<ProbeAnswer<'a>, AString<'a>> {
+                self.answer_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ProbeAnswer {
+                    code: 0,
+                    stdout: AString::from_str_in("ok", alloc),
+                    stderr: AString::from_str_in("", alloc),
+                })
+            }
+        }
+
+        let shared = SharedAlloc::global();
+        let alloc = Alloc::global();
+        let clang_pin = [0x11u8; 32];
+        let spawn = c_tasks_probe::Spawn {
+            program: "cc",
+            args: &["-E", "-"],
+            env: &[],
+            out_dir: "/out",
+            sdk: "",
+            mount: "/out",
+            sdk_id: "",
+            stdin: b"",
+        };
+        let probe = c_tasks_probe::canonicalize(
+            ContentId([0xaa; 32]),
+            &clang_pin,
+            &spawn,
+            |_| None,
+            alloc,
+        )
+        .expect("canonicalize probe");
+
+        let id_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let answer_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let base_probes = super::CScriptProbes {
+            answerer: OwnArc::new_in(
+                CountingAnswerer {
+                    id_calls: std::sync::Arc::clone(&id_calls),
+                    answer_calls: std::sync::Arc::clone(&answer_calls),
+                },
+                shared,
+            ),
+            #[cfg(target_os = "linux")]
+            hermetic: None,
+            records: OwnArc::new_in(super::MemCProbeStore::default(), shared),
+            sdk_dir: OwnArc::from_str_in("", shared),
+            sdk_id: OwnArc::from_str_in("", shared),
+            sdk_digest: [0; 32],
+            clang_sha256: clang_pin,
+        };
+        let setting = super::CProbeSetting::Ready(base_probes);
+
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(79, bstd::io::Limits::USUAL));
+        let cx = io.cx(super::Duration::from_secs(10), bstd::mem::TASK_FRAME).expect("sim cx");
+
+        // 1. Pre-cancelled caller Cx bound through `CProbeSetting::with_cx` rejects immediately
+        //    with zero calls to `answerer.id` or `answerer.answer`.
+        let mut saw_cancelled_answer = false;
+        let mut saw_cancelled_id = false;
+        let _ = cx.scope_with(|scope| {
+            scope.cancel();
+            let bound_setting = setting.with_cx(scope.cx());
+            let ready = bound_setting.ready().expect("ready setting");
+            let id_err = ready.answerer.id(alloc).expect_err("cancelled id must fail");
+            saw_cancelled_id = id_err.as_str().contains("cancelled");
+            let ans_err = ready
+                .answerer
+                .answer(&probe, &mut |_| None, alloc)
+                .expect_err("cancelled answer must fail");
+            saw_cancelled_answer = ans_err.as_str().contains("cancelled");
+        });
+        assert!(saw_cancelled_id, "cancelled bound id must report cancellation");
+        assert!(saw_cancelled_answer, "cancelled bound answer must report cancellation");
+        assert_eq!(id_calls.load(Ordering::SeqCst), 0, "cancelled bound id must not invoke underlying answerer");
+        assert_eq!(answer_calls.load(Ordering::SeqCst), 0, "cancelled bound answer must not invoke underlying answerer");
+
+        // 2. Expired caller deadline rejects immediately without invoking the answerer.
+        let clock = io.need_clock().expect("sim clock");
+        let short_cx = io.cx(super::Duration::from_millis(5), bstd::mem::TASK_FRAME).expect("short cx");
+        let _ = clock.sleep(&cx, super::Duration::from_millis(20));
+        let expired_setting = setting.with_cx(&short_cx);
+        let expired_ready = expired_setting.ready().expect("ready expired");
+        let exp_err = expired_ready
+            .answerer
+            .answer(&probe, &mut |_| None, alloc)
+            .expect_err("expired deadline must fail");
+        assert!(exp_err.as_str().contains("deadline"), "unexpected expired error: {exp_err}");
+        assert_eq!(answer_calls.load(Ordering::SeqCst), 0, "expired bound answer must not invoke underlying answerer");
+
+        // 3. On Linux, real `HermeticClangProbe::answer_in_cx` AND `CScriptProbes::with_cx`
+        //    (`BoundHermetic`) under a pre-cancelled caller Cx return `cancelled` immediately
+        //    BEFORE creating any work dir or spawning clang.
+        #[cfg(target_os = "linux")]
+        {
+            let sim_fs = io.need_fs().expect("sim fs");
+            let sim_root = sim_fs.root();
+            let shelf_rel = bstd::path::Path::new("shelf").expect("rel");
+            let work_rel = bstd::path::Path::new("work").expect("rel");
+            let shelf_cap = sim_root
+                .make_dir(&cx, &shelf_rel, bstd::fs::Durable::No)
+                .expect("mkdir shelf");
+            let work_base = sim_root
+                .make_dir(&cx, &work_rel, bstd::fs::Durable::No)
+                .expect("mkdir work");
+            let hermetic = super::HermeticClangProbe::from_shelf_dir(
+                blaze_own::Share::share(&io),
+                shelf_cap,
+                work_base.clone(),
+                None,
+                "tasks",
+                std::path::Path::new("/shelf"),
+                "x86_64-unknown-linux-gnu",
+                None,
+                std::path::PathBuf::from("/work/tasks"),
+                alloc,
+            )
+            .expect("construct HermeticClangProbe");
+            let hermetic_arc = OwnArc::new_in(hermetic, shared);
+            let hermetic_probes = super::CScriptProbes {
+                answerer: OwnArc::new_in(super::SharedHermetic(blaze_own::Share::share(&hermetic_arc)), shared),
+                hermetic: Some(blaze_own::Share::share(&hermetic_arc)),
+                records: OwnArc::new_in(super::MemCProbeStore::default(), shared),
+                sdk_dir: OwnArc::from_str_in("", shared),
+                sdk_id: OwnArc::from_str_in("", shared),
+                sdk_digest: [0; 32],
+                clang_sha256: clang_pin,
+            };
+            let mut hermetic_cancelled = false;
+            let mut bound_hermetic_cancelled = false;
+            let _ = cx.scope_with(|scope| {
+                scope.cancel();
+                let err = hermetic_arc
+                    .answer_in_cx(scope.cx(), &probe, &mut |_| None, alloc)
+                    .expect_err("cancelled HermeticClangProbe::answer_in_cx must fail immediately");
+                hermetic_cancelled = err.as_str().contains("cancelled");
+
+                let bound_hp = hermetic_probes.with_cx(scope.cx());
+                let err2 = bound_hp
+                    .answerer
+                    .answer(&probe, &mut |_| None, alloc)
+                    .expect_err("cancelled BoundHermetic::answer must fail immediately");
+                bound_hermetic_cancelled = err2.as_str().contains("cancelled");
+            });
+            assert!(hermetic_cancelled, "HermeticClangProbe::answer_in_cx must report cancellation");
+            assert!(bound_hermetic_cancelled, "BoundHermetic::answer must report cancellation");
+            let work_entries = work_base.own_entries(&cx).expect("list work dir").len();
+            assert_eq!(work_entries, 0, "cancelled probe must not create any task directory or spawn clang");
+        }
     }
 }

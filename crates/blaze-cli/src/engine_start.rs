@@ -147,6 +147,13 @@ pub(crate) struct RunProcs<'n, 'e> {
     /// The answer's `UnitGraph` row (`Standing::graph`).
     pub(crate) graph: blaze_drive::Input,
     pub(crate) env: &'n crate::fetch::FetchEnv<'e>,
+    /// Lazy macOS SDK handle sharing `Standing`'s `OnceCell` resolver so proc-macro dep-probe
+    /// keys match `check` on macOS (0 ms cost when no proc-macro call occurs).
+    pub(crate) sdk: crate::engine_check::RunSdk<'e>,
+    /// Shared command-level C-probe / spawn-pin holder from `check` (`Standing::probes_for_procs`)
+    /// so start-time proc-macro runners reuse the exact probe snapshot that keyed and produced
+    /// the `MacroModule` records.
+    pub(crate) probes: &'e crate::scripts::SharedCommandProbes,
     pub(crate) frame: &'n bstd::mem::Frame,
 }
 
@@ -189,8 +196,14 @@ impl<'n> RunProcs<'n, '_> {
             crate::units::emit_proc_macro_lock_files(cx, self.root, &stamps, proc_macros, lockfile.lock, checkout_dirs, None, &mut rows, frame)
                 .map_err(|error| said(format_args!("no proc-macro runner: macro files: {error}")))?;
         }
-        let side = crate::proc_runner::MacroSide { lock: lockfile, place: crate::macros::Place { home: env.home, checkout: env.checkout, members, rows: &rows }, heap: env.heap };
-        crate::proc_runner::make(world, *names.list(), &side).map_err(|error| said(format_args!("no proc-macro runner: {error} (proc_runner.rs `make`)")))
+        let resolved_sdk = self.sdk.resolve(cx);
+        let side = crate::proc_runner::MacroSide {
+            lock: lockfile,
+            place: crate::macros::Place { home: env.home, checkout: env.checkout, members, rows: &rows },
+            probes: self.probes.with_env(env).with_sdk(resolved_sdk).with_checked_snapshot(),
+            heap: env.heap,
+        };
+        crate::proc_runner::make(cx, world, *names.list(), &side).map_err(|error| said(format_args!("no proc-macro runner: {error} (proc_runner.rs `make`)")))
     }
 }
 
@@ -1211,7 +1224,9 @@ fn run_program_with(
     let typed = crate::engine_body_record::TypedFrom { cx, lent, records: standing.records(), alloc: heap.alloc() };
     let env = &facts.fetch_env;
     // The runner, made at a body's first proc-macro call ([`RunProcs`]; C9).
-    let inputs = RunProcs { cx, root, snapshot: found.snapshot(), graph: standing.graph, env, frame };
+    let sdk = standing.sdk_for_procs();
+    let probes = standing.probes_for_procs();
+    let inputs = RunProcs { cx, root, snapshot: found.snapshot(), graph: standing.graph, env, sdk, probes, frame };
     let maker = crate::job_texts::MadeOnce::new(|| inputs.make());
     let procs = crate::job_texts::Procs::ByNeed(&maker);
     let scope_records = crate::front_load::ScopeRecords::new(found.snapshot(), blaze_world::crate_list::CrateGraph::len(list), heap);
@@ -1591,7 +1606,9 @@ pub(crate) fn run_tests_status(
                 }
                 // One runner for every dirty suite, made at the first proc-macro call any body meets
                 // ([`RunProcs`]; C9). Before `runnable` and `bin_suites`, whose names records borrow it.
-                let inputs = inventory.suites.first().map(|(found, _)| RunProcs { cx, root, snapshot: found.snapshot(), graph: standing.graph, env: &facts.fetch_env, frame });
+                let sdk = standing.sdk_for_procs();
+                let probes = standing.probes_for_procs();
+                let inputs = inventory.suites.first().map(|(found, _)| RunProcs { cx, root, snapshot: found.snapshot(), graph: standing.graph, env: &facts.fetch_env, sdk, probes, frame });
                 let maker = crate::job_texts::MadeOnce::new(|| match &inputs {
                     Some(inputs) => inputs.make(),
                     None => Err("no proc-macro runner: this command has no test suite (engine_start.rs `run_tests`)"),

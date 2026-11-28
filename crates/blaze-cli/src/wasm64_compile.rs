@@ -149,6 +149,358 @@ fn fold_extra_cfgs_bytes<A: core::alloc::Allocator>(
 /// workers from simultaneously re-parsing `core`/`alloc`/`std` (~3.5x peak RSS reduction).
 static SYSROOT_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Stack-allocated 64-byte lowercase ASCII hex digest (zero heap allocation).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Hex64([u8; 64]);
+
+impl Hex64 {
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+        let mut out = [0u8; 64];
+        for (i, byte) in bytes.iter().enumerate() {
+            let hi = byte >> 4;
+            let lo = byte & 15;
+            if let Some(slot) = out.get_mut(2 * i) {
+                *slot = if hi < 10 { b'0' + hi } else { b'a' + (hi - 10) };
+            }
+            if let Some(slot) = out.get_mut(2 * i + 1) {
+                *slot = if lo < 10 { b'0' + lo } else { b'a' + (lo - 10) };
+            }
+        }
+        Self(out)
+    }
+
+    pub(crate) fn from_hex_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        let mut out = [0u8; 64];
+        out.copy_from_slice(bytes);
+        Some(Self(out))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.0).unwrap_or("")
+    }
+
+    /// Decodes this 64-hex digest back into its 32-byte [`ContentId`] representation (zero hash
+    /// domains, zero allocations, injective for all valid lowercase hex digests).
+    pub(crate) fn to_content_id(self) -> ContentId {
+        const fn nibble(b: u8) -> u8 {
+            match b {
+                b'0'..=b'9' => b - b'0',
+                b'a'..=b'f' => b - b'a' + 10,
+                b'A'..=b'F' => b - b'A' + 10,
+                _ => 0,
+            }
+        }
+        let mut out = [0u8; 32];
+        for (dst, pair) in out.iter_mut().zip(self.0.chunks_exact(2)) {
+            if let [hi, lo] = *pair {
+                *dst = (nibble(hi) << 4) | nibble(lo);
+            }
+        }
+        ContentId(out)
+    }
+}
+
+/// C-probe state observable by a dependency build script during wasm64 self-compilation.
+/// Never includes diagnostic prose or machine paths (Rule 21).
+#[derive(Clone, Copy)]
+pub(crate) enum DepCProbeIdentity<'a> {
+    /// No `CProbeSetting` configured (`HOME` unset).
+    Disabled,
+    /// `CProbeSetting::Unavailable(_)` (e.g. non-Linux host using `pins/answers/clang.json`,
+    /// or Linux host without a clang pin). Keyed only by a stable unavailability tag plus
+    /// semantic clang/SDK/answerer IDs — never by human-readable diagnostic text.
+    Unavailable {
+        clang_sha256: Option<[u8; 32]>,
+        sdk_id: Option<&'a str>,
+        answerer_id: ContentId,
+    },
+    /// `CProbeSetting::Ready(ready)` bound to the live `ready.answerer.id(alloc)` (on Linux,
+    /// includes the live host ELF runtime closure of `clang-23`), `ready.clang_sha256`, and
+    /// `ready.sdk_id`.
+    Ready {
+        clang_sha256: [u8; 32],
+        sdk_id: &'a str,
+        answerer_id: ContentId,
+    },
+}
+
+/// Deterministic probe/pin inputs that can affect dependency build scripts run during wasm64
+/// self-compilation (`host`, derived-fact `pins`, and live C-probe identity). Folded into the
+/// compiled module's identity key whenever a unit's wasm64 dependency closure contains at least
+/// one dependency build script (Rule 21).
+#[derive(Clone, Copy)]
+pub(crate) struct DepProbeIdentity<'a> {
+    pub(crate) host: &'a str,
+    pub(crate) pins: Option<&'a blaze_proc_macro::spawn_route::FactPins>,
+    pub(crate) c_probe: DepCProbeIdentity<'a>,
+}
+
+impl DepProbeIdentity<'_> {
+    /// Computes the deterministic 64-hex digest over all probe/pin inputs.
+    pub(crate) fn hex(&self) -> Hex64 {
+        let mut h = blaze_blake3::Hasher::new();
+        let feed_str = |h: &mut blaze_blake3::Hasher, s: &str| {
+            let len = u64::try_from(s.len()).unwrap_or(u64::MAX);
+            h.update(&len.to_le_bytes());
+            h.update(s.as_bytes());
+        };
+        h.update(b"blaze-wasm64-dep-probes-v3\0");
+        feed_str(&mut h, self.host);
+        match self.pins {
+            Some(pins) => {
+                h.update(&[1]);
+                feed_str(&mut h, &pins.clang_version_text);
+                feed_str(&mut h, &pins.macos_product_version);
+                feed_str(&mut h, &pins.macos_build_version);
+            }
+            None => {
+                h.update(&[0]);
+            }
+        }
+        match self.c_probe {
+            DepCProbeIdentity::Disabled => {
+                h.update(&[0]);
+            }
+            DepCProbeIdentity::Unavailable { clang_sha256, sdk_id, answerer_id } => {
+                h.update(&[1]);
+                match clang_sha256 {
+                    Some(sha) => {
+                        h.update(&[1]);
+                        h.update(&sha);
+                    }
+                    None => {
+                        h.update(&[0]);
+                    }
+                }
+                match sdk_id.filter(|s| !s.is_empty()) {
+                    Some(sdk) => {
+                        h.update(&[1]);
+                        feed_str(&mut h, sdk);
+                    }
+                    None => {
+                        h.update(&[0]);
+                    }
+                }
+                h.update(&answerer_id.0);
+            }
+            DepCProbeIdentity::Ready { clang_sha256, sdk_id, answerer_id } => {
+                h.update(&[2]);
+                h.update(&clang_sha256);
+                match Some(sdk_id).filter(|s| !s.is_empty()) {
+                    Some(sdk) => {
+                        h.update(&[1]);
+                        feed_str(&mut h, sdk);
+                    }
+                    None => {
+                        h.update(&[0]);
+                    }
+                }
+                h.update(&answerer_id.0);
+            }
+        }
+        Hex64::from_bytes(h.finalize())
+    }
+}
+
+/// Computes a deterministic 64-hex error tag for `MacroModule` task planning when probe/pin setup
+/// or wasm64 root lookup fails, hashing ONLY the stable semantic [`ProbeErrorKind`] (never
+/// human-readable diagnostic prose or machine paths, Rule 21) so the planned task source never
+/// matches a previous `Ok` record and always enters lookup to report the typed per-task refusal.
+pub(crate) fn probe_error_hex(kind: crate::scripts::ProbeErrorKind) -> Hex64 {
+    let mut h = blaze_blake3::Hasher::new();
+    h.update(b"blaze-wasm64-dep-probes-err-v2\0");
+    h.update(&[kind.tag()]);
+    Hex64::from_bytes(h.finalize())
+}
+
+/// Computes the deterministic 64-hex probe/pin digest from the shared command `SpawnSetting` and
+/// `CProbeSetting`, querying the live `ready.answerer_id_in_cx(cx, alloc)` bounded by caller
+/// cancellation/deadline whenever `CProbeSetting::Ready` is active (propagating any answerer
+/// identity error verbatim, never falling back to a constant).
+pub(crate) fn dep_probe_identity_from_setting(
+    cx: &bstd::cx::Cx,
+    host: &str,
+    spawn: &SpawnSetting,
+    c_probes: Option<&blaze_proc_macro::probe_clang::CProbeSetting>,
+    env_sdk_id: Option<&str>,
+    alloc: Alloc<'_>,
+    shared: blaze_own::SharedAlloc<'static>,
+) -> Result<Hex64, crate::scripts::ProbeSetupError> {
+    let c_probe = match c_probes {
+        None => DepCProbeIdentity::Disabled,
+        Some(blaze_proc_macro::probe_clang::CProbeSetting::Unavailable(_)) => {
+            DepCProbeIdentity::Unavailable {
+                clang_sha256: blaze_proc_macro::probe_clang::active_clang_pin(host),
+                sdk_id: env_sdk_id,
+                answerer_id: blaze_proc_macro::probe_clang::default_answerer_strategy_id(),
+            }
+        }
+        Some(blaze_proc_macro::probe_clang::CProbeSetting::Ready(ready)) => {
+            let answerer_id = ready.answerer_id_in_cx(cx, alloc).map_err(|error| {
+                let mut msg = blaze_own::String::new_in(shared);
+                let _ = write!(msg, "computing live C-probe answerer identity: {error}");
+                crate::scripts::ProbeSetupError::new(crate::scripts::ProbeErrorKind::AnswererIdentity, msg)
+            })?;
+            DepCProbeIdentity::Ready {
+                clang_sha256: ready.clang_sha256,
+                sdk_id: ready.sdk_id.as_ref(),
+                answerer_id,
+            }
+        }
+    };
+    Ok(DepProbeIdentity { host, pins: spawn.pins.as_ref(), c_probe }.hex())
+}
+
+/// Verifies that the live probe/pin identity (`current`) still matches the frozen identity
+/// captured at keying time (`expected`), refusing publication on mid-compile drift (Rule 21).
+fn verify_dep_probe_unchanged(
+    expected: Hex64,
+    current: Hex64,
+    unit_name: &str,
+    alloc: Alloc<'_>,
+) -> Result<(), SelfCompileError> {
+    if current == expected {
+        return Ok(());
+    }
+    let mut msg = blaze_own::String::new_in(alloc);
+    let _ = write!(
+        msg,
+        "live C-probe answerer or derived-fact pin identity changed during wasm64 self-compilation of {unit_name} (keyed {}, now {}); refusing to publish under stale key",
+        expected.as_str(),
+        current.as_str()
+    );
+    Err(SelfCompileError::Failed(msg.as_str().into()))
+}
+
+/// Revalidates `expected` against the live `CProbeSetting` and `SpawnSetting` under `cx` before
+/// publishing.
+#[expect(clippy::too_many_arguments, reason = "explicit capability parameters for unit-testable revalidation")]
+pub(crate) fn revalidate_dep_probe_setting(
+    cx: &bstd::cx::Cx,
+    host: &str,
+    spawn: &SpawnSetting,
+    c_probes: Option<&blaze_proc_macro::probe_clang::CProbeSetting>,
+    env_sdk_id: Option<&str>,
+    expected: Hex64,
+    unit_name: &str,
+    alloc: Alloc<'_>,
+    shared: blaze_own::SharedAlloc<'static>,
+) -> Result<(), SelfCompileError> {
+    let current = dep_probe_identity_from_setting(cx, host, spawn, c_probes, env_sdk_id, alloc, shared).map_err(|e| {
+        let mut msg = blaze_own::String::new_in(alloc);
+        let _ = write!(msg, "revalidating live C-probe identity of {unit_name}: {e}");
+        SelfCompileError::Failed(msg.as_str().into())
+    })?;
+    verify_dep_probe_unchanged(expected, current, unit_name, alloc)
+}
+
+fn revalidate_dep_probes(
+    cx: &bstd::cx::Cx,
+    probes: crate::scripts::CommandProbes<'_>,
+    expected: Hex64,
+    unit_name: &str,
+    alloc: Alloc<'_>,
+) -> Result<(), SelfCompileError> {
+    let current = probes.dep_probe_identity_hex(cx).map_err(|e| {
+        let mut msg = blaze_own::String::new_in(alloc);
+        let _ = write!(msg, "revalidating live C-probe identity of {unit_name}: {e}");
+        SelfCompileError::Failed(msg.as_str().into())
+    })?;
+    verify_dep_probe_unchanged(expected, current, unit_name, alloc)
+}
+
+/// Folds `probes_hex` into an existing 64-hex `deps_hex` digest (Rule 21).
+pub(crate) fn fold_dep_probes_hex(deps_hex: &str, probes_hex: &str) -> Hex64 {
+    let mut h = blaze_blake3::Hasher::new();
+    h.update(deps_hex.as_bytes());
+    h.update(b"\ndep-probes ");
+    h.update(probes_hex.as_bytes());
+    Hex64::from_bytes(h.finalize())
+}
+
+/// Folds `probes_hex` into an optional build-script `deps` digest, allocating the result in `frame`.
+pub(crate) fn fold_dep_probes_opt<'f>(
+    deps: Option<&str>,
+    probes_hex: &str,
+    frame: &'f bstd::mem::Frame,
+) -> &'f str {
+    let base = deps.unwrap_or("");
+    let folded = fold_dep_probes_hex(base, probes_hex);
+    frame.alloc_str(folded.as_str())
+}
+
+/// Returns whether `root_unit`'s `wasm64-blaze-wasip1` dependency closure executes at least one
+/// dependency build script (`run_dep_build_script`).
+/// Requires `wasm_graph` to be present and contain `root_unit`; never silently falls back to
+/// scanning the host graph (Rule 3: a wasm64-only dep build script would otherwise be missed).
+pub(crate) fn unit_has_dep_build_scripts(
+    graph: &UnitGraph<'_>,
+    wasm_graph: Option<&UnitGraph<'_>>,
+    root_unit: UnitId,
+    is_proc_macro: bool,
+) -> Result<bool, crate::scripts::ProbeSetupError> {
+    let shared = blaze_own::SharedAlloc::global();
+    let Some(wg) = wasm_graph else {
+        return Err(crate::scripts::ProbeSetupError::from_str(
+            crate::scripts::ProbeErrorKind::WasmGraphMissing,
+            "wasm64-blaze-wasip1 unit graph is absent; cannot classify dependency build scripts from the host graph",
+        ));
+    };
+    let frame = Frame::with_reserve(1 << 20, Tag::Other).map_err(|_| {
+        crate::scripts::ProbeSetupError::from_str(
+            crate::scripts::ProbeErrorKind::FrameReserve,
+            "failed to reserve frame for wasm64 dep build-script scan",
+        )
+    })?;
+    let erased = Erased::new(&frame);
+    let alloc = erased.handle();
+    let mode = if is_proc_macro { CompileMode::ProcMacro } else { CompileMode::BuildScript };
+    let active_root = match locate_root_in_wasm_graph(graph, wg, root_unit, mode, alloc) {
+        Ok(id) => id,
+        Err(why) => {
+            let mut msg = blaze_own::String::new_in(shared);
+            let _ = write!(msg, "{why}");
+            return Err(crate::scripts::ProbeSetupError::new(
+                crate::scripts::ProbeErrorKind::WasmRootMissing,
+                msg,
+            ));
+        }
+    };
+    let active_graph = wg;
+    let mut visited: AVec<'_, bool> = OwnVec::with_capacity_in(active_graph.units.len(), alloc);
+    visited.resize(active_graph.units.len(), false);
+    let mut stack: AVec<'_, UnitId> = OwnVec::new_in(alloc);
+    stack.push(active_root);
+    while let Some(uid) = stack.pop() {
+        let Some(slot) = visited.get_mut(uid.index()) else {
+            continue;
+        };
+        if *slot {
+            continue;
+        }
+        *slot = true;
+        let Some(u) = active_graph.units.get(uid.index()) else {
+            continue;
+        };
+        if !(uid == active_root && !is_proc_macro) && u.build_script.is_some() {
+            return Ok(true);
+        }
+        for dep in u.deps.iter() {
+            if active_graph
+                .units
+                .get(dep.unit.index())
+                .is_some_and(|du| matches!(du.kind, UnitKind::Lib | UnitKind::ProcMacro))
+            {
+                stack.push(dep.unit);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Immutable inputs borrowed from the coordinator for on-demand wasm64 self-compilation.
 #[derive(Clone, Copy)]
 pub(crate) struct CompileInputs<'a> {
@@ -168,6 +520,42 @@ pub(crate) struct CompileInputs<'a> {
     pub producers: Producers,
     /// Process heap for `Maker` tables (reclaimed when `Maker` drops).
     pub heap: &'static blaze_own::Heap,
+    /// Shared command-level lazy C-probe and derived-fact pin holder (opened on demand only when
+    /// a unit has dependency build scripts or executes `run_dep_build_script` on cache miss, and
+    /// shared with workspace `Script` tasks in `scripts.rs`).
+    pub probes: Option<crate::scripts::CommandProbes<'a>>,
+}
+
+/// Lazy command-level probe/pin handle threaded from [`CompileInputs`] into dependency build
+/// scripts executed during wasm64 self-compilation, plus the frozen `expected_probes` identity
+/// captured during keying for mid-compile revalidation before publishing (Rule 21).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DepScriptProbes<'a> {
+    pub(crate) shared: Option<crate::scripts::CommandProbes<'a>>,
+    pub(crate) expected_probes: Option<Hex64>,
+}
+
+impl<'a> DepScriptProbes<'a> {
+    fn from_inputs(inputs: CompileInputs<'a>) -> Self {
+        Self { shared: inputs.probes, expected_probes: None }
+    }
+
+    fn with_expected(self, expected_probes: Option<Hex64>) -> Self {
+        Self { shared: self.shared, expected_probes }
+    }
+}
+
+/// Builds a strictly hermetic [`SpawnSetting`] carrying only the derived-fact pins from `spawn`
+/// (never `hvbox_allowed`, ambient `tools`, or `userland`), or [`SpawnSetting::off`] when absent.
+pub(crate) fn dep_script_spawn_setting(spawn: Option<&SpawnSetting>) -> SpawnSetting {
+    match spawn.and_then(|s| s.pins.as_ref()) {
+        Some(pins) => SpawnSetting::facts_only(blaze_proc_macro::spawn_route::FactPins {
+            clang_version_text: pins.clang_version_text.as_str().into(),
+            macos_product_version: pins.macos_product_version.as_str().into(),
+            macos_build_version: pins.macos_build_version.as_str().into(),
+        }),
+        None => SpawnSetting::off(),
+    }
 }
 
 /// Wasm64 proc-macro reactor shim compiled as crate 0 alongside the proc-macro crate (crate 1).
@@ -760,8 +1148,10 @@ fn select_build_script_unit(
 /// Ensures the build-script unit `script_id` (`package version features`, expected `deps_digest`)
 /// has a compiled `wasm64` module in `<store>/build-script/modules/` and returns its
 /// `wasm-sha256` hex digest.
-#[expect(clippy::too_many_arguments, reason = "build-script compile entry point taking store, inputs, exact UnitId, package identity, and expected deps digest")]
+#[expect(clippy::too_many_arguments, reason = "build-script compile entry point taking cx, store, inputs, exact UnitId, package identity, and expected deps digest")]
+#[expect(clippy::too_many_arguments, reason = "top-level wasm64 build-script entry takes cx, store, compile inputs, unit id, metadata, expected deps, and frozen planned probes")]
 pub(crate) fn compile_build_script(
+    cx: &bstd::cx::Cx,
     store: &Path,
     inputs: CompileInputs<'_>,
     script_id: UnitId,
@@ -769,6 +1159,7 @@ pub(crate) fn compile_build_script(
     version: &str,
     features: &[&str],
     expected_deps: Option<&str>,
+    expected_probes: Option<Hex64>,
 ) -> Result<std::string::String, SelfCompileError> {
     let Some(checkout) = inputs.checkout else {
         return Err(SelfCompileError::Failed(std::format!(
@@ -796,6 +1187,7 @@ pub(crate) fn compile_build_script(
     want_sorted.sort_unstable();
     let script_id = select_build_script_unit(&decoded.graph, script_id, package, version, &want_sorted, &frame)?;
     ensure_build_script_unit(
+        cx,
         store,
         &decoded.graph,
         wasm_decoded.as_ref().map(|d| &d.graph),
@@ -804,6 +1196,7 @@ pub(crate) fn compile_build_script(
         inputs.members,
         &inputs.producers,
         inputs.heap,
+        DepScriptProbes::from_inputs(inputs).with_expected(expected_probes),
         script_id,
         expected_deps,
         0,
@@ -825,10 +1218,76 @@ fn path_pkg_files_digest(
     Some(blaze_proc_macro::module::files_digest(&mut files))
 }
 
+/// Computes the build-script files digest (`Cargo.toml` + `build.rs` root) when `pkg_id` is a
+/// workspace/path member, propagating any I/O error instead of silently downgrading to `None`
+/// (which would change the module lookup class to a source-unqualified registry/git key, Rule 3).
+fn member_script_files_digest<'a>(
+    checkout: &blaze_proc_macro::script_sandbox::RealRoot,
+    members: &[(LockId, &str, blaze_world::PathKind)],
+    pkg_id: LockId,
+    unit_root: &str,
+    unit_name: &str,
+    alloc: Alloc<'a>,
+) -> Result<Option<blaze_own::String<Alloc<'a>>>, SelfCompileError> {
+    let Some((_, dir, _)) = members.iter().find(|(id, _, _)| *id == pkg_id) else {
+        return Ok(None);
+    };
+    let pkg_dir = if dir.is_empty() {
+        checkout.path().to_path_buf()
+    } else {
+        checkout.path().join(dir)
+    };
+    let hex = script_unit::script_files_digest(&pkg_dir, unit_root).map_err(|e| {
+        let mut msg = blaze_own::String::new_in(alloc);
+        let _ = write!(msg, "reading build script files of {unit_name}: {e}");
+        SelfCompileError::Failed(msg.as_str().into())
+    })?;
+    Ok(Some(blaze_own::String::from_str_in(hex.as_str(), alloc)))
+}
+
+/// Looks up an already-compiled build-script module in `store`, propagating both store-lookup
+/// errors and `wasm-sha256` read errors cleanly so compilation runs ONLY on an explicit
+/// `Ok(None)` cache miss (Rule 3).
+fn lookup_cached_build_script_module<'a>(
+    store: &Path,
+    name: &str,
+    version: &str,
+    feats: &[&str],
+    files_digest: Option<&str>,
+    deps_digest: Option<&str>,
+    alloc: Alloc<'a>,
+) -> Result<Option<blaze_own::String<Alloc<'a>>>, SelfCompileError> {
+    match script_unit::module_of_files_and_deps(store, name, version, feats, files_digest, deps_digest) {
+        Ok(Some(record_dir)) => {
+            let digest = std::fs::read_to_string(record_dir.join("wasm-sha256")).map_err(|e| {
+                let mut msg = blaze_own::String::new_in(alloc);
+                let _ = write!(
+                    msg,
+                    "reading wasm-sha256 for cached build-script module {name} {version} in {}: {e}",
+                    record_dir.display()
+                );
+                SelfCompileError::Failed(msg.as_str().into())
+            })?;
+            Ok(Some(blaze_own::String::from_str_in(digest.trim(), alloc)))
+        }
+        Ok(None) => Ok(None),
+        Err(e) => {
+            let mut msg = blaze_own::String::new_in(alloc);
+            let _ = write!(
+                msg,
+                "looking up cached build-script module {name} {version} in {}: {e}",
+                store.display()
+            );
+            Err(SelfCompileError::Failed(msg.as_str().into()))
+        }
+    }
+}
+
 /// Recursively compiles `script_id` (and any build-script dependencies of its build-dependencies)
 /// into `<store>/build-script/modules/<key>` and returns its `wasm-sha256` digest.
-#[expect(clippy::too_many_arguments, reason = "recursive build-script compilation over store, graph, wasm_graph, lock, checkout, members, heap, unit, expected_deps, and depth")]
+#[expect(clippy::too_many_arguments, reason = "recursive build-script compilation over cx, store, graph, wasm_graph, lock, checkout, members, heap, dep_probes, unit, expected_deps, and depth")]
 fn ensure_build_script_unit(
+    cx: &bstd::cx::Cx,
     store: &Path,
     graph: &UnitGraph<'_>,
     wasm_graph: Option<&UnitGraph<'_>>,
@@ -837,6 +1296,7 @@ fn ensure_build_script_unit(
     members: &[(LockId, &str, blaze_world::PathKind)],
     producers: &Producers,
     heap: &'static blaze_own::Heap,
+    dep_probes: DepScriptProbes<'_>,
     script_id: UnitId,
     expected_deps: Option<&str>,
     depth: u8,
@@ -863,7 +1323,36 @@ fn ensure_build_script_unit(
             })
         })
         .transpose()?;
-    let deps_digest = script_unit::script_deps_digest(graph, wasm_graph, lock, script_id, |dep_pkg| {
+    // Ensure we always classify and compile against the exact `wasm64-blaze-wasip1` graph:
+    // if the caller did not supply a precomputed `wasm_graph`, resolve it once up front so both
+    // `unit_has_dep_build_scripts` and `compile_unit_to_wasm64` see the exact same WASI closure.
+    let resolved_wasm_frame = if wasm_graph.is_none() {
+        Some(Frame::with_reserve(COMPILE_FRAME_RESERVE, Tag::Other).map_err(|_| {
+            SelfCompileError::Failed("failed to reserve wasm64 resolution frame".into())
+        })?)
+    } else {
+        None
+    };
+    let resolved_wasm_erased = resolved_wasm_frame.as_ref().map(Erased::new);
+    let resolved_wasm = if let (Some(rf), Some(re)) = (&resolved_wasm_frame, &resolved_wasm_erased) {
+        let (wg, _) = resolve_wasm64_graph(
+            store,
+            graph,
+            lock,
+            checkout,
+            members,
+            script_id,
+            CompileMode::BuildScript,
+            rf,
+            re.bump(),
+        )?;
+        Some(wg)
+    } else {
+        None
+    };
+    let effective_wasm_graph = wasm_graph.or(resolved_wasm.as_ref());
+
+    let deps_digest = script_unit::script_deps_digest(graph, effective_wasm_graph, lock, script_id, |dep_pkg| {
         path_pkg_files_digest(checkout, members, dep_pkg)
     })
     .map_err(|e| {
@@ -871,6 +1360,29 @@ fn ensure_build_script_unit(
         let _ = write!(msg, "build-script deps digest of {}: {e}", unit.name.as_str());
         SelfCompileError::Failed(msg.as_str().into())
     })?;
+    let (deps_digest, frozen_probes) = if let Some(shared) = dep_probes.shared {
+        let has_dep_scripts = unit_has_dep_build_scripts(graph, effective_wasm_graph, script_id, false).map_err(|e| {
+            let mut msg = blaze_own::String::new_in(heap.alloc());
+            let _ = write!(msg, "build-script wasm64 dep lookup of {}: {e}", unit.name.as_str());
+            SelfCompileError::Failed(msg.as_str().into())
+        })?;
+        if has_dep_scripts {
+            let probes_hex = shared.dep_probe_identity_hex(cx).map_err(|e| {
+                let mut msg = blaze_own::String::new_in(heap.alloc());
+                let _ = write!(msg, "build-script dep probe identity of {}: {e}", unit.name.as_str());
+                SelfCompileError::Failed(msg.as_str().into())
+            })?;
+            if let Some(expected) = dep_probes.expected_probes {
+                verify_dep_probe_unchanged(expected, probes_hex, unit.name.as_str(), heap.alloc())?;
+            }
+            let folded = fold_dep_probes_hex(deps_digest.as_deref().unwrap_or(""), probes_hex.as_str());
+            (Some(folded.as_str().into()), Some(probes_hex))
+        } else {
+            (deps_digest, None)
+        }
+    } else {
+        (deps_digest, None)
+    };
     if let Some(want_deps) = expected_deps
         && deps_digest.as_deref() != Some(want_deps)
     {
@@ -886,33 +1398,40 @@ fn ensure_build_script_unit(
         return Err(SelfCompileError::Failed(msg.as_str().into()));
     }
 
-    // Fast path: already compiled and cached on disk.
-    if let Ok(Some(record_dir)) = script_unit::module_of_files_and_deps(
+    // Fast path: already compiled and cached on disk. Propagate store/digest errors cleanly and
+    // self-compile ONLY on an explicit `Ok(None)` miss (Rule 3).
+    if let Some(digest) = lookup_cached_build_script_module(
         store,
         unit.name.as_str(),
         unit.version.as_str(),
         &feats,
         files_digest.as_deref(),
         deps_digest.as_deref(),
-    ) && let Ok(digest) = std::fs::read_to_string(record_dir.join("wasm-sha256"))
-    {
-        return Ok(digest.trim().to_owned());
+        heap.alloc(),
+    )? {
+        return Ok(digest.as_str().to_owned());
     }
 
     let wasm = compile_unit_to_wasm64(
+        cx,
         store,
         graph,
-        wasm_graph,
+        effective_wasm_graph,
         lock,
         checkout,
         members,
         producers,
         heap,
+        dep_probes.with_expected(frozen_probes),
         script_id,
         CompileMode::BuildScript,
         depth,
     )?
     .wasm;
+
+    if let (Some(shared), Some(expected)) = (dep_probes.shared, frozen_probes) {
+        revalidate_dep_probes(cx, shared, expected, unit.name.as_str(), heap.alloc())?;
+    }
 
     let id = blaze_toolchain::PINNED;
     let mut identity = std::format!(
@@ -952,6 +1471,7 @@ fn ensure_build_script_unit(
 /// crate key and loaded `ModuleRecord`.
 #[expect(clippy::too_many_arguments, reason = "mirrors compile_unit_to_wasm64 inputs")]
 fn ensure_proc_macro_unit(
+    cx: &bstd::cx::Cx,
     store: &Path,
     graph: &UnitGraph<'_>,
     lock: &Lock<'_>,
@@ -959,6 +1479,7 @@ fn ensure_proc_macro_unit(
     members: &[(LockId, &str, blaze_world::PathKind)],
     producers: &Producers,
     heap: &'static blaze_own::Heap,
+    dep_probes: DepScriptProbes<'_>,
     pm_id: UnitId,
     depth: u8,
 ) -> Result<(CrateItemKey, blaze_proc_macro::module::ModuleRecord, std::string::String, std::string::String), SelfCompileError> {
@@ -987,6 +1508,28 @@ fn ensure_proc_macro_unit(
     .map_err(|e| std::format!("identifying proc-macro dep {} {}: {e}", unit.name.as_str(), unit.version.as_str()))?
     .map_err(|e| std::format!("proc-macro dep {} {} not identified: {e}", unit.name.as_str(), unit.version.as_str()))?
     .with_wasm_features(lock, graph, unit.package, |dep_id| path_pkg_files_digest(checkout, members, dep_id), heap.alloc());
+    let (identity, frozen_probes) = if let Some(shared) = dep_probes.shared {
+        let has_dep_scripts = unit_has_dep_build_scripts(graph, Some(graph), pm_id, true).map_err(|e| {
+            let mut msg = blaze_own::String::new_in(heap.alloc());
+            let _ = write!(msg, "proc-macro wasm64 dep lookup of {}: {e}", unit.name.as_str());
+            SelfCompileError::Failed(msg.as_str().into())
+        })?;
+        if has_dep_scripts {
+            let probes_hex = shared.dep_probe_identity_hex(cx).map_err(|e| {
+                let mut msg = blaze_own::String::new_in(heap.alloc());
+                let _ = write!(msg, "proc-macro dep probe identity of {}: {e}", unit.name.as_str());
+                SelfCompileError::Failed(msg.as_str().into())
+            })?;
+            if let Some(expected) = dep_probes.expected_probes {
+                verify_dep_probe_unchanged(expected, probes_hex, unit.name.as_str(), heap.alloc())?;
+            }
+            (identity.with_dep_probes(probes_hex.as_str()), Some(probes_hex))
+        } else {
+            (identity, None)
+        }
+    } else {
+        (identity, None)
+    };
 
     let (mod_key, id_text, existing) = identity.with_id(|id| {
         (
@@ -1000,6 +1543,7 @@ fn ensure_proc_macro_unit(
         Ok(rec) => rec,
         Err(blaze_proc_macro::module::ModuleError::Missing { .. }) => {
             let built = compile_unit_to_wasm64(
+                cx,
                 store,
                 graph,
                 Some(graph),
@@ -1008,10 +1552,14 @@ fn ensure_proc_macro_unit(
                 members,
                 producers,
                 heap,
+                dep_probes.with_expected(frozen_probes),
                 pm_id,
                 CompileMode::ProcMacro,
                 depth,
             )?;
+            if let (Some(shared), Some(expected)) = (dep_probes.shared, frozen_probes) {
+                revalidate_dep_probes(cx, shared, expected, unit.name.as_str(), heap.alloc())?;
+            }
             let wasm_sha256 = sha256_hex(&built.wasm);
             publish_proc_macro_module(
                 store,
@@ -1044,10 +1592,14 @@ fn ensure_proc_macro_unit(
 
 /// Compiles the proc-macro crate named by `identity` to `wasm64-blaze-wasip1`, atomically
 /// publishes `<store>/proc-macro/modules/<key>`, and returns its `wasm-sha256` digest.
+/// When `expected_probes` is `Some(hex)`, revalidates the live C-probe answerer and derived-fact
+/// pins after compilation and refuses publication if the live identity changed mid-compile.
 pub(crate) fn compile_proc_macro(
+    cx: &bstd::cx::Cx,
     store: &Path,
     inputs: CompileInputs<'_>,
     identity: &blaze_world::procs::MacroIdentity,
+    expected_probes: Option<Hex64>,
 ) -> Result<std::string::String, SelfCompileError> {
     let Some(checkout) = inputs.checkout else {
         return Err(SelfCompileError::Failed(std::format!(
@@ -1090,19 +1642,73 @@ pub(crate) fn compile_proc_macro(
         )));
     };
     let pm_id = UnitId(u32::try_from(unit_idx).unwrap_or(u32::MAX));
+    let resolved_wasm_frame = if wasm_decoded.is_none() {
+        Some(Frame::with_reserve(COMPILE_FRAME_RESERVE, Tag::Other).map_err(|_| {
+            SelfCompileError::Failed("failed to reserve wasm64 resolution frame".into())
+        })?)
+    } else {
+        None
+    };
+    let resolved_wasm_erased = resolved_wasm_frame.as_ref().map(Erased::new);
+    let resolved_wasm = if let (Some(rf), Some(re)) = (&resolved_wasm_frame, &resolved_wasm_erased) {
+        let (wg, _) = resolve_wasm64_graph(
+            store,
+            &decoded.graph,
+            &lock,
+            checkout,
+            inputs.members,
+            pm_id,
+            CompileMode::ProcMacro,
+            rf,
+            re.bump(),
+        )?;
+        Some(wg)
+    } else {
+        None
+    };
+    let wasm_graph_ref = wasm_decoded.as_ref().map(|d| &d.graph).or(resolved_wasm.as_ref());
+    let frozen_probes = match (inputs.probes, expected_probes) {
+        (Some(shared), Some(expected)) => {
+            revalidate_dep_probes(cx, shared, expected, identity.package.as_str(), inputs.heap.alloc())?;
+            Some(expected)
+        }
+        (Some(shared), None) => {
+            let has_dep_scripts = unit_has_dep_build_scripts(&decoded.graph, wasm_graph_ref, pm_id, true).map_err(|e| {
+                let mut msg = blaze_own::String::new_in(inputs.heap.alloc());
+                let _ = write!(msg, "proc-macro wasm64 dep lookup of {}: {e}", identity.package);
+                SelfCompileError::Failed(msg.as_str().into())
+            })?;
+            if has_dep_scripts {
+                Some(shared.dep_probe_identity_hex(cx).map_err(|e| {
+                    let mut msg = blaze_own::String::new_in(inputs.heap.alloc());
+                    let _ = write!(msg, "proc-macro dep probe identity of {}: {e}", identity.package);
+                    SelfCompileError::Failed(msg.as_str().into())
+                })?)
+            } else {
+                None
+            }
+        }
+        (None, _) => None,
+    };
     let built = compile_unit_to_wasm64(
+        cx,
         store,
         &decoded.graph,
-        wasm_decoded.as_ref().map(|d| &d.graph),
+        wasm_graph_ref,
         &lock,
         checkout,
         inputs.members,
         &inputs.producers,
         inputs.heap,
+        DepScriptProbes::from_inputs(inputs).with_expected(frozen_probes),
         pm_id,
         CompileMode::ProcMacro,
         0,
     )?;
+
+    if let (Some(shared), Some(expected)) = (inputs.probes, frozen_probes) {
+        revalidate_dep_probes(cx, shared, expected, identity.package.as_str(), inputs.heap.alloc())?;
+    }
 
     let (key, id_text) = identity.with_id(|id| {
         (blaze_proc_macro::module::module_key(id), blaze_proc_macro::module::identity(id))
@@ -1253,6 +1859,7 @@ fn scan_wasm64_feature_rows<'a>(
 /// under `serde_derive` receive their exact `rustc-cfg` atoms and `OUT_DIR` files during compilation.
 #[expect(clippy::too_many_arguments, reason = "dependency build-script execution on wasm64")]
 fn run_dep_build_script(
+    cx: &bstd::cx::Cx,
     store: &Path,
     graph: &UnitGraph<'_>,
     lock: &Lock<'_>,
@@ -1260,6 +1867,7 @@ fn run_dep_build_script(
     members: &[(LockId, &str, blaze_world::PathKind)],
     producers: &Producers,
     heap: &'static blaze_own::Heap,
+    dep_probes: DepScriptProbes<'_>,
     bs_id: UnitId,
     tc_cfg: &[(std::string::String, Option<std::string::String>)],
     tc_names: &[std::string::String],
@@ -1267,7 +1875,7 @@ fn run_dep_build_script(
     depth: u8,
 ) -> Result<std::vec::Vec<u8>, SelfCompileError> {
     // Ensure the build script's own wasm64 module exists first (`graph` here is already `wasm_graph`).
-    let _ = ensure_build_script_unit(store, graph, Some(graph), lock, checkout, members, producers, heap, bs_id, None, depth + 1)?;
+    let _ = ensure_build_script_unit(cx, store, graph, Some(graph), lock, checkout, members, producers, heap, dep_probes, bs_id, None, depth + 1)?;
     let frame = Frame::with_reserve(128 << 20, Tag::Other)
         .map_err(|_| SelfCompileError::Failed(std::string::String::from("failed to reserve dep build-script frame")))?;
     let erased = Erased::new(&frame);
@@ -1329,34 +1937,75 @@ fn run_dep_build_script(
     let mut table: std::vec::Vec<blaze_build_script::probe::Row> = rows.as_slice().to_vec();
     table.extend_from_slice(tc_feature_rows);
     table.sort_unstable_by_key(|r| r.key);
-    let files_digest = members
-        .iter()
-        .find(|(id, _, _)| *id == unit.package)
-        .and_then(|(_, dir, _)| {
-            let pkg_dir = if dir.is_empty() {
-                checkout.path().to_path_buf()
-            } else {
-                checkout.path().join(dir)
-            };
-            script_unit::script_files_digest(&pkg_dir, unit.root.as_str()).ok()
-        });
+    let files_digest = member_script_files_digest(
+        checkout,
+        members,
+        unit.package,
+        unit.root.as_str(),
+        unit.name.as_str(),
+        alloc,
+    )?;
     let deps_digest = script_unit::script_deps_digest(graph, Some(graph), lock, bs_id, |dep_pkg| {
         path_pkg_files_digest(checkout, members, dep_pkg)
     })
     .map_err(|e| {
         SelfCompileError::Failed(bstd::mem::format_in!(&frame, "dep build-script deps digest of {}: {e}", unit.name.as_str()).as_str().into())
     })?;
+    let deps_digest = if let Some(shared) = dep_probes.shared {
+        let has_dep_scripts = unit_has_dep_build_scripts(graph, Some(graph), bs_id, false).map_err(|e| {
+            SelfCompileError::Failed(
+                bstd::mem::format_in!(&frame, "dep build-script wasm64 dep lookup of {}: {e}", unit.name.as_str())
+                    .as_str()
+                    .into(),
+            )
+        })?;
+        if has_dep_scripts {
+            let probes_hex = shared.dep_probe_identity_hex(cx).map_err(|e| {
+                SelfCompileError::Failed(
+                    bstd::mem::format_in!(&frame, "dep build-script probe identity of {}: {e}", unit.name.as_str())
+                        .as_str()
+                        .into(),
+                )
+            })?;
+            let folded = fold_dep_probes_hex(deps_digest.as_deref().unwrap_or(""), probes_hex.as_str());
+            Some(folded.as_str().into())
+        } else {
+            deps_digest
+        }
+    } else {
+        deps_digest
+    };
+    let (c_probes, spawn_setting) = match dep_probes.shared {
+        Some(shared) => {
+            let cp = shared.c_probes(cx).map_err(|e| {
+                SelfCompileError::Failed(
+                    bstd::mem::format_in!(&frame, "dep build-script C probes for {}: {e}", unit.name.as_str())
+                        .as_str()
+                        .into(),
+                )
+            })?;
+            let sp = shared.spawn_setting(cx).map_err(|e| {
+                SelfCompileError::Failed(
+                    bstd::mem::format_in!(&frame, "dep build-script spawn pins for {}: {e}", unit.name.as_str())
+                        .as_str()
+                        .into(),
+                )
+            })?;
+            (cp, dep_script_spawn_setting(Some(sp)))
+        }
+        None => (None, SpawnSetting::off()),
+    };
     let setting = Setting {
         store,
         target: WASM64_TARGET,
         host: crate::graph::TRIPLE,
         table: Arc::new(table),
         probes: None,
-        c_probes: None,
+        c_probes: c_probes.map(|cp| cp.with_cx(cx)),
         c_mode: CMode::Deferred,
         mode: Mode::Check,
         native: None,
-        spawn_setting: Arc::new(SpawnSetting::off()),
+        spawn_setting: Arc::new(spawn_setting),
         files_digest: files_digest.as_deref(),
         deps_digest: deps_digest.as_deref(),
     };
@@ -1385,6 +2034,9 @@ fn run_dep_build_script(
     let ran = rt
         .run(&prepared.loaded, prepared.script, &prepared.env, alloc)
         .map_err(|e| std::format!("run dep build script {}: {e}", unit.name.as_str()))?;
+    if let (Some(shared), Some(expected)) = (dep_probes.shared, dep_probes.expected_probes) {
+        revalidate_dep_probes(cx, shared, expected, unit.name.as_str(), heap.alloc())?;
+    }
     let mut encoded: AVec<'_, u8> = OwnVec::new_in(alloc);
     ran.outputs.encode(&mut encoded);
     Ok(encoded.as_slice().to_vec())
@@ -1521,37 +2173,22 @@ fn locate_root_in_wasm_graph(
         want_root_feats.push(f.as_str());
     }
     want_root_feats.sort_unstable();
-    let root_idx = wasm_graph
-        .units
-        .iter()
-        .enumerate()
-        .position(|(i, u)| {
-            u32::try_from(i).is_ok_and(|uid| {
-                u.package == root.package
-                    && u.kind == want_kind
-                    && wasm_graph.host_unit_side(UnitId(uid)) == want_side
-                    && sorted_features_match(u, want_root_feats.as_slice())
-            })
+    let root_idx = wasm_graph.units.iter().enumerate().position(|(i, u)| {
+        u32::try_from(i).is_ok_and(|uid| {
+            u.package == root.package
+                && u.kind == want_kind
+                && wasm_graph.host_unit_side(UnitId(uid)) == want_side
+                && sorted_features_match(u, want_root_feats.as_slice())
         })
-        .or_else(|| {
-            wasm_graph.units.iter().position(|u| {
-                u.package == root.package
-                    && u.kind == want_kind
-                    && sorted_features_match(u, want_root_feats.as_slice())
-            })
-        })
-        .or_else(|| {
-            wasm_graph
-                .units
-                .iter()
-                .position(|u| u.package == root.package && u.kind == want_kind)
-        });
+    });
     let Some(root_idx) = root_idx else {
         return Err(fail(format_args!(
-            "wasm64 resolution for {} {} produced no matching {:?} unit",
+            "wasm64 resolution for {} {} produced no exact {:?} unit matching side {:?} and features {:?}",
             root.name.as_str(),
             root.version.as_str(),
-            want_kind
+            want_kind,
+            want_side,
+            want_root_feats.as_slice()
         )));
     };
     let root_u32 = u32::try_from(root_idx)
@@ -1720,9 +2357,10 @@ fn resolve_wasm64_graph<'r>(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "whole-program wasm64 compilation over store, graph, pre-resolved wasm_graph, lock, checkout, members, root unit, mode, and recursion depth"
+    reason = "whole-program wasm64 compilation over cx, store, graph, pre-resolved wasm_graph, lock, checkout, members, dep_probes, root unit, mode, and recursion depth"
 )]
 fn compile_unit_to_wasm64(
+    cx: &bstd::cx::Cx,
     store: &Path,
     graph: &UnitGraph<'_>,
     pre_wasm_graph: Option<&UnitGraph<'_>>,
@@ -1731,6 +2369,7 @@ fn compile_unit_to_wasm64(
     members: &[(LockId, &str, blaze_world::PathKind)],
     producers: &Producers,
     heap: &'static blaze_own::Heap,
+    dep_probes: DepScriptProbes<'_>,
     root_unit: UnitId,
     mode: CompileMode,
     depth: u8,
@@ -1832,6 +2471,7 @@ fn compile_unit_to_wasm64(
         }
         if wasm_graph.units.get(uid.index()).is_some_and(|u| u.kind == UnitKind::ProcMacro) {
             let (pm_key, record, pkg, ver) = ensure_proc_macro_unit(
+                cx,
                 store,
                 wasm_graph,
                 lock,
@@ -1839,6 +2479,7 @@ fn compile_unit_to_wasm64(
                 members,
                 producers,
                 heap,
+                dep_probes,
                 uid,
                 depth + 1,
             )?;
@@ -1881,6 +2522,7 @@ fn compile_unit_to_wasm64(
     let erased = Erased::new(&frame);
     let bump = erased.bump();
     let result = compile_unit_in(
+        cx,
         store,
         wasm_graph,
         lock,
@@ -1888,6 +2530,7 @@ fn compile_unit_to_wasm64(
         members,
         producers,
         heap,
+        dep_probes,
         wasm_root_unit,
         unit_order.as_slice(),
         &unit_to_pos,
@@ -1970,6 +2613,7 @@ fn mark_wasm64_sysroot<'a>(
     reason = "whole-program wasm64 compilation over arena-backed frames"
 )]
 fn compile_unit_in<'a>(
+    cx: &bstd::cx::Cx,
     store: &Path,
     graph: &'a UnitGraph<'a>,
     lock: &'a Lock<'a>,
@@ -1977,6 +2621,7 @@ fn compile_unit_in<'a>(
     members: &[(LockId, &str, blaze_world::PathKind)],
     producers: &Producers,
     heap: &'static blaze_own::Heap,
+    dep_probes: DepScriptProbes<'_>,
     root_unit: UnitId,
     unit_order: &[UnitId],
     unit_to_pos: &blaze_own::BTreeMap<UnitId, usize, Alloc<'_>>,
@@ -2106,6 +2751,7 @@ fn compile_unit_in<'a>(
         }
         if let Some(bs_id) = graph.units.get(uid.index()).and_then(|u| u.build_script) {
             let encoded = run_dep_build_script(
+                cx,
                 store,
                 graph,
                 lock,
@@ -2113,6 +2759,7 @@ fn compile_unit_in<'a>(
                 members,
                 producers,
                 heap,
+                dep_probes,
                 bs_id,
                 &tc_cfg_owned,
                 &tc_names,
@@ -3653,7 +4300,12 @@ mod tests {
         let producers = Producers::for_tests(b"wasm64-compile-test");
         let heap = blaze_own::testing::heap();
 
+        let io = bstd::test::native(&checkout_dir).expect("native io");
+        let cx = io
+            .cx(core::time::Duration::from_secs(60), bstd::mem::TASK_FRAME)
+            .expect("root cx");
         let compiled = compile_unit_to_wasm64(
+            &cx,
             &store_dir,
             &graph,
             None,
@@ -3662,6 +4314,7 @@ mod tests {
             &members,
             &producers,
             heap,
+            DepScriptProbes::default(),
             UnitId(0),
             CompileMode::BuildScript,
             0,
@@ -3903,5 +4556,1673 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
             Ok(None),
             "STD_ENV_ARCH must be unset (Ok(None)) so BodyHost/Host falls back to target_arch"
         );
+    }
+
+    #[test]
+    fn shared_command_probes_is_lazy_coalesced_and_threads_into_dep_script_setting() {
+        let tmp = std::env::temp_dir().join(std::format!(
+            "blaze-wasm64-dep-probes-unit-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let checkout = tmp.join("checkout");
+        let home_dir = tmp.join("home");
+        std::fs::create_dir_all(&checkout).expect("checkout dir");
+        std::fs::create_dir_all(home_dir.join(".blaze/v2")).expect("home .blaze/v2 dir");
+
+        let io = bstd::test::native(&checkout).expect("native io");
+        let cx = io
+            .cx(core::time::Duration::from_secs(30), bstd::mem::TASK_FRAME)
+            .expect("root cx");
+        let home_str = home_dir.to_str().expect("utf8 home");
+        let env_with_home = crate::fetch::FetchEnv {
+            clock: io.need_clock().expect("clock"),
+            checkout: "",
+            served: crate::engine_script_reads::Served::Simulated,
+            cert_file: None,
+            cert_dir: None,
+            rustflags: blaze_manifest::rustflags::RustflagsEnv::default(),
+            home: Some(home_str),
+            cargo_home: None,
+            start: Some(checkout.to_str().expect("utf8 checkout")),
+            toolchain: blaze_toolchain::PINNED,
+            fs: io.need_fs().expect("fs"),
+            sdk: crate::sdk::NONE_IN_TESTS,
+            exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
+            lan_peer: crate::fetch::LanPeerConfig::DISABLED,
+            heap: blaze_own::testing::heap(),
+        };
+
+        // Constructing `SharedCommandProbes` and threading it into `CompileInputs` must perform
+        // zero eager home-fs, clang-shelf, or derived-fact pin initialization (deferred until miss).
+        let holder = crate::scripts::SharedCommandProbes::new();
+        let probes = holder.with_env(&env_with_home);
+        assert!(
+            !probes.c_probes_initialized(),
+            "SharedCommandProbes::new must defer c_probes opening"
+        );
+        assert!(
+            !probes.spawn_setting_initialized(),
+            "SharedCommandProbes::new must defer spawn_setting initialization"
+        );
+
+        let inputs = CompileInputs {
+            graph: &[],
+            wasm_graph: &[],
+            lock: &[],
+            checkout: None,
+            members: &[],
+            producers: Producers::for_tests(b"wasm64-compile-test"),
+            heap: blaze_own::testing::heap(),
+            probes: Some(probes),
+        };
+        let from_inputs = DepScriptProbes::from_inputs(inputs);
+        assert!(!probes.c_probes_initialized());
+        assert!(!probes.spawn_setting_initialized());
+
+        // Computing `dep_probe_identity_hex` for a unit with dep build scripts opens BOTH the
+        // shared `spawn_setting` and the shared `CProbeSetting` (to query the live answerer ID)
+        // and coalesces subsequent `c_probes(&cx)` calls on the same `Once` instance.
+        let id_hex = probes
+            .dep_probe_identity_hex(&cx)
+            .expect("dep_probe_identity_hex must succeed on supported host");
+        assert_eq!(id_hex.as_str().len(), 64);
+        assert!(probes.c_probes_initialized());
+        assert!(probes.spawn_setting_initialized());
+
+        // Subsequent `c_probes` calls coalesce and reuse the exact same shared setting.
+        let first_c_probes = from_inputs
+            .shared
+            .expect("shared probes")
+            .c_probes(&cx)
+            .expect("c_probes open must succeed");
+        assert!(
+            first_c_probes.is_some(),
+            "SharedCommandProbes::c_probes with home=Some(..) must open c_probes"
+        );
+        let second_c_probes = probes
+            .c_probes(&cx)
+            .expect("second c_probes call must coalesce");
+        assert_eq!(
+            first_c_probes.as_ref().and_then(|p| p.ready()).is_some(),
+            second_c_probes.as_ref().and_then(|p| p.ready()).is_some(),
+            "coalesced c_probes must share identical Ready/Unavailable state"
+        );
+        #[cfg(target_os = "linux")]
+        if blaze_proc_macro::probe_clang::active_clang_pin(crate::graph::TRIPLE).is_some() {
+            assert!(
+                first_c_probes.as_ref().and_then(|p| p.ready()).is_some(),
+                "Linux host with pinned clang must open CProbeSetting::Ready"
+            );
+        }
+
+        let spawn = probes
+            .spawn_setting(&cx)
+            .expect("command_spawn_setting must succeed for supported host");
+        let shared_snapshot = probes
+            .spawn_setting_snapshot(&cx)
+            .expect("spawn_setting_snapshot must share the same verified snapshot");
+        assert_eq!(shared_snapshot.pins, spawn.pins);
+        assert!(!spawn.hvbox_allowed, "dep script spawn_setting must never allow unhermetic hvbox");
+        assert!(spawn.tools.is_empty(), "dep script spawn_setting must not enable ambient tools");
+        assert!(spawn.userland.is_none(), "dep script spawn_setting must not enable ambient userland");
+        if matches!(
+            crate::graph::TRIPLE,
+            "aarch64-unknown-linux-gnu" | "aarch64-apple-darwin"
+        ) {
+            let pins = spawn
+                .pins
+                .as_ref()
+                .expect("pinned host must populate derived-fact pins");
+            assert!(
+                pins.clang_version_text.starts_with("clang version "),
+                "unexpected clang_version_text: {:?}",
+                pins.clang_version_text
+            );
+        }
+
+        let setting = Setting {
+            store: &home_dir,
+            target: WASM64_TARGET,
+            host: crate::graph::TRIPLE,
+            table: Arc::new(std::vec::Vec::new()),
+            probes: None,
+            c_probes: first_c_probes,
+            c_mode: CMode::Deferred,
+            mode: Mode::Check,
+            native: None,
+            spawn_setting: Arc::new(dep_script_spawn_setting(Some(spawn))),
+            files_digest: None,
+            deps_digest: None,
+        };
+        assert!(
+            setting.c_probes.is_some(),
+            "CompileInputs must thread c_probes into dep build script Setting"
+        );
+        assert_eq!(
+            setting.spawn_setting.pins.is_some(),
+            spawn.pins.is_some(),
+            "CompileInputs must thread derived-fact pins into dep build script Setting"
+        );
+        assert!(!setting.spawn_setting.hvbox_allowed);
+        assert!(setting.spawn_setting.tools.is_empty());
+
+        // Negative control 1: when `home` is `None`, `c_probes` must remain `Ok(None)` and
+        // `dep_probe_identity_hex` reflects disabled C probes (different from `home = Some(..)`).
+        let env_no_home = crate::fetch::FetchEnv {
+            clock: io.need_clock().expect("clock"),
+            checkout: "",
+            served: crate::engine_script_reads::Served::Simulated,
+            cert_file: None,
+            cert_dir: None,
+            rustflags: blaze_manifest::rustflags::RustflagsEnv::default(),
+            home: None,
+            cargo_home: None,
+            start: None,
+            toolchain: blaze_toolchain::PINNED,
+            fs: io.need_fs().expect("fs"),
+            sdk: crate::sdk::NONE_IN_TESTS,
+            exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
+            lan_peer: crate::fetch::LanPeerConfig::DISABLED,
+            heap: blaze_own::testing::heap(),
+        };
+        let no_home_holder = crate::scripts::SharedCommandProbes::new();
+        let no_home_probes = no_home_holder.with_env(&env_no_home);
+        assert!(
+            no_home_probes.c_probes(&cx).expect("no-home c_probes").is_none(),
+            "SharedCommandProbes::c_probes with home=None must return Ok(None)"
+        );
+        assert_ne!(
+            no_home_probes.dep_probe_identity_hex(&cx).expect("no-home id"),
+            id_hex,
+            "Disabled C probes (home=None) must produce a different probe identity from home=Some(..)"
+        );
+
+        // Negative control 2: CompileInputs with probes=None keeps SpawnSetting::off().
+        let empty_inputs = CompileInputs { probes: None, ..inputs };
+        assert!(DepScriptProbes::from_inputs(empty_inputs).shared.is_none());
+        let empty_spawn = dep_script_spawn_setting(None);
+        assert!(empty_spawn.pins.is_none());
+        assert!(!empty_spawn.hvbox_allowed);
+        assert!(empty_spawn.tools.is_empty());
+
+        // Negative control 3: even if a caller constructed a SpawnSetting with hvbox_allowed=true,
+        // `dep_script_spawn_setting` strips it and retains only hermetic derived-fact pins.
+        let unhermetic = SpawnSetting {
+            hvbox_allowed: true,
+            tools: std::vec::Vec::new(),
+            userland: None,
+            pins: spawn.pins.clone(),
+        };
+        let sanitized = dep_script_spawn_setting(Some(&unhermetic));
+        assert!(!sanitized.hvbox_allowed, "dep_script_spawn_setting must stay strictly hermetic");
+        assert!(sanitized.tools.is_empty());
+        assert!(sanitized.userland.is_none());
+        assert_eq!(sanitized.pins, spawn.pins);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dep_probe_identity_invalidates_module_and_script_keys_on_pin_or_probe_change() {
+        let base_pins = blaze_proc_macro::spawn_route::FactPins {
+            clang_version_text: std::string::String::from("clang version 23.0.0"),
+            macos_product_version: std::string::String::from("15.4"),
+            macos_build_version: std::string::String::from("24E248"),
+        };
+        let base_ready = DepCProbeIdentity::Ready {
+            clang_sha256: [0x11; 32],
+            sdk_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            answerer_id: ContentId([0x22; 32]),
+        };
+        let base = DepProbeIdentity {
+            host: "aarch64-unknown-linux-gnu",
+            pins: Some(&base_pins),
+            c_probe: base_ready,
+        };
+        let base_hex = base.hex();
+        assert_eq!(base_hex, base.hex(), "DepProbeIdentity::hex must be deterministic");
+
+        let mut alt_clang_ver = base_pins.clone();
+        alt_clang_ver.clang_version_text = std::string::String::from("clang version 24.0.0");
+        let mut alt_macos_ver = base_pins.clone();
+        alt_macos_ver.macos_product_version = std::string::String::from("15.5");
+        let mut alt_macos_build = base_pins.clone();
+        alt_macos_build.macos_build_version = std::string::String::from("24F74");
+
+        let variants: [(&str, DepProbeIdentity<'_>); 10] = [
+            ("host", DepProbeIdentity { host: "aarch64-apple-darwin", ..base }),
+            ("pins=None", DepProbeIdentity { pins: None, ..base }),
+            ("clang_version_text", DepProbeIdentity { pins: Some(&alt_clang_ver), ..base }),
+            ("macos_product_version", DepProbeIdentity { pins: Some(&alt_macos_ver), ..base }),
+            ("macos_build_version", DepProbeIdentity { pins: Some(&alt_macos_build), ..base }),
+            ("ready.clang_sha256", DepProbeIdentity {
+                c_probe: DepCProbeIdentity::Ready {
+                    clang_sha256: [0x33; 32],
+                    sdk_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    answerer_id: ContentId([0x22; 32]),
+                },
+                ..base
+            }),
+            ("ready.sdk_id", DepProbeIdentity {
+                c_probe: DepCProbeIdentity::Ready {
+                    clang_sha256: [0x11; 32],
+                    sdk_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    answerer_id: ContentId([0x22; 32]),
+                },
+                ..base
+            }),
+            ("ready.live_answerer_id", DepProbeIdentity {
+                c_probe: DepCProbeIdentity::Ready {
+                    clang_sha256: [0x11; 32],
+                    sdk_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    answerer_id: ContentId([0x44; 32]),
+                },
+                ..base
+            }),
+            ("c_probe=Unavailable", DepProbeIdentity {
+                c_probe: DepCProbeIdentity::Unavailable {
+                    clang_sha256: Some([0x11; 32]),
+                    sdk_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    answerer_id: ContentId([0x22; 32]),
+                },
+                ..base
+            }),
+            ("c_probe=Disabled", DepProbeIdentity { c_probe: DepCProbeIdentity::Disabled, ..base }),
+        ];
+
+        let base_script_deps = fold_dep_probes_hex("deadbeef", base_hex.as_str());
+        let frame = Frame::with_reserve(2 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let a = erased.handle();
+        let lock = Lock::read(
+            b"version = 4\n\n[[package]]\nname = \"sqlx-macros\"\nversion = \"0.9.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+            a,
+        )
+        .expect("parse lock");
+        let mut pm_unit = make_unit(0, "sqlx-macros", "sqlx_macros", UnitKind::ProcMacro, "2024", &[], a);
+        pm_unit.version = Text::from_str_in("0.9.0", a);
+        let pm_graph = make_graph(std::vec![pm_unit], a);
+        let locked = blaze_proc_macro::module::LockedPackages::of(&lock);
+        let git_folders = std::collections::BTreeMap::new();
+        let base_identity = blaze_world::procs::identify(
+            &lock,
+            &locked,
+            &git_folders,
+            &pm_graph,
+            &pm_graph.units[0],
+            |_| Ok(None::<std::string::String>),
+            a,
+        )
+        .expect("identify io")
+        .expect("macro identity");
+        let make_macro_key = |probes_hex: &str| {
+            base_identity
+                .clone()
+                .with_dep_probes(probes_hex)
+                .with_id(blaze_proc_macro::module::module_key)
+        };
+        let base_macro_key = make_macro_key(base_hex.as_str());
+        assert_ne!(
+            base_identity.with_id(blaze_proc_macro::module::module_key),
+            base_macro_key,
+            "with_dep_probes must produce a distinct module_key from unfolded identity"
+        );
+
+        for (label, variant) in variants {
+            let v_hex = variant.hex();
+            assert_ne!(
+                v_hex, base_hex,
+                "changing {label} must change DepProbeIdentity::hex"
+            );
+            assert_ne!(
+                fold_dep_probes_hex("deadbeef", v_hex.as_str()),
+                base_script_deps,
+                "changing {label} must invalidate build-script deps_digest"
+            );
+            assert_ne!(
+                make_macro_key(v_hex.as_str()),
+                base_macro_key,
+                "changing {label} must invalidate proc-macro module_key"
+            );
+        }
+    }
+
+    #[test]
+    fn dep_probe_identity_from_setting_keys_by_live_answerer_id_and_propagates_errors() {
+        use blaze_build_script::c_tasks_probe::{CanonicalProbe, ProbeAnswer, ProbeAnswerer};
+        use blaze_proc_macro::probe_clang::{CProbeSetting, CProbeStore, CScriptProbes, MemCProbeStore};
+
+        struct FakeAnswerer(Result<ContentId, &'static str>);
+
+        impl ProbeAnswerer for FakeAnswerer {
+            fn id<'a>(&self, alloc: Alloc<'a>) -> Result<ContentId, blaze_own::AString<'a>> {
+                match self.0 {
+                    Ok(id) => Ok(id),
+                    Err(msg) => Ok(()).and_then(|()| Err(blaze_own::AString::from_str_in(msg, alloc))),
+                }
+            }
+
+            fn answer<'a, 'b>(
+                &self,
+                _probe: &CanonicalProbe<'_, '_>,
+                _input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+                alloc: Alloc<'a>,
+            ) -> Result<ProbeAnswer<'a>, blaze_own::AString<'a>> {
+                Err(blaze_own::AString::from_str_in("unused in identity test", alloc))
+            }
+        }
+
+        let shared = blaze_own::SharedAlloc::global();
+        let make_ready = |res: Result<ContentId, &'static str>| {
+            let answerer: blaze_own::Arc<dyn ProbeAnswerer + Send + Sync, blaze_own::SharedAlloc<'static>> =
+                blaze_own::Arc::new_in(FakeAnswerer(res), shared);
+            let records: blaze_own::Arc<dyn CProbeStore, blaze_own::SharedAlloc<'static>> =
+                blaze_own::Arc::new_in(MemCProbeStore::default(), shared);
+            CProbeSetting::Ready(CScriptProbes {
+                answerer,
+                #[cfg(target_os = "linux")]
+                hermetic: None,
+                records,
+                sdk_dir: blaze_own::Arc::from_str_in("", shared),
+                sdk_id: blaze_own::Arc::from_str_in("", shared),
+                sdk_digest: [0; 32],
+                clang_sha256: [0x99; 32],
+            })
+        };
+
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(41, bstd::io::Limits::USUAL));
+        let cx = io
+            .cx(core::time::Duration::from_secs(10), bstd::mem::TASK_FRAME)
+            .expect("sim cx");
+        let heap = blaze_own::testing::heap();
+        let spawn = SpawnSetting::facts_only(blaze_proc_macro::spawn_route::FactPins {
+            clang_version_text: std::string::String::from("clang version 23.0.0"),
+            macos_product_version: std::string::String::new(),
+            macos_build_version: std::string::String::new(),
+        });
+        let ready_a = make_ready(Ok(ContentId([0xaa; 32])));
+        let ready_b = make_ready(Ok(ContentId([0xbb; 32])));
+        let ready_err = make_ready(Err("corrupt elf inode record"));
+
+        let hex_a = dep_probe_identity_from_setting(
+            &cx,
+            "aarch64-unknown-linux-gnu",
+            &spawn,
+            Some(&ready_a),
+            None,
+            heap.alloc(),
+            shared,
+        )
+        .expect("live answerer A");
+        let hex_b = dep_probe_identity_from_setting(
+            &cx,
+            "aarch64-unknown-linux-gnu",
+            &spawn,
+            Some(&ready_b),
+            None,
+            heap.alloc(),
+            shared,
+        )
+        .expect("live answerer B");
+        assert_ne!(
+            hex_a, hex_b,
+            "changing the live ProbeAnswerer::id() (e.g. host ELF runtime closure) must invalidate module keys"
+        );
+        assert_ne!(
+            fold_dep_probes_hex("deadbeef", hex_a.as_str()),
+            fold_dep_probes_hex("deadbeef", hex_b.as_str()),
+        );
+
+        let err = dep_probe_identity_from_setting(
+            &cx,
+            "aarch64-unknown-linux-gnu",
+            &spawn,
+            Some(&ready_err),
+            None,
+            heap.alloc(),
+            shared,
+        )
+        .expect_err("live answerer id error must propagate");
+        assert_eq!(err.kind, crate::scripts::ProbeErrorKind::AnswererIdentity);
+        assert!(
+            err.detail.as_str().contains("corrupt elf inode record"),
+            "unexpected error: {}",
+            err.detail.as_str()
+        );
+
+        // Caller cancellation propagation: a cancelled `Cx` MUST abort `answerer_id_in_cx`
+        // immediately rather than running under an unlinked root context.
+        let _ = cx.scope_with(|scope| {
+            scope.cancel();
+            let cancel_err = dep_probe_identity_from_setting(
+                scope.cx(),
+                "aarch64-unknown-linux-gnu",
+                &spawn,
+                Some(&ready_a),
+                None,
+                heap.alloc(),
+                shared,
+            )
+            .expect_err("cancelled caller Cx must abort answerer_id_in_cx");
+            assert_eq!(cancel_err.kind, crate::scripts::ProbeErrorKind::AnswererIdentity);
+            assert!(
+                cancel_err.detail.as_str().contains("cancelled"),
+                "unexpected cancel error: {}",
+                cancel_err.detail.as_str()
+            );
+        });
+
+        // Setup-error task-key stability (P2): `probe_error_hex` hashes ONLY the semantic
+        // `ProbeErrorKind`, NEVER human-readable diagnostic prose or machine-specific paths.
+        let err_alice = crate::scripts::ProbeSetupError::from_str(
+            crate::scripts::ProbeErrorKind::CProbesOpen,
+            "/home/alice/.blaze/v2: permission denied",
+        );
+        let err_bob = crate::scripts::ProbeSetupError::from_str(
+            crate::scripts::ProbeErrorKind::CProbesOpen,
+            "/Users/bob/.blaze/v2: missing shelf",
+        );
+        let err_other_kind = crate::scripts::ProbeSetupError::from_str(
+            crate::scripts::ProbeErrorKind::SpawnPinsOpen,
+            "/home/alice/.blaze/v2: permission denied",
+        );
+        assert_eq!(
+            probe_error_hex(err_alice.kind),
+            probe_error_hex(err_bob.kind),
+            "different diagnostic prose/paths for the same ProbeErrorKind must produce the exact same key tag"
+        );
+        assert_eq!(
+            crate::engine_scripts::PlannedProbe::Failed(err_alice).source_hex(),
+            crate::engine_scripts::PlannedProbe::Failed(err_bob).source_hex(),
+        );
+        assert_ne!(
+            probe_error_hex(crate::scripts::ProbeErrorKind::CProbesOpen),
+            probe_error_hex(err_other_kind.kind),
+            "distinct ProbeErrorKind variants must produce distinct key tags"
+        );
+
+        // Diagnostic text exclusion: two `CProbeSetting::Unavailable` values with different
+        // human-readable reasons (e.g. different machine/home paths) MUST produce the exact same
+        // probe identity digest.
+        let unavail_alice = CProbeSetting::Unavailable(blaze_own::Arc::from_str_in(
+            "c-probe home capability: /home/alice/.blaze/v2: permission denied",
+            shared,
+        ));
+        let unavail_bob = CProbeSetting::Unavailable(blaze_own::Arc::from_str_in(
+            "c-probe home capability: /Users/bob/.blaze/v2: missing shelf",
+            shared,
+        ));
+        let hex_unavail_a = dep_probe_identity_from_setting(
+            &cx,
+            "aarch64-unknown-linux-gnu",
+            &spawn,
+            Some(&unavail_alice),
+            None,
+            heap.alloc(),
+            shared,
+        )
+        .expect("unavail alice");
+        let hex_unavail_b = dep_probe_identity_from_setting(
+            &cx,
+            "aarch64-unknown-linux-gnu",
+            &spawn,
+            Some(&unavail_bob),
+            None,
+            heap.alloc(),
+            shared,
+        )
+        .expect("unavail bob");
+        assert_eq!(
+            hex_unavail_a, hex_unavail_b,
+            "Unavailable diagnostic text/paths must not enter DepProbeIdentity"
+        );
+
+        // Mid-compile answerer mutation refusal: if the live `ProbeAnswerer::id()` changes
+        // between keying and publication, `revalidate_dep_probe_setting` MUST refuse publication.
+        struct MutableAnswerer(std::sync::Arc<core::sync::atomic::AtomicU8>);
+        impl ProbeAnswerer for MutableAnswerer {
+            fn id<'a>(&self, _alloc: Alloc<'a>) -> Result<ContentId, blaze_own::AString<'a>> {
+                Ok(ContentId([self.0.load(core::sync::atomic::Ordering::SeqCst); 32]))
+            }
+            fn answer<'a, 'b>(
+                &self,
+                _probe: &CanonicalProbe<'_, '_>,
+                _input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+                alloc: Alloc<'a>,
+            ) -> Result<ProbeAnswer<'a>, blaze_own::AString<'a>> {
+                Err(blaze_own::AString::from_str_in("unused", alloc))
+            }
+        }
+        let mutable_state = std::sync::Arc::new(core::sync::atomic::AtomicU8::new(0xaa));
+        let answerer_dyn: blaze_own::Arc<dyn ProbeAnswerer + Send + Sync, blaze_own::SharedAlloc<'static>> =
+            blaze_own::Arc::new_in(MutableAnswerer(std::sync::Arc::clone(&mutable_state)), shared);
+        let records_dyn: blaze_own::Arc<dyn CProbeStore, blaze_own::SharedAlloc<'static>> =
+            blaze_own::Arc::new_in(MemCProbeStore::default(), shared);
+        let mutable_ready = CProbeSetting::Ready(CScriptProbes {
+            answerer: answerer_dyn,
+            #[cfg(target_os = "linux")]
+            hermetic: None,
+            records: records_dyn,
+            sdk_dir: blaze_own::Arc::from_str_in("", shared),
+            sdk_id: blaze_own::Arc::from_str_in("", shared),
+            sdk_digest: [0; 32],
+            clang_sha256: [0x99; 32],
+        });
+        let frozen_hex = dep_probe_identity_from_setting(
+            &cx,
+            "aarch64-unknown-linux-gnu",
+            &spawn,
+            Some(&mutable_ready),
+            None,
+            heap.alloc(),
+            shared,
+        )
+        .expect("initial frozen identity");
+        revalidate_dep_probe_setting(
+            &cx,
+            "aarch64-unknown-linux-gnu",
+            &spawn,
+            Some(&mutable_ready),
+            None,
+            frozen_hex,
+            "sqlx-macros",
+            heap.alloc(),
+            shared,
+        )
+        .expect("unchanged live answerer must pass revalidation");
+
+        // Simulate a live host ELF closure switch mid-compile (e.g. `/run/current-system` switch).
+        mutable_state.store(0xbb, core::sync::atomic::Ordering::SeqCst);
+        let drift_err = revalidate_dep_probe_setting(
+            &cx,
+            "aarch64-unknown-linux-gnu",
+            &spawn,
+            Some(&mutable_ready),
+            None,
+            frozen_hex,
+            "sqlx-macros",
+            heap.alloc(),
+            shared,
+        )
+        .expect_err("mid-compile live answerer mutation must refuse publication");
+        assert!(
+            std::format!("{drift_err}").contains("refusing to publish under stale key"),
+            "unexpected drift error: {drift_err}"
+        );
+
+        // `MacroModule` task source/key invalidation: changing `probes_hex` MUST change BOTH
+        // proc-macro and build-script `MacroModule` task sources and their `Tools::key`.
+        let graph_source = ContentId([0x55; 32]);
+        let subject = ContentId([0x66; 32]);
+        let pm_base = crate::macros::part_source_with_files(graph_source, ContentId([0x77; 32]), subject);
+        let pm_src_a = crate::macros::part_source_with_dep_probes(pm_base, hex_a.as_str());
+        let pm_src_b = crate::macros::part_source_with_dep_probes(pm_base, hex_b.as_str());
+        assert_ne!(pm_src_a, pm_base);
+        assert_ne!(pm_src_a, pm_src_b, "changing probe digest must change proc-macro MacroModule source");
+
+        let bs_base = crate::script_modules::part_source(graph_source, subject);
+        let bs_src_a = crate::engine_scripts::script_module_task_source(
+            graph_source,
+            subject,
+            &[(subject, crate::engine_scripts::PlannedProbe::Digest(hex_a))],
+        );
+        let bs_src_b = crate::engine_scripts::script_module_task_source(
+            graph_source,
+            subject,
+            &[(subject, crate::engine_scripts::PlannedProbe::Digest(hex_b))],
+        );
+        assert_ne!(bs_src_a, bs_base);
+        assert_ne!(bs_src_a, bs_src_b, "changing probe digest must change build-script MacroModule source");
+        assert_eq!(
+            crate::engine_scripts::script_module_task_source(graph_source, subject, &[]),
+            bs_base,
+            "units without dep build scripts must keep their original MacroModule task source"
+        );
+        let tools = blaze_engine::Tools([blaze_drive::Tool(ContentId([0x88; 32])); blaze_drive::key::KINDS]);
+        let task_name = crate::script_modules::name(subject);
+        assert_ne!(
+            tools.key(task_name, &pm_src_a),
+            tools.key(task_name, &pm_src_b),
+            "changing probe digest must invalidate proc-macro MacroModule task key"
+        );
+        assert_ne!(
+            tools.key(task_name, &bs_src_a),
+            tools.key(task_name, &bs_src_b),
+            "changing probe digest must invalidate build-script MacroModule task key"
+        );
+    }
+
+    #[test]
+    fn unit_has_dep_build_scripts_distinguishes_units_with_and_without_dep_scripts() {
+        let frame = Frame::with_reserve(4 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let a = erased.handle();
+        let make_u = |pkg: u32, name: &str, kind: UnitKind<'static>, build_script: Option<u32>, deps: &[(&str, u32)]| -> Unit<'_> {
+            let mut u = make_unit(pkg, name, name, kind, "2024", deps, a);
+            u.build_script = build_script.map(UnitId);
+            u
+        };
+
+        // Units:
+        // 0: plain_lib (Lib, no build script)
+        // 1: ring_bs (BuildScript, no deps)
+        // 2: ring_lib (Lib, build_script = Some(1))
+        // 3: bs_plain (BuildScript, depends on 0: plain_lib)
+        // 4: bs_with_ring (BuildScript, depends on 2: ring_lib)
+        // 5: pm_plain (ProcMacro, depends on 0: plain_lib, no build script)
+        // 6: pm_own_bs (ProcMacro, build_script = Some(1), depends on 0)
+        // 7: pm_dep_ring (ProcMacro, depends on 2: ring_lib)
+        let graph = make_graph(
+            std::vec![
+                make_u(0, "plain_lib", UnitKind::Lib, None, &[]),
+                make_u(1, "ring", UnitKind::BuildScript, None, &[]),
+                make_u(1, "ring", UnitKind::Lib, Some(1), &[]),
+                make_u(2, "bs_plain", UnitKind::BuildScript, None, &[("plain_lib", 0)]),
+                make_u(3, "bs_with_ring", UnitKind::BuildScript, None, &[("ring", 2)]),
+                make_u(4, "pm_plain", UnitKind::ProcMacro, None, &[("plain_lib", 0)]),
+                make_u(5, "pm_own_bs", UnitKind::ProcMacro, Some(1), &[("plain_lib", 0)]),
+                make_u(6, "pm_dep_ring", UnitKind::ProcMacro, None, &[("ring", 2)]),
+            ],
+            a,
+        );
+
+        // Passing `None` for `wasm_graph` MUST return `Err(WasmGraphMissing)` rather than
+        // silently scanning the host graph (wasm64 target-gated deps can differ from host).
+        let missing_wg = unit_has_dep_build_scripts(&graph, None, UnitId(3), false)
+            .expect_err("missing wasm_graph must return Err instead of scanning host graph");
+        assert_eq!(missing_wg.kind, crate::scripts::ProbeErrorKind::WasmGraphMissing);
+
+        assert!(!unit_has_dep_build_scripts(&graph, Some(&graph), UnitId(3), false).expect("bs_plain"));
+        assert!(unit_has_dep_build_scripts(&graph, Some(&graph), UnitId(4), false).expect("bs_with_ring"));
+        assert!(!unit_has_dep_build_scripts(&graph, Some(&graph), UnitId(5), true).expect("pm_plain"));
+        assert!(unit_has_dep_build_scripts(&graph, Some(&graph), UnitId(6), true).expect("pm_own_bs"));
+        assert!(unit_has_dep_build_scripts(&graph, Some(&graph), UnitId(7), true).expect("pm_dep_ring"));
+
+        // When a `wasm_graph` is supplied and does NOT contain the requested root unit,
+        // `unit_has_dep_build_scripts` MUST return `Err(WasmRootMissing)` instead of falling back.
+        let empty_wasm_graph = make_graph(std::vec![make_u(0, "plain_lib", UnitKind::Lib, None, &[])], a);
+        let bs_err = unit_has_dep_build_scripts(&graph, Some(&empty_wasm_graph), UnitId(4), false)
+            .expect_err("missing BuildScript root in wasm_graph must return Err");
+        assert_eq!(bs_err.kind, crate::scripts::ProbeErrorKind::WasmRootMissing);
+        assert!(
+            bs_err.detail.as_str().contains("bs_with_ring"),
+            "error should name the missing build-script root: {}",
+            bs_err.detail.as_str()
+        );
+        let pm_err = unit_has_dep_build_scripts(&graph, Some(&empty_wasm_graph), UnitId(7), true)
+            .expect_err("missing ProcMacro root in wasm_graph must return Err");
+        assert_eq!(pm_err.kind, crate::scripts::ProbeErrorKind::WasmRootMissing);
+        assert!(
+            pm_err.detail.as_str().contains("pm_dep_ring"),
+            "error should name the missing proc-macro root: {}",
+            pm_err.detail.as_str()
+        );
+    }
+
+    #[test]
+    fn macros_list_isolates_probe_failures_and_refuses_planned_drift() {
+        let frame = Frame::with_reserve(8 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let a = erased.handle();
+        let make_u = |pkg: u32, name: &str, kind: UnitKind<'static>, build_script: Option<u32>, deps: &[(&str, u32)]| -> Unit<'_> {
+            let mut u = make_unit(pkg, name, name, kind, "2024", deps, a);
+            u.version = Text::from_str_in("0.1.0", a);
+            u.build_script = build_script.map(UnitId);
+            u.cfg.push(CfgAtom::flag("debug_assertions", a));
+            if matches!(u.kind, UnitKind::ProcMacro) {
+                u.cfg.push(CfgAtom::flag("proc_macro", a));
+            }
+            u.cfg.sort();
+            u
+        };
+        let graph = make_graph(
+            std::vec![
+                make_u(0, "plain-lib", UnitKind::Lib, None, &[]),
+                make_u(1, "ring", UnitKind::BuildScript, None, &[]),
+                make_u(1, "ring", UnitKind::Lib, Some(1), &[]),
+                make_u(2, "pm-plain", UnitKind::ProcMacro, None, &[("plain_lib", 0)]),
+                make_u(3, "pm-dep-ring", UnitKind::ProcMacro, None, &[("ring", 2)]),
+            ],
+            a,
+        );
+        let target = blaze_unit_graph::TargetDesc::new(
+            "x86_64-unknown-linux-gnu",
+            blaze_own::Vec::new_in(a),
+            a,
+        );
+        let encoded = blaze_unit_graph::record::encode(&graph, &target, &target, a).expect("encode graph");
+        let sections = crate::graph_payload::Sections {
+            graph: &encoded,
+            list: &[],
+            wasm_graph: &encoded,
+        };
+
+        let lock_text = b"version = 4\n\n\
+[[package]]\nname = \"plain-lib\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"1111111111111111111111111111111111111111111111111111111111111111\"\n\n\
+[[package]]\nname = \"ring\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"2222222222222222222222222222222222222222222222222222222222222222\"\n\n\
+[[package]]\nname = \"pm-plain\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"3333333333333333333333333333333333333333333333333333333333333333\"\n\n\
+[[package]]\nname = \"pm-dep-ring\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"4444444444444444444444444444444444444444444444444444444444444444\"\n";
+        let heap = blaze_own::testing::heap();
+        let lock = crate::fetch::Lockfile::read(lock_text, heap, &frame).expect("parse lockfile");
+        let rows = crate::sweep::Rows::new_in(&frame);
+        let place = crate::macros::Place { home: None, checkout: "", members: None, rows: &rows };
+        let empty_modules = std::path::Path::new("/nonexistent-blaze-test-modules-dir");
+
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(42, bstd::io::Limits::USUAL));
+        let cx = io
+            .cx(core::time::Duration::from_secs(10), bstd::mem::TASK_FRAME)
+            .expect("sim cx");
+        let fetch_env = crate::fetch::FetchEnv {
+            clock: io.need_clock().expect("sim clock"),
+            checkout: "",
+            served: crate::engine_script_reads::Served::Simulated,
+            cert_file: None,
+            cert_dir: None,
+            rustflags: blaze_manifest::rustflags::RustflagsEnv::default(),
+            home: None,
+            cargo_home: None,
+            start: None,
+            toolchain: blaze_toolchain::PINNED,
+            fs: io.need_fs().expect("sim fs"),
+            sdk: crate::sdk::NONE_IN_TESTS,
+            exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
+            lan_peer: crate::fetch::LanPeerConfig::DISABLED,
+            heap,
+        };
+        let shared_probes = crate::scripts::SharedCommandProbes::new();
+        let probes = shared_probes.with_env(&fetch_env);
+
+        let pm_plain_subj = crate::macros::subject_of("pm-plain", "0.1.0");
+        let pm_dep_subj = crate::macros::subject_of("pm-dep-ring", "0.1.0");
+
+        // Case 1: Planned probe failure on `pm-dep-ring` (`UnitId(4)`) MUST be isolated to
+        // `pm-dep-ring`, leaving unrelated `pm-plain` listed as `Ok(ListedMacro { dep_probes: None, .. })`.
+        let planned_failed = [(
+            UnitId(4),
+            crate::engine_scripts::PlannedProbe::Failed(crate::scripts::ProbeSetupError::from_str(
+                crate::scripts::ProbeErrorKind::SpawnPinsOpen,
+                "simulated spawn pin failure",
+            )),
+        )];
+        let listed_fail = crate::macros::list(
+            &cx,
+            sections,
+            &lock,
+            empty_modules,
+            &place,
+            Some(probes),
+            Some(&planned_failed),
+            a,
+        )
+        .expect("list must isolate per-macro probe failures");
+        let plain_res = listed_fail.iter().find(|(s, _)| *s == pm_plain_subj).expect("pm-plain");
+        assert!(
+            matches!(&plain_res.1, Ok(m) if m.dep_probes.is_none()),
+            "unrelated proc-macro must stay Ok without dep_probes"
+        );
+        let dep_res = listed_fail.iter().find(|(s, _)| *s == pm_dep_subj).expect("pm-dep-ring");
+        assert!(
+            matches!(
+                &dep_res.1,
+                Err(crate::macros::MacroListFailure::Probes(e)) if e.kind == crate::scripts::ProbeErrorKind::SpawnPinsOpen
+            ),
+            "dependent proc-macro must carry its planned probe failure"
+        );
+
+        // Case 2: Stale planned digest on `pm-dep-ring` (`UnitId(4)`) MUST be refused with `PlannedDrift`
+        // rather than silently compiling/filing a different live probe identity under the planned
+        // task key — while still keeping `pm-plain` unaffected.
+        let stale_hex = Hex64(*b"0000000000000000000000000000000000000000000000000000000000000000");
+        let planned_stale = [(UnitId(4), crate::engine_scripts::PlannedProbe::Digest(stale_hex))];
+        let listed_drift = crate::macros::list(
+            &cx,
+            sections,
+            &lock,
+            empty_modules,
+            &place,
+            Some(probes),
+            Some(&planned_stale),
+            a,
+        )
+        .expect("list must isolate planned-drift refusal");
+        let plain_res2 = listed_drift.iter().find(|(s, _)| *s == pm_plain_subj).expect("pm-plain");
+        assert!(matches!(&plain_res2.1, Ok(m) if m.dep_probes.is_none()));
+        let dep_res2 = listed_drift.iter().find(|(s, _)| *s == pm_dep_subj).expect("pm-dep-ring");
+        assert!(
+            matches!(
+                &dep_res2.1,
+                Err(crate::macros::MacroListFailure::Probes(e)) if e.kind == crate::scripts::ProbeErrorKind::PlannedDrift
+            ),
+            "drifted live probe identity must be refused with PlannedDrift"
+        );
+    }
+
+    #[test]
+    fn duplicate_proc_macro_subjects_aggregate_probes_without_false_planned_drift() {
+        let frame = Frame::with_reserve(8 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let a = erased.handle();
+        let make_u = |pkg: u32, name: &str, kind: UnitKind<'static>, build_script: Option<u32>, features: &[&str], deps: &[(&str, u32)]| -> Unit<'_> {
+            let mut u = make_unit(pkg, name, name, kind, "2024", deps, a);
+            u.version = Text::from_str_in("0.1.0", a);
+            u.build_script = build_script.map(UnitId);
+            for &feat in features {
+                u.features.push(Text::from_str_in(feat, a));
+                u.cfg.push(CfgAtom::pair("feature", feat, a));
+            }
+            u.cfg.push(CfgAtom::flag("debug_assertions", a));
+            if matches!(u.kind, UnitKind::ProcMacro) {
+                u.cfg.push(CfgAtom::flag("proc_macro", a));
+            }
+            u.cfg.sort();
+            u
+        };
+
+        // Two distinct `UnitKind::ProcMacro` units sharing the SAME `(name, version)` ("pm-dup" 0.1.0):
+        // - Unit 3: feature "with-ring" -> depends on `ring` (HAS dependency build script)
+        // - Unit 4: feature "plain" -> depends on `plain-lib` (NO dependency build script)
+        let graph_dep_first = make_graph(
+            std::vec![
+                make_u(0, "plain-lib", UnitKind::Lib, None, &[], &[]),
+                make_u(1, "ring", UnitKind::BuildScript, None, &[], &[]),
+                make_u(1, "ring", UnitKind::Lib, Some(1), &[], &[]),
+                make_u(2, "pm-dup", UnitKind::ProcMacro, None, &["with-ring"], &[("ring", 2)]),
+                make_u(2, "pm-dup", UnitKind::ProcMacro, None, &["plain"], &[("plain_lib", 0)]),
+            ],
+            a,
+        );
+        let graph_plain_first = make_graph(
+            std::vec![
+                make_u(0, "plain-lib", UnitKind::Lib, None, &[], &[]),
+                make_u(1, "ring", UnitKind::BuildScript, None, &[], &[]),
+                make_u(1, "ring", UnitKind::Lib, Some(1), &[], &[]),
+                make_u(2, "pm-dup", UnitKind::ProcMacro, None, &["plain"], &[("plain_lib", 0)]),
+                make_u(2, "pm-dup", UnitKind::ProcMacro, None, &["with-ring"], &[("ring", 2)]),
+            ],
+            a,
+        );
+
+        let lock_text = b"version = 4\n\n\
+[[package]]\nname = \"plain-lib\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"1111111111111111111111111111111111111111111111111111111111111111\"\n\n\
+[[package]]\nname = \"ring\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"2222222222222222222222222222222222222222222222222222222222222222\"\n\n\
+[[package]]\nname = \"pm-dup\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"5555555555555555555555555555555555555555555555555555555555555555\"\n";
+        let heap = blaze_own::testing::heap();
+        let lock = crate::fetch::Lockfile::read(lock_text, heap, &frame).expect("parse lockfile");
+        let rows = crate::sweep::Rows::new_in(&frame);
+        let place = crate::macros::Place { home: None, checkout: "", members: None, rows: &rows };
+        let empty_modules = std::path::Path::new("/nonexistent-blaze-test-modules-dir");
+
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(78, bstd::io::Limits::USUAL));
+        let cx = io
+            .cx(core::time::Duration::from_secs(10), bstd::mem::TASK_FRAME)
+            .expect("sim cx");
+        let fetch_env = crate::fetch::FetchEnv {
+            clock: io.need_clock().expect("sim clock"),
+            checkout: "",
+            served: crate::engine_script_reads::Served::Simulated,
+            cert_file: None,
+            cert_dir: None,
+            rustflags: blaze_manifest::rustflags::RustflagsEnv::default(),
+            home: None,
+            cargo_home: None,
+            start: None,
+            toolchain: blaze_toolchain::PINNED,
+            fs: io.need_fs().expect("sim fs"),
+            sdk: crate::sdk::NONE_IN_TESTS,
+            exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
+            lan_peer: crate::fetch::LanPeerConfig::DISABLED,
+            heap,
+        };
+        let shared_probes = crate::scripts::SharedCommandProbes::new();
+        let probes = shared_probes.with_env(&fetch_env);
+        let pm_dup_subj = crate::macros::subject_of("pm-dup", "0.1.0");
+        let target = blaze_unit_graph::TargetDesc::new(
+            "x86_64-unknown-linux-gnu",
+            blaze_own::Vec::new_in(a),
+            a,
+        );
+
+        for (label, graph, expected_dep_uid) in [
+            ("dep-first", &graph_dep_first, UnitId(3)),
+            ("plain-first", &graph_plain_first, UnitId(4)),
+        ] {
+            let planned = crate::engine_scripts::classify_dep_probe_tags(
+                &cx,
+                graph,
+                Some(graph),
+                true,
+                &[],
+                None,
+                probes,
+                &frame,
+            );
+            assert_eq!(planned.proc_macros.len(), 1, "{label}: subject table must contain pm-dup");
+            assert_eq!(planned.proc_macros[0].0, pm_dup_subj);
+            assert_eq!(planned.proc_macro_units.len(), 1, "{label}: only the dep-script unit gets a planned probe entry");
+            assert_eq!(planned.proc_macro_units[0].0, expected_dep_uid);
+            let live_hex = planned.digest().expect("planned digest");
+
+            let encoded = blaze_unit_graph::record::encode(graph, &target, &target, a).expect("encode graph");
+            let sections = crate::graph_payload::Sections {
+                graph: &encoded,
+                list: &[],
+                wasm_graph: &encoded,
+            };
+            let listed = crate::macros::list(
+                &cx,
+                sections,
+                &lock,
+                empty_modules,
+                &place,
+                Some(probes),
+                Some(planned.proc_macro_units.as_slice()),
+                a,
+            )
+            .expect("macros::list must succeed for duplicate subjects");
+            assert_eq!(listed.len(), 2, "{label}: both duplicate units must be listed");
+            // Neither unit may hit `PlannedDrift`!
+            assert!(
+                listed.iter().all(|(s, r)| *s == pm_dup_subj && r.is_ok()),
+                "{label}: neither duplicate unit may fail with PlannedDrift"
+            );
+            // Deterministic sort puts the probe-dependent unit FIRST (rank 1) and the plain unit
+            // SECOND (rank 2), so `macros::run`'s `partition_point` matches `planned.proc_macros`.
+            assert!(
+                matches!(&listed[0].1, Ok(m) if m.dep_probes == Some(live_hex)),
+                "{label}: first duplicate entry must carry dep_probes = Some(live_hex)"
+            );
+            assert!(
+                matches!(&listed[1].1, Ok(m) if m.dep_probes.is_none()),
+                "{label}: second duplicate entry must stay Ok with dep_probes = None"
+            );
+        }
+
+        // Also verify that if the second duplicate unit fails (missing wasm root), `classify_dep_probe_tags`
+        // does NOT drop its error when the first duplicate unit succeeded with `Digest`!
+        let partial_wasm = make_graph(
+            std::vec![
+                make_u(0, "plain-lib", UnitKind::Lib, None, &[], &[]),
+                make_u(1, "ring", UnitKind::BuildScript, None, &[], &[]),
+                make_u(1, "ring", UnitKind::Lib, Some(1), &[], &[]),
+                make_u(2, "pm-dup", UnitKind::ProcMacro, None, &["with-ring"], &[("ring", 2)]),
+            ],
+            a,
+        );
+        let planned_err = crate::engine_scripts::classify_dep_probe_tags(
+            &cx,
+            &graph_dep_first,
+            Some(&partial_wasm),
+            true,
+            &[],
+            None,
+            probes,
+            &frame,
+        );
+        assert_eq!(planned_err.proc_macro_units.len(), 2, "both units must be classified (first Digest, second Failed)");
+        assert!(
+            matches!(
+                planned_err.proc_macros.first(),
+                Some((s, crate::engine_scripts::PlannedProbe::Failed(e)))
+                    if *s == pm_dup_subj && e.kind == crate::scripts::ProbeErrorKind::WasmRootMissing
+            ),
+            "error on second duplicate unit must win over first duplicate's Digest"
+        );
+    }
+
+    #[test]
+    fn find_wasm_root_unit_rejects_inexact_features_and_host_feature_side() {
+        let frame = Frame::with_reserve(4 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let a = erased.handle();
+
+        let make_u = |pkg: u32,
+                      name: &str,
+                      kind: UnitKind<'static>,
+                      for_host: bool,
+                      build_script: Option<u32>,
+                      feats: &[&str]|
+         -> Unit<'_> {
+            let mut u = make_unit(pkg, name, name, kind, "2024", &[], a);
+            u.for_host = for_host;
+            u.build_script = build_script.map(UnitId);
+            for &f in feats {
+                u.features.push(Text::from_str_in(f, a));
+            }
+            u
+        };
+
+        // Host graph:
+        // 0: foo BuildScript (features=["std"], served by target Lib -> HostFeatureSide::Target)
+        // 1: foo Lib (for_host=false, build_script=Some(0))
+        // 2: my-macro ProcMacro (features=["macros"])
+        let host_graph = make_graph(
+            std::vec![
+                make_u(1, "foo", UnitKind::BuildScript, true, None, &["std"]),
+                make_u(1, "foo", UnitKind::Lib, false, Some(0), &["std"]),
+                make_u(2, "my-macro", UnitKind::ProcMacro, true, None, &["macros"]),
+            ],
+            a,
+        );
+
+        // Wasm graph 1: same package & kind, WRONG features (missing "std" / wrong feature "other").
+        let wg_wrong_feats = make_graph(
+            std::vec![
+                make_u(1, "foo", UnitKind::BuildScript, true, None, &["other"]),
+                make_u(1, "foo", UnitKind::Lib, false, Some(0), &["other"]),
+                make_u(2, "my-macro", UnitKind::ProcMacro, true, None, &[]),
+            ],
+            a,
+        );
+        let bs_feat_err = locate_root_in_wasm_graph(&host_graph, &wg_wrong_feats, UnitId(0), CompileMode::BuildScript, a)
+            .expect_err("inexact BuildScript features in wasm_graph must be refused");
+        assert!(
+            std::format!("{bs_feat_err}").contains("no exact"),
+            "unexpected error: {bs_feat_err}"
+        );
+        let pm_feat_err = locate_root_in_wasm_graph(&host_graph, &wg_wrong_feats, UnitId(2), CompileMode::ProcMacro, a)
+            .expect_err("inexact ProcMacro features in wasm_graph must be refused");
+        assert!(
+            std::format!("{pm_feat_err}").contains("no exact"),
+            "unexpected error: {pm_feat_err}"
+        );
+
+        // Wasm graph 2: same package & kind & exact features, WRONG HostFeatureSide
+        // (served only by a for_host=true server -> HostFeatureSide::Host instead of Target).
+        let wg_wrong_side = make_graph(
+            std::vec![
+                make_u(1, "foo", UnitKind::BuildScript, true, None, &["std"]),
+                make_u(1, "foo", UnitKind::Lib, true, Some(0), &["std"]),
+            ],
+            a,
+        );
+        let bs_side_err = locate_root_in_wasm_graph(&host_graph, &wg_wrong_side, UnitId(0), CompileMode::BuildScript, a)
+            .expect_err("wrong HostFeatureSide BuildScript in wasm_graph must be refused");
+        assert!(
+            std::format!("{bs_side_err}").contains("no exact"),
+            "unexpected error: {bs_side_err}"
+        );
+
+        // Exact match on package + kind + side + features succeeds.
+        assert_eq!(
+            locate_root_in_wasm_graph(&host_graph, &host_graph, UnitId(0), CompileMode::BuildScript, a)
+                .expect("exact BuildScript root must match"),
+            UnitId(0)
+        );
+        assert_eq!(
+            locate_root_in_wasm_graph(&host_graph, &host_graph, UnitId(2), CompileMode::ProcMacro, a)
+                .expect("exact ProcMacro root must match"),
+            UnitId(2)
+        );
+    }
+
+    #[test]
+    fn lookup_cached_build_script_module_propagates_store_and_digest_errors() {
+        let base = std::env::temp_dir().join(std::format!(
+            "blaze-wasm64-cache-lookup-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("create temp base");
+        let heap = blaze_own::testing::heap();
+
+        // 1. Clean empty store -> explicit Ok(None) cache miss.
+        let empty_store = base.join("empty-store");
+        std::fs::create_dir_all(&empty_store).expect("create empty store");
+        let miss = lookup_cached_build_script_module(
+            &empty_store,
+            "ring",
+            "0.17.14",
+            &["alloc"],
+            None,
+            Some("deadbeef"),
+            heap.alloc(),
+        )
+        .expect("empty store must return Ok(None)");
+        assert!(miss.is_none());
+
+        // 2. Corrupt/unreadable module store (a regular file at `build-script/modules`) -> Err.
+        let corrupt_store = base.join("corrupt-store");
+        std::fs::create_dir_all(corrupt_store.join("build-script")).expect("create corrupt parent");
+        std::fs::write(corrupt_store.join("build-script/modules"), b"not-a-dir").expect("write file");
+        let store_err = lookup_cached_build_script_module(
+            &corrupt_store,
+            "ring",
+            "0.17.14",
+            &["alloc"],
+            None,
+            Some("deadbeef"),
+            heap.alloc(),
+        )
+        .expect_err("unreadable/corrupt build-script module store must propagate Err");
+        assert!(
+            std::format!("{store_err}").contains("looking up cached build-script module"),
+            "unexpected store error: {store_err}"
+        );
+
+        // 3. Cached record dir present with valid identity but missing `wasm-sha256` -> Err (NOT cache miss!).
+        let rec_dir = empty_store.join("build-script/modules/cached-ring-rec");
+        std::fs::create_dir_all(&rec_dir).expect("create record dir");
+        let id = blaze_toolchain::PINNED;
+        let identity = std::format!(
+            "{}\nname ring\nversion 0.17.14\nfeatures alloc\ndeps deadbeef\ntoolchain {id}\nwasm-target {WASM64_TARGET}\n{}\nbuilder blaze-wasm64\n",
+            script_unit::WASM_MODULE_HEADER,
+            script_unit::shim_line(),
+        );
+        std::fs::write(rec_dir.join("identity"), identity).expect("write identity");
+        std::fs::write(rec_dir.join("module.wasm"), b"\0asm\x01\0\0\0").expect("write wasm");
+        let digest_err = lookup_cached_build_script_module(
+            &empty_store,
+            "ring",
+            "0.17.14",
+            &["alloc"],
+            None,
+            Some("deadbeef"),
+            heap.alloc(),
+        )
+        .expect_err("missing wasm-sha256 in existing cached module dir must propagate Err");
+        assert!(
+            std::format!("{digest_err}").contains("reading wasm-sha256"),
+            "unexpected digest error: {digest_err}"
+        );
+
+        // 4. Writing `wasm-sha256` makes lookup return Ok(Some(digest)).
+        std::fs::write(rec_dir.join("wasm-sha256"), "abcd1234\n").expect("write digest");
+        let hit = lookup_cached_build_script_module(
+            &empty_store,
+            "ring",
+            "0.17.14",
+            &["alloc"],
+            None,
+            Some("deadbeef"),
+            heap.alloc(),
+        )
+        .expect("valid cached module must succeed")
+        .expect("valid cached module must hit");
+        assert_eq!(hit.as_str(), "abcd1234");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn member_script_files_digest_propagates_io_errors_instead_of_downgrading_to_none() {
+        let base = std::env::temp_dir().join(std::format!(
+            "blaze-wasm64-member-digest-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("good-member")).expect("create good-member");
+        std::fs::write(
+            base.join("good-member/Cargo.toml"),
+            "[package]\nname = \"good\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write Cargo.toml");
+        std::fs::write(base.join("good-member/build.rs"), "fn main() {}\n").expect("write build.rs");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::create_dir_all(base.join("unreadable-member")).expect("create unreadable-member");
+            let unreadable_manifest = base.join("unreadable-member/Cargo.toml");
+            std::fs::write(&unreadable_manifest, "[package]\nname = \"bad\"\nversion = \"0.1.0\"\n")
+                .expect("write unreadable Cargo.toml");
+            std::fs::set_permissions(&unreadable_manifest, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod 000");
+
+            let checkout = blaze_proc_macro::script_sandbox::RealRoot::resolve(&base).expect("open checkout");
+            let members = [
+                (LockId(1), "good-member", blaze_world::PathKind::Member),
+                (LockId(2), "unreadable-member", blaze_world::PathKind::Member),
+            ];
+            let heap = blaze_own::testing::heap();
+
+            // Non-member registry/git package -> Ok(None).
+            let non_member = member_script_files_digest(
+                &checkout,
+                &members,
+                LockId(99),
+                "build.rs",
+                "registry-crate",
+                heap.alloc(),
+            )
+            .expect("non-member must return Ok(None)");
+            assert!(non_member.is_none());
+
+            // Valid workspace member -> Ok(Some(hex)).
+            let good = member_script_files_digest(
+                &checkout,
+                &members,
+                LockId(1),
+                "build.rs",
+                "good",
+                heap.alloc(),
+            )
+            .expect("valid member must return Ok(Some)")
+            .expect("digest present");
+            assert_eq!(good.as_str().len(), 64);
+
+            // Workspace/path member with unreadable Cargo.toml MUST return Err, NOT Ok(None).
+            let err = member_script_files_digest(
+                &checkout,
+                &members,
+                LockId(2),
+                "build.rs",
+                "unreadable-member",
+                heap.alloc(),
+            )
+            .expect_err("member build-script files digest I/O error must propagate");
+            assert!(
+                std::format!("{err}").contains("reading build script files of unreadable-member"),
+                "unexpected member digest error: {err}"
+            );
+
+            let _ = std::fs::set_permissions(&unreadable_manifest, std::fs::Permissions::from_mode(0o644));
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ready_dep_probe_mismatch_detects_changed_probes_on_ready_wake_path() {
+        use blaze_drive::{Kind, Name, Tool};
+        use blaze_engine::{Cause, Gen, Phase, Row, Stage, Tools, pages};
+
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(53, bstd::io::Limits::USUAL));
+        let cx = io
+            .cx(core::time::Duration::from_secs(10), bstd::mem::TASK_FRAME)
+            .expect("sim cx");
+        let fs = io.need_fs().expect("fs");
+        let clock = io.need_clock().expect("clock");
+        let err = io.need_err().expect("err");
+        let home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.shared();
+        let frame = cx.frame();
+        let erased = blaze_own::Erased::new(frame);
+        let lent = home
+            .open_store(&blaze_cas::plain::Settings::default(), crate::store::Facts { boot: Some(1), nonce: 53 }, heap.alloc())
+            .expect("open store");
+        let mut store = crate::store::CommandStore::new(&cx, &lent, false, 0, None, clock, &err, erased.handle())
+            .expect("command store");
+        let tools = Tools([Tool(ContentId([0x33; 32])); blaze_drive::key::KINDS]);
+
+        let graph_source = ContentId([0x11; 32]);
+        let hex_a = Hex64(*b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let hex_b = Hex64(*b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        let bs_subj = ContentId([0x21; 32]);
+        let bs_name = crate::script_modules::name(bs_subj);
+        let bs_src_a = crate::engine_scripts::script_module_task_source(
+            graph_source,
+            bs_subj,
+            &[(bs_subj, crate::engine_scripts::PlannedProbe::Digest(hex_a))],
+        );
+
+        let pm_reg_subj = crate::macros::subject_of("sqlx-macros", "0.9.0");
+        let pm_reg_name = Name::new(Kind::MacroModule, pm_reg_subj);
+        let pm_reg_src_a = crate::macros::part_source_with_dep_probes(
+            crate::macros::part_source_with_files(graph_source, crate::macro_files::empty_closure_digest(), pm_reg_subj),
+            hex_a.as_str(),
+        );
+
+        // Workspace/patched proc-macro with a non-empty `closure_digest`: `macros::run` stores the
+        // 64-byte `dep_probes` hex in its `MacroModule` record payload.
+        let pm_ws_subj = crate::macros::subject_of("ws-macros", "0.1.0");
+        let pm_ws_name = Name::new(Kind::MacroModule, pm_ws_subj);
+        let non_empty_files = ContentId([0x77; 32]);
+        let pm_ws_src_a = crate::macros::part_source_with_dep_probes(
+            crate::macros::part_source_with_files(graph_source, non_empty_files, pm_ws_subj),
+            hex_a.as_str(),
+        );
+        let pm_ws_rec_bytes = blaze_drive::record::write_plain(
+            pm_ws_name,
+            pm_ws_src_a,
+            ContentId([0x88; 32]),
+            &[],
+            hex_a.as_str().as_bytes(),
+            erased.handle(),
+        );
+        let pm_ws_rec_key = blaze_drive::key::content_key(&pm_ws_rec_bytes);
+        crate::store::Store::put(&mut store, &cx, pm_ws_rec_key, &pm_ws_rec_bytes).expect("put pm_ws record");
+
+        let mut kept = pages::Kept::new_in(alloc);
+        kept.answer.serial = Gen(1);
+        let phase = Phase::new(Stage::Scripts, 0);
+        for (name, source, rec) in [
+            (bs_name, bs_src_a, None),
+            (pm_reg_name, pm_reg_src_a, None),
+            (pm_ws_name, pm_ws_src_a, Some(pm_ws_rec_key)),
+        ] {
+            kept.answer.by_file.entry(name).or_insert_with(|| blaze_own::Vec::new_in(alloc)).push(name);
+            kept.answer.rows.insert(
+                name,
+                Row {
+                    key: tools.key(name, &source),
+                    phase,
+                    file: name,
+                    source,
+                    out: ContentId([0x88; 32]),
+                    serial: Gen(1),
+                    defines: blaze_own::Vec::new_in(alloc),
+                    reads: blaze_own::Vec::new_in(alloc),
+                    by_cell: blaze_own::Vec::new_in(alloc),
+                    findings: 0,
+                    inline: false,
+                    failed: false,
+                },
+            );
+            kept.causes.insert(name, (Gen(1), Cause::New));
+            if let Some(k) = rec {
+                kept.records.insert(name, k);
+            }
+        }
+        let enc = pages::encode_at_bits(&kept, 4, alloc);
+        for (k, b) in enc.puts.iter() {
+            crate::store::Store::put(&mut store, &cx, *k, b).expect("put page");
+        }
+        let dir = crate::engine_answer::open_root(&cx, &mut store, enc.root, alloc)
+            .expect("open root io")
+            .expect("valid root");
+        let snap = store.snapshot_in(alloc).expect("snapshot");
+        let headers = pages::Headers::Absent { since: Gen(1) };
+        let stored = crate::engine_answer::Stored::new(&dir, &snap, &headers, pages::Check::Store, alloc);
+
+        let make_planned = |bs_hex: Hex64, reg_hex: Hex64, ws_hex: Hex64| {
+            let mut p = crate::engine_scripts::PlannedDepProbes::empty(frame);
+            p.script_modules.push((bs_subj, crate::engine_scripts::PlannedProbe::Digest(bs_hex)));
+            p.proc_macros.push((pm_reg_subj, crate::engine_scripts::PlannedProbe::Digest(reg_hex)));
+            p.proc_macros.push((pm_ws_subj, crate::engine_scripts::PlannedProbe::Digest(ws_hex)));
+            p.proc_macros.sort_unstable_by_key(|(s, _)| *s);
+            p
+        };
+
+        // Unchanged probe digest across all 3 tasks -> ready wake admitted (`Ok(None)`).
+        let same = make_planned(hex_a, hex_a, hex_a);
+        assert_eq!(
+            crate::engine_scripts::ready_dep_probe_mismatch(&cx, &mut store, &stored, graph_source, &same)
+                .expect("unchanged probes check"),
+            None
+        );
+
+        // Changed probe digest on build-script MacroModule -> ready wake refused (`Some(bs_name)`).
+        let drift_bs = make_planned(hex_b, hex_a, hex_a);
+        assert_eq!(
+            crate::engine_scripts::ready_dep_probe_mismatch(&cx, &mut store, &stored, graph_source, &drift_bs)
+                .expect("drift bs check"),
+            Some(bs_name)
+        );
+
+        // Changed probe digest on registry proc-macro -> ready wake refused (`Some(pm_reg_name)`).
+        let drift_reg = make_planned(hex_a, hex_b, hex_a);
+        assert_eq!(
+            crate::engine_scripts::ready_dep_probe_mismatch(&cx, &mut store, &stored, graph_source, &drift_reg)
+                .expect("drift reg check"),
+            Some(pm_reg_name)
+        );
+
+        // Changed probe digest on workspace/patched proc-macro -> ready wake refused (`Some(pm_ws_name)`).
+        let drift_ws = make_planned(hex_a, hex_a, hex_b);
+        assert_eq!(
+            crate::engine_scripts::ready_dep_probe_mismatch(&cx, &mut store, &stored, graph_source, &drift_ws)
+                .expect("drift ws check"),
+            Some(pm_ws_name)
+        );
+    }
+
+    #[test]
+    fn scoped_dep_probe_planning_excludes_out_of_scope_macros_and_scripts_without_probe_init() {
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(76, bstd::io::Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root sim cx");
+        let fs = io.need_fs().expect("sim fs");
+        let clock = io.need_clock().expect("sim clock");
+        let heap = blaze_own::testing::heap();
+        let env = crate::fetch::FetchEnv {
+            clock,
+            checkout: "",
+            served: crate::engine_script_reads::Served::Simulated,
+            cert_file: None,
+            cert_dir: None,
+            rustflags: blaze_manifest::rustflags::RustflagsEnv::default(),
+            home: None,
+            cargo_home: None,
+            start: None,
+            toolchain: blaze_toolchain::PINNED,
+            fs,
+            sdk: crate::sdk::NONE_IN_TESTS,
+            exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
+            lan_peer: crate::fetch::LanPeerConfig::DISABLED,
+            heap,
+        };
+        let frame = cx.frame();
+        let erased = Erased::new(frame);
+        let a = erased.handle();
+        let make_u = |pkg: u32, name: &str, kind: UnitKind<'static>, build_script: Option<u32>, deps: &[(&str, u32)]| -> Unit<'_> {
+            let mut u = make_unit(pkg, name, name, kind, "2024", deps, a);
+            u.build_script = build_script.map(UnitId);
+            u
+        };
+
+        // Workspace graph with BOTH probe-free (`pm_plain`, `bs_plain`) and probe-dependent
+        // (`pm_dep_ring`, `bs_with_ring`) units.
+        let graph = make_graph(
+            std::vec![
+                make_u(0, "plain_lib", UnitKind::Lib, None, &[]),
+                make_u(1, "ring", UnitKind::BuildScript, None, &[]),
+                make_u(1, "ring", UnitKind::Lib, Some(1), &[]),
+                make_u(2, "bs_plain", UnitKind::BuildScript, None, &[("plain_lib", 0)]),
+                make_u(3, "bs_with_ring", UnitKind::BuildScript, None, &[("ring", 2)]),
+                make_u(4, "pm_plain", UnitKind::ProcMacro, None, &[("plain_lib", 0)]),
+                make_u(5, "pm_dep_ring", UnitKind::ProcMacro, None, &[("ring", 2)]),
+            ],
+            a,
+        );
+        let pm_plain_subj = crate::macros::subject(&graph.units[5]);
+        let pm_dep_ring_subj = crate::macros::subject(&graph.units[6]);
+        let bs_plain_subj = ContentId::of("scoped-dep-probe-test", b"bs_plain");
+        let bs_with_ring_subj = ContentId::of("scoped-dep-probe-test", b"bs_with_ring");
+        let wasm_scripts = [(bs_plain_subj, UnitId(3)), (bs_with_ring_subj, UnitId(4))];
+
+        // 1. Scoped closure excluding ALL macros and scripts -> zero probe init, `leaf_id() == None`.
+        let holder_empty = crate::scripts::SharedCommandProbes::new();
+        let empty_scope = crate::engine_scripts::ScopedModuleSets {
+            script_modules: blaze_own::Vec::new_in(frame),
+            macro_modules: blaze_own::Vec::new_in(frame),
+        };
+        let planned_empty = crate::engine_scripts::classify_dep_probe_tags(
+            &cx,
+            &graph,
+            Some(&graph),
+            false,
+            &wasm_scripts,
+            Some(&empty_scope),
+            holder_empty.with_env(&env),
+            frame,
+        );
+        assert!(planned_empty.proc_macros.is_empty());
+        assert!(planned_empty.script_modules.is_empty());
+        assert_eq!(planned_empty.leaf_id(), None);
+        assert!(!holder_empty.c_probes_initialized());
+        assert!(!holder_empty.spawn_setting_initialized());
+
+        // 2. Scoped closure containing ONLY probe-free `pm_plain` & `bs_plain` (excluding
+        //    `pm_dep_ring` & `bs_with_ring`) -> zero probe init, `leaf_id() == None`.
+        let holder_plain = crate::scripts::SharedCommandProbes::new();
+        let mut plain_macros = blaze_own::Vec::new_in(frame);
+        plain_macros.push(pm_plain_subj);
+        let mut plain_scripts = blaze_own::Vec::new_in(frame);
+        plain_scripts.push(bs_plain_subj);
+        let plain_scope = crate::engine_scripts::ScopedModuleSets {
+            script_modules: plain_scripts,
+            macro_modules: plain_macros,
+        };
+        let planned_plain = crate::engine_scripts::classify_dep_probe_tags(
+            &cx,
+            &graph,
+            Some(&graph),
+            true,
+            &wasm_scripts,
+            Some(&plain_scope),
+            holder_plain.with_env(&env),
+            frame,
+        );
+        assert!(planned_plain.proc_macros.is_empty());
+        assert!(planned_plain.script_modules.is_empty());
+        assert_eq!(planned_plain.leaf_id(), None, "out-of-scope probe-dependent macro/script must not record DepProbes leaf");
+        assert!(!holder_plain.c_probes_initialized(), "out-of-scope macro/script must not initialize c_probes");
+        assert!(!holder_plain.spawn_setting_initialized(), "out-of-scope macro/script must not initialize spawn_setting");
+
+        // 3. Scoped closure including ONLY `pm_dep_ring` -> plans `pm_dep_ring` alone (not `bs_with_ring`),
+        //    initializes probes, and produces `leaf_id().is_some()`.
+        let holder_macro = crate::scripts::SharedCommandProbes::new();
+        let mut macro_only = blaze_own::Vec::new_in(frame);
+        macro_only.push(pm_dep_ring_subj);
+        let macro_scope = crate::engine_scripts::ScopedModuleSets {
+            script_modules: blaze_own::Vec::new_in(frame),
+            macro_modules: macro_only,
+        };
+        let planned_macro = crate::engine_scripts::classify_dep_probe_tags(
+            &cx,
+            &graph,
+            Some(&graph),
+            true,
+            &wasm_scripts,
+            Some(&macro_scope),
+            holder_macro.with_env(&env),
+            frame,
+        );
+        assert_eq!(planned_macro.proc_macros.len(), 1);
+        assert_eq!(planned_macro.proc_macros[0].0, pm_dep_ring_subj);
+        assert!(planned_macro.script_modules.is_empty());
+        assert!(planned_macro.leaf_id().is_some());
+        assert!(holder_macro.spawn_setting_initialized());
+
+        // 4. Whole-workspace (`scoped_sets = None`) -> plans both `pm_dep_ring` and `bs_with_ring`.
+        let holder_whole = crate::scripts::SharedCommandProbes::new();
+        let planned_whole = crate::engine_scripts::classify_dep_probe_tags(
+            &cx,
+            &graph,
+            Some(&graph),
+            true,
+            &wasm_scripts,
+            None,
+            holder_whole.with_env(&env),
+            frame,
+        );
+        assert_eq!(planned_whole.proc_macros.len(), 1);
+        assert_eq!(planned_whole.script_modules.len(), 1);
+        assert_eq!(planned_whole.script_modules[0].0, bs_with_ring_subj);
+        assert!(planned_whole.leaf_id().is_some());
+    }
+
+    #[test]
+    fn ensure_proc_macro_unit_rejects_drifted_probes_before_cache_hit() {
+        let tmp = std::env::temp_dir().join(std::format!(
+            "blaze-wasm64-nested-pm-drift-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+
+        let frame = Frame::with_reserve(8 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let a = erased.handle();
+        let make_u = |pkg: u32, name: &str, kind: UnitKind<'static>, build_script: Option<u32>, deps: &[(&str, u32)]| -> Unit<'_> {
+            let mut u = make_unit(pkg, name, name, kind, "2024", deps, a);
+            u.version = Text::from_str_in("0.1.0", a);
+            u.build_script = build_script.map(UnitId);
+            u
+        };
+        // Graph where nested proc-macro `pm-dep-ring` (Unit 2) depends on `ring` (Unit 1, build script Unit 0).
+        let graph = make_graph(
+            std::vec![
+                make_u(0, "ring", UnitKind::BuildScript, None, &[]),
+                make_u(0, "ring", UnitKind::Lib, Some(0), &[]),
+                make_u(1, "pm-dep-ring", UnitKind::ProcMacro, None, &[("ring", 1)]),
+            ],
+            a,
+        );
+        let lock_text = b"version = 4\n\n\
+[[package]]\nname = \"ring\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"2222222222222222222222222222222222222222222222222222222222222222\"\n\n\
+[[package]]\nname = \"pm-dep-ring\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"4444444444444444444444444444444444444444444444444444444444444444\"\n";
+        let heap = blaze_own::testing::heap();
+        let lock = crate::fetch::Lockfile::read(lock_text, heap, &frame).expect("lockfile");
+
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(82, bstd::io::Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("sim cx");
+        let fetch_env = crate::fetch::FetchEnv {
+            clock: io.need_clock().expect("clock"),
+            checkout: "",
+            served: crate::engine_script_reads::Served::Simulated,
+            cert_file: None,
+            cert_dir: None,
+            rustflags: blaze_manifest::rustflags::RustflagsEnv::default(),
+            home: None,
+            cargo_home: None,
+            start: None,
+            toolchain: blaze_toolchain::PINNED,
+            fs: io.need_fs().expect("fs"),
+            sdk: crate::sdk::NONE_IN_TESTS,
+            exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
+            lan_peer: crate::fetch::LanPeerConfig::DISABLED,
+            heap,
+        };
+        let shared_probes = crate::scripts::SharedCommandProbes::new();
+        let probes = shared_probes.with_env(&fetch_env);
+        let live_hex = probes.dep_probe_identity_hex(&cx).expect("live hex");
+
+        // Pre-populate a cached module record on disk for `live_hex` (tag B) so the cache-hit path
+        // would succeed if `ensure_proc_macro_unit` skipped planned-probe drift validation!
+        let locked = blaze_proc_macro::module::LockedPackages::of(lock.lock);
+        let folders = blaze_world::procs::git_folders(&tmp).expect("git folders");
+        let identity_b = blaze_world::procs::identify(
+            lock.lock,
+            &locked,
+            &folders,
+            &graph,
+            &graph.units[2],
+            |_| Ok(None::<&str>),
+            heap.alloc(),
+        )
+        .expect("identify")
+        .expect("identified")
+        .with_wasm_features(lock.lock, &graph, graph.units[2].package, |_| None::<&str>, heap.alloc())
+        .with_dep_probes(live_hex.as_str());
+        let (mod_key, id_text) = identity_b.with_id(|id| {
+            (
+                blaze_proc_macro::module::module_key(id),
+                blaze_proc_macro::module::identity(id),
+            )
+        });
+        let fake_wasm = b"\0asm\x01\0\0\0";
+        let fake_sha = sha256_hex(fake_wasm);
+        publish_proc_macro_module(&tmp, &mod_key, &id_text, fake_wasm, &fake_sha, &[], PROC_MACRO_DECLS_GLOBAL)
+            .expect("publish cached nested proc-macro module for live probe B");
+
+        // Now ask `ensure_proc_macro_unit` with a DIFFERENT planned probe tag A -> MUST refuse
+        // drift BEFORE loading/returning the cached B module!
+        let planned_a = Hex64::from_bytes([0xaa; 32]);
+        assert_ne!(planned_a, live_hex);
+        let producers = blaze_ids::producer::Producers::for_tests(b"nested-pm-drift");
+        let checkout = blaze_proc_macro::script_sandbox::RealRoot::resolve(&tmp).expect("real root");
+        let err = ensure_proc_macro_unit(
+            &cx,
+            &tmp,
+            &graph,
+            lock.lock,
+            &checkout,
+            &[],
+            &producers,
+            heap,
+            DepScriptProbes { shared: Some(probes), expected_probes: Some(planned_a) },
+            UnitId(2),
+            0,
+        )
+        .expect_err("ensure_proc_macro_unit must refuse drifted live probe before cache hit");
+        let msg = std::format!("{err}");
+        assert!(
+            msg.contains("changed") || msg.contains("planned"),
+            "error must report planned-vs-live probe drift, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

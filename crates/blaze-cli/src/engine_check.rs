@@ -452,7 +452,7 @@ pub(crate) fn warm_toolchain(
         shown.quiet = true;
         let mut check_opts = opts();
         check_opts.fresh = fresh;
-        let checked = check_live(cx, fs, host, rng, Some(args), net, root, check_opts, &mut shown, phases, out, err, None, Some(&lazy_sdk), None, crate::store::StoreTeardown::Drop)?;
+        let checked = check_live(cx, fs, host, rng, Some(args), net, root, check_opts, &mut shown, phases, out, err, None, Some(&lazy_sdk), None, None, crate::store::StoreTeardown::Drop)?;
         let tc_hex = blaze_toolchain::PINNED.hex();
         out.line(
             cx,
@@ -508,7 +508,7 @@ fn serve(
                     let ran = crate::run_line::watched(cx, err, clock, line, |watch, bg| {
                         watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Checking));
                         let live = line.live.then_some(bg);
-                        let res = check_live(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err, live, Some(&lazy_sdk), None, crate::store::StoreTeardown::ForgetForExit);
+                        let res = check_live(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err, live, Some(&lazy_sdk), None, None, crate::store::StoreTeardown::ForgetForExit);
                         watch.see(blaze_screen::Step::Says);
                         res
                     }).map_err(CliError::RunLine)??;
@@ -524,7 +524,7 @@ fn serve(
                     if selectors.is_empty() {
                         selectors.push("all");
                     }
-                    let mut ask = |mut shown| check_live(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err, None, Some(&lazy_sdk), None, crate::store::StoreTeardown::Drop).map(|checked| (checked, shown));
+                    let mut ask = |mut shown| check_live(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err, None, Some(&lazy_sdk), None, None, crate::store::StoreTeardown::Drop).map(|checked| (checked, shown));
                     match crate::fix_then_check::<crate::fix::Atomic, Checked>(cx, root, &selectors, (caps, view, shown_root), frame, out, &mut ask)? {
                         crate::Fixed::Refused => None,
                         crate::Fixed::Checked(checked, _) => Some(checked),
@@ -923,9 +923,50 @@ pub(crate) struct Standing<'r, 'm> {
     /// already-opened `~/.blaze` directory so pure-Rust starts pay 0 ms for SDK probing.
     sdk_resolver: &'r dyn Fn(&Cx, Option<&Dir<ReadWrite>>, u64) -> Result<blaze_apple_sdk::Sdk<'r>, blaze_apple_sdk::SdkRefused<'r>>,
     home_dir: Option<&'r Dir<ReadWrite>>,
+    /// Check-time command probes (`SharedCommandProbes`) carried into start-time proc-macro
+    /// runners (`RunProcs`) so `run`/`test`/`export` reuse the exact probe/pin snapshot that
+    /// keyed and produced the `MacroModule` records.
+    probes: &'r crate::scripts::SharedCommandProbes,
+}
+
+/// Borrowed lazy macOS SDK handle handed to start-time proc-macro runners (`RunProcs`) so
+/// `run`/`test`/`export` resolve the exact same SDK identity snapshot as `check` on first
+/// proc-macro demand (0 ms cost on pure-Rust starts) without borrowing `Standing::store`.
+#[derive(Clone, Copy)]
+pub(crate) struct RunSdk<'r> {
+    place_sdk: Result<blaze_apple_sdk::Sdk<'r>, blaze_apple_sdk::SdkRefused<'r>>,
+    resolver: &'r dyn Fn(&Cx, Option<&Dir<ReadWrite>>, u64) -> Result<blaze_apple_sdk::Sdk<'r>, blaze_apple_sdk::SdkRefused<'r>>,
+    home_dir: Option<&'r Dir<ReadWrite>>,
+    wall_ns: u64,
+}
+
+impl<'r> RunSdk<'r> {
+    pub(crate) fn resolve(&self, cx: &Cx) -> Result<blaze_apple_sdk::Sdk<'r>, blaze_apple_sdk::SdkRefused<'r>> {
+        if self.place_sdk.is_ok() {
+            return self.place_sdk;
+        }
+        (self.resolver)(cx, self.home_dir, self.wall_ns)
+    }
 }
 
 impl<'r, 'm> Standing<'r, 'm> {
+    /// Returns a `Copy` lazy SDK handle borrowing only immutable fields of `Standing` so
+    /// start-time `RunProcs` can resolve the exact same macOS SDK snapshot as `check`.
+    pub(crate) fn sdk_for_procs(&self) -> RunSdk<'r> {
+        RunSdk {
+            place_sdk: self.place.sdk,
+            resolver: self.sdk_resolver,
+            home_dir: self.home_dir,
+            wall_ns: self.lent.wall_ns(),
+        }
+    }
+
+    /// Returns the check-time command probe holder (`SharedCommandProbes`) so start-time
+    /// `RunProcs` reuse the exact spawn-pin, C-probe, and probe-identity snapshot from `check`.
+    pub(crate) fn probes_for_procs(&self) -> &'r crate::scripts::SharedCommandProbes {
+        self.probes
+    }
+
     /// Resolves the macOS SDK lazily on first demand (at most once per command via `OnceCell`),
     /// reusing the already-opened `~/.blaze` home directory and caching the result into
     /// `self.place.sdk`.
@@ -1647,6 +1688,7 @@ fn preserve_standing_sibling_names<'a, 'f, 's, 'r>(
     last_lines: Option<&crate::engine_lines::Last<'_, '_>>,
     tools: &blaze_engine::Tools,
     env: &FetchEnv<'_>,
+    script_module_probe_tags: &[(blaze_ids::ContentId, crate::engine_scripts::PlannedProbe)],
     alloc: SharedAlloc<'a>,
     heap_alloc: blaze_own::Alloc<'static>,
 ) -> Result<Option<ScopedUnits>, CliError> {
@@ -1722,7 +1764,10 @@ fn preserve_standing_sibling_names<'a, 'f, 's, 'r>(
     }
     for subject in world.script_module_subjects() {
         let name = crate::script_modules::name(subject);
-        module_sources.insert(name, crate::script_modules::part_source(graph_pub.source, subject));
+        module_sources.insert(
+            name,
+            crate::engine_scripts::script_module_task_source(graph_pub.source, subject, script_module_probe_tags),
+        );
     }
     let mut given_answers: SMap<'_, Name, blaze_ids::ContentId> = SMap::new_in(alloc);
     let mut changed_slots: SSet<'_, Name> = SSet::new_in(alloc);
@@ -2184,6 +2229,115 @@ fn open_abs_dir(cx: &Cx, fs: &bstd::fs::Fs, abs: &str) -> Result<Dir<ReadWrite>,
     })
 }
 
+/// Seeds `probes` with the dependency-probe identity tag that produced a pinned JIT certificate
+/// (`cert`), checking the checkout pointer's `LeafKind::DepProbes` leaf first (when the pointer
+/// still names `cert`) and falling back to any `Kind::MacroModule` record's 64-byte probe payload
+/// stored inside `stood_root` (so pinned launches stay pinned to `cert`'s probe identity even after
+/// subsequent workspace edits advance the checkout pointer). Zero probe I/O on workspaces with no
+/// probe-dependent `MacroModule`s.
+#[expect(clippy::too_many_arguments, reason = "pinned certificate probe seeding over cx, store, stored, root, cert, checkout, scope, probes, and frame")]
+pub(crate) fn seed_pinned_dep_probes<D: blaze_core::Driver, S: crate::store::Sharing>(
+    cx: &Cx,
+    store: &mut crate::store::CommandStore<'_, '_, D, S>,
+    stored: &crate::engine_answer::Stored<'_>,
+    stood_root: &blaze_engine::pages::Root<'_>,
+    cert: blaze_ids::ContentId,
+    checkout: &str,
+    scope: CheckScope<'_>,
+    probes: &crate::scripts::SharedCommandProbes,
+    frame: &Frame,
+) -> Result<Option<crate::wasm64_compile::Hex64>, CliError> {
+    use crate::store::Store as _;
+    let scoped_root = crate::engine_answer::scoped_root_name(checkout, scope, frame);
+    let whole_root = crate::engine_answer::root_name(checkout, frame);
+    let roots: [&str; 2] = [scoped_root.as_str(), whole_root.as_str()];
+    for (idx, root_name) in roots.iter().enumerate() {
+        if idx == 1 && *root_name == scoped_root.as_str() {
+            continue;
+        }
+        if let Some(Ok(ptr)) = crate::engine_answer::load_pointer(cx, store, root_name)?
+            && ptr.root.0 == cert
+        {
+            for i in 0..ptr.leaves.len() {
+                let leaf = ptr.leaves.row(i);
+                if leaf.kind == sweep::LeafKind::DepProbes {
+                    let hex = crate::wasm64_compile::Hex64::from_bytes(leaf.id.0);
+                    probes.publish_checked_dep_probe_hex(hex);
+                    return Ok(Some(hex));
+                }
+            }
+        }
+    }
+    for &name in stood_root.files.keys() {
+        if name.kind != Kind::MacroModule {
+            continue;
+        }
+        let Some(header) = stored.header(name).map_err(crate::engine_answer::page_error)? else {
+            return Err(EngineCheckError::StartPage {
+                name,
+                why: "a pinned MacroModule header is missing from the stored answer",
+            }
+            .into());
+        };
+        if header.facts.failed {
+            continue;
+        }
+        let Some(rec_key) = header.record else {
+            return Err(EngineCheckError::StartPage {
+                name,
+                why: "a pinned MacroModule row has no stored record key",
+            }
+            .into());
+        };
+        let Some(held) = store.get(cx, rec_key)? else {
+            return Err(EngineCheckError::StartPage {
+                name,
+                why: "a pinned MacroModule record is missing from the store",
+            }
+            .into());
+        };
+        let Ok(blaze_drive::record::Stored::Whole(view)) = blaze_drive::record::open(held.bytes) else {
+            return Err(EngineCheckError::StartPage {
+                name,
+                why: "a pinned MacroModule record in the store is malformed",
+            }
+            .into());
+        };
+        if view.name != name {
+            return Err(EngineCheckError::StartPage {
+                name,
+                why: "a pinned MacroModule record in the store names a different task",
+            }
+            .into());
+        }
+        if view.payload.is_empty() {
+            continue;
+        }
+        let Some(hex) = crate::wasm64_compile::Hex64::from_hex_bytes(view.payload) else {
+            return Err(EngineCheckError::StartPage {
+                name,
+                why: "a pinned MacroModule record carries a malformed dependency-probe payload",
+            }
+            .into());
+        };
+        probes.publish_checked_dep_probe_hex(hex);
+        return Ok(Some(hex));
+    }
+    Ok(None)
+}
+
+/// Publishes (or clears when `None`) the verified dependency-probe identity snapshot captured
+/// during a certificate sweep into `command_probes` right before returning a certificate hit.
+pub(crate) fn apply_cert_dep_probe_snapshot(
+    command_probes: &crate::scripts::SharedCommandProbes,
+    cert_hex: Option<crate::wasm64_compile::Hex64>,
+) {
+    match cert_hex {
+        Some(hex) => command_probes.publish_checked_dep_probe_hex(hex),
+        None => command_probes.clear_checked_dep_probe_hex(),
+    }
+}
+
 /// Opens a pinned engine answer `Standing` directly from `cert` (`standing.root`) in `store_home`
 /// for `blaze jit-exec` — ZERO workspace stat sweep, ZERO file hashing, and ZERO re-checking.
 /// Commits the store cleanly after `start` returns (including updated `start_list`, compiled
@@ -2323,6 +2477,18 @@ pub(crate) fn open_pinned_standing<R>(
     let sdk_resolver = |cx: &Cx, home_dir: Option<&Dir<ReadWrite>>, wall_ns: u64| {
         lazy_sdk.resolve_on_demand(cx, home_dir, wall_ns)
     };
+    let command_probes = crate::scripts::SharedCommandProbes::new();
+    let _ = seed_pinned_dep_probes(
+        cx,
+        &mut store,
+        &stored,
+        &stood_root,
+        cert,
+        place.checkout,
+        scope,
+        &command_probes,
+        frame,
+    )?;
     let standing = Standing {
         root: cert,
         store: &mut store,
@@ -2349,6 +2515,7 @@ pub(crate) fn open_pinned_standing<R>(
         test_packages: None,
         sdk_resolver: &sdk_resolver,
         home_dir: Some(opened.home.dir()),
+        probes: &command_probes,
     };
     let started = start(standing, phases, rng);
     if let Some((name, why)) = refused.get() {
@@ -2693,7 +2860,7 @@ fn check_and_open<R>(
                     let mut first = print::Shown::new(caps, blaze_report::frame::plain::View::Agent, shown_root, frame);
                     first.quiet = true;
                     first.output_only = false;
-                    let _ = check_live(cx, fs, host, rng, args, net, root, opts(), &mut first, phases, out, err, None, Some(&lazy_sdk), Some(&mut reused_store), crate::store::StoreTeardown::Drop)?;
+                    let _ = check_live(cx, fs, host, rng, args, net, root, opts(), &mut first, phases, out, err, None, Some(&lazy_sdk), None, Some(&mut reused_store), crate::store::StoreTeardown::Drop)?;
                     if first.listed.iter().any(|l| l.fix.is_some())
                         && let Ok(applied) = crate::fix::apply(cx, root, &crate::fix::Atomic, &first.listed, &["all"], frame)?
                     {
@@ -2710,7 +2877,8 @@ fn check_and_open<R>(
         let mut opts = opts();
         opts.scope = check_scope;
         let toolchain = opts.toolchain;
-        let checked = check_live(cx, fs, host, rng, args, net, root, opts, &mut shown, phases, out, err, live, Some(&lazy_sdk), Some(&mut reused_store), crate::store::StoreTeardown::Drop)?;
+        let command_probes = crate::scripts::SharedCommandProbes::new();
+        let checked = check_live(cx, fs, host, rng, args, net, root, opts, &mut shown, phases, out, err, live, Some(&lazy_sdk), Some(&command_probes), Some(&mut reused_store), crate::store::StoreTeardown::Drop)?;
         // The check has answered: its signals go back before the start, which takes the
         // parent's own (D103: run_loop.rs `Held::hold`; a suite's pool, test_drive.rs
         // `Signals`, once for the suite). Held into the start, the first run is refused.
@@ -2817,6 +2985,7 @@ fn check_and_open<R>(
                     test_packages: selected_packages,
                     sdk_resolver: &sdk_resolver,
                     home_dir: Some(opened.home.dir()),
+                    probes: &command_probes,
                 })
             }
             _ => None,
@@ -3101,7 +3270,7 @@ pub(crate) fn check<'f>(
     out: &Out,
     err: &Out,
 ) -> Result<Checked, CliError> {
-    check_live(cx, fs, host, rng, args, net, root, opts, shown, phases, out, err, None, None, None, crate::store::StoreTeardown::Drop)
+    check_live(cx, fs, host, rng, args, net, root, opts, shown, phases, out, err, None, None, None, None, crate::store::StoreTeardown::Drop)
 }
 
 /// Extracts an [`crate::engine_answer::Unreadable`] reason when reading a lazy page or standing
@@ -3222,6 +3391,7 @@ fn check_live<'f, 's: 'f>(
     err: &Out,
     live: Option<&(dyn blaze_screen::Watch + Sync)>,
     lazy_sdk: Option<&LazySdk<'s>>,
+    shared_probes: Option<&crate::scripts::SharedCommandProbes>,
     mut reuse_store: Option<&mut Option<crate::store::Opened>>,
     teardown: crate::store::StoreTeardown,
 ) -> Result<Checked, CliError> {
@@ -3278,6 +3448,7 @@ fn check_live<'f, 's: 'f>(
                             &mut active,
                             live,
                             lazy_sdk,
+                            shared_probes,
                             reuse,
                             &request_mem_slot,
                             teardown,
@@ -3305,6 +3476,7 @@ fn check_live<'f, 's: 'f>(
                         &mut active,
                         live,
                         lazy_sdk,
+                        shared_probes,
                         reuse,
                         &request_mem_slot,
                         teardown,
@@ -3439,6 +3611,7 @@ fn checking<'f, 's: 'f>(
     active: &mut Option<Phase>,
     live: Option<&(dyn blaze_screen::Watch + Sync)>,
     lazy_sdk: Option<&LazySdk<'s>>,
+    shared_probes: Option<&crate::scripts::SharedCommandProbes>,
     mut reuse_store: Option<&mut Option<crate::store::Opened>>,
     request_mem_slot: &core::cell::OnceCell<crate::engine_phase_mem::RequestMem>,
     teardown: crate::store::StoreTeardown,
@@ -3730,6 +3903,32 @@ fn checking<'f, 's: 'f>(
     if let Some(sweep) = script_sweep.as_mut() { sweep.prepare(cx, &mut store, pointer_root_name, &journal, frame)?; }
     let mut followed_kept = None;
     let mut own_scoped_moved = false;
+    let owned_probes = crate::scripts::SharedCommandProbes::new();
+    let command_probes = shared_probes.unwrap_or(&owned_probes);
+    let mut env = place.fetch_env(phases.clock().clone(), toolchain, fs.clone(), heap);
+    let wall_ns = phases.clock().wall().as_ns();
+    // Helper invoked ONLY when a stored pointer's leaf table carries a `LeafKind::DepProbes` row
+    // (workspaces with probe-dependent `MacroModule`s): validates live derived-fact pins / SDK /
+    // Linux clang closure BEFORE accepting a certificate and captures the verified digest so the
+    // certificate-hit branch can publish it into `command_probes` for start-time `RunProcs`.
+    let cert_dep_probe_hex: core::cell::Cell<Option<crate::wasm64_compile::Hex64>> = core::cell::Cell::new(None);
+    let resolve_dep_probes = |env: &FetchEnv<'_>| -> Result<blaze_ids::ContentId, CliError> {
+        let resolved_sdk = match lazy_sdk {
+            Some(lazy) => lazy.resolve_on_demand(cx, Some(opened.home.dir()), wall_ns),
+            None => env.sdk,
+        };
+        let tag = match command_probes.with_env(env).with_sdk(resolved_sdk).dep_probe_identity_hex(cx) {
+            Ok(hex) => {
+                cert_dep_probe_hex.set(Some(hex));
+                hex
+            }
+            Err(err) => {
+                cert_dep_probe_hex.set(None);
+                crate::wasm64_compile::probe_error_hex(err.kind)
+            }
+        };
+        Ok(tag.to_content_id())
+    };
     if let (Some(pointer), Some(lines)) = (&pointer, &last_lines) {
         // Only the rows the journal's changes reach are looked at; all where it says nothing.
         // Another checkout's leaves: every row looked at (its journal is not this checkout's).
@@ -3738,12 +3937,13 @@ fn checking<'f, 's: 'f>(
             crate::engine_ready_edit::StoredBase::Own | crate::engine_ready_edit::StoredBase::ToolsMoved => journal.marked(&pointer.leaves, frame),
         };
         let sdk_digest_fn = || match lazy_sdk {
-            Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), phases.clock().wall().as_ns()),
+            Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), wall_ns),
             None => Ok(blaze_build_script::facts::sdk_id_digest("")),
         };
+        let dep_probes_fn = || resolve_dep_probes(&env);
         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
         let follow_began = phases.clock().now();
-        let (followed, statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &pointer.leaves, marked.as_deref(), script_sweep.as_mut(), Some(&sdk_digest_fn), frame)?;
+        let (followed, statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &pointer.leaves, marked.as_deref(), script_sweep.as_mut(), Some(&sdk_digest_fn), Some(&dep_probes_fn), frame)?;
         let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
         sweep_counts = journal.counts(statted, u32::try_from(pointer.leaves.len()).unwrap_or(u32::MAX)).with_parts(journal.parts(&pointer.leaves, frame)).with_looks(followed.looks, follow_ns);
         // Set, then borrowed SHARED: `Option::insert` hands back a `&mut`, and `today_slots` below
@@ -3810,6 +4010,7 @@ fn checking<'f, 's: 'f>(
                 }
             };
             if (own_certifies && (whole_clean_cert || scoped_filtered.is_some())) || adopted.is_some() {
+                apply_cert_dep_probe_snapshot(command_probes, cert_dep_probe_hex.get());
                 // The certificate's print and commit, then its profile, each in a call of its own
                 // (rule 54: no stage's temporaries in this frame).
                 let cert_root = if own_whole { whole_root.as_str() } else { answer_root.as_str() };
@@ -3875,12 +4076,14 @@ fn checking<'f, 's: 'f>(
         };
         let whole_marked = whole_journal.marked(&whole_ptr.leaves, frame);
         let sdk_digest_fn = || match lazy_sdk {
-            Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), phases.clock().wall().as_ns()),
+            Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), wall_ns),
             None => Ok(blaze_build_script::facts::sdk_id_digest("")),
         };
+        cert_dep_probe_hex.set(None);
+        let dep_probes_fn = || resolve_dep_probes(&env);
         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
         let follow_began = phases.clock().now();
-        let (whole_followed, whole_statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &whole_ptr.leaves, whole_marked.as_deref(), None, Some(&sdk_digest_fn), frame)?;
+        let (whole_followed, whole_statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &whole_ptr.leaves, whole_marked.as_deref(), None, Some(&sdk_digest_fn), Some(&dep_probes_fn), frame)?;
         let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
         let whole_moved = whole_followed.layout_moved
             || whole_followed.now.rows.iter().zip(whole_followed.was.iter()).any(|(now, was)| now.state() != *was);
@@ -3908,6 +4111,7 @@ fn checking<'f, 's: 'f>(
                 }
             };
             if whole_clean_cert || scoped_filtered.is_some() {
+                apply_cert_dep_probe_snapshot(command_probes, cert_dep_probe_hex.get());
                 let whole_view_slot = if scoped_filtered.is_some() {
                     None
                 } else {
@@ -4000,12 +4204,13 @@ fn checking<'f, 's: 'f>(
                     }
                     if let Some(new_ptr) = &pointer {
                         let sdk_digest_fn = || match lazy_sdk {
-                            Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), phases.clock().wall().as_ns()),
+                            Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), wall_ns),
                             None => Ok(blaze_build_script::facts::sdk_id_digest("")),
                         };
+                        let dep_probes_fn = || resolve_dep_probes(&env);
                         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
                         let follow_began = phases.clock().now();
-                        let (followed, statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &new_ptr.leaves, None, script_sweep.as_mut(), Some(&sdk_digest_fn), frame)?;
+                        let (followed, statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &new_ptr.leaves, None, script_sweep.as_mut(), Some(&sdk_digest_fn), Some(&dep_probes_fn), frame)?;
                         let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
                         sweep_counts = journal.counts(statted, u32::try_from(new_ptr.leaves.len()).unwrap_or(u32::MAX)).with_parts(journal.parts(&new_ptr.leaves, frame)).with_looks(followed.looks, follow_ns);
                         followed_kept = Some(followed);
@@ -4087,7 +4292,6 @@ fn checking<'f, 's: 'f>(
         phases.mark_cx(cx, "stored answer read", frame);
     }
     let read_from_last = last_root.is_some();
-    let mut env = place.fetch_env(phases.clock().clone(), toolchain, fs.clone(), heap);
 
     // 1. Plan: the units stage, then the files, then the crates; on the ready path
     // ([`ready_setup`]) none of them: the graph's row and list, the outlines read back by their
@@ -4167,10 +4371,45 @@ fn checking<'f, 's: 'f>(
             discovered.plan.files_read = setup.rows_read;
             discovered.plan.files_total = setup.slots;
             let ReadySetup { rows, names, graph, outlined, deferred, slots, files: file_counts, skipped, places: file_places, rows_read: _ } = setup;
+            let scoped = ScopedUnits::of(check_scope, names.list(), heap.alloc());
+            if ({
+                use blaze_world::crate_list::CrateGraph as _;
+                let list = names.list();
+                (0..list.len()).any(|at| {
+                    scoped.as_ref().is_none_or(|s| s.allows(at))
+                        && (list.proc_macro(at) || names.script_of(at).is_some())
+                })
+            }) && let Some(lazy) = lazy_sdk
+            {
+                env.sdk = lazy.resolve_in_home(cx, Some(opened.home.dir()), phases);
+            }
+            let ready_dep_probes = crate::engine_scripts::plan_dep_probe_tags_at(
+                cx,
+                &names,
+                &mut store,
+                graph.at,
+                scoped.as_ref(),
+                command_probes.with_env(&env),
+                scripts.has_runner(),
+                frame,
+            )?;
+            if !ready_dep_probes.proc_macros.is_empty() || !ready_dep_probes.script_modules.is_empty() {
+                let Some(graph_header) = last_stored.header(Name::unit_graph()).map_err(crate::engine_answer::page_error)? else {
+                    return Ok(Err(ReadyRefused::NoRow { name: Name::unit_graph() }));
+                };
+                if let Some(stale_module) = crate::engine_scripts::ready_dep_probe_mismatch(
+                    cx,
+                    &mut store,
+                    last_stored,
+                    graph_header.facts.source,
+                    &ready_dep_probes,
+                )? {
+                    return Ok(Err(ReadyRefused::Kind { name: stale_module }));
+                }
+            }
             let names = Some(NamesStage::new(names, frame));
             let graph = Some(graph);
             let plan_list = names.as_ref().and_then(|stage| stage.names.as_ref()).map(|world| world.list());
-            let scoped = plan_list.and_then(|list| ScopedUnits::of(check_scope, list, heap.alloc()));
             let mut found_places: SVec<'_, (Name, blaze_engine::pages::FilePlace)> = SVec::new_in(alloc);
             found_places.extend(last.places.iter().filter(|(_, place)| place.flags & PLACE_FOUND != 0).map(|(file, place)| (*file, *place)));
             found_places.sort_unstable_by_key(|(file, _)| *file);
@@ -4220,6 +4459,11 @@ fn checking<'f, 's: 'f>(
             }
             let entering_tasks = crate::engine_ready_edit::entering_tasks(last_stored, &tools, &pre_files, &woken, alloc)?;
             drop(pre_files);
+            if let Some(hex) = ready_dep_probes.digest() {
+                command_probes.publish_checked_dep_probe_hex(hex);
+            } else {
+                command_probes.clear_checked_dep_probe_hex();
+            }
             phases.mark_cx(cx, "ready wake (the entering names from the stored pages, admitted, their tasks)", frame);
             Ok(Ok(blaze_own::Box::new_in(
                 CheckedSetup {
@@ -4370,10 +4614,38 @@ fn checking<'f, 's: 'f>(
                 planned.push(Planned { name: one.name, phase: Phase::new(Stage::Units, one.wave), source: one.source, file: one.name });
             }
             if let Some(stage) = &names {
-                if stage.names.as_ref().is_some_and(|world| world.script_keys().next().is_some())
-                    && let Some(lazy) = lazy_sdk
+                if stage.names.as_ref().is_some_and(|world| {
+                    use blaze_world::crate_list::CrateGraph as _;
+                    let list = world.list();
+                    (0..list.len()).any(|at| {
+                        scoped.as_ref().is_none_or(|s| s.allows(at))
+                            && (list.proc_macro(at) || world.script_of(at).is_some())
+                    })
+                }) && let Some(lazy) = lazy_sdk
                 {
                     env.sdk = lazy.resolve_in_home(cx, home_dir, phases);
+                }
+                let planned_dep_probes = match (stage.names.as_ref(), discovered.get_mut(Name::unit_graph())) {
+                    (Some(world), Some(graph_pub)) => crate::engine_scripts::plan_dep_probe_tags(
+                        cx,
+                        world,
+                        &mut store,
+                        graph_pub,
+                        tools,
+                        scoped.as_ref(),
+                        command_probes.with_env(&env),
+                        scripts.has_runner(),
+                        frame,
+                    )?,
+                    _ => crate::engine_scripts::PlannedDepProbes::empty(frame),
+                };
+                if let Some(dep_probes_id) = planned_dep_probes.leaf_id() {
+                    sweep::record_dep_probes(&mut rows, dep_probes_id);
+                }
+                if let Some(hex) = planned_dep_probes.digest() {
+                    command_probes.publish_checked_dep_probe_hex(hex);
+                } else {
+                    command_probes.clear_checked_dep_probe_hex();
                 }
                 let _cx = cx.span(STAGES_PLAN_SPAN);
                 let preserved_names = match (scoped.as_ref(), stored.as_ref()) {
@@ -4388,13 +4660,14 @@ fn checking<'f, 's: 'f>(
                         last_lines.as_ref(),
                         &tools,
                         &env,
+                        planned_dep_probes.script_modules.as_slice(),
                         alloc,
                         heap.alloc(),
                     )?,
                     _ => None,
                 };
                 let names_scoped = preserved_names.as_ref().or(scoped.as_ref());
-                planned.extend(scripts.plan(stage, &discovered, tools, &env, names_scoped, alloc, frame)?);
+                planned.extend(scripts.plan(stage, &discovered, tools, &env, names_scoped, planned_dep_probes, alloc, frame)?);
                 let no_reads = Rows::new_in(frame);
                 planned.extend(scripts.plan_reads(followed_kept.as_ref().map_or(&no_reads, |followed: &sweep::Followed<'_>| &followed.now), alloc));
                 planned.extend(stage.plan(names_scoped, alloc, frame)?);
@@ -4729,6 +5002,7 @@ fn checking<'f, 's: 'f>(
     let side = laid_now.and_then(|laid| laid.lock.as_ref()).map(|lockfile| crate::proc_runner::MacroSide {
         lock: lockfile,
         place: crate::macros::Place { home: env.home, checkout: env.checkout, members, rows: &rows },
+        probes: command_probes.with_env(&env),
         // PHASE-MEM-DEBT(Names): the proc macros' expansions on the process heap
         // (proc_runner.rs `MacroSide::heap`, `&'static Heap`): made in a Names phase, read by
         // the Scripts and Names phases after; the record is what should cross.
@@ -4740,6 +5014,7 @@ fn checking<'f, 's: 'f>(
         members,
         env: &env,
         producers,
+        probes: command_probes.with_env(&env),
         side: side.as_ref(),
         outlined: &outlined,
         workers,

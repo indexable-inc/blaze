@@ -309,7 +309,7 @@ fn main() {
         }
     };
     let mut features = blaze_world::lib_features_record::FeatureMemory::new(alloc);
-    let setup = ScriptSetup::open_recorded(ScriptSetupOpts { world, target: TARGET, macro_target: MACRO_TARGET, native, alloc }, ONE_RUN_TOOL, &mut features).unwrap_or_else(|e| panic!("the scripts' setting: {e}"));
+    let setup = ScriptSetup::open_recorded(ScriptSetupOpts { world, target: TARGET, macro_target: MACRO_TARGET, native, spawn: None, alloc }, ONE_RUN_TOOL, &mut features).unwrap_or_else(|e| panic!("the scripts' setting: {e}"));
     println!("probe table: {} rows for {TARGET}, {} for {MACRO_TARGET}", setup.table.len(), setup.macro_table.len());
     match &setup.native {
         Ok(run) => println!("native: fact shim {}", run.shim),

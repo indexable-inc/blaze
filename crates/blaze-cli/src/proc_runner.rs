@@ -42,6 +42,9 @@ use blaze_own::Alloc;
 pub(crate) struct MacroSide<'s, 'p, 'r> {
     pub lock: &'s crate::fetch::Lockfile<'s>,
     pub place: crate::macros::Place<'p, 'r>,
+    /// Shared lazy command-level probe/pin handle so proc-macro module lookup matches
+    /// `macros::list` and `wasm64_compile` when a proc-macro has dependency build scripts.
+    pub probes: crate::scripts::CommandProbes<'s>,
     /// The process's heap, handed from `main` (`FetchEnv::heap`): the runtime's.
     pub heap: &'static blaze_own::Heap,
 }
@@ -59,6 +62,8 @@ pub(crate) enum MakeError {
     Runtime(std::string::String),
     /// A macro crate whose module is in the store and could not be read.
     Module { krate: std::string::String, why: std::string::String },
+    /// The command's derived-fact pin setting for dependency build scripts could not be opened.
+    Probes(crate::scripts::ProbeSetupError),
     /// The lazy caller pack opener could not reserve room on the command heap.
     Trees(&'static str),
 }
@@ -71,6 +76,7 @@ impl core::fmt::Display for MakeError {
             MakeError::Store(why) => write!(f, "the proc-macro module store: {why}"),
             MakeError::Runtime(why) => write!(f, "the proc-macro runtime (Wasmtime): {why}"),
             MakeError::Module { krate, why } => write!(f, "the proc-macro module of {krate} could not be read: {why}"),
+            MakeError::Probes(why) => write!(f, "{why}"),
             MakeError::Trees(why) => write!(f, "the proc-macro runner's lazy pack table: {why}"),
         }
     }
@@ -322,7 +328,7 @@ mod with_sandbox {
     /// identity, its module read from `<home>/.blaze/v2` (a missing one kept for its calls),
     /// expansion records kept under `<home>/.blaze/v2/proc-macro/expansions`, and each calling
     /// crate's sandbox package built lazily on first proc-macro call in that crate.
-    pub(crate) fn make(names: &crate::names::NamesWorld<'_>, list: CrateList<'static>, side: &MacroSide<'_, '_, '_>) -> Result<&'static ProcRunner<'static>, MakeError> {
+    pub(crate) fn make(cx: &bstd::cx::Cx, names: &crate::names::NamesWorld<'_>, list: CrateList<'static>, side: &MacroSide<'_, '_, '_>) -> Result<&'static ProcRunner<'static>, MakeError> {
         let home = side.place.home.ok_or(MakeError::NoHome)?;
         let modules = std::path::Path::new(home).join(".blaze/v2");
         let locked = LockedPackages::of(side.lock.lock);
@@ -343,6 +349,7 @@ mod with_sandbox {
             if !krate.proc_macro {
                 continue;
             }
+            let unit_id = unit;
             let unit = &graph.units[unit.0 as usize];
             let identity = identify(side.lock.lock, &locked, &folders, graph, unit, |id| Ok(side.place.member_files(id)), side.heap.alloc()).map_err(|e| MakeError::Store(e.to_string()))?;
             // No identity: the `MacroModule` task's failure names the crate; it gets no key.
@@ -350,6 +357,17 @@ mod with_sandbox {
             let identity = match names.wasm_graph() {
                 Some(wg) => identity.with_wasm_features(side.lock.lock, wg, unit.package, |dep_id| side.place.member_files(dep_id), side.heap.alloc()),
                 None => identity,
+            };
+            // Isolate per-macro dependency-probe failures just like `Unidentified` above: a
+            // failure on one dependent proc-macro never blocks unrelated proc-macros in this
+            // runner; that crate gets no key here and its own `MacroModule` task reports the error.
+            let identity = match crate::wasm64_compile::unit_has_dep_build_scripts(graph, names.wasm_graph(), unit_id, true) {
+                Ok(true) => match side.probes.dep_probe_identity_hex(cx) {
+                    Ok(hex) => identity.with_dep_probes(hex.as_str()),
+                    Err(_) => continue,
+                },
+                Ok(false) => identity,
+                Err(_) => continue,
             };
             let (key, module) = identity.with_id(|id| (crate_key(&module_key(id)), read_module(&modules, id)));
             if let Err(error) = &module
@@ -417,7 +435,7 @@ mod without_sandbox {
         }
     }
 
-    pub(crate) fn make(_: &crate::names::NamesWorld<'_>, _: blaze_world::crate_list::CrateList<'static>, _: &MacroSide<'_, '_, '_>) -> Result<&'static ProcRunner<'static>, MakeError> {
+    pub(crate) fn make(_: &bstd::cx::Cx, _: &crate::names::NamesWorld<'_>, _: blaze_world::crate_list::CrateList<'static>, _: &MacroSide<'_, '_, '_>) -> Result<&'static ProcRunner<'static>, MakeError> {
         Err(MakeError::NoSandbox)
     }
 }
