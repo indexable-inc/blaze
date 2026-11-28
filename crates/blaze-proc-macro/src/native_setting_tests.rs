@@ -426,6 +426,31 @@ fn linux_host_native_setting_accepts_linux_shelf_and_features_h() {
         assert_eq!(lent_rpaths, [expected_rpath.to_str().expect("utf8")]);
         jobs.end().unwrap_or_else(|e| panic!("{e}"));
 
+        // Streaming sysroot hashing allows large shared libraries (>64 MiB, e.g. `libLLVM.so` in
+        // an ambient Nix `NIX_LDFLAGS` rpath) in O(1) memory without failing sysroot resolution.
+        let large_rpath = home.join("large-rpath/lib");
+        fs::create_dir_all(&large_rpath).expect("large rpath");
+        let large_so = large_rpath.join("libLLVM-23.so");
+        let f = fs::File::create(&large_so).expect("create large so");
+        f.set_len(65 * 1024 * 1024).expect("set_len 65 MiB sparse file");
+        drop(f);
+        let large_rpaths = [large_rpath.to_str().expect("utf8 large rpath")];
+        let with_large = crate::native_setting::command_native_setting_with_link(
+            home_s,
+            sdk_s,
+            crate::native_setting::LinuxLinkInputs {
+                lib_dir: Some(libc_lib_s),
+                dynamic_linker: Some(dyn_loader.to_str().expect("utf8 dyn")),
+                rpaths: &large_rpaths,
+            },
+            "test",
+            LINUX_HOST,
+            alloc,
+        )
+        .unwrap_or_else(|e| panic!("large (>64 MiB) library in rpath must stream-hash cleanly: {e}"));
+        assert_eq!(with_large.sdk_version.len(), 64);
+        assert_ne!(with_large.sdk_version.as_str(), full_owned.sdk_version.as_str());
+
         // Negative control: a symlink loop on `<sdk>/include/linux` propagates `NoSdk` naming
         // `include/linux` instead of silently dropping `sdk_extra`.
         let broken_sdk = home.join("glibc-broken");

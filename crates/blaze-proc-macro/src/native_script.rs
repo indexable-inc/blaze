@@ -1059,9 +1059,6 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         if xcode_dev_dir.is_some() {
             out.push("/Applications/Xcode.app/Contents/Developer/usr/bin/gnumake");
         }
-        if runs_out_dir && Path::new("/usr/bin/cmp").is_file() {
-            out.push("/usr/bin/cmp");
-        }
         // The fact shim (N7), started through its links (`rustc`, `cargo`, `pkg-config`, `sw_vers`).
         if let Some(facts) = script.facts {
             out.push(facts.shim.as_str());

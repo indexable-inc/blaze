@@ -335,9 +335,10 @@ pub fn native_setting<'a>(
     native_setting_with_link(shelf, sdk, LinuxLinkInputs::default(), work, host, alloc)
 }
 
-/// Explicit bound on any single SDK marker, header, or runtime library file read while keying
-/// a host sysroot (rule 18): rejects non-regular targets (FIFOs, `/dev/zero`, sockets) BEFORE
-/// opening so malformed or hostile host sysroots can never hang or exhaust memory.
+/// Explicit bound on buffered SDK marker/settings files (`SDKSettings.json`, `include/features.h`)
+/// read whole into memory (rule 18). Streamed sysroot libraries/headers in [`hash_regular`] use a
+/// fixed 16 KiB stack buffer and are not capped at 64 MiB (large shared libraries like `libLLVM.so`
+/// in an ambient Nix rpath must hash cleanly without failing sysroot resolution).
 const MAX_SDK_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 fn stat_meta(path: &str) -> io::Result<fs::Metadata> {
@@ -350,9 +351,6 @@ fn open_regular(path: &str) -> io::Result<(fs::File, u64)> {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
     let expected_len = meta.len();
-    if expected_len > MAX_SDK_FILE_BYTES {
-        return Err(io::Error::from(io::ErrorKind::InvalidData));
-    }
     let file = fs::File::open(path)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
@@ -362,6 +360,9 @@ fn open_regular(path: &str) -> io::Result<(fs::File, u64)> {
 
 fn read_bounded<'a>(path: &str, alloc: Alloc<'a>) -> io::Result<AVec<'a, u8>> {
     let (mut file, expected_len) = open_regular(path)?;
+    if expected_len > MAX_SDK_FILE_BYTES {
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
     let cap = usize::try_from(expected_len).unwrap_or(0);
     let mut out: AVec<'a, u8> = Vec::with_capacity_in(cap, alloc);
     let mut buf = [0u8; 16 * 1024];
@@ -393,7 +394,7 @@ fn hash_regular(sha: &mut blaze_sha256::Sha256, path: &str) -> io::Result<()> {
             break;
         }
         total = total.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
-        if total > MAX_SDK_FILE_BYTES {
+        if total > expected_len {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
         if let Some(chunk) = buf.get(..n) {

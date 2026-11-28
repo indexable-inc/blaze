@@ -40,6 +40,14 @@ fn read_file(path: &Path) -> io::Result<std::vec::Vec<u8>> {
     std::fs::read(path)
 }
 
+fn read_file_bounded<'a>(path: &Path, alloc: Alloc<'a>) -> io::Result<blaze_own::AVec<'a, u8>> {
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    read_bounded(file, alloc)
+}
+
 fn write_file(path: &str, bytes: &[u8]) -> io::Result<()> {
     std::fs::write(path, bytes)
 }
@@ -357,33 +365,25 @@ pub fn shim_main(heap: &Heap) -> i32 {
             Ok(decoded) => decoded,
             Err(e) => return say_refused(blaze_own::format_in!(alloc, "`{argv0}`: {e}").as_str()),
         };
-        let snippet_buf;
-        let snippet_stdin;
-        let snippet: &[u8] = match compile.input {
-            Snippet::Stdin => {
-                snippet_stdin = match read_bounded(io::stdin().lock(), alloc) {
-                    Ok(bytes) => bytes,
-                    Err(e) => return say_refused(blaze_own::format_in!(alloc, "`{argv0}`: reading probe stdin: {e}").as_str()),
-                };
-                snippet_stdin.as_slice()
-            }
-            Snippet::File(path) => {
-                snippet_buf = match read_file(Path::new(path)) {
-                    Ok(bytes) => bytes,
-                    Err(e) => return say_refused(blaze_own::format_in!(alloc, "`{argv0}`: {path}: {e}").as_str()),
-                };
-                snippet_buf.as_slice()
-            }
+        let snippet = match compile.input {
+            Snippet::Stdin => match read_bounded(io::stdin().lock(), alloc) {
+                Ok(bytes) => bytes,
+                Err(e) => return say_refused(blaze_own::format_in!(alloc, "`{argv0}`: reading probe stdin: {e}").as_str()),
+            },
+            Snippet::File(path) => match read_file_bounded(Path::new(path), alloc) {
+                Ok(bytes) => bytes,
+                Err(e) => return say_refused(blaze_own::format_in!(alloc, "`{argv0}`: {path}: {e}").as_str()),
+            },
         };
-        fact_shim::ask_rustc_probe(&args, snippet, probe_host, &Table { rows: probe_rows.as_slice() }, alloc)
+        fact_shim::ask_rustc_probe(&args, snippet.as_slice(), probe_host, &Table { rows: probe_rows.as_slice() }, alloc)
     } else {
         fact_shim::ask(argv0, &args, pins.as_ref(), alloc)
     };
-    let printed = (|| -> std::io::Result<()> {
-        let mut stdout = std::io::stdout().lock();
+    let printed = (|| -> io::Result<()> {
+        let mut stdout = io::stdout().lock();
         stdout.write_all(reply.stdout.as_bytes())?;
         stdout.flush()?;
-        let mut stderr = std::io::stderr().lock();
+        let mut stderr = io::stderr().lock();
         stderr.write_all(reply.stderr.as_bytes())?;
         stderr.flush()
     })();
@@ -474,6 +474,20 @@ mod rustc_probe_tests {
         assert_eq!(asked.reads.len(), 1);
         assert_eq!(asked.reads[0].subject, IMAGE_SUBJECT);
         assert!(asked.reads[0].digest.is_some());
+
+        // File-backed `rustc` probe snippets enforce the exact same 4 MiB bound as stdin probes.
+        let ok_file = root.join("probe.rs");
+        std::fs::write(&ok_file, b"#![no_std]\n").expect("write ok probe");
+        let ok_bytes = super::read_file_bounded(&ok_file, alloc).expect("small probe file allowed");
+        assert_eq!(ok_bytes.as_slice(), b"#![no_std]\n");
+
+        let huge_file = root.join("huge.rs");
+        let f = std::fs::File::create(&huge_file).expect("create huge probe");
+        f.set_len(super::MAX_PROBE_SNIPPET_BYTES + 1).expect("set_len huge probe");
+        drop(f);
+        let err = super::read_file_bounded(&huge_file, alloc).expect_err("over-4MiB probe file must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }
