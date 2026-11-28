@@ -1662,6 +1662,14 @@ impl Bb {
         self.e(Expr::Await(operand))
     }
 
+    pub fn do_expr(&mut self, operand: ExprId) -> ExprId {
+        self.e(Expr::Do(operand))
+    }
+
+    pub fn defer_expr(&mut self, body: ExprId) -> ExprId {
+        self.e(Expr::Defer(body))
+    }
+
     /// Makes the body an `async fn`'s, returning `output` (a type of the body's table).
     pub fn async_fn(&mut self, output: PTy) {
         self.coroutine = Some(CoroutineKind::Async { output });

@@ -56,6 +56,7 @@ mod coroutine_id;
 mod cost;
 mod deferred_place;
 mod discriminant;
+mod do_expr;
 mod dyn_objects;
 mod expect_inputs;
 mod expect_fudge;

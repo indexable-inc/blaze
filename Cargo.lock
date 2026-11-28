@@ -2199,6 +2199,7 @@ dependencies = [
  "blaze-int",
  "blaze-json",
  "blaze-kit",
+ "blaze-machine",
  "blaze-math",
  "blaze-mem",
  "blaze-memchr",

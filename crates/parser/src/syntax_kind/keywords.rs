@@ -124,6 +124,8 @@ const CONTEXTUAL: &[(&str, SyntaxKind, Option<Edition>)] = &[
     // Comptime field unrolling (`inline for pat in expr { ... }`): contextual keyword only
     // immediately before `for`.
     ("inline", INLINE_KW, None),
+    // Lexical cleanup block (`defer { ... }`): contextual keyword only immediately before `{`.
+    ("defer", DEFER_KW, None),
 ];
 
 const fn names<const N: usize, T: Copy, U: Copy>(
@@ -483,6 +485,7 @@ mod tests {
             "requires" => REQUIRES_KW,
             "uniq" => UNIQ_KW,
             "inline" => INLINE_KW,
+            "defer" => DEFER_KW,
             "yeet" => YEET_KW,
             _ => return None,
         };

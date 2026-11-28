@@ -35,6 +35,7 @@ pub(crate) mod coerce_interior;
 pub(crate) mod control;
 pub(crate) mod coroutine;
 pub(crate) mod cost;
+pub(crate) mod do_expr;
 pub(crate) mod expect_inputs;
 pub(crate) mod fallback;
 pub(crate) mod field;
@@ -97,6 +98,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             Expr::FormatArgs { args, uses } => self.expr_format_args(f, e, args, uses),
             Expr::Await(operand) => self.expr_await(f, e, operand),
+            Expr::Do(operand) => self.expr_do(f, e, operand),
+            Expr::Defer(body) => self.expr_defer(f, e, body),
             Expr::AsyncBlock { body, capture } => self.expr_async_block(f, e, body, capture),
             Expr::Underscore => self.expr_underscore(e),
             Expr::OffsetOf { ty, fields } => self.expr_offset_of(e, ty, fields),

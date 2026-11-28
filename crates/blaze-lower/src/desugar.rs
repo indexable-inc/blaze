@@ -239,6 +239,19 @@ impl Machine<'_, '_, '_, '_> {
         self.put_expr(Expr::Await(e), r)
     }
 
+    /// `EXPR.do`: one-shot lexical algebraic effect suspension (`docs/v2/plan/design/sans-io-machines.md`).
+    ///
+    /// Unlike `.await`, `.do` is legal in any function body without `async`; typeck proves
+    /// `T: Request` and projects `<T as Request>::Answer`.
+    pub(crate) fn do_op(&mut self, e: ExprId, r: Range) -> ExprId {
+        self.put_expr(Expr::Do(e), r)
+    }
+
+    /// `defer { body }`: lexical scope-exit cleanup block (`docs/v2/plan/design/sans-io-machines.md`).
+    pub(crate) fn defer_op(&mut self, body: ExprId, r: Range) -> ExprId {
+        self.put_expr(Expr::Defer(body), r)
+    }
+
     /// An `async fn`'s body: its parameters (`pats`, the written patterns) become the coroutine's
     /// moved arguments. Returns the body's root and the fn's parameter patterns, in `ids`.
     pub(crate) fn async_fn(&mut self, pats: &[u32], body: ExprId, r: Range) -> (ExprId, List) {

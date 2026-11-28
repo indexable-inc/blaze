@@ -1249,6 +1249,7 @@ pub(crate) fn empty_record(a: Alloc<'_>) -> Checked<'_> {
         findings: blaze_own::Vec::new_in(a),
         undecided: blaze_own::Vec::new_in(a),
         inferred_output: None,
+        suspends: false,
     }
 }
 

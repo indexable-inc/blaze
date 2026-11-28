@@ -3192,7 +3192,9 @@ pub fn analyze_checked_body<'a>(
             | blaze_typeck::Expr::Asm { .. }
             | blaze_typeck::Expr::Closure { .. }
             | blaze_typeck::Expr::AsyncBlock { .. }
-            | blaze_typeck::Expr::Await(_) => {
+            | blaze_typeck::Expr::Await(_)
+            | blaze_typeck::Expr::Do(_)
+            | blaze_typeck::Expr::Defer(_) => {
                 cx.mark_all_params(ParamUse::UNANALYZED_CALLEE);
             }
             blaze_typeck::Expr::FormatArgs { .. } => {

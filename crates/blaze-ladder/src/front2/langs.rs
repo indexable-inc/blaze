@@ -12,7 +12,7 @@ use super::index::Index;
 use crate::resolve::{Kind, Ns};
 
 /// The lang items that are traits: what `TraitDef::lang` may be.
-pub const TRAITS: [LangItem; 56] = [
+pub const TRAITS: [LangItem; 57] = [
     LangItem::Sized,
     LangItem::MetaSized,
     LangItem::PointeeSized,
@@ -69,6 +69,7 @@ pub const TRAITS: [LangItem; 56] = [
     LangItem::Enum,
     LangItem::UnitEnum,
     LangItem::TryAsDyn,
+    LangItem::Request,
 ];
 
 /// The trait lang item `#[lang = "name"]` declares, if `name` is one.
@@ -267,6 +268,7 @@ pub fn mark(item: LangItem) -> Mark {
         LangItem::UnitEnum => "blaze_unit_enum",
         LangItem::TryAsDyn => "try_as_dyn",
         LangItem::VaList => "va_list",
+        LangItem::Request => "blaze_request",
     })
 }
 
@@ -275,4 +277,4 @@ pub fn mark(item: LangItem) -> Mark {
 /// `core::mem::variant_count::<LangItem>()` and its order, so a new variant cannot be left out).
 /// The list's one home is blaze-typeck's `LangItem::ALL` (the checked-body record decodes a
 /// lang item by it).
-pub const ALL: [LangItem; 103] = LangItem::ALL;
+pub const ALL: [LangItem; 104] = LangItem::ALL;

@@ -900,8 +900,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     exprs.push((a, 0));
                 }
             }
-            // `.await` takes its operand by value.
-            Expr::Await(operand) => exprs.push((operand, USE_MOVE)),
+            // `.await` and `.do` take their operand by value.
+            Expr::Await(operand) | Expr::Do(operand) => exprs.push((operand, USE_MOVE)),
+            Expr::Defer(body) => exprs.push((body, 0)),
             Expr::AsyncBlock { body, .. } => exprs.push((body, 0)),
             Expr::Underscore | Expr::OffsetOf { .. } => {}
             // An output writes its place (as an assignment's left side does); the rest read.

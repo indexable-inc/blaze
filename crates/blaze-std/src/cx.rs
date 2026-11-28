@@ -780,6 +780,43 @@ impl Cx {
         }
     }
 
+    /// Drives a sans-IO [`blaze_machine::Machine`] through `handler` under a child [`Cx::span`],
+    /// checking this context's cancellation and deadline before each request and translating a
+    /// [`Stopped`] into [`blaze_machine::Stopped`] so the machine may run bounded graceful cleanup
+    /// ([`blaze_machine::Machine::on_cancel`]) or abandon cleanly.
+    pub fn drive_machine<M, Ctx, H>(
+        &self,
+        span: &'static str,
+        handler: &mut H,
+        machine_cx: &mut Ctx,
+        machine: M,
+        opts: blaze_machine::DriveOpts,
+    ) -> Result<M::Out, blaze_machine::DriveError<M::Err, H::Error>>
+    where
+        M: blaze_machine::Machine<Ctx>,
+        H: blaze_machine::Handler<M::Req>,
+    {
+        let child = self.span(span);
+        let mut guarded = CxMachineHandler {
+            cx: &child,
+            inner: handler,
+            grace: blaze_machine::GraceBudget::DEFAULT,
+            in_cleanup: false,
+            performed: 0,
+        };
+        let result = blaze_machine::drive(&mut guarded, machine_cx, machine, opts);
+        if guarded.performed == 0
+            && result.is_ok()
+            && let Err(stopped) = child.stopped(child.io())
+        {
+            return Err(blaze_machine::DriveError::Stopped(stopped_to_machine(
+                stopped,
+                guarded.grace,
+            )));
+        }
+        result
+    }
+
     /// The one wait: the next completion of `tag` from `io`, until this context's deadline.
     /// It ends ready, or with [`Stopped::Cancelled`] once the scope is cancelled, or
     /// [`Stopped::Deadline`] once the deadline passes on the driver's clock, or
@@ -1223,6 +1260,54 @@ impl CxSpawn {
     }
 }
 
+/// Translates a bstd [`Stopped`] into a [`blaze_machine::Stopped`] under `grace`.
+#[inline]
+const fn stopped_to_machine(
+    stopped: Stopped,
+    grace: blaze_machine::GraceBudget,
+) -> blaze_machine::Stopped {
+    match stopped {
+        Stopped::Cancelled { .. } => blaze_machine::Stopped::cancelled(grace),
+        Stopped::Deadline { .. } | Stopped::Stalled { .. } | Stopped::OutOfMemory { .. } => {
+            blaze_machine::Stopped::deadline(grace)
+        }
+    }
+}
+
+/// Adapter that checks [`Cx`] cancellation and deadline before each request emitted to `inner`,
+/// switching to passthrough once the machine enters bounded graceful cleanup (`on_cancel`).
+struct CxMachineHandler<'a, H> {
+    cx: &'a Cx,
+    inner: &'a mut H,
+    grace: blaze_machine::GraceBudget,
+    in_cleanup: bool,
+    performed: u32,
+}
+
+impl<R, H> blaze_machine::Handler<R> for CxMachineHandler<'_, H>
+where
+    R: blaze_machine::Request,
+    H: blaze_machine::Handler<R>,
+{
+    type Error = H::Error;
+
+    fn perform<Out>(
+        &mut self,
+        request: R,
+        deliver: impl FnOnce(blaze_machine::Perform<R::Answer<'_>>) -> Out,
+    ) -> Result<Out, Self::Error> {
+        self.performed = self.performed.saturating_add(1);
+        if !self.in_cleanup
+            && let Err(stopped) = self.cx.stopped(self.cx.io())
+        {
+            self.in_cleanup = true;
+            let machine_stopped = stopped_to_machine(stopped, self.grace);
+            return Ok(deliver(blaze_machine::Perform::Stopped(machine_stopped)));
+        }
+        self.inner.perform(request, deliver)
+    }
+}
+
 impl core::fmt::Debug for CxSpawn {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("CxSpawn").finish_non_exhaustive()
@@ -1480,5 +1565,169 @@ mod cx_bound_dst {
             "deadline",
             cx_bound_schedule,
         );
+    }
+}
+
+#[cfg(test)]
+mod drive_machine_tests {
+    use core::time::Duration;
+
+    use blaze_machine::{
+        CancelAction, CancelReason, DriveError, DriveOpts, Machine, Request, Script, Stopped, Turn,
+    };
+
+    use crate::{
+        io::{Io, Limits, SimWorld},
+        mem::TASK_FRAME,
+        trace::RecordKind,
+    };
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum OpReq {
+        Fetch(u32),
+        Close(u32),
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum OpAns {
+        Value(u32),
+        Closed,
+    }
+
+    impl Request for OpReq {
+        type Answer<'s> = OpAns;
+    }
+
+    enum DemoMachine {
+        Init { handle: u32, cleanup_on_cancel: bool },
+        WaitingFetch { handle: u32, cleanup_on_cancel: bool },
+        Closing { out: Result<u32, CancelReason> },
+    }
+
+    impl Machine for DemoMachine {
+        type Req = OpReq;
+        type Out = u32;
+        type Err = CancelReason;
+
+        fn start(self, _cx: &mut ()) -> Turn<Self, Self::Req, Self::Out, Self::Err> {
+            match self {
+                DemoMachine::Init { handle, cleanup_on_cancel } => Turn::Ask {
+                    request: OpReq::Fetch(handle),
+                    next: DemoMachine::WaitingFetch { handle, cleanup_on_cancel },
+                },
+                _ => unreachable!("start called on non-Init state"),
+            }
+        }
+
+        fn resume(self, answer: OpAns, _cx: &mut ()) -> Turn<Self, Self::Req, Self::Out, Self::Err> {
+            match (self, answer) {
+                (DemoMachine::WaitingFetch { handle, .. }, OpAns::Value(v)) => Turn::Ask {
+                    request: OpReq::Close(handle),
+                    next: DemoMachine::Closing { out: Ok(v) },
+                },
+                (DemoMachine::Closing { out: Ok(v) }, OpAns::Closed) => Turn::Done(v),
+                (DemoMachine::Closing { out: Err(reason) }, OpAns::Closed) => Turn::Fail(reason),
+                _ => unreachable!("mismatched answer"),
+            }
+        }
+
+        fn on_cancel(
+            self,
+            stopped: Stopped,
+            _cx: &mut (),
+        ) -> CancelAction<Turn<Self, Self::Req, Self::Out, Self::Err>> {
+            match self {
+                DemoMachine::WaitingFetch { handle, cleanup_on_cancel: true } => {
+                    CancelAction::Cleanup(Turn::Ask {
+                        request: OpReq::Close(handle),
+                        next: DemoMachine::Closing { out: Err(stopped.reason) },
+                    })
+                }
+                _ => CancelAction::Abandon,
+            }
+        }
+    }
+
+    #[test]
+    fn drive_machine_opens_span_and_completes() {
+        let io = Io::simulated(SimWorld::new(7, Limits::USUAL));
+        let cx = io.cx(Duration::from_secs(10), TASK_FRAME).expect("root cx");
+        let alloc = blaze_own::testing::heap().alloc();
+
+        let mut script = Script::new_in(alloc);
+        script.expect_answer(OpReq::Fetch(9), OpAns::Value(42));
+        script.expect_answer(OpReq::Close(9), OpAns::Closed);
+
+        let res = cx.drive_machine(
+            "demo.machine",
+            &mut script,
+            &mut (),
+            DemoMachine::Init { handle: 9, cleanup_on_cancel: true },
+            DriveOpts { max_steps: 8 },
+        );
+        assert_eq!(res, Ok(42));
+        assert_eq!(script.finish(), Ok(()));
+
+        let saw_span = io.trace(|t| {
+            t.records().iter().any(|rec| {
+                rec.span == "demo.machine"
+                    && matches!(rec.kind, RecordKind::Opened { parent: "main" })
+            })
+        });
+        assert!(saw_span, "Cx::drive_machine must open its named span in the world trace");
+    }
+
+    #[test]
+    fn drive_machine_translates_cancel_and_runs_bounded_cleanup() {
+        let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+        let cx = io.cx(Duration::from_secs(10), TASK_FRAME).expect("root cx");
+        let alloc = blaze_own::testing::heap().alloc();
+
+        let _ = cx.scope_with(|scope| {
+            scope.cancel();
+            // `OpReq::Fetch` is intercepted before reaching `script`; only `Close` cleanup runs.
+            let mut script = Script::new_in(alloc);
+            script.expect_answer(OpReq::Close(3), OpAns::Closed);
+
+            let res = scope.cx().drive_machine(
+                "demo.cancelled",
+                &mut script,
+                &mut (),
+                DemoMachine::Init { handle: 3, cleanup_on_cancel: true },
+                DriveOpts { max_steps: 8 },
+            );
+            assert_eq!(res, Err(DriveError::Machine(CancelReason::Cancelled)));
+            assert_eq!(script.finish(), Ok(()));
+        });
+    }
+
+    #[test]
+    fn drive_machine_translates_expired_deadline_to_machine_stopped() {
+        let io = Io::simulated(SimWorld::new(13, Limits::USUAL));
+        let root = io.cx(Duration::from_secs(60), TASK_FRAME).expect("root cx");
+        let clock = io.need_clock().expect("clock");
+        let short = root.until(blaze_core::wait::Deadline::after(
+            io.now(),
+            Duration::from_millis(10),
+        ));
+        clock.sleep(&root, Duration::from_millis(25)).expect("advance virtual clock");
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut script: Script<'_, OpReq, OpAns> = Script::new_in(alloc);
+        let res = short.drive_machine(
+            "demo.deadline",
+            &mut script,
+            &mut (),
+            DemoMachine::Init { handle: 5, cleanup_on_cancel: false },
+            DriveOpts { max_steps: 8 },
+        );
+        assert!(
+            matches!(
+                res,
+                Err(DriveError::Stopped(Stopped { reason: CancelReason::Deadline, .. }))
+            ),
+            "expected Deadline stop, got {res:?}"
+        );
+        assert_eq!(script.finish(), Ok(()));
     }
 }

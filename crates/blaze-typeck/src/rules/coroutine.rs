@@ -390,7 +390,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             let node = self.body.expr(e)?;
             match node {
-                Expr::Await(_) => suspends = true,
+                Expr::Await(_) | Expr::Do(_) => suspends = true,
                 Expr::Missing => return Ok(None),
                 // Creating a nested coroutine or closure does not poll or call it.
                 Expr::AsyncBlock { .. } | Expr::Closure { .. } | Expr::ConstBlock { .. } => continue,
@@ -466,7 +466,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     Expr::Block { tail: Some(ref value), .. }
                     | Expr::Return { value: Some(ref value) }
                     | Expr::Become { ref value }
-                    | Expr::Await(ref value) => core::slice::from_ref(value),
+                    | Expr::Await(ref value)
+                    | Expr::Do(ref value) => core::slice::from_ref(value),
                     _ => &[],
                 };
                 for &value in values {
@@ -598,7 +599,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             | Expr::Continue { .. }
             | Expr::Underscore
             | Expr::OffsetOf { .. } => {}
-            Expr::Paren(i) | Expr::Loop { body: i } | Expr::Await(i) => exprs.push(i),
+            Expr::Paren(i) | Expr::Loop { body: i } | Expr::Await(i) | Expr::Do(i) | Expr::Defer(i) => exprs.push(i),
             Expr::Block { stmts, tail, .. } | Expr::ConstBlock { stmts, tail, .. } => {
                 for &s in b.stmt_list(stmts)? {
                     match b.stmt(s)? {

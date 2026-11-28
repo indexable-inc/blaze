@@ -2668,6 +2668,8 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
             Expr::Let { .. } => return Err(unsupported("`let` outside an `if` or `while` condition's `&&` chain")),
             Expr::FormatArgs { .. } => return Err(unsupported("`format_args!` in a constant")),
             Expr::Await(_) | Expr::AsyncBlock { .. } => return Err(unsupported("`async` in a constant")),
+            Expr::Do(_) => return Err(unsupported("`.do` in a constant")),
+            Expr::Defer(_) => return Err(unsupported("`defer` in a constant")),
             Expr::Underscore => return Err(unsupported("`_` (`_ = e`) in a constant")),
             // The Reference, inline-assembly: "asm! ... cannot be used in const contexts".
             Expr::Asm { .. } => return Err(unsupported("inline assembly in a constant")),

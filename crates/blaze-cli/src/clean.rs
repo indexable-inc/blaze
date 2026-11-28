@@ -366,21 +366,44 @@ pub(crate) fn run_with_store<'w>(
     let held = match home {
         None if with_store => return Err(crate::CliError::Clean(CleanError::NoHome)),
         None => None,
-        Some(home) if fs.root().stat(cx, &Path::new(home.trim_matches('/'))?)?.is_none() => None,
         Some(home) => {
             let below = home.trim_matches('/');
-            let dir = fs.home(cx, "/", &Path::new(below)?).map_err(|error| crate::CliError::Clean(CleanError::Home(error)))?;
-            let lead_str = bstd::mem::format_in!(frame, "/{below}/");
-            if with_all {
-                home_root_dir = Some((dir.clone(), bstd::mem::format_in!(frame, "/{below}/")));
-            }
-            match store(cx, &dir, frame) {
-                Ok(found) => found.map(|found| (dir, lead_str, found)),
-                Err(refusal @ CleanError::NotTheStore { .. }) if !with_store => {
-                    not_blazes = Some(refusal);
-                    None
+            let below_path = Path::new(below)?;
+            let dir = match fs.home(cx, "/", &below_path) {
+                Ok(dir) => Some(dir),
+                Err(bstd::fs::HomeError {
+                    why: bstd::fs::HomeWhy::Fs(bstd::fs::FsError { kind: bstd::fs::FsKind::NotFound, .. }),
+                    ..
+                }) => None,
+                Err(error) => return Err(crate::CliError::Clean(CleanError::Home(error))),
+            };
+            match dir {
+                None => None,
+                Some(dir) => {
+                    // `Fs::open_dir` succeeds even when `below_path` does not exist yet on disk,
+                    // so verify existence through `dir.world()` (rooted at `/` natively, or the
+                    // simulation root in tests) rather than `fs.root()` (which is the checkout).
+                    let exists = match dir.world().fs() {
+                        Some(home_fs) => home_fs.root().stat(cx, &below_path)?.is_some(),
+                        None => true,
+                    };
+                    if !exists {
+                        None
+                    } else {
+                        let lead_str = bstd::mem::format_in!(frame, "/{below}/");
+                        if with_all {
+                            home_root_dir = Some((dir.clone(), bstd::mem::format_in!(frame, "/{below}/")));
+                        }
+                        match store(cx, &dir, frame) {
+                            Ok(found) => found.map(|found| (dir, lead_str, found)),
+                            Err(refusal @ CleanError::NotTheStore { .. }) if !with_store => {
+                                not_blazes = Some(refusal);
+                                None
+                            }
+                            Err(refusal) => return Err(crate::CliError::Clean(refusal)),
+                        }
+                    }
                 }
-                Err(refusal) => return Err(crate::CliError::Clean(refusal)),
             }
         }
     };
@@ -660,3 +683,76 @@ pub(crate) fn sweep_other_forms(cx: &Cx, blaze: &Dir<ReadWrite>, now_ns: u64, er
 #[cfg(test)]
 #[path = "clean_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod store_root_tests {
+    use super::*;
+    use bstd::mem::TASK_FRAME;
+    use bstd::test::BUDGET;
+
+    /// Verifies `blaze clean --store` invoked from a subdirectory checkout (where `fs.root()` is
+    /// the checkout directory, NOT `/`) actually removes `<HOME>/.blaze/v2/store` instead of
+    /// silently skipping it via `fs.root().stat(HOME)`.
+    #[test]
+    fn clean_store_from_subdirectory_checkout_removes_home_store() {
+        let base = std::env::temp_dir().join(std::format!(
+            "blaze-clean-store-subdir-{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let checkout = base.join("nested").join("checkout");
+        let home = base.join("user_home");
+        let checkout_v2 = checkout.join(".blaze").join("v2");
+        let home_store = home.join(".blaze").join("v2").join("store");
+        let home_store_own = home.join(".blaze").join(crate::store::plain_place::STORE_DIR);
+        let home_toolchain = home.join(".blaze").join("v2").join("toolchain").join("abc");
+        std::fs::create_dir_all(&checkout_v2).expect("make checkout .blaze/v2");
+        std::fs::create_dir_all(&home_store_own).expect("make home store");
+        std::fs::create_dir_all(&home_toolchain).expect("make home toolchain");
+        std::fs::write(checkout.join("Cargo.toml"), "[package]\n").expect("write Cargo.toml");
+        std::fs::write(checkout_v2.join("profile.txt"), "profile\n").expect("write profile");
+        std::fs::write(
+            home_store.join(blaze_cas::plain::CACHEDIR_TAG),
+            blaze_cas::plain::CACHEDIR_SIGNATURE,
+        )
+        .expect("write CACHEDIR.TAG");
+        std::fs::write(home_store_own.join("head"), b"head").expect("write store head");
+        std::fs::write(home_toolchain.join("lib.rlib"), b"toolchain").expect("write toolchain");
+
+        // Native world rooted at `checkout` (`fs.root() != "/"` and does NOT contain `home`).
+        let io = bstd::test::native(&checkout).expect("native world over subdirectory checkout");
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+        let fs = io.need_fs().expect("fs");
+        let out = io.need_out().expect("out");
+        let home_str = home.to_str().expect("UTF-8 home path");
+
+        // Confirm the old bug's precondition: `fs.root().stat(home.trim_matches('/'))` is `None`.
+        assert!(
+            fs.root()
+                .stat(&cx, &Path::new(home_str.trim_matches('/')).expect("trimmed home path"))
+                .expect("stat under checkout root")
+                .is_none(),
+            "checkout root must not contain HOME"
+        );
+
+        let status = run_with(&cx, &fs, ["--store"].into_iter(), Some(home_str), &out)
+            .expect("blaze clean --store from subdirectory checkout");
+        assert!(matches!(status, bstd::entry::Status::OK), "expected Status::OK");
+        assert!(!checkout_v2.exists(), "checkout .blaze/v2 must be removed");
+        assert!(
+            !home_store.exists(),
+            "<HOME>/.blaze/v2/store must be removed when invoked from a subdirectory checkout"
+        );
+        assert!(home_toolchain.join("lib.rlib").exists(), "toolchain shelf must be kept");
+
+        // A nonexistent HOME still succeeds cleanly as nothing to remove.
+        let missing_home = base.join("does_not_exist");
+        let missing_str = missing_home.to_str().expect("UTF-8 missing home path");
+        let status_missing = run_with(&cx, &fs, ["--store"].into_iter(), Some(missing_str), &out)
+            .expect("blaze clean --store with nonexistent HOME");
+        assert!(matches!(status_missing, bstd::entry::Status::OK), "expected Status::OK");
+
+        drop((out, fs, cx, io));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}

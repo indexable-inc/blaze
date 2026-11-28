@@ -470,6 +470,8 @@ fn expr(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, e: ExprId) -> fmt::
         Expr::OffsetOf { ty, fields } => node(p, work, "offset-of", &[W::Ty(ty), W::Names(fields)]),
         Expr::Underscore => p.atom("_"),
         Expr::Await(e) => node(p, work, "await", &[W::Expr(e)]),
+        Expr::Do(e) => node(p, work, "do", &[W::Expr(e)]),
+        Expr::Defer(e) => node(p, work, "defer", &[W::Expr(e)]),
         Expr::InlineFor { pat, iter, body } => {
             node(p, work, "inline-for", &[W::Pat(pat), W::Expr(iter), W::Expr(body)])
         }

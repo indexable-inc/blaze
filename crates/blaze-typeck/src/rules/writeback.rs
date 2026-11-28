@@ -994,6 +994,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             findings,
             undecided,
             inferred_output,
+            suspends: self.suspends,
             index_mut,
             suggests,
             hidden,

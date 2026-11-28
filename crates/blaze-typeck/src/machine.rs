@@ -538,6 +538,8 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     pub ret: Ty,
     /// Whether the code checked so far always diverges (rustc's `Diverges::Always`).
     pub diverges: bool,
+    /// Whether this body contains any `.do` suspension point (`expr_do`).
+    pub suspends: bool,
     pub frames: Vec<Frame, Alloc<'a>>,
     pub max_frames: usize,
     /// Foreign records whose output, witness, or signature is being instantiated.
@@ -748,6 +750,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             common,
             ret: err,
             diverges: false,
+            suspends: false,
             frames: Vec::new_in(alloc),
             lowering_records: Vec::new_in(alloc),
             max_frames: 4 * body.nodes() + 64,

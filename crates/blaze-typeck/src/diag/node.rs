@@ -83,6 +83,8 @@ pub const fn expr_form(e: &Expr) -> &'static str {
         Expr::Closure { .. } => "a closure",
         Expr::FormatArgs { .. } => "a `format_args!`",
         Expr::Await(_) => "an `.await`",
+        Expr::Do(_) => "a `.do`",
+        Expr::Defer(_) => "a `defer` block",
         Expr::AsyncBlock { .. } => "an `async` block",
         Expr::Underscore => "an `_` assignee",
         Expr::OffsetOf { .. } => "an `offset_of!`",
@@ -420,6 +422,10 @@ impl Sketch<'_, '_, '_, '_> {
                             let _ = stack.push(SketchTask::Str(".await"));
                             let _ = stack.push(SketchTask::Expr(inner, d));
                         }
+                        Expr::Do(inner) => {
+                            let _ = stack.push(SketchTask::Str(".do"));
+                            let _ = stack.push(SketchTask::Expr(inner, d));
+                        }
                         Expr::Return { value: Some(v) } => {
                             self.out.write_str("return ")?;
                             let _ = stack.push(SketchTask::Expr(v, d));
@@ -441,6 +447,7 @@ impl Sketch<'_, '_, '_, '_> {
                         Expr::ConstBlock { .. } => self.out.write_str("const { .. }")?,
                         Expr::Loop { .. } => self.out.write_str("loop { .. }")?,
                         Expr::AsyncBlock { .. } => self.out.write_str("async { .. }")?,
+                        Expr::Defer(_) => self.out.write_str("defer { .. }")?,
                         Expr::FormatArgs { .. } => self.out.write_str("format_args!(..)")?,
                         Expr::OffsetOf { .. } => self.out.write_str("offset_of!(..)")?,
                         Expr::Asm { .. } => self.out.write_str("asm!(..)")?,

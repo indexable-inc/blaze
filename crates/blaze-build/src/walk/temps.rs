@@ -691,7 +691,9 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     | Expr::Ref { operand: x, .. }
                     | Expr::RawRef { operand: x, .. }
                     | Expr::Cast { operand: x, .. }
-                    | Expr::Await(x) => todo_expr.push(x),
+                    | Expr::Await(x)
+                    | Expr::Do(x)
+                    | Expr::Defer(x) => todo_expr.push(x),
                     Expr::Break { value, .. } | Expr::Return { value } => {
                         if let Some(x) = value {
                             todo_expr.push(x);
