@@ -623,7 +623,7 @@ fn estimate_added_bytes(kept: &Kept<'_>, work: &Work<'_>) -> u64 {
         added = added.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
     }
     for (_, changes) in work.readers.iter() {
-        let adds = changes.iter().filter(|&(_, &add)| add).count();
+        let adds = changes.iter().filter(|&(_, add)| add).count();
         if adds > 0 {
             let len = bep6::IDX.saturating_add(4).saturating_add(bep6::IDX.saturating_mul(adds));
             added = added.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
@@ -889,7 +889,7 @@ where
     let new_records = record_updates.values().filter(|v| v.is_some()).count();
     total = total.saturating_add(u64::try_from((bep6::RECORD_V6 + ID) * (kept_old_records + new_records)).unwrap_or(u64::MAX));
     let mut old_reader_iter = old_readers.iter().peekable();
-    for (&id, changes) in work.readers.iter() {
+    for (id, changes) in work.readers.iter() {
         while let Some(&&(ok, _, ob)) = old_reader_iter.peek() && ok < id {
             total = total.saturating_add(u64::try_from(ob.len()).unwrap_or(u64::MAX));
             old_reader_iter.next();
@@ -899,8 +899,8 @@ where
             old_count = ob.len().saturating_sub(8) / bep6::IDX;
             old_reader_iter.next();
         }
-        let adds = changes.iter().filter(|&(_, &add)| add).count();
-        let removes = changes.iter().filter(|&(_, &add)| !add).count();
+        let adds = changes.iter().filter(|&(_, add)| add).count();
+        let removes = changes.iter().filter(|&(_, add)| !add).count();
         let est = old_count.saturating_add(adds).saturating_sub(removes);
         if est > 0 {
             total = total.saturating_add(u64::try_from(bep6::IDX + 4 + bep6::IDX * est).unwrap_or(u64::MAX));
@@ -1097,17 +1097,17 @@ where
                 let old_dicts = old_page.dicts();
                 for chunk in tail.chunks_exact(bep6::IDX) {
                     let reader = old_dicts.name(view::word(chunk));
-                    while ch.peek().is_some_and(|item| *item.0 < reader) {
-                        if let Some((&name, &true)) = ch.next() { put_name(scratch, name); }
+                    while ch.peek().is_some_and(|item| item.0 < reader) {
+                        if let Some((name, true)) = ch.next() { put_name(scratch, name); }
                     }
-                    if ch.peek().is_some_and(|item| *item.0 == reader) {
-                        if let Some((&name, &true)) = ch.next() { put_name(scratch, name); }
+                    if ch.peek().is_some_and(|item| item.0 == reader) {
+                        if let Some((name, true)) = ch.next() { put_name(scratch, name); }
                     } else {
                         put_name(scratch, reader);
                     }
                 }
             }
-            for (&name, &add) in ch {
+            for (name, add) in ch {
                 if add { put_name(scratch, name); }
             }
             let count = (scratch.len() - CELL_ID - 4) / NAME;
@@ -1121,18 +1121,18 @@ where
         };
         let mut updates = work.readers.iter().peekable();
         for &(k, page, old_bytes) in old_readers.iter() {
-            while let Some(&(&id, changes)) = updates.peek() && id < k {
+            while let Some(&(id, changes)) = updates.peek() && id < k {
                 updates.next();
                 write_merged(&mut bufs, &mut scratch, id, None, changes);
             }
-            if let Some(&(&id, changes)) = updates.peek() && id == k {
+            if let Some(&(id, changes)) = updates.peek() && id == k {
                 updates.next();
                 write_merged(&mut bufs, &mut scratch, id, Some((page, old_bytes)), changes);
             } else {
                 write_dict_at(&mut bufs, readers_page_of(&k, new_bits), READERS, page, old_bytes);
             }
         }
-        for (&id, changes) in updates {
+        for (id, changes) in updates {
             write_merged(&mut bufs, &mut scratch, id, None, changes);
         }
     }
@@ -1391,27 +1391,27 @@ fn file_changes<'a>(root: &mut Root<'a>, last: &Root<'_>, work: &Work<'_>, sourc
 }
 
 fn reader_changes<'a>(work: &Work<'_>, source: &dyn StoredPages, delta: &mut Changed<'a>) -> Result<(), PagesError> {
-    for (&id, changes) in work.readers.iter() {
+    for (id, changes) in work.readers.iter() {
         let old_page = source.page_for(readers_slot(&id), Ask::Readers)?;
         let old_present = old_page.is_some_and(|p| p.readers_present(&id));
         let old_count = old_page.map_or(0, |p| p.readers(&id).len());
-        let adds = changes.iter().filter(|&(_, &add)| add).count();
+        let adds = changes.iter().filter(|&(_, add)| add).count();
         let mut changes = changes.iter().peekable();
         let cap = (CELL_ID + 4).saturating_add(NAME.saturating_mul(old_count.saturating_add(adds)));
         let mut readers = SVec::with_capacity_in(cap, delta.alloc);
         put_cell_id(&mut readers, &id);
         put_u32(&mut readers, 0);
         for reader in old_page.into_iter().flat_map(|p| p.readers(&id)) {
-            while changes.peek().is_some_and(|item| *item.0 < reader) {
-                if let Some((&name, &true)) = changes.next() { put_name(&mut readers, name); }
+            while changes.peek().is_some_and(|item| item.0 < reader) {
+                if let Some((name, true)) = changes.next() { put_name(&mut readers, name); }
             }
-            if changes.peek().is_some_and(|item| *item.0 == reader) {
-                if let Some((&name, &true)) = changes.next() { put_name(&mut readers, name); }
+            if changes.peek().is_some_and(|item| item.0 == reader) {
+                if let Some((name, true)) = changes.next() { put_name(&mut readers, name); }
             } else {
                 put_name(&mut readers, reader);
             }
         }
-        for (&name, &add) in changes { if add { put_name(&mut readers, name); } }
+        for (name, add) in changes { if add { put_name(&mut readers, name); } }
         let count = (readers.len() - CELL_ID - 4) / NAME;
         let count_u32 = u32::try_from(count).unwrap_or(u32::MAX);
         if let Some(slot) = readers.get_mut(CELL_ID..CELL_ID + 4) {

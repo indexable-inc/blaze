@@ -335,9 +335,9 @@ impl<'a> ReadAudit<'a> {
             }
         }
         for (id, edits) in work.readers.iter() {
-            if !row_exists(&id.of) && !has_cell(id) {
-                for (&reader, &added) in edits.iter() {
-                    self.membership(reader, *id, added);
+            if !row_exists(&id.of) && !has_cell(&id) {
+                for (reader, added) in edits.iter() {
+                    self.membership(reader, id, added);
                 }
             }
         }
@@ -372,22 +372,7 @@ impl<'a> Answer<'a> {
         prior.cells.finish_order();
         // Keep the newest membership for an edge across requests. Each column is
         // sorted and contains each (cell,reader) at most once.
-        let mut edges = ReaderEdits::new_in(next.alloc);
-        let mut left = prior.readers.edits.iter().copied().peekable();
-        let mut right = next.readers.edits.iter().copied().peekable();
-        while let (Some(a), Some(b)) = (left.peek(), right.peek()) {
-            match a.0.cmp(&b.0) {
-                core::cmp::Ordering::Less => edges.edits.extend(left.next()),
-                core::cmp::Ordering::Greater => edges.edits.extend(right.next()),
-                core::cmp::Ordering::Equal => {
-                    left.next();
-                    edges.edits.extend(right.next());
-                }
-            }
-        }
-        edges.edits.extend(left);
-        edges.edits.extend(right);
-        prior.readers = edges;
+        prior.readers = ReaderEdits::merge_newer(prior.readers, next.readers, next.alloc);
         self.work = Some(prior);
     }
 
@@ -1079,25 +1064,23 @@ impl<'a, L: LastAnswer> Overlay<'a, L> {
         // write. At the fold, omit writes that restored a reader's original membership.
         // A row changed only once emitted a symmetric difference already.
         if !self.replaced_again.is_empty() {
-            let mut kept = 0;
-            for at in 0..edits.edits.len() {
-                let ((id, reader), added) = edits.edits[at];
-                if self.replaced_again.contains(&reader) {
-                    let had = match (self.last.task(&reader), self.last.cell(&id)) {
-                        (Some(task), Some(cell)) => self.last.read_of(task, cell)?.found != Found::NotRead,
+            let last = &self.last;
+            let replaced_again = &self.replaced_again;
+            edits.try_retain(|id, reader, added| -> Result<bool, EngineError> {
+                if replaced_again.contains(&reader) {
+                    let had = match (last.task(&reader), last.cell(&id)) {
+                        (Some(task), Some(cell)) => last.read_of(task, cell)?.found != Found::NotRead,
                         _ => false,
                     };
                     if added == had {
-                        continue;
+                        return Ok(false);
                     }
                 }
-                edits.edits[kept] = edits.edits[at];
-                kept += 1;
-            }
-            edits.edits.truncate(kept);
+                Ok(true)
+            })?;
         }
         if self.plant == Plant::LostReaderTombstone {
-            edits.edits.retain(|(_, added)| *added);
+            edits.retain_added();
         }
         self.work.readers = edits;
         Ok(())

@@ -997,7 +997,7 @@ impl<'w, 'a> RowsFolded<'w, 'a> {
         let moved = generations.moved(before);
         // Every newly named read contributes an addition to the reverse index. Unchanged
         // memberships already have dictionary entries, including reads of absent values.
-        let additions = self.work.readers.iter().filter_map(|(id, edits)| edits.iter().any(|(_, reads)| *reads).then_some(*id));
+        let additions = self.work.readers.iter().filter_map(|(id, edits)| edits.iter().any(|(_, reads)| reads).then_some(id));
         let cells = additions.chain(self.work.owed_cells.keys().copied()).chain(moved.iter().copied());
         let made = self.work.rows.iter().filter_map(|(name, row)| row.as_ref().map(|row| (name, row)));
         next.assign_ids(made, &self.work.owed_tasks, cells)?;

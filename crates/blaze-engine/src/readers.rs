@@ -180,45 +180,553 @@ impl IndexCost {
     }
 }
 
+enum EditsRepr<'a> {
+    /// Interned 8-byte-per-edge representation produced by [`Paired::finish`].
+    ///
+    /// Invariants:
+    /// - `names` is sorted strictly ascending by `Name`.
+    /// - `cells` is sorted strictly ascending by `(names[cc.of], cc.cell)` (i.e. canonical `CellId`
+    ///   order), and every `cc.of` is a valid index into `names`.
+    /// - `edges` is sorted strictly ascending by `(edge.cell, edge.reader())`, each pair at most
+    ///   once, with every `edge.cell` valid in `cells` and every `edge.reader()` valid in `names`.
+    Compact {
+        edges: SVec<'a, CompactEdge>,
+        cells: SVec<'a, CompactCell>,
+        names: SVec<'a, Name>,
+    },
+    /// Flat representation used by [`Mapped::finish`] (the test oracle) and tiny hand-built deltas.
+    ///
+    /// Invariant: sorted strictly ascending by `(CellId, Name)`, each pair at most once.
+    Flat(SVec<'a, ((CellId, Name), bool)>),
+}
+
 /// The request's reader writes at its end, each `(cell, reader)` once with its newest write
 /// (`true`: reads it from now on; `false`: no longer), sorted by cell then reader: what a form's
-/// fold reads (overlay.rs `Work::readers`). One column.
+/// fold reads (overlay.rs `Work::readers`). Stored compactly at 8 bytes per edge for [`Paired`].
 pub struct ReaderEdits<'a> {
-    pub edits: SVec<'a, ((CellId, Name), bool)>,
+    repr: EditsRepr<'a>,
 }
 
 impl<'a> ReaderEdits<'a> {
     pub fn new_in(alloc: SharedAlloc<'a>) -> ReaderEdits<'a> {
-        ReaderEdits { edits: Vec::new_in(alloc) }
+        ReaderEdits { repr: EditsRepr::Flat(Vec::new_in(alloc)) }
     }
 
-    /// Each cell written, ascending, with its writes.
-    pub fn iter(&self) -> impl Iterator<Item = (&CellId, Edits<'_>)> + '_ {
-        self.edits.chunk_by(|a, b| a.0.0 == b.0.0).map(|group| (&group[0].0.0, Edits { edits: group }))
+    /// A single `(cell, reader) -> reads` membership edit.
+    pub fn from_single(id: CellId, reader: Name, reads: bool, alloc: SharedAlloc<'a>) -> ReaderEdits<'a> {
+        let mut edits = Vec::with_capacity_in(1, alloc);
+        edits.push(((id, reader), reads));
+        ReaderEdits { repr: EditsRepr::Flat(edits) }
+    }
+
+    /// Wraps a flat column already sorted strictly ascending by `(CellId, Name)`.
+    pub fn from_sorted_flat(edits: SVec<'a, ((CellId, Name), bool)>) -> ReaderEdits<'a> {
+        ReaderEdits { repr: EditsRepr::Flat(edits) }
+    }
+
+    /// Each cell written, ascending, with its writes (ascending by reader).
+    pub fn iter(&self) -> ReaderEditsIter<'_> {
+        let inner = match &self.repr {
+            EditsRepr::Compact { edges, cells, names } => {
+                ReaderEditsIterInner::Compact { edges: edges.as_slice(), cells: cells.as_slice(), names: names.as_slice() }
+            }
+            EditsRepr::Flat(edits) => ReaderEditsIterInner::Flat(edits.as_slice()),
+        };
+        ReaderEditsIter { inner }
+    }
+
+    /// Every `((CellId, Name), bool)` write, strictly ascending by `(CellId, Name)`.
+    pub fn pairs(&self) -> impl Iterator<Item = ((CellId, Name), bool)> + '_ {
+        self.iter().flat_map(|(id, edits)| edits.iter().map(move |(reader, reads)| ((id, reader), reads)))
+    }
+
+    /// The `index`-th `((CellId, Name), bool)` write in ascending order, decoded in `O(1)`.
+    pub fn get(&self, index: usize) -> Option<((CellId, Name), bool)> {
+        match &self.repr {
+            EditsRepr::Compact { edges, cells, names } => {
+                let edge = *edges.get(index)?;
+                let cc = *cells.get(usize::try_from(edge.cell).unwrap_or(usize::MAX))?;
+                let definer = *names.get(usize::try_from(cc.of).unwrap_or(usize::MAX))?;
+                let reader = *names.get(usize::try_from(edge.reader()).unwrap_or(usize::MAX))?;
+                Some(((CellId { of: definer, cell: cc.cell }, reader), edge.reads()))
+            }
+            EditsRepr::Flat(edits) => edits.get(index).copied(),
+        }
+    }
+
+    /// The writes for `cell` alone, ascending by reader, in `O(log n)` with zero allocation.
+    pub fn edits_of(&self, cell: CellId) -> Option<Edits<'_>> {
+        match &self.repr {
+            EditsRepr::Compact { edges, cells, names } => {
+                let of_idx = u32::try_from(names.binary_search(&cell.of).ok()?).ok()?;
+                let cell_idx = u32::try_from(
+                    cells.binary_search_by(|cc| cc.of.cmp(&of_idx).then_with(|| cc.cell.cmp(&cell.cell))).ok()?,
+                )
+                .ok()?;
+                let from = edges.partition_point(|edge| edge.cell < cell_idx);
+                let rest = edges.get(from..)?;
+                let len = rest.partition_point(|edge| edge.cell == cell_idx);
+                let slice = rest.get(..len)?;
+                (!slice.is_empty()).then_some(Edits { slice: EditsSlice::Compact { edges: slice, names: names.as_slice() } })
+            }
+            EditsRepr::Flat(edits) => {
+                let from = edits.partition_point(|((id, _), _)| *id < cell);
+                let rest = edits.get(from..)?;
+                let len = rest.partition_point(|((id, _), _)| *id == cell);
+                let slice = rest.get(..len)?;
+                (!slice.is_empty()).then_some(Edits { slice: EditsSlice::Flat(slice) })
+            }
+        }
+    }
+
+    /// Whether any write removes a reader (`reads == false`) from a cell owned by `kind`.
+    pub fn any_removed_of(&self, kind: Kind) -> bool {
+        match &self.repr {
+            EditsRepr::Compact { edges, cells, names } => {
+                for edge in edges.iter() {
+                    if !edge.reads()
+                        && let Some(cc) = cells.get(usize::try_from(edge.cell).unwrap_or(usize::MAX))
+                        && let Some(definer) = names.get(usize::try_from(cc.of).unwrap_or(usize::MAX))
+                        && definer.kind == kind
+                    {
+                        return true;
+                    }
+                }
+                false
+            }
+            EditsRepr::Flat(edits) => edits.iter().any(|((id, _), added)| !*added && id.of.kind == kind),
+        }
     }
 
     /// The writes held: one a `(cell, reader)`.
     pub fn len(&self) -> usize {
-        self.edits.len()
+        match &self.repr {
+            EditsRepr::Compact { edges, .. } => edges.len(),
+            EditsRepr::Flat(edits) => edits.len(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.edits.is_empty()
+        self.len() == 0
     }
+
+    /// Exact heap capacity in bytes held by this delta.
+    pub fn byte_size(&self) -> usize {
+        match &self.repr {
+            EditsRepr::Compact { edges, cells, names } => edges
+                .capacity()
+                .saturating_mul(size_of::<CompactEdge>())
+                .saturating_add(cells.capacity().saturating_mul(size_of::<CompactCell>()))
+                .saturating_add(names.capacity().saturating_mul(size_of::<Name>())),
+            EditsRepr::Flat(edits) => edits.capacity().saturating_mul(size_of::<((CellId, Name), bool)>()),
+        }
+    }
+
+    /// Keeps only the writes for which `keep(cell, reader, reads)` returns `Ok(true)`, in place.
+    pub fn try_retain<E>(&mut self, mut keep: impl FnMut(CellId, Name, bool) -> Result<bool, E>) -> Result<(), E> {
+        match &mut self.repr {
+            EditsRepr::Compact { edges, cells, names } => {
+                let mut kept = 0usize;
+                for at in 0..edges.len() {
+                    let Some(&edge) = edges.get(at) else { break };
+                    let Some(&cc) = cells.get(usize::try_from(edge.cell).unwrap_or(usize::MAX)) else { continue };
+                    let Some(&definer) = names.get(usize::try_from(cc.of).unwrap_or(usize::MAX)) else { continue };
+                    let Some(&reader) = names.get(usize::try_from(edge.reader()).unwrap_or(usize::MAX)) else { continue };
+                    if keep(CellId { of: definer, cell: cc.cell }, reader, edge.reads())? {
+                        if let Some(dst) = edges.get_mut(kept) {
+                            *dst = edge;
+                        }
+                        kept += 1;
+                    }
+                }
+                edges.truncate(kept);
+            }
+            EditsRepr::Flat(edits) => {
+                let mut kept = 0usize;
+                for at in 0..edits.len() {
+                    let Some(&entry) = edits.get(at) else { break };
+                    let ((id, reader), added) = entry;
+                    if keep(id, reader, added)? {
+                        if let Some(dst) = edits.get_mut(kept) {
+                            *dst = entry;
+                        }
+                        kept += 1;
+                    }
+                }
+                edits.truncate(kept);
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops every removal tombstone (`reads == false`), in place (for `Plant::LostReaderTombstone`).
+    pub fn retain_added(&mut self) {
+        match &mut self.repr {
+            EditsRepr::Compact { edges, .. } => edges.retain(|edge| edge.reads()),
+            EditsRepr::Flat(edits) => edits.retain(|(_, added)| *added),
+        }
+    }
+
+    /// Merges two sorted deltas keeping the newest write (`newer`) on equal `(cell, reader)` pairs.
+    /// Preserves compact 8-byte-per-edge storage whenever either side is compact.
+    pub fn merge_newer(older: ReaderEdits<'a>, newer: ReaderEdits<'a>, alloc: SharedAlloc<'a>) -> ReaderEdits<'a> {
+        if older.is_empty() {
+            return newer;
+        }
+        if newer.is_empty() {
+            return older;
+        }
+        match (older.repr, newer.repr) {
+            (EditsRepr::Flat(left), EditsRepr::Flat(right)) => {
+                let mut out: SVec<'a, ((CellId, Name), bool)> = Vec::with_capacity_in(left.len().saturating_add(right.len()), alloc);
+                let (mut i, mut j) = (0usize, 0usize);
+                while let (Some(&a), Some(&b)) = (left.get(i), right.get(j)) {
+                    match a.0.cmp(&b.0) {
+                        Ordering::Less => {
+                            out.push(a);
+                            i += 1;
+                        }
+                        Ordering::Greater => {
+                            out.push(b);
+                            j += 1;
+                        }
+                        Ordering::Equal => {
+                            out.push(b);
+                            i += 1;
+                            j += 1;
+                        }
+                    }
+                }
+                if let Some(rest) = left.get(i..) {
+                    out.extend_from_slice(rest);
+                }
+                if let Some(rest) = right.get(j..) {
+                    out.extend_from_slice(rest);
+                }
+                ReaderEdits { repr: EditsRepr::Flat(out) }
+            }
+            (left_repr, right_repr) => {
+                let (e1, c1, n1) = into_compact_parts(left_repr, alloc);
+                let (e2, c2, n2) = into_compact_parts(right_repr, alloc);
+                merge_compact_edits(e1, c1, n1, e2, c2, n2, alloc)
+            }
+        }
+    }
+}
+
+fn into_compact_parts<'a>(repr: EditsRepr<'a>, alloc: SharedAlloc<'a>) -> (SVec<'a, CompactEdge>, SVec<'a, CompactCell>, SVec<'a, Name>) {
+    match repr {
+        EditsRepr::Compact { edges, cells, names } => (edges, cells, names),
+        EditsRepr::Flat(flat) => {
+            let mut paired = Paired::new_in(alloc, Plant::None);
+            paired.reserve(flat.len());
+            for ((id, reader), reads) in flat {
+                paired.write(id, reader, reads);
+            }
+            match paired.finish(alloc).repr {
+                EditsRepr::Compact { edges, cells, names } => (edges, cells, names),
+                EditsRepr::Flat(_) => (Vec::new_in(alloc), Vec::new_in(alloc), Vec::new_in(alloc)),
+            }
+        }
+    }
+}
+
+fn merge_compact_edits<'a>(
+    e1: SVec<'a, CompactEdge>,
+    c1: SVec<'a, CompactCell>,
+    n1: SVec<'a, Name>,
+    e2: SVec<'a, CompactEdge>,
+    c2: SVec<'a, CompactCell>,
+    n2: SVec<'a, Name>,
+    alloc: SharedAlloc<'a>,
+) -> ReaderEdits<'a> {
+    let mut names: SVec<'a, Name> = Vec::with_capacity_in(n1.len().max(n2.len()), alloc);
+    let mut n1_map: SVec<'a, u32> = Vec::from_elem_in(0u32, n1.len(), alloc);
+    let mut n2_map: SVec<'a, u32> = Vec::from_elem_in(0u32, n2.len(), alloc);
+    let (mut i, mut j) = (0usize, 0usize);
+    while let (Some(&a), Some(&b)) = (n1.get(i), n2.get(j)) {
+        let idx = u32::try_from(names.len()).unwrap_or(MAX_READER_ID);
+        match a.cmp(&b) {
+            Ordering::Less => {
+                names.push(a);
+                if let Some(slot) = n1_map.get_mut(i) {
+                    *slot = idx;
+                }
+                i += 1;
+            }
+            Ordering::Greater => {
+                names.push(b);
+                if let Some(slot) = n2_map.get_mut(j) {
+                    *slot = idx;
+                }
+                j += 1;
+            }
+            Ordering::Equal => {
+                names.push(a);
+                if let Some(slot) = n1_map.get_mut(i) {
+                    *slot = idx;
+                }
+                if let Some(slot) = n2_map.get_mut(j) {
+                    *slot = idx;
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    while let Some(&a) = n1.get(i) {
+        let idx = u32::try_from(names.len()).unwrap_or(MAX_READER_ID);
+        names.push(a);
+        if let Some(slot) = n1_map.get_mut(i) {
+            *slot = idx;
+        }
+        i += 1;
+    }
+    while let Some(&b) = n2.get(j) {
+        let idx = u32::try_from(names.len()).unwrap_or(MAX_READER_ID);
+        names.push(b);
+        if let Some(slot) = n2_map.get_mut(j) {
+            *slot = idx;
+        }
+        j += 1;
+    }
+    drop(n1);
+    drop(n2);
+
+    let mut cells: SVec<'a, CompactCell> = Vec::with_capacity_in(c1.len().max(c2.len()), alloc);
+    let mut c1_map: SVec<'a, u32> = Vec::from_elem_in(0u32, c1.len(), alloc);
+    let mut c2_map: SVec<'a, u32> = Vec::from_elem_in(0u32, c2.len(), alloc);
+    let (mut i, mut j) = (0usize, 0usize);
+    while let (Some(&ca), Some(&cb)) = (c1.get(i), c2.get(j)) {
+        let oa = n1_map.get(usize::try_from(ca.of).unwrap_or(usize::MAX)).copied().unwrap_or(0);
+        let ob = n2_map.get(usize::try_from(cb.of).unwrap_or(usize::MAX)).copied().unwrap_or(0);
+        let idx = u32::try_from(cells.len()).unwrap_or(u32::MAX);
+        match oa.cmp(&ob).then_with(|| ca.cell.cmp(&cb.cell)) {
+            Ordering::Less => {
+                cells.push(CompactCell { of: oa, cell: ca.cell });
+                if let Some(slot) = c1_map.get_mut(i) {
+                    *slot = idx;
+                }
+                i += 1;
+            }
+            Ordering::Greater => {
+                cells.push(CompactCell { of: ob, cell: cb.cell });
+                if let Some(slot) = c2_map.get_mut(j) {
+                    *slot = idx;
+                }
+                j += 1;
+            }
+            Ordering::Equal => {
+                cells.push(CompactCell { of: oa, cell: ca.cell });
+                if let Some(slot) = c1_map.get_mut(i) {
+                    *slot = idx;
+                }
+                if let Some(slot) = c2_map.get_mut(j) {
+                    *slot = idx;
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    while let Some(&ca) = c1.get(i) {
+        let oa = n1_map.get(usize::try_from(ca.of).unwrap_or(usize::MAX)).copied().unwrap_or(0);
+        let idx = u32::try_from(cells.len()).unwrap_or(u32::MAX);
+        cells.push(CompactCell { of: oa, cell: ca.cell });
+        if let Some(slot) = c1_map.get_mut(i) {
+            *slot = idx;
+        }
+        i += 1;
+    }
+    while let Some(&cb) = c2.get(j) {
+        let ob = n2_map.get(usize::try_from(cb.of).unwrap_or(usize::MAX)).copied().unwrap_or(0);
+        let idx = u32::try_from(cells.len()).unwrap_or(u32::MAX);
+        cells.push(CompactCell { of: ob, cell: cb.cell });
+        if let Some(slot) = c2_map.get_mut(j) {
+            *slot = idx;
+        }
+        j += 1;
+    }
+    drop(c1);
+    drop(c2);
+
+    let remap = |edge: CompactEdge, cm: &[u32], nm: &[u32]| -> CompactEdge {
+        let c = cm.get(usize::try_from(edge.cell).unwrap_or(usize::MAX)).copied().unwrap_or(0);
+        let r = nm.get(usize::try_from(edge.reader()).unwrap_or(usize::MAX)).copied().unwrap_or(0);
+        CompactEdge::new(c, r, edge.reads())
+    };
+    let mut edges: SVec<'a, CompactEdge> = Vec::with_capacity_in(e1.len().saturating_add(e2.len()), alloc);
+    let (mut i, mut j) = (0usize, 0usize);
+    while let (Some(&raw_a), Some(&raw_b)) = (e1.get(i), e2.get(j)) {
+        let a = remap(raw_a, &c1_map, &n1_map);
+        let b = remap(raw_b, &c2_map, &n2_map);
+        match a.pair_key().cmp(&b.pair_key()) {
+            Ordering::Less => {
+                edges.push(a);
+                i += 1;
+            }
+            Ordering::Greater => {
+                edges.push(b);
+                j += 1;
+            }
+            Ordering::Equal => {
+                edges.push(b);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    while let Some(&raw_a) = e1.get(i) {
+        edges.push(remap(raw_a, &c1_map, &n1_map));
+        i += 1;
+    }
+    while let Some(&raw_b) = e2.get(j) {
+        edges.push(remap(raw_b, &c2_map, &n2_map));
+        j += 1;
+    }
+    ReaderEdits { repr: EditsRepr::Compact { edges, cells, names } }
+}
+
+enum ReaderEditsIterInner<'e> {
+    Compact {
+        edges: &'e [CompactEdge],
+        cells: &'e [CompactCell],
+        names: &'e [Name],
+    },
+    Flat(&'e [((CellId, Name), bool)]),
+}
+
+/// Iterator over cells in ascending [`CellId`] order, yielding each cell's [`Edits`].
+pub struct ReaderEditsIter<'e> {
+    inner: ReaderEditsIterInner<'e>,
+}
+
+impl<'e> Iterator for ReaderEditsIter<'e> {
+    type Item = (CellId, Edits<'e>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.inner {
+            ReaderEditsIterInner::Compact { edges, cells, names } => {
+                let first = edges.first()?;
+                let cell_idx = first.cell;
+                let mut end = 1usize;
+                while let Some(next) = edges.get(end)
+                    && next.cell == cell_idx
+                {
+                    end += 1;
+                }
+                let (group, rest) = edges.split_at_checked(end)?;
+                *edges = rest;
+                let cc = *cells.get(usize::try_from(cell_idx).unwrap_or(usize::MAX))?;
+                let definer = *names.get(usize::try_from(cc.of).unwrap_or(usize::MAX))?;
+                Some((
+                    CellId { of: definer, cell: cc.cell },
+                    Edits { slice: EditsSlice::Compact { edges: group, names } },
+                ))
+            }
+            ReaderEditsIterInner::Flat(edits) => {
+                let first = edits.first()?;
+                let cell_id = first.0.0;
+                let mut end = 1usize;
+                while let Some(next) = edits.get(end)
+                    && next.0.0 == cell_id
+                {
+                    end += 1;
+                }
+                let (group, rest) = edits.split_at_checked(end)?;
+                *edits = rest;
+                Some((cell_id, Edits { slice: EditsSlice::Flat(group) }))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EditsSlice<'e> {
+    Compact {
+        edges: &'e [CompactEdge],
+        names: &'e [Name],
+    },
+    Flat(&'e [((CellId, Name), bool)]),
 }
 
 /// One cell's writes, ascending by reader.
 #[derive(Clone, Copy)]
 pub struct Edits<'e> {
-    edits: &'e [((CellId, Name), bool)],
+    slice: EditsSlice<'e>,
 }
 
 impl<'e> Edits<'e> {
     /// Each reader written and whether it reads the cell from now on.
-    pub fn iter(&self) -> impl Iterator<Item = (&'e Name, &'e bool)> + 'e {
-        self.edits.iter().map(|edit| (&edit.0.1, &edit.1))
+    pub fn iter(&self) -> EditsIter<'e> {
+        EditsIter { slice: self.slice, at: 0 }
+    }
+
+    pub fn len(&self) -> usize {
+        match self.slice {
+            EditsSlice::Compact { edges, .. } => edges.len(),
+            EditsSlice::Flat(edits) => edits.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Looks up `reader` in this cell's sorted writes in `O(log k)`.
+    pub fn get(&self, reader: &Name) -> Option<bool> {
+        match self.slice {
+            EditsSlice::Compact { edges, names } => {
+                let nr = u32::try_from(names.binary_search(reader).ok()?).ok()?;
+                let at = edges.binary_search_by_key(&nr, |edge| edge.reader()).ok()?;
+                edges.get(at).map(|edge| edge.reads())
+            }
+            EditsSlice::Flat(edits) => {
+                let at = edits.binary_search_by_key(reader, |((_, r), _)| *r).ok()?;
+                edits.get(at).map(|(_, reads)| *reads)
+            }
+        }
     }
 }
+
+/// Iterator over one cell's `(Name, bool)` writes, ascending by reader.
+#[derive(Clone, Copy)]
+pub struct EditsIter<'e> {
+    slice: EditsSlice<'e>,
+    at: usize,
+}
+
+impl Iterator for EditsIter<'_> {
+    type Item = (Name, bool);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = match self.slice {
+            EditsSlice::Compact { edges, names } => {
+                let edge = *edges.get(self.at)?;
+                let reader = *names.get(usize::try_from(edge.reader()).unwrap_or(usize::MAX))?;
+                (reader, edge.reads())
+            }
+            EditsSlice::Flat(edits) => {
+                let ((_, reader), reads) = *edits.get(self.at)?;
+                (reader, reads)
+            }
+        };
+        self.at = self.at.saturating_add(1);
+        Some(item)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = match self.slice {
+            EditsSlice::Compact { edges, .. } => edges.len().saturating_sub(self.at),
+            EditsSlice::Flat(edits) => edits.len().saturating_sub(self.at),
+        };
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for EditsIter<'_> {}
 
 /// The seam (rule 78): how a request keeps its writes to the reverse index. Each instantiation
 /// gives the same answers to the same writes (readers_sim.rs).
@@ -487,7 +995,7 @@ impl<'a> ReaderIndex<'a> for Paired<'a> {
             let both = merge_compact_runs(&older, &newer, alloc);
             runs.push(both);
         }
-        let Some(merged) = runs.pop() else {
+        let Some(mut merged) = runs.pop() else {
             return ReaderEdits::new_in(alloc);
         };
         drop(runs);
@@ -495,8 +1003,8 @@ impl<'a> ReaderIndex<'a> for Paired<'a> {
             return ReaderEdits::new_in(alloc);
         }
 
-        // Compute canonical ascending `Name` and `CellId` ranks so we sort 8-byte `u64` keys
-        // instead of 83-byte tuples.
+        // Compute canonical ascending `Name` and `CellId` ranks so we remap and sort the 8-byte
+        // `CompactEdge` column in place without materializing 83-byte tuples.
         let mut name_order: SVec<'a, u32> = Vec::with_capacity_in(names.len(), alloc);
         for i in 0..names.len() {
             name_order.push(u32::try_from(i).unwrap_or(u32::MAX));
@@ -506,12 +1014,19 @@ impl<'a> ReaderIndex<'a> for Paired<'a> {
             let nb = names.get(usize::try_from(b).unwrap_or(usize::MAX));
             na.cmp(&nb)
         });
+        let mut sorted_names: SVec<'a, Name> = Vec::with_capacity_in(names.len(), alloc);
         let mut name_rank: SVec<'a, u32> = Vec::from_elem_in(0u32, names.len(), alloc);
         for (rank, &id) in name_order.iter().enumerate() {
-            if let Some(slot) = name_rank.get_mut(usize::try_from(id).unwrap_or(usize::MAX)) {
+            let idx = usize::try_from(id).unwrap_or(usize::MAX);
+            if let Some(&name) = names.get(idx) {
+                sorted_names.push(name);
+            }
+            if let Some(slot) = name_rank.get_mut(idx) {
                 *slot = u32::try_from(rank).unwrap_or(MAX_READER_ID);
             }
         }
+        drop(name_order);
+        drop(names);
 
         let mut cell_order: SVec<'a, u32> = Vec::with_capacity_in(cells.len(), alloc);
         for i in 0..cells.len() {
@@ -529,39 +1044,38 @@ impl<'a> ReaderIndex<'a> for Paired<'a> {
                 _ => Ordering::Equal,
             }
         });
+        let mut sorted_cells: SVec<'a, CompactCell> = Vec::with_capacity_in(cells.len(), alloc);
         let mut cell_rank: SVec<'a, u32> = Vec::from_elem_in(0u32, cells.len(), alloc);
         for (rank, &id) in cell_order.iter().enumerate() {
-            if let Some(slot) = cell_rank.get_mut(usize::try_from(id).unwrap_or(usize::MAX)) {
+            let idx = usize::try_from(id).unwrap_or(usize::MAX);
+            if let Some(&cc) = cells.get(idx) {
+                let of = name_rank.get(usize::try_from(cc.of).unwrap_or(usize::MAX)).copied().unwrap_or(0);
+                sorted_cells.push(CompactCell { of, cell: cc.cell });
+            }
+            if let Some(slot) = cell_rank.get_mut(idx) {
                 *slot = u32::try_from(rank).unwrap_or(u32::MAX);
             }
         }
+        drop(cell_order);
+        drop(cells);
 
-        let mut packed: SVec<'a, u64> = Vec::with_capacity_in(merged.len(), alloc);
-        for edge in merged {
+        for edge in merged.iter_mut() {
             let cr = cell_rank.get(usize::try_from(edge.cell).unwrap_or(usize::MAX)).copied().unwrap_or(0);
             let nr = name_rank.get(usize::try_from(edge.reader()).unwrap_or(usize::MAX)).copied().unwrap_or(0);
-            let rb = (nr << 1) | u32::from(edge.reads());
-            packed.push((u64::from(cr) << 32) | u64::from(rb));
+            edge.cell = cr;
+            edge.reader_and_bit = (nr << 1) | u32::from(edge.reads());
         }
         drop(cell_rank);
         drop(name_rank);
-        packed.sort_unstable();
+        merged.sort_unstable_by_key(|edge| (u64::from(edge.cell) << 32) | u64::from(edge.reader_and_bit));
 
-        let mut edits: SVec<'a, ((CellId, Name), bool)> = Vec::with_capacity_in(packed.len(), alloc);
-        for p in packed {
-            let cr = usize::try_from(p >> 32).unwrap_or(usize::MAX);
-            let rb = u32::try_from(p & 0xFFFF_FFFF).unwrap_or(0);
-            let nr = usize::try_from(rb >> 1).unwrap_or(usize::MAX);
-            let reads = (rb & 1) != 0;
-            if let (Some(&cid_idx), Some(&nid_idx)) = (cell_order.get(cr), name_order.get(nr))
-                && let Some(&cc) = cells.get(usize::try_from(cid_idx).unwrap_or(usize::MAX))
-                && let Some(&definer) = names.get(usize::try_from(cc.of).unwrap_or(usize::MAX))
-                && let Some(&reader) = names.get(usize::try_from(nid_idx).unwrap_or(usize::MAX))
-            {
-                edits.push(((CellId { of: definer, cell: cc.cell }, reader), reads));
-            }
+        ReaderEdits {
+            repr: EditsRepr::Compact {
+                edges: merged,
+                cells: sorted_cells,
+                names: sorted_names,
+            },
         }
-        ReaderEdits { edits }
     }
 
     fn cost(&self) -> IndexCost {
@@ -637,7 +1151,7 @@ impl<'a> ReaderIndex<'a> for Mapped<'a> {
                 edits.push(((*id, *reader), *reads));
             }
         }
-        ReaderEdits { edits }
+        ReaderEdits::from_sorted_flat(edits)
     }
 
     fn cost(&self) -> IndexCost {
@@ -651,5 +1165,195 @@ impl<'a> ReaderIndex<'a> for Mapped<'a> {
         }
         let bytes = edges * size_of::<(Name, bool)>() as u64 + cells * size_of::<(CellId, SMap<'a, Name, bool>)>() as u64;
         IndexCost { writes: self.writes, edges, bytes, allocations: nodes, phase_allocations_max: 0, runs: 0, seals: 0, exact: false }
+    }
+}
+
+#[cfg(test)]
+mod compact_reader_edits_tests {
+    use super::*;
+    use blaze_id::ContentId;
+    use std::collections::BTreeMap as StdMap;
+    use std::vec::Vec as StdVec;
+
+    fn mk_name(kind: Kind, n: u32) -> Name {
+        Name::new(kind, ContentId::of("compact reader edits name", &n.to_le_bytes()))
+    }
+
+    fn mk_cell(kind: Kind, owner: u32, tag: u32) -> CellId {
+        let mut bytes = [0u8; 16];
+        bytes[..4].copy_from_slice(&tag.to_le_bytes());
+        CellId { of: mk_name(kind, owner), cell: Cell(bytes) }
+    }
+
+    fn collect_via_iter(edits: &ReaderEdits<'_>) -> StdVec<((CellId, Name), bool)> {
+        let mut out = StdVec::new();
+        for (id, delta) in edits.iter() {
+            for (reader, reads) in delta.iter() {
+                out.push(((id, reader), reads));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn compact_finish_memory_footprint_and_oracle_equivalence() {
+        let alloc = blaze_own::testing::heap().shared();
+        let mut paired = Paired::new_in(alloc, Plant::None);
+        let mut mapped = Mapped::new_in(alloc, Plant::None);
+        let mut oracle: StdMap<(CellId, Name), bool> = StdMap::new();
+
+        // 10,000 edges across 100 unique cells and 100 unique reader names, with overwrites
+        // and deletions (`reads = false`).
+        for c in 0..100u32 {
+            let kind = if c % 3 == 0 { Kind::Signature } else { Kind::Given };
+            let cid = mk_cell(kind, c % 25, c);
+            for r in 0..100u32 {
+                let reader = mk_name(Kind::BodyCheck, r);
+                let reads = (c + r) % 5 != 0;
+                paired.write(cid, reader, reads);
+                mapped.write(cid, reader, reads);
+                oracle.insert((cid, reader), reads);
+            }
+        }
+        // Overwrite a subset to exercise newest-wins and seal transitions.
+        let mut scratch = Vec::new_in(alloc);
+        paired.edits_of(mk_cell(Kind::Signature, 0, 0), &mut scratch);
+        for i in 0..50u32 {
+            let cid = mk_cell(if i % 3 == 0 { Kind::Signature } else { Kind::Given }, i % 25, i);
+            let reader = mk_name(Kind::BodyCheck, (i * 7) % 100);
+            let reads = i % 2 == 0;
+            paired.write(cid, reader, reads);
+            mapped.write(cid, reader, reads);
+            oracle.insert((cid, reader), reads);
+        }
+
+        let compact = paired.finish(alloc);
+        let flat = mapped.finish(alloc);
+        let expected: StdVec<((CellId, Name), bool)> = oracle.iter().map(|(&k, &v)| (k, v)).collect();
+
+        assert_eq!(compact.len(), 10_000);
+        assert!(!compact.is_empty());
+        assert_eq!(compact.len(), flat.len());
+        assert_eq!(compact.len(), expected.len());
+
+        // Strict memory bound: O(edges * 8 + cells * 20 + names * 33), far below 83 B/edge flat floor.
+        let bytes_per_edge = compact.byte_size() / compact.len();
+        assert!(
+            bytes_per_edge <= 16,
+            "compact ReaderEdits must stay <= 16 B/edge (got {bytes_per_edge} B/edge, {} bytes for {} edges; flat is {} B/edge)",
+            compact.byte_size(),
+            compact.len(),
+            flat.byte_size() / flat.len(),
+        );
+        assert!(compact.byte_size() * 5 < flat.byte_size(), "compact ({}) must be >5x smaller than flat ({})", compact.byte_size(), flat.byte_size());
+
+        // Exact ordering & element equivalence via iter(), pairs(), and get(i).
+        assert_eq!(collect_via_iter(&compact), expected);
+        assert_eq!(collect_via_iter(&flat), expected);
+        assert_eq!(compact.pairs().collect::<StdVec<_>>(), expected);
+        for (i, &want) in expected.iter().enumerate() {
+            assert_eq!(compact.get(i), Some(want));
+            assert_eq!(flat.get(i), Some(want));
+        }
+        assert_eq!(compact.get(expected.len()), None);
+
+        // Point lookups (`edits_of`, `Edits::get`, `any_removed_of`).
+        assert!(compact.any_removed_of(Kind::Signature));
+        assert!(compact.any_removed_of(Kind::Given));
+        assert!(!compact.any_removed_of(Kind::Units));
+        assert_eq!(compact.any_removed_of(Kind::Signature), flat.any_removed_of(Kind::Signature));
+        assert_eq!(compact.any_removed_of(Kind::Units), flat.any_removed_of(Kind::Units));
+
+        let present = mk_cell(Kind::Signature, 0, 0);
+        let absent = mk_cell(Kind::Units, 999, 999);
+        assert!(compact.edits_of(absent).is_none());
+        assert!(flat.edits_of(absent).is_none());
+        let dc = compact.edits_of(present).expect("present cell in compact");
+        let df = flat.edits_of(present).expect("present cell in flat");
+        assert_eq!(dc.len(), df.len());
+        assert_eq!(dc.iter().collect::<StdVec<_>>(), df.iter().collect::<StdVec<_>>());
+        for r in 0..100u32 {
+            let reader = mk_name(Kind::BodyCheck, r);
+            assert_eq!(dc.get(&reader), df.get(&reader));
+            assert_eq!(dc.get(&reader), oracle.get(&(present, reader)).copied());
+        }
+        assert_eq!(dc.get(&mk_name(Kind::Units, 999)), None);
+    }
+
+    #[test]
+    fn compact_empty_single_retain_and_merge_equivalence() {
+        let alloc = blaze_own::testing::heap().shared();
+
+        // Empty index.
+        let empty_p = Paired::new_in(alloc, Plant::None).finish(alloc);
+        let empty_m = Mapped::new_in(alloc, Plant::None).finish(alloc);
+        assert!(empty_p.is_empty() && empty_m.is_empty());
+        assert_eq!(empty_p.len(), 0);
+        assert_eq!(empty_p.get(0), None);
+        assert!(empty_p.iter().next().is_none());
+        assert!(!empty_p.any_removed_of(Kind::Given));
+
+        // Single-edge index (both `true` and `false`).
+        let c0 = mk_cell(Kind::Given, 1, 1);
+        let r0 = mk_name(Kind::BodyCheck, 1);
+        let mut p1 = Paired::new_in(alloc, Plant::None);
+        p1.write(c0, r0, true);
+        p1.write(c0, r0, false);
+        let mut single = p1.finish(alloc);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single.get(0), Some(((c0, r0), false)));
+        assert!(single.any_removed_of(Kind::Given));
+        single.retain_added();
+        assert!(single.is_empty());
+        assert!(!single.any_removed_of(Kind::Given));
+        assert!(single.edits_of(c0).is_none());
+
+        // `try_retain` and `merge_newer` across Compact + Compact and Compact + Flat.
+        let c1 = mk_cell(Kind::Signature, 2, 2);
+        let c2 = mk_cell(Kind::Given, 3, 3);
+        let r1 = mk_name(Kind::BodyCheck, 10);
+        let r2 = mk_name(Kind::BodyCheck, 20);
+
+        let mut p_old = Paired::new_in(alloc, Plant::None);
+        p_old.write(c0, r0, true);
+        p_old.write(c1, r1, true);
+        p_old.write(c1, r2, false);
+        let mut old_c = p_old.finish(alloc);
+
+        let mut m_old = Mapped::new_in(alloc, Plant::None);
+        m_old.write(c0, r0, true);
+        m_old.write(c1, r1, true);
+        m_old.write(c1, r2, false);
+        let mut old_f = m_old.finish(alloc);
+
+        let filter = |id: CellId, reader: Name, _added: bool| -> Result<bool, ()> { Ok(!(id == c1 && reader == r1)) };
+        old_c.try_retain(filter).expect("retain compact");
+        old_f.try_retain(filter).expect("retain flat");
+        assert_eq!(old_c.pairs().collect::<StdVec<_>>(), old_f.pairs().collect::<StdVec<_>>());
+
+        let mut p_new = Paired::new_in(alloc, Plant::None);
+        p_new.write(c0, r0, false);
+        p_new.write(c2, r2, true);
+        let new_c = p_new.finish(alloc);
+
+        let mut m_new = Mapped::new_in(alloc, Plant::None);
+        m_new.write(c0, r0, false);
+        m_new.write(c2, r2, true);
+        let new_f = m_new.finish(alloc);
+
+        let merged_cc = ReaderEdits::merge_newer(old_c, new_c, alloc);
+        let merged_ff = ReaderEdits::merge_newer(old_f, new_f, alloc);
+        assert_eq!(merged_cc.pairs().collect::<StdVec<_>>(), merged_ff.pairs().collect::<StdVec<_>>());
+        assert_eq!(merged_cc.len(), 3);
+        assert_eq!(merged_cc.edits_of(c0).and_then(|d| d.get(&r0)), Some(false));
+        assert_eq!(merged_cc.edits_of(c1).and_then(|d| d.get(&r2)), Some(false));
+        assert_eq!(merged_cc.edits_of(c2).and_then(|d| d.get(&r2)), Some(true));
+
+        // Compact + Flat merge keeps compact representation.
+        let single_flat = ReaderEdits::from_single(c2, r0, true, alloc);
+        let merged_cf = ReaderEdits::merge_newer(merged_cc, single_flat, alloc);
+        assert_eq!(merged_cf.len(), 4);
+        assert_eq!(merged_cf.edits_of(c2).and_then(|d| d.get(&r0)), Some(true));
+        assert_eq!(merged_cf.edits_of(c2).and_then(|d| d.get(&r2)), Some(true));
     }
 }
