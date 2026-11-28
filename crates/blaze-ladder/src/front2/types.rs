@@ -767,7 +767,7 @@ fn bare_name<'v>(v: &View<'v>, t: lf::TypeId) -> Result<Option<&'v str>, Why> {
 /// `text` of type `want` (the Reference, "Literal expressions"): `true`, `false`, or an integer
 /// literal, `-` before it for a signed type; its bits are the value's in `want`'s width, as
 /// blaze-consteval writes them. `None`: the text is no such literal.
-fn literal_value(tys: &mut PortableTys<'_>, text: &str, want: PTy, r: Range) -> Result<Option<PTy>, Why> {
+fn literal_value(tys: &mut PortableTys<'_>, text: &str, want: PTy, ptr_bits: u32, r: Range) -> Result<Option<PTy>, Why> {
     let node = *tys.view().get(want).ok_or(program(format!("a const parameter's type is past the type table"), r))?;
     let signed = match node {
         PNode::Bool => {
@@ -783,7 +783,7 @@ fn literal_value(tys: &mut PortableTys<'_>, text: &str, want: PTy, r: Range) -> 
         _ => return Ok(None),
     };
     let Some(&(name, _)) = PRIMS.iter().find(|(_, n)| *n == node) else { return Ok(None) };
-    let bits = int_bits(name);
+    let bits = int_bits(name, ptr_bits);
     let (neg, digits) = match text.strip_prefix('-') {
         Some(rest) => (true, rest.trim_start()),
         None => (false, text),
@@ -805,14 +805,14 @@ fn literal_value(tys: &mut PortableTys<'_>, text: &str, want: PTy, r: Range) -> 
     Ok(Some(intern(tys, PNode::ConstValue { ty: want, bits })?))
 }
 
-/// An integer type's width by its name; `isize` and `usize` are 64 bits here, as
-/// [`usize_literal`] takes them.
-fn int_bits(name: &str) -> u32 {
+/// An integer type's width by its name, with `ptr_bits` (`32` or `64`) for `isize`/`usize`.
+fn int_bits(name: &str, ptr_bits: u32) -> u32 {
     match name {
         "i8" | "u8" => 8,
         "i16" | "u16" => 16,
         "i32" | "u32" => 32,
         "i128" | "u128" => 128,
+        "isize" | "usize" => ptr_bits,
         _ => 64,
     }
 }
@@ -1339,7 +1339,20 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // expression, never a literal with the suffix `usize << 0`.
         let digits = text.strip_prefix('-').map_or(text, str::trim_start);
         if Self::one_token(digits) {
-            if let Some(value) = literal_value(tys, text, ty, r)? {
+            let ptr_bits = self
+                .resolver
+                .names
+                .crate_of(env.module)
+                .and_then(|k| self.resolver.names.cfg_atoms(k))
+                .and_then(|atoms| {
+                    atoms
+                        .iter()
+                        .find(|(n, _)| *n == "target_pointer_width")
+                        .and_then(|(_, w)| w.and_then(|w| w.parse::<u32>().ok()))
+                })
+                .filter(|&b| b == 32 || b == 64)
+                .unwrap_or(64);
+            if let Some(value) = literal_value(tys, text, ty, ptr_bits, r)? {
                 return Ok(value);
             }
         }

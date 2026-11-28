@@ -1074,6 +1074,23 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
                     Some(t) => tys.view().get(t).copied(),
                     None => None,
                 };
+                // A braced pointer-sized literal (`{ 1usize }`, `{ -1isize }`) skipped the
+                // target-unaware `blaze-lower` literal fast path. When its explicit suffix
+                // disagrees with the expected parameter type (e.g. `{ 1usize }` for `const B:
+                // bool`), evaluate it at its own inferred type so `blaze-typeck` reports E0308
+                // while preserving target-aware overflow checking.
+                let digits = text.strip_prefix('-').map_or(text, str::trim_start);
+                let ptr_lit_mismatch = parser::LexedStr::single_token(parser::Edition::CURRENT, digits)
+                    .is_some_and(|(kind, _)| kind.is_literal())
+                    && ((text.ends_with("usize") && node != Some(blaze_typeck::PNode::Uint(blaze_typeck::UintTy::Usize)))
+                        || (text.ends_with("isize") && node != Some(blaze_typeck::PNode::Int(blaze_typeck::IntTy::Isize))));
+                let eval_want_ty = |tys: &mut PortableTys<'_>| {
+                    if ptr_lit_mismatch {
+                        super::types::intern(tys, blaze_typeck::PNode::Infer)
+                    } else {
+                        want_ty(tys)
+                    }
+                };
                 // Of a type the checker finds (`Infer`): an expression naming an item of the
                 // body is still the body's constant, never read at the module, where the name
                 // means another item; it is filed with its type left to the checker when that
@@ -1083,7 +1100,7 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
                 let local = self.body_anon(source, marks, scope, node.unwrap_or(blaze_typeck::PNode::Infer), range, tys);
                 match local {
                     Some(made) => made,
-                    None => self.builder.const_term(tys, &self.env, text, range, &want_ty),
+                    None => self.builder.const_term(tys, &self.env, text, range, &eval_want_ty),
                 }
             }
         };

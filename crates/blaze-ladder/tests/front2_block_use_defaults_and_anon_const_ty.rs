@@ -71,6 +71,14 @@ mod m {
         pub use super::Map;
     }
 
+    pub struct OnlyType {
+        pub x: i32,
+    }
+
+    impl OnlyType {
+        pub const ASSOC: i32 = 41;
+    }
+
     pub struct Driver;
 
     pub struct HasNewTextSignature<T>(T);
@@ -230,6 +238,44 @@ fn pos_chained_block_use_defaults() -> m::Map<i32, i32> {
     Map::<i32, i32>::new(1, 2)
 }
 
+fn pos_deep_20_hop_chained_block_use_defaults() -> m::Map<i32, i32> {
+    use m::sub as s0;
+    use s0 as s1;
+    use s1 as s2;
+    use s2 as s3;
+    use s3 as s4;
+    use s4 as s5;
+    use s5 as s6;
+    use s6 as s7;
+    use s7 as s8;
+    use s8 as s9;
+    use s9 as s10;
+    use s10 as s11;
+    use s11 as s12;
+    use s12 as s13;
+    use s13 as s14;
+    use s14 as s15;
+    use s15 as s16;
+    use s16 as s17;
+    use s17 as s18;
+    use s18 as s19;
+    use s19 as s20;
+    use s20::Map;
+    Map::<i32, i32>::new(1, 2)
+}
+
+fn pos_chained_type_only_use_does_not_shadow_local_fn() -> i32 {
+    use crate::m::OnlyType as A;
+    use A as X;
+    fn X() -> i32 {
+        1
+    }
+    let a = X();
+    let b = X::ASSOC;
+    let _ = a;
+    b
+}
+
 fn pos_local_var_does_not_shadow_type_path() -> m::Map<i32, i32> {
     use m::Map;
     let Map = 0i32;
@@ -257,20 +303,34 @@ fn neg_block_use_too_few_required_args() -> m::Map<i32, i32> {
     use m::Map;
     Map::<i32>::new(1, 2)
 }
+
+fn neg_cyclic_local_use_terminates() {
+    use a as b;
+    use b as a;
+    a();
+}
 "#;
     let items = [
         "pos_block_use_defaults",
         "pos_block_use_struct_lit_defaults",
         "pos_chained_block_use_defaults",
+        "pos_deep_20_hop_chained_block_use_defaults",
+        "pos_chained_type_only_use_does_not_shadow_local_fn",
         "pos_local_var_does_not_shadow_type_path",
         "pos_local_struct_defaults",
         "pos_local_type_alias_defaults",
         "neg_block_use_too_few_required_args",
+        "neg_cyclic_local_use_terminates",
     ];
     let got = check_items(text, &items);
     for (name, outcome) in &got {
         if name.starts_with("pos_") {
             assert_eq!(outcome, "clean", "`{name}` must check clean, got: {outcome}");
+        } else if name == "neg_cyclic_local_use_terminates" {
+            assert!(
+                outcome.contains("UnresolvedPath") && outcome.contains("E0425"),
+                "`{name}` must terminate with E0425 UnresolvedPath, got: {outcome}"
+            );
         } else {
             assert!(
                 outcome.contains("GenericArgCount") && outcome.contains("E0107"),

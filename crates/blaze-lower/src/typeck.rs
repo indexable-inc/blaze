@@ -1201,8 +1201,14 @@ impl Conv<'_, '_, '_, '_, '_> {
         let r = self.v.const_range(c)?;
         let text = self.v.text_at(r)?.trim();
         let unbraced = text.strip_prefix('{').and_then(|t| t.strip_suffix('}')).map(str::trim);
-        let value = const_literal(text)
-            .or_else(|| unbraced.and_then(const_literal).filter(|v| !matches!(v.ty, ConstLitTy::Int(None))));
+        let value = const_literal(text).or_else(|| {
+            unbraced.and_then(const_literal).filter(|v| {
+                !matches!(
+                    v.ty,
+                    ConstLitTy::Int(None | Some(IntSuffix::Int(IntTy::Isize) | IntSuffix::Uint(UintTy::Usize)))
+                )
+            })
+        });
         let Some(value) = value else {
             let term = match place {
                 ArgList::Path { path, segment } => self.types.const_term_at(self.v, c, ArgAt { path, segment, index }, self.tys)?,

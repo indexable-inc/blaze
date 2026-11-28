@@ -1833,6 +1833,56 @@ fn const_literals_read_their_values() {
     assert_eq!(v("{ 3 }"), None);
 }
 
+/// Braced pointer-sized literals (`{ 0x1_0000_0000usize }`, `{ 1isize }`) must NOT take the
+/// target-unaware 64-bit fast path in `const_arg`; they delegate to `Types::const_term_at` so
+/// 32-bit targets catch pointer-width overflow. Fixed-width literals (`{ 1u8 }`, `{ true }`)
+/// still lower directly without consulting `Types::const_term_at`.
+#[test]
+fn braced_pointer_sized_literals_delegate_to_types_while_fixed_width_fast_path() {
+    struct CountingTypes {
+        delegated: std::vec::Vec<std::string::String>,
+    }
+    impl Types for CountingTypes {
+        fn ty(&mut self, view: &View<'_>, t: crate::form::TypeId, _: &mut PortableTys<'_>) -> Result<blaze_typeck::PTy, Refused> {
+            Err(Refused::Form { what: "ty", range: view.site(view.type_range(t)?)? })
+        }
+        fn repeat_len(&mut self, view: &View<'_>, len: ExprId) -> Result<u64, Refused> {
+            Err(Refused::Form { what: "repeat_len", range: view.site(view.expr_range(len)?)? })
+        }
+        fn const_arg(&mut self, view: &View<'_>, c: crate::form::ConstIdx, _: &mut PortableTys<'_>) -> Result<blaze_typeck::PTy, Refused> {
+            Err(Refused::Form { what: "const_arg", range: view.site(view.const_range(c)?)? })
+        }
+        fn const_term_at(
+            &mut self,
+            view: &View<'_>,
+            c: crate::form::ConstIdx,
+            _: crate::typeck::ArgAt,
+            tys: &mut PortableTys<'_>,
+        ) -> Result<crate::typeck::ConstTerm, Refused> {
+            let text = std::string::String::from(view.text_at(view.const_range(c)?)?.trim());
+            self.delegated.push(text);
+            let ty = tys.intern(blaze_typeck::PNode::Infer).map_err(Refused::Check)?;
+            Ok(crate::typeck::ConstTerm::Is(ty))
+        }
+    }
+    let text = "fn main() {
+    f::<{ 0x1_0000_0000usize }>();
+    f::<{ 1isize }>();
+    f::<{ 1u8 }>();
+    f::<{ true }>();
+}";
+    let alloc = Alloc::global();
+    let lowered = match lower_body(text, Edition::E2024, &mut NoCfg, &mut crate::NoModule, alloc) {
+        Ok(l) => l,
+        Err(need) => panic!("{text}: needs {:?}", need.atoms),
+    };
+    let view = lowered.view();
+    let mut tys = PortableTys::new_in(alloc);
+    let mut types = CountingTypes { delegated: std::vec::Vec::new() };
+    to_typeck(&view, ItemKey(1), &mut tys, &mut types, alloc).expect("to_typeck succeeds");
+    assert_eq!(types.delegated, ["{ 0x1_0000_0000usize }", "{ 1isize }"]);
+}
+
 /// A call argument that is an integer literal, or a `-` of one, has its value as written in
 /// `call_arg_ints` (a `#[rustc_legacy_const_generics]` callee's const argument; blaze-typeck
 /// rules/legacy_const.rs): hex, `_` and a suffix read, the `-` left to the checker, the entry

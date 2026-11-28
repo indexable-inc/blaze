@@ -16,7 +16,7 @@ use crate::resolve::{Kind, Ns, ResolveError};
 
 /// Stack-backed buffer for path segments (<= 8 segments hit zero heap allocations; longer
 /// paths spill into the scratch `Alloc`).
-enum SmallPathBuf<'a, 'b> {
+pub(super) enum SmallPathBuf<'a, 'b> {
     Inline { buf: [&'a str; 8], len: usize },
     Spill(OwnVec<&'a str, Alloc<'b>>),
 }
@@ -270,19 +270,10 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                     && local_type.is_none()
                     && let Some(row) = self.store.locals.find(self.owner, Some(scope.0), first, LocalNs::Value)
                     && row.kind == LocalKind::Use
+                    && let Ok(expanded) = expand_local_use(&self.store.locals, self.owner, self.module, row, &[], alloc)
+                    && let Ok(t) = self.resolver().path_with(expanded.module, expanded.dollar, expanded.abs, &expanded.segments, Ns::Type)
                 {
-                    let mut use_module = self.module;
-                    if let Some(&head) = row.path.first()
-                        && !row.abs
-                        && let Some(item) = self.store.locals.find(self.owner, Some(row.scope), head, LocalNs::Type).filter(|r| r.kind.in_block_module())
-                        && let Some(m) = item.module
-                    {
-                        use_module = m;
-                    }
-                    let use_dollar = if row.abs { None } else { super::glob_uses::dollar_of(row.path.first().copied(), row.first_mark) };
-                    if let Ok(t) = self.resolver().path_with(use_module, use_dollar, row.abs, row.path, Ns::Type) {
-                        return Ok(Err(PathMiss::At { segment: 0, after: None, why: MissWhy::NotAValue(checker_of(t.key)) }));
-                    }
+                    return Ok(Err(PathMiss::At { segment: 0, after: None, why: MissWhy::NotAValue(checker_of(t.key)) }));
                 }
                 // rustc_resolve late.rs `resolve_qpath`: a path of two or more segments that
                 // fails, whose first segment is a builtin type's name, is that builtin type
@@ -472,18 +463,20 @@ pub(super) fn fixed_alias<'a>(view: blaze_typeck::PTys<'_>, generics: u32, ty: P
 
 /// Result of expanding a block-local `use` binding (following chained local `use` rows and
 /// block-module items).
-struct ExpandedLocalUse<'a, 'b, 'l> {
-    abs: bool,
-    segments: SmallPathBuf<'a, 'b>,
-    module: blaze_id::ItemKey,
-    dollar: Option<blaze_id::CrateItemKey>,
-    local_type: Option<super::locals::Row<'l>>,
+pub(super) struct ExpandedLocalUse<'a, 'b, 'l> {
+    pub abs: bool,
+    pub segments: SmallPathBuf<'a, 'b>,
+    pub module: blaze_id::ItemKey,
+    pub dollar: Option<blaze_id::CrateItemKey>,
+    pub local_type: Option<super::locals::Row<'l>>,
 }
 
 /// Rewrites a path starting at a block-local `use` row `row` (followed by `tail`), following
 /// chained block-local `use` rows (`use a::b as c; use c::d;`) and placing the final prefix at
 /// its block module when it names a block-local item (`LocalKind::in_block_module`).
-fn expand_local_use<'a, 'b, 'l: 'a>(
+/// Cycle detection tracks visited `(key, scope, range, name)` rows rather than imposing a fixed
+/// hop limit, so arbitrarily deep valid chains resolve while cyclic imports terminate cleanly.
+pub(super) fn expand_local_use<'a, 'b, 'l: 'a>(
     locals: &super::locals::Locals<'l>,
     owner: blaze_typeck::ItemKey,
     default_module: blaze_id::ItemKey,
@@ -493,8 +486,6 @@ fn expand_local_use<'a, 'b, 'l: 'a>(
 ) -> Result<ExpandedLocalUse<'a, 'b, 'l>, LocalGap> {
     let mut abs = row.abs;
     let mut cur_scope = row.scope;
-    let mut cur_range = row.range;
-    let mut cur_name = row.name;
     let mut first_mark = row.first_mark;
     let mut prefix = SmallPathBuf::with_capacity(row.path.len() + tail.len(), alloc);
     for &seg in row.path.iter() {
@@ -502,7 +493,9 @@ fn expand_local_use<'a, 'b, 'l: 'a>(
     }
     let mut module = default_module;
     let mut local_type = None;
-    for _ in 0..16 {
+    let first_id = (row.key, row.scope, row.range, row.name);
+    let mut visited: OwnVec<(blaze_id::ItemKey, u32, blaze_surface::Range, &'l str), Alloc<'b>> = OwnVec::new_in(alloc);
+    loop {
         if abs {
             break;
         }
@@ -520,10 +513,20 @@ fn expand_local_use<'a, 'b, 'l: 'a>(
                 }
                 None => return Err(LocalGap { item: item.key, form: item.kind.unplaced(), range: item.range }),
             }
-        } else if item.kind == LocalKind::Use
-            && !(item.scope == cur_scope && item.range == cur_range && item.name == cur_name)
-            && !item.path.is_empty()
-        {
+        } else if item.kind == LocalKind::Use && !item.path.is_empty() {
+            let next_id = (item.key, item.scope, item.range, item.name);
+            let seen = if visited.is_empty() {
+                next_id == first_id
+            } else {
+                visited.iter().any(|&v| v == next_id)
+            };
+            if seen {
+                break;
+            }
+            if visited.is_empty() {
+                visited.push(first_id);
+            }
+            visited.push(next_id);
             let mut next = SmallPathBuf::with_capacity(item.path.len() + prefix.len(), alloc);
             for &seg in item.path.iter() {
                 next.push(seg, alloc);
@@ -534,8 +537,6 @@ fn expand_local_use<'a, 'b, 'l: 'a>(
             prefix = next;
             abs = item.abs;
             cur_scope = item.scope;
-            cur_range = item.range;
-            cur_name = item.name;
             first_mark = item.first_mark;
         } else {
             break;
