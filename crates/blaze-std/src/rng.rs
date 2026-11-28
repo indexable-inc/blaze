@@ -11,6 +11,8 @@ use core::num::NonZero;
 
 pub use blaze_rng::{GAMMA, SplitMix64, mix};
 
+pub mod req;
+
 /// A generator of its own. Not `Clone`: a copy would draw the same numbers; [`Rng::fork`]
 /// makes another that draws others.
 pub struct Rng {

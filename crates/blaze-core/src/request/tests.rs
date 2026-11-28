@@ -1797,3 +1797,239 @@ fn direct_fs_handler_commits_chained_write_flush_without_effect_enum_bridge() {
         assert_eq!(handler.finish_task(ExitKind::Normal), Ok(0));
     });
 }
+
+#[test]
+fn direct_fs_handler_over_real_sim_survives_crash_without_effect_enum() {
+    use super::DirectFsHandler;
+
+    let h = heap();
+    let tmp = FileName::new("real-sim.tmp").unwrap();
+    let target = FileName::new("real-sim.bin").unwrap();
+    let dirty = FileName::new("real-sim-unflushed.bin").unwrap();
+    let missing = FileName::new("real-sim-absent.bin").unwrap();
+    // > 2 sectors (1536 bytes) so unsynced writes tear visibly across sectors on crash.
+    let payload = std::vec![0xC3u8; 1536];
+    let dirty_payload = std::vec![0x5Du8; 1536];
+    let mut saw_dirty_lost_or_torn = false;
+
+    for seed in 0..64u64 {
+        let mut sim = Sim::new(seed, Faults::default());
+
+        // Phase 1: drive OpenWrite -> Chain<WriteFrom, Flush> -> Close -> RenameFlushed -> SyncDir
+        // plus an unflushed sibling write directly against `Sim` with zero `Effect`/`Done` enum.
+        with_brand(|brand| {
+            let mut handler: DirectFsHandler<'_, '_, Sim> =
+                DirectFsHandler::new(&mut sim, TaskId(501), brand, h.alloc());
+            let root = handler.root();
+
+            let file = handler
+                .perform(
+                    root.open_write(OpenOpts { path: tmp.clone(), create: true, truncate: true }),
+                    |p| match p {
+                        Perform::Answered(res) => res,
+                        _ => unreachable!(),
+                    },
+                )
+                .unwrap()
+                .unwrap();
+
+            let write_req = file.write_from(WriteFromOpts {
+                at: ByteOffset(0),
+                buf: DmaBuf::from_slice_in(&payload, h.alloc())
+                    .with_registered_index(FixedBufIndex(1)),
+            });
+            let flush_req = file.flush();
+            let chain_out = handler
+                .perform(Chain::new(write_req, flush_req), |p| match p {
+                    Perform::Answered(out) => out,
+                    _ => unreachable!(),
+                })
+                .unwrap();
+            let (flushed_file, proof) = match chain_out {
+                ChainOutcome::Both(Ok(buf), Ok((f, proof))) => {
+                    assert_eq!(buf.registered_index(), Some(FixedBufIndex(1)));
+                    buf.release();
+                    (f, proof)
+                }
+                other => panic!("seed {seed}: expected ChainOutcome::Both(Ok, Ok), got {other:?}"),
+            };
+
+            assert_eq!(
+                handler
+                    .perform(flushed_file.close(), |p| match p {
+                        Perform::Answered(res) => res,
+                        _ => unreachable!(),
+                    })
+                    .unwrap(),
+                Ok(())
+            );
+            assert_eq!(
+                handler
+                    .perform(
+                        root.rename_flushed(RenameFlushedOpts {
+                            flushed: proof,
+                            to: target.clone(),
+                        }),
+                        |p| match p {
+                            Perform::Answered(res) => res,
+                            _ => unreachable!(),
+                        },
+                    )
+                    .unwrap(),
+                Ok(())
+            );
+            assert_eq!(
+                handler
+                    .perform(root.sync_dir(), |p| match p {
+                        Perform::Answered(res) => res,
+                        _ => unreachable!(),
+                    })
+                    .unwrap(),
+                Ok(())
+            );
+
+            // Unflushed, unsynced sibling write must be lost or torn across real Sim crashes.
+            let dirty_file = handler
+                .perform(
+                    root.open_write(OpenOpts {
+                        path: dirty.clone(),
+                        create: true,
+                        truncate: true,
+                    }),
+                    |p| match p {
+                        Perform::Answered(res) => res,
+                        _ => unreachable!(),
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            let dirty_buf = handler
+                .perform(
+                    dirty_file.write_from(WriteFromOpts {
+                        at: ByteOffset(0),
+                        buf: DmaBuf::from_slice_in(&dirty_payload, h.alloc()),
+                    }),
+                    |p| match p {
+                        Perform::Answered(res) => res,
+                        _ => unreachable!(),
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            dirty_buf.release();
+            assert_eq!(
+                handler
+                    .perform(dirty_file.close(), |p| match p {
+                        Perform::Answered(res) => res,
+                        _ => unreachable!(),
+                    })
+                    .unwrap(),
+                Ok(())
+            );
+
+            assert_eq!(handler.finish_task(ExitKind::Normal), Ok(0));
+        });
+
+        // Simulate real power loss against `Sim`'s crash model!
+        sim.crash();
+
+        // Flushed & dir-synced target MUST survive intact on every single seed.
+        assert!(sim.exists(&target), "seed {seed}: flushed target must survive crash");
+        assert_eq!(
+            sim.contents(&target),
+            payload,
+            "seed {seed}: flushed target bytes must match exactly after crash"
+        );
+        assert!(!sim.exists(&tmp), "seed {seed}: renamed tmp must not exist after SyncDir + crash");
+
+        let dirty_after = sim.exists(&dirty).then(|| sim.contents(&dirty));
+        if dirty_after.as_ref() != Some(&dirty_payload) {
+            saw_dirty_lost_or_torn = true;
+        }
+
+        // Phase 2: ReadInto + Batch<Stat, 4> over the crashed `Sim`.
+        with_brand(|brand| {
+            let mut handler: DirectFsHandler<'_, '_, Sim> =
+                DirectFsHandler::new(&mut sim, TaskId(502), brand, h.alloc());
+            let root = handler.root();
+            let ro = root.narrow_read_only();
+
+            let opened = handler
+                .perform(ro.open_read(target.clone()), |p| match p {
+                    Perform::Answered(res) => res,
+                    _ => unreachable!(),
+                })
+                .unwrap()
+                .unwrap();
+            let filled = handler
+                .perform(
+                    opened.read_into(ReadIntoOpts {
+                        at: ByteOffset(0),
+                        buf: DmaBuf::with_capacity_in(ByteLen(payload.len() as u32), h.alloc())
+                            .with_registered_index(FixedBufIndex(3)),
+                    }),
+                    |p| match p {
+                        Perform::Answered(res) => res,
+                        _ => unreachable!(),
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(filled.filled, ByteLen(payload.len() as u32));
+            assert_eq!(filled.buf.as_slice(), payload.as_slice());
+            assert_eq!(filled.buf.registered_index(), Some(FixedBufIndex(3)));
+            filled.buf.release();
+            assert_eq!(
+                handler
+                    .perform(opened.close(), |p| match p {
+                        Perform::Answered(res) => res,
+                        _ => unreachable!(),
+                    })
+                    .unwrap(),
+                Ok(())
+            );
+
+            let mut batch: Batch<Stat<'_>, 4> = Batch::new();
+            assert_eq!(batch.try_push(root.stat(target.clone())).unwrap(), 0);
+            assert_eq!(batch.try_push(root.stat(tmp.clone())).unwrap(), 1);
+            assert_eq!(batch.try_push(root.stat(dirty.clone())).unwrap(), 2);
+            assert_eq!(batch.try_push(root.stat(missing.clone())).unwrap(), 3);
+
+            let ready = handler
+                .perform(batch, |p| match p {
+                    Perform::Answered(v) => v,
+                    _ => unreachable!(),
+                })
+                .unwrap();
+            assert_eq!(ready.len(), 4);
+            for entry in ready.as_slice() {
+                match entry.index {
+                    0 => {
+                        let meta = entry.answer.as_ref().unwrap().as_ref().unwrap();
+                        assert_eq!(meta.len, payload.len() as u64);
+                        assert!(!meta.dir);
+                    }
+                    1 | 3 => {
+                        assert_eq!(entry.answer, Ok(None));
+                    }
+                    2 => match &dirty_after {
+                        Some(bytes) => {
+                            let meta = entry.answer.as_ref().unwrap().as_ref().unwrap();
+                            assert_eq!(meta.len, bytes.len() as u64);
+                            assert!(!meta.dir);
+                        }
+                        None => assert_eq!(entry.answer, Ok(None)),
+                    },
+                    other => panic!("unexpected batch index {other}"),
+                }
+            }
+
+            assert_eq!(handler.finish_task(ExitKind::Normal), Ok(0));
+        });
+    }
+
+    assert!(
+        saw_dirty_lost_or_torn,
+        "unflushed sibling must be lost or torn on crash across real Sim seeds"
+    );
+}

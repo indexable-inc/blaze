@@ -27,6 +27,7 @@ use crate::request::{
     BufError, ByteLen, Close, DmaBuf, FilledBuf, FixedBufIndex, Flush, FlushedProof, FsError,
     OpenRead, OpenWrite, ReadInto, RenameFlushed, Stat, SyncDir, WriteFrom,
 };
+use crate::sim::Sim;
 use crate::{DirName, FileName, Meta};
 
 // ---------------------------------------------------------------------------
@@ -620,6 +621,50 @@ impl<'a> DirectFsBackend for InMemoryDirectFs<'a> {
             ino: entry.ino,
             dev: 1,
         }))
+    }
+}
+
+/// Direct zero-`Effect`/`Done` implementation of [`DirectFsBackend`] over the real crash-simulable
+/// [`Sim`] disk state (`Sim::crash`, `Sim::exists`, `Sim::contents`).
+impl DirectFsBackend for Sim {
+    #[inline]
+    fn open_write(&mut self, path: &FileName, create: bool, truncate: bool) -> Result<(), FsError> {
+        self.direct_open_write(path, create, truncate)
+    }
+
+    #[inline]
+    fn open_read(&mut self, path: &FileName) -> Result<(), FsError> {
+        self.direct_open_read(path)
+    }
+
+    #[inline]
+    fn read_at(&mut self, path: &FileName, at: u64, dst: &mut [u8]) -> Result<usize, FsError> {
+        self.direct_read_at(path, at, dst)
+    }
+
+    #[inline]
+    fn write_at(&mut self, path: &FileName, at: u64, src: &[u8]) -> Result<(), FsError> {
+        self.direct_write_at(path, at, src)
+    }
+
+    #[inline]
+    fn flush(&mut self, path: &FileName) -> Result<(), FsError> {
+        self.direct_flush(path)
+    }
+
+    #[inline]
+    fn rename(&mut self, from: &FileName, to: &FileName) -> Result<(), FsError> {
+        self.direct_rename(from, to)
+    }
+
+    #[inline]
+    fn sync_dir(&mut self, dir: &DirName) -> Result<(), FsError> {
+        self.direct_sync_dir(dir)
+    }
+
+    #[inline]
+    fn stat(&mut self, path: &FileName) -> Result<Option<Meta>, FsError> {
+        self.direct_stat(path)
     }
 }
 

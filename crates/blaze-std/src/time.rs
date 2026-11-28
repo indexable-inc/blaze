@@ -8,6 +8,8 @@
 use core::fmt;
 use core::time::Duration;
 
+pub mod req;
+
 const SECS_PER_MINUTE: i64 = 60;
 const SECS_PER_HOUR: i64 = 3_600;
 const SECS_PER_DAY: i64 = 86_400;

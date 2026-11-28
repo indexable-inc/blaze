@@ -72,10 +72,11 @@ const fn known(name: &'static str, planned: Stage) -> KnownAttr {
 
 /// Every `blaze::` attribute this build knows, sorted by name: the extensions ledger's section 3
 /// (2026-11-16), every one known and unchecked today but `args` (rule 83, 2026-11-17),
-/// `capability` and `handle` (two-tier sans-IO firewall, 2026-11-27), and `cost` (checked
-/// complexity contracts, 2026-11-27). A stage that starts to check one, or the verdict that
-/// removes one, changes its `state` here and nowhere else.
-pub const KNOWN: [KnownAttr; 55] = {
+/// `capability` and `handle` (two-tier sans-IO firewall, 2026-11-27), `cost` (checked complexity
+/// contracts, 2026-11-27), and `max_state_bytes` and `syscalls` (sans-IO machine state budget and
+/// syscall policy, 2026-11-28). A stage that starts to check one, or the verdict that removes
+/// one, changes its `state` here and nowhere else.
+pub const KNOWN: [KnownAttr; 57] = {
     use Stage::*;
     [
         known("answers_request", Effects),
@@ -122,6 +123,9 @@ pub const KNOWN: [KnownAttr; 55] = {
         // it was tried as and why that failed (blaze-lint `lock-without-reason` reads it).
         known("lock_exception", Effects),
         known("mark", Comptime),
+        // Compile-time suspended state size ceiling (`#[blaze::max_state_bytes(N)]` on `.do`
+        // workflows): enforced by `blaze_lir::coroutine_machine::split_machine_bounded`.
+        KnownAttr { name: "max_state_bytes", state: State::Checked(Effects), planned: Effects },
         known("may", Effects),
         known("may_suspend", Effects),
         known("memo", Comptime),
@@ -143,6 +147,9 @@ pub const KNOWN: [KnownAttr; 55] = {
         known("simd", Codegen),
         known("specialization", Traits),
         known("specialization_trait", Traits),
+        // Declared syscall set (`#[blaze::syscalls(...)]` on driver/capability items): checked
+        // against inferred syscall effects (`blaze-typeck` capability/syscall policy).
+        KnownAttr { name: "syscalls", state: State::Checked(Effects), planned: Effects },
         known("theorem", Proofs),
         known("trust", Effects),
         known("uniq", Syntax),
@@ -204,4 +211,27 @@ fn distance_within(a: &[u8], b: &[u8], bound: usize) -> Option<usize> {
     }
     let d = prev[b.len()];
     (d <= bound).then_some(d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BlazeAttr, KNOWN, KnownAttr, Stage, State, classify};
+
+    #[test]
+    fn known_table_is_sorted_and_unique() {
+        assert!(KNOWN.windows(2).all(|w| w[0].name < w[1].name), "KNOWN must stay sorted and unique");
+    }
+
+    #[test]
+    fn max_state_bytes_and_syscalls_are_checked_effects_attrs() {
+        for name in ["max_state_bytes", "syscalls"] {
+            let BlazeAttr::Known(idx) = classify(name) else {
+                panic!("expected `blaze::{name}` to classify as Known");
+            };
+            assert_eq!(
+                KNOWN[usize::from(idx)],
+                KnownAttr { name, state: State::Checked(Stage::Effects), planned: Stage::Effects },
+            );
+        }
+    }
 }

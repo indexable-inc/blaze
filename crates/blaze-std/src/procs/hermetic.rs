@@ -1792,3 +1792,101 @@ pub fn confinement_digest(text: &[u8]) -> Digest {
     hasher.update(text);
     Digest(hasher.finalize())
 }
+
+/// Maps hermetic child capabilities (`allow_net`, `allow_procs`) into a minimal
+/// [`blaze_sys::effects::DomainMask`] covering baseline filesystem/clock/rng/vm/stat/sync
+/// authority while omitting `NET` and `PROC` unless explicitly requested.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub const fn domain_mask_for_hermetic(
+    allow_net: bool,
+    allow_procs: bool,
+) -> blaze_sys::effects::DomainMask {
+    use blaze_sys::effects::DomainMask;
+    let mut mask = DomainMask::CLOCK
+        .union(DomainMask::RNG)
+        .union(DomainMask::VM)
+        .union(DomainMask::STAT)
+        .union(DomainMask::FS)
+        .union(DomainMask::SYNC);
+    if allow_net {
+        mask = mask.union(DomainMask::NET);
+    }
+    if allow_procs {
+        mask = mask.union(DomainMask::PROC);
+    }
+    mask
+}
+
+/// Renders a default-deny macOS Seatbelt SBPL profile for `mask` directly into `out` via
+/// [`blaze_sys::effects::synthesize_seatbelt_sbpl`] with zero heap allocation.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn render_effect_seatbelt_sbpl(
+    mask: blaze_sys::effects::DomainMask,
+    out: &mut impl core::fmt::Write,
+) -> core::fmt::Result {
+    blaze_sys::effects::synthesize_seatbelt_sbpl(mask, out)
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod effect_policy_tests {
+    use blaze_own::FixedString;
+    use blaze_sys::effects::DomainMask;
+
+    use super::{domain_mask_for_hermetic, render_effect_seatbelt_sbpl};
+
+    #[test]
+    fn hermetic_domain_mask_default_omits_net_and_proc_and_renders_default_deny_sbpl() {
+        let mask = domain_mask_for_hermetic(false, false);
+        assert!(!mask.contains(DomainMask::NET), "default hermetic mask must omit NET");
+        assert!(!mask.contains(DomainMask::PROC), "default hermetic mask must omit PROC");
+        assert!(mask.contains(DomainMask::FS));
+        assert!(mask.contains(DomainMask::CLOCK));
+        assert!(mask.contains(DomainMask::RNG));
+        assert!(mask.contains(DomainMask::VM));
+        assert!(mask.contains(DomainMask::STAT));
+        assert!(mask.contains(DomainMask::SYNC));
+
+        let mut sbpl = FixedString::<2048>::new();
+        assert_eq!(render_effect_seatbelt_sbpl(mask, &mut sbpl), Ok(()));
+        let text = sbpl.text().expect("SBPL profile fits in 2048 bytes");
+        assert!(
+            text.starts_with("(version 1)\n(deny default)\n"),
+            "missing default-deny header:\n{text}"
+        );
+        assert!(
+            !text.contains("network*"),
+            "default hermetic SBPL must not permit network*:\n{text}"
+        );
+        assert!(
+            !text.contains("process-fork"),
+            "default hermetic SBPL must not permit process-fork:\n{text}"
+        );
+        assert!(
+            !text.contains("process-exec"),
+            "default hermetic SBPL must not permit process-exec:\n{text}"
+        );
+
+        let net_mask = domain_mask_for_hermetic(true, false);
+        assert!(net_mask.contains(DomainMask::NET));
+        assert!(!net_mask.contains(DomainMask::PROC));
+        let mut net_sbpl = FixedString::<2048>::new();
+        assert_eq!(render_effect_seatbelt_sbpl(net_mask, &mut net_sbpl), Ok(()));
+        let net_text = net_sbpl.text().expect("net SBPL fits");
+        assert!(net_text.contains("(allow network*)"), "missing network*:\n{net_text}");
+        assert!(!net_text.contains("process-fork"), "unexpected process-fork:\n{net_text}");
+
+        let proc_mask = domain_mask_for_hermetic(false, true);
+        assert!(!proc_mask.contains(DomainMask::NET));
+        assert!(proc_mask.contains(DomainMask::PROC));
+        let mut proc_sbpl = FixedString::<2048>::new();
+        assert_eq!(render_effect_seatbelt_sbpl(proc_mask, &mut proc_sbpl), Ok(()));
+        let proc_text = proc_sbpl.text().expect("proc SBPL fits");
+        assert!(!proc_text.contains("network*"), "unexpected network*:\n{proc_text}");
+        assert!(
+            proc_text.contains("(allow process-fork process-exec)"),
+            "missing process-fork/exec:\n{proc_text}"
+        );
+    }
+}
