@@ -329,8 +329,9 @@ impl crate::front_load::OpenByNeed for HeadsScopeRecords<'_, '_, '_, '_> {
         edition: blaze_surface::Edition,
         text: &'s str,
         verify_digest: bool,
+        bump: blaze_own::Bump<'s>,
     ) -> Option<Result<blaze_scope::items_record::CurrentFile<'s>, blaze_scope::items_record::ItemsRecordError>> {
-        self.lazy.pack_file_items(world_at, nfiles, file, expected_surface, edition, text, verify_digest)
+        self.lazy.pack_file_items(world_at, nfiles, file, expected_surface, edition, text, verify_digest, bump)
     }
 }
 

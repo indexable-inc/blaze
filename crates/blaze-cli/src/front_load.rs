@@ -499,7 +499,10 @@ impl<'r> ScopeRecords<'r> {
     /// [`ItemsRecordError::FileItemsSurfaceConflict`] on a conflicting CAS/cached entry instead
     /// of silently re-outlining) and, when `verify_digest` is `true` (checkout `/0/` files),
     /// validates `text_digest` against `text` so a concurrent edit never reuses a stale outline.
-    #[expect(clippy::too_many_arguments, reason = "pack file items lookup: crate slot, file, expected surface, edition, text, verify flag")]
+    /// On a cold CAS miss whose fresh outline disagrees with `expected_surface` (stale
+    /// `ItemsRecord`), returns the already-built uncached [`CurrentFile`] in `bump` without
+    /// populating the shared cell or retrying a second outline.
+    #[expect(clippy::too_many_arguments, reason = "pack file items lookup: crate slot, file, expected surface, edition, text, verify flag, bump")]
     pub(crate) fn cached_pack_file_items<'s>(
         &'s self,
         world_at: usize,
@@ -509,6 +512,7 @@ impl<'r> ScopeRecords<'r> {
         edition: blaze_surface::Edition,
         text: &'s str,
         verify_digest: bool,
+        bump: Bump<'s>,
     ) -> Option<Result<CurrentFile<'s>, ItemsRecordError>> {
         let caches = self
             .file_caches
@@ -552,7 +556,16 @@ impl<'r> ScopeRecords<'r> {
                 }));
             }
         }
-        let (surface, buf, offset, len) = match blaze_mem::frame::task(blaze_mem::Tag::Parse, |scratch| {
+        enum Built<'s> {
+            Cached {
+                surface: ContentId,
+                buf: Vec<u8, blaze_own::SharedAlloc<'static>>,
+                offset: usize,
+                len: usize,
+            },
+            Uncached(CurrentFile<'s>),
+        }
+        let built = match blaze_mem::frame::task(blaze_mem::Tag::Parse, |scratch| {
             let erased = blaze_own::Erased::new(scratch);
             let alloc = erased.handle();
             let outline = blaze_file_items::outline(text, edition, alloc);
@@ -561,31 +574,45 @@ impl<'r> ScopeRecords<'r> {
                 Err(why) => return Err(ItemsRecordError::FileItemsBuild { file, why }),
             };
             let surface = outline.surface();
+            if surface != expected_surface {
+                // Fresh outline disagrees with `ItemsRecord`: do not poison the shared cell and do
+                // not return `None` (which would re-outline the file a second time via
+                // `CurrentFile::from_text`); return the already-built uncached view directly so
+                // `ItemsRecord::check_file` reports `ItemsRecordError::Stale` in one pass.
+                let view = match blaze_surface::FileItemsView::read(blaze_scope::resolve::aligned(&encoded, bump)) {
+                    Ok(v) => v,
+                    Err(why) => return Err(ItemsRecordError::FileItemsRead { file, why }),
+                };
+                return Ok(Built::Uncached(CurrentFile { text, surface, view }));
+            }
             let len = encoded.len();
             let mut buf = Vec::with_capacity_in(len.saturating_add(15), self.heap.shared());
             buf.resize(len.saturating_add(15), 0);
             let offset = (16 - (buf.as_ptr().addr() & 15)) & 15;
             let Some(dst) = offset.checked_add(len).and_then(|end| buf.get_mut(offset..end)) else {
-                return Ok(None);
+                return Err(ItemsRecordError::FileItemsUnavailable {
+                    file,
+                    what: "cached pack FileItems buffer bounds overflowed (front_load.rs)",
+                });
             };
             dst.copy_from_slice(&encoded);
-            Ok(Some((surface, buf, offset, len)))
+            Ok(Built::Cached { surface, buf, offset, len })
         }) {
-            Ok(Some(v)) => v,
-            Ok(None) => return None,
+            Ok(v) => v,
             Err(why) => return Some(Err(why)),
         };
+        let (surface, buf, offset, len) = match built {
+            Built::Uncached(current) => return Some(Ok(current)),
+            Built::Cached { surface, buf, offset, len } => (surface, buf, offset, len),
+        };
         let Some(check_slice) = offset.checked_add(len).and_then(|end| buf.get(offset..end)) else {
-            return None;
+            return Some(Err(ItemsRecordError::FileItemsUnavailable {
+                file,
+                what: "cached pack FileItems slice bounds invalid (front_load.rs)",
+            }));
         };
         if let Err(why) = blaze_surface::FileItemsView::read(check_slice) {
             return Some(Err(ItemsRecordError::FileItemsRead { file, why }));
-        }
-        if surface != expected_surface {
-            // Fresh outline still disagrees with `ItemsRecord`: do not poison the shared cell;
-            // return `None` so the caller outlines into its frame and `ItemsRecord::check_file`
-            // reports `ItemsRecordError::Stale`.
-            return None;
         }
         let _ = cell.set(CachedPackFileItems::Owned { edition: edition.byte(), text_digest: digest, surface, buf, offset, len });
         let entry = cell.get()?;
@@ -683,7 +710,7 @@ pub(crate) trait OpenByNeed: Sync {
     /// Cached `FileItems` view keyed by `(world_at, file)` (sized by `nfiles`), validated
     /// against `expected_surface`. When `verify_digest` is `true`, also validates the cached
     /// entry's `text_digest` against `text`. Returns `None` if no matching cache slot is available.
-    #[expect(clippy::too_many_arguments, reason = "pack file items lookup: crate slot, file, expected surface, edition, text, verify flag")]
+    #[expect(clippy::too_many_arguments, reason = "pack file items lookup: crate slot, file, expected surface, edition, text, verify flag, bump")]
     fn pack_file_items<'s>(
         &'s self,
         _world_at: usize,
@@ -693,6 +720,7 @@ pub(crate) trait OpenByNeed: Sync {
         _edition: blaze_surface::Edition,
         _text: &'s str,
         _verify_digest: bool,
+        _bump: Bump<'s>,
     ) -> Option<Result<CurrentFile<'s>, ItemsRecordError>> {
         None
     }
@@ -712,8 +740,9 @@ impl OpenByNeed for ScopeRecords<'_> {
         edition: blaze_surface::Edition,
         text: &'s str,
         verify_digest: bool,
+        bump: Bump<'s>,
     ) -> Option<Result<CurrentFile<'s>, ItemsRecordError>> {
-        self.cached_pack_file_items(world_at, nfiles, file, expected_surface, edition, text, verify_digest)
+        self.cached_pack_file_items(world_at, nfiles, file, expected_surface, edition, text, verify_digest, bump)
     }
 }
 
@@ -1010,7 +1039,7 @@ impl<'n> Load<'n> for StoreLoad<'n> {
                     })
                 };
                 if let Some((world_at, nfiles)) = target
-                    && let Some(res) = records.pack_file_items(world_at, nfiles, index, surface, edition, text, full.starts_with("/0/"))
+                    && let Some(res) = records.pack_file_items(world_at, nfiles, index, surface, edition, text, full.starts_with("/0/"), bump)
                 {
                     return res.map(Some);
                 }
@@ -1557,8 +1586,9 @@ mod tests {
         store.put(&cx, stale_key, &stale_old_bytes).expect("put stale record under old producer key");
         let snap_pos = store.commit_for_body_reads().expect("commit positive snapshot");
         let scope_pos = ScopeRecords::new(&snap_pos, 4, heap);
+        let bump_pos = blaze_own::testing::bump();
         let opened_pos = scope_pos
-            .cached_pack_file_items(1, 2, 0, fresh_surface, Edition::E2024, text, false)
+            .cached_pack_file_items(1, 2, 0, fresh_surface, Edition::E2024, text, false, bump_pos)
             .expect("cached_pack_file_items must return Some")
             .expect("positive path must succeed");
         assert_eq!(
@@ -1579,8 +1609,9 @@ mod tests {
         store_neg.put(&cx_neg, current_key, &stale_cur_bytes).expect("put stale record under current key");
         let snap_neg = store_neg.commit_for_body_reads().expect("commit negative snapshot");
         let scope_neg = ScopeRecords::new(&snap_neg, 4, heap);
+        let bump_neg = blaze_own::testing::bump();
         match scope_neg
-            .cached_pack_file_items(1, 2, 0, fresh_surface, Edition::E2024, text, false)
+            .cached_pack_file_items(1, 2, 0, fresh_surface, Edition::E2024, text, false, bump_neg)
             .expect("cached_pack_file_items must return Some")
         {
             Err(ItemsRecordError::FileItemsSurfaceConflict { file: 0, expected, found }) => {
@@ -1709,9 +1740,10 @@ mod tests {
         // instead of silently re-outlining.
         store.put(&cx, cas_key, &make_record(stale_surface)).expect("put stale record");
         let stale_snap = store.commit_for_body_reads().expect("stale snapshot");
+        let bump = blaze_own::testing::bump();
         let scope_records = ScopeRecords::new(&stale_snap, 4, heap);
         match scope_records
-            .cached_pack_file_items(0, 2, 0, real_surface, ed, text, false)
+            .cached_pack_file_items(0, 2, 0, real_surface, ed, text, false, bump)
             .expect("must return Some(Err)")
         {
             Err(ItemsRecordError::FileItemsSurfaceConflict { file: 0, expected, found }) => {
@@ -1721,6 +1753,35 @@ mod tests {
             Err(other) => panic!("expected FileItemsSurfaceConflict, got {other:?}"),
         }
 
+        // Cold CAS miss where `ItemsRecord` expects a stale surface (`stale_surface != real_surface`):
+        // must return `Some(Ok(CurrentFile { surface: real_surface, .. }))` directly (never `None`,
+        // avoiding a second outline via `CurrentFile::from_text`), while leaving the shared cell
+        // empty so a matching caller still populates the cell cleanly.
+        let home_cold = Home::of(&cx, &io.need_fs().expect("files"), Some("/h-cold")).expect("test home cold");
+        let lent_cold = home_cold.open_store(&blaze_cas::plain::Settings::default(), Facts { boot: Some(1), nonce: 81 }, alloc).expect("store cold");
+        let mut store_cold = CommandStore::new(&cx, &lent_cold, false, 0, None, io.need_clock().expect("clock"), &err, alloc).expect("command store cold");
+        let empty_snap = store_cold.commit_for_body_reads().expect("empty snapshot");
+        let cold_records = ScopeRecords::new(&empty_snap, 4, heap);
+        let uncached_mismatch = cold_records
+            .cached_pack_file_items(0, 2, 0, stale_surface, ed, text, false, bump)
+            .expect("cold mismatched surface must return Some(Ok(CurrentFile)) directly without falling back to None")
+            .expect("valid uncached CurrentFile");
+        assert_eq!(uncached_mismatch.surface, real_surface);
+        assert_eq!(uncached_mismatch.view.len(), outline.items().len());
+        let cold_cell_empty = cold_records
+            .file_caches
+            .get()
+            .and_then(|crates| crates.get(0))
+            .and_then(|files| files.get())
+            .and_then(|files| files.get(0))
+            .is_some_and(|cell| cell.get().is_none());
+        assert!(cold_cell_empty, "cold mismatched outline must not populate the shared cell");
+        let cold_match = cold_records
+            .cached_pack_file_items(0, 2, 0, real_surface, ed, text, false, bump)
+            .expect("matching cold outline must succeed")
+            .expect("valid CurrentFile");
+        assert_eq!(cold_match.surface, real_surface);
+
         // Positive control: a fresh store holds a matching `real_surface` record and serves it directly.
         let home2 = Home::of(&cx, &io.need_fs().expect("files"), Some("/h2")).expect("test home 2");
         let lent2 = home2.open_store(&blaze_cas::plain::Settings::default(), Facts { boot: Some(1), nonce: 80 }, alloc).expect("store 2");
@@ -1729,7 +1790,7 @@ mod tests {
         let fresh_snap = store2.commit_for_body_reads().expect("fresh snapshot");
         let fresh_records = ScopeRecords::new(&fresh_snap, 4, heap);
         let hit = fresh_records
-            .cached_pack_file_items(0, 2, 0, real_surface, ed, text, false)
+            .cached_pack_file_items(0, 2, 0, real_surface, ed, text, false, bump)
             .expect("matching CAS record")
             .expect("valid CurrentFile");
         assert_eq!(hit.surface, real_surface);
@@ -1738,7 +1799,7 @@ mod tests {
         // Negative control (in-memory cell): querying the populated slot with a mismatched surface
         // must fail loudly with typed `FileItemsSurfaceConflict`.
         match fresh_records
-            .cached_pack_file_items(0, 2, 0, stale_surface, ed, text, false)
+            .cached_pack_file_items(0, 2, 0, stale_surface, ed, text, false, bump)
             .expect("must return Some(Err)")
         {
             Err(ItemsRecordError::FileItemsSurfaceConflict { file: 0, expected, found }) => {

@@ -3111,14 +3111,15 @@ impl CachedDepFile {
         }
     }
 
-    fn open<'n>(
+    fn open_checked<'n>(
         &'n self,
         snapshot: &'n StoreSnapshot,
         index: u32,
         text: &'n str,
         expected_surface: ContentId,
+        check_surface: bool,
     ) -> Result<blaze_scope::items_record::CurrentFile<'n>, blaze_scope::items_record::ItemsRecordError> {
-        if self.surface != expected_surface {
+        if check_surface && self.surface != expected_surface {
             return Err(blaze_scope::items_record::ItemsRecordError::FileItemsSurfaceConflict {
                 file: index,
                 expected: expected_surface,
@@ -3128,7 +3129,8 @@ impl CachedDepFile {
         match &self.data {
             CachedDepData::Snapshot => match snapshot.get(self.key) {
                 Ok(Some(bytes)) => {
-                    let (surface, view) = crate::front_load::open_pack_file_items(bytes, index, self.text_digest, expected_surface)?;
+                    let check_expected = if check_surface { expected_surface } else { self.surface };
+                    let (surface, view) = crate::front_load::open_pack_file_items(bytes, index, self.text_digest, check_expected)?;
                     Ok(blaze_scope::items_record::CurrentFile { view, text, surface })
                 }
                 Ok(None) => Err(blaze_scope::items_record::ItemsRecordError::FileItemsUnavailable {
@@ -3163,6 +3165,38 @@ const DEP_FILE_SMALL_PROBES: usize = 8;
 const DEP_FILE_SLOTS: usize = 4096;
 const DEP_FILE_PROBES: usize = 16;
 
+/// Test-only planted-bug controls for the [`DependencyFiles`] publication & durability DST
+/// (Rules 23, 43). Absent in non-test builds.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum DepFilesPlant {
+    #[default]
+    None,
+    /// Pre-fix control 1: publish and persist a cold-miss outline even when its surface disagrees
+    /// with `expected_surface`.
+    PublishMismatchedSurface,
+    /// Pre-fix control 2: skip surface validation on in-phase slab hits.
+    SkipSlotSurfaceCheck,
+    /// Pre-fix control 3: treat a conflicting CAS surface as a silent miss instead of failing with
+    /// `FileItemsSurfaceConflict`.
+    SilentCasConflictFallback,
+}
+
+/// Cold-miss outline output of [`DependencyFiles::outline_cold_entry`], separating publishable
+/// matching entries from mismatched uncached views so DSTs can interleave publication deterministically.
+enum ColdDepOutline<'n> {
+    Publish {
+        hash: usize,
+        world_at: usize,
+        index: u32,
+        edition: u8,
+        text_len: usize,
+        digest: ContentId,
+        candidate: CachedDepFile,
+    },
+    Uncached(blaze_scope::items_record::CurrentFile<'n>),
+}
+
 /// Lock-free request-wide cache of outlined dependency files (owned by [`Prepared`], dropped with
 /// the phase): checks the committed CAS snapshot first (zero-copy `FileItemsView` with zero lex,
 /// zero parse, zero `to_file_items` hashing, zero heap copies, and zero locks), falling back on
@@ -3172,6 +3206,8 @@ struct DependencyFiles {
     small: bstd::sync::PublishOnce<Vec<bstd::sync::PublishOnce<CachedDepFile>, SharedAlloc<'static>>>,
     large: bstd::sync::PublishOnce<Vec<bstd::sync::PublishOnce<CachedDepFile>, SharedAlloc<'static>>>,
     heap: &'static blaze_own::Heap,
+    #[cfg(test)]
+    plant: DepFilesPlant,
 }
 
 impl DependencyFiles {
@@ -3180,7 +3216,49 @@ impl DependencyFiles {
             small: bstd::sync::PublishOnce::new(),
             large: bstd::sync::PublishOnce::new(),
             heap,
+            #[cfg(test)]
+            plant: DepFilesPlant::None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_plant(heap: &'static blaze_own::Heap, plant: DepFilesPlant) -> DependencyFiles {
+        DependencyFiles {
+            small: bstd::sync::PublishOnce::new(),
+            large: bstd::sync::PublishOnce::new(),
+            heap,
+            plant,
+        }
+    }
+
+    #[cfg(test)]
+    fn check_slot_surface(&self) -> bool {
+        self.plant != DepFilesPlant::SkipSlotSurfaceCheck
+    }
+
+    #[cfg(not(test))]
+    fn check_slot_surface(&self) -> bool {
+        true
+    }
+
+    #[cfg(test)]
+    fn allow_mismatched_publish(&self) -> bool {
+        self.plant == DepFilesPlant::PublishMismatchedSurface
+    }
+
+    #[cfg(not(test))]
+    fn allow_mismatched_publish(&self) -> bool {
+        false
+    }
+
+    #[cfg(test)]
+    fn silent_cas_conflict(&self) -> bool {
+        self.plant == DepFilesPlant::SilentCasConflictFallback
+    }
+
+    #[cfg(not(test))]
+    fn silent_cas_conflict(&self) -> bool {
+        false
     }
 
     fn slot_hash(world_at: usize, index: u32, edition: u8) -> usize {
@@ -3277,8 +3355,10 @@ impl DependencyFiles {
         vec.map(Vec::as_slice)
     }
 
-    #[expect(clippy::too_many_arguments, reason = "dependency file lookup: snapshot, identity, text, digest, expected surface, edition, pin, bump")]
-    fn get_or_outline<'n>(
+    /// Phase 1 of [`Self::get_or_outline`]: probe the in-phase lock-free slabs and committed CAS
+    /// snapshot, publishing a zero-copy `Snapshot` slot on CAS hit. Returns `Ok(None)` on a cold miss.
+    #[expect(clippy::too_many_arguments, reason = "dependency file lookup: snapshot, identity, text, digest, expected surface, edition, pin")]
+    fn lookup_slab_or_cas<'n>(
         &'n self,
         snapshot: &'n StoreSnapshot,
         world_at: usize,
@@ -3288,21 +3368,21 @@ impl DependencyFiles {
         expected_surface: ContentId,
         edition: blaze_surface::Edition,
         pin: DepFilePin,
-        bump: blaze_own::Bump<'n>,
-    ) -> Result<blaze_scope::items_record::CurrentFile<'n>, blaze_scope::items_record::ItemsRecordError> {
+    ) -> Result<Option<blaze_scope::items_record::CurrentFile<'n>>, blaze_scope::items_record::ItemsRecordError> {
         let ed = edition.byte();
         let hash = Self::slot_hash(world_at, index, ed);
+        let check_surface = self.check_slot_surface();
         // 1. In-phase lock-free cache: skips even re-hashing immutable pack file text on repeat asks,
         //    failing loudly with `FileItemsSurfaceConflict` if `cached.surface != expected_surface`.
         if let Some(small) = self.small.get()
             && let Some(cached) = Self::find_in(small.as_slice(), DEP_FILE_SMALL_PROBES, hash, world_at, index, ed, text.len(), digest)
         {
-            return cached.open(snapshot, index, text, expected_surface);
+            return cached.open_checked(snapshot, index, text, expected_surface, check_surface).map(Some);
         }
         if let Some(large) = self.large.get()
             && let Some(cached) = Self::find_in(large.as_slice(), DEP_FILE_PROBES, hash, world_at, index, ed, text.len(), digest)
         {
-            return cached.open(snapshot, index, text, expected_surface);
+            return cached.open_checked(snapshot, index, text, expected_surface, check_surface).map(Some);
         }
         // 2. Committed CAS lookup: zero-copy `FileItemsView` straight from `snapshot`. Because
         //    `pack_file_items_key` binds `PACK_FILE_ITEMS_SOURCE`, all four outliner domains,
@@ -3312,7 +3392,13 @@ impl DependencyFiles {
         let cas_key = crate::front_load::pack_file_items_key(edition, digest);
         match snapshot.get(cas_key) {
             Ok(Some(bytes)) => {
-                let (surface, view) = crate::front_load::open_pack_file_items(bytes, index, digest, expected_surface)?;
+                let (surface, view) = match crate::front_load::open_pack_file_items(bytes, index, digest, expected_surface) {
+                    Ok(opened) => opened,
+                    Err(blaze_scope::items_record::ItemsRecordError::FileItemsSurfaceConflict { .. }) if self.silent_cas_conflict() => {
+                        return Ok(None);
+                    }
+                    Err(err) => return Err(err),
+                };
                 let mut candidate = Some(CachedDepFile {
                     world_at,
                     index,
@@ -3327,50 +3413,91 @@ impl DependencyFiles {
                 if let Some(small) = Self::init_slab(&self.small, DEP_FILE_SMALL_SLOTS, self.heap)
                     && Self::insert_in(small, DEP_FILE_SMALL_PROBES, hash, &mut candidate, world_at, index, ed, text.len(), digest).is_some()
                 {
-                    return Ok(blaze_scope::items_record::CurrentFile { view, text, surface });
+                    return Ok(Some(blaze_scope::items_record::CurrentFile { view, text, surface }));
                 }
                 if candidate.is_some()
                     && let Some(large) = Self::init_slab(&self.large, DEP_FILE_SLOTS, self.heap)
                 {
                     let _ = Self::insert_in(large, DEP_FILE_PROBES, hash, &mut candidate, world_at, index, ed, text.len(), digest);
                 }
-                return Ok(blaze_scope::items_record::CurrentFile { view, text, surface });
+                Ok(Some(blaze_scope::items_record::CurrentFile { view, text, surface }))
             }
-            Ok(None) => {}
-            Err(_) => {
-                return Err(blaze_scope::items_record::ItemsRecordError::FileItemsUnavailable {
-                    file: index,
-                    what: "reading cached dependency FileItems record from committed snapshot failed (engine_bodies.rs)",
-                });
-            }
+            Ok(None) => Ok(None),
+            Err(_) => Err(blaze_scope::items_record::ItemsRecordError::FileItemsUnavailable {
+                file: index,
+                what: "reading cached dependency FileItems record from committed snapshot failed (engine_bodies.rs)",
+            }),
         }
-        // 3. Cold CAS miss: outline once in a warm task frame into a single 16-aligned
-        // `[plain_head | file_items]` buffer and publish into the lock-free slab for this phase
-        // and deterministic CAS persistence at phase merge.
-        let (surface, cached_entry) = blaze_mem::frame::task(bstd::mem::Tag::Parse, |scratch| -> Result<(ContentId, CachedDepFile), blaze_scope::items_record::ItemsRecordError> {
+    }
+
+    /// Phase 2 of [`Self::get_or_outline`]: outline a cold miss once in a warm task frame.
+    /// Matching surfaces produce [`ColdDepOutline::Publish`] for lock-free slab publication and
+    /// deterministic CAS persistence; mismatched surfaces return [`ColdDepOutline::Uncached`]
+    /// directly in `bump` so the caller reports `Stale` without publishing or double-outlining.
+    #[expect(clippy::too_many_arguments, reason = "cold dependency file outline: identity, text, digest, expected surface, edition, pin, bump")]
+    fn outline_cold_entry<'n>(
+        &'n self,
+        world_at: usize,
+        index: u32,
+        text: &'n str,
+        digest: Option<ContentId>,
+        expected_surface: ContentId,
+        edition: blaze_surface::Edition,
+        pin: DepFilePin,
+        bump: blaze_own::Bump<'n>,
+    ) -> Result<ColdDepOutline<'n>, blaze_scope::items_record::ItemsRecordError> {
+        let ed = edition.byte();
+        let hash = Self::slot_hash(world_at, index, ed);
+        let digest = digest.unwrap_or_else(|| ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes()));
+        let cas_key = crate::front_load::pack_file_items_key(edition, digest);
+        let allow_mismatched = self.allow_mismatched_publish();
+        blaze_mem::frame::task(bstd::mem::Tag::Parse, |scratch| -> Result<ColdDepOutline<'n>, blaze_scope::items_record::ItemsRecordError> {
             let erased = blaze_own::Erased::new(scratch);
             let alloc = erased.handle();
             let outline = blaze_file_items::outline(text, edition, alloc);
             let raw = outline.to_file_items(text, digest, alloc)
                 .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsBuild { file: index, why })?;
             let surface = outline.surface();
+            if surface != expected_surface && !allow_mismatched {
+                let view = blaze_surface::FileItemsView::read(blaze_scope::resolve::aligned(&raw, bump))
+                    .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsRead { file: index, why })?;
+                return Ok(ColdDepOutline::Uncached(blaze_scope::items_record::CurrentFile { view, text, surface }));
+            }
             let head = crate::front_load::pack_file_items_head(cas_key, digest, surface, raw.len(), alloc);
-            let cached = CachedDepFile::from_record(world_at, index, ed, text.len(), digest, surface, cas_key, pin, &head, &raw, self.heap.shared());
-            Ok((surface, cached))
-        })?;
-        let mut candidate = Some(cached_entry);
-        if surface == expected_surface {
-            if let Some(small) = Self::init_slab(&self.small, DEP_FILE_SMALL_SLOTS, self.heap)
-                && let Some(published) = Self::insert_in(small, DEP_FILE_SMALL_PROBES, hash, &mut candidate, world_at, index, ed, text.len(), digest)
-            {
-                return published.open(snapshot, index, text, expected_surface);
+            let candidate = CachedDepFile::from_record(world_at, index, ed, text.len(), digest, surface, cas_key, pin, &head, &raw, self.heap.shared());
+            Ok(ColdDepOutline::Publish { hash, world_at, index, edition: ed, text_len: text.len(), digest, candidate })
+        })
+    }
+
+    /// Phase 3 of [`Self::get_or_outline`]: race lock-free `PublishOnce` insertion into `small` /
+    /// `large` slabs and open from the winning slot (falling back to `bump` only if both probe
+    /// chains are completely full).
+    fn publish_cold_entry<'n>(
+        &'n self,
+        snapshot: &'n StoreSnapshot,
+        text: &'n str,
+        expected_surface: ContentId,
+        built: ColdDepOutline<'n>,
+        bump: blaze_own::Bump<'n>,
+    ) -> Result<blaze_scope::items_record::CurrentFile<'n>, blaze_scope::items_record::ItemsRecordError> {
+        let (hash, world_at, index, edition, text_len, digest, candidate) = match built {
+            ColdDepOutline::Uncached(file) => return Ok(file),
+            ColdDepOutline::Publish { hash, world_at, index, edition, text_len, digest, candidate } => {
+                (hash, world_at, index, edition, text_len, digest, candidate)
             }
-            if candidate.is_some()
-                && let Some(large) = Self::init_slab(&self.large, DEP_FILE_SLOTS, self.heap)
-                && let Some(published) = Self::insert_in(large, DEP_FILE_PROBES, hash, &mut candidate, world_at, index, ed, text.len(), digest)
-            {
-                return published.open(snapshot, index, text, expected_surface);
-            }
+        };
+        let check_surface = self.check_slot_surface() && !self.allow_mismatched_publish();
+        let mut candidate = Some(candidate);
+        if let Some(small) = Self::init_slab(&self.small, DEP_FILE_SMALL_SLOTS, self.heap)
+            && let Some(published) = Self::insert_in(small, DEP_FILE_SMALL_PROBES, hash, &mut candidate, world_at, index, edition, text_len, digest)
+        {
+            return published.open_checked(snapshot, index, text, expected_surface, check_surface);
+        }
+        if candidate.is_some()
+            && let Some(large) = Self::init_slab(&self.large, DEP_FILE_SLOTS, self.heap)
+            && let Some(published) = Self::insert_in(large, DEP_FILE_PROBES, hash, &mut candidate, world_at, index, edition, text_len, digest)
+        {
+            return published.open_checked(snapshot, index, text, expected_surface, check_surface);
         }
         let Some(entry) = candidate else {
             return Err(blaze_scope::items_record::ItemsRecordError::FileItemsUnavailable {
@@ -3386,7 +3513,27 @@ impl DependencyFiles {
         };
         let view = blaze_surface::FileItemsView::read(blaze_scope::resolve::aligned(raw, bump))
             .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsRead { file: index, why })?;
-        Ok(blaze_scope::items_record::CurrentFile { view, text, surface })
+        Ok(blaze_scope::items_record::CurrentFile { view, text, surface: entry.surface })
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "dependency file lookup: snapshot, identity, text, digest, expected surface, edition, pin, bump")]
+    fn get_or_outline<'n>(
+        &'n self,
+        snapshot: &'n StoreSnapshot,
+        world_at: usize,
+        index: u32,
+        text: &'n str,
+        digest: Option<ContentId>,
+        expected_surface: ContentId,
+        edition: blaze_surface::Edition,
+        pin: DepFilePin,
+        bump: blaze_own::Bump<'n>,
+    ) -> Result<blaze_scope::items_record::CurrentFile<'n>, blaze_scope::items_record::ItemsRecordError> {
+        if let Some(hit) = self.lookup_slab_or_cas(snapshot, world_at, index, text, digest, expected_surface, edition, pin)? {
+            return Ok(hit);
+        }
+        let built = self.outline_cold_entry(world_at, index, text, digest, expected_surface, edition, pin, bump)?;
+        self.publish_cold_entry(snapshot, text, expected_surface, built, bump)
     }
 
     /// Persists newly built dependency `FileItems` CAS records in deterministic key order
@@ -3778,8 +3925,9 @@ impl crate::front_load::OpenByNeed for LazyScopeRecords<'_> {
         edition: blaze_surface::Edition,
         text: &'s str,
         verify_digest: bool,
+        bump: blaze_own::Bump<'s>,
     ) -> Option<Result<blaze_scope::items_record::CurrentFile<'s>, blaze_scope::items_record::ItemsRecordError>> {
-        self.inner.pack_file_items(world_at, nfiles, file, expected_surface, edition, text, verify_digest)
+        self.inner.pack_file_items(world_at, nfiles, file, expected_surface, edition, text, verify_digest, bump)
     }
 }
 
@@ -10162,6 +10310,429 @@ mod worker_frame_caps_tests {
             Ok(_) => panic!("mismatched in-phase slab surface must fail loudly"),
             Err(other) => panic!("expected FileItemsSurfaceConflict, got {other:?}"),
         }
+    }
+
+    /// Deterministic simulation test (Rules 23, 43) for [`DependencyFiles`] concurrent same-slot
+    /// publication, surface conflict detection, deterministic CAS persistence, sync-failure
+    /// rejection, and crash recovery across 24 deterministic seeds with an independent oracle and
+    /// 3 planted-bug controls (`PublishMismatchedSurface`, `SkipSlotSurfaceCheck`,
+    /// `SilentCasConflictFallback`).
+    #[test]
+    fn dst_dependency_files_concurrent_publication_and_durable_recovery() {
+        use crate::store::{CommandStore, Facts, Home, Store};
+        use blaze_scope::items_record::ItemsRecordError;
+        use bstd::io::{Io, Limits, SimWorld};
+
+        #[derive(Clone, Copy)]
+        struct Fixture {
+            world_at: usize,
+            index: u32,
+            text: &'static str,
+            pin: DepFilePin,
+            digest: ContentId,
+            surface: ContentId,
+            items_len: usize,
+            key: Key,
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum WorkerExpect {
+            Match,
+            MismatchRace { bogus: ContentId },
+            MismatchOnly { bogus: ContentId },
+            CasConflict,
+        }
+
+        enum WorkerState<'n> {
+            Init,
+            ColdMiss,
+            Outlined(ColdDepOutline<'n>),
+            Done,
+        }
+
+        struct Worker<'n> {
+            fixture_idx: usize,
+            expect: WorkerExpect,
+            state: WorkerState<'n>,
+            saw_conflict: bool,
+        }
+
+        fn next_u64(state: &mut u64) -> u64 {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *state = x;
+            x
+        }
+
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let ed = blaze_surface::Edition::E2021;
+        let bogus_surface = ContentId([0xD5; 32]);
+
+        let mk_fixture = |world_at: usize, index: u32, text: &'static str, pin: DepFilePin| -> Fixture {
+            let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
+            let outline = blaze_file_items::outline(text, ed, alloc);
+            let surface = outline.surface();
+            assert_ne!(surface, bogus_surface);
+            Fixture {
+                world_at,
+                index,
+                text,
+                pin,
+                digest,
+                surface,
+                items_len: outline.items().len(),
+                key: crate::front_load::pack_file_items_key(ed, digest),
+            }
+        };
+
+        let fixtures = [
+            mk_fixture(1, 0, "pub fn dst_race_slot(x: u32) -> u32 { x + 1 }\n", DepFilePin::Toolchain),
+            mk_fixture(2, 0, "pub fn dst_mismatch_only(x: u32) -> u32 { x + 2 }\n", DepFilePin::MemberRow),
+            mk_fixture(3, 0, "pub fn dst_cas_conflict(x: u32) -> u32 { x + 3 }\n", DepFilePin::MemberRow),
+            mk_fixture(4, 0, "pub const DST_MEMBER_ROW: usize = 99;\n", DepFilePin::MemberRow),
+            mk_fixture(5, 0, "pub fn dst_fault_phase(v: u64) -> u64 { v ^ 7 }\n", DepFilePin::Toolchain),
+        ];
+
+        // Pre-build a conflicting CAS record under `fixtures[2].key` with `bogus_surface != real_surface`.
+        let conflict_record = {
+            let f = fixtures[2];
+            let outline = blaze_file_items::outline(f.text, ed, alloc);
+            let raw = outline.to_file_items(f.text, f.digest, alloc).expect("conflict to_file_items");
+            let head = crate::front_load::pack_file_items_head(f.key, f.digest, bogus_surface, raw.len(), alloc);
+            let mut rec = Vec::with_capacity_in(head.len() + raw.len(), alloc);
+            rec.extend_from_slice(&head);
+            rec.extend_from_slice(&raw);
+            rec
+        };
+
+        let run_schedule = |seed: u64, plant: DepFilesPlant| -> Result<(), &'static str> {
+            let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let durable = (seed % 2) == 0;
+            let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
+            let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).map_err(|_| "root cx")?;
+            let err = io.need_err().map_err(|_| "stderr")?;
+            let mut settings = blaze_cas::plain::Settings::default();
+            settings.durable = durable;
+            let mut boot = 1u64;
+            let mut nonce = seed.wrapping_mul(100);
+
+            let open_store = |boot_id: u64, n: u64| -> Result<_, &'static str> {
+                let home = Home::of(&cx, &io.need_fs().map_err(|_| "fs")?, Some("/h")).map_err(|_| "home")?;
+                let lent = home.open_store(&settings, Facts { boot: Some(boot_id), nonce: n }, alloc).map_err(|_| "open_store")?;
+                if durable {
+                    lent.set_commit_durability(blaze_cas::plain::CommitDurability::Full);
+                }
+                Ok(lent)
+            };
+
+            // Seed conflicting CAS entry for fixture 2 and commit baseline snapshot.
+            nonce += 1;
+            let lent0 = open_store(boot, nonce)?;
+            let mut store0 = CommandStore::new(&cx, &lent0, false, 0, None, io.need_clock().map_err(|_| "clock")?, &err, alloc)
+                .map_err(|_| "store0")?;
+            store0.put(&cx, fixtures[2].key, &conflict_record).map_err(|_| "put conflict seed")?;
+            let snap0 = store0.commit_for_body_reads().map_err(|_| "commit0")?;
+
+            let frame = Frame::new(bstd::mem::Tag::Other).map_err(|_| "frame")?;
+            let erased = blaze_own::Erased::new(&frame);
+            let bump = erased.bump();
+
+            // Phase 1: deterministically interleave 9 workers racing the same slots across
+            // Lookup -> Outline -> Publish boundaries.
+            let deps1 = DependencyFiles::with_plant(heap, plant);
+            let mut workers = Vec::with_capacity_in(9, alloc);
+            // 3 matching workers racing slot (1, 0)
+            workers.push(Worker { fixture_idx: 0, expect: WorkerExpect::Match, state: WorkerState::Init, saw_conflict: false });
+            workers.push(Worker { fixture_idx: 0, expect: WorkerExpect::Match, state: WorkerState::Init, saw_conflict: false });
+            workers.push(Worker { fixture_idx: 0, expect: WorkerExpect::Match, state: WorkerState::Init, saw_conflict: false });
+            // 2 mismatched workers racing the SAME slot (1, 0)
+            workers.push(Worker { fixture_idx: 0, expect: WorkerExpect::MismatchRace { bogus: bogus_surface }, state: WorkerState::Init, saw_conflict: false });
+            workers.push(Worker { fixture_idx: 0, expect: WorkerExpect::MismatchRace { bogus: bogus_surface }, state: WorkerState::Init, saw_conflict: false });
+            // 2 workers racing a mismatched-only slot (2, 0) — must never publish or persist
+            workers.push(Worker { fixture_idx: 1, expect: WorkerExpect::MismatchOnly { bogus: bogus_surface }, state: WorkerState::Init, saw_conflict: false });
+            workers.push(Worker { fixture_idx: 1, expect: WorkerExpect::MismatchOnly { bogus: bogus_surface }, state: WorkerState::Init, saw_conflict: false });
+            // 1 worker hitting pre-existing conflicting CAS record at slot (3, 0)
+            workers.push(Worker { fixture_idx: 2, expect: WorkerExpect::CasConflict, state: WorkerState::Init, saw_conflict: false });
+            // 1 matching MemberRow worker at slot (4, 0)
+            workers.push(Worker { fixture_idx: 3, expect: WorkerExpect::Match, state: WorkerState::Init, saw_conflict: false });
+
+            // Force at least two matching workers on slot (1, 0) to observe ColdMiss before either
+            // publishes so `PublishOnce::set` contention is guaranteed on every seed.
+            let mut remaining = workers.len();
+            let mut step_num = 0usize;
+            while remaining > 0 {
+                let pick = if step_num == 0 {
+                    0
+                } else if step_num == 1 {
+                    1
+                } else {
+                    let mut ready = Vec::with_capacity_in(workers.len(), alloc);
+                    for (idx, w) in workers.iter().enumerate() {
+                        if !matches!(w.state, WorkerState::Done) {
+                            ready.push(idx);
+                        }
+                    }
+                    let chosen_at = usize::try_from(next_u64(&mut rng) % u64::try_from(ready.len()).map_err(|_| "len")?).map_err(|_| "idx")?;
+                    ready[chosen_at]
+                };
+                step_num += 1;
+
+                let w = &mut workers[pick];
+                let f = fixtures[w.fixture_idx];
+                let expected_surface = match w.expect {
+                    WorkerExpect::Match | WorkerExpect::CasConflict => f.surface,
+                    WorkerExpect::MismatchRace { bogus } | WorkerExpect::MismatchOnly { bogus } => bogus,
+                };
+
+                let prev = core::mem::replace(&mut w.state, WorkerState::Done);
+                match prev {
+                    WorkerState::Init => {
+                        match deps1.lookup_slab_or_cas(&snap0, f.world_at, f.index, f.text, Some(f.digest), expected_surface, ed, f.pin) {
+                            Ok(Some(file)) => {
+                                match w.expect {
+                                    WorkerExpect::Match => {
+                                        if file.surface != f.surface || file.view.file() != f.digest || file.view.len() != f.items_len {
+                                            return Err("matching lookup returned wrong file items");
+                                        }
+                                    }
+                                    WorkerExpect::MismatchRace { .. } => {
+                                        // A slot hit for a mismatched caller MUST fail with FileItemsSurfaceConflict!
+                                        return Err("mismatched lookup hit published slot without returning FileItemsSurfaceConflict");
+                                    }
+                                    WorkerExpect::MismatchOnly { .. } => {
+                                        return Err("mismatched-only slot must never be cached in slab or CAS");
+                                    }
+                                    WorkerExpect::CasConflict => {
+                                        return Err("conflicting CAS entry must not succeed");
+                                    }
+                                }
+                                remaining -= 1;
+                            }
+                            Ok(None) => {
+                                if w.expect == WorkerExpect::CasConflict {
+                                    return Err("conflicting CAS entry silently fell back as a miss");
+                                }
+                                w.state = WorkerState::ColdMiss;
+                            }
+                            Err(ItemsRecordError::FileItemsSurfaceConflict { file, expected, found }) => {
+                                if file != f.index || expected != expected_surface {
+                                    return Err("FileItemsSurfaceConflict reported wrong file or expected surface");
+                                }
+                                match w.expect {
+                                    WorkerExpect::MismatchRace { .. } => {
+                                        if found != f.surface {
+                                            return Err("mismatched race conflict reported wrong found surface");
+                                        }
+                                        w.saw_conflict = true;
+                                    }
+                                    WorkerExpect::CasConflict => {
+                                        if found != bogus_surface {
+                                            return Err("CAS conflict reported wrong found surface");
+                                        }
+                                        w.saw_conflict = true;
+                                    }
+                                    WorkerExpect::Match | WorkerExpect::MismatchOnly { .. } => {
+                                        return Err("unexpected FileItemsSurfaceConflict on non-conflicting worker");
+                                    }
+                                }
+                                remaining -= 1;
+                            }
+                            Err(_) => return Err("unexpected ItemsRecordError in lookup_slab_or_cas"),
+                        }
+                    }
+                    WorkerState::ColdMiss => {
+                        let built = deps1
+                            .outline_cold_entry(f.world_at, f.index, f.text, Some(f.digest), expected_surface, ed, f.pin, bump)
+                            .map_err(|_| "outline_cold_entry failed")?;
+                        w.state = WorkerState::Outlined(built);
+                    }
+                    WorkerState::Outlined(built) => {
+                        match deps1.publish_cold_entry(&snap0, f.text, expected_surface, built, bump) {
+                            Ok(file) => {
+                                if file.surface != f.surface || file.view.file() != f.digest || file.view.len() != f.items_len {
+                                    return Err("published/uncached cold outline returned wrong file items");
+                                }
+                                if w.expect == WorkerExpect::CasConflict {
+                                    return Err("conflicting CAS entry must never reach publish_cold_entry");
+                                }
+                            }
+                            Err(ItemsRecordError::FileItemsSurfaceConflict { file, expected, found }) => {
+                                if file != f.index || expected != expected_surface || found != f.surface {
+                                    return Err("publish conflict reported wrong metadata");
+                                }
+                                if !matches!(w.expect, WorkerExpect::MismatchRace { .. }) {
+                                    return Err("unexpected FileItemsSurfaceConflict during publish");
+                                }
+                                w.saw_conflict = true;
+                            }
+                            Err(_) => return Err("unexpected error in publish_cold_entry"),
+                        }
+                        remaining -= 1;
+                    }
+                    WorkerState::Done => {}
+                }
+            }
+
+            // Post-publication oracle check on slot (1, 0): querying the now-published slot with
+            // `bogus_surface` MUST always fail with `FileItemsSurfaceConflict`.
+            match deps1.get_or_outline(&snap0, fixtures[0].world_at, fixtures[0].index, fixtures[0].text, Some(fixtures[0].digest), bogus_surface, ed, fixtures[0].pin, bump) {
+                Err(ItemsRecordError::FileItemsSurfaceConflict { file: 0, expected, found })
+                    if expected == bogus_surface && found == fixtures[0].surface => {}
+                _ => return Err("published slot failed to reject mismatched expected_surface"),
+            }
+
+            // Persist Phase 1 and commit durably to disk (`lent0.commit()`).
+            let mut member_rows: Option<Vec<Key, blaze_own::Alloc<'static>>> = None;
+            deps1.persist(&cx, &mut store0, &mut member_rows, heap).map_err(|_| "persist phase 1")?;
+            if member_rows.as_ref().map_or(0, Vec::len) != 1 || member_rows.as_ref().and_then(|v| v.first().copied()) != Some(fixtures[3].key) {
+                return Err("member_rows did not pin exclusively fixture 3 (mismatched-only fixture 1 leaked?)");
+            }
+            lent0.commit().map_err(|_| "durable commit phase 1")?;
+            let snap1 = store0.commit_for_body_reads().map_err(|_| "commit1")?;
+
+            // Oracle Check 1: committed fixtures (0, 3) exist in CAS; mismatched-only fixture (1)
+            // MUST NOT exist in CAS; conflicting fixture (2) still fails loudly.
+            if snap1.get(fixtures[1].key).map_err(|_| "snap1 get mismatch")?.is_some() {
+                return Err("mismatched-only file was wrongly persisted to CAS");
+            }
+            let deps_warm = DependencyFiles::with_plant(heap, plant);
+            for idx in [0usize, 3] {
+                let f = fixtures[idx];
+                let got = deps_warm
+                    .get_or_outline(&snap1, f.world_at, f.index, f.text, Some(f.digest), f.surface, ed, f.pin, bump)
+                    .map_err(|_| "warm zero-copy hit failed")?;
+                if got.surface != f.surface || got.view.file() != f.digest || got.view.len() != f.items_len {
+                    return Err("warm zero-copy hit mismatched oracle");
+                }
+            }
+            // Idempotent re-persist of Snapshot-backed entries must never trigger TwoValues.
+            let mut warm_rows: Option<Vec<Key, blaze_own::Alloc<'static>>> = None;
+            deps_warm.persist(&cx, &mut store0, &mut warm_rows, heap).map_err(|_| "warm re-persist")?;
+            drop(snap1);
+            drop(snap0);
+
+            // Phase 2: race fixture 4 (`F_FAULT_PHASE`), persist it, and inject a durable sync
+            // failure + power cut (even seeds) or uncommitted process death (odd seeds).
+            let snap_pre_fault = store0.commit_for_body_reads().map_err(|_| "commit pre-fault")?;
+            let deps_fault = DependencyFiles::with_plant(heap, plant);
+            let f4 = fixtures[4];
+            let m0 = deps_fault.lookup_slab_or_cas(&snap_pre_fault, f4.world_at, f4.index, f4.text, Some(f4.digest), f4.surface, ed, f4.pin).map_err(|_| "f4 lookup 0")?;
+            let m1 = deps_fault.lookup_slab_or_cas(&snap_pre_fault, f4.world_at, f4.index, f4.text, Some(f4.digest), f4.surface, ed, f4.pin).map_err(|_| "f4 lookup 1")?;
+            if m0.is_some() || m1.is_some() {
+                return Err("f4 should be cold before fault phase");
+            }
+            let o0 = deps_fault.outline_cold_entry(f4.world_at, f4.index, f4.text, Some(f4.digest), f4.surface, ed, f4.pin, bump).map_err(|_| "f4 outline 0")?;
+            let o1 = deps_fault.outline_cold_entry(f4.world_at, f4.index, f4.text, Some(f4.digest), f4.surface, ed, f4.pin, bump).map_err(|_| "f4 outline 1")?;
+            let _ = deps_fault.publish_cold_entry(&snap_pre_fault, f4.text, f4.surface, o1, bump).map_err(|_| "f4 publish 1")?;
+            let _ = deps_fault.publish_cold_entry(&snap_pre_fault, f4.text, f4.surface, o0, bump).map_err(|_| "f4 publish 0")?;
+            let mut fault_rows: Option<Vec<Key, blaze_own::Alloc<'static>>> = None;
+            deps_fault.persist(&cx, &mut store0, &mut fault_rows, heap).map_err(|_| "persist f4")?;
+            drop(snap_pre_fault);
+
+            if durable {
+                let fail_dir = blaze_core::FileName::new("h").ok_or("fail_dir")?;
+                io.with_sim(|sim| sim.fail_syncs(fail_dir));
+                if lent0.commit().is_ok() {
+                    return Err("durable commit under fail_syncs unexpectedly succeeded");
+                }
+                drop(store0);
+                drop(lent0);
+                if !io.crash() {
+                    return Err("io.crash failed");
+                }
+                boot += 1;
+            } else {
+                // Drop without committing `f4`, then simulate abrupt process death.
+                drop(store0);
+                drop(lent0);
+                io.with_sim(|sim| sim.processes_died());
+            }
+
+            // Phase 3: fresh-open recovery oracle after crash/sync-fault.
+            nonce += 1;
+            let lent_rec = open_store(boot, nonce)?;
+            let mut store_rec = CommandStore::new(&cx, &lent_rec, false, 0, None, io.need_clock().map_err(|_| "clock rec")?, &err, alloc)
+                .map_err(|_| "store_rec")?;
+            let snap_rec = store_rec.commit_for_body_reads().map_err(|_| "snap_rec")?;
+
+            // Oracle Check 2: committed fixtures (0, 3) MUST survive crash intact and serve
+            // zero-copy `CachedDepData::Snapshot` hits; fixture 1 MUST still be absent; fixture 2
+            // MUST still fail loudly with `FileItemsSurfaceConflict`.
+            if snap_rec.get(fixtures[1].key).map_err(|_| "snap_rec get f1")?.is_some() {
+                return Err("post-crash CAS unexpectedly contains mismatched-only fixture 1");
+            }
+            let deps_rec = DependencyFiles::with_plant(heap, plant);
+            for idx in [0usize, 3] {
+                let f = fixtures[idx];
+                let got = deps_rec
+                    .get_or_outline(&snap_rec, f.world_at, f.index, f.text, Some(f.digest), f.surface, ed, f.pin, bump)
+                    .map_err(|_| "post-crash committed fixture failed to open")?;
+                if got.surface != f.surface || got.view.file() != f.digest || got.view.len() != f.items_len {
+                    return Err("post-crash committed fixture corrupted");
+                }
+            }
+            let snap_hits = deps_rec
+                .small
+                .get()
+                .map_or(0, |slab| {
+                    slab.iter()
+                        .filter_map(|slot| slot.get())
+                        .filter(|entry| matches!(entry.data, CachedDepData::Snapshot))
+                        .count()
+                });
+            if snap_hits != 2 {
+                return Err("post-crash committed fixtures did not reuse zero-copy Snapshot slots");
+            }
+            match deps_rec.get_or_outline(&snap_rec, fixtures[2].world_at, fixtures[2].index, fixtures[2].text, Some(fixtures[2].digest), fixtures[2].surface, ed, fixtures[2].pin, bump) {
+                Err(ItemsRecordError::FileItemsSurfaceConflict { file: 0, expected, found })
+                    if expected == fixtures[2].surface && found == bogus_surface => {}
+                _ => return Err("post-crash conflicting CAS entry did not return FileItemsSurfaceConflict"),
+            }
+
+            // Fixture 4 (from the failed-sync / uncommitted crash phase) must recover cleanly
+            // without corruption and persist cleanly in Phase 3.
+            let got4 = deps_rec
+                .get_or_outline(&snap_rec, f4.world_at, f4.index, f4.text, Some(f4.digest), f4.surface, ed, f4.pin, bump)
+                .map_err(|_| "post-crash f4 recovery failed")?;
+            if got4.surface != f4.surface || got4.view.file() != f4.digest || got4.view.len() != f4.items_len {
+                return Err("post-crash f4 recovery mismatched oracle");
+            }
+            let mut rec_rows: Option<Vec<Key, blaze_own::Alloc<'static>>> = None;
+            deps_rec.persist(&cx, &mut store_rec, &mut rec_rows, heap).map_err(|_| "post-crash persist f4")?;
+            drop(snap_rec);
+            lent_rec.commit().map_err(|_| "durable commit final")?;
+            let snap_final = store_rec.commit_for_body_reads().map_err(|_| "commit final")?;
+            let deps_final = DependencyFiles::with_plant(heap, plant);
+            let final4 = deps_final
+                .get_or_outline(&snap_final, f4.world_at, f4.index, f4.text, Some(f4.digest), f4.surface, ed, f4.pin, bump)
+                .map_err(|_| "final zero-copy f4 hit failed")?;
+            if final4.surface != f4.surface || final4.view.len() != f4.items_len {
+                return Err("final zero-copy f4 mismatched oracle");
+            }
+            Ok(())
+        };
+
+        for seed in 1..=24u64 {
+            run_schedule(seed, DepFilesPlant::None)
+                .unwrap_or_else(|why| panic!("DST invariant violated on seed {seed}: {why}"));
+        }
+
+        // Planted-bug controls (Rules 23, 43): every planted bug MUST be caught by the oracle.
+        assert!(
+            run_schedule(2, DepFilesPlant::PublishMismatchedSurface).is_err(),
+            "control failed: oracle did not catch PublishMismatchedSurface"
+        );
+        assert!(
+            run_schedule(2, DepFilesPlant::SkipSlotSurfaceCheck).is_err(),
+            "control failed: oracle did not catch SkipSlotSurfaceCheck"
+        );
+        assert!(
+            run_schedule(2, DepFilesPlant::SilentCasConflictFallback).is_err(),
+            "control failed: oracle did not catch SilentCasConflictFallback"
+        );
     }
 
     #[test]
