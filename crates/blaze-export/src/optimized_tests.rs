@@ -107,7 +107,7 @@ fn both(named: &[(&str, &[u8])], data: &[Data<'_>], platform: Platform) -> (AVec
     for &(name, bytes) in named {
         v1s.push(Function { symbol: sym(name), record: CodeView::read(bytes).unwrap(), tier: Tier::Fast });
     }
-    let program = ProgramIn { name: "tiny", functions: &v1s, data, entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality: None, tls: None, profile: None, natives: None, exports: &[], symbol_names: &[] };
+    let program = ProgramIn { name: "tiny", functions: &v1s, data, entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality: None, tls: None, profile: None, natives: None, exports: &[], inits: &[], symbol_names: &[] };
     let mut today = Vec::new_in(alloc);
     export(&program, platform, &mut today, alloc).unwrap();
     let mut converted: AVec<'_, AVec<'static, u8>> = Vec::new_in(alloc);
@@ -298,6 +298,7 @@ fn optimized_equals_export_with_rust_tls() {
         profile: None,
         natives: None,
         exports: &[],
+        inits: &[],
         symbol_names: &[],
     };
     let prog_v2 = ProgramIn02 {

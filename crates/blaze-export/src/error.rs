@@ -46,6 +46,11 @@ pub enum ExportError {
     NoTlsRuntime { target: Target },
     /// `TlsRuntime::ender` is not among the program's functions.
     TlsEnderNotPlaced { ender: Symbol },
+    /// An [`crate::InitStatic`] names no `Space::Static` datum in `ProgramIn::data`.
+    InitNotPlaced { symbol: Symbol },
+    /// An [`crate::InitStatic`]'s datum cannot form an initializer table entry (zeroed, empty, or
+    /// not an 8-byte multiple).
+    InitBadDatum { symbol: Symbol, why: &'static str },
     /// An address relocation (`Page21`, `PageOff12`) names a thread-local: a thread-local is
     /// reached through its index word (`GotPage21`/`GotPageOff12`) or relro `Abs64`.
     TlsAddress { from: Symbol, at: u32 },
@@ -157,6 +162,12 @@ impl fmt::Display for ExportError {
             ),
             ExportError::TlsEnderNotPlaced { ender } => {
                 write!(f, "export: the thread-local ender {ender} is not among the program's functions")
+            }
+            ExportError::InitNotPlaced { symbol } => {
+                write!(f, "export: initializer static {symbol} is not among the program's data ({HOLE})")
+            }
+            ExportError::InitBadDatum { symbol, why } => {
+                write!(f, "export: initializer static {symbol} is invalid: {why}")
             }
             ExportError::TlsAddress { from, at } => write!(
                 f,

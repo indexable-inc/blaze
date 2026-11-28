@@ -166,6 +166,7 @@ fn eh_out_exported_program_lands_and_exits_42() {
         profile: None,
         natives: None,
         exports: &[],
+        inits: &[],
         symbol_names: &[],
     };
     let mut file = Vec::new_in(Alloc::global());
@@ -540,6 +541,7 @@ fn rust_tls_exported_program_runs_multithreaded_and_exits_42() {
         profile: None,
         natives: None,
         exports: &[],
+        inits: &[],
         symbol_names: &[],
     };
     let mut file_v1 = Vec::new_in(alloc);

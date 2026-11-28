@@ -139,6 +139,20 @@ pub struct CExport<'r> {
     pub symbol: Symbol,
 }
 
+/// A Rust static placed in an initializer section (`#[link_section = ".init_array"]`,
+/// `".init_array.<priority>"`, or `"__DATA,__mod_init_func"`). Its `Space::Static` datum in
+/// [`ProgramIn::data`] holds one or more 8-byte function pointers (`DataWord`s); the export sorts
+/// all Rust initializers by `(priority.unwrap_or(u32::MAX), symbol)` and places them into ELF
+/// `DT_INIT_ARRAY` / `DT_INIT_ARRAYSZ` or Mach-O `__DATA_CONST,__mod_init_func` so the platform
+/// loader calls them before `main`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct InitStatic {
+    pub symbol: Symbol,
+    /// Ascending numeric priority from `.init_array.<N>` (`0..=65535`); `None` for unsuffixed
+    /// `.init_array` or Mach-O `__mod_init_func` (runs after all prioritized entries).
+    pub priority: Option<u32>,
+}
+
 /// The program's thread-local runtime symbols (`blaze_code::tls`, THREADS.md D2), when the
 /// program has Rust thread-locals ([`Space::Tls`]): `descriptor` is the `Space::Static` symbol
 /// the code records name for the program-wide 40-byte `Desc` (which `blaze-export` synthesizes
@@ -181,6 +195,9 @@ pub struct ProgramIn<'r> {
     /// Every C name the program exports, sorted by name, each once (two exporters of one name
     /// are refused by name). The front end gives it; only `natives`' words read it.
     pub exports: &'r [CExport<'r>],
+    /// Rust statics placed in `.init_array` / `.init_array.<prio>` (ELF) or
+    /// `__DATA,__mod_init_func` (Mach-O), each naming a `Space::Static` datum in `data`.
+    pub inits: &'r [InitStatic],
     /// Optional human-readable names for reached functions (emitted as local Mach-O `N_SECT`
     /// symbols so `nm`, `lldb`, `sample`, `xctrace`, and `otool`/`llvm-objdump` resolve addresses
     /// to Rust function names). Any order; empty leaves the symbol table with imports only.

@@ -50,6 +50,21 @@ pub struct CrateLinks<'a> {
     /// Every export of the crate with the item it names, sorted by name; one export a name
     /// (a second is [`LinksError::TwoExports`], never merged).
     pub exports: AVec<'a, CrateExport<'a>>,
+    /// Every static placed in an initializer section (`#[link_section = ".init_array"]`,
+    /// `".init_array.<prio>"`, or `"__DATA,__mod_init_func"`), sorted by
+    /// `(priority.unwrap_or(u32::MAX), item)`.
+    pub inits: AVec<'a, CrateInit<'a>>,
+}
+
+/// One static of a crate placed in a loader initializer section (`#[link_section = ".init_array"]`,
+/// `".init_array.<priority>"`, or `"__DATA,__mod_init_func"`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CrateInit<'a> {
+    pub section: &'a str,
+    pub item: ItemKey,
+    /// Ascending numeric priority from `.init_array.<N>` (`0..=65535`); `None` for unsuffixed
+    /// `.init_array` or Mach-O `__mod_init_func` (runs after prioritized entries).
+    pub priority: Option<u32>,
 }
 
 /// One export of a crate: its symbol name (`export_name`'s value, else the identifier: the
@@ -149,6 +164,8 @@ pub enum KeyFor<'a> {
     Call { mac: &'a str },
     /// A `#[no_mangle]` or `#[export_name]` fn or static: the export names its item.
     Export,
+    /// A static placed in `.init_array` / `__mod_init_func`: the initializer names its item.
+    Init,
     /// A fn, const or static whose body writes a block (blaze-scope blocks.rs) and holds an
     /// extern block: which blocks are written is keyed by the body's item.
     Body,
@@ -632,7 +649,7 @@ impl<'a, 'c> Gather<'a, 'c> {
             crate_key: None,
             body_of: None,
             whole: "",
-            out: CrateLinks { decls: AVec::new_in(alloc), foreign: AVec::new_in(alloc), exports: AVec::new_in(alloc) },
+            out: CrateLinks { decls: AVec::new_in(alloc), foreign: AVec::new_in(alloc), exports: AVec::new_in(alloc), inits: AVec::new_in(alloc) },
         })
     }
 
@@ -791,6 +808,13 @@ impl<'a, 'c> Gather<'a, 'c> {
         if let Some(pair) = self.out.exports.windows(2).find(|pair| pair[0].name == pair[1].name) {
             return Err(LinksError::TwoExports { krate: self.krate, first: pair[0], second: pair[1] });
         }
+        self.out.inits.sort_unstable_by(|a, b| {
+            a.priority
+                .unwrap_or(u32::MAX)
+                .cmp(&b.priority.unwrap_or(u32::MAX))
+                .then_with(|| a.item.cmp(&b.item))
+        });
+        self.out.inits.dedup_by(|later, kept| later.item == kept.item);
         Ok(self.out)
     }
 
@@ -1238,8 +1262,9 @@ impl<'a, 'c> Gather<'a, 'c> {
 
     /// A fn or static outside an extern block: its export, when it has one (Reference, abi:
     /// "When the no_mangle and export_name attributes are both applied to the same item, the
-    /// symbol name from export_name is used"). Lowered only when its attributes can name one or
-    /// turn it off. Gives whether it is off.
+    /// symbol name from export_name is used"), and for statics any initializer `#[link_section]`
+    /// (`.init_array`, `.init_array.<prio>`, `__DATA,__mod_init_func`). Lowered only when its
+    /// attributes can name one or turn it off. Gives whether it is off.
     fn exported(
         &mut self,
         text: &'a str,
@@ -1250,15 +1275,16 @@ impl<'a, 'c> Gather<'a, 'c> {
         key: Option<ItemKey>,
     ) -> Result<bool, LinksError<'a>> {
         let sig = cut(item_text, item.signature).ok_or(self.attr_err(at, "a signature outside its entry"))?;
-        if !(sig.contains("no_mangle") || sig.contains("export_name") || sig.contains("cfg")) {
+        let is_static = matches!(item.detail, ItemDetail::Static { .. });
+        if !(sig.contains("no_mangle") || sig.contains("export_name") || sig.contains("cfg") || (is_static && sig.contains("link_section"))) {
             return Ok(false);
         }
         let outcome = self.with_lower(item_text, at, |low, alloc| {
             if low.view().cfg_out() {
-                return Ok((true, None));
+                return Ok((true, None, None));
             }
             let rows = self.written(low, item_text, at, alloc)?;
-            let (mut no_mangle, mut export_name) = (false, None);
+            let (mut no_mangle, mut export_name, mut init_section) = (false, None, None);
             for w in rows.iter() {
                 match w.path {
                     // `#[unsafe(no_mangle)]`'s row has the inner path (blaze-lower's UNSAFE_META).
@@ -1272,6 +1298,14 @@ impl<'a, 'c> Gather<'a, 'c> {
                             return Err(self.attr_err(at, "`export_name` given twice"));
                         }
                     }
+                    "link_section" if is_static => {
+                        if matches!(w.meta, AttrMeta::KeyValue | AttrMeta::Unsafe)
+                            && let Some(section) = list_value(w.args, self.edition, self.bump)
+                            && let Some(priority) = parse_init_section(section)
+                        {
+                            init_section = Some((section, priority));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1281,17 +1315,20 @@ impl<'a, 'c> Gather<'a, 'c> {
                 (None, true) => Some(self.identifier(item, item_text, at)?),
                 (None, false) => None,
             };
-            Ok((false, symbol))
+            Ok((false, symbol, init_section))
         })?;
         if outcome.0 {
             return Ok(true);
         }
-        let Some(symbol) = outcome.1 else {
-            return Ok(false);
-        };
-        let Some(key) = key else { return Err(self.unkeyed(text, outline, at, KeyFor::Export)) };
-        let ident = self.identifier(item, item_text, at)?;
-        self.out.exports.try_push(CrateExport { name: symbol, item: key, ident }).map_err(|_| LinksError::Alloc)?;
+        if let Some(symbol) = outcome.1 {
+            let Some(key) = key else { return Err(self.unkeyed(text, outline, at, KeyFor::Export)) };
+            let ident = self.identifier(item, item_text, at)?;
+            self.out.exports.try_push(CrateExport { name: symbol, item: key, ident }).map_err(|_| LinksError::Alloc)?;
+        }
+        if let Some((section, priority)) = outcome.2 {
+            let Some(key) = key else { return Err(self.unkeyed(text, outline, at, KeyFor::Init)) };
+            self.out.inits.try_push(CrateInit { section, item: key, priority }).map_err(|_| LinksError::Alloc)?;
+        }
         Ok(false)
     }
 
@@ -1300,6 +1337,34 @@ impl<'a, 'c> Gather<'a, 'c> {
         let name = item.name.and_then(|r| cut(item_text, r)).ok_or(self.attr_err(at, "a fn or static without a name in its outline"))?;
         Ok(name.strip_prefix("r#").unwrap_or(name))
     }
+}
+
+/// Parses an ELF `.init_array` / `.init_array.<priority>` or Mach-O `__DATA,__mod_init_func`
+/// `#[link_section]` name. Returns `Some(priority)` when `section` is an initializer section
+/// (`Some(Some(n))` for numeric `.init_array.N` with `0..=65535`, `Some(None)` for unsuffixed
+/// `.init_array`, non-numeric `.init_array.*`, or Mach-O `__mod_init_func`), and `None` for any
+/// other section.
+pub(crate) fn parse_init_section(section: &str) -> Option<Option<u32>> {
+    if section == ".init_array" {
+        return Some(None);
+    }
+    if let Some(suffix) = section.strip_prefix(".init_array.") {
+        if !suffix.is_empty() && suffix.len() <= 5 && suffix.bytes().all(|b| b.is_ascii_digit()) {
+            let value = suffix.bytes().fold(0u32, |n, d| n * 10 + u32::from(d - b'0'));
+            if value <= 65535 {
+                return Some(Some(value));
+            }
+        }
+        return Some(None);
+    }
+    if section == "__DATA,__mod_init_func"
+        || section == "__DATA_CONST,__mod_init_func"
+        || section.starts_with("__DATA,__mod_init_func,")
+        || section.starts_with("__DATA_CONST,__mod_init_func,")
+    {
+        return Some(None);
+    }
+    None
 }
 
 #[cfg(test)]

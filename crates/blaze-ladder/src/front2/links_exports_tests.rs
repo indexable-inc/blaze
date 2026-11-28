@@ -8,7 +8,7 @@ use blaze_id::{ContentId, ItemKey};
 use blaze_own::{Bump, Erased};
 use blaze_surface::{Edition, ItemIndex};
 
-use super::{CrateExport, CrateLinks, Entry, Gather, KeyFor, LinksError, TextOf};
+use super::{CrateExport, CrateInit, CrateLinks, Entry, Gather, KeyFor, LinksError, TextOf};
 
 const MAC: &[(&str, Option<&str>)] = &[("target_os", Some("macos")), ("unix", None)];
 
@@ -83,4 +83,53 @@ fn two_exporters_of_one_name_refused() {
     );
 
     println!("links: two exporters of `f` refused (TwoExports), each export keeps its item");
+}
+
+/// Rust `#[link_section = ".init_array..."]` and `"__DATA,__mod_init_func"` statics are collected
+/// into `CrateLinks::inits` under the crate's cfg, sorted by `(priority, item)`, and round-trip
+/// through `native_links::write_table` / `open_table` (TABLE_FORM 2).
+#[test]
+fn link_section_init_array_statics_collected_sorted_and_round_tripped() {
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+    let erased = Erased::new(&frame);
+    let bump = erased.bump();
+    let alloc = bump.alloc();
+
+    let src = "\
+#[used]\n\
+#[link_section = \".init_array\"]\n\
+static PLAIN_INIT: extern \"C\" fn() = f;\n\
+#[used]\n\
+#[unsafe(link_section = \".init_array.00098\")]\n\
+static CAPTURE: extern \"C\" fn() = f;\n\
+#[cfg_attr(target_os = \"linux\", unsafe(link_section = \".init_array.00099\"))]\n\
+static STD_ARGS: extern \"C\" fn() = f;\n\
+#[link_section = \".rodata\"]\n\
+static NOT_AN_INIT: u8 = 0;\n\
+#[cfg(target_os = \"windows\")]\n\
+#[link_section = \".init_array.00001\"]\n\
+static CFG_OUT_INIT: extern \"C\" fn() = f;\n";
+
+    let linux: &[(&str, Option<&str>)] = &[("target_os", Some("linux")), ("unix", None)];
+    let outline = blaze_file_items::outline(src, Edition::E2024, alloc);
+    let mut gather = Gather::new("bstd", Edition::E2024, linux, &[], bump).expect("gather");
+    gather.text(TextOf::File("src/rt/block.rs"), src, &outline, &|at| Entry::Keyed(index_key(at))).expect("text");
+    let links = gather.finish().expect("finish");
+    assert_eq!(
+        links.inits.as_slice(),
+        [
+            CrateInit { section: ".init_array.00098", item: index_key(ItemIndex(1)), priority: Some(98) },
+            CrateInit { section: ".init_array.00099", item: index_key(ItemIndex(2)), priority: Some(99) },
+            CrateInit { section: ".init_array", item: index_key(ItemIndex(0)), priority: None },
+        ]
+    );
+
+    // Round-trip through `native_links::write_table` / `open_table` (TABLE_FORM 2).
+    let mut table_bytes = blaze_own::AVec::new_in(alloc);
+    crate::native_links::write_table(&links, &mut table_bytes).expect("write_table");
+    let opened = match crate::native_links::open_table(table_bytes.as_slice(), alloc).expect("open_table") {
+        crate::native_links::Table::Links(opened) => opened,
+        crate::native_links::Table::Refused(msg) => panic!("unexpected refusal: {msg}"),
+    };
+    assert_eq!(opened.inits.as_slice(), links.inits.as_slice());
 }
