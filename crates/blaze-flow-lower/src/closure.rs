@@ -1367,7 +1367,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                                     if let Some(tail) = path.get(rem_start..) {
                                         sib_path.extend_from_slice(tail);
                                     }
-                                    if let Ok(Some(m)) = self.trace_dyn_path(other, sib_path, heads, want_dyn, e) {
+                                    if let Ok(Some(m)) = self.trace_dyn_path(other, sib_path, None, heads, want_dyn, e) {
                                         match arg_match {
                                             None => arg_match = Some(m),
                                             Some((_, prev_s, prev_b)) if prev_b == m.2 && prev_s == m.1 => {}
@@ -1441,7 +1441,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                                     if let Some(tail) = path.get(rem_start..) {
                                         sib_path.extend_from_slice(tail);
                                     }
-                                    if let Ok(Some(m)) = self.trace_dyn_path(other, sib_path, heads, want_dyn, e) {
+                                    if let Ok(Some(m)) = self.trace_dyn_path(other, sib_path, None, heads, want_dyn, e) {
                                         match arg_match {
                                             None => arg_match = Some(m),
                                             Some((_, prev_s, prev_b)) if prev_b == m.2 && prev_s == m.1 => {}
@@ -1476,7 +1476,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     Expr::Assign { lhs, rhs } if rhs == walk_cur => {
                         let mut lhs_path: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
                         lhs_path.extend_from_slice(&path);
-                        if let Ok(Some(m)) = self.trace_dyn_path(lhs, lhs_path, heads, want_dyn, e) {
+                        if let Ok(Some(m)) = self.trace_dyn_path(lhs, lhs_path, Some(pe), heads, want_dyn, e) {
                             found = Some(m);
                         }
                         stop = true;
@@ -1945,6 +1945,53 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         Ok(Some(None))
     }
 
+    /// Whether an assignment LHS expression `lhs` writes to local `target`, either directly
+    /// (`target = ...`), through a field/index place (`target.0 = ...`), or nested inside a
+    /// destructuring assignment target (`(target, _) = ...`, `[target, _] = ...`,
+    /// `S { a: target } = ...`, `Wrap(target) = ...`).
+    fn assign_lhs_writes_local(&self, lhs: ExprId, target: PatId) -> bool {
+        let mut stack: Vec<ExprId, A> = Vec::new_in(self.alloc);
+        stack.push(lhs);
+        let mut steps = 0usize;
+        let max_steps = self.body.exprs.len().saturating_add(1);
+        while let Some(cur) = stack.pop() {
+            steps += 1;
+            if steps > max_steps {
+                return true;
+            }
+            let Some(&ex) = self.body.exprs.get(cur.ix()) else { continue };
+            match ex {
+                Expr::Local(q) if q == target => return true,
+                Expr::Paren(i)
+                | Expr::Field { base: i, .. }
+                | Expr::TupleField { base: i, .. }
+                | Expr::Index { base: i, .. } => stack.push(i),
+                Expr::Tuple { elems } | Expr::Array { elems } => {
+                    if let Some(es) = self.body.expr_lists.get(elems.range()) {
+                        stack.extend_from_slice(es);
+                    }
+                }
+                Expr::Call { args, .. } => {
+                    if let Some(es) = self.body.expr_lists.get(args.range()) {
+                        stack.extend_from_slice(es);
+                    }
+                }
+                Expr::Struct { fields, rest, .. } => {
+                    if let Some(fs) = self.body.field_inits.get(fields.range()) {
+                        for f in fs {
+                            stack.push(f.expr);
+                        }
+                    }
+                    if let Some(r) = rest {
+                        stack.push(r);
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// Traces a container expression `start` (whose adjusted type is the root of `path`) back to a
     /// declared head (`static`, `const`, struct field, callee output, or owner parameter),
     /// transforming `path` step-by-step along every resolved call, deref, field, constructor,
@@ -1955,6 +2002,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         &self,
         start: ExprId,
         mut path: Vec<DynPathStep, A>,
+        skip_assign: Option<ExprId>,
         heads: &blaze_borrow::Columns<'_>,
         want_dyn: PTy,
         e: ExprId,
@@ -2215,13 +2263,18 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         }
                     }
                     // 2. Unreassigned local bound by `let pat = init`, `match scrutinee { pat => .. }`,
-                    //    or `if let pat = init`.
-                    let reassigned = self.body.exprs.iter().any(|ex| {
-                        matches!(
-                            *ex,
-                            Expr::Assign { lhs, .. } | Expr::AssignOp { lhs, .. }
-                                if matches!(self.body.exprs.get(lhs.ix()), Some(&Expr::Local(q)) if q == p)
-                        )
+                    //    or `if let pat = init`. Check both direct `p = ...` and destructuring
+                    //    assignment targets such as `(p, _) = ...`, `[p, _] = ...`, `S { a: p } = ...`,
+                    //    and `Wrap(p) = ...`.
+                    let reassigned = self.body.exprs.iter().enumerate().any(|(ix, ex)| {
+                        let ex_id = ExprId(to_u32(ix));
+                        if skip_assign == Some(ex_id) {
+                            return false;
+                        }
+                        match *ex {
+                            Expr::Assign { lhs, .. } | Expr::AssignOp { lhs, .. } => self.assign_lhs_writes_local(lhs, p),
+                            _ => false,
+                        }
                     });
                     if reassigned {
                         return Ok(None);

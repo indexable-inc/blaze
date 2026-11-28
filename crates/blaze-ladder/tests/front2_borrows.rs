@@ -601,6 +601,116 @@ fn copy_outlives_static_scalar_ok() {
     let _ = (a, b);
 }
 
+impl<'a, T> OutlivesToken<'a, T> {
+    const fn new(_: T) -> Self {
+        OutlivesToken(PhantomData, PhantomData)
+    }
+}
+
+const PROMOTED_OUTLIVES: &'static OutlivesToken<'static, &'static u8> = &OutlivesToken::new(&1u8);
+const NON_FREEZE_CELL: &'static core::cell::Cell<u8> = &core::cell::Cell::new(1u8);
+
+struct StaticToken<'a, T>(PhantomData<&'a ()>, PhantomData<T>);
+impl<T: Copy> Copy for StaticToken<'static, T> {}
+impl<T: Copy> Clone for StaticToken<'static, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_constrained_static_ok(t: StaticToken<'static, u8>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+fn copy_constrained_static_err<'short>(t: StaticToken<'short, u8>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+struct SamePair<'a, 'b, T>(PhantomData<&'a ()>, PhantomData<&'b ()>, PhantomData<T>);
+impl<'a, T: Copy> Copy for SamePair<'a, 'a, T> {}
+impl<'a, T: Copy> Clone for SamePair<'a, 'a, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_constrained_same_pair_ok<'a>(p: SamePair<'a, 'a, u8>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_constrained_same_pair_err<'a, 'b>(p: SamePair<'a, 'b, u8>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+trait Parent<'x> {}
+trait Child<'x>: Parent<'x> {}
+struct SuperWrap<'a, T>(PhantomData<&'a ()>, PhantomData<T>);
+impl<'a, T: Copy + Parent<'a>> Copy for SuperWrap<'a, T> {}
+impl<'a, T: Copy + Parent<'a>> Clone for SuperWrap<'a, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_supertrait_region_ok<'a, T: Copy + Child<'a>>(w: SuperWrap<'a, T>) {
+    let a = w;
+    let b = w;
+    let _ = (a, b);
+}
+
+fn copy_supertrait_region_mismatch_err<'a, 'b, T: Copy + Child<'b>>(w: SuperWrap<'a, T>) {
+    let a = w;
+    let b = w;
+    let _ = (a, b);
+}
+
+trait Has<'a> {
+    type Out;
+}
+struct ProjToken<'a, T>(PhantomData<&'a ()>, PhantomData<T>);
+impl<'a, T: Has<'a, Out = u8>> Copy for ProjToken<'a, T> {}
+impl<'a, T: Has<'a, Out = u8>> Clone for ProjToken<'a, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_proj_region_ok<'a, T: Has<'a, Out = u8>>(p: ProjToken<'a, T>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_proj_region_mismatch_err<'a, 'b, T: Has<'b, Out = u8>>(p: ProjToken<'a, T>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_proj_region_wrong_out_err<'a, T: Has<'a, Out = u16>>(p: ProjToken<'a, T>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn dyn_expect_destructuring_reassign_err(
+    s: Vec<Reader>,
+    non_static: (Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool>>, u32),
+) {
+    let mut readers = s;
+    let _other;
+    (readers, _other) = non_static;
+    readers.push(Box::new(move |link| link.downcast()));
+}
+
 fn copy_outlives_static_ref_ok(t: OutlivesToken<'static, &'static u8>) {
     let a = t;
     let b = t;
@@ -945,6 +1055,11 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         "copy_trait_region_static_ok",
         "copy_trait_region_param_ok",
         "copy_trait_region_param_static_ok",
+        "copy_constrained_static_ok",
+        "copy_constrained_same_pair_ok",
+        "copy_supertrait_region_ok",
+        "copy_proj_region_ok",
+        "PROMOTED_OUTLIVES",
     ] {
         let body = find(ok_fn);
         let (types, v) = world.check_borrows(body, heap.alloc());
@@ -954,7 +1069,8 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
 
     // Negative controls: non-`'static` `dyn Fn(&(dyn MyErr + '_))` MUST still fail with E0521
     // (including beside an unrelated `&READERS` sibling arg, unrelated owner param, sibling arg
-    // using a different generic parameter, unrelated unary wrapper call, or `Err(v)` match arm).
+    // using a different generic parameter, unrelated unary wrapper call, `Err(v)` match arm,
+    // or a local reassigned inside a destructuring assignment target).
     for err_fn in [
         "dyn_expect_negative_elided",
         "dyn_expect_negative_unrelated_owner_param",
@@ -963,6 +1079,7 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         "dyn_expect_negative_unrelated_sibling",
         "dyn_expect_negative_unrelated_unary_call",
         "dyn_expect_match_err_elided_err",
+        "dyn_expect_destructuring_reassign_err",
     ] {
         let body = find(err_fn);
         let (types, v) = world.check_borrows(body, heap.alloc());
@@ -975,22 +1092,24 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         );
     }
 
-    // Named early-bound `'a` in `Err(v)` arm must also fail borrowck (cannot satisfy `'static`).
-    {
-        let body = find("dyn_expect_match_err_short_err");
+    // Named early-bound `'a` in `Err(v)` arm and non-`Freeze` `Cell<u8>` constant promotion
+    // must still fail borrowck.
+    for err_fn in ["dyn_expect_match_err_short_err", "NON_FREEZE_CELL"] {
+        let body = find(err_fn);
         let (types, v) = world.check_borrows(body, heap.alloc());
-        assert!(types.is_clean(), "dyn_expect_match_err_short_err types: {types:?}");
-        assert!(v.refused.is_none(), "dyn_expect_match_err_short_err refused: {:?}", v.refused);
+        assert!(types.is_clean(), "{err_fn} types: {types:?}");
+        assert!(v.refused.is_none(), "{err_fn} refused: {:?}", v.refused);
         assert!(
             !v.findings.is_empty(),
-            "dyn_expect_match_err_short_err expected outlives error, got: {}",
+            "{err_fn} expected borrow error, got: {}",
             shown(text_of(body), &v)
         );
     }
 
     // Negative controls: `Ptr` with `Aliasing = Exclusive` (including Copy markers and generic
-    // tuples), `OutlivesToken` with unproven `T: 'a` `Copy` bounds (including closure captures),
-    // and `Marked`/`MarkedLt` with weaker or mismatched `Marker<'r>` bounds MUST fail with E0382.
+    // tuples), `OutlivesToken` with unproven `T: 'a` `Copy` bounds (including guards and closure
+    // captures), constrained self-lifetime impls (`'static`, `'a/'a`), supertrait regions,
+    // regioned projection bounds, and `Marked`/`MarkedLt` mismatches MUST fail with E0382.
     for err_fn in [
         "copy_proj_exclusive_err",
         "copy_proj_exclusive_copy_arg_err",
@@ -1002,6 +1121,11 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         "copy_outlives_closure_capture_err",
         "copy_trait_region_short_err",
         "copy_trait_region_param_mismatch_err",
+        "copy_constrained_static_err",
+        "copy_constrained_same_pair_err",
+        "copy_supertrait_region_mismatch_err",
+        "copy_proj_region_mismatch_err",
+        "copy_proj_region_wrong_out_err",
     ] {
         let body = find(err_fn);
         let (types, v) = world.check_borrows(body, heap.alloc());

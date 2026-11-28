@@ -1602,7 +1602,11 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
             let tr = *tr;
             let mut subst: AVec<'a, tc::PTy> = AVec::with_capacity_in(tr_args.len(), self.alloc);
             subst.extend_from_slice(tr_args);
-            let tr_regs_empty = tr_regs_opt.as_ref().is_some_and(|v| v.is_empty());
+            let tr_regs: Option<AVec<'a, Region>> = tr_regs_opt.as_ref().map(|v| {
+                let mut copy: AVec<'a, Region> = AVec::with_capacity_in(v.len(), self.alloc);
+                copy.extend_from_slice(v);
+                copy
+            });
             cursor += 1;
             if !r.store.trait_defs.contains_key(&tr)
                 && let Some(lib) = r.keys.library_in(r.names, tr)
@@ -1615,6 +1619,13 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                 h.u32(u32::try_from(def.supertraits.len()).unwrap_or(u32::MAX));
                 let stys = r.store.tys.view();
                 let reader = r.store.regions.reader(r.store.work_alloc());
+                let tr_own_lts = reader.lifetime_params(tr).ok().map(|p| p.count());
+                if let Some(n) = tr_own_lts {
+                    h.tag(1);
+                    h.u32(n);
+                } else {
+                    h.tag(0);
+                }
                 let tr_cregs = reader.clauses(tr).ok();
                 if let Some(cls) = tr_cregs {
                     h.tag(1);
@@ -1636,15 +1647,26 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                         let nth32 = u32::try_from(s_nth).ok()?;
                         let cv = tr_cregs?.iter().find(|c| c.nth == nth32)?;
                         let sl = cv.col.as_slice();
-                        if sl.is_empty() && tr_regs_empty {
-                            Some(AVec::new_in(alloc))
-                        } else if sl.iter().all(|r| *r == Region::Static) {
-                            let mut v: AVec<'a, Region> = AVec::with_capacity_in(sl.len(), alloc);
-                            v.extend_from_slice(sl);
-                            Some(v)
-                        } else {
-                            None
+                        if sl.is_empty() {
+                            return Some(AVec::new_in(alloc));
                         }
+                        let mut v: AVec<'a, Region> = AVec::with_capacity_in(sl.len(), alloc);
+                        for &reg in sl {
+                            match reg {
+                                Region::Static => v.push(Region::Static),
+                                Region::Param(p) => {
+                                    let own_n = tr_own_lts?;
+                                    if p >= own_n {
+                                        return None;
+                                    }
+                                    let pi = usize::try_from(p).ok()?;
+                                    let &owner_r = tr_regs.as_deref()?.get(pi)?;
+                                    v.push(owner_r);
+                                }
+                                Region::Late { .. } => return None,
+                            }
+                        }
+                        Some(v)
                     };
                     match *sc {
                         tc::PClause::Trait { trait_: sup, args: sargs } => {
@@ -2439,11 +2461,68 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                 continue;
             };
             // When checking a trait goal under `strict_outlives`, verify the candidate impl's
-            // header regions: `self_col` must be unconstrained (distinct `Region::Param`s, never
-            // fixing `'static` or equating two lifetimes like `Same<'a, 'a>`), and `tcol` (laid as
-            // `[trait_own.., self_col.., extra_arg_regs..]`) must match `req_regs` followed by
-            // `self_col` with no unverified extra-argument regions.
+            // header regions. For a top-level `Copy` impl (`norm_depth == 1`, `req_regs == Some(&[])`),
+            // constrained self-type ADT lifetimes (`'static` at slot `j`, or repeated param `'a` at
+            // slots `i` and `j`, e.g. `Copy for Token<'static, T>` / `Copy for Pair<'a, 'a, T>`) are
+            // translated into concrete `CopyOutlives` obligations instead of rejecting the impl.
+            let mut header_obs: AVec<'a, blaze_flow_lower::CopyOutlives> = AVec::new_in(self.alloc);
             if self.strict_outlives {
+                let top_copy_adt_lts = if norm_depth == 1
+                    && req_regs.is_some_and(|rr| rr.is_empty())
+                    && let Some(head) = r.store.impls.get(&imp)
+                    && let Ok(tc::PNode::Adt(adt, _)) = r.store.tys.view().node(head.self_ty)
+                    && let Some(adt_row) = r.store.adts.get(&adt)
+                {
+                    usize::try_from(adt_row.lifetimes).ok()
+                } else {
+                    None
+                };
+                let check_self_col = |sc: &[Region], obs: &mut AVec<'a, blaze_flow_lower::CopyOutlives>| -> bool {
+                    if let Some(adt_lts) = top_copy_adt_lts
+                        && adt_lts <= sc.len()
+                    {
+                        for (j, &reg) in sc.iter().enumerate() {
+                            if j < adt_lts {
+                                let Ok(j32) = u32::try_from(j) else { return false };
+                                match reg {
+                                    Region::Static => {
+                                        let ob = blaze_flow_lower::CopyOutlives::SlotEqOwner {
+                                            slot: j32,
+                                            owner_region: u32::MAX,
+                                        };
+                                        if obs.scan_for(&ob).is_none() {
+                                            obs.push(ob);
+                                        }
+                                    }
+                                    Region::Param(_) => {
+                                        if let Some(prev_i) = sc.get(..j).and_then(|pref| pref.iter().position(|r| *r == reg)) {
+                                            let Ok(i32) = u32::try_from(prev_i) else { return false };
+                                            let ob1 = blaze_flow_lower::CopyOutlives::Region { long: i32, short: j32 };
+                                            let ob2 = blaze_flow_lower::CopyOutlives::Region { long: j32, short: i32 };
+                                            if obs.scan_for(&ob1).is_none() {
+                                                obs.push(ob1);
+                                            }
+                                            if obs.scan_for(&ob2).is_none() {
+                                                obs.push(ob2);
+                                            }
+                                        }
+                                    }
+                                    Region::Late { .. } => return false,
+                                }
+                            } else if !matches!(reg, Region::Param(_))
+                                || sc.get(..j).is_some_and(|prev| prev.contains(&reg))
+                            {
+                                return false;
+                            }
+                        }
+                        true
+                    } else {
+                        sc.iter().enumerate().all(|(i, reg)| {
+                            matches!(*reg, Region::Param(_))
+                                && sc.get(..i).is_some_and(|prev| !prev.contains(reg))
+                        })
+                    }
+                };
                 let regs_ok = match req_regs {
                     Some(rr) => {
                         let reader = r.store.regions.reader(r.store.work_alloc());
@@ -2451,22 +2530,14 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                             Ok((self_col, Some(tcol))) => {
                                 let sc = self_col.as_slice();
                                 let tc = tcol.as_slice();
-                                let self_unconstrained = sc.iter().enumerate().all(|(i, reg)| {
-                                    matches!(*reg, Region::Param(_))
-                                        && sc.get(..i).is_some_and(|prev| !prev.contains(reg))
-                                });
-                                self_unconstrained
+                                check_self_col(sc, &mut header_obs)
                                     && tc.len() == rr.len().saturating_add(sc.len())
                                     && tc.get(..rr.len()) == Some(rr)
                                     && tc.get(rr.len()..) == Some(sc)
                             }
                             Ok((self_col, None)) => {
                                 let sc = self_col.as_slice();
-                                rr.is_empty()
-                                    && sc.iter().enumerate().all(|(i, reg)| {
-                                        matches!(*reg, Region::Param(_))
-                                            && sc.get(..i).is_some_and(|prev| !prev.contains(reg))
-                                    })
+                                rr.is_empty() && check_self_col(sc, &mut header_obs)
                             }
                             Err(_) => false,
                         }
@@ -2485,12 +2556,21 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                         self.active_goals.pop();
                         return ImplMatch::Unknown;
                     }
-                    matched = Some((imp, subst, trait_arg_count));
+                    if header_obs.is_empty() {
+                        matched = Some((imp, subst, trait_arg_count));
+                    } else {
+                        matched_outlives = Some(header_obs);
+                    }
                 }
-                Truth::TrueIfOutlives(obs) => {
+                Truth::TrueIfOutlives(mut obs) => {
                     if matched.is_some() || matched_outlives.is_some() {
                         self.active_goals.pop();
                         return ImplMatch::Unknown;
+                    }
+                    for &ob in header_obs.iter() {
+                        if obs.scan_for(&ob).is_none() {
+                            obs.push(ob);
+                        }
                     }
                     matched_outlives = Some(obs);
                 }
@@ -2543,6 +2623,9 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
             /// parameters mapped through `lt_map` (`None` = `'static`, `Some(slot)` = ADT lifetime slot).
             TraitMapped(tc::ItemKey, AVec<'a, tc::PTy>, AVec<'a, Option<u32>>),
             Proj(tc::ItemKey, tc::Name, AVec<'a, tc::PTy>, tc::PTy),
+            /// Projection clause on a conditional `Copy` impl whose region column mentions
+            /// `'static` or impl lifetime parameters mapped through `lt_map`.
+            ProjMapped(tc::ItemKey, tc::Name, AVec<'a, tc::PTy>, tc::PTy, AVec<'a, Option<u32>>),
             TypeOutlives(tc::PTy, Option<blaze_flow_lower::CopyOutlives>),
             RegionOutlives(blaze_flow_lower::CopyOutlives),
             OutlivesUnproven,
@@ -2602,11 +2685,9 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                             if lt_map.len() <= pi {
                                 lt_map.resize(pi + 1, None);
                             }
-                            if let Some(slot) = lt_map.get_mut(pi) {
-                                if slot.is_some() {
-                                    lt_ok = false;
-                                    break;
-                                }
+                            if let Some(slot) = lt_map.get_mut(pi)
+                                && slot.is_none()
+                            {
                                 *slot = u32::try_from(j).ok();
                             }
                         }
@@ -2778,18 +2859,58 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                                 }
                             }
                         }
+                        let mut proj_mapped: Option<AVec<'a, Option<u32>>> = None;
                         let proj_regs_ok = if self.strict_outlives {
                             u32::try_from(nth)
                                 .ok()
                                 .and_then(|nth32| imp_cregs.and_then(|cls| cls.iter().find(|cv| cv.nth == nth32)))
-                                .is_some_and(|cv| cv.col.as_slice().is_empty())
+                                .is_some_and(|cv| {
+                                    let sl = cv.col.as_slice();
+                                    if sl.is_empty() {
+                                        return true;
+                                    }
+                                    if sl.iter().all(|reg| *reg == Region::Static) {
+                                        let mut mv: AVec<'a, Option<u32>> = AVec::with_capacity_in(sl.len(), self.alloc);
+                                        mv.resize(sl.len(), None);
+                                        proj_mapped = Some(mv);
+                                        return false;
+                                    }
+                                    if can_emit_copy_ob
+                                        && let Some((_, _, lt_map)) = &adt_req
+                                    {
+                                        let mut mv: AVec<'a, Option<u32>> = AVec::with_capacity_in(sl.len(), self.alloc);
+                                        let mut all_mapped = true;
+                                        for &reg in sl {
+                                            match reg {
+                                                Region::Static => mv.push(None),
+                                                Region::Param(p) => {
+                                                    if let Some(slot) = usize::try_from(p).ok().and_then(|pi| lt_map.get(pi).copied().flatten()) {
+                                                        mv.push(Some(slot));
+                                                    } else {
+                                                        all_mapped = false;
+                                                        break;
+                                                    }
+                                                }
+                                                Region::Late { .. } => {
+                                                    all_mapped = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if all_mapped {
+                                            proj_mapped = Some(mv);
+                                        }
+                                    }
+                                    false
+                                })
                         } else {
                             true
                         };
                         let inst_term = self.copy_from_table(stys, term, Some(subst), 0, budget);
-                        match (ok, proj_regs_ok, inst_term) {
-                            (true, true, Some(t)) => clauses.push(InstClause::Proj(trait_, name, inst_args, t)),
-                            (true, false, Some(_)) => clauses.push(InstClause::OutlivesUnproven),
+                        match (ok, proj_regs_ok, proj_mapped, inst_term) {
+                            (true, true, _, Some(t)) => clauses.push(InstClause::Proj(trait_, name, inst_args, t)),
+                            (true, false, Some(mv), Some(t)) => clauses.push(InstClause::ProjMapped(trait_, name, inst_args, t, mv)),
+                            (true, false, None, Some(_)) => clauses.push(InstClause::OutlivesUnproven),
                             _ => clauses.push(InstClause::Unknown),
                         }
                     }
@@ -2890,6 +3011,86 @@ impl<'a, 'f> InstDropEval<'a, 'f> {
                                     ambiguous = true;
                                     break;
                                 }
+                            }
+                        }
+                    }
+                    if !ambiguous && let Some(obs) = matched_obs {
+                        for &ob in obs.iter() {
+                            if extra_outlives.scan_for(&ob).is_none() {
+                                extra_outlives.push(ob);
+                            }
+                        }
+                    } else {
+                        any_outlives_unproven = true;
+                    }
+                }
+                InstClause::ProjMapped(pt, pn, pargs, pterm, mapped) => {
+                    let mut norm_args: AVec<'a, tc::PTy> = AVec::with_capacity_in(pargs.len(), self.alloc);
+                    let mut norm_ok = true;
+                    for &a in pargs.iter() {
+                        match self.normalize_deep(r, langs, a, norm_depth + 1, budget) {
+                            Some(na) => norm_args.push(na),
+                            None => {
+                                norm_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    let Some(norm_term) = self.normalize_deep(r, langs, *pterm, norm_depth + 1, budget) else {
+                        any_unknown = true;
+                        continue;
+                    };
+                    if !norm_ok {
+                        any_unknown = true;
+                        continue;
+                    }
+                    let mut matched_obs: Option<AVec<'a, blaze_flow_lower::CopyOutlives>> = None;
+                    let mut ambiguous = false;
+                    for op_ix in 0..self.owner_projs.len() {
+                        let Some((opt, opn, opargs, opterm, oregs)) = self.owner_projs.get(op_ix) else { break };
+                        let Some(or) = oregs.as_deref() else { continue };
+                        if *opt != *pt || *opn != *pn || opargs.as_slice() != norm_args.as_slice() || or.len() != mapped.len() {
+                            continue;
+                        }
+                        let opterm = *opterm;
+                        let mut obs: AVec<'a, blaze_flow_lower::CopyOutlives> = AVec::new_in(self.alloc);
+                        let mut row_ok = true;
+                        for (&m_slot, &owner_r) in mapped.iter().zip(or.iter()) {
+                            match (m_slot, owner_r) {
+                                (None, Region::Static) => {}
+                                (Some(slot), Region::Static) => {
+                                    let ob = blaze_flow_lower::CopyOutlives::SlotEqOwner { slot, owner_region: u32::MAX };
+                                    if obs.scan_for(&ob).is_none() {
+                                        obs.push(ob);
+                                    }
+                                }
+                                (Some(slot), Region::Param(k)) => {
+                                    let ob = blaze_flow_lower::CopyOutlives::SlotEqOwner { slot, owner_region: k };
+                                    if obs.scan_for(&ob).is_none() {
+                                        obs.push(ob);
+                                    }
+                                }
+                                _ => {
+                                    row_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !row_ok {
+                            continue;
+                        }
+                        let Some(norm_opterm) = self.normalize_deep(r, langs, opterm, norm_depth + 1, budget) else {
+                            continue;
+                        };
+                        if norm_opterm != norm_term {
+                            continue;
+                        }
+                        match &matched_obs {
+                            None => matched_obs = Some(obs),
+                            Some(prev) if prev.as_slice() == obs.as_slice() => {}
+                            Some(_) => {
+                                ambiguous = true;
+                                break;
                             }
                         }
                     }

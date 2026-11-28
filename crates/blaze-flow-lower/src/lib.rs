@@ -3755,16 +3755,20 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         if edges.is_empty() && subsets.is_empty() {
             return false;
         }
+        let Ok(n_origs) = usize::try_from(self.b.origins_len()) else {
+            return false;
+        };
+        if long.index() >= n_origs || short.index() >= n_origs {
+            return false;
+        }
+        let mut visited: Vec<bool, A> = Vec::with_capacity_in(n_origs, self.alloc);
+        visited.resize(n_origs, false);
         let mut stack: Vec<Origin, A> = Vec::new_in(self.alloc);
-        let mut visited: Vec<Origin, A> = Vec::new_in(self.alloc);
+        if let Some(slot) = visited.get_mut(long.index()) {
+            *slot = true;
+        }
         stack.push(long);
-        visited.push(long);
-        let mut steps = 0u32;
         while let Some(cur) = stack.pop() {
-            steps += 1;
-            if steps > 256 {
-                return false;
-            }
             for &(from, into) in edges {
                 if from != cur {
                     continue;
@@ -3772,8 +3776,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 if into == short {
                     return true;
                 }
-                if visited.scan_for(&into).is_none() && visited.len() < 128 {
-                    visited.push(into);
+                if let Some(slot) = visited.get_mut(into.index())
+                    && !*slot
+                {
+                    *slot = true;
                     stack.push(into);
                 }
             }
@@ -3784,8 +3790,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 if into == short {
                     return true;
                 }
-                if visited.scan_for(&into).is_none() && visited.len() < 128 {
-                    visited.push(into);
+                if let Some(slot) = visited.get_mut(into.index())
+                    && !*slot
+                {
+                    *slot = true;
                     stack.push(into);
                 }
             }
@@ -7708,9 +7716,112 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         self.extend_temp(at, STATIC_EXTENDED, e)
     }
 
+    /// Whether `root_ty` is `Copy` when every lifetime slot inside it is `'static` (used during
+    /// constant promotion, where promoted temporaries live for `'static`). Preserves conditional
+    /// `Copy` (`InstCopy::IfOutlives`) while requiring every generic type parameter in an `Arg`
+    /// outlives obligation to outlive `'static` and every `SlotEqOwner` to equal `'static`.
+    fn ty_is_copy_static(&mut self, root_ty: PTy, e: ExprId) -> Result<bool, Refusal> {
+        if self.is_copy_pty(root_ty, e)? {
+            return Ok(true);
+        }
+        let mut stack = TyStack::new(root_ty, self.alloc);
+        let mut steps = 0u32;
+        while let Some(t) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse(Form::Bound, e);
+            }
+            match self.node(t, e)? {
+                PNode::Bool
+                | PNode::Char
+                | PNode::Int(_)
+                | PNode::Uint(_)
+                | PNode::Float(_)
+                | PNode::Never
+                | PNode::Ptr(..)
+                | PNode::FnDef(..)
+                | PNode::FnPtr(..)
+                | PNode::ConstValue { .. }
+                | PNode::ConstParam(_)
+                | PNode::Ref(Mutbl::Not, _) => {}
+                PNode::Ref(Mutbl::Mut, _) => return Ok(false),
+                PNode::Array(elem, _) | PNode::Pat(elem, _) => stack.push(elem),
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => {
+                    stack.extend_from_slice(self.list(l, e)?);
+                }
+                PNode::Adt(k, l) => {
+                    let f = self.adt_facts(k, e)?;
+                    if !f.copy {
+                        return Ok(false);
+                    }
+                    let args = self.list(l, e)?;
+                    let facts: &'b F = self.facts;
+                    match facts.copy_args(k) {
+                        None => match facts.inst_is_copy(t) {
+                            Some(InstCopy::Yes) => {}
+                            Some(InstCopy::No) => return Ok(false),
+                            Some(InstCopy::IfOutlives(obs)) => {
+                                let st = self.universal(Region::Static);
+                                for &ob in obs {
+                                    match ob {
+                                        CopyOutlives::Region { .. } => {}
+                                        CopyOutlives::Arg { arg, .. } => {
+                                            let Ok(arg_ix) = usize::try_from(arg) else {
+                                                return Ok(false);
+                                            };
+                                            let Some(&arg_ty) = args.get(arg_ix) else {
+                                                return Ok(false);
+                                            };
+                                            let mut params: Vec<u32, A> = Vec::new_in(self.alloc);
+                                            if self.outlives_components(arg_ty, e, &mut params, true)? {
+                                                return Ok(false);
+                                            }
+                                            for &u in params.iter() {
+                                                let pu = self.param_origin(u);
+                                                if !self.origin_outlives_known(pu, st) {
+                                                    return Ok(false);
+                                                }
+                                            }
+                                        }
+                                        CopyOutlives::SlotEqOwner { owner_region, .. } => {
+                                            if owner_region != u32::MAX {
+                                                return Ok(false);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            None => stack.extend_from_slice(args),
+                        },
+                        Some(need) if need.len() == args.len() => {
+                            for (&a, &req) in args.iter().zip(need.iter()) {
+                                if req {
+                                    stack.push(a);
+                                }
+                            }
+                        }
+                        Some(_) => return self.refuse(Form::CopyArgsUnaligned { adt: k }, e),
+                    }
+                }
+                PNode::Param(i) => {
+                    if !self.facts.param_copy(i) {
+                        return Ok(false);
+                    }
+                }
+                PNode::Alias { .. } | PNode::Opaque(..) => {
+                    if !self.facts.alias_copy(t) {
+                        return Ok(false);
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
     /// Whether a value of `ty` has no drop glue and is guaranteed `Freeze` (no interior
     /// mutability). Conservative `false` for non-`Copy` ADTs and unresolved/opaque types.
-    fn const_init_freeze_no_drop(&self, ty: TyD, e: ExprId) -> Result<bool, Refusal> {
+    fn const_init_freeze_no_drop(&mut self, ty: TyD, e: ExprId) -> Result<bool, Refusal> {
         if self.needs_drop(ty, e)? {
             return Ok(false);
         }
@@ -7741,9 +7852,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 PNode::Tuple(l) | PNode::Record(_, l) => stack.extend_from_slice(self.list(l, e)?),
                 PNode::Array(elem, _) | PNode::Slice(elem) | PNode::Pat(elem, _) => stack.push(elem),
                 // In Rust, `Copy` structurally requires every field to be `Copy` (E0204), and
-                // `UnsafeCell<T>` is `!Copy`, so any `Copy` ADT is guaranteed `Freeze` + no-drop.
+                // `UnsafeCell<T>` is `!Copy`, so any `Copy` ADT at `'static` is guaranteed
+                // `Freeze` + no-drop.
                 PNode::Adt(..) => {
-                    if !self.is_copy_pty(t, e)? {
+                    if !self.ty_is_copy_static(t, e)? {
                         return Ok(false);
                     }
                 }

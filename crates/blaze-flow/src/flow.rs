@@ -705,6 +705,11 @@ impl<A: Allocator + Copy> FlowBuilder<A> {
         self.flow.placeholder.get(o.index()).copied().unwrap_or(false)
     }
 
+    /// Number of origins created in this flow so far.
+    pub fn origins_len(&self) -> u32 {
+        self.flow.origins
+    }
+
     pub fn block(&mut self) -> Block {
         self.flow.blocks.push(Ops { start: 0, end: 0 });
         self.filled.push(false);
