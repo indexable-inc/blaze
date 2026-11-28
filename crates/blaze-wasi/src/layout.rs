@@ -12,7 +12,7 @@
 
 use core::{fmt, marker::PhantomData, ops::Range};
 
-use crate::{Dirent, Errno, Filestat, Filetype, ROOT, ROOT_FD, Stop, System};
+use crate::{Dirent, Errno, Fdstat, Filestat, Filetype, ROOT, ROOT_FD, Stop, System};
 
 /// The width of a guest's pointers and sizes, as its memory lays them out: what the core needs
 /// of a [`crate::Width`] (which adds the argument type Wasmtime passes and the import module).
@@ -207,14 +207,13 @@ impl<W: Pointers> Mem<'_, W> {
         Ok(SUCCESS)
     }
 
-    /// WASI's `fdstat` of a descriptor of `filetype` at `out`: no flags; every right, base and
-    /// inheriting.
-    pub(crate) fn put_fdstat(&mut self, out: u64, filetype: Filetype) -> Result<(), Halt> {
-        let mut stat = [0; 24];
-        stat[0] = filetype as u8;
-        stat[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
-        stat[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
-        self.put(out, &stat)
+    /// WASI's `fdstat` of `stat` at `out`: no flags; the descriptor's base and inheriting rights.
+    pub(crate) fn put_fdstat(&mut self, out: u64, stat: &Fdstat) -> Result<(), Halt> {
+        let mut bytes = [0; 24];
+        bytes[0] = stat.filetype as u8;
+        bytes[8..16].copy_from_slice(&stat.rights_base.to_le_bytes());
+        bytes[16..24].copy_from_slice(&stat.rights_inheriting.to_le_bytes());
+        self.put(out, &bytes)
     }
 
     /// WASI's `filestat` of `stat` at `out`.

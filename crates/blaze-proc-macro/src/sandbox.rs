@@ -14,11 +14,11 @@
 //!   tree (by `..` or a link) stops the run with [`ProcLimit::Paths`], naming the path.
 //! - Standard output and error are dropped.
 
-use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::{Component, Path, PathBuf}};
+use std::{ffi::{OsStr, OsString}, fs, os::unix::ffi::OsStrExt, path::{Component, Path, PathBuf}};
 
 use blaze_expand::ProcLimit;
 use blaze_ids::ContentId;
-use blaze_wasi::{Answer, Dirent, Errno, Filestat, Filetype, Open, ROOT_FD, Stop, System};
+use blaze_wasi::{Answer, Dirent, Errno, Fdstat, Filestat, Filetype, Open, ROOT_FD, Stop, System};
 
 use crate::package_env::{EnvAnswer, EnvRefused, PackageEnv};
 
@@ -119,7 +119,15 @@ impl std::fmt::Debug for Files {
 enum Found {
     Folder,
     File(u64),
-    Link,
+    Link(u64),
+    Loop,
+}
+
+/// Outcome of resolving a disk path inside the served tree.
+enum Real {
+    Found(PathBuf, PathBuf),
+    Missing,
+    Loop,
 }
 
 impl Files {
@@ -142,7 +150,7 @@ impl Files {
     /// a member's `Files::Member { workspace, .. }` is (blaze-cli proc_callers.rs `shown`). The OS names it `.`: `canonicalize("")` is
     /// `ENOENT`, which refused every file of every member of a checkout so started, `chdir` into
     /// `/workspace/<dir>` first (the shim's, at each call; MX 2026-11-17).
-    fn real(&self, root: &Path, rel: &Path) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    fn real(&self, root: &Path, rel: &Path) -> Result<Real, String> {
         let root = if root.as_os_str().is_empty() { Path::new(".") } else { root };
         let seen = self.seen();
         let shown = || {
@@ -152,14 +160,18 @@ impl Files {
                 format!("{}/{}", seen.mount(), rel.to_string_lossy())
             }
         };
-        let Ok(real) = std::fs::canonicalize(root.join(rel)) else { return Ok(None) };
+        let real = match std::fs::canonicalize(root.join(rel)) {
+            Ok(real) => real,
+            Err(err) if err.raw_os_error() == Some(libc::ELOOP) => return Ok(Real::Loop),
+            Err(_) => return Ok(Real::Missing),
+        };
         let Ok(top) = std::fs::canonicalize(root) else {
             return Err(format!("opened {}, but the folder {} is served from cannot be resolved", shown(), seen.mount()));
         };
         if !real.starts_with(&top) {
             return Err(format!("opened {}, a link out of {}, the tree the macro is served", shown(), seen.mount()));
         }
-        Ok(Some((real, top)))
+        Ok(Real::Found(real, top))
     }
 
     /// The listed files under the folder `rel` (`""`: the package's).
@@ -206,18 +218,38 @@ impl Files {
         match self {
             Files::Folder(root) | Files::Member { workspace: root, .. } => {
                 if follow {
-                    return Ok(self.real(root, rel)?.and_then(|(real, _)| stat_of(&real, true)));
+                    return Ok(match self.real(root, rel)? {
+                        Real::Found(real, _) => stat_of(&real, true),
+                        Real::Loop => Some(Found::Loop),
+                        Real::Missing => None,
+                    });
                 }
                 if rel.as_os_str().is_empty() {
-                    return Ok(self.real(root, rel)?.map(|_| Found::Folder));
+                    return Ok(match self.real(root, rel)? {
+                        Real::Found(..) => Some(Found::Folder),
+                        Real::Loop => Some(Found::Loop),
+                        Real::Missing => None,
+                    });
                 }
                 if rel.is_absolute() {
-                    return Ok(self.real(root, rel)?.and_then(|(real, _)| stat_of(&real, true)));
+                    return Ok(match self.real(root, rel)? {
+                        Real::Found(real, _) => stat_of(&real, true),
+                        Real::Loop => Some(Found::Loop),
+                        Real::Missing => None,
+                    });
                 }
                 let (Some(parent), Some(name)) = (rel.parent(), rel.file_name()) else {
-                    return Ok(self.real(root, rel)?.and_then(|(real, _)| stat_of(&real, true)));
+                    return Ok(match self.real(root, rel)? {
+                        Real::Found(real, _) => stat_of(&real, true),
+                        Real::Loop => Some(Found::Loop),
+                        Real::Missing => None,
+                    });
                 };
-                Ok(self.real(root, parent)?.and_then(|(parent_real, _)| stat_of(&parent_real.join(name), false)))
+                Ok(match self.real(root, parent)? {
+                    Real::Found(parent_real, _) => stat_of(&parent_real.join(name), false),
+                    Real::Loop => Some(Found::Loop),
+                    Real::Missing => None,
+                })
             }
             Files::Listed(files) => {
                 let Some(rel) = rel.to_str() else { return Ok(None) };
@@ -236,7 +268,10 @@ impl Files {
     /// The bytes of the file `rel`; `None` when absent.
     fn bytes(&self, rel: &Path) -> Result<Option<Vec<u8>>, String> {
         match self {
-            Files::Folder(root) | Files::Member { workspace: root, .. } => Ok(self.real(root, rel)?.and_then(|(real, _)| std::fs::read(real).ok())),
+            Files::Folder(root) | Files::Member { workspace: root, .. } => Ok(match self.real(root, rel)? {
+                Real::Found(real, _) => std::fs::read(real).ok(),
+                Real::Missing | Real::Loop => None,
+            }),
             Files::Listed(files) => {
                 let Some(rel) = rel.to_str() else { return Ok(None) };
                 if let Some((path, commit)) = self.submodule_covering(rel) {
@@ -252,8 +287,8 @@ impl Files {
     fn listing(&self, rel: &Path) -> Result<(PathBuf, Vec<(Vec<u8>, Filetype)>), String> {
         match self {
             Files::Folder(root) | Files::Member { workspace: root, .. } => Ok(match self.real(root, rel)? {
-                Some((real, top)) => (real.strip_prefix(&top).map(Path::to_path_buf).unwrap_or_default(), listing(&real)),
-                None => Default::default(),
+                Real::Found(real, top) => (real.strip_prefix(&top).map(Path::to_path_buf).unwrap_or_default(), listing(&real)),
+                Real::Missing | Real::Loop => Default::default(),
             }),
             Files::Listed(files) => {
                 let Some(rel) = rel.to_str() else { return Ok(Default::default()) };
@@ -376,7 +411,7 @@ fn stat_of(path: &Path, follow: bool) -> Option<Found> {
     let meta = if follow { std::fs::metadata(path) } else { std::fs::symlink_metadata(path) }.ok()?;
     let ft = meta.file_type();
     Some(if ft.is_symlink() {
-        Found::Link
+        Found::Link(meta.len())
     } else if ft.is_dir() {
         Found::Folder
     } else {
@@ -453,8 +488,26 @@ pub fn answer_now(package: &Package, subject: &str) -> Result<Option<ContentId>,
         "stat" | "lstat" => match files.find(path, kind == "stat").map_err(UnknownSubject)? {
             Some(Found::Folder) => Some(stat_digest(Filetype::Directory, 0)),
             Some(Found::File(size)) => Some(stat_digest(Filetype::RegularFile, size)),
-            Some(Found::Link) => Some(stat_digest(Filetype::SymbolicLink, 0)),
+            Some(Found::Link(size)) => Some(stat_digest(Filetype::SymbolicLink, size)),
+            Some(Found::Loop) => Some(stat_digest(Filetype::Unknown, 0)),
             None => None,
+        },
+        "link" => match files {
+            Files::Folder(root) | Files::Member { workspace: root, .. } => {
+                if path.as_os_str().is_empty() || path.is_absolute() {
+                    None
+                } else if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+                    match files.real(root, parent).map_err(UnknownSubject)? {
+                        Real::Found(parent_real, _) => {
+                            fs::read_link(parent_real.join(name)).ok().map(|target| digest(target.as_os_str().as_encoded_bytes()))
+                        }
+                        Real::Missing | Real::Loop => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            Files::Listed(_) => None,
         },
         _ => return Err(unknown()),
     })
@@ -529,34 +582,36 @@ impl Sandbox {
 
     /// `path`, named from the directory descriptor `at` (`ROOT_FD` for `/`, or an open folder's
     /// descriptor), as a path from the served tree's root together with `at`'s inheriting rights:
-    /// `..` and `.` taken out; verifies `at` holds `required_right` (and, when `child_rights` is
-    /// given, that requested base/inheriting rights do not exceed `at`'s inheriting rights); a path
-    /// that leaves the tree, climbs above `/`, or passes an absolute path to a non-root descriptor
-    /// is refused, naming it.
+    /// walks components in POSIX/WASI order so intermediate symlinks expand before `..` is
+    /// applied; verifies `at` holds `required_right` (and, when `child_rights` is given, that
+    /// requested base/inheriting rights do not exceed `at`'s inheriting rights); a path that
+    /// leaves the tree, climbs above `/`, or passes an absolute path to a non-root descriptor is
+    /// refused, naming it.
     fn resolve_at(&mut self, at: u32, path: &[u8], required_right: u64, child_rights: Option<(u64, u64)>) -> Answer<(PathBuf, u64)> {
+        const MAX_SYMLINK_HOPS: u8 = 40;
         let mount = self.package.files.seen().mount();
         let mount_name = OsStr::new(mount.trim_start_matches('/'));
-        let mut parts: Vec<&OsStr> = Vec::new();
-        let parent_inheriting = if at == ROOT_FD {
+        let top = match &self.package.files {
+            Files::Folder(root) | Files::Member { workspace: root, .. } => {
+                let root = if root.as_os_str().is_empty() { Path::new(".") } else { root.as_path() };
+                fs::canonicalize(root).ok()
+            }
+            Files::Listed(_) => None,
+        };
+        let mut parts: Vec<OsString> = Vec::new();
+        let mut pending = [OsString::new(); 0].to_vec();
+        let has_trailing_slash = path.ends_with(b"/");
+        let (parent_inheriting, from_dir_fd, raw_shown) = if at == ROOT_FD {
             let Ok(text) = std::str::from_utf8(path) else {
                 return Err(self.refuse(format!("named the path {:?}, which is not UTF-8", String::from_utf8_lossy(path))));
             };
-            for part in text.split('/') {
-                match part {
-                    "" | "." => {}
-                    ".." => {
-                        if parts.pop().is_none() {
-                            return Err(self.refuse(format!("named {text:?}, which leaves the root")));
-                        }
-                    }
-                    part => parts.push(OsStr::new(part)),
+            for part in text.split('/').rev() {
+                if !part.is_empty() {
+                    pending.push(OsString::from(part));
                 }
             }
-            if parts.first().copied() != Some(mount_name) {
-                let slash = if text.starts_with('/') { "" } else { "/" };
-                return Err(self.refuse(format!("named {slash}{text}, outside {mount}, the tree the macro is served, the only one it may read")));
-            }
-            u64::MAX
+            let slash = if text.starts_with('/') { "" } else { "/" };
+            (u64::MAX, false, format!("{slash}{text}"))
         } else {
             let slot = at.checked_sub(ROOT_FD + 1).and_then(|i| usize::try_from(i).ok());
             let (folder, rights_base, rights_inheriting) = match slot.and_then(|i| self.files.get(i)).and_then(Option::as_ref) {
@@ -579,34 +634,101 @@ impl Sandbox {
             if path.is_empty() {
                 return Ok(Err(Errno::NOENT));
             }
-            parts.push(mount_name);
+            parts.push(mount_name.to_os_string());
             for comp in folder.components() {
                 if let Component::Normal(seg) = comp {
-                    parts.push(seg);
+                    parts.push(seg.to_os_string());
                 }
             }
-            for part in path.split(|&b| b == b'/') {
-                match part {
-                    b"" | b"." => {}
-                    b".." => {
-                        if parts.pop().is_none() {
-                            let shown_dir = folder.to_string_lossy();
-                            let shown_path = OsStr::from_bytes(path).to_string_lossy();
-                            let full = if shown_dir.is_empty() { format!("{mount}/{shown_path}") } else { format!("{mount}/{shown_dir}/{shown_path}") };
-                            return Err(self.refuse(format!("named {full:?}, which leaves the root")));
-                        }
-                    }
-                    part => parts.push(OsStr::from_bytes(part)),
+            for part in path.split(|&b| b == b'/').rev() {
+                if !part.is_empty() {
+                    pending.push(OsStr::from_bytes(part).to_os_string());
                 }
             }
-            if parts.first().copied() != Some(mount_name) {
-                let shown_dir = folder.to_string_lossy();
-                let shown_path = OsStr::from_bytes(path).to_string_lossy();
-                let full = if shown_dir.is_empty() { format!("{mount}/{shown_path}") } else { format!("{mount}/{shown_dir}/{shown_path}") };
-                return Err(self.refuse(format!("named {full}, outside {mount}, the tree the macro is served, the only one it may read")));
-            }
-            rights_inheriting
+            let shown_dir = folder.to_string_lossy();
+            let shown_path = OsStr::from_bytes(path).to_string_lossy();
+            let shown = if shown_dir.is_empty() { format!("{mount}/{shown_path}") } else { format!("{mount}/{shown_dir}/{shown_path}") };
+            (rights_inheriting, true, shown)
         };
+
+        let mut hops: u8 = 0;
+        let mut last_link: Option<PathBuf> = None;
+        while let Some(seg) = pending.pop() {
+            if seg.is_empty() || seg.as_os_str() == OsStr::new(".") {
+                continue;
+            }
+            if seg.as_os_str() == OsStr::new("..") {
+                if parts.len() == 1 && parts.first().map(OsString::as_os_str) == Some(mount_name) && (from_dir_fd || last_link.is_some()) {
+                    let why = match &last_link {
+                        Some(link) => format!("opened {mount}/{}, a link out of {mount}, the tree the macro is served", link.to_string_lossy()),
+                        None => format!("named {raw_shown}, outside {mount}, the tree the macro is served, the only one it may read"),
+                    };
+                    return Err(self.refuse(why));
+                }
+                if parts.pop().is_none() {
+                    return Err(self.refuse(format!("named {raw_shown:?}, which leaves the root")));
+                }
+                continue;
+            }
+            parts.push(seg);
+            let is_intermediate = !pending.is_empty() || has_trailing_slash;
+            if is_intermediate && parts.len() > 1 && parts.first().map(OsString::as_os_str) == Some(mount_name)
+                && let Some(top_dir) = &top
+            {
+                let mut cur_rel = PathBuf::new();
+                for s in parts.iter().skip(1) {
+                    cur_rel.push(s);
+                }
+                let cur_disk = top_dir.join(&cur_rel);
+                if let Ok(meta) = fs::symlink_metadata(&cur_disk) {
+                    if meta.file_type().is_symlink() {
+                        hops += 1;
+                        if hops > MAX_SYMLINK_HOPS {
+                            return Ok(Err(Errno::LOOP));
+                        }
+                        let Ok(target) = fs::read_link(&cur_disk) else {
+                            return Ok(Err(Errno::IO));
+                        };
+                        self.record(Self::subject("link", &cur_rel), Some(digest(target.as_os_str().as_encoded_bytes())));
+                        let link_shown = cur_rel.to_string_lossy().into_owned();
+                        last_link = Some(cur_rel);
+                        parts.pop();
+                        if target.is_absolute() {
+                            let in_top = target
+                                .strip_prefix(top_dir)
+                                .ok()
+                                .map(Path::to_path_buf)
+                                .or_else(|| fs::canonicalize(&target).ok().and_then(|c| c.strip_prefix(top_dir).ok().map(Path::to_path_buf)));
+                            let Some(in_top) = in_top else {
+                                return Err(self.refuse(format!("opened {mount}/{link_shown}, a link out of {mount}, the tree the macro is served")));
+                            };
+                            parts.truncate(1);
+                            for part in in_top.as_os_str().as_encoded_bytes().split(|&b| b == b'/').rev() {
+                                if !part.is_empty() {
+                                    pending.push(OsStr::from_bytes(part).to_os_string());
+                                }
+                            }
+                        } else {
+                            for part in target.as_os_str().as_encoded_bytes().split(|&b| b == b'/').rev() {
+                                if !part.is_empty() {
+                                    pending.push(OsStr::from_bytes(part).to_os_string());
+                                }
+                            }
+                        }
+                    } else if !meta.file_type().is_dir() {
+                        self.record(Self::subject("stat", &cur_rel), Some(stat_digest(Filetype::RegularFile, meta.len())));
+                        return Ok(Err(Errno::NOTDIR));
+                    }
+                }
+            }
+        }
+        if parts.first().map(OsString::as_os_str) != Some(mount_name) {
+            let why = match &last_link {
+                Some(link) => format!("opened {mount}/{}, a link out of {mount}, the tree the macro is served", link.to_string_lossy()),
+                None => format!("named {raw_shown}, outside {mount}, the tree the macro is served, the only one it may read"),
+            };
+            return Err(self.refuse(why));
+        }
         let mut rel = PathBuf::new();
         for seg in parts.iter().skip(1) {
             rel.push(seg);
@@ -679,6 +801,21 @@ impl System for Sandbox {
             _ => match self.opened(fd) {
                 Some(file) if file.dir.is_some() => Ok(Filetype::Directory),
                 Some(_) => Ok(Filetype::RegularFile),
+                None => Err(Errno::BADF),
+            },
+        })
+    }
+
+    fn fd_fdstat(&mut self, fd: u32) -> Answer<Fdstat> {
+        Ok(match fd {
+            0..=2 => Ok(Fdstat { filetype: Filetype::CharacterDevice, rights_base: u64::MAX, rights_inheriting: u64::MAX }),
+            ROOT_FD => Ok(Fdstat { filetype: Filetype::Directory, rights_base: u64::MAX, rights_inheriting: u64::MAX }),
+            _ => match self.opened(fd) {
+                Some(file) => Ok(Fdstat {
+                    filetype: if file.dir.is_some() { Filetype::Directory } else { Filetype::RegularFile },
+                    rights_base: file.rights_base,
+                    rights_inheriting: file.rights_inheriting,
+                }),
                 None => Err(Errno::BADF),
             },
         })
@@ -757,8 +894,12 @@ impl System for Sandbox {
                 self.record(Self::subject("file", &rel), Some(digest(&bytes)));
                 Opened { bytes, pos: 0, rights_base, rights_inheriting, dir: None }
             }
-            Found::Link => {
-                self.record(Self::subject("lstat", &rel), Some(stat_digest(Filetype::SymbolicLink, 0)));
+            Found::Link(size) => {
+                self.record(Self::subject("lstat", &rel), Some(stat_digest(Filetype::SymbolicLink, size)));
+                return Ok(Err(Errno::LOOP));
+            }
+            Found::Loop => {
+                self.record(Self::subject("stat", &rel), Some(stat_digest(Filetype::Unknown, 0)));
                 return Ok(Err(Errno::LOOP));
             }
         };
@@ -785,7 +926,11 @@ impl System for Sandbox {
         let found = match self.found(&rel, follow)? {
             Some(Found::Folder) => Some((Filetype::Directory, 0)),
             Some(Found::File(size)) => Some((Filetype::RegularFile, size)),
-            Some(Found::Link) => Some((Filetype::SymbolicLink, 0)),
+            Some(Found::Link(size)) => Some((Filetype::SymbolicLink, size)),
+            Some(Found::Loop) => {
+                self.record(Self::subject("stat", &rel), Some(stat_digest(Filetype::Unknown, 0)));
+                return Ok(Err(Errno::LOOP));
+            }
             None => None,
         };
         let kind = if follow { "stat" } else { "lstat" };
@@ -1267,7 +1412,7 @@ mod dir_fd_tests {
             let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
             let lstat = sandbox.path_stat(dir_fd, b"escape", false).expect("lstat does not dereference target").expect("symlink exists");
             assert_eq!(lstat.filetype, Filetype::SymbolicLink);
-            assert_eq!(lstat.size, 0, "symlink size must not leak target path length");
+            assert_eq!(lstat.size, b"../../../../outside/secret.txt".len() as u64, "WASI lstat size is target pathname byte length");
 
             let (_pkg, mut sandbox) = member_sandbox(&tree);
             let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
@@ -1592,5 +1737,131 @@ mod dir_fd_tests {
         let a_fd = sandbox.open(full_fd, b"a.rs", READ_ONLY).expect("not stopped").expect("a.rs opens");
         assert_eq!(read_all(&mut sandbox, a_fd), b"pub fn a() {}\n");
         assert!(sandbox.refused.is_none());
+    }
+
+    /// Codex Round 3 P2 #1 (`fd_fdstat_get` retained rights): `fd_fdstat` returns the exact
+    /// retained `rights_base` and `rights_inheriting` on a restricted directory fd, so a guest
+    /// following `wasi_rt::open_under` (`max & dir.rights_inheriting`) succeeds on permitted
+    /// children while requesting rights beyond `rights_inheriting` fails with `Errno::NOTCAPABLE`.
+    #[test]
+    fn fd_fdstat_returns_retained_rights_and_matches_libc_open_under_flow() {
+        let tree = make_workspace("fdstat_rights");
+        let (_pkg, mut sandbox) = member_sandbox(&tree);
+
+        let root_stat = sandbox.fd_fdstat(ROOT_FD).expect("not stopped").expect("ROOT_FD fdstat");
+        assert_eq!(root_stat.filetype, Filetype::Directory);
+        assert_eq!((root_stat.rights_base, root_stat.rights_inheriting), (u64::MAX, u64::MAX));
+
+        let restricted_base = RIGHT_PATH_OPEN | RIGHT_PATH_FILESTAT_GET | RIGHT_FD_READDIR;
+        let restricted_inheriting = RIGHT_FD_READ | RIGHT_PATH_FILESTAT_GET;
+        let dir_fd = sandbox
+            .open(
+                ROOT_FD,
+                b"/workspace/crates/m/parts",
+                Open { dirflags: 1, oflags: 0, rights_base: restricted_base, rights_inheriting: restricted_inheriting, fdflags: 0 },
+            )
+            .expect("not stopped")
+            .expect("restricted dir opens");
+
+        let dir_stat = sandbox.fd_fdstat(dir_fd).expect("not stopped").expect("dir_fd fdstat");
+        assert_eq!(dir_stat.filetype, Filetype::Directory);
+        assert_eq!(dir_stat.rights_base, restricted_base);
+        assert_eq!(dir_stat.rights_inheriting, restricted_inheriting);
+
+        // Simulate `wasi_rt::open_under` using the advertised `dir_stat.rights_inheriting`: succeeds!
+        let advertised = Open {
+            dirflags: 1,
+            oflags: 0,
+            rights_base: RIGHT_FD_READ & dir_stat.rights_inheriting,
+            rights_inheriting: dir_stat.rights_inheriting,
+            fdflags: 0,
+        };
+        let a_fd = sandbox.open(dir_fd, b"a.rs", advertised).expect("not stopped").expect("advertised child open succeeds");
+        assert_eq!(read_all(&mut sandbox, a_fd), b"pub fn a() {}\n");
+
+        let file_stat = sandbox.fd_fdstat(a_fd).expect("not stopped").expect("file fdstat");
+        assert_eq!(file_stat.filetype, Filetype::RegularFile);
+        assert_eq!(file_stat.rights_base, RIGHT_FD_READ);
+        assert_eq!(file_stat.rights_inheriting, restricted_inheriting);
+
+        // Exceeding `dir_stat.rights_inheriting` (asking for `RIGHT_PATH_OPEN`) fails with NOTCAPABLE.
+        let excessive = Open { dirflags: 1, oflags: 0, rights_base: RIGHT_PATH_OPEN, rights_inheriting: 0, fdflags: 0 };
+        assert_eq!(sandbox.open(dir_fd, b"sub", excessive).expect("not stopped"), Err(Errno::NOTCAPABLE));
+    }
+
+    /// Codex Round 3 P2 #2 (symlink length in no-follow stats): `path_stat(..., follow=false)`
+    /// preserves the symlink's `meta.len()` (target pathname byte length) and records it in
+    /// `lstat:` so retargeting the symlink to a different-length target invalidates `answer_now`.
+    #[cfg(unix)]
+    #[test]
+    fn no_follow_stat_preserves_symlink_target_length_and_invalidates_on_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let tree = make_workspace("lstat_len");
+        let parts = tree.ws.join("crates/m/parts");
+        symlink("sub", parts.join("var_link")).expect("short symlink");
+
+        let (pkg, mut sandbox) = member_sandbox(&tree);
+        let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
+
+        let st1 = sandbox.path_stat(dir_fd, b"var_link", false).expect("not stopped").expect("lstat short");
+        assert_eq!(st1.filetype, Filetype::SymbolicLink);
+        assert_eq!(st1.size, b"sub".len() as u64);
+
+        let read = sandbox.reads.iter().find(|r| r.subject == "lstat:crates/m/parts/var_link").expect("lstat read").clone();
+        assert_eq!(answer_now(&pkg, &read.subject), Ok(read.digest));
+
+        // Retarget to a different-length target (`sub/deep`): `answer_now` must change!
+        std::fs::remove_file(parts.join("var_link")).expect("unlink");
+        symlink("sub/deep", parts.join("var_link")).expect("longer symlink");
+        let st2 = sandbox.path_stat(dir_fd, b"var_link", false).expect("not stopped").expect("lstat long");
+        assert_eq!(st2.filetype, Filetype::SymbolicLink);
+        assert_eq!(st2.size, b"sub/deep".len() as u64);
+        assert_ne!(answer_now(&pkg, &read.subject), Ok(read.digest), "lstat digest must change when symlink target length changes");
+    }
+
+    /// Codex Round 3 P2 #3 (intermediate symlink before `..` & symlink loops): with
+    /// `link -> sub/deep` and a decoy `b.rs` in `parts/`, opening `link/../b.rs` relative to
+    /// `parts`'s dir-fd resolves `link` first and reads `sub/b.rs` (NOT `parts/b.rs`), records
+    /// both `link:` and `file:` reads with `answer_now` parity, rejects `a.rs/..` with `NOTDIR`,
+    /// and returns `Errno::LOOP` on symlink cycles (`loop_a -> loop_b`, `loop_b -> loop_a`).
+    #[cfg(unix)]
+    #[test]
+    fn intermediate_symlink_resolves_before_dotdot_and_loops_return_eloop() {
+        use std::os::unix::fs::symlink;
+
+        let tree = make_workspace("intermediate_symlink");
+        let parts = tree.ws.join("crates/m/parts");
+        std::fs::write(parts.join("b.rs"), b"WRONG decoy in parts/").expect("decoy b.rs");
+        symlink("sub/deep", parts.join("link")).expect("link -> sub/deep");
+        symlink("loop_b", parts.join("loop_a")).expect("loop_a -> loop_b");
+        symlink("loop_a", parts.join("loop_b")).expect("loop_b -> loop_a");
+
+        let (pkg, mut sandbox) = member_sandbox(&tree);
+        let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
+
+        // `link/../b.rs` must resolve through `link` (`sub/deep`), then pop `deep`, reading `sub/b.rs`.
+        let b_fd = sandbox.open(dir_fd, b"link/../b.rs", READ_ONLY).expect("not stopped").expect("link/../b.rs opens");
+        assert_eq!(read_all(&mut sandbox, b_fd), b"pub fn b() {}\n");
+        assert!(sandbox.reads.iter().any(|r| r.subject == "file:crates/m/parts/sub/b.rs"), "{:?}", sandbox.reads);
+        assert!(!sandbox.reads.iter().any(|r| r.subject == "file:crates/m/parts/b.rs"), "must not read decoy");
+        let link_read = sandbox.reads.iter().find(|r| r.subject == "link:crates/m/parts/link").expect("link read").clone();
+        for read in &sandbox.reads {
+            assert_eq!(answer_now(&pkg, &read.subject), Ok(read.digest), "parity for {}", read.subject);
+        }
+
+        // Traversing `..` through a regular file (`a.rs/..`) fails with ENOTDIR.
+        assert_eq!(sandbox.open(dir_fd, b"a.rs/..", READ_ONLY).expect("not stopped"), Err(Errno::NOTDIR));
+
+        // Symlink cycles return ELOOP both as intermediate component (`loop_a/x`) and final component (`loop_a`).
+        assert_eq!(sandbox.open(dir_fd, b"loop_a/x", READ_ONLY).expect("not stopped"), Err(Errno::LOOP));
+        assert_eq!(sandbox.open(dir_fd, b"loop_a", READ_ONLY).expect("not stopped"), Err(Errno::LOOP));
+        assert_eq!(sandbox.path_stat(dir_fd, b"loop_a", true).expect("not stopped"), Err(Errno::LOOP));
+        assert_eq!(sandbox.path_stat(dir_fd, b"loop_a", false).expect("not stopped").expect("lstat loop_a").filetype, Filetype::SymbolicLink);
+
+        // Retargeting the intermediate symlink invalidates its recorded `link:` read!
+        std::fs::remove_file(parts.join("link")).expect("unlink");
+        symlink("sub", parts.join("link")).expect("retarget link");
+        assert_ne!(answer_now(&pkg, &link_read.subject), Ok(link_read.digest), "retargeting intermediate symlink must invalidate link read");
     }
 }
