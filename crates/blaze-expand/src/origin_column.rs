@@ -28,9 +28,9 @@
 //! [`NO_MARK`] for none). Tags: 0 input, 1 attribute argument, 2 definition, 3 a
 //! `macro m(params)`'s parameter, 4 made, 5 an input token that is not as written (an item the
 //! attribute walk rewrote, `cfg_attr`). A mark: the definition's crate key (32), a module flag
-//! u32 (0 none, 1 one) and the module's key (32, zero for none), the transparency's byte as a u32
-//! and the edition's byte as a u32. Sans-IO, no recursion; everything allocated is in the
-//! caller's `alloc`.
+//! u32 (0 none, 1 one) and the module's key (32, zero for none), the transparency's byte plus
+//! `LOCAL_INNER_BIT` as a u32, the edition's byte as a u32, and the local hygiene hash as a u64.
+//! Sans-IO, no recursion; everything allocated is in the caller's `alloc`.
 
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_own::{AVec, Alloc};
@@ -41,35 +41,39 @@ use crate::{DefSite, Edition, TokenOrigin, TokenStream, Transparency};
 /// One row's bytes.
 pub const ROW: usize = 20;
 /// One mark's bytes.
-pub const MARK: usize = 32 + 4 + 32 + 4 + 4;
+pub const MARK: usize = 32 + 4 + 32 + 4 + 4 + 8;
 /// A row's mark index for a token with no mark.
 pub const NO_MARK: u32 = u32::MAX;
 /// The column's head: its row count and mark count.
 const HEAD: usize = 8;
 
 /// Flag bit packed into the 4-byte transparency word (`bytes[68..72]`) for
-/// `#[macro_export(local_inner_macros)]` token hygiene, keeping [`MARK`] at 76 bytes.
+/// `#[macro_export(local_inner_macros)]` token hygiene.
 const LOCAL_INNER_BIT: u32 = 1 << 8;
 
 /// A token's mark as the column keeps it: the innermost mark of its context (blaze-expand
 /// `TokenStream::hygiene`): where the macro is defined, how it resolves names, the edition
-/// the token is read in, and whether it came from a `#[macro_export(local_inner_macros)]` body.
+/// the token is read in, whether it came from a `#[macro_export(local_inner_macros)]` body,
+/// and the content-addressed local hygiene hash of its non-transparent expansion chain
+/// ([`crate::local_hygiene`], `0` when transparent or absent).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TextMark {
     pub site: DefSite,
     pub transparency: Transparency,
     pub edition: Edition,
     pub local_inner: bool,
+    pub hygiene: u64,
 }
 
 impl TextMark {
-    /// The column's form of an expansion's mark.
+    /// The column's form of an expansion's mark (without a local-hygiene chain: `hygiene: 0`).
     pub fn of(mark: crate::tokens::Mark) -> TextMark {
         TextMark {
             site: mark.site,
             transparency: mark.transparency,
             edition: mark.edition,
             local_inner: mark.local_inner,
+            hygiene: 0,
         }
     }
 
@@ -77,19 +81,21 @@ impl TextMark {
     /// ([`crate::tokens::lex_marked`]): this mark's site, transparency, edition and
     /// `local_inner` flag, of an earlier expansion ([`crate::MarkOf::Outer`], never `This`: a
     /// call's input holds no mark of the call's own, `ExpandError::Unsealed`), named by a key
-    /// hashed from the mark's bytes.
+    /// hashed from the mark's hygiene identity (`site`, `transparency`, `hygiene`).
     ///
-    /// Keeping `self.transparency` pairs with [`Self::local_hygiene`] in `blaze-lower`
-    /// (`Machine::hygiene_at`): both the item's own tokens and any token re-lexed into an inner
-    /// macro call compute the exact same [`crate::local_hygiene`], so an item-level macro's own
-    /// bindings match across inner calls (`proptest!`) while call-site parameters stay
-    /// hygienically separate from def-site template identifiers (`cold!` in `blaze-sys`).
+    /// Keeping `self.transparency` and folding `self.hygiene` pairs with [`Self::local_hygiene`]
+    /// in `blaze-lower` (`Machine::hygiene_at`): both the item's own tokens and any token
+    /// re-lexed into an inner macro call compute the exact same [`crate::local_hygiene`], so an
+    /// item-level macro's own bindings match across inner calls (`proptest!`), call-site
+    /// parameters stay hygienically separate from def-site template identifiers (`cold!` in
+    /// `blaze-sys`), and tokens from distinct invocations of the same recursive `macro_rules!`
+    /// (e.g. `prost::encoding::varint!` Arm 1 vs Arm 2) stay hygienically distinct.
     pub fn as_outer_mark(self) -> crate::tokens::Mark {
-        // Hash only hygiene identity (`site` + `transparency`), not `edition`: when a
+        // Hash only hygiene identity (`site` + `transparency` + `hygiene`), not `edition`: when a
         // `Transparent` proc-macro of one edition is invoked inside a `SemiOpaque`/`Opaque`
         // macro of another edition, its tokens carry the enclosing macro's `site`/`transparency`
-        // with the proc-macro's `edition` and must still share `local_hygiene` with the enclosing
-        // macro's own tokens.
+        // and `hygiene` with the proc-macro's `edition` and must still share `local_hygiene` with
+        // the enclosing macro's own tokens.
         let mut hasher = blaze_ids::Hasher::new("blaze v2 text mark expansion 1");
         hasher.part(&self.site.krate.0.0);
         match self.site.module {
@@ -103,6 +109,7 @@ impl TextMark {
             }
         }
         hasher.part(&u32::from(self.transparency.byte()).to_le_bytes());
+        hasher.part(&self.hygiene.to_le_bytes());
         crate::tokens::Mark {
             of: crate::tokens::MarkOf::Outer(hasher.finish()),
             transparency: self.transparency,
@@ -134,8 +141,8 @@ impl TextMark {
 
     /// The mark's [`MARK`] bytes, little-endian: the crate key (32), the module flag u32 (0 none,
     /// 1 some), the module key (32, zero for none), the transparency byte plus `LOCAL_INNER_BIT`
-    /// as u32, the edition byte as u32. One mark has one form: the column's table and the lowered
-    /// body's marks (blaze-lower) both keep these bytes.
+    /// as u32, the edition byte as u32, and the local hygiene hash as u64. One mark has one form:
+    /// the column's table and the lowered body's marks (blaze-lower) both keep these bytes.
     pub fn to_bytes(self) -> [u8; MARK] {
         let mut out = [0u8; MARK];
         out[..32].copy_from_slice(&self.site.krate.0.0);
@@ -146,12 +153,15 @@ impl TextMark {
         let flags = u32::from(self.transparency.byte()) | if self.local_inner { LOCAL_INNER_BIT } else { 0 };
         out[68..72].copy_from_slice(&flags.to_le_bytes());
         out[72..76].copy_from_slice(&u32::from(self.edition.byte()).to_le_bytes());
+        out[76..84].copy_from_slice(&self.hygiene.to_le_bytes());
         out
     }
 
     /// The mark [`to_bytes`](TextMark::to_bytes) wrote, or `None` for bytes no mark writes: a
     /// length other than [`MARK`], a flag other than 0 or 1, a nonzero module key under flag 0,
-    /// unknown flag bits, or a transparency or edition no byte names.
+    /// unknown flag bits, a transparency or edition no byte names, a non-zero `hygiene` under
+    /// [`Transparency::Transparent`], or a non-zero even `hygiene` (every [`crate::local_hygiene`]
+    /// hash has bit 0 set).
     pub fn from_bytes(bytes: &[u8]) -> Option<TextMark> {
         if bytes.len() != MARK {
             return None;
@@ -173,7 +183,16 @@ impl TextMark {
         let transparency = Transparency::from_byte(u8::try_from(flags & 0xff).ok()?)?;
         let local_inner = (flags & LOCAL_INNER_BIT) != 0;
         let edition = Edition::from_byte(u8::try_from(u32_at(bytes, 72)).ok()?)?;
-        Some(TextMark { site: DefSite { krate: CrateItemKey(key(0)), module }, transparency, edition, local_inner })
+        let mut hygiene_bytes = [0u8; 8];
+        hygiene_bytes.copy_from_slice(&bytes[76..84]);
+        let hygiene = u64::from_le_bytes(hygiene_bytes);
+        if transparency == Transparency::Transparent && hygiene != 0 {
+            return None;
+        }
+        if hygiene != 0 && (hygiene & 1) == 0 {
+            return None;
+        }
+        Some(TextMark { site: DefSite { krate: CrateItemKey(key(0)), module }, transparency, edition, local_inner, hygiene })
     }
 }
 

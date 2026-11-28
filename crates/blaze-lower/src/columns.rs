@@ -74,8 +74,9 @@ blaze_format_core::record! {
     /// it (`e`, NONE for the item's own text) ([`crate::scope_origin`]).
     /// Format 3: the marks of the expansions' words (`mark_starts`, `mark_bytes`).
     /// Format 4 assigns the reserved last head word to the fn text prefix.
+    /// Format 5: `mark_bytes` rows widen from 76 to 84 bytes (`TextMark::hygiene: u64`).
     #[derive(Clone, Copy, Debug)]
-    pub struct LoweredRoot: 4 {
+    pub struct LoweredRoot: 5 {
         pub langs: u64,
         pub exprs: Slice<Node>,
         pub expr_ranges: Slice<Range>,

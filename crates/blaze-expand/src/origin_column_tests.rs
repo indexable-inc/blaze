@@ -227,8 +227,8 @@ fn marks_ride_in_the_same_column() {
     use blaze_id::{ContentId, CrateItemKey, ItemKey};
     let alloc = blaze_own::testing::heap().alloc();
     let site = DefSite { krate: CrateItemKey(ContentId([7; 32])), module: Some(ItemKey(ContentId([9; 32]))) };
-    let opaque = TextMark { site, transparency: Transparency::Opaque, edition: Edition::E2021, local_inner: false };
-    let other = TextMark { site: DefSite { krate: CrateItemKey(ContentId([3; 32])), module: None }, transparency: Transparency::SemiOpaque, edition: Edition::E2024, local_inner: true };
+    let opaque = TextMark { site, transparency: Transparency::Opaque, edition: Edition::E2021, local_inner: false, hygiene: 0x1111_2222_3333_4445 };
+    let other = TextMark { site: DefSite { krate: CrateItemKey(ContentId([3; 32])), module: None }, transparency: Transparency::SemiOpaque, edition: Edition::E2024, local_inner: true, hygiene: 0x5555_6666_7777_8889 };
     let bytes_of = |marks: [Option<TextMark>; 3]| {
         let mut column = OriginColumn::new_in(alloc);
         column.push(0, 2, TextOrigin::Def(0), marks[0]).expect("in order");
@@ -247,11 +247,33 @@ fn marks_ride_in_the_same_column() {
     let (ra, _) = OriginsRef::open(&a).expect("reads");
     assert_eq!((ra.mark(0), ra.mark(2)), (Some(opaque), Some(other)));
     assert_eq!(a[..8 + 2 * crate::origin_column::MARK], b[..8 + 2 * crate::origin_column::MARK]);
-    assert_eq!(crate::origin_column::MARK, 76, "local_inner packs into existing 4-byte flags word");
+    assert_eq!(crate::origin_column::MARK, 84, "TextMark is 76 bytes plus 8-byte little-endian hygiene");
     assert!(other.as_outer_mark().local_inner, "as_outer_mark preserves local_inner");
     assert!(!opaque.as_outer_mark().local_inner, "as_outer_mark preserves local_inner = false");
+    // Same `(site, transparency, edition, local_inner)` with distinct `hygiene` produces distinct
+    // `as_outer_mark().of` and `local_hygiene()`, and occupies distinct entries in the column.
+    let other_arm2 = TextMark { hygiene: 0x9999_AAAA_BBBB_CCCD, ..other };
+    assert_ne!(other.as_outer_mark().of, other_arm2.as_outer_mark().of);
+    assert_ne!(other.local_hygiene(), other_arm2.local_hygiene());
+    let rec_bytes = bytes_of([Some(other), None, Some(other_arm2)]);
+    let (rec_col, _) = OriginsRef::open(&rec_bytes).expect("recursive marks open");
+    assert_eq!((rec_col.mark(0), rec_col.mark(2)), (Some(other), Some(other_arm2)));
+    assert_eq!(rec_bytes.len(), 8 + 2 * crate::origin_column::MARK + 3 * crate::origin_column::ROW);
+    // Negative controls: corrupt flag bits, even non-zero hygiene, or non-zero hygiene on Transparent.
     let mut bad_flags = other.to_bytes();
     bad_flags[69] |= 0x02; // unknown flag bit above LOCAL_INNER_BIT
     assert_eq!(TextMark::from_bytes(&bad_flags), None, "unknown flag bits are refused");
+    let mut even_hygiene = other.to_bytes();
+    even_hygiene[76..84].copy_from_slice(&0x1234_5678u64.to_le_bytes());
+    assert_eq!(TextMark::from_bytes(&even_hygiene), None, "non-zero even hygiene is refused");
+    let trans_zero = TextMark { site, transparency: Transparency::Transparent, edition: Edition::E2021, local_inner: false, hygiene: 0 };
+    assert_eq!(TextMark::from_bytes(&trans_zero.to_bytes()), Some(trans_zero));
+    assert_eq!(trans_zero.local_hygiene(), 0);
+    let mut trans_nonzero = trans_zero.to_bytes();
+    trans_nonzero[76..84].copy_from_slice(&0x1234_5679u64.to_le_bytes());
+    assert_eq!(TextMark::from_bytes(&trans_nonzero), None, "Transparent mark with non-zero hygiene is refused");
+    // Synthetic non-transparent marks with `hygiene == 0` (e.g. `root_mark`) round-trip cleanly.
+    let zero_opaque = TextMark { hygiene: 0, ..opaque };
+    assert_eq!(TextMark::from_bytes(&zero_opaque.to_bytes()), Some(zero_opaque));
     std::println!("origin marks: 1 kept, read back equal");
 }

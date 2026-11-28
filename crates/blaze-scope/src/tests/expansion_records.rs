@@ -280,3 +280,19 @@ fn a_call_by_path_and_by_textual_scope_share_one_record() {
     assert_eq!((call_a.macro_name, call_b.macro_name), ("make", "a::make"), "each call part names the path as written");
     assert_ne!(row_a.call_part, row_b.call_part, "the call parts are equal: the path is not the call's");
 }
+
+#[test]
+fn previous_expansion_record_form_2_is_refused() {
+    let bump = super::SyncFrame::leaked();
+    let mut bytes = blaze_own::AVec::new_in(bump.alloc());
+    ExpansionRecord::write_raw("pub struct S;", &[], &mut bytes).expect("write raw record");
+    let mut old = bytes.to_vec();
+    old[..4].copy_from_slice(&2u32.to_le_bytes());
+    assert!(
+        matches!(
+            ExpansionRecord::open_in(&old, bump),
+            Err(expansion_records::ExpansionRecordsError::OldForm { what: "an expansion record", found: 2 })
+        ),
+        "form-2 expansion record must be refused as OldForm"
+    );
+}

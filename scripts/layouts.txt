@@ -226,7 +226,7 @@ crates/blaze-scope/src/items_record.rs	VERSION	test previous_items_version_19_is
 crates/blaze-scope/src/names_record.rs	MAGIC	none
 crates/blaze-scope/src/names_record.rs	VERSION	none
 crates/blaze-scope/src/scope_record.rs	MAGIC	none
-crates/blaze-scope/src/scope_record.rs	VERSION	none
+crates/blaze-scope/src/scope_record.rs	VERSION	test previous_scope_version_9_is_rejected
 crates/blaze-scope/src/tests_record.rs	MAGIC	none
 crates/blaze-scope/src/tests_record.rs	VERSION	none
 crates/blaze-scope/src/tree_record.rs	MAGIC	none

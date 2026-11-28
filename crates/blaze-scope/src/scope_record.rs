@@ -78,7 +78,10 @@ pub(crate) const MAGIC: [u8; 4] = *b"BZCS";
 // 9: expansion `OriginColumn`s retain innermost `Transparency::Transparent` `TextMark`s for
 // edition tracking (e.g. edition-2021 proc-macros invoked from edition-2024 crates); a version-8
 // record is refused (`NotThisRecord`).
-pub(crate) const VERSION: u32 = 9;
+// 10: expansion `OriginColumn` `TextMark`s widen from 76 to 84 bytes (`hygiene: u64` for
+// recursive `macro_rules!` local hygiene) and `expansion_records::RECORD_FORM` bumps 2 -> 3; a
+// version-9 record is refused (`NotThisRecord`).
+pub(crate) const VERSION: u32 = 10;
 pub(crate) const ALIGN: usize = 16;
 /// The errored flag of an error crate's record (crate_scope.rs `error_record`); 0 in any other.
 pub(crate) const ERRORED: u8 = 1;

@@ -199,7 +199,7 @@ pub fn column_of<'a>(
     origins: &[blaze_expand::TokenOrigin],
     input: blaze_expand::origin_column::InputIndex<'_>,
     // Each token's projected text mark (drive.md, "A token keeps its mark": the same column):
-    // `|at| expansion.text_mark(at)`.
+    // `|at| expansion.text_mark_of(at, own_key.0)`.
     marks: &dyn Fn(usize) -> Option<blaze_expand::origin_column::TextMark>,
     alloc: Alloc<'a>,
 ) -> Result<OriginColumn<'a>, OriginsError> {

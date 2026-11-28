@@ -4045,7 +4045,7 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
         CallShape::FnLike => blaze_expand::origin_column::InputShape::Inside,
         CallShape::Attr | CallShape::Derive => blaze_expand::origin_column::InputShape::Whole,
     };
-    let mark_of = |at: usize| expansion.text_mark(at);
+    let mark_of = |at: usize| expansion.text_mark_of(at, own_key.0);
     let origin_column = crate::expansion_origins::column_of(call, &placed, &roots, &expansion.origins, input_index, &mark_of, alloc);
     let (rendered_text, text, made, column, moved_copies, synthetic_blocks): (
         &'a str,
@@ -5247,7 +5247,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
         CallShape::FnLike => blaze_expand::origin_column::InputShape::Inside,
         CallShape::Attr | CallShape::Derive => blaze_expand::origin_column::InputShape::Whole,
     };
-    let mark_of = |at: usize| expansion.text_mark(at);
+    let mark_of = |at: usize| expansion.text_mark_of(at, own_key.0);
     let origin_column = crate::expansion_origins::column_of(call, &placed, &roots, &expansion.origins, input_index, &mark_of, alloc);
     let (rendered_text, text, made, column, moved_copies, synthetic_blocks): (
         &'a str,
