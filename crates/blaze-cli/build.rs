@@ -16,6 +16,7 @@
 //! without invalidating cached `CodeRecord`s in `~/.blaze/v2`.
 
 use std::fmt::Write as _;
+use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -24,6 +25,13 @@ use blaze_ids::producer::Row;
 use blaze_producers::{Digest, Entry, Step, Walk};
 
 const BUILD_CFG_DOMAIN: &str = "blaze-cli code-builder cfg 1";
+const PACK_FILE_ITEMS_CFG_DOMAIN: &str = "blaze-cli pack-file-items cfg 1";
+const PACK_FILE_ITEMS_ROOTS: [&str; 2] = ["blaze-file-items", "blaze-drive"];
+const PACK_FILE_ITEMS_CLI_FILES: [&str; 3] = [
+    "crates/blaze-cli/src/engine_bodies.rs",
+    "crates/blaze-cli/src/front_load.rs",
+    "crates/blaze-cli/src/sweep.rs",
+];
 
 fn main() -> ExitCode {
     #[expect(clippy::disallowed_methods, reason = "cargo hands a build script its target only as `CARGO_CFG_TARGET_OS`")]
@@ -42,14 +50,14 @@ fn main() -> ExitCode {
     println!("cargo::rerun-if-env-changed=CARGO_CFG_DEBUG_ASSERTIONS");
 
     let alloc = blaze_own::Heap::process().alloc();
-    if let Err(why) = emit_code_builder_producer(&os, alloc) {
-        eprintln!("blaze-cli build.rs: failed to compute CodeBuilder producer digest: {why}");
+    if let Err(why) = emit_producers(&os, alloc) {
+        eprintln!("blaze-cli build.rs: failed to compute producer digests: {why}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
 }
 
-fn emit_code_builder_producer(os: &str, alloc: blaze_own::Alloc<'_>) -> Result<(), String> {
+fn emit_producers(os: &str, alloc: blaze_own::Alloc<'_>) -> Result<(), String> {
     #[expect(clippy::disallowed_methods, reason = "cargo hands a build script its manifest/out dirs and cfg via env")]
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|e| format!("CARGO_MANIFEST_DIR: {e}"))?;
     #[expect(clippy::disallowed_methods, reason = "cargo hands a build script its out dir via env")]
@@ -62,81 +70,133 @@ fn emit_code_builder_producer(os: &str, alloc: blaze_own::Alloc<'_>) -> Result<(
     let debug_assertions = std::env::var_os("CARGO_CFG_DEBUG_ASSERTIONS").is_some();
 
     let workspace_root = Path::new(&manifest_dir).join("../..");
-    let mut walk = Walk::for_row(Row::CodeBuilder, alloc).map_err(|why| format!("{why}"))?;
-    loop {
-        let (is_list, path) = match walk.next().map_err(|why| format!("{why}"))? {
-            Step::Done => break,
-            Step::Read(path) => (false, path.to_owned()),
-            Step::List(path) => (true, path.to_owned()),
-        };
-        let full = workspace_root.join(&path);
-        if !is_list {
-            let bytes = match std::fs::read(&full) {
-                Ok(b) => Some(b),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(format!("read {path}: {e}")),
+    let out_dir_path = Path::new(&out_dir);
+    let drive_walk = |walk: &mut Walk<'_>| {
+        loop {
+            let (is_list, path) = match walk.next().map_err(|why| format!("{why}"))? {
+                Step::Done => return Ok(()),
+                Step::Read(path) => (false, path.to_owned()),
+                Step::List(path) => (true, path.to_owned()),
             };
-            walk.read(bytes.as_deref()).map_err(|why| format!("{why}"))?;
-            continue;
-        }
-        let dir = match std::fs::read_dir(&full) {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                walk.listed(None).map_err(|why| format!("{why}"))?;
+            let full = workspace_root.join(&path);
+            if !is_list {
+                let bytes = match fs::read(&full) {
+                    Ok(b) => Some(b),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(format!("read {path}: {e}")),
+                };
+                walk.read(bytes.as_deref()).map_err(|why| format!("{why}"))?;
                 continue;
             }
-            Err(e) => return Err(format!("list {path}: {e}")),
-        };
-        let mut names: Vec<(String, bool)> = Vec::new();
-        for entry in dir {
-            let entry = entry.map_err(|e| format!("list {path}: {e}"))?;
-            let Ok(name) = entry.file_name().into_string() else {
-                continue;
+            let dir = match fs::read_dir(&full) {
+                Ok(d) => d,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    walk.listed(None).map_err(|why| format!("{why}"))?;
+                    continue;
+                }
+                Err(e) => return Err(format!("list {path}: {e}")),
             };
-            let is_dir = std::fs::metadata(entry.path())
-                .map_err(|e| format!("metadata {path}/{name}: {e}"))?
-                .is_dir();
-            names.push((name, is_dir));
+            let mut names = blaze_own::Vec::new_in(alloc);
+            for entry in dir {
+                let entry = entry.map_err(|e| format!("list {path}: {e}"))?;
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                let is_dir = fs::metadata(entry.path())
+                    .map_err(|e| format!("metadata {path}/{name}: {e}"))?
+                    .is_dir();
+                names.push((name, is_dir));
+            }
+            let mut entries = blaze_own::Vec::with_capacity_in(names.len(), alloc);
+            for (n, d) in names.iter() {
+                entries.push(Entry { name: n.as_str(), is_dir: *d });
+            }
+            walk.listed(Some(entries.as_slice())).map_err(|why| format!("{why}"))?;
         }
-        let entries: Vec<Entry<'_>> = names.iter().map(|(n, d)| Entry { name: n.as_str(), is_dir: *d }).collect();
-        walk.listed(Some(&entries)).map_err(|why| format!("{why}"))?;
-    }
+    };
+    let write_const = |file_name: &str, doc: &str, const_name: &str, digest: &[u8; 32], extra: &str| {
+        let mut generated = blaze_own::String::new_in(alloc);
+        generated.push_str(doc);
+        let _ = write!(generated, "pub(crate) const {const_name}: [u8; 32] = [");
+        for (i, b) in digest.iter().enumerate() {
+            if i > 0 {
+                generated.push_str(", ");
+            }
+            let _ = write!(generated, "0x{b:02x}");
+        }
+        generated.push_str("];\n");
+        generated.push_str(extra);
+        let out_path = out_dir_path.join(file_name);
+        let unchanged = fs::read(&out_path).ok().is_some_and(|old| old == generated.as_bytes());
+        if unchanged {
+            Ok(())
+        } else {
+            fs::write(&out_path, generated.as_bytes()).map_err(|e| format!("write {}: {e}", out_path.display()))
+        }
+    };
 
-    let single = walk.finish_row(Row::CodeBuilder).map_err(|why| format!("{why}"))?;
-    let row_digest = match single.digest {
+    // 1. `CODE_BUILDER_SOURCE`: `Row::CodeBuilder` transitive closure + build cfg.
+    let mut cb_walk = Walk::for_row(Row::CodeBuilder, alloc).map_err(|why| format!("{why}"))?;
+    drive_walk(&mut cb_walk)?;
+    let single = cb_walk.finish_row(Row::CodeBuilder).map_err(|why| format!("{why}"))?;
+    let cb_row_digest = match single.digest {
         Digest::Source(bytes) => bytes,
         Digest::Refused(why) => return Err(format!("CodeBuilder row refused: {why}")),
     };
-
     for rel in single.watch.iter() {
         println!("cargo::rerun-if-changed={}", workspace_root.join(rel.as_str()).display());
     }
-
-    let mut hasher = Hasher::new(BUILD_CFG_DOMAIN);
-    hasher
-        .part(&row_digest)
+    let mut cb_hasher = Hasher::new(BUILD_CFG_DOMAIN);
+    cb_hasher
+        .part(&cb_row_digest)
         .part(arch.as_bytes())
         .part(os.as_bytes())
         .part(env_name.as_bytes())
         .part(&[u8::from(debug_assertions)]);
-    let final_digest = hasher.finish().0;
+    let cb_digest = cb_hasher.finish().0;
+    let cb_extra = format!("#[cfg(test)] pub(crate) const CODE_BUILDER_TARGET_ENV: &str = {env_name:?};\n");
+    write_const(
+        "code_builder_producer.rs",
+        "/// Compile-time `ProducerId<CodeBuilder>` digest from `blaze-producers` + build cfg (Rule 21).\n",
+        "CODE_BUILDER_SOURCE",
+        &cb_digest,
+        &cb_extra,
+    )?;
 
-    let mut generated = String::with_capacity(320);
-    generated.push_str("/// Compile-time `ProducerId<CodeBuilder>` digest from `blaze-producers` + build cfg (Rule 21).\n");
-    generated.push_str("pub(crate) const CODE_BUILDER_SOURCE: [u8; 32] = [");
-    for (i, b) in final_digest.iter().enumerate() {
-        if i > 0 {
-            generated.push_str(", ");
-        }
-        let _ = write!(generated, "0x{b:02x}");
+    // 2. `PACK_FILE_ITEMS_SOURCE`: dedicated pack `FileItems` closure (`blaze-file-items` +
+    // `blaze-drive`) plus the exact `blaze-cli` pack `FileItems` encode/decode/domain files
+    // (`engine_bodies.rs`, `front_load.rs`, `sweep.rs`) and build cfg. Excludes codegen crates
+    // (`blaze-emit`, `blaze-lir`, `blaze-ladder`, etc.) and unrelated CLI files (Rule 21, 52, 54).
+    let mut pfi_walk = Walk::for_crates(&PACK_FILE_ITEMS_ROOTS, alloc).map_err(|why| format!("{why}"))?;
+    drive_walk(&mut pfi_walk)?;
+    let pfi = pfi_walk.finish_crates("pack-file-items").map_err(|why| format!("{why}"))?;
+    let pfi_closure_digest = match pfi.digest {
+        Digest::Source(bytes) => bytes,
+        Digest::Refused(why) => return Err(format!("pack-file-items closure refused: {why}")),
+    };
+    for rel in pfi.watch.iter() {
+        println!("cargo::rerun-if-changed={}", workspace_root.join(rel.as_str()).display());
     }
-    generated.push_str("];\n");
-    let _ = writeln!(generated, "#[cfg(test)] pub(crate) const CODE_BUILDER_TARGET_ENV: &str = {env_name:?};");
-
-    let out_path = Path::new(&out_dir).join("code_builder_producer.rs");
-    let unchanged = std::fs::read(&out_path).ok().is_some_and(|old| old == generated.as_bytes());
-    if !unchanged {
-        std::fs::write(&out_path, generated.as_bytes()).map_err(|e| format!("write {}: {e}", out_path.display()))?;
+    let mut pfi_hasher = Hasher::new(PACK_FILE_ITEMS_CFG_DOMAIN);
+    pfi_hasher.part(&pfi_closure_digest);
+    for rel in PACK_FILE_ITEMS_CLI_FILES {
+        let full = workspace_root.join(rel);
+        println!("cargo::rerun-if-changed={}", full.display());
+        let bytes = fs::read(&full).map_err(|e| format!("read {rel}: {e}"))?;
+        pfi_hasher.part(rel.as_bytes()).part(&bytes);
     }
+    pfi_hasher
+        .part(arch.as_bytes())
+        .part(os.as_bytes())
+        .part(env_name.as_bytes())
+        .part(&[u8::from(debug_assertions)]);
+    let pfi_digest = pfi_hasher.finish().0;
+    write_const(
+        "pack_file_items_producer.rs",
+        "/// Compile-time pack `FileItems` producer digest (`blaze-file-items` + `blaze-drive` closures + CLI pack `FileItems` files + build cfg; Rule 21, 52, 54).\n",
+        "PACK_FILE_ITEMS_SOURCE",
+        &pfi_digest,
+        "",
+    )?;
     Ok(())
 }

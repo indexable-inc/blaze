@@ -428,11 +428,10 @@ fn a_missing_lock_row_refuses_its_row_alone() {
     std::println!("producers: a missing lock row, an unnamed path crate and a required unlocked dependency each refused the names row alone");
 }
 
-fn drive_single<'a>(files: &[(&str, &str)], row: Row, alloc: Alloc<'a>) -> Result<crate::SingleDigest<'a>, Refused<'a>> {
-    let mut walk = Walk::for_row(row, alloc)?;
+fn drive_walk<'a>(files: &[(&str, &str)], walk: &mut Walk<'a>, alloc: Alloc<'a>) -> Result<(), Refused<'a>> {
     loop {
         match walk.next()? {
-            Step::Done => break,
+            Step::Done => return Ok(()),
             Step::Read(path) => {
                 let found = files.iter().find(|(p, _)| *p == path).map(|(_, text)| text.as_bytes());
                 walk.read(found)?;
@@ -458,6 +457,11 @@ fn drive_single<'a>(files: &[(&str, &str)], row: Row, alloc: Alloc<'a>) -> Resul
             }
         }
     }
+}
+
+fn drive_single<'a>(files: &[(&str, &str)], row: Row, alloc: Alloc<'a>) -> Result<crate::SingleDigest<'a>, Refused<'a>> {
+    let mut walk = Walk::for_row(row, alloc)?;
+    drive_walk(files, &mut walk, alloc)?;
     walk.finish_row(row)
 }
 
@@ -523,4 +527,50 @@ fn producer_exclude_and_for_row_scope_code_builder_precisely() {
         }
         other => panic!("expected UnknownExclude, got {:?}", other.map(|_| ())),
     }
+}
+
+fn drive_crates<'a>(files: &[(&str, &str)], roots: &[&str], label: &str, alloc: Alloc<'a>) -> Result<crate::CratesDigest<'a>, Refused<'a>> {
+    let mut walk = Walk::for_crates(roots, alloc)?;
+    drive_walk(files, &mut walk, alloc)?;
+    walk.finish_crates(label)
+}
+
+#[test]
+fn for_crates_digests_exact_closure_and_excludes_unrelated_crates() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let base_tree = tree(&[], alloc);
+    let base = drive_crates(&base_tree, &["blaze-expand"], "expand-only", alloc).expect("for_crates walks");
+    assert!(base.digest.source().is_some(), "expected Source digest");
+    assert!(
+        base.watch.iter().any(|w| w.as_str() == "crates/blaze-expand/src"),
+        "root crate src must be watched: {:?}",
+        base.watch
+    );
+    assert!(
+        base.watch.iter().any(|w| w.as_str() == "crates/blaze-own/src"),
+        "transitive dep src must be watched: {:?}",
+        base.watch
+    );
+    assert!(
+        !base.watch.iter().any(|w| w.as_str() == "crates/blaze-ladder/src"),
+        "unrelated crate src must NOT be watched: {:?}",
+        base.watch
+    );
+
+    // Editing a transitive dependency (`blaze-own`) moves the digest.
+    let edit_dep = tree(&[("crates/blaze-own/src/lib.rs", "pub struct Vec(u16);\n")], alloc);
+    let after_dep = drive_crates(&edit_dep, &["blaze-expand"], "expand-only", alloc).expect("after dep edit");
+    assert_ne!(after_dep.digest.source(), base.digest.source());
+
+    // Editing an unrelated crate (`blaze-ladder`) leaves the digest unchanged.
+    let edit_unrelated = tree(&[("crates/blaze-ladder/src/lib.rs", "pub fn ladder() { 99; }\n")], alloc);
+    let after_unrelated = drive_crates(&edit_unrelated, &["blaze-expand"], "expand-only", alloc).expect("after unrelated edit");
+    assert_eq!(after_unrelated.digest.source(), base.digest.source());
+
+    // Empty root list and unknown root crate are refused by name (Rule 3).
+    assert!(matches!(Walk::for_crates(&[], alloc), Err(Refused::Shape { .. })));
+    assert!(matches!(
+        drive_crates(&base_tree, &["no-such-crate"], "bad", alloc),
+        Err(Refused::NoPathCrate { .. })
+    ));
 }

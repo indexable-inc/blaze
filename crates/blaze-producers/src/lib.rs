@@ -120,6 +120,14 @@ pub struct SingleDigest<'a> {
     pub watch: Vec<Text<'a>, Alloc<'a>>,
 }
 
+/// The walk's answer for an explicit crate closure ([`Walk::for_crates`], [`Walk::finish_crates`]).
+pub struct CratesDigest<'a> {
+    pub digest: Digest<'a>,
+    /// Relative to the workspace root, sorted, each once: only the manifests, lock, pins, and
+    /// top-level entries of crates inside the requested closure.
+    pub watch: Vec<Text<'a>, Alloc<'a>>,
+}
+
 /// One row's answer.
 #[derive(Debug)]
 pub enum Digest<'a> {
@@ -300,6 +308,10 @@ pub struct Walk<'a> {
     /// Whether the pins folder itself was listed.
     pins_listed: bool,
     watch: Vec<Text<'a>, Alloc<'a>>,
+    /// Explicit crate-name roots for [`Walk::for_crates`]; empty for row walks.
+    extra_roots: Vec<Text<'a>, Alloc<'a>>,
+    /// Planned closure for `extra_roots`, populated during [`Walk::plan`].
+    extra_plan: Option<Plan<'a>>,
 }
 
 const ALL_SOURCE_ROWS: u8 = {
@@ -331,6 +343,23 @@ impl<'a> Walk<'a> {
         Ok(Walk::with_mask(1u8 << row.index(), alloc))
     }
 
+    /// A walk from the root manifest over an explicit set of workspace crate names (`roots`):
+    /// reads, hashes, and watches only the crates inside their transitive dependency closure
+    /// (plus manifests, lock, and `pins/`).
+    pub fn for_crates(roots: &[&str], alloc: Alloc<'a>) -> Result<Walk<'a>, Refused<'a>> {
+        if roots.is_empty() {
+            return Err(Refused::Shape {
+                path: text(ROOT_MANIFEST, alloc),
+                what: "non-empty crate root list for `Walk::for_crates`",
+            });
+        }
+        let mut walk = Walk::with_mask(0, alloc);
+        for &name in roots {
+            walk.extra_roots.push(text(name, alloc));
+        }
+        Ok(walk)
+    }
+
     fn with_mask(wanted_rows: u8, alloc: Alloc<'a>) -> Walk<'a> {
         let mut queue = VecDeque::new_in(alloc);
         queue.push_back((Job::Root, text(ROOT_MANIFEST, alloc)));
@@ -348,6 +377,8 @@ impl<'a> Walk<'a> {
             pins: Vec::new_in(alloc),
             pins_listed: false,
             watch: Vec::new_in(alloc),
+            extra_roots: Vec::new_in(alloc),
+            extra_plan: None,
         }
     }
 
@@ -607,6 +638,73 @@ impl<'a> Walk<'a> {
         Err(Refused::UnknownRow { path: text(ROOT_MANIFEST, alloc), name: text(row.name(), alloc) })
     }
 
+    /// The digest of the explicit crate closure walked via [`Walk::for_crates`], domain-separated
+    /// by `label`, once [`Walk::next`] said [`Step::Done`].
+    pub fn finish_crates(mut self, label: &str) -> Result<CratesDigest<'a>, Refused<'a>> {
+        let alloc = self.alloc;
+        if self.phase != Phase::Done || self.asked.is_some() {
+            return Err(Refused::Unasked { answered: "finish_crates before done" });
+        }
+        let (Some(root), Some(lock), true) = (self.root.as_ref(), self.lock.as_ref(), self.pins_listed) else {
+            return Err(Refused::Unasked { answered: "finish_crates before done" });
+        };
+        let Some(mut plan) = self.extra_plan.take() else {
+            return Err(Refused::Unasked { answered: "finish_crates without for_crates" });
+        };
+        self.pins.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        let mut pins = Hasher::new(PINS_DOMAIN);
+        let pins_len = u64::try_from(self.pins.len()).unwrap_or(u64::MAX);
+        pins.part(&pins_len.to_le_bytes());
+        for (_, id) in self.pins.iter() {
+            pins.id(id);
+        }
+        let pins = pins.finish();
+        let mut crate_ids: Vec<ContentId, Alloc<'a>> = Vec::new_in(alloc);
+        for krate in self.crates.iter_mut() {
+            krate.files.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+            let mut hasher = Hasher::new(CRATE_DOMAIN);
+            hasher.part(krate.dir.as_bytes()).part(krate.name.as_bytes());
+            let files_len = u64::try_from(krate.files.len()).unwrap_or(u64::MAX);
+            hasher.part(&files_len.to_le_bytes());
+            for (_, id) in krate.files.iter() {
+                hasher.id(id);
+            }
+            crate_ids.push(hasher.finish());
+        }
+        let digest = if let Some(why) = plan.refused.take() {
+            Digest::Refused(why)
+        } else {
+            let mut hasher = Hasher::new(ROW_DOMAIN);
+            hasher.part(label.as_bytes());
+            for &krate in plan.crates.iter() {
+                if let Some(id) = crate_ids.get(krate) {
+                    hasher.part(b"crate").id(id);
+                }
+            }
+            for &ws in plan.ws.iter() {
+                if let Some(dep) = root.deps.get(ws) {
+                    hasher.part(dep.key.as_bytes()).id(&dep.digest);
+                }
+            }
+            match &root.edition {
+                Some(edition) => hasher.part(b"edition").id(edition),
+                None => hasher.part(b"no edition"),
+            };
+            for &reached in plan.locked.iter() {
+                if let Some(row) = lock.get(reached) {
+                    hasher.part(row.name.as_bytes()).part(row.version.as_bytes());
+                    hasher.opt_part(row.source.as_deref()).opt_part(row.checksum.as_deref());
+                }
+            }
+            hasher.part(b"pins").id(&pins);
+            Digest::Source(hasher.finish().0)
+        };
+        let mut watch = core::mem::replace(&mut self.watch, Vec::new_in(alloc));
+        watch.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        watch.dedup();
+        Ok(CratesDigest { digest, watch })
+    }
+
     /// Asks for the manifest of the crate at `dir` once, and knows the crate by it.
     fn want_crate(&mut self, dir: &str) {
         let alloc = self.alloc;
@@ -767,6 +865,10 @@ impl<'a> Walk<'a> {
             }
             self.plans.push(Plan { crates, ws, locked, refused });
         }
+        if !self.extra_roots.is_empty() {
+            let plan = self.plan_extra_crates(root, lock, &mut digested)?;
+            self.extra_plan = Some(plan);
+        }
         self.queue.push_back((Job::PinDir, text(PINS, alloc)));
         for (at, krate) in self.crates.iter().enumerate() {
             if digested[at] {
@@ -774,6 +876,141 @@ impl<'a> Walk<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Computes the transitive crate + workspace-dep + lock-row closure for `self.extra_roots`
+    /// (`Walk::for_crates`), marking every reached crate in `digested`.
+    fn plan_extra_crates(&self, root: &Root<'a>, lock: &[LockRow<'a>], digested: &mut [bool]) -> Result<Plan<'a>, Refused<'a>> {
+        let alloc = self.alloc;
+        let mut seen = Vec::new_in(alloc);
+        seen.resize(self.crates.len(), false);
+        let mut work: Vec<usize, Alloc<'a>> = Vec::new_in(alloc);
+        for wanted in self.extra_roots.iter() {
+            let mut found = false;
+            for (at, krate) in self.crates.iter().enumerate() {
+                if krate.name.as_str() == wanted.as_str() {
+                    found = true;
+                    if let Some(slot) = seen.get_mut(at)
+                        && !*slot
+                    {
+                        *slot = true;
+                        work.push(at);
+                    }
+                }
+            }
+            if !found {
+                return Err(Refused::NoPathCrate { name: text(wanted.as_str(), alloc) });
+            }
+        }
+        let mut ws = Vec::new_in(alloc);
+        let mut names: Vec<(Text<'a>, bool), Alloc<'a>> = Vec::new_in(alloc);
+        let mut taken = Vec::new_in(alloc);
+        taken.resize(lock.len(), false);
+        let mut refused = None;
+        'walk: loop {
+            if let Some(at) = work.pop() {
+                let Some(krate) = self.crates.get(at) else { continue };
+                let manifest = child(krate.dir.as_str(), "Cargo.toml", alloc);
+                for (_, dep, optional) in krate.deps.iter() {
+                    let dir = match dep {
+                        Dep::Path(dir) => dir,
+                        Dep::Outside(name) => {
+                            names.push((text(name.as_str(), alloc), *optional));
+                            continue;
+                        }
+                        Dep::Workspace(key) => {
+                            let Some(entry) = ws_dep(root, key) else {
+                                return Err(Refused::NoWorkspaceDep { path: manifest, key: text(key.as_str(), alloc) });
+                            };
+                            ws.push(entry);
+                            let Some(ws_row) = root.deps.get(entry) else { continue };
+                            match &ws_row.target {
+                                Target::Path(dir) => dir,
+                                Target::Outside(name) => {
+                                    names.push((text(name.as_str(), alloc), *optional));
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+                    let next = *self
+                        .by_dir
+                        .get(dir.as_str())
+                        .ok_or_else(|| Refused::Missing { path: child(dir, "Cargo.toml", alloc) })?;
+                    if let Some(slot) = seen.get_mut(next)
+                        && !*slot
+                    {
+                        *slot = true;
+                        work.push(next);
+                    }
+                }
+            } else if let Some((name, optional)) = names.pop() {
+                let mut found = false;
+                for (reached, row) in lock.iter().enumerate() {
+                    if row.name != name.as_str() {
+                        continue;
+                    }
+                    found = true;
+                    if let Some(slot) = taken.get_mut(reached) {
+                        if *slot {
+                            continue;
+                        }
+                        *slot = true;
+                    }
+                    if row.source.is_some() {
+                        for dep in row.deps.iter() {
+                            names.push((text(dep.as_str(), alloc), false));
+                        }
+                        continue;
+                    }
+                    let mut named = false;
+                    for (next, krate) in self.crates.iter().enumerate() {
+                        if krate.name.as_str() == name.as_str() {
+                            named = true;
+                            if let Some(slot) = seen.get_mut(next)
+                                && !*slot
+                            {
+                                *slot = true;
+                                work.push(next);
+                            }
+                        }
+                    }
+                    if !named {
+                        refused = Some(Refused::NoPathCrate { name: text(name.as_str(), alloc) });
+                        break 'walk;
+                    }
+                }
+                if !found && !optional {
+                    refused = Some(Refused::NotLocked { name });
+                    break 'walk;
+                }
+            } else {
+                break;
+            }
+        }
+        let mut crates = Vec::new_in(alloc);
+        for (at, &is_seen) in seen.iter().enumerate() {
+            if is_seen {
+                if let Some(slot) = digested.get_mut(at) {
+                    *slot = true;
+                }
+                crates.push(at);
+            }
+        }
+        crates.sort_unstable_by(|&a, &b| {
+            let da = self.crates.get(a).map_or("", |c| c.dir.as_str());
+            let db = self.crates.get(b).map_or("", |c| c.dir.as_str());
+            da.cmp(db)
+        });
+        ws.sort_unstable();
+        ws.dedup();
+        let mut locked = Vec::new_in(alloc);
+        for (reached, &is_taken) in taken.iter().enumerate() {
+            if is_taken {
+                locked.push(reached);
+            }
+        }
+        Ok(Plan { crates, ws, locked, refused })
     }
 }
 

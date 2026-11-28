@@ -253,13 +253,14 @@ pub(crate) fn lang_places_of<A: core::alloc::Allocator>(
 /// Content-addressed CAS key for a pack/dependency file's encoded `(surface, FileItems)` record.
 /// Built purely from registered `blaze_drive::key` primitives (`FILE_SOURCE_DOMAIN`,
 /// `CONTENT_DOMAIN`, `VALUE_DOMAIN`, `TASK_DOMAIN`) and covering all four `blaze-file-items`
-/// outliner domains, the compile-time compiler-crate source closure (`CODE_BUILDER_SOURCE`, which
-/// covers `blaze-file-items`, `blaze-surface`, and `parser` so any outliner/surface/encoding
-/// change automatically invalidates stale CAS entries even without a manual domain bump while
-/// CLI-only rebuilds stay warm), the file edition, and the file text's `FILE_DOMAIN` digest
-/// (rule 21, rule 54).
+/// outliner domains, the dedicated compile-time pack-`FileItems` producer closure
+/// (`PACK_FILE_ITEMS_SOURCE`, covering the `blaze-file-items` + `blaze-drive` crate closures and
+/// the `blaze-cli` pack-`FileItems` encode/decode/domain files `engine_bodies.rs`,
+/// `front_load.rs`, and `sweep.rs`, while excluding unrelated codegen/CLI files so codegen edits
+/// stay warm), the file edition, and the file text's `FILE_DOMAIN` digest (rule 21, rule 52,
+/// rule 54).
 pub(crate) fn pack_file_items_key(edition: blaze_surface::Edition, text_digest: ContentId) -> Key {
-    pack_file_items_key_with_producer(edition, text_digest, crate::producers::CODE_BUILDER_SOURCE)
+    pack_file_items_key_with_producer(edition, text_digest, crate::producers::PACK_FILE_ITEMS_SOURCE)
 }
 
 pub(crate) fn pack_file_items_key_with_producer(
@@ -1377,8 +1378,8 @@ mod tests {
         );
         assert_eq!(
             k2021,
-            pack_file_items_key_with_producer(Edition::E2021, digest, crate::producers::CODE_BUILDER_SOURCE),
-            "pack_file_items_key must bind CODE_BUILDER_SOURCE"
+            pack_file_items_key_with_producer(Edition::E2021, digest, crate::producers::PACK_FILE_ITEMS_SOURCE),
+            "pack_file_items_key must bind PACK_FILE_ITEMS_SOURCE"
         );
 
         let outline = blaze_file_items::outline(text, Edition::E2021, alloc);
@@ -1447,7 +1448,7 @@ mod tests {
         assert_ne!(stale_surface, fresh_surface, "control stale surface must differ from current surface");
 
         let old_producer = [0x01; 32];
-        assert_ne!(old_producer, crate::producers::CODE_BUILDER_SOURCE);
+        assert_ne!(old_producer, crate::producers::PACK_FILE_ITEMS_SOURCE);
         let stale_key = pack_file_items_key_with_producer(Edition::E2024, digest, old_producer);
         let current_key = pack_file_items_key(Edition::E2024, digest);
         assert_ne!(stale_key, current_key, "prior producer key must not collide with current key");
