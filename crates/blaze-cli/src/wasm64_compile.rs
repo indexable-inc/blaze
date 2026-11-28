@@ -558,10 +558,11 @@ pub(crate) fn dep_script_spawn_setting(spawn: Option<&SpawnSetting>) -> SpawnSet
     }
 }
 
-/// Wasm64 proc-macro reactor shim compiled as crate 0 alongside the proc-macro crate (crate 1).
+/// Wasm64 proc-macro reactor shim compiled alongside the proc-macro crate (`shim_idx < tc_base`).
 /// Mirrors `crates/blaze-proc-macro/guest/shim.rs` for `wasm64-blaze-wasip1` (`blaze_proc_macro_64`)
-/// and overrides `wasi_rt::getenv` (via crate-0 export precedence in `collect_rust_c_exports`) so
-/// every `std::env::var` call tracks individual env reads through `blaze_pm_env_var`.
+/// and overrides `wasi_rt::rt::env::getenv` (via `export_override_crates = &[shim_crate]` in
+/// `export_shim` / `LazyProgram` and crate-index precedence in `collect_rust_c_exports`) so every
+/// `std::env::var` call tracks individual env reads through `blaze_pm_env_var`.
 const WASM64_PROC_MACRO_SHIM: &str = r#"#![allow(unsafe_code)]
 
 use std::{ffi::CStr, mem::ManuallyDrop, panic};
@@ -3352,6 +3353,11 @@ fn emit_wasm64_from_records<'n>(
                 Some(crate::run_parent::command_make_watch()),
                 heap_alloc,
             );
+            // Register the injected proc-macro shim crate as an export-override crate so
+            // `export_shim` binds `libc::getenv` to `blaze_wasm64_pm_shim::getenv` (->
+            // `blaze_proc_macro_64::env_var`) instead of `wasi_rt::rt::env::getenv` (whose
+            // `ENV` is uninitialized in reactor modules that enter via `_initialize`).
+            maker.set_export_override_crates(&[shim_crate]);
             let exports = [
                 (init_sym, "_initialize"),
                 (alloc_sym, "blaze_proc_macro_alloc"),
@@ -6222,6 +6228,225 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         assert!(
             msg.contains("changed") || msg.contains("planned"),
             "error must report planned-vs-live probe drift, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn wasm64_compile_proc_macro_with_real_toolchain_imports_env_var_and_reads_cargo_pkg_version() {
+        let home = std::env::var("HOME").expect("HOME");
+        let real_shelf = PathBuf::from(home).join(".blaze/v2/toolchain");
+        let tc_id = blaze_toolchain::PINNED;
+        if !real_shelf.join(tc_id.to_string()).exists() {
+            eprintln!("skipping wasm64_compile_proc_macro test: pinned toolchain {tc_id} not on shelf");
+            return;
+        }
+
+        let tmp = std::env::temp_dir().join(std::format!(
+            "blaze-wasm64-pm-getenv-prod-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let checkout_dir = tmp.join("checkout");
+        let store_dir = tmp.join("store");
+        let pkg_dir = tmp.join("caller_pkg");
+        std::fs::create_dir_all(checkout_dir.join("src")).expect("checkout src dir");
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        std::fs::create_dir_all(&pkg_dir).expect("caller pkg dir");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_shelf, store_dir.join("toolchain")).expect("symlink toolchain");
+        std::fs::write(
+            checkout_dir.join("Cargo.toml"),
+            "[package]\nname = \"demo_pm\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\nproc-macro = true\n",
+        )
+        .expect("write Cargo.toml");
+        std::fs::write(
+            checkout_dir.join("src/lib.rs"),
+            "extern crate proc_macro;\n\
+use proc_macro::TokenStream;\n\
+\n\
+#[proc_macro]\n\
+pub fn pkg_version(_input: TokenStream) -> TokenStream {\n\
+    let ver = std::env::var(\"CARGO_PKG_VERSION\").expect(\"CARGO_PKG_VERSION\");\n\
+    format!(\"\\\"{ver}\\\"\").parse().expect(\"tokens\")\n\
+}\n",
+        )
+        .expect("write src/lib.rs");
+
+        let frame = Frame::with_reserve(16 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let a = erased.handle();
+
+        let lock_text = "version = 4\n\n[[package]]\nname = \"demo_pm\"\nversion = \"0.1.0\"\n";
+        let lock = Lock::read(lock_text.as_bytes(), a).expect("parse lock");
+        let mut pm_unit = make_unit(0, "demo_pm", "demo_pm", UnitKind::ProcMacro, "2024", &[], a);
+        pm_unit.root = Text::from_str_in("src/lib.rs", a);
+        let graph = make_graph(std::vec![pm_unit], a);
+        let checkout = blaze_proc_macro::script_sandbox::RealRoot::of_start(
+            &checkout_dir,
+            blaze_own::planted::NoPlant,
+        )
+        .expect("open checkout");
+        let members = [(LockId(0), "", blaze_world::PathKind::Member)];
+        let producers = Producers::for_tests(b"wasm64-pm-getenv-test");
+        let heap = blaze_own::testing::heap();
+        let io = bstd::test::native(&checkout_dir).expect("native io");
+        let cx = io
+            .cx(core::time::Duration::from_secs(120), bstd::mem::TASK_FRAME)
+            .expect("cx");
+
+        let compiled = compile_unit_to_wasm64(
+            &cx,
+            &store_dir,
+            &graph,
+            None,
+            &lock,
+            &checkout,
+            &members,
+            &producers,
+            heap,
+            DepScriptProbes::default(),
+            UnitId(0),
+            CompileMode::ProcMacro,
+            0,
+        )
+        .expect("proc-macro compiles cleanly to wasm64 via production compile_unit_to_wasm64");
+
+        let checked = check_wasm64(&compiled.wasm).expect("valid wasm64");
+        assert!(checked.memory64);
+
+        // Verify the emitted wasm64 module imports `blaze_proc_macro_64::env_var`.
+        let mut has_env_var_import = false;
+        let read_leb = |bytes: &[u8], pos: &mut usize| -> u64 {
+            let mut v = 0u64;
+            let mut s = 0u32;
+            loop {
+                let b = bytes[*pos];
+                *pos += 1;
+                v |= u64::from(b & 0x7f) << s;
+                if b & 0x80 == 0 {
+                    return v;
+                }
+                s += 7;
+            }
+        };
+        let mut pos = 8usize;
+        while pos < compiled.wasm.len() {
+            let sec_id = compiled.wasm[pos];
+            pos += 1;
+            let sec_len = usize::try_from(read_leb(&compiled.wasm, &mut pos)).expect("sec len");
+            let sec_end = pos + sec_len;
+            if sec_id == 2 {
+                let count = read_leb(&compiled.wasm, &mut pos);
+                for _ in 0..count {
+                    let mlen = usize::try_from(read_leb(&compiled.wasm, &mut pos)).expect("mlen");
+                    let module = core::str::from_utf8(&compiled.wasm[pos..pos + mlen]).expect("mod");
+                    pos += mlen;
+                    let flen = usize::try_from(read_leb(&compiled.wasm, &mut pos)).expect("flen");
+                    let field = core::str::from_utf8(&compiled.wasm[pos..pos + flen]).expect("fld");
+                    pos += flen;
+                    if module == "blaze_proc_macro_64" && field == "env_var" {
+                        has_env_var_import = true;
+                    }
+                    let kind = compiled.wasm[pos];
+                    pos += 1;
+                    match kind {
+                        0x00 => {
+                            let _ = read_leb(&compiled.wasm, &mut pos);
+                        }
+                        0x01 => {
+                            pos += 1;
+                            let fl = compiled.wasm[pos];
+                            pos += 1;
+                            let _ = read_leb(&compiled.wasm, &mut pos);
+                            if fl & 1 != 0 {
+                                let _ = read_leb(&compiled.wasm, &mut pos);
+                            }
+                        }
+                        0x02 => {
+                            let fl = compiled.wasm[pos];
+                            pos += 1;
+                            let _ = read_leb(&compiled.wasm, &mut pos);
+                            if fl & 1 != 0 {
+                                let _ = read_leb(&compiled.wasm, &mut pos);
+                            }
+                        }
+                        0x03 => pos += 2,
+                        _ => break,
+                    }
+                }
+                break;
+            }
+            pos = sec_end;
+        }
+        assert!(
+            has_env_var_import,
+            "production compile_unit_to_wasm64 proc-macro MUST import blaze_proc_macro_64::env_var"
+        );
+
+        // Execute LIVE through `blaze_proc_macro::host::Runtime`!
+        let mod_dir = tmp.join("mod");
+        std::fs::create_dir_all(&mod_dir).expect("mod dir");
+        std::fs::write(mod_dir.join("module.wasm"), &compiled.wasm).expect("write module.wasm");
+        let digest = sha256_hex(&compiled.wasm);
+        let record = blaze_proc_macro::module::ModuleRecord {
+            key: digest.clone(),
+            name: std::string::String::from("demo_pm"),
+            version: std::string::String::from("0.1.0"),
+            wasm_sha256: digest,
+            macros: compiled.macros,
+            decls: std::string::String::from(PROC_MACRO_DECLS_GLOBAL),
+            dir: mod_dir.clone(),
+            compiled: mod_dir.join("compiled"),
+            native_dylib: None,
+        };
+        let rt = blaze_proc_macro::host::Runtime::new(heap).expect("Runtime");
+        let loaded = rt.load(&record).expect("load proc-macro");
+        let env = blaze_proc_macro::package_env::PackageEnv::set_only(std::vec![(
+            std::string::String::from("CARGO_PKG_VERSION"),
+            std::string::String::from("4.6.7-clap-test"),
+        )])
+        .expect("PackageEnv");
+        let pkg = Arc::new(
+            blaze_proc_macro::sandbox::Package::new(
+                blaze_proc_macro::sandbox::Files::Folder(pkg_dir),
+                env,
+            )
+            .expect("Package"),
+        );
+        let input = blaze_expand::lex("", blaze_expand::Edition::E2024, heap.alloc()).expect("lex");
+        let call = blaze_expand::ProcCall {
+            kind: blaze_expand::ProcKind::FnLike,
+            input: &input,
+            attr_args: None,
+            file: Ok("src/lib.rs"),
+        };
+        let ran = rt
+            .expand(
+                &loaded,
+                &record.macros[0],
+                &call,
+                blaze_expand::Edition::E2024,
+                pkg,
+                blaze_proc_macro::host::Limits::STANDARD,
+                heap.alloc(),
+            )
+            .expect("expand demo_pm::pkg_version");
+        let rendered: std::string::String = ran
+            .produced
+            .tokens
+            .tokens()
+            .iter()
+            .map(|t| ran.produced.tokens.text_of(t))
+            .collect();
+        assert_eq!(rendered, "4.6.7-clap-test");
+        assert!(
+            ran.produced
+                .reads
+                .list()
+                .iter()
+                .any(|r| ran.produced.reads.subject(r) == "env:CARGO_PKG_VERSION"),
+            "expected tracked env:CARGO_PKG_VERSION read"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -468,6 +468,11 @@ impl<'t> Inputs<'t> {
         out
     }
 
+    /// The source texts table (`SourceTexts`) backing this crate set.
+    pub fn texts(&'t self) -> &'t Texts<'t> {
+        &self.texts
+    }
+
     /// Every crate's names, resolved together, held in `bump` (the caller's arena, alive as long as
     /// the names), with per-call macro scratch rolled back after each expansion.
     pub fn resolve(&'t self, crates: &[CrateInput<'t>], bump: Bump<'t>) -> Result<Names<'t>, NamesError<'t>> {
