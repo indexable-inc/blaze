@@ -5,8 +5,11 @@
 //! build script gets (native_script.rs `run_script`), narrowed to one compile:
 //!
 //! - the program: `bin/clang-23` of the shelf, run with `-fintegrated-cc1 -c` and
-//!   `--no-default-config`, so it starts no helper (no `helpers`: it may exec nothing) and reads
-//!   no `clang.cfg`;
+//!   `--no-default-config`, reading no `clang.cfg`; C/C++ compiles run a single `-cc1` job
+//!   in-process (no `helpers`: Linux seccomp refuses `clone` without `CLONE_THREAD`), while
+//!   assembly (`.S` / `-xassembler-with-cpp` / `.s`) and `-save-temps*`/`-fno-integrated-cc1`
+//!   compiles spawn `clang-23` itself for `-cc1 -E` / `-cc1as` (`helpers: &[self.clang]`:
+//!   Landlock still permits executing only that one binary and no other);
 //! - reads: the package's folder, the script's `OUT_DIR` as its record laid, each dependency's
 //!   laid `OUT_DIR` (`DEP_*_INCLUDE`), the SDK, the shelf: each a tree root named by its
 //!   digest ([`Laid`]); nothing else but macOS's loader reads;
@@ -510,6 +513,18 @@ fn lang_flags(lang: Lang) -> &'static [&'static str] {
     }
 }
 
+/// Whether `clang-23` will `posix_spawn` itself during `compile`:
+/// - `Lang::AsmCpp` (`.S` / `-xassembler-with-cpp`) runs two jobs (`-cc1 -E` + `-cc1as`), and
+///   `Lang::Asm` runs `-cc1as` (two jobs on Darwin); clang's `-fintegrated-cc1` cannot run
+///   multi-job pipelines in-process, so it spawns `self.clang`.
+/// - Explicit `-fno-integrated-cc1` or `-save-temps*` on C/C++ also spawns `self.clang`.
+/// Plain C/C++ compiles run a single `-cc1` job in-process and stay at `helpers: &[]` so Linux
+/// seccomp keeps `Filter { processes: false }` (`clone` without `CLONE_THREAD` returns `EPERM`).
+fn needs_self_exec(lang: Lang, args: &[&str]) -> bool {
+    matches!(lang, Lang::Asm | Lang::AsmCpp)
+        || args.iter().any(|arg| *arg == "-fno-integrated-cc1" || *arg == "-save-temps" || arg.starts_with("-save-temps="))
+}
+
 fn refused<'a>(alloc: Alloc<'a>, parts: &[&str]) -> Refused<'a> {
     let mut words = String::new_in(alloc);
     for part in parts {
@@ -656,6 +671,8 @@ impl CCompiler for ShelfClang<'_> {
         files.clear_output().map_err(|_| refused(alloc, &["the task folder could not be emptied: ", self.task_out]))?;
         let env = [("SOURCE_DATE_EPOCH", "0")];
         let report = RelPath::new(DEPFILE, blaze_roots::Limits::SHIPPED.most_path).map_err(|_| refused(alloc, &["the depfile's name"]))?;
+        let self_clang = [self.clang];
+        let helpers: &[&str] = if needs_self_exec(unit.lang, unit.args.as_slice()) { &self_clang } else { &[] };
         let spec = HermeticSpec::new(HermeticOpts {
             program: Program::Stored { name: "clang", digest: Digest(self.shelf.digest), path: self.clang },
             args: &args,
@@ -663,7 +680,7 @@ impl CCompiler for ShelfClang<'_> {
             roots,
             mounts: &mounts,
             cwd: self.task_out,
-            helpers: &[],
+            helpers,
             helper_folders: &[],
             channels: &[],
             clock: ClockSpec::Fixed { unix_secs: 0 },
@@ -738,9 +755,69 @@ fn replace_all<'a>(text: &str, from: &str, to: &str, alloc: Alloc<'a>) -> AStrin
 
 #[cfg(test)]
 mod tests {
-    use super::{Depfile, Laid, PATH_MOST, join, laid_of, lang_flags, push_linux_sysroot_flags};
+    use core::time::Duration;
+
+    use super::{Depfile, Laid, PATH_MOST, join, laid_of, lang_flags, needs_self_exec, push_linux_sysroot_flags};
     use blaze_build_script::c_tasks::Lang;
-    use bstd::procs::hermetic::ReportParser;
+    use blaze_core::wait::Deadline;
+    use blaze_roots::{Digest, Mount, Root, RootId, RootKind, Roots};
+    use bstd::procs::hermetic::{Budget, Capture, ClockSpec, HermeticOpts, HermeticSpec, HermeticStreams, Level, Program, ReportParser, ReportSpec};
+
+    /// Assembly compiles (`.S` / `-xassembler-with-cpp` like `psm` and `ring`, and `.s`) invoke
+    /// `clang-23` subprocesses via `posix_spawn` (`-cc1 -E` + `-cc1as`) and therefore must name
+    /// `clang-23` alone as a helper so Linux seccomp permits `clone` while Landlock keeps exec
+    /// restricted to that single binary. Plain C/C++ compiles run `-cc1` in-process and keep
+    /// `helpers: &[]` (`starts_programs() == false`).
+    #[test]
+    fn self_exec_helpers_match_clang_job_model() {
+        assert!(needs_self_exec(Lang::AsmCpp, &[]));
+        assert!(needs_self_exec(Lang::Asm, &[]));
+        assert!(!needs_self_exec(Lang::C, &["-O2", "-fPIC"]));
+        assert!(!needs_self_exec(Lang::Cxx, &["-std=c++20"]));
+        assert!(needs_self_exec(Lang::C, &["-O2", "-save-temps=obj"]));
+        assert!(needs_self_exec(Lang::C, &["-save-temps"]));
+        assert!(needs_self_exec(Lang::Cxx, &["-fno-integrated-cc1"]));
+
+        let clang = "/shelf/bin/clang-23";
+        let roots_arr = [
+            Root { name: "shelf", kind: RootKind::Tree { tree: Digest([1; 32]) } },
+            Root { name: "out", kind: RootKind::Output },
+        ];
+        let mounts_arr = [
+            Mount { spelling: b"/shelf", root: RootId(0) },
+            Mount { spelling: b"/task", root: RootId(1) },
+        ];
+        let roots = Roots::new(&roots_arr).expect("roots");
+        let self_clang = [clang];
+        let build_spec = |lang: Lang| {
+            let helpers: &[&str] = if needs_self_exec(lang, &[]) { &self_clang } else { &[] };
+            HermeticSpec::new(HermeticOpts {
+                program: Program::Stored { name: "clang", digest: Digest([1; 32]), path: clang },
+                args: &["-c"],
+                env: &[("SOURCE_DATE_EPOCH", "0")],
+                roots,
+                mounts: &mounts_arr,
+                cwd: "/task",
+                helpers,
+                helper_folders: &[],
+                channels: &[],
+                clock: ClockSpec::Fixed { unix_secs: 0 },
+                seed: 0,
+                budget: Budget { cpu: Duration::from_secs(10), memory: 1 << 30, steps: None },
+                deadline: Deadline::after(Duration::ZERO, Duration::from_secs(10)),
+                streams: HermeticStreams { stdout: Capture::Keep { most: 4096 }, stderr: Capture::Keep { most: 4096 } },
+                level: Level::Inputs,
+                report: ReportSpec::WholeRoots,
+            })
+            .expect("valid hermetic spec")
+        };
+        let asm_spec = build_spec(Lang::AsmCpp);
+        assert!(asm_spec.starts_programs(), "AsmCpp must allow clang self-spawn on Linux seccomp");
+        assert_eq!(asm_spec.helpers(), [clang]);
+        let c_spec = build_spec(Lang::C);
+        assert!(!c_spec.starts_programs(), "plain C compile must keep Filter {{ processes: false }}");
+        assert!(c_spec.helpers().is_empty());
+    }
 
     /// aws-lc's and ring's `.S`: clang's preprocessor writes a temporary file the assembler reads;
     /// in the grant's world only the task folder may be written, so `.S` names it there. Twin:
