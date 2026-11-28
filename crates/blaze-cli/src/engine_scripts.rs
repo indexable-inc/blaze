@@ -1939,7 +1939,7 @@ impl<'f> ScriptsStage<'f> {
                     }
                     (Ok(true), Some(PlannedProbe::Digest(planned_hex))) => match handles.probes.dep_probe_identity_hex(cx) {
                         Ok(live_hex) if live_hex == *planned_hex => (
-                            Some(crate::wasm64_compile::fold_dep_probes_opt(module.deps.as_deref(), planned_hex.as_str(), queue.jobs)),
+                            Some(crate::wasm64_compile::fold_dep_probes_opt(module.deps, planned_hex.as_str(), queue.jobs)),
                             Some(*planned_hex),
                         ),
                         Ok(live_hex) => {
@@ -1980,7 +1980,7 @@ impl<'f> ScriptsStage<'f> {
                         );
                         return Ok(Dispatch::Answered(Completed::answer(drive, Did::Hole(failed, work::held_str(words.as_str(), frame)))?));
                     }
-                    (Ok(false), None) => (module.deps.as_deref().map(|s| &*queue.jobs.alloc_str(s)), None),
+                    (Ok(false), None) => (module.deps, None),
                     (Err(error), _) => {
                         let failed = TaskFailure { name, why: Why::Refused { what: "the build-script wasm64 dependency graph lookup failed", rule: crate::script_modules::RULE } };
                         let words = bstd::mem::format_in!(frame, "the build script of {} {}: {error}", module.package, module.version);
@@ -1988,13 +1988,13 @@ impl<'f> ScriptsStage<'f> {
                     }
                 }
             } else {
-                (module.deps.as_deref().map(|s| &*queue.jobs.alloc_str(s)), None)
+                (module.deps, None)
             };
             let wanted = crate::script_modules::Wanted {
                 script_unit: module.script_unit,
                 ran_as: module.ran_as, package: module.package, version: module.version,
-                features: queue.jobs.alloc_slice_copy(&module.features),
-                files: module.files.as_deref().map(|s| &*queue.jobs.alloc_str(s)),
+                features: module.features,
+                files: module.files,
                 deps,
                 expected_probes,
             };

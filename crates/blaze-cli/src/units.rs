@@ -2093,8 +2093,8 @@ dev-dep = { path = \"../dev-dep\" }
             let graph = mk_graph();
             let wasm_graph = mk_graph();
             let ro = root.read_only();
-            let files = crate::macro_files::script_files_digest_in_dir(&cx, &ro, "crates/app", "build.rs", frame);
-            let deps_wg = blaze_proc_macro::script_unit::script_deps_digest(
+            let files = crate::macro_files::script_files_digest_in_dir(&cx, &ro, "crates/app", "build.rs", frame, frame);
+            let deps_wg = blaze_proc_macro::script_unit::script_deps_digest_with(
                 &graph,
                 Some(&wasm_graph),
                 lock,
@@ -2103,11 +2103,12 @@ dev-dep = { path = \"../dev-dep\" }
                     members
                         .iter()
                         .find(|p| p.id == dep_pkg)
-                        .and_then(|p| crate::macro_files::package_files_digest_in_dir(&cx, &ro, p.dir.as_str(), frame))
+                        .and_then(|p| crate::macro_files::package_files_digest_in_dir(&cx, &ro, p.dir.as_str(), frame, frame))
                 },
+                frame,
             )
             .expect("deps with wg");
-            let deps_no_wg = blaze_proc_macro::script_unit::script_deps_digest(
+            let deps_no_wg = blaze_proc_macro::script_unit::script_deps_digest_with(
                 &graph,
                 None,
                 lock,
@@ -2116,12 +2117,13 @@ dev-dep = { path = \"../dev-dep\" }
                     members
                         .iter()
                         .find(|p| p.id == dep_pkg)
-                        .and_then(|p| crate::macro_files::package_files_digest_in_dir(&cx, &ro, p.dir.as_str(), frame))
+                        .and_then(|p| crate::macro_files::package_files_digest_in_dir(&cx, &ro, p.dir.as_str(), frame, frame))
                 },
+                frame,
             )
             .expect("deps without wg");
-            let sub_wg = crate::script_modules::subject(crate::scripts::RanAs::Wasm, "app", "0.1.0", &[], files.as_deref(), deps_wg.as_deref());
-            let sub_no_wg = crate::script_modules::subject(crate::scripts::RanAs::Wasm, "app", "0.1.0", &[], files.as_deref(), deps_no_wg.as_deref());
+            let sub_wg = crate::script_modules::subject(crate::scripts::RanAs::Wasm, "app", "0.1.0", &[], files, deps_wg.as_deref());
+            let sub_no_wg = crate::script_modules::subject(crate::scripts::RanAs::Wasm, "app", "0.1.0", &[], files, deps_no_wg.as_deref());
             (source, sub_wg, sub_no_wg)
         };
 

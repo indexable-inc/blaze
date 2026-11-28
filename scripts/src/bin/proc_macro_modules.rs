@@ -1237,35 +1237,68 @@ fn inherit(member: &str, root: &str, root_dir: &Path, path: &Path) -> Result<Str
 /// a stack of folders.
 fn files_digest(dir: &Path) -> Result<String, Failure> {
     use blaze_build_script::served::{InPackage, in_package};
-    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut folders = vec![(dir.to_owned(), String::new())];
-    while let Some((folder, relative)) = folders.pop() {
+    let mut files: Vec<(Vec<u8>, PathBuf)> = Vec::new();
+    let mut folders: Vec<(Vec<u8>, PathBuf)> = vec![(Vec::new(), dir.to_owned())];
+    while let Some((relative, folder)) = folders.pop() {
         for entry in std::fs::read_dir(&folder).map_err(io(&folder))? {
             let entry = entry.map_err(io(&folder))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
+            let file_name = entry.file_name();
+            let raw_name = file_name.as_encoded_bytes();
             let path = entry.path();
             let kind = entry.file_type().map_err(io(&path))?;
             let place = if relative.is_empty() { InPackage::Root } else { InPackage::Beneath };
-            if !in_package(entry.file_name().as_encoded_bytes(), kind.is_dir(), place) {
+            if !in_package(raw_name, kind.is_dir(), place) {
                 continue;
             }
-            let at = if relative.is_empty() { name.clone() } else { format!("{relative}/{name}") };
+            let mut at = Vec::with_capacity(relative.len() + usize::from(!relative.is_empty()) + raw_name.len());
+            if !relative.is_empty() {
+                at.extend_from_slice(&relative);
+                at.push(b'/');
+            }
+            at.extend_from_slice(raw_name);
             if kind.is_dir() {
-                folders.push((path, at));
+                folders.push((at, path));
             } else if kind.is_file() {
-                files.push((at, std::fs::read(&path).map_err(io(&path))?));
+                files.push((at, path));
             }
         }
     }
-    files.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-    let mut all = Vec::new();
-    for (path, bytes) in &files {
-        all.extend_from_slice(path.as_bytes());
-        all.push(0);
-        all.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        all.extend_from_slice(bytes);
+    files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = blaze_sha256::Sha256::new();
+    let mut chunk = [0u8; 64 * 1024];
+    for (rel_bytes, path) in &files {
+        let mut file = std::fs::File::open(path).map_err(io(path))?;
+        let expected_len = file.metadata().map_err(io(path))?.len();
+        hasher.update(rel_bytes);
+        hasher.update(&[0]);
+        hasher.update(&expected_len.to_le_bytes());
+        let mut total: u64 = 0;
+        loop {
+            match std::io::Read::read(&mut file, &mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let Some(slice) = chunk.get(..n) else { break };
+                    total = total.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+                    if total > expected_len {
+                        return Err(io(path)(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "file grew while streaming files_digest",
+                        )));
+                    }
+                    hasher.update(slice);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(io(path)(e)),
+            }
+        }
+        if total != expected_len {
+            return Err(io(path)(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "file shrank while streaming files_digest",
+            )));
+        }
     }
-    Ok(sha256(&all))
+    Ok(hex(&hasher.finish()))
 }
 
 /// The names of a vendored manifest's `[features]` table, `default` among them when it has

@@ -95,7 +95,7 @@ blaze-own	191
 blaze-pbr	71
 blaze-phf	26
 blaze-preview	2
-blaze-proc-macro	231
+blaze-proc-macro	230
 blaze-producers	3
 blaze-protocol	107
 blaze-radix	30
