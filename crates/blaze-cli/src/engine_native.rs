@@ -1216,7 +1216,7 @@ pub(crate) fn image_in<'w>(
             reads.push((script.name, script.out));
         }
     }
-    let encoded = crate::store::record_codec::encode_selective_in(image.as_slice(), scratch)
+    let encoded = crate::store::record_codec::encode_selective_in(image.as_slice(), NATIVE_IMAGE_MAX_BYTES, scratch)
         .map_err(|why| NativeError::Link { what: "compressing the program's native image", words: held(bstd::mem::format_in!(scratch, "{why}").as_str(), ask) })?;
     let stored_payload = encoded.as_slice();
     let head = blaze_drive::record::write_plain_head(record_name, key.0, out, &reads, stored_payload.len(), alloc);
@@ -1766,7 +1766,7 @@ mod tests {
         // 2. Small (< 4 KiB) raw payload stays zero-copy (Decoded::Borrowed, not compressed).
         let mut small_raw = std::vec![0xcf, 0xfa, 0xed, 0xfe];
         small_raw.resize(1024, 0xab);
-        let enc_small = crate::store::record_codec::encode_selective_in(&small_raw, &f.scratch).expect("encode small");
+        let enc_small = crate::store::record_codec::encode_selective_in(&small_raw, NATIVE_IMAGE_MAX_BYTES, &f.scratch).expect("encode small");
         assert!(!enc_small.is_compressed(), "small payloads stay raw");
         let dec_small = decode_image_payload(made.key, enc_small.as_slice(), &f.scratch).expect("decode small");
         assert!(!dec_small.was_compressed(), "raw payloads borrow zero-copy");
