@@ -267,7 +267,7 @@ fn module_decls_round_trip_in_source_order() {
                 true => ExternTarget::SelfCrate,
                 false => ExternTarget::Dep(name(tape)),
             };
-            decls.extern_crates.push(ExternCrateDecl { target, rename: rename(tape), vis: written(tape) });
+            decls.extern_crates.push(ExternCrateDecl { target, rename: rename(tape), vis: written(tape), macro_use: tape.coin("extern_macro_use") });
         }
         if tape.coin("a macro_rules") {
             decls.macro_rules.push(MacroRulesDecl { name: name(tape), def: key(150), pos: 20, export: tape.coin("export"), shapes: shapes(tape) });

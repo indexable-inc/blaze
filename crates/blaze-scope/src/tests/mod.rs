@@ -374,7 +374,11 @@ impl World {
     }
 
     pub(crate) fn extern_crate(&mut self, at: ItemKey, target: ExternTarget<N>, rename: Rename<N>, vis: V) {
-        self.d(at).extern_crates.push(ExternCrateDecl { target, rename, vis: vis.decl() });
+        self.d(at).extern_crates.push(ExternCrateDecl { target, rename, vis: vis.decl(), macro_use: false });
+    }
+
+    pub(crate) fn extern_crate_macro_use(&mut self, at: ItemKey, target: ExternTarget<N>, rename: Rename<N>, vis: V) {
+        self.d(at).extern_crates.push(ExternCrateDecl { target, rename, vis: vis.decl(), macro_use: true });
     }
 
     /// `macro_rules! name`.

@@ -1712,6 +1712,7 @@ pub(crate) fn resolve_one_with<'a, 'r, 'p: 'a, S: SourceTexts<'a>, P: Par>(
     let mut fill: Fill<'a, &'a str> = Fill::new_in(alloc);
     fill.first = first;
     let added_externs: AVec<'a, (&'a str, ItemKey)>;
+    let added_macro_use: AVec<'a, ItemKey>;
     let shapes: AVec<'a, crate::GroupShape<'a>>;
     let cuts: AVec<'a, ((ItemKey, u32), u32)>;
     {
@@ -1798,6 +1799,7 @@ pub(crate) fn resolve_one_with<'a, 'r, 'p: 'a, S: SourceTexts<'a>, P: Par>(
         }
         fill.done = solved.done;
         added_externs = solved.added_externs;
+        added_macro_use = solved.added_macro_use;
         shapes = solved.groups;
         cuts = solved.cuts;
     }
@@ -1809,6 +1811,15 @@ pub(crate) fn resolve_one_with<'a, 'r, 'p: 'a, S: SourceTexts<'a>, P: Par>(
         crate_root_record.extern_prelude.extend_from_slice(&added_externs);
         crate_root_record.extern_prelude.sort_by(|a, b| a.0.cmp(b.0));
         crate_root_record.extern_prelude.dedup_by_key(|it| it.0);
+    }
+    // Macro-written root `#[macro_use] extern crate` items' dependency roots also belong in the
+    // crate root record's `#[macro_use]` prelude (e.g. reqwest's `if_hyper! { #[macro_use]
+    // extern crate doc_comment; }`), preserving order so downstream lexical lookups and body
+    // solves see them too.
+    for root in added_macro_use {
+        if crate_root_record.macro_use.scan_for(&root).is_none() {
+            crate_root_record.macro_use.push(root);
+        }
     }
     // Synthesize the proc-macro crate's `_DECLS` harness static AFTER macro expansion completes
     // so macro-generated `#[proc_macro*]` exports (e.g. `derive_more-impl`'s `create_derive!`)
@@ -2435,7 +2446,7 @@ fn root_record_of<'a>(
     // there. The written name is read from the root's own text; one a root macro call writes
     // is not seen (stated gap).
     if let Some(name) = plan.injected.filter(|name| input.edition == Edition::E2015 || !root_binds_type(&low.decls[0], name)) {
-        low.decls[0].extern_crates.push(ExternCrateDecl { target: ExternTarget::Dep(name), rename: Rename::Same, vis: WrittenVis::Private });
+        low.decls[0].extern_crates.push(ExternCrateDecl { target: ExternTarget::Dep(name), rename: Rename::Same, vis: WrittenVis::Private, macro_use: true });
     }
     let root_input = RootInput {
         krate: input.key,

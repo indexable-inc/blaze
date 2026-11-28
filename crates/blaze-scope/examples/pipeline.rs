@@ -1714,7 +1714,7 @@ impl<'a> Lower<'a> {
                     Rename::To("_") => Rename::Underscore,
                     other => other,
                 };
-                self.out.decls.extern_crates.push(ExternCrateDecl { target, rename, vis });
+                self.out.decls.extern_crates.push(ExternCrateDecl { target, rename, vis, macro_use: attrs.macro_use });
             }
             ItemDetail::ExternBlock { .. } => self.items(Some(idx)),
             ItemDetail::MacroRules { exported } => {

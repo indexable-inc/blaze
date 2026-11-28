@@ -797,6 +797,9 @@ struct Outer<'a, N> {
     /// The `#[macro_use]` prelude of other crates' exported macros is not empty: a macro name
     /// that misses before it is not known here.
     macro_use: bool,
+    /// The dependency root modules macro-written root `#[macro_use] extern crate` items added
+    /// to `Cells::macro_use`, in the order added.
+    added_macro_use: AVec<'a, ItemKey>,
 }
 
 pub(crate) struct Cells<'a, N> {
@@ -1360,6 +1363,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 foreign: ABTreeMap::new_in(alloc),
                 foreign_open: false,
                 macro_use: false,
+                added_macro_use: AVec::new_in(alloc),
             },
             tools: AVec::new_in(alloc),
             builtin_attrs: AVec::new_in(alloc),
@@ -1850,7 +1854,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
         for (k, ec) in d.extern_crates.iter().enumerate() {
             let vis = self.import_vis(m, &ec.vis, vis::VisAt { module: m, frag: fid, ord: (vis::ORD_EXTERN_CRATE, k as u32) })?;
-            self.extern_crate(m, ec.target, ec.rename, vis, fid, up.is_some())?;
+            self.extern_crate(m, ec.target, ec.rename, vis, ec.macro_use, fid, up.is_some())?;
         }
         for r in d.macro_rules.iter() {
             let def = Def { key: r.def, kind: DefKind::Macro(r.shapes) };
@@ -2038,7 +2042,16 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// place of a dependency's: `.. as n;` beside a dependency's `n` is R8's error (rustc's
     /// "macro-expanded `extern crate` items cannot shadow names passed with `--extern`"). The
     /// root text's own are in the root record's extern prelude already.
-    fn extern_crate(&mut self, m: ModId, target: ExternTarget<N>, rename: Rename<N>, vis: Visibility, fid: FragId, expanded: bool) -> Result<(), CellError> {
+    fn extern_crate(
+        &mut self,
+        m: ModId,
+        target: ExternTarget<N>,
+        rename: Rename<N>,
+        vis: Visibility,
+        macro_use: bool,
+        fid: FragId,
+        expanded: bool,
+    ) -> Result<(), CellError> {
         let (root, written) = match target {
             ExternTarget::Dep(name) => (self.dep_roots.binary_search_by(|d| d.0.cmp(&name)).ok().map(|k| self.dep_roots[k].1), Some(name)),
             ExternTarget::SelfCrate => (Some(self.modules[self.root as usize].key), None),
@@ -2054,6 +2067,15 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             }
             return Ok(());
         };
+        // A macro-written root `#[macro_use] extern crate dep;` (including `as alias` and `as _`)
+        // adds `dep`'s root to the `#[macro_use]` prelude (Reference `names.preludes.macro_use`).
+        // Root-text items are already in `self.macro_use` from the crate root record. Only
+        // dependency crates (not `extern crate self`) at the crate root enter this prelude.
+        if expanded && macro_use && m == self.root && written.is_some() && self.macro_use.scan_for(&root).is_none() {
+            self.macro_use.push(root);
+            self.outer.macro_use = true;
+            self.outer.added_macro_use.push(root);
+        }
         let Some(name) = bound else { return Ok(()) };
         if self.plant == CellPlant::ExternCrateBindsNothing {
             return Ok(());
@@ -3709,8 +3731,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     if let Some(j) = self.growing(m, me, guess) {
                         return Step::Wait(Node::Item(j));
                     }
-                    // The extern prelude may still grow by a root call's `extern crate .. as`.
-                    if ns == Namespace::Types
+                    // The extern prelude may still grow by a root call's `extern crate .. as`,
+                    // and the `#[macro_use]` prelude by a root call's `#[macro_use] extern crate`.
+                    if matches!(ns, Namespace::Types | Namespace::Macros)
                         && let Some(j) = self.growing(self.root, me, guess)
                     {
                         return Step::Wait(Node::Item(j));

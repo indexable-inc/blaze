@@ -385,3 +385,258 @@ pub mod parent_bad {
         "control: legacy #[macro_export] macro_rules! in #[macro_use] prelude must still conflict with `use super::*;`"
     );
 }
+
+/// Macro-expanded `#[macro_use] extern crate dep;` at the crate root imports `dep`'s exported
+/// macros into the `#[macro_use]` prelude for both the crate root (including calls inside the
+/// same expansion and siblings before/after it) and child modules, in fresh `Names` and encoded
+/// `RecordNames` alike (reqwest's `if_hyper! { #[macro_use] extern crate doc_comment; doctest!(..); }`).
+#[test]
+fn macro_expanded_macro_use_extern_crate_imports_macros() {
+    static DEP: &str = "#![no_core]
+pub struct DepType;
+#[macro_export]
+macro_rules! dep_macro {
+    ($name:ident) => { pub struct $name; };
+}
+";
+    static USER: &str = "#![no_core]
+macro_rules! if_hyper {
+    ($($item:item)*) => { $($item)* };
+}
+pub mod before {
+    dep_macro!(FromBefore);
+}
+if_hyper! {
+    #[macro_use]
+    extern crate dep;
+    dep_macro!(FromExpansion);
+}
+dep_macro!(FromRoot);
+pub mod after {
+    dep_macro!(FromAfter);
+}
+";
+    static FILES: Texts = Texts(&[&[("/dep/lib.rs", DEP)], &[("/user/lib.rs", USER)]]);
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
+    let inputs = [input("dep", "/dep/lib.rs", &[]), input("user", "/user/lib.rs", &[("dep", 0)])];
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), &FILES, &Serial, &Ready::serial(WAIT), bump)
+        .unwrap_or_else(|e| panic!("solve: {e:?}"));
+    let all: Vec<&'static CrateNames<'static>> = solved.iter().map(|s| s.names).collect();
+    for (i, c) in all.iter().enumerate() {
+        assert!(c.notes.is_empty(), "crate {i}: unexpected notes {:?}", c.notes);
+        for (m, done) in c.done.iter() {
+            assert!(done.scope.errors.is_empty(), "crate {i} module {m:x} had unexpected errors: {:?}", done.scope.errors);
+        }
+    }
+    let fresh = Names::of_crates(&inputs, Sysroot::default(), &all, g).unwrap_or_else(|e| panic!("names: {e:?}"));
+    let records: Vec<&'static [u8]> = all.iter().map(|n| aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), bump)).collect();
+    let keys: Vec<CrateItemKey> = all.iter().map(|n| n.key).collect();
+    let read = RecordNames::new(&keys, Loaded(records), g);
+    let dep_root = fresh.root(0);
+    let user_root = fresh.root(1);
+    let [want_mac, _] = macro_at(&fresh, &read, dep_root, "dep_macro");
+    let want_mac = want_mac.unwrap_or_else(|e| panic!("dep_macro in dep: {e:?}"));
+
+    for (label, segments) in [
+        ("FromExpansion", &["FromExpansion"][..]),
+        ("FromRoot", &["FromRoot"][..]),
+        ("before::FromBefore", &["before", "FromBefore"][..]),
+        ("after::FromAfter", &["after", "FromAfter"][..]),
+    ] {
+        let w = Written { kind: PathKind::Plain, segments };
+        let a = path(&fresh, user_root, Namespace::Types, w, g);
+        let b = path(&read, user_root, Namespace::Types, w, g);
+        assert!(a.is_ok() && a == b, "`{label}`: fresh {a:?}, records {b:?}");
+    }
+    let before_mod = path(&fresh, user_root, Namespace::Types, Written { kind: PathKind::Plain, segments: &["before"] }, g)
+        .unwrap_or_else(|e| panic!("before mod: {e:?}"))
+        .def
+        .key;
+    let after_mod = path(&fresh, user_root, Namespace::Types, Written { kind: PathKind::Plain, segments: &["after"] }, g)
+        .unwrap_or_else(|e| panic!("after mod: {e:?}"))
+        .def
+        .key;
+    for (place, module) in [("root", user_root), ("before", before_mod), ("after", after_mod)] {
+        for (side, got) in ["fresh", "records"].into_iter().zip(macro_at(&fresh, &read, module, "dep_macro")) {
+            assert_eq!(got.map(|r| r.def), Ok(want_mac.def), "`dep_macro` in {place} ({side})");
+        }
+    }
+}
+
+/// Macro-expanded `#[macro_use] extern crate dep as _;` and `#[macro_use] extern crate dep as alias;`
+/// both import `dep`'s exported macros; `as _` adds no type-namespace binding in the root while
+/// `as alias` binds `alias` in both the root and the extern prelude.
+#[test]
+fn macro_expanded_macro_use_extern_crate_as_underscore_and_alias() {
+    static DEP: &str = "#![no_core]
+pub struct DepType;
+#[macro_export]
+macro_rules! dep_macro {
+    ($name:ident) => { pub struct $name; };
+}
+";
+    static UNDERSCORE: &str = "#![no_core]
+macro_rules! if_hyper {
+    ($($item:item)*) => { $($item)* };
+}
+if_hyper! {
+    #[macro_use]
+    extern crate dep as _;
+    dep_macro!(FromUnderscore);
+}
+pub mod sub {
+    dep_macro!(FromSub);
+}
+";
+    static ALIAS: &str = "#![no_core]
+macro_rules! if_hyper {
+    ($($item:item)*) => { $($item)* };
+}
+if_hyper! {
+    #[macro_use]
+    extern crate dep as alias;
+    dep_macro!(FromAlias);
+}
+pub use ::alias::DepType as Reexported;
+";
+    static FILES_UNDERSCORE: Texts = Texts(&[&[("/dep/lib.rs", DEP)], &[("/user/lib.rs", UNDERSCORE)]]);
+    static FILES_ALIAS: Texts = Texts(&[&[("/dep/lib.rs", DEP)], &[("/user/lib.rs", ALIAS)]]);
+
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
+    let inputs = [input("dep", "/dep/lib.rs", &[]), input("user", "/user/lib.rs", &[("dep", 0)])];
+
+    // 1. `#[macro_use] extern crate dep as _;`
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), &FILES_UNDERSCORE, &Serial, &Ready::serial(WAIT), bump)
+        .unwrap_or_else(|e| panic!("underscore solve: {e:?}"));
+    let all: Vec<&'static CrateNames<'static>> = solved.iter().map(|s| s.names).collect();
+    for (i, c) in all.iter().enumerate() {
+        assert!(c.notes.is_empty(), "underscore crate {i}: notes {:?}", c.notes);
+        for (m, done) in c.done.iter() {
+            assert!(done.scope.errors.is_empty(), "underscore crate {i} module {m:x} errors: {:?}", done.scope.errors);
+        }
+    }
+    let fresh = Names::of_crates(&inputs, Sysroot::default(), &all, g).unwrap_or_else(|e| panic!("names: {e:?}"));
+    let records: Vec<&'static [u8]> = all.iter().map(|n| aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), bump)).collect();
+    let keys: Vec<CrateItemKey> = all.iter().map(|n| n.key).collect();
+    let read = RecordNames::new(&keys, Loaded(records), g);
+    let user_root = fresh.root(1);
+    for segments in [&["FromUnderscore"][..], &["sub", "FromSub"][..]] {
+        let w = Written { kind: PathKind::Plain, segments };
+        let a = path(&fresh, user_root, Namespace::Types, w, g);
+        let b = path(&read, user_root, Namespace::Types, w, g);
+        assert!(a.is_ok() && a == b, "underscore {segments:?}: fresh {a:?}, records {b:?}");
+    }
+    for (side, got) in ["fresh", "records"].into_iter().zip(macro_at(&fresh, &read, user_root, "dep_macro")) {
+        assert!(got.is_ok(), "underscore `dep_macro` ({side}): {got:?}");
+    }
+    // `as _` binds nothing in the module's own scope (`self::dep` is not found).
+    let self_dep = Written { kind: PathKind::SelfMod, segments: &["dep"] };
+    assert!(not_found(&path(&fresh, user_root, Namespace::Types, self_dep, g)), "`self::dep` must not be bound by `as _`");
+
+    // 2. `#[macro_use] extern crate dep as alias;`
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), &FILES_ALIAS, &Serial, &Ready::serial(WAIT), bump)
+        .unwrap_or_else(|e| panic!("alias solve: {e:?}"));
+    let all: Vec<&'static CrateNames<'static>> = solved.iter().map(|s| s.names).collect();
+    for (i, c) in all.iter().enumerate() {
+        assert!(c.notes.is_empty(), "alias crate {i}: notes {:?}", c.notes);
+        for (m, done) in c.done.iter() {
+            assert!(done.scope.errors.is_empty(), "alias crate {i} module {m:x} errors: {:?}", done.scope.errors);
+        }
+    }
+    let fresh = Names::of_crates(&inputs, Sysroot::default(), &all, g).unwrap_or_else(|e| panic!("names: {e:?}"));
+    let records: Vec<&'static [u8]> = all.iter().map(|n| aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), bump)).collect();
+    let keys: Vec<CrateItemKey> = all.iter().map(|n| n.key).collect();
+    let read = RecordNames::new(&keys, Loaded(records), g);
+    let user_root = fresh.root(1);
+    for segments in [&["FromAlias"][..], &["Reexported"][..]] {
+        let w = Written { kind: PathKind::Plain, segments };
+        let a = path(&fresh, user_root, Namespace::Types, w, g);
+        let b = path(&read, user_root, Namespace::Types, w, g);
+        assert!(a.is_ok() && a == b, "alias {segments:?}: fresh {a:?}, records {b:?}");
+    }
+    for (side, got) in ["fresh", "records"].into_iter().zip(macro_at(&fresh, &read, user_root, "dep_macro")) {
+        assert!(got.is_ok(), "alias `dep_macro` ({side}): {got:?}");
+    }
+}
+
+/// Negative controls for macro-expanded `extern crate`:
+/// 1. Without `#[macro_use]`, `dep`'s macros are NOT imported.
+/// 2. Under `#[cfg(false)]`, `#[macro_use] extern crate dep;` is stripped and imports nothing.
+/// 3. In a non-root module, `#[macro_use] extern crate dep;` does NOT enter the `#[macro_use]` prelude.
+#[test]
+fn macro_expanded_extern_crate_negative_controls() {
+    static DEP: &str = "#![no_core]
+#[macro_export]
+macro_rules! dep_macro {
+    ($name:ident) => { pub struct $name; };
+}
+";
+    static NO_MACRO_USE: &str = "#![no_core]
+macro_rules! if_hyper {
+    ($($item:item)*) => { $($item)* };
+}
+if_hyper! {
+    extern crate dep;
+    dep_macro!(Nope);
+}
+";
+    static CFG_FALSE: &str = "#![no_core]
+macro_rules! if_hyper {
+    ($($item:item)*) => { $($item)* };
+}
+if_hyper! {
+    #[cfg(false)]
+    #[macro_use]
+    extern crate dep;
+    dep_macro!(Nope);
+}
+";
+    static IN_SUBMOD: &str = "#![no_core]
+#[macro_use]
+mod macros {
+    macro_rules! if_hyper {
+        ($($item:item)*) => { $($item)* };
+    }
+}
+pub mod inner {
+    if_hyper! {
+        #[macro_use]
+        extern crate dep;
+        dep_macro!(Nope);
+    }
+}
+";
+    static FILES_NO_ATTR: Texts = Texts(&[&[("/dep/lib.rs", DEP)], &[("/user/lib.rs", NO_MACRO_USE)]]);
+    static FILES_CFG_FALSE: Texts = Texts(&[&[("/dep/lib.rs", DEP)], &[("/user/lib.rs", CFG_FALSE)]]);
+    static FILES_SUBMOD: Texts = Texts(&[&[("/dep/lib.rs", DEP)], &[("/user/lib.rs", IN_SUBMOD)]]);
+
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
+    let inputs = [input("dep", "/dep/lib.rs", &[]), input("user", "/user/lib.rs", &[("dep", 0)])];
+
+    for (label, files) in [
+        ("without #[macro_use]", &FILES_NO_ATTR),
+        ("#[cfg(false)] #[macro_use]", &FILES_CFG_FALSE),
+        ("non-root #[macro_use]", &FILES_SUBMOD),
+    ] {
+        let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), files, &Serial, &Ready::serial(WAIT), bump)
+            .unwrap_or_else(|e| panic!("{label}: solve failed: {e:?}"));
+        let all: Vec<&'static CrateNames<'static>> = solved.iter().map(|s| s.names).collect();
+        let has_unresolved = all[1].done.values().any(|done| {
+            done.scope.errors.iter().any(|err| {
+                matches!(err, blaze_surface::ScopeError::Macro { why: blaze_surface::Unresolved::NotFound, .. })
+            })
+        });
+        assert!(has_unresolved, "{label}: expected unresolved macro error for `dep_macro!`, got done={:?}", all[1].done.values().map(|d| &d.scope.errors).collect::<Vec<_>>());
+        let fresh = Names::of_crates(&inputs, Sysroot::default(), &all, g).unwrap_or_else(|e| panic!("names: {e:?}"));
+        let records: Vec<&'static [u8]> = all.iter().map(|n| aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), bump)).collect();
+        let keys: Vec<CrateItemKey> = all.iter().map(|n| n.key).collect();
+        let read = RecordNames::new(&keys, Loaded(records), g);
+        let user_root = fresh.root(1);
+        for (side, got) in ["fresh", "records"].into_iter().zip(macro_at(&fresh, &read, user_root, "dep_macro")) {
+            assert!(not_found(&got), "{label}: `dep_macro` must not be in #[macro_use] prelude ({side}): {got:?}");
+        }
+    }
+}

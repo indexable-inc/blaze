@@ -76,6 +76,10 @@ impl<'a, N: Name> Touched<'a, N> {
             }
             for e in a.extern_crates.iter() {
                 if !b.extern_crates.iter().any(|o| o == e) {
+                    if e.macro_use {
+                        t.wild = true;
+                        return t;
+                    }
                     match e.rename {
                         Rename::To(n) => t.names.push(n),
                         // An `extern crate` binds its rename or its crate's name; either way the

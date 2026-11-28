@@ -3318,7 +3318,7 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
                         self.out.macro_use.push(written);
                     }
                 }
-                self.out.decls.extern_crates.push(ExternCrateDecl { target, rename, vis });
+                self.out.decls.extern_crates.push(ExternCrateDecl { target, rename, vis, macro_use: attrs.macro_use });
             }
             ItemDetail::ExternBlock { .. } => return true,
             ItemDetail::MacroRules { exported } => {

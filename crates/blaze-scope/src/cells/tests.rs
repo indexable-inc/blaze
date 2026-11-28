@@ -2216,3 +2216,46 @@ fn macro2_at_dep_root_is_excluded_from_macro_use_prelude() {
     assert_eq!(called(call_explicit), Some(std_assert_matches), "explicit std_like::assert_matches! must still resolve: {:?}", c.call_outcome(call_explicit));
     assert_eq!(called(call_imported), Some(std_assert_matches), "use std_like::assert_matches; must still resolve: {:?}", c.call_outcome(call_imported));
 }
+
+/// Macro-written root `#[macro_use] extern crate` (including `as _`) adds the dependency to the
+/// `#[macro_use]` prelude and wakes macro calls waiting in sibling items and child modules,
+/// producing the same outcome in both forward and backward schedules.
+#[test]
+fn macro_expanded_macro_use_extern_crate_wakes_calls_forward_and_backward() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let dep = w.root(2, Edition::E2021);
+    let mac = w.rules_with(dep, "doctest", true);
+    w.cr(dep).macro_exports.push(("doctest", mac, crate::MacroShapes::FN_LIKE));
+    w.dep(root, "doc_comment", dep);
+
+    let sub = w.module(root, "sub", V::Pub);
+    let sub_call = w.call(sub, "doctest", crate::CallShape::FnLike);
+    w.rules(root, "if_hyper");
+    let root_call = w.call(root, "if_hyper", crate::CallShape::FnLike);
+    w.extern_crate_macro_use(root_call, crate::ExternTarget::Dep("doc_comment"), crate::Rename::Underscore, V::Priv);
+    let in_exp_call = w.call(root_call, "doctest", crate::CallShape::FnLike);
+
+    let d = cells_of(&w, dep, CellPlant::None);
+    let d_dep = SolvedDep { cells: core::cell::RefCell::new(d), krate: crate::tests::crate_key(2), root: dep };
+    let expand = |call: ItemKey, _: crate::Def| {
+        w.expanded.borrow_mut().insert(call);
+    };
+    for backward in [false, true] {
+        w.expanded.borrow_mut().clear();
+        let mut c = Cells::load_with(&w, root, Some(&d_dep), blaze_own::testing::heap().alloc()).expect("load root");
+        c.backward = backward;
+        c.run(&w, &expand, &[]).expect("run root");
+        assert!(
+            matches!(c.call_outcome(sub_call), Some(Outcome::Called(d)) if d.key == mac),
+            "backward={backward}: sub `doctest!` should wake and resolve: {:?}",
+            c.call_outcome(sub_call)
+        );
+        assert!(
+            matches!(c.call_outcome(in_exp_call), Some(Outcome::Called(d)) if d.key == mac),
+            "backward={backward}: expansion `doctest!` should resolve: {:?}",
+            c.call_outcome(in_exp_call)
+        );
+        assert_eq!(&c.outer.added_macro_use[..], &[dep][..], "backward={backward}: added_macro_use");
+    }
+}

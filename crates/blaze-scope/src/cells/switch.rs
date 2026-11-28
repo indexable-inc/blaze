@@ -67,6 +67,7 @@ impl core::fmt::Display for Unwritten {
 pub(crate) struct Solved<'a> {
     pub done: HashMap<ItemKey, Resolved<'a, &'a str>, Alloc<'a>>,
     pub added_externs: AVec<'a, (&'a str, ItemKey)>,
+    pub added_macro_use: AVec<'a, ItemKey>,
     /// D116's equality check of this crate, when the driver asked for it.
     pub decide: Option<super::DecideCheck<'a, &'a str>>,
     /// The crate's groups as the solve found them (groups.rs), written into records from the
@@ -238,6 +239,8 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>, P: crate::task:
         }
         let mut added_externs: AVec<'a, (&'a str, ItemKey)> = AVec::with_capacity_in(c.outer.added.len(), out_alloc);
         added_externs.extend(c.outer.added.iter().map(|(&name, &root)| (name, root)));
+        let mut added_macro_use: AVec<'a, ItemKey> = AVec::with_capacity_in(c.outer.added_macro_use.len(), out_alloc);
+        added_macro_use.extend_from_slice(&c.outer.added_macro_use);
         // D116: every cell decided again on demand over the frozen tables, after the scopes are
         // written (it leaves `c` re-decided; nothing reads `c` after it).
         // D116 point 7: the records at module grain against the written scopes, before `decide`
@@ -267,7 +270,7 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>, P: crate::task:
         if let Some(r) = c.member_refusal {
             return Err(Unwritten::Member(r));
         }
-        Ok(Solved { done, added_externs, decide, groups, cuts })
+        Ok(Solved { done, added_externs, added_macro_use, decide, groups, cuts })
     };
     let mut result = None;
     let mode = solve_scratch(&mut |solver_alloc| {
