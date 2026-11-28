@@ -4239,23 +4239,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         }
         // The signature is laid: its types' implied bounds on the type parameters are read
         // below (`sig_param_bounds` sets this again where it cannot read them).
-        self.param_all_unsure = false;
-        // The bounds the signature's and the impl header's types imply, whole (front2
-        // adt_facts.rs): `'long: 'short` known, `T: 'r` taken by `param_origin`.
-        self.implied_given = false;
-        if let Some((params, regions)) = facts.implied_bounds() {
-            for &(long, short) in regions {
-                let (ol, os) = (self.universal(long), self.universal(short));
-                if self.plant != Plant::NoKnown {
-                    self.b.known(ol, os);
-                }
-            }
-            for &(p, r) in params {
-                let o = self.universal(r);
-                self.param_implied.push((p, o));
-            }
-            self.implied_given = true;
-        }
+        self.load_implied_bounds();
         let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc);
         let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         for i in 0..=nparams {
@@ -4459,14 +4443,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 }
             }
         }
-        // The declared outlives clauses, `(longer, shorter)` (ParamsView::outlives): known, as
-        // `known(a, b)` says `a` outlives `b`.
-        for &(a, b) in sig.bounds() {
-            let (oa, ob) = (self.universal(a), self.universal(b));
-            if self.plant != Plant::NoKnown {
-                self.b.known(oa, ob);
-            }
-        }
+        // The declared outlives clauses (`'a: 'b` and concrete structural `T: 'r` components).
+        self.load_declared_bounds(sig, root)?;
         self.stats.sig_read = true;
         Ok(())
     }
