@@ -94,9 +94,10 @@ pub(crate) fn names_digests<C: Compress>(
     scratch.clear();
     let mut ends = [0usize; BATCH + 1];
     let mut count = 0;
+    let alloc = *scratch.allocator();
     for (at, item) in items.iter().enumerate() {
         let calls_macros = item.parent.is_none_or(|parent| lowered_one_by_one(items[parent.at()].detail));
-        message(scratch, text, edition, item, &attrs[item.attrs.to_usize()], calls_macros);
+        message(scratch, text, edition, item, &attrs[item.attrs.to_usize()], calls_macros, alloc);
         count += 1;
         ends[count] = scratch.len();
         if count == BATCH || scratch.len() >= BATCH_BYTES || at + 1 == items.len() {
@@ -150,13 +151,13 @@ const fn lowered_one_by_one(detail: ItemDetail) -> bool {
 #[cfg(test)]
 pub(crate) fn names_digest(text: &str, edition: u8, item: &Item, attrs: &[Attr], calls_macros: bool) -> ContentId {
     let mut hasher = blaze_ids::Hasher::of(&NAMES);
-    message(&mut hasher, text, edition, item, attrs, calls_macros);
+    message(&mut hasher, text, edition, item, attrs, calls_macros, blaze_own::testing::heap().alloc());
     hasher.finish()
 }
 
 /// The message a names digest is the digest of, into `sink`: one definition, whether the bytes
 /// are streamed through a hasher or copied to be hashed side by side with other entries'.
-fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[Attr], calls_macros: bool) {
+fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[Attr], calls_macros: bool, alloc: blaze_own::Alloc<'_>) {
     let own = |range: Range| item.text(text, range).as_bytes();
     sink.part(&[edition, item.kind() as u8]);
     match item.name {
@@ -196,7 +197,7 @@ fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[
             // `engine_names.rs` (`has_shadowed_expr_macro`).
             let sig = item.text(text, item.signature);
             if body_holds_items || crate::nested::has_writing_block(sig) {
-                whole |= crate::nested::digest_body_blocks(item.range.of(text), &mut |bytes| {
+                whole |= crate::nested::digest_body_blocks(item.range.of(text), alloc, &mut |bytes| {
                     sink.part(bytes);
                 });
             }
@@ -205,7 +206,7 @@ fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[
             sink.part(&form(text, item));
             let body = item.range.of(text);
             if crate::nested::adt_has_writing_block(body) {
-                whole |= crate::nested::digest_body_blocks(body, &mut |bytes| {
+                whole |= crate::nested::digest_body_blocks(body, alloc, &mut |bytes| {
                     sink.part(bytes);
                 });
             }
@@ -216,7 +217,7 @@ fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[
         ItemDetail::Enum | ItemDetail::Union => {
             let body = item.range.of(text);
             if crate::nested::adt_has_writing_block(body) {
-                whole |= crate::nested::digest_body_blocks(body, &mut |bytes| {
+                whole |= crate::nested::digest_body_blocks(body, alloc, &mut |bytes| {
                     sink.part(bytes);
                 });
             }
@@ -224,7 +225,7 @@ fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[
         ItemDetail::Trait => {
             let head = crate::nested::trait_head(item.range.of(text));
             if crate::nested::has_writing_block(head) {
-                whole |= crate::nested::digest_body_blocks(head, &mut |bytes| {
+                whole |= crate::nested::digest_body_blocks(head, alloc, &mut |bytes| {
                     sink.part(bytes);
                 });
             }
@@ -232,7 +233,7 @@ fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[
         ItemDetail::TraitAlias | ItemDetail::TypeAlias => {
             let body = item.range.of(text);
             if crate::nested::has_writing_block(body) {
-                whole |= crate::nested::digest_body_blocks(body, &mut |bytes| {
+                whole |= crate::nested::digest_body_blocks(body, alloc, &mut |bytes| {
                     sink.part(bytes);
                 });
             }
@@ -480,6 +481,48 @@ mod tests {
             crate::outline(arg_item_before, Edition::E2024, alloc).surface(),
             crate::outline(arg_item_after, Edition::E2024, alloc).surface(),
             "nested item inside std macro arg must hash whole into Outline::surface()"
+        );
+    }
+
+    #[test]
+    fn head_block_and_call_cfg_gates_move_names_digest() {
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Changing `#[cfg(any())]` -> `#[cfg(all())]` on a fn param around a scanned head block
+        // (whose only macro is a bare std expr macro) MUST change `Outline::surface()`.
+        let fn_off = "fn f(#[cfg(any())] _: [u8; { matches!(0, 0) as usize }]) {}\n";
+        let fn_on = "fn f(#[cfg(all())] _: [u8; { matches!(0, 0) as usize }]) {}\n";
+        assert_ne!(
+            crate::outline(fn_off, Edition::E2024, alloc).surface(),
+            crate::outline(fn_on, Edition::E2024, alloc).surface(),
+            "changing #[cfg] on a fn param around a scanned head block must move Outline::surface()"
+        );
+
+        // Moving `#[cfg(any())]` across a parameter comma MUST also move `Outline::surface()`.
+        let fn_param0 = "fn f(#[cfg(any())] _: u8, _: [u8; { matches!(0, 0) as usize }]) {}\n";
+        let fn_param1 = "fn f(_: u8, #[cfg(any())] _: [u8; { matches!(0, 0) as usize }]) {}\n";
+        assert_ne!(
+            crate::outline(fn_param0, Edition::E2024, alloc).surface(),
+            crate::outline(fn_param1, Edition::E2024, alloc).surface(),
+            "moving #[cfg] from an unrelated param onto the scanned head block param must move Outline::surface()"
+        );
+
+        // Same for `#[cfg_attr(..., cfg(...))]` and tuple struct fields.
+        let tup_off = "struct T(#[cfg_attr(all(), cfg(any()))] [u8; { matches!(0, 0) as usize }]);\n";
+        let tup_on = "struct T(#[cfg_attr(all(), cfg(all()))] [u8; { matches!(0, 0) as usize }]);\n";
+        assert_ne!(
+            crate::outline(tup_off, Edition::E2024, alloc).surface(),
+            crate::outline(tup_on, Edition::E2024, alloc).surface(),
+            "changing #[cfg_attr(..., cfg(...))] on a tuple field around a scanned head block must move Outline::surface()"
+        );
+
+        // Direct head macro call gated by `#[cfg(...)]` MUST also move `Outline::surface()`.
+        let call_off = "fn f(#[cfg(any())] _: [u8; make_len!()]) {}\n";
+        let call_on = "fn f(#[cfg(all())] _: [u8; make_len!()]) {}\n";
+        assert_ne!(
+            crate::outline(call_off, Edition::E2024, alloc).surface(),
+            crate::outline(call_on, Edition::E2024, alloc).surface(),
+            "changing #[cfg] on a direct head macro call must move Outline::surface()"
         );
     }
 }

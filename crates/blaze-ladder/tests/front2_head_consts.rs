@@ -2311,3 +2311,119 @@ fn main() {}
     }
     expect("nested inherent const inside qpath const", &got, &[true, false]);
 }
+
+/// Round 12 P1 #1: type macros in item heads (`type A = ty!();`, `fn ret_ty() -> ty!()`,
+/// `struct Tup(ty!());`) carry enclosing head ownership through expansion so item-declaring
+/// const blocks inside the expanded type resolve in `blaze-scope`'s expansion block modules.
+#[test]
+fn type_macro_in_head_with_item_declaring_const_block_resolves() {
+    let text = "
+macro_rules! ty {
+    () => {
+        [u8; {
+            #[repr(u16)]
+            enum TyMacroEnum { A = 0, B = 1 }
+            core::mem::size_of::<TyMacroEnum>()
+        }]
+    };
+}
+type A = ty!();
+fn ret_ty() -> ty!() { [0u8; 2] }
+struct Tup(ty!());
+
+fn alias_ok(x: A) -> [u8; 2] { x }
+fn alias_bad(x: A) -> [u8; 3] { x }
+fn ret_ok() -> [u8; 2] { ret_ty() }
+fn ret_bad() -> [u8; 3] { ret_ty() }
+fn tup_ok(t: Tup) -> [u8; 2] { t.0 }
+fn tup_bad(t: Tup) -> [u8; 3] { t.0 }
+fn main() {}
+";
+    let got = check_fns(text, &["alias_ok", "alias_bad", "ret_ok", "ret_bad", "tup_ok", "tup_bad"]);
+    expect("type macro in head with item-declaring const block", &got, &[true, false, true, false, true, false]);
+}
+
+/// Round 12 P1 #3: generic type defaults that contain an owned lifetime (`&'static ...`) take
+/// `lay_default_arg`'s general re-lowering path and must preserve the declaring item's head owner
+/// so item-declaring const blocks inside the default resolve.
+#[test]
+fn generic_default_with_owned_lifetime_and_item_declaring_const_block_resolves() {
+    let text = "
+struct S<T = &'static [u8; {
+    #[repr(u16)]
+    enum DefLtEnum { A = 0, B = 1 }
+    core::mem::size_of::<DefLtEnum>()
+}]>(T);
+
+fn ok_def(s: S) -> &'static [u8; 2] { s.0 }
+fn bad_def(s: S) -> &'static [u8; 3] { s.0 }
+fn main() {}
+";
+    let got = check_fns(text, &["ok_def", "bad_def"]);
+    expect("generic default with owned lifetime and item-declaring const block", &got, &[true, false]);
+}
+
+/// Round 12 P1 #4: identical structural-record default text in two different modules/owners
+/// must receive distinct anonymous default keys (`owner_lib` in `record_default_member_name`)
+/// so the second owner never overwrites the first's `FnHead` or `HeadAnon`.
+#[test]
+fn structural_record_defaults_with_identical_text_in_distinct_modules_do_not_collide() {
+    use blaze_ladder::front2::consts::int_of;
+    use blaze_ladder::front2::heads::Want;
+    use blaze_ladder::front2::keys::Keys;
+    use blaze_typeck::{Name, RecordSchema};
+
+    const TEXT: &str = "#![blaze::records]
+mod a {
+    pub const N: isize = 1;
+    pub type Rec = { n: isize = { enum E { V = N } E::V as isize } };
+}
+mod b {
+    pub const N: isize = 2;
+    pub type Rec = { n: isize = { enum E { V = N } E::V as isize } };
+}
+fn main() {}
+";
+    let alloc = test_alloc();
+    let tc = open_toolchain();
+    let files = [("/hello-world/src/main.rs".to_string(), TEXT.to_string())];
+    let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let sources = [SourceFile { path: "src/main.rs", text: TEXT }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+    let front = Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
+    let rec_a = names::path(&names, names.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments: &["a", "Rec"] }, alloc)
+        .unwrap_or_else(|e| panic!("a::Rec: {e}"))
+        .whole(2)
+        .expect("a::Rec key")
+        .key;
+    let rec_b = names::path(&names, names.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments: &["b", "Rec"] }, alloc)
+        .unwrap_or_else(|e| panic!("b::Rec: {e}"))
+        .whole(2)
+        .expect("b::Rec key")
+        .key;
+
+    let mut store = Store::new(front.index.lang("sized"), &frame, alloc);
+    let mut keys = Keys::new();
+    let schema = RecordSchema::of_sorted_names(&[Name::of("n")]);
+    let rk = schema.defaults_key();
+
+    store.ensure(&names, &mut keys, Want::Head(rec_a)).unwrap_or_else(|e| panic!("ensure a::Rec: {e}"));
+    let dk_a = store.field_defaults.get(&rk).expect("a::Rec field_defaults")[0].expect("a::Rec default key");
+
+    store.ensure(&names, &mut keys, Want::Head(rec_b)).unwrap_or_else(|e| panic!("ensure b::Rec: {e}"));
+    let dk_b = store.field_defaults.get(&rk).expect("b::Rec field_defaults")[0].expect("b::Rec default key");
+
+    assert_ne!(dk_a, dk_b, "identical structural-record default text in distinct modules must produce distinct keys");
+
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
+    let (mut buckets, mut consts) = (None, Consts::default());
+    let mut r = Records { names: &names, index: &front.index, store: &mut store, keys: &mut keys, buckets: &mut buckets, consts: None, order: BuildOrder::AsAsked };
+    let val_a = int_of(consts.value(&mut r, prepared, dk_a).unwrap_or_else(|e| panic!("eval a::Rec default: {e}")));
+    let val_b = int_of(consts.value(&mut r, prepared, dk_b).unwrap_or_else(|e| panic!("eval b::Rec default: {e}")));
+    assert_eq!(val_a, Some(1), "a::Rec default must evaluate in mod a (N == 1)");
+    assert_eq!(val_b, Some(2), "b::Rec default must evaluate in mod b (N == 2)");
+}

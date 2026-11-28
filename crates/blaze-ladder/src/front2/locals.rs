@@ -431,13 +431,17 @@ pub(super) fn owner_scanned_text<'n, S: NamesSource<'n>>(names: S, owner_item: L
 
 /// Enclosing library item and byte alignment for a head-level anonymous constant
 /// (`"const _: TY = { <expr> };"`), used to map its blocks back to the enclosing item's
-/// `blaze-scope` block modules.
+/// `blaze-scope` block modules (or to a type-macro expansion's `statements_as_items` block
+/// modules when [`Self::expansion`] is `Some`).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct HeadAnon<'n> {
     pub owner_item: LibKey,
     pub expr_offset: u32,
     pub expr_len: u32,
     pub prefix: u32,
+    /// When `Some`, the expression came from expanding a type macro in `owner_item`'s head:
+    /// `(call_key, exp_text, root_call_offset)`.
+    pub expansion: Option<(LibKey, &'n str, u32)>,
     /// Leaf substitutions applied to the expression text (`const_inherent`/`const_qpath`),
     /// mapping byte offsets past `prefix` back to byte offsets in the original expression slice.
     pub edits: &'n [super::anon::TextEdit],
@@ -519,9 +523,13 @@ impl<'n> Locals<'n> {
 
     /// Files the head-level anonymous constant `key` as originating from `owner` in its enclosing
     /// library item, wrapped with a `prefix`-byte synthetic `"const _: TY = { "` header.
-    pub(super) fn file_head_anon(&mut self, key: ItemKey, owner: super::anon::HeadOwner, edits: &[super::anon::TextEdit], prefix: u32) {
+    pub(super) fn file_head_anon(&mut self, key: ItemKey, owner: super::anon::HeadOwner, exp_text: Option<&str>, edits: &[super::anon::TextEdit], prefix: u32) {
         let edits: &'n [super::anon::TextEdit] = if edits.is_empty() { &[] } else { self.frame.alloc_slice_copy(edits) };
-        self.head_anons.insert(key, HeadAnon { owner_item: owner.item, expr_offset: owner.offset, expr_len: owner.len, prefix, edits });
+        let expansion = match (owner.expansion, exp_text) {
+            (Some(exp), Some(t)) => Some((exp.call, &*self.frame.alloc_str(t), exp.root_call_offset)),
+            _ => None,
+        };
+        self.head_anons.insert(key, HeadAnon { owner_item: owner.item, expr_offset: owner.offset, expr_len: owner.len, prefix, expansion, edits });
     }
 
     /// The enclosing library item alignment of a head-level anonymous constant, if any.
@@ -880,6 +888,79 @@ impl<'n> Locals<'n> {
         let Some(ha) = self.head_anons.get(&owner).copied() else {
             return (None, None);
         };
+        if let Some((call_key, exp_text, _)) = ha.expansion {
+            let Ok(exp_blocks) = blaze_scope::expanded_blocks::expansion_blocks(exp_text, alloc) else {
+                return (None, None);
+            };
+            let block_count = exp_blocks.nested.blocks.len();
+            let mut exp_modules: blaze_own::AVec<'a, Option<LibKey>> = blaze_own::AVec::with_capacity_in(block_count, alloc);
+            exp_modules.resize(block_count, None);
+            for (b, block) in exp_blocks.nested.blocks.iter().enumerate() {
+                let Some(ordinal) = exp_blocks.ordinals.get(b).copied().flatten() else { continue };
+                let outer = match block.parent {
+                    None | Some(0) => Some(call_key),
+                    Some(p) => usize::try_from(p).ok().and_then(|idx| exp_modules.get(idx)).copied().flatten(),
+                };
+                let name = blaze_scope::expanded_blocks::expansion_block_name(call_key, ordinal, alloc);
+                if let Some(slot) = exp_modules.get_mut(b) {
+                    *slot = outer.map(|o| blaze_scope::task::key_of(crate_key, o, "mod", name.as_str(), 0));
+                }
+            }
+            let wrap = blaze_scope::expanded_blocks::WRAP_OPEN;
+            let wrapped_offset = wrap.saturating_add(ha.expr_offset);
+            let wrapped_end = wrapped_offset.saturating_add(ha.expr_len);
+            let enclosing_module = exp_blocks
+                .nested
+                .blocks
+                .iter()
+                .enumerate()
+                .skip(1)
+                .rev()
+                .find(|(_, b)| b.open < wrapped_offset && wrapped_end < b.close)
+                .and_then(|(idx, _)| exp_modules.get(idx).copied().flatten());
+            let mut mapped: blaze_own::AVec<'a, Option<LibKey>> = blaze_own::AVec::with_capacity_in(nested.blocks.len(), alloc);
+            let mut any = false;
+            for blk in nested.blocks.iter() {
+                let module = if blk.open >= ha.prefix {
+                    super::anon::orig_offset(ha.edits, blk.open - ha.prefix)
+                        .and_then(|rel| wrapped_offset.checked_add(rel))
+                        .and_then(|target_open| exp_blocks.nested.blocks.binary_search_by_key(&target_open, |b| b.open).ok())
+                        .and_then(|idx| exp_modules.get(idx).copied().flatten())
+                } else {
+                    enclosing_module
+                };
+                any |= module.is_some();
+                mapped.push(module);
+            }
+            let mut call_keys: blaze_own::AVec<'a, (u32, LibKey)> = blaze_own::AVec::new_in(alloc);
+            let lookup_exp_call = |start: u32| -> Option<LibKey> {
+                let rel = start.checked_sub(ha.prefix)?;
+                let owner_start = wrapped_offset.checked_add(super::anon::orig_offset(ha.edits, rel)?)?;
+                let (block, n) = super::scope_table::statement_call(&exp_blocks.nested, owner_start)?;
+                let owner_mod = if block == 0 {
+                    call_key
+                } else {
+                    usize::try_from(block).ok().and_then(|idx| exp_modules.get(idx)).copied().flatten()?
+                };
+                Some(blaze_scope::task::key_of(crate_key, owner_mod, "MacroCall", "", n))
+            };
+            for c in nested.calls.iter().chain(nested.head_calls.iter()) {
+                if let Some(ck) = lookup_exp_call(c.range.start).or_else(|| lookup_exp_call(c.path.start)) {
+                    call_keys.push((c.range.start, ck));
+                    if c.path.start != c.range.start {
+                        call_keys.push((c.path.start, ck));
+                    }
+                }
+            }
+            return if any || !call_keys.is_empty() {
+                (
+                    Some(super::scope_table::OwnedHandBlocks { modules: mapped, head_module: None, call_keys }),
+                    Some(ha.owner_item),
+                )
+            } else {
+                (None, None)
+            };
+        }
         let Some(owner_text) = owner_scanned_text(names, ha.owner_item) else {
             return (None, None);
         };

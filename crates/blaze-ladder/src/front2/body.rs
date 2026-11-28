@@ -1677,6 +1677,10 @@ fn body_at<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, ite
                     .seeded_text_of(ha.owner_item)
                     .and_then(|it| it.impl_header.and_then(|hdr| blaze_scope::expansion_origins::offset_in(it.text, hdr)))
                     .unwrap_or(0);
+                if let Some((_, _, root_call_offset)) = ha.expansion {
+                    let base = header_off.checked_add(root_call_offset)?;
+                    return Some(super::body_host::BodyAt { lib: ha.owner_item, off: base, sub: 0, fixed: true, edits: &[] });
+                }
                 let base = header_off.checked_add(ha.expr_offset)?;
                 if fixed {
                     let rel = super::anon::orig_offset(ha.edits, off.checked_sub(ha.prefix)?)?;
@@ -1958,7 +1962,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             // Every word's mark is in the lowered record (`View::mark_of_path`): an expansion's
             // lowered into the body, and the item's own when a macro wrote it
             // (`lower_body_expanding_marked`), so the builder needs no second copy of them.
-            builder: Builder { resolver: Paths { names }, heads: &store.maps, marks: None, owner: None },
+            builder: Builder { resolver: Paths { names }, heads: &store.maps, marks: None, owner: None, expanded: None },
             // A written type's first segment is asked of the blocks' named imports first
             // (super::block_type_uses): a block holding only `use`s is no module to read at.
             env: Env {

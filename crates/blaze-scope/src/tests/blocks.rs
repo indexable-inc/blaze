@@ -1158,6 +1158,10 @@ pub fn g(
     #[cfg_attr(any(), cfg(any()))] _kept: [u8; make_len!()],
     #[cfg_attr(all(), cfg(all()))] _enabled: [u8; make_len!()],
 ) {}
+pub fn h(
+    #[xtool::cfg_attr(all(), cfg(any()))] _tool_cfg_attr: [u8; make_len!()],
+    #[xtool::cfg(any())] _tool_cfg: [u8; make_len!()],
+) {}
 "#;
 
 static CFG_GATED_HEAD_MACRO_CALLS_TEXTS: Texts = Texts(&[&[("/user/lib.rs", CFG_GATED_HEAD_MACRO_CALLS)]]);
@@ -1190,4 +1194,20 @@ fn cfg_disabled_head_macro_calls_are_not_expanded_while_enabled_ones_are() {
         .item_at(exp_mod, Namespace::Types, Written { kind: PathKind::Plain, segments: &["HeadCfgEnum"] }, alloc)
         .unwrap_or_else(|e| panic!("`HeadCfgEnum` in fn `f` enabled head call: {e}"));
     assert_eq!(e.def.kind, DefKind::Enum);
+
+    // Round 12 P1 #2: tool-qualified `#[xtool::cfg_attr(all(), cfg(any()))]` and
+    // `#[xtool::cfg(any())]` are inert tool attributes and MUST leave `make_len!()` enabled.
+    let h_item = names
+        .item_at(root, Namespace::Values, Written { kind: PathKind::Plain, segments: &["h"] }, alloc)
+        .unwrap_or_else(|e| panic!("`h`: {e}"));
+    let h_head_mod = crate::blocks::head_call_module(names.krate(0).key, h_item.def.key);
+    for ordinal in 0..2 {
+        let ck = crate::task::key_of(names.krate(0).key, h_head_mod, "MacroCall", "", ordinal);
+        let en = crate::expanded_blocks::expansion_block_name(ck, 0, alloc);
+        let em = crate::task::key_of(names.krate(0).key, ck, "mod", en.as_str(), 0);
+        let he = names
+            .item_at(em, Namespace::Types, Written { kind: PathKind::Plain, segments: &["HeadCfgEnum"] }, alloc)
+            .unwrap_or_else(|e| panic!("`HeadCfgEnum` in fn `h` tool-qualified attr call {ordinal}: {e}"));
+        assert_eq!(he.def.kind, DefKind::Enum);
+    }
 }

@@ -847,6 +847,18 @@ fn int_literal(text: &str) -> Option<(u128, &str)> {
     Some((value, &text[end..]))
 }
 
+/// Expansion provenance for a type lowered by `type_expand::expand_type_text` (`pattern_ty.rs`
+/// `macro_ty` and `heads.rs` `fn_head` return-type expansion): lets [`Builder::head_owner_of`]
+/// connect item-declaring const blocks inside the expansion back to the enclosing item's
+/// `blaze-scope` expansion block modules (`__blaze_block_x<tag(call)>_<ord>`).
+#[derive(Clone, Copy)]
+pub(super) struct ExpandedOwner<'b> {
+    pub(super) item: LibKey,
+    pub(super) owner_text: &'b str,
+    pub(super) base_offset: u32,
+    pub(super) view: View<'b>,
+}
+
 /// The type builder of one item: its resolver, over the names source `S`
 /// ([`NamesSource`]: the solved names or each crate's records), and the heads lowered so far.
 pub struct Builder<'b, H: Heads, S> {
@@ -860,23 +872,121 @@ pub struct Builder<'b, H: Heads, S> {
     /// modules for: carried onto head-level anonymous constants (`anon::HeadOwner`) so blocks
     /// declared inside them resolve to their `blaze-scope` block modules.
     pub owner: Option<(LibKey, &'b str)>,
+    /// Present when this builder walks an expanded type's view (`pattern_ty.rs` / `heads.rs`):
+    /// maps const blocks inside macro expansions back to the enclosing head call's expansion
+    /// block modules.
+    pub(super) expanded: Option<ExpandedOwner<'b>>,
 }
 
 impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
-    /// If `text` is an unmodified subslice of `self.owner`'s scanned text and may declare items or
-    /// invoke macros, returns its [`super::anon::HeadOwner`] coordinates and, when `text` contains
-    /// a macro call (`!`), its observable [`super::anon::HeadSite`] (`(line, col)` and shown file
+    /// Resolves the `blaze-scope` `MacroCall` key and outermost owner-text call offset for
+    /// expansion `target_exp` inside `exp.view`.
+    fn resolve_expansion_call(&self, exp: ExpandedOwner<'_>, target_exp: u32) -> Option<super::anon::HeadExpansion> {
+        let names = self.resolver.names;
+        let krate = names
+            .crate_of(exp.item)
+            .or_else(|| names.member_owner(exp.item).and_then(|(c, _)| names.crate_of(c)))?;
+        let crate_key = names.crate_key(krate)?;
+        blaze_mem::frame::task(blaze_mem::Tag::Parse, |frame| {
+            let scratch = blaze_own::Erased::new(frame);
+            let alloc = scratch.handle();
+            let total = exp.view.expansion_keys.len();
+            let mut chain: blaze_own::AVec<'_, u32> = blaze_own::AVec::new_in(alloc);
+            let mut cur = target_exp;
+            for _ in 0..=total {
+                chain.push(cur);
+                match exp.view.expansion_call_at(cur).ok()? {
+                    blaze_lower::scope_origin::CallAt::Item { .. } => break,
+                    blaze_lower::scope_origin::CallAt::Expansion { expansion: writer, .. } => cur = writer,
+                }
+            }
+            chain.reverse();
+            let root_exp = *chain.first()?;
+            let blaze_lower::scope_origin::CallAt::Item { start: root_start } = exp.view.expansion_call_at(root_exp).ok()? else {
+                return None;
+            };
+            let root_call_offset = exp.base_offset.checked_add(root_start)?;
+            let owner_nested = blaze_file_items::nested::scan(exp.owner_text, alloc);
+            if owner_nested.end != blaze_file_items::nested::NestedEnd::Whole {
+                return None;
+            }
+            let owner_modules = blaze_scope::blocks::block_modules(crate_key, exp.item, &owner_nested, alloc);
+            let mut call_key = if let Some((block, n)) = super::scope_table::statement_call(&owner_nested, root_call_offset) {
+                let owner_mod = usize::try_from(block).ok().and_then(|idx| owner_modules.get(idx)).copied().flatten()?;
+                blaze_scope::task::key_of(crate_key, owner_mod, "MacroCall", "", n)
+            } else {
+                if owner_nested.head_calls.is_empty() {
+                    return None;
+                }
+                let head_mod = blaze_scope::blocks::head_call_module(crate_key, exp.item);
+                let n = super::scope_table::head_call(&owner_nested, root_call_offset)?;
+                blaze_scope::task::key_of(crate_key, head_mod, "MacroCall", "", n)
+            };
+            for &next_exp in chain.get(1..).unwrap_or(&[]) {
+                let blaze_lower::scope_origin::CallAt::Expansion { expansion: writer, start } = exp.view.expansion_call_at(next_exp).ok()? else {
+                    return None;
+                };
+                let writer_text = exp.view.expansion_text(writer).ok()?;
+                let writer_blocks = blaze_scope::expanded_blocks::expansion_blocks(writer_text, alloc).ok()?;
+                let block_count = writer_blocks.nested.blocks.len();
+                let mut writer_modules: blaze_own::AVec<'_, Option<LibKey>> = blaze_own::AVec::with_capacity_in(block_count, alloc);
+                writer_modules.resize(block_count, None);
+                for (b, block) in writer_blocks.nested.blocks.iter().enumerate() {
+                    let Some(ordinal) = writer_blocks.ordinals.get(b).copied().flatten() else { continue };
+                    let outer = match block.parent {
+                        None | Some(0) => Some(call_key),
+                        Some(p) => usize::try_from(p).ok().and_then(|idx| writer_modules.get(idx)).copied().flatten(),
+                    };
+                    let name = blaze_scope::expanded_blocks::expansion_block_name(call_key, ordinal, alloc);
+                    if let Some(slot) = writer_modules.get_mut(b) {
+                        *slot = outer.map(|o| blaze_scope::task::key_of(crate_key, o, "mod", name.as_str(), 0));
+                    }
+                }
+                let target_start = start.checked_add(blaze_scope::expanded_blocks::WRAP_OPEN)?;
+                let (block, n) = super::scope_table::statement_call(&writer_blocks.nested, target_start)?;
+                let owner_mod = if block == 0 {
+                    call_key
+                } else {
+                    usize::try_from(block).ok().and_then(|idx| writer_modules.get(idx)).copied().flatten()?
+                };
+                call_key = blaze_scope::task::key_of(crate_key, owner_mod, "MacroCall", "", n);
+            }
+            Some(super::anon::HeadExpansion { call: call_key, root_call_offset })
+        })
+    }
+
+    /// If `text` is an unmodified subslice of `self.owner`'s scanned text (or of a macro expansion
+    /// in `self.expanded`) and may declare items or invoke macros, returns its
+    /// [`super::anon::HeadOwner`] coordinates, optional expansion text, and—when `text` contains
+    /// a macro call (`!`)—its observable [`super::anon::HeadSite`] (`(line, col)` and shown file
     /// path via `body_place`/`body_file`) so inserting a blank line or moving a module across
     /// `#[path]` files invalidates cached head constants.
-    fn head_owner_of(&self, text: &str) -> Option<(super::anon::HeadOwner, Option<super::anon::HeadSite<'n>>)> {
-        let (item, owner_text) = self.owner?;
+    fn head_owner_of(&self, text: &str) -> Option<(super::anon::HeadOwner, Option<&'b str>, Option<super::anon::HeadSite<'n>>)> {
         if !blaze_file_items::nested::may_write_block(text) {
             return None;
         }
-        let offset = blaze_scope::expansion_origins::offset_in(owner_text, text)?;
         let len = u32::try_from(text.len()).ok()?;
-        let site = super::anon::head_site_of(self.resolver.names, item, offset, text);
-        Some((super::anon::HeadOwner { item, offset, len }, site))
+        if let Some((item, owner_text)) = self.owner
+            && let Some(offset) = blaze_scope::expansion_origins::offset_in(owner_text, text)
+        {
+            let site = super::anon::head_site_of(self.resolver.names, item, offset, text);
+            return Some((super::anon::HeadOwner { item, offset, len, expansion: None }, None, site));
+        }
+        let exp = self.expanded?;
+        for j in 0..exp.view.expansion_keys.len() {
+            let Ok(j_u32) = u32::try_from(j) else { break };
+            let Ok(exp_text) = exp.view.expansion_text(j_u32) else { continue };
+            if let Some(offset) = blaze_scope::expansion_origins::offset_in(exp_text, text) {
+                let head_exp = self.resolve_expansion_call(exp, j_u32)?;
+                let site = super::anon::head_site_of(self.resolver.names, exp.item, head_exp.root_call_offset, text);
+                return Some((
+                    super::anon::HeadOwner { item: exp.item, offset, len, expansion: Some(head_exp) },
+                    Some(exp_text),
+                    site,
+                ));
+            }
+        }
+        None
     }
     /// The portable type of `t`, by a work list (no recursion).
     pub fn ty(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId) -> Result<PTy, Why> {
@@ -993,7 +1103,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         text: &str,
         r: Range,
         ty: Option<PNode>,
-        carried_owner: Option<(super::anon::HeadOwner, Option<super::anon::HeadSite<'n>>)>,
+        carried_owner: Option<(super::anon::HeadOwner, Option<&str>, Option<super::anon::HeadSite<'n>>)>,
         carried_edits: Option<blaze_own::AVec<'static, super::anon::TextEdit>>,
     ) -> Result<u128, Why> {
         let text = text.trim();
@@ -1095,8 +1205,8 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             } else {
                 None
             };
-            if let (Some((owner, site)), Some(edits)) = (owner_site, final_edits) {
-                ask = ask.in_head_item(owner, site, edits, alloc);
+            if let (Some((owner, exp_text, site)), Some(edits)) = (owner_site, final_edits) {
+                ask = ask.in_head_item(owner, exp_text, site, edits, alloc);
             }
             if let Some(rows) = carried_marks {
                 ask = ask.carry_marks(rows);
@@ -2243,7 +2353,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 consts: cs,
                 body: None,
             };
-            let alias_builder = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks, owner: Some((alias, alias_text.text)) };
+            let alias_builder = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks, owner: Some((alias, alias_text.text)), expanded: None };
             let mut full = blaze_own::Vec::with_capacity_in(want + 1, alloc);
             full.push(self_ty);
             full.extend_from_slice(given);
@@ -4454,7 +4564,20 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 consts: cs,
                 body: None,
             };
-            let def_builder = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks, owner: None };
+            let def_owner_text = if let Some(hdr) = item_text.impl_header {
+                hdr
+            } else if matches!(self.resolver.names.detail_of(item_key), Some(blaze_surface::ItemDetail::Trait)) {
+                blaze_file_items::nested::trait_head(item_text.text)
+            } else {
+                item_text.text
+            };
+            let def_builder = Builder {
+                resolver: crate::resolve::Paths { names: self.resolver.names },
+                heads: self.heads,
+                marks,
+                owner: Some((item_key, def_owner_text)),
+                expanded: None,
+            };
             let mut def_sink = RegionSink::new_in(alloc);
             def_sink.default_depth = s.default_depth + 1;
             let raw_ty = match def_builder.ty_regions(tys, &def_env, dv, default_ty, &mut def_sink) {
@@ -5753,7 +5876,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 consts: cs,
                 body: None,
             };
-            let alias_builder = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks, owner: Some((alias_key, alias_text.text)) };
+            let alias_builder = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks, owner: Some((alias_key, alias_text.text)), expanded: None };
             // Fill any omitted defaulted type/const arguments declared by the trait alias
             // (`trait Alias<T = &'static u8> = Gen<T>;`, `trait Alias<const N: usize = 3> = Gen<N>;`)
             // into `all_args`/`all_pool`/`all_index` with `Slot::quiet`.

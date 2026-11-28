@@ -329,9 +329,11 @@ pub enum CfgEmit<'a> {
 /// found in `range`, skipping `#![...]` inner attributes and non-gating attributes or `cfg_attr`
 /// payloads such as `non_exhaustive`, `derive(...)`, `allow(...)`, `doc = ...`, or `serde(...)`.
 pub fn for_each_cfg_attr(text: &str, range: Range, alloc: Alloc<'_>, mut f: impl FnMut(CfgEmit<'_>)) {
-    /// Classifies an attribute body (`cfg(...)`, `core::cfg(...)`, `cfg_attr(...)`, etc.),
-    /// returning `(is_cfg, is_cfg_attr, parens_inner_range_in_slice)` when the attribute has a
-    /// balanced `(...)` argument list.
+    /// Classifies an attribute body (`cfg(...)` or `cfg_attr(...)`), requiring the builtin
+    /// attribute name to be strictly unqualified (no `::` path prefix — tool-qualified paths like
+    /// `#[xtool::cfg(any())]` or `#[xtool::cfg_attr(all(), cfg(any()))]` are inert tool
+    /// attributes, not builtin cfg gates), returning `(is_cfg, is_cfg_attr, parens_inner_range)`
+    /// when the attribute has a balanced `(...)` argument list.
     fn classify_attr_body(slice: &str) -> (bool, bool, Option<(usize, usize)>) {
         let mut at = 0usize;
         let mut is_cfg = false;
@@ -351,12 +353,14 @@ pub fn for_each_cfg_attr(text: &str, range: Range, alloc: Alloc<'_>, mut f: impl
             }
             if in_path {
                 match kind {
-                    TokenKind::Ident => {
+                    TokenKind::Ident if !is_cfg && !is_cfg_attr => {
                         let w = slice.get(t_start..at);
                         is_cfg = w == Some("cfg");
                         is_cfg_attr = w == Some("cfg_attr");
+                        if !is_cfg && !is_cfg_attr {
+                            return (false, false, None);
+                        }
                     }
-                    TokenKind::Colon => {}
                     TokenKind::OpenParen if is_cfg || is_cfg_attr => {
                         in_path = false;
                         open_inner = Some(at);
@@ -870,10 +874,11 @@ fn std_expr_arg_bucket(name: &str, arg_count: u16, has_semi: bool) -> u16 {
 /// [`STD_EXPR_MACROS`] calls, after feeding the deterministic written-block parent tree and
 /// std-macro call shapes into `feed`. When the body writes no blocks at all (including the fast
 /// `!may_write_block(text)` path), feeds `[0]`.
-pub(crate) fn digest_body_blocks(text: &str, feed: &mut impl FnMut(&[u8])) -> bool {
+pub(crate) fn digest_body_blocks(text: &str, alloc: Alloc<'_>, feed: &mut impl FnMut(&[u8])) -> bool {
     const MAX_BRACKETS: usize = 64;
     const MAX_BLOCKS: usize = 128;
     const MAX_CALLS: usize = 128;
+    const MAX_CFG_ATTRS: usize = 64;
     const NO_BLOCK: u16 = u16::MAX;
 
     if !may_write_block(text) {
@@ -922,9 +927,15 @@ pub(crate) fn digest_body_blocks(text: &str, feed: &mut impl FnMut(&[u8])) -> bo
     let mut calls = [CallRec { block: NO_BLOCK, macro_idx: 0, delim: 0, arg_count: 0, in_arg: false, has_semi: false, arg_brace_depth: 0 }; MAX_CALLS];
     let mut call_count = 0usize;
 
+    let mut cfg_attrs = [(Range { start: 0, end: 0 }, 0u16, 0u16); MAX_CFG_ATTRS];
+    let mut cfg_attr_count = 0usize;
+    let mut comma_count = 0u16;
+
     let mut prev = Prev::Other;
     let mut after_pound = false;
     let mut attr_depth = 0u32;
+    let mut attr_start = 0usize;
+    let mut attr_is_inner = false;
     let mut at = 0usize;
 
     for token in tokenize(text, FrontmatterAllowed::No, Cpu::BASELINE) {
@@ -947,6 +958,20 @@ pub(crate) fn digest_body_blocks(text: &str, feed: &mut impl FnMut(&[u8])) -> bo
                 }
                 TokenKind::CloseParen | TokenKind::CloseBracket | TokenKind::CloseBrace => {
                     attr_depth -= 1;
+                    if attr_depth == 0
+                        && !attr_is_inner
+                        && kind == TokenKind::CloseBracket
+                        && text.get(attr_start..at).is_some_and(|s| s.contains("cfg"))
+                    {
+                        let (Ok(s), Ok(e), Ok(blk)) = (u32::try_from(attr_start), u32::try_from(at), u16::try_from(block_count)) else {
+                            return true;
+                        };
+                        let Some(slot) = cfg_attrs.get_mut(cfg_attr_count) else {
+                            return true;
+                        };
+                        *slot = (Range { start: s, end: e }, blk, comma_count);
+                        cfg_attr_count += 1;
+                    }
                 }
                 _ => {}
             }
@@ -957,11 +982,14 @@ pub(crate) fn digest_body_blocks(text: &str, feed: &mut impl FnMut(&[u8])) -> bo
             match kind {
                 TokenKind::Pound => {
                     after_pound = true;
+                    attr_start = start;
+                    attr_is_inner = false;
                     prev = Prev::Other;
                     continue;
                 }
                 TokenKind::Bang if was_pound => {
                     after_pound = true;
+                    attr_is_inner = true;
                     prev = Prev::Other;
                     continue;
                 }
@@ -969,6 +997,9 @@ pub(crate) fn digest_body_blocks(text: &str, feed: &mut impl FnMut(&[u8])) -> bo
                     attr_depth = 1;
                     prev = Prev::Other;
                     continue;
+                }
+                TokenKind::Comma => {
+                    comma_count = comma_count.saturating_add(1);
                 }
                 _ => {}
             }
@@ -1238,6 +1269,36 @@ pub(crate) fn digest_body_blocks(text: &str, feed: &mut impl FnMut(&[u8])) -> bo
         feed(&[rec.macro_idx, rec.delim]);
         feed(&bucket.to_le_bytes());
         feed(&rec.arg_brace_depth.to_le_bytes());
+    }
+    if cfg_attr_count > 0 {
+        for &(range, blk, comma) in cfg_attrs.get(..cfg_attr_count).unwrap_or(&[]) {
+            let mut emitted = false;
+            for_each_cfg_attr(text, range, alloc, |piece| {
+                if !emitted {
+                    feed(&[2]);
+                    feed(&blk.to_le_bytes());
+                    feed(&comma.to_le_bytes());
+                    emitted = true;
+                }
+                match piece {
+                    CfgEmit::Lit(s) => {
+                        feed(&[3]);
+                        feed(s.as_bytes());
+                    }
+                    CfgEmit::Src(r) => {
+                        if let (Ok(s), Ok(e)) = (usize::try_from(r.start), usize::try_from(r.end))
+                            && let Some(part) = text.get(s..e)
+                        {
+                            feed(&[4]);
+                            feed(part.as_bytes());
+                        }
+                    }
+                }
+            });
+            if emitted {
+                feed(&[0]);
+            }
+        }
     }
     false
 }
@@ -3124,7 +3185,7 @@ mod tests {
 
         let shape = |text: &str| -> (bool, std::vec::Vec<u8>) {
             let mut buf = std::vec::Vec::new();
-            let whole = super::digest_body_blocks(text, &mut |bytes| buf.extend_from_slice(bytes));
+            let whole = super::digest_body_blocks(text, blaze_own::testing::heap().alloc(), &mut |bytes| buf.extend_from_slice(bytes));
             (whole, buf)
         };
 
@@ -3326,7 +3387,7 @@ fn h() {
 
         // `digest_body_blocks` returns `whole = true` for direct head macro calls so edits invalidate surface.
         let mut buf = blaze_own::AVec::new_in(heap.alloc());
-        assert!(super::digest_body_blocks(text, &mut |b| buf.extend_from_slice(b)));
+        assert!(super::digest_body_blocks(text, heap.alloc(), &mut |b| buf.extend_from_slice(b)));
     }
 
     #[test]
@@ -3358,6 +3419,13 @@ fn h() {
         };
         assert_eq!(render_cfg("#[cfg_attr(all(), non_exhaustive)]").as_str(), "");
         assert_eq!(render_cfg("#[cfg_attr(all(), non_exhaustive, derive(Debug))]").as_str(), "");
+        // Tool-qualified paths ending in `cfg` or `cfg_attr` are inert tool attributes, NOT builtin gates.
+        assert_eq!(render_cfg("#[xtool::cfg(any())]").as_str(), "");
+        assert_eq!(render_cfg("#[xtool::cfg_attr(all(), cfg(any()))]").as_str(), "");
+        assert_eq!(render_cfg("#[cfg_attr(all(), xtool::cfg(any()))]").as_str(), "");
+        assert_eq!(render_cfg("#[cfg_attr(all(), xtool::cfg_attr(all(), cfg(any())))]").as_str(), "");
+        assert_eq!(render_cfg("#[::cfg(any())]").as_str(), "");
+        assert_eq!(render_cfg("#[core::cfg(any())]").as_str(), "");
         assert_eq!(render_cfg("#[cfg_attr(all(), cfg(any()))]").as_str(), "#[cfg_attr(all(), cfg(any()))]\n");
         assert_eq!(
             render_cfg("#[cfg_attr(all(), non_exhaustive, cfg(any()), allow(dead_code))]").as_str(),

@@ -174,21 +174,39 @@ pub struct HeadSite<'a> {
     pub file: Option<&'a str>,
 }
 
+/// Expansion-call provenance when a head-level anonymous constant came from expanding a type
+/// macro in the enclosing item's head (e.g. `type A = ty!();` where `ty!()` expands to
+/// `[u8; { enum E {} core::mem::size_of::<E>() }]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadExpansion {
+    /// The `blaze-scope` `MacroCall` key whose `statements_as_items` fragment holds this
+    /// expansion's block modules (`__blaze_block_x<tag(call)>_<ord>`).
+    pub call: LibKey,
+    /// Byte offset in the enclosing item's scanned owner text of the outermost macro call
+    /// (where `line!()`/`column!()`/`file!()` report their call-site position).
+    pub root_call_offset: u32,
+}
+
 /// The enclosing library item whose scanned text (`blaze_scope::blocks`) owns the block modules
 /// of a head-level anonymous constant expression (`where (): Trait<{ pub enum Tag .. }>`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeadOwner {
     pub item: LibKey,
     /// Byte offset of the original unmodified expression inside `item`'s scanned text
-    /// (`impl_header` for an impl, `trait_head` for a trait, whole text for other items/members).
+    /// (`impl_header` for an impl, `trait_head` for a trait, whole text for other items/members),
+    /// or inside the expansion text when [`Self::expansion`] is `Some`.
     pub offset: u32,
-    /// Byte length of the original unmodified expression inside `item`'s scanned text.
+    /// Byte length of the original unmodified expression inside that scanned text.
     pub len: u32,
+    /// `Some` when the expression came from expanding a type macro in `item`'s head rather than
+    /// standing verbatim in `item`'s scanned text.
+    pub expansion: Option<HeadExpansion>,
 }
 
 #[derive(Clone, Debug)]
 struct HeadOwned {
     owner: HeadOwner,
+    exp_text: Option<AString<'static>>,
     edits: AVec<'static, TextEdit>,
     member: AString<'static>,
 }
@@ -438,12 +456,29 @@ impl Ask {
         Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: Some(self_ty), body: None, head_owner: None, marked: None })
     }
 
-    pub(super) fn in_head_item(mut self, owner: HeadOwner, site: Option<HeadSite<'_>>, edits: AVec<'static, TextEdit>, alloc: Alloc<'static>) -> Self {
+    pub(super) fn in_head_item(
+        mut self,
+        owner: HeadOwner,
+        exp_text: Option<&str>,
+        site: Option<HeadSite<'_>>,
+        edits: AVec<'static, TextEdit>,
+        alloc: Alloc<'static>,
+    ) -> Self {
         let mut hash = blaze_ids::Hasher::new("blaze-ladder head item anonymous constant 1");
         hash.part(self.member_name().as_bytes());
         hash.update(&owner.item.0.0);
         hash.update(&owner.offset.to_le_bytes());
         hash.update(&owner.len.to_le_bytes());
+        match owner.expansion {
+            Some(exp) => {
+                hash.update(&[1]);
+                hash.update(&exp.call.0.0);
+                hash.update(&exp.root_call_offset.to_le_bytes());
+            }
+            None => {
+                hash.update(&[0]);
+            }
+        }
         // Include the full substitution mapping: `BodyHost::place_of_call` remaps call columns
         // through `edits`, so replacing a long qualified constant with its literal value changes
         // later `column!()` positions even when the substituted text, owner, offset, and start
@@ -478,12 +513,17 @@ impl Ask {
         let member = blaze_own::format_in!(alloc, "head {:x}", hash.finish());
         let key = anon_const_key(checker_of(self.module), &member);
         self.need = if self.body.is_some() { body_need_key(key) } else { need_key(key) };
-        self.head_owner = Some(HeadOwned { owner, edits, member });
+        let exp_text = exp_text.map(|t| {
+            let mut s = AString::new_in(alloc);
+            s.push_str(t);
+            s
+        });
+        self.head_owner = Some(HeadOwned { owner, exp_text, edits, member });
         self
     }
 
-    pub(super) fn head_owner(&self) -> Option<(HeadOwner, &[TextEdit])> {
-        self.head_owner.as_ref().map(|h| (h.owner, h.edits.as_slice()))
+    pub(super) fn head_owner(&self) -> Option<(HeadOwner, Option<&str>, &[TextEdit])> {
+        self.head_owner.as_ref().map(|h| (h.owner, h.exp_text.as_deref(), h.edits.as_slice()))
     }
 
     pub(super) fn carry_marks(mut self, rows: AVec<'static, (u32, TextMark)>) -> Self {
@@ -614,7 +654,7 @@ pub fn self_value<H: super::types::Heads + ?Sized>(
     self_ty: tc::PTy,
     self_node: PNode,
     marks: Option<TextMarks<'_>>,
-    head_owner: Option<(HeadOwner, Option<HeadSite<'_>>)>,
+    head_owner: Option<(HeadOwner, Option<&str>, Option<HeadSite<'_>>)>,
     edits: Option<AVec<'static, TextEdit>>,
     r: blaze_surface::Range,
 ) -> Result<u128, Why> {
@@ -636,9 +676,9 @@ pub fn self_value<H: super::types::Heads + ?Sized>(
         } else {
             None
         };
-        if let Some((owner, site)) = head_owner {
+        if let Some((owner, exp_text, site)) = head_owner {
             let edits = edits.unwrap_or_else(|| AVec::new_in(alloc));
-            ask = ask.in_head_item(owner, site, edits, alloc);
+            ask = ask.in_head_item(owner, exp_text, site, edits, alloc);
         }
         if let Some(rows) = carried_marks {
             ask = ask.carry_marks(rows);
@@ -771,10 +811,10 @@ pub fn file_asked<'n>(store: &mut Store<'n>, keys: &mut Keys) -> Result<Vec<LibK
             store.locals.file_anon(key, owner, scope);
         }
         let prim = written_ty(a.ty, &a.text).ok_or(FileFail::NoName(a.ty))?;
-        if let Some((owner, edits)) = a.head_owner() {
+        if let Some((owner, exp_text, edits)) = a.head_owner() {
             let prefix = "const _: ".len() + prim.len() + " = { ".len();
             if let Ok(prefix) = u32::try_from(prefix) {
-                store.locals.file_head_anon(key, owner, edits, prefix);
+                store.locals.file_head_anon(key, owner, exp_text, edits, prefix);
             }
         }
         if store.fns.contains_key(&key) {
@@ -873,15 +913,15 @@ mod tests {
         let base = Ask::of(module, PNode::Uint(tc::UintTy::Usize), expr).expect("usize anon const");
         let item_a = LibKey(ContentId([2; 32]));
         let item_b = LibKey(ContentId([3; 32]));
-        let owner = |item, offset| HeadOwner { item, offset, len: expr.len() as u32 };
+        let owner = |item, offset| HeadOwner { item, offset, len: expr.len() as u32, expansion: None };
         let empty = || blaze_own::AVec::new_in(alloc);
-        let a_at_10 = base.clone().in_head_item(owner(item_a, 10), None, empty(), alloc);
-        let a_at_10_again = base.clone().in_head_item(owner(item_a, 10), None, empty(), alloc);
-        let a_at_20 = base.clone().in_head_item(owner(item_a, 20), None, empty(), alloc);
-        let b_at_10 = base.clone().in_head_item(owner(item_b, 10), None, empty(), alloc);
-        let a_line_3 = base.clone().in_head_item(owner(item_a, 10), Some(HeadSite { line: 3, col: 5, file: Some("src/a.rs") }), empty(), alloc);
-        let a_line_4 = base.clone().in_head_item(owner(item_a, 10), Some(HeadSite { line: 4, col: 5, file: Some("src/a.rs") }), empty(), alloc);
-        let a_file_b = base.clone().in_head_item(owner(item_a, 10), Some(HeadSite { line: 3, col: 5, file: Some("src/b.rs") }), empty(), alloc);
+        let a_at_10 = base.clone().in_head_item(owner(item_a, 10), None, None, empty(), alloc);
+        let a_at_10_again = base.clone().in_head_item(owner(item_a, 10), None, None, empty(), alloc);
+        let a_at_20 = base.clone().in_head_item(owner(item_a, 20), None, None, empty(), alloc);
+        let b_at_10 = base.clone().in_head_item(owner(item_b, 10), None, None, empty(), alloc);
+        let a_line_3 = base.clone().in_head_item(owner(item_a, 10), None, Some(HeadSite { line: 3, col: 5, file: Some("src/a.rs") }), empty(), alloc);
+        let a_line_4 = base.clone().in_head_item(owner(item_a, 10), None, Some(HeadSite { line: 4, col: 5, file: Some("src/a.rs") }), empty(), alloc);
+        let a_file_b = base.clone().in_head_item(owner(item_a, 10), None, Some(HeadSite { line: 3, col: 5, file: Some("src/b.rs") }), empty(), alloc);
         assert_eq!(a_at_10.need, a_at_10_again.need, "identical head owner and offset share one key");
         assert_ne!(a_at_10.need, base.need, "head-owned anon const differs from unowned");
         assert_ne!(a_at_10.need, a_at_20.need, "different offsets in the same item get distinct keys");
@@ -895,6 +935,7 @@ mod tests {
             transparency: Transparency::Opaque,
             edition: Edition::E2021,
             local_inner: false,
+            hygiene: 0,
         };
         let mut marks_a = blaze_own::AVec::new_in(alloc);
         marks_a.push((0, mark));
@@ -928,7 +969,7 @@ mod tests {
         let site = Some(HeadSite { line: 3, col: 5, file: Some("src/a.rs") });
         let mut sub_edits = blaze_own::AVec::new_in(alloc);
         sub_edits.push(TextEdit { sub_start: 0, sub_end: 7, orig_start: 0, orig_end: 15 });
-        let with_edits = base.clone().in_head_item(owner(item_a, 10), site, sub_edits, alloc);
+        let with_edits = base.clone().in_head_item(owner(item_a, 10), None, site, sub_edits, alloc);
         assert_ne!(with_edits.need, a_line_3.need, "changing substitution edits must change the head anon const key");
     }
 }
