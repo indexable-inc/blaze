@@ -828,7 +828,7 @@ impl<'n> Locals<'n> {
         let mut blocks: blaze_own::Vec<BlockModule, &'n Frame> = blaze_own::Vec::new_in(frame);
         if let Some(ms) = modules.as_ref() {
             for (b, block) in nested.blocks.iter().enumerate() {
-                if let (true, Some(module)) = (known[b], ms.modules.get(b).copied().flatten()) {
+                if let (Some(true), Some(module)) = (known.get(b).copied(), ms.modules.get(b).copied().flatten()) {
                     blocks.push(BlockModule { open: block.open, close: block.close, module });
                 }
             }

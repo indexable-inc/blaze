@@ -397,7 +397,7 @@ impl Ask {
         }
         let name = format!("{prim}: {text}").into_boxed_str();
         let need = need_key(anon_const_key(checker_of(module), &name));
-        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: None, body: None, head_owner: None, marked: None })
+        Some(Ask { need, module, ty, name, text: text.into(), self_ty: None, body: None, head_owner: None, marked: None })
     }
 
     /// The anonymous constant `text` of type `ty` written in block `scope` of the body `owner`
@@ -428,7 +428,7 @@ impl Ask {
         }
         .into_boxed_str();
         let need = body_need_key(anon_const_key(checker_of(module), &name));
-        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: self_.map(|(t, _)| t), body: Some((owner, scope)), head_owner: None, marked: None })
+        Some(Ask { need, module, ty, name, text: text.into(), self_ty: self_.map(|(t, _)| t), body: Some((owner, scope)), head_owner: None, marked: None })
     }
 
     /// The anonymous constant `text` of type `ty` written in `module` where `Self` is the
@@ -453,7 +453,7 @@ impl Ask {
         }
         .into_boxed_str();
         let need = need_key(anon_const_key(checker_of(module), &name));
-        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: Some(self_ty), body: None, head_owner: None, marked: None })
+        Some(Ask { need, module, ty, name, text: text.into(), self_ty: Some(self_ty), body: None, head_owner: None, marked: None })
     }
 
     pub(super) fn in_head_item(
@@ -659,7 +659,7 @@ pub fn self_value<H: super::types::Heads + ?Sized>(
     r: blaze_surface::Range,
 ) -> Result<u128, Why> {
     let source = text.trim();
-    let Some(mut ask) = ty.and_then(|ty| Ask::of_self(module, ty, source, self_ty, self_node)) else { return Err(Why::ConstPath(Box::from(source), r)) };
+    let Some(mut ask) = ty.and_then(|ty| Ask::of_self(module, ty, source, self_ty, self_node)) else { return Err(Why::ConstPath(source.into(), r)) };
     if let Some(alloc) = heads.mark_alloc() {
         let carried_marks = if let Some(marks) = marks {
             let mark_edits = edits.as_deref().unwrap_or(&[]);
@@ -691,7 +691,7 @@ pub fn self_value<H: super::types::Heads + ?Sized>(
         return Err(Why::ConstPath(format!("{source}: {why}").into_boxed_str(), r));
     }
     let need = ask.need;
-    if heads.ask_anon(ask) { Err(Why::NeedConst(need, r)) } else { Err(Why::ConstPath(Box::from(source), r)) }
+    if heads.ask_anon(ask) { Err(Why::NeedConst(need, r)) } else { Err(Why::ConstPath(source.into(), r)) }
 }
 
 /// The token marks of a HEAD's constant expression `orig` (a slice of the text `marks` are
