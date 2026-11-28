@@ -104,6 +104,21 @@ pub type CaptureProjs<'a> = Soa<(u8, u32, u32, PTy), Alloc<'a>>;
 /// where its signature's expectation came from ([`SigFrom`]).
 pub type Closures<'a> = Soa<(ExprId, ClosureKind, PTy, Option<PTy>, SigFrom), Alloc<'a>>;
 
+/// Where a [`SigFrom::Supertrait`] closure signature expectation originated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SupertraitOrigin {
+    /// Elaborated from a pending trait obligation filed by clause `nth` of the item the path or
+    /// method call `expr` names (`Cause::Clause { expr, nth }`).
+    Clause { expr: ExprId, nth: u32 },
+    /// Elaborated from a trait-object principal (`dyn SubTrait`) at closure expression `expr`:
+    /// explicit `'static` regions in the supertrait signature stay `SigSlot::Static` (matching
+    /// [`SigFrom::Object`]), and `expr` keys any supertrait / GAT selections recorded in
+    /// `Checked::selected`.
+    Object { expr: ExprId },
+    /// Elaborated from a pending trait obligation with no single call clause.
+    Other,
+}
+
 /// Where a closure's signature was expected from (D148, docs/v2/plan/design/flow.md "Lifetimes
 /// are produced once and carried beside the types", piece L5). The erased signature in
 /// [`Closures`] holds no region; the flow lowering reads a closure's regions from WHERE the
@@ -114,9 +129,16 @@ pub type Closures<'a> = Soa<(ExprId, ClosureKind, PTy, Option<PTy>, SigFrom), Al
 pub enum SigFrom {
     /// A pending `Fn*` obligation registered by clause `nth` of the item the path or method call
     /// `expr` names (`Cause::Clause`): the inputs are that clause's argument tuple; the output is
-    /// clause `output`'s term (the `FnOnce::Output` projection of the same use) when one was
-    /// pending, else the body's own.
-    Clause { expr: ExprId, nth: u32, output: Option<u32> },
+    /// clause `output`'s term (the `FnOnce::Output` projection of the same use when
+    /// `output_trait` is `None`, or of `output_trait`'s predicates when a separate supertrait
+    /// supplied `Output`), else the body's own.
+    Clause { expr: ExprId, nth: u32, output: Option<u32>, output_trait: Option<ItemKey> },
+    /// A `Fn*` supertrait elaborated from a pending trait bound (or `dyn SubTrait`): `origin`
+    /// records whether it came from a call's clause or a trait object; `trait_` declares the `Fn*`
+    /// clause at index `nth` in `Predicates(trait_)` / `HeadRegions::clauses(trait_)`, and
+    /// `output` names the trait and clause index of the matching `<Self as FnOnce<..>>::Output`
+    /// projection when it came from a supertrait.
+    Supertrait { origin: SupertraitOrigin, trait_: ItemKey, nth: u32, output: Option<(ItemKey, u32)> },
     /// Every parameter's type and the return type written on the closure, no expectation used.
     Written,
     /// No expectation (or one the body itself made, not a declared clause): every region is the

@@ -481,179 +481,243 @@ pub fn classify_closure_env_use<'a>(
     };
     let is_fn_or_mut = |tr: tc::ItemKey| Some(tr) == langs.fn_traits[0] || Some(tr) == langs.fn_traits[1];
     let is_fn_once = |tr: tc::ItemKey| Some(tr) == langs.fn_traits[2];
-    match sig_from {
-        tc::SigFrom::Clause { expr, nth, .. } => {
-            let call_expr = match view.exprs.get(expr.ix()) {
-                Some(tc::Expr::MethodCall { args, .. } | tc::Expr::Call { args, .. })
-                    if arg_contains_closure(view, done, *args, closure) =>
+    let check_call_fn_once_only = |expr: tc::ExprId, clause_nth: u32, expect_fn_once: bool| -> ClosureEnvUse {
+        let call_expr = match view.exprs.get(expr.ix()) {
+            Some(tc::Expr::MethodCall { args, .. } | tc::Expr::Call { args, .. })
+                if arg_contains_closure(view, done, *args, closure) =>
+            {
+                Some(expr)
+            }
+            _ => view.exprs.iter().enumerate().find_map(|(ix, x)| match *x {
+                tc::Expr::Call { callee, args }
+                    if unwrap_parens(view, callee) == expr && arg_contains_closure(view, done, args, closure) =>
                 {
-                    Some(expr)
+                    u32::try_from(ix).ok().map(tc::ExprId)
                 }
-                _ => view.exprs.iter().enumerate().find_map(|(ix, x)| match *x {
-                    tc::Expr::Call { callee, args }
-                        if unwrap_parens(view, callee) == expr && arg_contains_closure(view, done, args, closure) =>
-                    {
-                        Some(tc::ExprId(ix as u32))
-                    }
+                _ => None,
+            }),
+        };
+        let Some(call_expr) = call_expr else {
+            return ClosureEnvUse::Unknown;
+        };
+        let callee_of = |e: tc::ExprId| {
+            done.callees
+                .column::<0>()
+                .iter()
+                .position(|&x| x == e)
+                .and_then(|pos| done.callees.column::<1>().get(pos).copied())
+        };
+        let def_fn_of = |e: tc::ExprId| {
+            done.expr_defs
+                .column::<0>()
+                .iter()
+                .position(|&x| x == e)
+                .and_then(|pos| match done.expr_defs.column::<1>().get(pos).copied() {
+                    Some(tc::Def::Fn(k)) => Some(k),
                     _ => None,
-                }),
-            };
-            let Some(call_expr) = call_expr else {
-                return ClosureEnvUse::Unknown;
-            };
-            let callee_of = |e: tc::ExprId| {
-                done.callees
-                    .column::<0>()
-                    .iter()
-                    .position(|&x| x == e)
-                    .and_then(|pos| done.callees.column::<1>().get(pos).copied())
-            };
-            let def_fn_of = |e: tc::ExprId| {
-                done.expr_defs
-                    .column::<0>()
-                    .iter()
-                    .position(|&x| x == e)
-                    .and_then(|pos| match done.expr_defs.column::<1>().get(pos).copied() {
-                        Some(tc::Def::Fn(k)) => Some(k),
-                        _ => None,
-                    })
-            };
-            let Some(callee_key) = callee_of(expr).or_else(|| callee_of(call_expr)).or_else(|| def_fn_of(expr)) else {
-                return ClosureEnvUse::Unknown;
-            };
-            let Some(preds) = store.preds.get(&callee_key) else {
-                return ClosureEnvUse::Unknown;
-            };
-            let tys = store.tys.view();
-            let Some(&tc::PClause::Trait { trait_, args }) = preds.clauses.get(nth as usize) else {
-                return ClosureEnvUse::Unknown;
-            };
+                })
+        };
+        let Some(callee_key) = callee_of(expr).or_else(|| callee_of(call_expr)).or_else(|| def_fn_of(expr)) else {
+            return ClosureEnvUse::Unknown;
+        };
+        let Some(preds) = store.preds.get(&callee_key) else {
+            return ClosureEnvUse::Unknown;
+        };
+        let tys = store.tys.view();
+        let Ok(cidx) = usize::try_from(clause_nth) else {
+            return ClosureEnvUse::Unknown;
+        };
+        let Some(&tc::PClause::Trait { trait_, args }) = preds.clauses.get(cidx) else {
+            return ClosureEnvUse::Unknown;
+        };
+        if expect_fn_once {
             if is_fn_or_mut(trait_) {
                 return ClosureEnvUse::FnOrFnMut;
             }
             if !is_fn_once(trait_) {
                 return ClosureEnvUse::Unknown;
             }
-            let Ok(list) = tys.list(args) else {
+        }
+        let Ok(list) = tys.list(args) else {
+            return ClosureEnvUse::Unknown;
+        };
+        let Some(&first) = list.first() else {
+            return ClosureEnvUse::Unknown;
+        };
+        let Ok(tc::PNode::Param(param_idx)) = tys.node(first) else {
+            return ClosureEnvUse::Unknown;
+        };
+        // Verify EVERY clause on `Param(param_idx)` in `callee_key` (including inherited
+        // impl/trait clauses): none may require `Fn` or `FnMut`, directly or via supertraits.
+        let mut visited: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+        let mut stack: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+        for clause in preds.clauses.iter() {
+            let tc::PClause::Trait { trait_: other_trait, args: other_args } = *clause else {
+                continue;
+            };
+            let Ok(olist) = tys.list(other_args) else {
                 return ClosureEnvUse::Unknown;
             };
-            let Some(&first) = list.first() else {
-                return ClosureEnvUse::Unknown;
+            let Some(&ofirst) = olist.first() else {
+                continue;
             };
-            let Ok(tc::PNode::Param(param_idx)) = tys.node(first) else {
-                return ClosureEnvUse::Unknown;
-            };
-            // Verify EVERY clause on `Param(param_idx)` in `callee_key` (including inherited
-            // impl/trait clauses): none may require `Fn` or `FnMut`, directly or via supertraits.
-            let mut visited: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
-            let mut stack: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
-            for clause in preds.clauses.iter() {
-                let tc::PClause::Trait { trait_: other_trait, args: other_args } = *clause else {
-                    continue;
-                };
-                let Ok(olist) = tys.list(other_args) else {
-                    return ClosureEnvUse::Unknown;
-                };
-                let Some(&ofirst) = olist.first() else {
-                    continue;
-                };
-                if !matches!(tys.node(ofirst), Ok(tc::PNode::Param(p)) if p == param_idx) {
-                    continue;
-                }
-                if is_fn_or_mut(other_trait) {
+            if !matches!(tys.node(ofirst), Ok(tc::PNode::Param(p)) if p == param_idx) {
+                continue;
+            }
+            if is_fn_or_mut(other_trait) {
+                return ClosureEnvUse::FnOrFnMut;
+            }
+            if is_fn_once(other_trait) || facts.trait_relates_nothing(other_trait) || facts.is_auto_trait(other_trait) {
+                continue;
+            }
+            visited.clear();
+            stack.clear();
+            stack.push(other_trait);
+            while let Some(t) = stack.pop() {
+                if is_fn_or_mut(t) {
                     return ClosureEnvUse::FnOrFnMut;
                 }
-                if is_fn_once(other_trait) || facts.trait_relates_nothing(other_trait) || facts.is_auto_trait(other_trait) {
+                if is_fn_once(t) || facts.trait_relates_nothing(t) || facts.is_auto_trait(t) {
                     continue;
                 }
-                visited.clear();
-                stack.clear();
-                stack.push(other_trait);
-                while let Some(t) = stack.pop() {
-                    if is_fn_or_mut(t) {
-                        return ClosureEnvUse::FnOrFnMut;
-                    }
-                    if is_fn_once(t) || facts.trait_relates_nothing(t) || facts.is_auto_trait(t) {
-                        continue;
-                    }
-                    if visited.contains(&t) {
-                        continue;
-                    }
-                    if visited.len() >= 64 {
-                        return ClosureEnvUse::Unknown;
-                    }
-                    visited.push(t);
-                    let Some(def) = store.trait_defs.get(&t) else {
-                        return ClosureEnvUse::Unknown;
-                    };
-                    for sc in def.supertraits.iter() {
-                        if let tc::PClause::Trait { trait_: sup, args: sargs } = *sc
-                            && tys.list(sargs).ok().and_then(|l| l.first().copied()).is_some_and(|f| matches!(tys.node(f), Ok(tc::PNode::Param(0))))
-                        {
-                            stack.push(sup);
-                        }
-                    }
+                if visited.contains(&t) {
+                    continue;
                 }
-            }
-            ClosureEnvUse::FnOnceOnly
-        }
-        tc::SigFrom::Object => {
-            let mut cur = closure;
-            let mut behind_ref = false;
-            let tys = done.types.view();
-            for _ in 0..8 {
-                let (lo, hi) = adjust_range(done, cur);
-                let adj_ty = if hi > lo {
-                    done.adjusts.column::<2>().get(hi - 1).copied()
-                } else {
-                    done.expr_ty.get(cur.ix()).copied()
-                };
-                if let Some(ty) = adj_ty
-                    && let Some(dyn_ty) = peel_to_dyn(tys, ty, facts)
-                    && let Ok(tc::PNode::Dynamic(preds_list)) = tys.node(dyn_ty)
-                    && let Ok(preds) = tys.list(preds_list)
-                {
-                    for &p in preds {
-                        if let Ok(tc::PNode::ExTrait(tr, _)) = tys.node(p) {
-                            if is_fn_or_mut(tr) {
-                                return ClosureEnvUse::FnOrFnMut;
-                            }
-                            if is_fn_once(tr) && !behind_ref {
-                                return ClosureEnvUse::FnOnceOnly;
-                            }
-                        }
-                    }
+                if visited.len() >= 64 {
                     return ClosureEnvUse::Unknown;
                 }
-                let parent = view.exprs.iter().enumerate().find_map(|(ix, expr)| {
-                    let pe = tc::ExprId(ix as u32);
-                    match *expr {
-                        tc::Expr::Paren(inner) | tc::Expr::Cast { operand: inner, .. } if inner == cur => Some((pe, false)),
-                        tc::Expr::Ref { operand: inner, .. } if inner == cur => Some((pe, true)),
-                        tc::Expr::Call { args, .. } => {
-                            let es = view.expr_lists.get(args.range())?;
-                            if es.len() == 1
-                                && es[0] == cur
-                                && let Some(&pty) = done.expr_ty.get(pe.ix())
-                                && let Ok(tc::PNode::Adt(k, _)) = tys.node(pty)
-                                && facts.adt(k).is_some_and(|a| a.is_box)
-                            {
-                                Some((pe, false))
-                            } else {
-                                None
+                visited.push(t);
+                let Some(def) = store.trait_defs.get(&t) else {
+                    return ClosureEnvUse::Unknown;
+                };
+                for sc in def.supertraits.iter() {
+                    if let tc::PClause::Trait { trait_: sup, args: sargs } = *sc
+                        && tys.list(sargs).ok().and_then(|l| l.first().copied()).is_some_and(|f| matches!(tys.node(f), Ok(tc::PNode::Param(0))))
+                    {
+                        stack.push(sup);
+                    }
+                }
+            }
+        }
+        ClosureEnvUse::FnOnceOnly
+    };
+    let check_object_use = |allow_supertraits: bool| -> ClosureEnvUse {
+        let mut cur = closure;
+        let mut behind_ref = false;
+        let tys = done.types.view();
+        for _ in 0..8 {
+            let (lo, hi) = adjust_range(done, cur);
+            let adj_ty = if hi > lo {
+                done.adjusts.column::<2>().get(hi - 1).copied()
+            } else {
+                done.expr_ty.get(cur.ix()).copied()
+            };
+            if let Some(ty) = adj_ty
+                && let Some(dyn_ty) = peel_to_dyn(tys, ty, facts)
+                && let Ok(tc::PNode::Dynamic(preds_list)) = tys.node(dyn_ty)
+                && let Ok(preds) = tys.list(preds_list)
+            {
+                let mut visited: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+                let mut stack: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+                let mut saw_fn_once = false;
+                let store_tys = store.tys.view();
+                for &p in preds {
+                    if let Ok(tc::PNode::ExTrait(tr, _)) = tys.node(p) {
+                        if is_fn_or_mut(tr) {
+                            return ClosureEnvUse::FnOrFnMut;
+                        }
+                        if is_fn_once(tr) {
+                            saw_fn_once = true;
+                            continue;
+                        }
+                        if !allow_supertraits {
+                            continue;
+                        }
+                        visited.clear();
+                        stack.clear();
+                        stack.push(tr);
+                        while let Some(t) = stack.pop() {
+                            if is_fn_or_mut(t) {
+                                return ClosureEnvUse::FnOrFnMut;
+                            }
+                            if is_fn_once(t) {
+                                saw_fn_once = true;
+                                continue;
+                            }
+                            if facts.trait_relates_nothing(t) || facts.is_auto_trait(t) || visited.contains(&t) {
+                                continue;
+                            }
+                            if visited.len() >= 64 {
+                                return ClosureEnvUse::Unknown;
+                            }
+                            visited.push(t);
+                            let Some(def) = store.trait_defs.get(&t) else {
+                                return ClosureEnvUse::Unknown;
+                            };
+                            for sc in def.supertraits.iter() {
+                                if let tc::PClause::Trait { trait_: sup, args: sargs } = *sc
+                                    && store_tys.list(sargs).ok().and_then(|l| l.first().copied()).is_some_and(|f| matches!(store_tys.node(f), Ok(tc::PNode::Param(0))))
+                                {
+                                    stack.push(sup);
+                                }
                             }
                         }
-                        _ => None,
                     }
-                });
-                let Some((pe, is_ref)) = parent else {
-                    break;
-                };
-                behind_ref |= is_ref;
-                cur = pe;
+                }
+                if saw_fn_once && !behind_ref {
+                    return ClosureEnvUse::FnOnceOnly;
+                }
+                return ClosureEnvUse::Unknown;
             }
-            ClosureEnvUse::Unknown
+            let parent = view.exprs.iter().enumerate().find_map(|(ix, expr)| {
+                let pe = tc::ExprId(u32::try_from(ix).ok()?);
+                match *expr {
+                    tc::Expr::Paren(inner) | tc::Expr::Cast { operand: inner, .. } if inner == cur => Some((pe, false)),
+                    tc::Expr::Ref { operand: inner, .. } if inner == cur => Some((pe, true)),
+                    tc::Expr::Call { args, .. } => {
+                        let es = view.expr_lists.get(args.range())?;
+                        if es.len() == 1
+                            && es[0] == cur
+                            && let Some(&pty) = done.expr_ty.get(pe.ix())
+                            && let Ok(tc::PNode::Adt(k, _)) = tys.node(pty)
+                            && facts.adt(k).is_some_and(|a| a.is_box)
+                        {
+                            Some((pe, false))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            });
+            let Some((pe, is_ref)) = parent else {
+                break;
+            };
+            behind_ref |= is_ref;
+            cur = pe;
         }
+        ClosureEnvUse::Unknown
+    };
+    match sig_from {
+        tc::SigFrom::Clause { expr, nth, .. } => check_call_fn_once_only(expr, nth, true),
+        tc::SigFrom::Supertrait { origin, trait_, nth, .. } => {
+            let Some(preds) = store.preds.get(&trait_) else {
+                return ClosureEnvUse::Unknown;
+            };
+            let Ok(idx) = usize::try_from(nth) else {
+                return ClosureEnvUse::Unknown;
+            };
+            match preds.clauses.get(idx) {
+                Some(&tc::PClause::Trait { trait_: st, .. }) if is_fn_or_mut(st) => ClosureEnvUse::FnOrFnMut,
+                Some(&tc::PClause::Trait { trait_: st, .. }) if is_fn_once(st) => match origin {
+                    tc::SupertraitOrigin::Clause { expr, nth: root_nth } => check_call_fn_once_only(expr, root_nth, false),
+                    tc::SupertraitOrigin::Object { .. } => check_object_use(true),
+                    tc::SupertraitOrigin::Other => ClosureEnvUse::Unknown,
+                },
+                _ => ClosureEnvUse::Unknown,
+            }
+        }
+        tc::SigFrom::Object => check_object_use(false),
         tc::SigFrom::Written | tc::SigFrom::Inferred => {
             let called_immediately = view
                 .exprs

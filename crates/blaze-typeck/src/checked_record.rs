@@ -34,7 +34,7 @@
 
 use blaze_own::{Alloc, Soa, Vec};
 
-use crate::columns::{AdjustKind, CaptureKind, Checked, CoroutineWitness, SigFrom, UnionPat};
+use crate::columns::{AdjustKind, CaptureKind, Checked, CoroutineWitness, SigFrom, SupertraitOrigin, UnionPat};
 use crate::error::CheckError;
 use crate::ids::{ExprId, FloatTy, FnPtrHeader, IntTy, ItemKey, LangItem, List, Mutbl, Name, PatId, PathIdx, RecordSchema, ScopeId, UintTy};
 use crate::portable::{PNode, PTy, PortableTys};
@@ -58,7 +58,9 @@ use crate::world::{CtorKind, Def, Needs, Prim, Question, ReadList, Shape};
 /// 06: a type node may be an extern type (`PNode::Foreign`, node tag 30).
 /// 07: structural record schemas/names, union pattern narrowing (`union_pats`), and union
 /// coercion adjustments (`AdjustKind::UnionInject`, `AdjustKind::UnionWiden`).
-pub const CHECKED_RECORD_MAGIC: [u8; 8] = *b"bzchkd07";
+/// 08: closure `SigFrom::Supertrait` (with `SupertraitOrigin`) and `SigFrom::Clause::output_trait`
+/// provenance (`Col::Closures`, row width 65).
+pub const CHECKED_RECORD_MAGIC: [u8; 8] = *b"bzchkd08";
 
 /// The record's columns, in the order the header and the body lay them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,7 +160,7 @@ impl Col {
             Col::Captures => 4 + 4 + 1,
             Col::CapturePlaces => 4 + 4 + 4 + 4 + 1 + 4,
             Col::CaptureProjs => 1 + 4 + 4 + 4,
-            Col::Closures => 4 + 1 + 4 + 5 + 14,
+            Col::Closures => 4 + 1 + 4 + 5 + 51,
             Col::Hidden => 16 + 4,
             Col::CoroutineWitnesses => 4 + 1,
             Col::Awaited => 4 + 4,
@@ -1262,17 +1264,45 @@ fn encode_rows<'b>(c: &Checked<'_>, stalled_proved: bool, alloc: Alloc<'b>) -> R
         p.u8(u8::from(places.is_some()));
         p.ty(places.unwrap_or(PTy(0)));
         match a.column::<4>()[i] {
-            SigFrom::Clause { expr, nth, output } => {
+            SigFrom::Clause { expr, nth, output, output_trait } => {
                 p.u8(0);
                 p.u32(expr.0);
                 p.u32(nth);
                 p.u8(u8::from(output.is_some()));
                 p.u32(output.unwrap_or(0));
+                p.u8(u8::from(output_trait.is_some()));
+                p.key(output_trait.unwrap_or(ItemKey(0)));
             }
             SigFrom::Written => p.u8(1),
             SigFrom::Inferred => p.u8(2),
             SigFrom::Object => p.u8(3),
             SigFrom::FnPtr => p.u8(4),
+            SigFrom::Supertrait { origin, trait_, nth, output } => {
+                p.u8(5);
+                match origin {
+                    SupertraitOrigin::Clause { expr, nth: root_nth } => {
+                        p.u8(0);
+                        p.u32(expr.0);
+                        p.u32(root_nth);
+                    }
+                    SupertraitOrigin::Object { expr } => {
+                        p.u8(1);
+                        p.u32(expr.0);
+                        p.u32(0);
+                    }
+                    SupertraitOrigin::Other => {
+                        p.u8(2);
+                        p.u32(0);
+                        p.u32(0);
+                    }
+                }
+                p.key(trait_);
+                p.u32(nth);
+                p.u8(u8::from(output.is_some()));
+                let (ot, on) = output.unwrap_or((ItemKey(0), 0));
+                p.key(ot);
+                p.u32(on);
+            }
         }
     })?;
     w.column(Col::Hidden, c.hidden.iter(), |p, &(k, t)| {
@@ -1683,12 +1713,33 @@ impl<'r> CheckedRecord<'r> {
                     let f = g.u8()?;
                     let some = bool_of(g, f)?;
                     let output = g.u32()?;
-                    SigFrom::Clause { expr, nth, output: some.then_some(output) }
+                    let ft = g.u8()?;
+                    let has_trait = bool_of(g, ft)?;
+                    let output_trait = g.key()?;
+                    SigFrom::Clause { expr, nth, output: some.then_some(output), output_trait: has_trait.then_some(output_trait) }
                 }
                 1 => SigFrom::Written,
                 2 => SigFrom::Inferred,
                 3 => SigFrom::Object,
                 4 => SigFrom::FnPtr,
+                5 => {
+                    let ot = g.u8()?;
+                    let oe = ExprId(g.u32()?);
+                    let on_root = g.u32()?;
+                    let origin = match ot {
+                        0 => SupertraitOrigin::Clause { expr: oe, nth: on_root },
+                        1 => SupertraitOrigin::Object { expr: oe },
+                        2 => SupertraitOrigin::Other,
+                        _ => return Err(g.bad(ot)),
+                    };
+                    let trait_ = g.key()?;
+                    let nth = g.u32()?;
+                    let f = g.u8()?;
+                    let some = bool_of(g, f)?;
+                    let out_t = g.key()?;
+                    let out_n = g.u32()?;
+                    SigFrom::Supertrait { origin, trait_, nth, output: some.then_some((out_t, out_n)) }
+                }
                 _ => return Err(g.bad(t)),
             };
             closures.push((e, kind, sig, places, from));

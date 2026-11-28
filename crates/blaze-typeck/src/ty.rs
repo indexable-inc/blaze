@@ -296,6 +296,8 @@ pub trait TypeCtx {
     /// order registered: what an E0282 names as waiting on its variable (rules/writeback.rs
     /// `undecided_of`).
     fn pending_goals(&self, out: &mut blaze_own::Vec<Goal, blaze_own::Alloc<'_>>);
+    /// Appends every obligation still pending (goal + cause), in registration order.
+    fn pending_obligations(&self, out: &mut blaze_own::Vec<Obligation, blaze_own::Alloc<'_>>);
     /// Whether `goal` may hold, evaluated in a probe (`predicate_may_hold`): nothing is bound.
     fn may_hold<W: World>(
         &mut self,

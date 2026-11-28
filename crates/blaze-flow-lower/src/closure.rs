@@ -786,28 +786,91 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         let mut outer_binder = 0u32;
         let mut static_as_static = false;
         let call_expr = match from {
-            SigFrom::Clause { expr, .. } => Some(expr),
+            SigFrom::Clause { expr, .. }
+            | SigFrom::Supertrait {
+                origin: blaze_typeck::SupertraitOrigin::Clause { expr, .. } | blaze_typeck::SupertraitOrigin::Object { expr },
+                ..
+            } => Some(expr),
             _ => None,
         };
+        let mut in_env: Option<blaze_typeck::List> = None;
+        let mut out_env: Option<blaze_typeck::List> = None;
+        let clause_part = |cs: &[blaze_typeck::region_facts::ClauseView<'b>], n: u32, child: u32| {
+            let c = cs.iter().find(|c| c.nth == n)?;
+            let slots = c.col.child(child)?;
+            let declared = blaze_borrow::RegionTypes::kids(&heads, c.col.ty()).ok().and_then(|k| k.get(child));
+            Some((slots, declared))
+        };
         let (ins, outs): (InPart<'_>, OutPart<'_>) = match from {
-            SigFrom::Clause { expr, nth, output } => {
+            SigFrom::Clause { expr, nth, output, output_trait } => {
+                in_env = self.callee_of(expr).map(|(_, g)| g);
                 let item = self.clause_owner(expr, nth, e)?;
                 let clauses = match facts.regions().clauses(item) {
                     Ok(c) => c,
                     Err(u) => return self.refuse(Form::RegionsUnread { item: u.item, why: u.why }, e),
                 };
-                let part = |n: u32, child: u32| {
-                    let c = clauses.iter().find(|c| c.nth == n)?;
-                    let slots = c.col.child(child)?;
-                    let declared = blaze_borrow::RegionTypes::kids(&heads, c.col.ty()).ok().and_then(|k| k.get(child));
-                    Some((slots, declared))
+                let Some((in_s, in_d)) = clause_part(clauses, nth, 1) else {
+                    return self.refuse(Form::ClosureClauseUnread { nth }, e);
                 };
-                let Some((in_s, in_d)) = part(nth, 1) else { return self.refuse(Form::ClosureClauseUnread { nth }, e) };
+                let outs = match (output, output_trait) {
+                    (Some(o), Some(ot)) => {
+                        out_env = self.supertrait_env_args(expr, ot, row, e)?;
+                        let out_clauses = match facts.regions().clauses(ot) {
+                            Ok(c) => c,
+                            Err(u) => return self.refuse(Form::RegionsUnread { item: u.item, why: u.why }, e),
+                        };
+                        match clause_part(out_clauses, o, 2) {
+                            Some(s) => Some(s),
+                            None => return self.refuse(Form::ClosureClauseUnread { nth: o }, e),
+                        }
+                    }
+                    (Some(o), None) => {
+                        out_env = in_env;
+                        match clause_part(clauses, o, 2) {
+                            Some(s) => Some(s),
+                            None => return self.refuse(Form::ClosureClauseUnread { nth: o }, e),
+                        }
+                    }
+                    (None, _) => None,
+                };
+                (Some((in_s, in_d, None)), outs)
+            }
+            SigFrom::Supertrait { origin, trait_, nth, output } => {
+                if matches!(origin, blaze_typeck::SupertraitOrigin::Object { .. }) {
+                    static_as_static = true;
+                }
+                if let Some(expr) = call_expr {
+                    in_env = self.supertrait_env_args(expr, trait_, row, e)?;
+                }
+                let clauses = match facts.regions().clauses(trait_) {
+                    Ok(c) => c,
+                    Err(u) => return self.refuse(Form::RegionsUnread { item: u.item, why: u.why }, e),
+                };
+                let Some((in_s, in_d)) = clause_part(clauses, nth, 1) else {
+                    return self.refuse(Form::ClosureClauseUnread { nth }, e);
+                };
                 let outs = match output {
-                    Some(o) => match part(o, 2) {
-                        Some(s) => Some(s),
-                        None => return self.refuse(Form::ClosureClauseUnread { nth: o }, e),
-                    },
+                    Some((out_trait, o)) => {
+                        out_env = if out_trait == trait_ {
+                            in_env
+                        } else if let Some(expr) = call_expr {
+                            self.supertrait_env_args(expr, out_trait, row, e)?
+                        } else {
+                            None
+                        };
+                        let out_clauses = if out_trait == trait_ {
+                            clauses
+                        } else {
+                            match facts.regions().clauses(out_trait) {
+                                Ok(c) => c,
+                                Err(u) => return self.refuse(Form::RegionsUnread { item: u.item, why: u.why }, e),
+                            }
+                        };
+                        match clause_part(out_clauses, o, 2) {
+                            Some(s) => Some(s),
+                            None => return self.refuse(Form::ClosureClauseUnread { nth: o }, e),
+                        }
+                    }
                     None => None,
                 };
                 (Some((in_s, in_d, None)), outs)
@@ -895,7 +958,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         pairs.push((dk, ik));
                     }
                 }
-                self.lay_sig_part(s, nin, 0, outer_binder, static_as_static, call_expr, &pairs, &heads, &mut owner, out, e)?
+                self.lay_sig_part(s, nin, 0, outer_binder, static_as_static, call_expr, in_env, &pairs, &heads, &mut owner, out, e)?
             }
             None => {
                 let ce = ck.closures.column::<0>().get(row).copied();
@@ -915,7 +978,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 if let Some(d) = declared {
                     pairs.push((d, output));
                 }
-                self.lay_sig_part(s, nout, 1, outer_binder, static_as_static, call_expr, &pairs, &heads, &mut owner, out, e)?
+                self.lay_sig_part(s, nout, 1, outer_binder, static_as_static, call_expr, out_env, &pairs, &heads, &mut owner, out, e)?
             }
             None => {
                 for _ in 0..nout {
@@ -1660,10 +1723,40 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         }
     }
 
+    /// Substituted arguments `[Self, A, ..]` of `trait_` recorded by typeck in `Checked::selected`
+    /// at `call_expr` for closure `closure_row`, used as `root_env` when normalizing GAT /
+    /// associated-type projections inside a supertrait's `Fn*` / `Output` clause.
+    fn supertrait_env_args(
+        &self,
+        call_expr: ExprId,
+        trait_: ItemKey,
+        closure_row: usize,
+        e: ExprId,
+    ) -> Result<Option<blaze_typeck::List>, Refusal> {
+        let ordinal = to_u32(closure_row);
+        let mut fallback: Option<blaze_typeck::List> = None;
+        for rows in [self.ck.call_selections(call_expr), self.ck.selected.as_slice()] {
+            for row in rows {
+                if row.trait_ != trait_ || row.name.is_some() {
+                    continue;
+                }
+                if let Some(&first) = self.list(row.args, e)?.first()
+                    && matches!(self.node(first, e)?, PNode::Closure { owner, ordinal: o, .. } if owner == self.body.owner && o == ordinal)
+                {
+                    return Ok(Some(row.args));
+                }
+                if fallback.is_none() && row.expr == call_expr {
+                    fallback = Some(row.args);
+                }
+            }
+        }
+        Ok(fallback)
+    }
+
     /// One part (`part` 0 the inputs, 1 the output) of `Lower::sig_slots` from the clause's
     /// slots `s` over the part's `n` positions; `pairs`: the part's declared types (the
     /// clause's, in `heads`' table) beside the closure's own (the body's), when read.
-    #[expect(clippy::too_many_arguments, reason = "the part, its declared and actual types, outer binder, static flag, call expr, and the owner count")]
+    #[expect(clippy::too_many_arguments, reason = "the part, its declared and actual types, outer binder, static flag, call expr, root env, and the owner count")]
     fn lay_sig_part(
         &self,
         s: &[Region],
@@ -1672,6 +1765,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         outer_binder: u32,
         static_as_static: bool,
         call_expr: Option<ExprId>,
+        root_env: Option<blaze_typeck::List>,
         pairs: &[(PTy, PTy)],
         heads: &blaze_borrow::Columns<'_>,
         owner: &mut u32,
@@ -1693,7 +1787,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             // Pool<'a>>::Cx = ()` drops 1 slot while `L = &ScaleLast` adds 1 position so total
             // `s.len() == n` despite shifted slots). Laid by walking the declared part beside
             // the closure's own; never guessed.
-            return self.lay_sig_typed(s, n, part, outer_binder, static_as_static, call_expr, pairs, heads, owner, out, e);
+            return self.lay_sig_typed(s, n, part, outer_binder, static_as_static, call_expr, root_env, pairs, heads, owner, out, e);
         }
         for &r in s {
             out.push(Self::region_sig_slot(r, outer_binder, static_as_static, owner));
@@ -1955,6 +2049,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         outer_binder: u32,
         static_as_static: bool,
         call_expr: Option<ExprId>,
+        root_env: Option<blaze_typeck::List>,
         pairs: &[(PTy, PTy)],
         heads: &blaze_borrow::Columns<'_>,
         owner: &mut u32,
@@ -1969,7 +2064,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         let first = out.len();
         let mut slot_buf: Vec<Region, A> = Vec::new_in(self.alloc);
         slot_buf.extend_from_slice(s);
-        let root_env = call_expr.and_then(|ce| self.callee_of(ce).map(|(_, g)| g));
         // Split `s` across top-level `pairs` by `heads.count(d)`.
         let mut init_frames: Vec<(PTy, PTy, usize, usize, Option<blaze_typeck::List>), A> = Vec::new_in(self.alloc);
         let mut cursor = 0usize;
@@ -2228,7 +2322,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
     /// (its method call, or the path its call names).
     pub(crate) fn sig_from_call(&self, row: usize, e: ExprId) -> Result<bool, Refusal> {
         let Some(&from) = self.ck.closures.column::<4>().get(row) else { return self.refuse(Form::Malformed, e) };
-        let SigFrom::Clause { expr, .. } = from else { return Ok(false) };
+        let expr = match from {
+            SigFrom::Clause { expr, .. }
+            | SigFrom::Supertrait { origin: blaze_typeck::SupertraitOrigin::Clause { expr, .. }, .. } => expr,
+            _ => return Ok(false),
+        };
         Ok(expr == e || matches!(self.body.exprs.get(e.ix()), Some(Expr::Call { callee, .. }) if *callee == expr))
     }
 

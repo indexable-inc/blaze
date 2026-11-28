@@ -1349,11 +1349,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             }
             need_coarse_closure_tie = true;
             let row = ordinal as usize;
-            if let Some(&blaze_typeck::SigFrom::Clause { nth, output, .. }) = self.ck.closures.column::<4>().get(row)
+            if let Some(&blaze_typeck::SigFrom::Clause { nth, output, output_trait, .. }) = self.ck.closures.column::<4>().get(row)
                 && self.sig_from_call(row, e)?
             {
                 sc.sig_clauses.push(nth);
-                if let Some(o) = output {
+                if output_trait.is_none()
+                    && let Some(o) = output
+                {
                     sc.sig_clauses.push(o);
                 }
             }

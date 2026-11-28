@@ -136,6 +136,7 @@ mod dyn_closure_sig;
 mod diag_node;
 mod undecided_origin;
 mod fn_ptr_fn_traits;
+mod closure_supertrait_sig;
 
 pub(crate) fn clauses(cs: &[PClause]) -> Vec<PClause> {
     cs.to_vec()

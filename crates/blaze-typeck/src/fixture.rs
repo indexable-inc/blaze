@@ -983,6 +983,8 @@ impl World for Fx {
             &i.clauses
         } else if let Some((_, o)) = self.opaques.iter().find(|(k, _)| *k == item) {
             o
+        } else if let Some(t) = self.traits.iter().find(|t| t.key == item) {
+            &t.supers
         } else {
             &[]
         };
