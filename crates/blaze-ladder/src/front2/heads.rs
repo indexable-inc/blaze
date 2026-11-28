@@ -2888,13 +2888,23 @@ pub struct Store<'n> {
     /// Maps a `TypeAlias`'s library key to its owner-scoped structural record `field_defaults` key
     /// when the alias expands to a structural record with defaults.
     pub alias_record_defaults: Rows<LibKey, ItemKey>,
+    /// Maps a `TypeAlias`'s library key to per-parameter owner-scoped record defaults when the
+    /// alias names a callable type (`fn(Rec) -> ...`, `dyn Fn(Rec) -> ...`).
+    pub alias_call_record_defaults: Rows<LibKey, blaze_own::Vec<(u32, ItemKey), Alloc<'static>>>,
     /// Maps a function/const/static checker key to per-parameter (`Some(idx)`) and output (`None`)
     /// owner-scoped structural record `field_defaults` keys.
     pub fn_record_defaults: Rows<ItemKey, blaze_own::Vec<(Option<u32>, ItemKey), Alloc<'static>>>,
+    /// Maps `(fn_or_const_ck, param_index_or_none_for_output)` to per-parameter owner-scoped
+    /// record defaults when that parameter/output has a callable type (`fn(Rec)`, `impl Fn(Rec)`,
+    /// `&dyn Fn(Rec)`, etc.).
+    pub fn_param_call_record_defaults: Rows<(ItemKey, Option<u32>), blaze_own::Vec<(u32, ItemKey), Alloc<'static>>>,
     /// Maps `(adt_ck, variant_index, field_name)` to an owner-scoped structural record
     /// `field_defaults` key when an ADT field's written type is a structural record (or alias)
     /// with defaults.
     pub adt_field_record_defaults: Rows<(ItemKey, u32, Name), ItemKey>,
+    /// Maps `(adt_ck, variant_index, field_name)` to per-parameter owner-scoped record defaults
+    /// when an ADT field has a callable type (`fn(Rec)`, `&dyn Fn(Rec)`, etc.).
+    pub adt_field_call_record_defaults: Rows<(ItemKey, u32, Name), blaze_own::Vec<(u32, ItemKey), Alloc<'static>>>,
     pub impls: Rows<ItemKey, ImplHead>,
     /// Trait impls whose header is lowered while one of their associated types waits on a
     /// constant ([`ProvisionalImpl`]). Visible only while that impl's `waiting_const` is on
@@ -3574,8 +3584,11 @@ impl<'n> Store<'n> {
             record_defaults_by_module: Rows::new_in(alloc),
             record_type_defaults: Rows::new_in(alloc),
             alias_record_defaults: Rows::new_in(alloc),
+            alias_call_record_defaults: Rows::new_in(alloc),
             fn_record_defaults: Rows::new_in(alloc),
+            fn_param_call_record_defaults: Rows::new_in(alloc),
             adt_field_record_defaults: Rows::new_in(alloc),
+            adt_field_call_record_defaults: Rows::new_in(alloc),
             impls: Rows::new_in(alloc),
             provisional_impls: Rows::new_in(alloc),
             provisional_used: core::cell::RefCell::new(blaze_own::Vec::new_in(alloc)),
@@ -3663,8 +3676,11 @@ impl<'n> Store<'n> {
             record_defaults_by_module,
             record_type_defaults,
             alias_record_defaults,
+            alias_call_record_defaults,
             fn_record_defaults,
+            fn_param_call_record_defaults,
             adt_field_record_defaults,
+            adt_field_call_record_defaults,
             impls,
             provisional_impls,
             provisional_used,
@@ -3748,8 +3764,11 @@ impl<'n> Store<'n> {
         record_defaults_by_module.clear();
         record_type_defaults.clear();
         alias_record_defaults.clear();
+        alias_call_record_defaults.clear();
         fn_record_defaults.clear();
+        fn_param_call_record_defaults.clear();
         adt_field_record_defaults.clear();
+        adt_field_call_record_defaults.clear();
         impls.clear();
         provisional_impls.clear();
         provisional_used.get_mut().clear();
@@ -4336,8 +4355,9 @@ impl<'n> Store<'n> {
     }
 
     /// Returns the owner-scoped `field_defaults` key for type `ty_id` in `v` (written in
-    /// `owner_lib` / `module`) when it names either a `TypeRef::Record` registered by `owner_lib`
-    /// or a `TypeAlias` with recorded structural record defaults.
+    /// `owner_lib` / `module`) when it names (optionally behind references/pointers) either a
+    /// `TypeRef::Record` registered by `owner_lib` or a `TypeAlias` with recorded structural
+    /// record defaults.
     pub(super) fn record_default_key_for_type<S: NamesSource<'n>>(
         &self,
         names: S,
@@ -4345,13 +4365,126 @@ impl<'n> Store<'n> {
         module: LibKey,
         marks: Option<TextMarks<'_>>,
         v: &View<'_>,
-        ty_id: lf::TypeId,
+        mut ty_id: lf::TypeId,
     ) -> Option<ItemKey> {
-        match v.ty(ty_id).ok()? {
-            lf::TypeRef::Record(_) => self.record_type_defaults.get(&(owner_lib, ty_id.0)).copied(),
-            lf::TypeRef::Path(p) => Self::resolve_record_alias(names, module, marks, v, p, self.work_alloc()).and_then(|al| self.alias_record_defaults.get(&al).copied()),
-            _ => None,
+        for _ in 0..8 {
+            match v.ty(ty_id).ok()? {
+                lf::TypeRef::Ref { inner, .. } | lf::TypeRef::Ptr { inner, .. } => ty_id = inner,
+                lf::TypeRef::Record(_) => return self.record_type_defaults.get(&(owner_lib, ty_id.0)).copied(),
+                lf::TypeRef::Path(p) => {
+                    return Self::resolve_record_alias(names, module, marks, v, p, self.work_alloc())
+                        .and_then(|al| self.alias_record_defaults.get(&al).copied());
+                }
+                _ => return None,
+            }
         }
+        None
+    }
+
+    /// Extracts per-parameter owner-scoped structural record defaults from a callable written type
+    /// (`fn(Rec) -> ...`, `for<'a> fn(&'a Rec) -> ...`, `impl Fn(Rec) -> ...`, `&dyn Fn(Rec)`,
+    /// `Box<dyn Fn(Rec)>`, or a `TypeAlias` to one).
+    #[expect(clippy::too_many_arguments, reason = "written type context for callable record default extraction")]
+    pub(super) fn callable_param_record_defaults<'a, S: NamesSource<'n>>(
+        &self,
+        names: S,
+        owner_lib: LibKey,
+        module: LibKey,
+        marks: Option<TextMarks<'_>>,
+        v: &View<'_>,
+        mut ty_id: lf::TypeId,
+        out_alloc: Alloc<'a>,
+    ) -> blaze_own::Vec<(u32, ItemKey), Alloc<'a>> {
+        let mut out = blaze_own::Vec::new_in(out_alloc);
+        for _ in 0..8 {
+            let Ok(tr) = v.ty(ty_id) else { break };
+            match tr {
+                lf::TypeRef::Ref { inner, .. } | lf::TypeRef::Ptr { inner, .. } | lf::TypeRef::For { inner, .. } => {
+                    ty_id = inner;
+                }
+                lf::TypeRef::FnPtr { params, .. } => {
+                    if let Ok(param_rows) = v.rows(params) {
+                        for (pi, &pn) in param_rows.iter().enumerate() {
+                            if let Ok(p) = lf::Param::decode(pn)
+                                && let Some(pt) = p.ty
+                                && let Some(srk) = self.record_default_key_for_type(names, owner_lib, module, marks, v, pt)
+                                && let Ok(pi_u32) = u32::try_from(pi)
+                            {
+                                out.push((pi_u32, srk));
+                            }
+                        }
+                    }
+                    break;
+                }
+                lf::TypeRef::Dyn(bounds) | lf::TypeRef::Impl(bounds) => {
+                    if let Ok(brows) = v.rows(bounds) {
+                        for &bn in brows {
+                            let Ok(lf::Bound::Trait { ty: bty, .. }) = lf::Bound::decode(bn) else { continue };
+                            let Ok(lf::TypeRef::Path(bp)) = v.ty(bty) else { continue };
+                            let Ok(pr) = v.path(bp) else { continue };
+                            let Ok(segs) = v.segments(pr) else { continue };
+                            let Some(&last_row) = segs.last() else { continue };
+                            let Ok(seg) = lf::Segment::decode(last_row) else { continue };
+                            if !seg.parenthesized {
+                                continue;
+                            }
+                            if let Ok(arg_rows) = v.rows(seg.args) {
+                                let mut pi = 0u32;
+                                for &an in arg_rows {
+                                    if let Ok(lf::GenericArg::Type(pt)) = lf::GenericArg::decode(an) {
+                                        if let Some(srk) = self.record_default_key_for_type(names, owner_lib, module, marks, v, pt) {
+                                            out.push((pi, srk));
+                                        }
+                                        pi = pi.saturating_add(1);
+                                    }
+                                }
+                            }
+                            if !out.is_empty() {
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
+                lf::TypeRef::Path(p) => {
+                    if let Some(al) = Self::resolve_record_alias(names, module, marks, v, p, self.work_alloc())
+                        && let Some(rows) = self.alias_call_record_defaults.get(&al)
+                    {
+                        out.extend_from_slice(rows);
+                        break;
+                    }
+                    // Peel single-type-arg smart pointer wrappers such as `Box<dyn Fn(Rec)>`.
+                    let peeled = (|| -> Option<lf::TypeId> {
+                        let pr = v.path(p).ok()?;
+                        let segs = v.segments(pr).ok()?;
+                        let seg = lf::Segment::decode(*segs.last()?).ok()?;
+                        let arg_rows = v.rows(seg.args).ok()?;
+                        let mut found: Option<lf::TypeId> = None;
+                        for &an in arg_rows {
+                            if let Ok(lf::GenericArg::Type(inner)) = lf::GenericArg::decode(an) {
+                                if found.is_some() {
+                                    return None;
+                                }
+                                found = Some(inner);
+                            }
+                        }
+                        let inner = found?;
+                        matches!(
+                            v.ty(inner).ok()?,
+                            lf::TypeRef::FnPtr { .. } | lf::TypeRef::Dyn(_) | lf::TypeRef::Impl(_) | lf::TypeRef::For { .. }
+                        )
+                        .then_some(inner)
+                    })();
+                    if let Some(inner) = peeled {
+                        ty_id = inner;
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        out
     }
 
     /// Registers `HeadAnon` alignment and remapped hygiene `anon_marks` for a frozen/seeded
@@ -5590,6 +5723,10 @@ impl<'n> Store<'n> {
         if let Some(srk) = self.record_default_key_for_type(names, key, module, marks, v, lf::TypeId(t)) {
             self.alias_record_defaults.insert(key, srk);
         }
+        let call_recs = self.callable_param_record_defaults(names, key, module, marks, v, lf::TypeId(t), a);
+        if !call_recs.is_empty() {
+            self.alias_call_record_defaults.insert(key, call_recs);
+        }
         self.maps.alias_defaults.insert(key, defaults);
         self.maps.aliases.insert(key, Some((generics, ty)));
         self.maps.const_params.insert(key, cs);
@@ -6587,13 +6724,17 @@ impl<'n> Store<'n> {
         sans_io |= names.in_sans_io_scope(key, module);
         let discrs = discriminants(&b, &mut self.tys, &env, v, repr, &written)?;
         self.register_record_defaults(names, keys, key, owner, &env, marks, v)?;
-        if Self::view_has_record_type(v) || !self.alias_record_defaults.is_empty() {
+        if Self::view_has_record_type(v) || !self.alias_record_defaults.is_empty() || !self.alias_call_record_defaults.is_empty() {
             let adt_owner_lib = owner.map_or(key, |(k, _)| k);
             for (fi_idx, fa) in field_at.iter().enumerate() {
-                if let Some(srk) = self.record_default_key_for_type(names, adt_owner_lib, module, marks, v, fa.written)
-                    && let Some(field) = fields.get(fi_idx)
-                {
-                    self.adt_field_record_defaults.insert((ck, fa.variant, field.name), srk);
+                if let Some(field) = fields.get(fi_idx) {
+                    if let Some(srk) = self.record_default_key_for_type(names, adt_owner_lib, module, marks, v, fa.written) {
+                        self.adt_field_record_defaults.insert((ck, fa.variant, field.name), srk);
+                    }
+                    let call_recs = self.callable_param_record_defaults(names, adt_owner_lib, module, marks, v, fa.written, self.tys.alloc());
+                    if !call_recs.is_empty() {
+                        self.adt_field_call_record_defaults.insert((ck, fa.variant, field.name), call_recs);
+                    }
                 }
             }
         }
@@ -8075,23 +8216,32 @@ impl<'n> Store<'n> {
             let rec_env = Env { module, params: &ps, bounds: Bounds::Done(&bounds), self_, self_assoc: self_assoc_slice, anon: &anon, consts: &cs, body: None };
             self.register_record_defaults(names, keys, fn_owner_lib, owner, &rec_env, marks, v)?;
         }
-        if has_rec || !self.alias_record_defaults.is_empty() {
+        if has_rec || !self.alias_record_defaults.is_empty() || !self.alias_call_record_defaults.is_empty() {
             let mut fn_recs: blaze_own::Vec<(Option<u32>, ItemKey), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
             if let Ok(param_rows) = v.rows(v.list(head::PARAMS)) {
                 for (pi, &pn) in param_rows.iter().enumerate() {
                     if let Ok(p) = lf::Param::decode(pn)
                         && let Some(t) = p.ty
-                        && let Some(srk) = self.record_default_key_for_type(names, fn_owner_lib, module, marks, v, t)
                         && let Ok(pi_u32) = u32::try_from(pi)
                     {
-                        fn_recs.push((Some(pi_u32), srk));
+                        if let Some(srk) = self.record_default_key_for_type(names, fn_owner_lib, module, marks, v, t) {
+                            fn_recs.push((Some(pi_u32), srk));
+                        }
+                        let call_recs = self.callable_param_record_defaults(names, fn_owner_lib, module, marks, v, t, alloc);
+                        if !call_recs.is_empty() {
+                            self.fn_param_call_record_defaults.insert((key, Some(pi_u32)), call_recs);
+                        }
                     }
                 }
             }
-            if let Some(t) = written_ret
-                && let Some(srk) = self.record_default_key_for_type(names, fn_owner_lib, module, marks, v, t)
-            {
-                fn_recs.push((None, srk));
+            if let Some(t) = written_ret {
+                if let Some(srk) = self.record_default_key_for_type(names, fn_owner_lib, module, marks, v, t) {
+                    fn_recs.push((None, srk));
+                }
+                let call_recs = self.callable_param_record_defaults(names, fn_owner_lib, module, marks, v, t, alloc);
+                if !call_recs.is_empty() {
+                    self.fn_param_call_record_defaults.insert((key, None), call_recs);
+                }
             }
             if !fn_recs.is_empty() {
                 self.fn_record_defaults.insert(key, fn_recs);

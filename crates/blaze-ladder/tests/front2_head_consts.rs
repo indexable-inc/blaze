@@ -2389,6 +2389,8 @@ fn mk_a_root() -> a::Rec { { .. } }
 fn mk_b_root() -> b::Rec { { .. } }
 fn take_a(r: a::Rec) -> isize { r.n }
 fn take_b(r: b::Rec) -> isize { r.n }
+fn take_ref_a(r: &a::Rec) -> isize { r.n }
+fn take_ref_b(r: &b::Rec) -> isize { r.n }
 struct Sink;
 impl Sink {
     fn take_a(&self, r: a::Rec) -> isize { r.n }
@@ -2396,9 +2398,40 @@ impl Sink {
     fn assoc_a(r: a::Rec) -> isize { r.n }
     fn assoc_b(r: b::Rec) -> isize { r.n }
 }
+mod tr_a {
+    pub trait TakeRec {
+        fn take_tr(&self, r: super::a::Rec) -> isize;
+    }
+    impl TakeRec for super::Sink {
+        fn take_tr(&self, r: super::a::Rec) -> isize { r.n }
+    }
+}
+mod tr_b {
+    pub trait TakeRec {
+        fn take_tr(&self, r: super::b::Rec) -> isize;
+    }
+    impl TakeRec for super::Sink {
+        fn take_tr(&self, r: super::b::Rec) -> isize { r.n }
+    }
+}
+mod only_tr_a {
+    use super::tr_a::TakeRec;
+    pub fn call(s: &super::Sink) -> isize { s.take_tr({ .. }) }
+}
+mod only_tr_b {
+    use super::tr_b::TakeRec;
+    pub fn call(s: &super::Sink) -> isize { s.take_tr({ .. }) }
+}
 struct Wrapper {
     a: a::Rec,
     b: b::Rec,
+}
+struct OuterWrap {
+    inner: Wrapper,
+}
+struct Hooks {
+    on_a: fn(a::Rec) -> isize,
+    on_b: fn(b::Rec) -> isize,
 }
 struct WrapA(a::Rec);
 struct WrapB(b::Rec);
@@ -2460,6 +2493,59 @@ fn both_deep_alias_in_one_fn() {
     let _x: m1::m2::m3::m4::m5::m6::m7::m8::m9::Rec = { .. };
     let _y: b::Rec = { .. };
 }
+fn both_block_scoped_trait_methods_in_one_fn(s: &Sink) -> isize {
+    let x = { use tr_a::TakeRec; s.take_tr({ .. }) };
+    let y = { use tr_b::TakeRec; s.take_tr({ .. }) };
+    x + y
+}
+fn both_qualified_trait_methods_in_one_fn(s: &Sink) -> isize {
+    <Sink as tr_a::TakeRec>::take_tr(s, { .. }) + <Sink as tr_b::TakeRec>::take_tr(s, { .. })
+}
+fn both_field_assigns_in_one_fn(w: &mut Wrapper) -> isize {
+    w.a = { .. };
+    w.b = { .. };
+    w.a.n + w.b.n
+}
+fn both_nested_field_assigns_in_one_fn(o: &mut OuterWrap) -> isize {
+    o.inner.a = { .. };
+    (*o).inner.b = { .. };
+    o.inner.a.n + o.inner.b.n
+}
+fn both_tuple_field_assigns_in_one_fn(wa: &mut WrapA, wb: &mut WrapB) -> isize {
+    wa.0 = { .. };
+    wb.0 = { .. };
+    wa.0.n + wb.0.n
+}
+fn both_direct_closures_in_one_fn() -> isize {
+    (|r: a::Rec| r.n)({ .. }) + (|r: b::Rec| r.n)({ .. })
+}
+fn both_local_closures_in_one_fn() -> isize {
+    let fa = |r: a::Rec| r.n;
+    let fb = |r: b::Rec| r.n;
+    fa({ .. }) + fb({ .. })
+}
+fn both_fn_ptr_locals_in_one_fn() -> isize {
+    let fa: fn(a::Rec) -> isize = take_a;
+    let fb: fn(b::Rec) -> isize = take_b;
+    fa({ .. }) + fb({ .. })
+}
+fn both_fn_ptr_params_in_one_fn(fa: fn(a::Rec) -> isize, fb: fn(b::Rec) -> isize) -> isize {
+    fa({ .. }) + fb({ .. })
+}
+fn both_impl_fn_params_in_one_fn(fa: impl Fn(a::Rec) -> isize, fb: &dyn Fn(b::Rec) -> isize) -> isize {
+    fa({ .. }) + fb({ .. })
+}
+fn both_field_callables_in_one_fn(h: &Hooks) -> isize {
+    (h.on_a)({ .. }) + (h.on_b)({ .. })
+}
+fn both_ref_and_break_in_one_fn() -> isize {
+    take_ref_a(&{ .. }) + take_ref_b(&loop { break { .. }; })
+}
+fn ret_b_with_closure_returning_a() -> b::Rec {
+    let g = || -> a::Rec { return { .. }; };
+    let _ = g();
+    { .. }
+}
 fn both_match_many_arms_in_one_fn(k: u32) -> isize {
     let ra: a::Rec = match k {
         0 => { .. }, 1 => { .. }, 2 => { .. }, 3 => { .. }, 4 => { .. }, 5 => { .. }, 6 => { .. }, 7 => { .. },
@@ -2518,11 +2604,13 @@ fn main() {}
     // `b::mk` / `mk_b_root` (NOT overwritten by `b::Rec`!).
     let prepared = Prepares::new_in(blaze_own::testing::bump());
     let (mut buckets, mut consts) = (None, Consts::default());
-    let cases: [(&[&str], u128, &str); 4] = [
+    let cases: [(&[&str], u128, &str); 6] = [
         (&["a", "mk"], 1, "a::mk must pick a::Rec default (N == 1)"),
         (&["b", "mk"], 2, "b::mk must pick b::Rec default (N == 2)"),
         (&["mk_a_root"], 1, "mk_a_root must pick a::Rec default (N == 1)"),
         (&["mk_b_root"], 2, "mk_b_root must pick b::Rec default (N == 2)"),
+        (&["only_tr_a", "call"], 1, "only_tr_a::call must pick in-scope tr_a::TakeRec (N == 1)"),
+        (&["only_tr_b", "call"], 2, "only_tr_b::call must pick in-scope tr_b::TakeRec (N == 2)"),
     ];
     for (segs, expected, msg) in cases {
         let fn_key = lookup(Namespace::Values, segs);
@@ -2558,6 +2646,19 @@ fn main() {}
         &["both_generic_let_methods_in_one_fn"][..],
         &["both_generic_turbofish_assoc_in_one_fn"][..],
         &["both_deep_alias_in_one_fn"][..],
+        &["both_block_scoped_trait_methods_in_one_fn"][..],
+        &["both_qualified_trait_methods_in_one_fn"][..],
+        &["both_field_assigns_in_one_fn"][..],
+        &["both_nested_field_assigns_in_one_fn"][..],
+        &["both_tuple_field_assigns_in_one_fn"][..],
+        &["both_direct_closures_in_one_fn"][..],
+        &["both_local_closures_in_one_fn"][..],
+        &["both_fn_ptr_locals_in_one_fn"][..],
+        &["both_fn_ptr_params_in_one_fn"][..],
+        &["both_impl_fn_params_in_one_fn"][..],
+        &["both_field_callables_in_one_fn"][..],
+        &["both_ref_and_break_in_one_fn"][..],
+        &["ret_b_with_closure_returning_a"][..],
     ] {
         let fn_key = lookup(Namespace::Values, segs);
         let body = lower_fn(&names, prepared, &mut keys, &mut store, fn_key).unwrap_or_else(|e| panic!("lower {segs:?}: {e}"));
