@@ -277,6 +277,27 @@ fn linux_host_native_setting_accepts_linux_shelf_and_features_h() {
         let split_b = command_native_setting(home_s, sdk_s, "test", LINUX_HOST, alloc).unwrap_or_else(|e| panic!("{e}"));
         assert_ne!(split_a.sdk_version.as_str(), split_b.sdk_version.as_str());
 
+        // Retargeting a directory symlink (`include/asm` from `arch-a` to `arch-b` while BOTH
+        // target trees remain present on disk) MUST move `sdk_version`.
+        let retarget_sdk = home.join("glibc-retarget");
+        fs::create_dir_all(retarget_sdk.join("include/arch-a")).expect("arch-a");
+        fs::create_dir_all(retarget_sdk.join("include/arch-b")).expect("arch-b");
+        fs::write(retarget_sdk.join(LINUX_HOST_SYSROOT_MARKER), b"#define __GLIBC__ 2\n").expect("retarget features.h");
+        fs::write(retarget_sdk.join("include/arch-a/errno.h"), b"#define EINVAL 22\n").expect("arch-a errno.h");
+        fs::write(retarget_sdk.join("include/arch-b/errno.h"), b"#define EINVAL 99\n").expect("arch-b errno.h");
+        std::os::unix::fs::symlink(retarget_sdk.join("include/arch-a"), retarget_sdk.join("include/asm")).expect("asm -> arch-a");
+        let retarget_a = command_native_setting(home_s, retarget_sdk.to_str().expect("utf8"), "test", LINUX_HOST, alloc)
+            .unwrap_or_else(|e| panic!("{e}"));
+        fs::remove_file(retarget_sdk.join("include/asm")).expect("rm asm link");
+        std::os::unix::fs::symlink(retarget_sdk.join("include/arch-b"), retarget_sdk.join("include/asm")).expect("asm -> arch-b");
+        let retarget_b = command_native_setting(home_s, retarget_sdk.to_str().expect("utf8"), "test", LINUX_HOST, alloc)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_ne!(
+            retarget_a.sdk_version.as_str(),
+            retarget_b.sdk_version.as_str(),
+            "retargeting directory symlink include/asm must move sdk_version even when both target dirs stay on disk"
+        );
+
         // Split libc runtime `sdk_lib` is canonicalized, stored, and hashed into `sdk_version`:
         // changing any link input (e.g. `crt1.o`) invalidates `sdk_version`.
         let libc_lib = home.join("glibc-2.44/lib");

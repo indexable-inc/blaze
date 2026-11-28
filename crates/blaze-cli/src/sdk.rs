@@ -920,13 +920,16 @@ pub(crate) struct LinuxSysrootEnv<'e> {
     pub(crate) nix_ldflags: Option<&'e str>,
 }
 
-/// Resolved Linux host C library sysroot: header root (`include/features.h`) plus an optional
-/// split libc runtime library directory (e.g. NixOS `/nix/store/<hash>-glibc-<ver>/lib` holding
-/// `crt1.o`, `libc.so`, `libc_nonshared.a`) needed when process-tree steps link against glibc.
+/// Resolved Linux host C library sysroot: header root (`include/features.h`) plus optional
+/// split libc runtime link inputs (e.g. NixOS `/nix/store/<hash>-glibc-<ver>/lib`, ELF dynamic
+/// linker path, and preserved `-rpath` directories from `nix-support/libc-ldflags` / `NIX_LDFLAGS`)
+/// needed when process-tree steps compile, link, and execute probes against glibc.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct LinuxHostSysroot<'f> {
     pub(crate) dir: &'f str,
     pub(crate) lib_dir: Option<&'f str>,
+    pub(crate) dynamic_linker: Option<&'f str>,
+    pub(crate) rpaths: &'f [&'f str],
 }
 
 /// Why Linux host sysroot discovery failed on a concrete host path (rule 3, rule 19):
@@ -1014,18 +1017,28 @@ pub(crate) fn resolve_linux_host_sysroot<'f>(
     resolve_linux_host_sysroot_on(&Host { wall_ns: 0 }, env, frame)
 }
 
-/// Resolves the split NixOS glibc runtime library directory (`crt1.o` / `libc.so`) beside a
-/// Nix wrapper (`nix-support/libc-crt1-cflags`, `libc-ldflags`, `orig-libc`), in `NIX_LDFLAGS`,
-/// or in `<sdk_dir>/nix-support/propagated-build-inputs`. Clean absence returns `Ok(None)`;
-/// real I/O, UTF-8, or `stat` failures stop discovery immediately.
-fn resolve_nix_lib_dir<'f, H: LinuxHostFs>(
+/// Resolved split NixOS libc runtime link inputs discovered beside a Nix wrapper or in
+/// `NIX_LDFLAGS` / `propagated-build-inputs`.
+struct NixLinkMeta<'f> {
+    lib_dir: Option<&'f str>,
+    dynamic_linker: Option<&'f str>,
+    rpaths: &'f [&'f str],
+}
+
+/// Resolves split NixOS glibc runtime link inputs (`lib_dir` holding `crt1.o`/`libc.so`, ELF
+/// `dynamic_linker` from `nix-support/dynamic-linker` or `libc-ldflags`/`NIX_LDFLAGS`, and
+/// preserved `-rpath` directories from `nix-support/libc-ldflags`/`NIX_LDFLAGS`). Clean absence
+/// returns empty optional fields; real I/O, UTF-8, or `stat` failures stop discovery immediately.
+fn resolve_nix_link_meta<'f, H: LinuxHostFs>(
     host: &H,
     wrapper_root: Option<&str>,
     sdk_dir: &str,
     nix_ldflags: Option<&str>,
     frame: &'f Frame,
-) -> Result<Option<&'f str>, LinuxSysrootError<'f>> {
-    use blaze_build_script::toolchain::for_each_nix_lib_candidate;
+) -> Result<NixLinkMeta<'f>, LinuxSysrootError<'f>> {
+    use blaze_build_script::toolchain::{
+        for_each_nix_lib_candidate, for_each_nix_rpath_in_flags, nix_dynamic_linker_in_flags,
+    };
 
     let has_libc_link_inputs = |lib_dir: &str| -> Result<bool, LinuxSysrootError<'f>> {
         let crt1 = bstd::mem::format_in!(frame, "{lib_dir}/crt1.o");
@@ -1055,32 +1068,69 @@ fn resolve_nix_lib_dir<'f, H: LinuxHostFs>(
         Ok(found)
     };
 
+    let mut lib_dir: Option<&'f str> = None;
+    let mut dynamic_linker: Option<&'f str> = None;
+    let mut rpaths: Vec<&'f str, &'f Frame> = Vec::new_in(frame);
+    let mut collect_rpaths = |flags: &str| {
+        for_each_nix_rpath_in_flags(flags, |dir| {
+            if !rpaths.iter().any(|seen| *seen == dir) {
+                rpaths.push(crate::work::held_str(dir, frame));
+            }
+        });
+    };
+
     if let Some(wrapper) = wrapper_root {
-        for file in ["nix-support/libc-crt1-cflags", "nix-support/libc-ldflags"] {
-            if let Some(flags) = host.read_text(wrapper, file, frame)?
-                && let Some(found) = first_lib_in_flags(flags)?
+        if let Some(crt_flags) = host.read_text(wrapper, "nix-support/libc-crt1-cflags", frame)? {
+            lib_dir = first_lib_in_flags(crt_flags)?;
+        }
+        if let Some(libc_ld) = host.read_text(wrapper, "nix-support/libc-ldflags", frame)? {
+            if lib_dir.is_none() {
+                lib_dir = first_lib_in_flags(libc_ld)?;
+            }
+            if let Some(dyn_path) = nix_dynamic_linker_in_flags(libc_ld)
+                && host.has_file(dyn_path, frame)?
             {
-                return Ok(Some(found));
+                dynamic_linker = Some(crate::work::held_str(dyn_path, frame));
+            }
+            collect_rpaths(libc_ld);
+        }
+        if dynamic_linker.is_none()
+            && let Some(dyn_text) = host.read_text(wrapper, "nix-support/dynamic-linker", frame)?
+        {
+            let trimmed = dyn_text.trim();
+            if trimmed.starts_with('/') && host.has_file(trimmed, frame)? {
+                dynamic_linker = Some(crate::work::held_str(trimmed, frame));
             }
         }
-        if let Some(orig) = host.read_text(wrapper, "nix-support/orig-libc", frame)? {
+        if lib_dir.is_none()
+            && let Some(orig) = host.read_text(wrapper, "nix-support/orig-libc", frame)?
+        {
             let trimmed = orig.trim().trim_end_matches('/');
             if trimmed.starts_with('/') && trimmed.len() > 1 {
                 let candidate = bstd::mem::format_in!(frame, "{trimmed}/lib");
                 if has_libc_link_inputs(candidate.as_str())? {
-                    return Ok(Some(crate::work::held_str(candidate.as_str(), frame)));
+                    lib_dir = Some(crate::work::held_str(candidate.as_str(), frame));
                 }
             }
         }
     }
 
-    if let Some(ldflags) = nix_ldflags
-        && let Some(found) = first_lib_in_flags(ldflags)?
-    {
-        return Ok(Some(found));
+    if let Some(ldflags) = nix_ldflags {
+        if lib_dir.is_none() {
+            lib_dir = first_lib_in_flags(ldflags)?;
+        }
+        if dynamic_linker.is_none()
+            && let Some(dyn_path) = nix_dynamic_linker_in_flags(ldflags)
+            && host.has_file(dyn_path, frame)?
+        {
+            dynamic_linker = Some(crate::work::held_str(dyn_path, frame));
+        }
+        collect_rpaths(ldflags);
     }
 
-    if let Some(propagated) = host.read_text(sdk_dir, "nix-support/propagated-build-inputs", frame)? {
+    if lib_dir.is_none()
+        && let Some(propagated) = host.read_text(sdk_dir, "nix-support/propagated-build-inputs", frame)?
+    {
         for token in propagated.split_ascii_whitespace() {
             let trimmed = token.trim_end_matches('/');
             if !trimmed.starts_with('/') || trimmed.len() <= 1 {
@@ -1088,12 +1138,17 @@ fn resolve_nix_lib_dir<'f, H: LinuxHostFs>(
             }
             let candidate = bstd::mem::format_in!(frame, "{trimmed}/lib");
             if has_libc_link_inputs(candidate.as_str())? {
-                return Ok(Some(crate::work::held_str(candidate.as_str(), frame)));
+                lib_dir = Some(crate::work::held_str(candidate.as_str(), frame));
+                break;
             }
         }
     }
 
-    Ok(None)
+    Ok(NixLinkMeta {
+        lib_dir,
+        dynamic_linker,
+        rpaths: frame.alloc_slice_copy(rpaths.as_slice()),
+    })
 }
 
 /// [`resolve_linux_host_sysroot`] over an injectable [`LinuxHostFs`] seam (rule 78).
@@ -1111,7 +1166,12 @@ pub(crate) fn resolve_linux_host_sysroot_on<'f, H: LinuxHostFs>(
 
     // 1. Standard FHS Linux (`/usr/include/features.h`).
     if has_marker(LINUX_HOST_SYSROOT_DIR)? {
-        return Ok(Some(LinuxHostSysroot { dir: LINUX_HOST_SYSROOT_DIR, lib_dir: None }));
+        return Ok(Some(LinuxHostSysroot {
+            dir: LINUX_HOST_SYSROOT_DIR,
+            lib_dir: None,
+            dynamic_linker: None,
+            rpaths: &[],
+        }));
     }
 
     let first_candidate = |flags: &str| -> Result<Option<&'f str>, LinuxSysrootError<'f>> {
@@ -1137,8 +1197,13 @@ pub(crate) fn resolve_linux_host_sysroot_on<'f, H: LinuxHostFs>(
     if let Some(cflags) = env.nix_cflags_compile
         && let Some(dir) = first_candidate(cflags)?
     {
-        let lib_dir = resolve_nix_lib_dir(host, None, dir, env.nix_ldflags, frame)?;
-        return Ok(Some(LinuxHostSysroot { dir, lib_dir }));
+        let meta = resolve_nix_link_meta(host, None, dir, env.nix_ldflags, frame)?;
+        return Ok(Some(LinuxHostSysroot {
+            dir,
+            lib_dir: meta.lib_dir,
+            dynamic_linker: meta.dynamic_linker,
+            rpaths: meta.rpaths,
+        }));
     }
 
     // 3. NixOS wrapped C compiler on `PATH` (`<realpath(cc)>/../../nix-support/libc-cflags`).
@@ -1167,8 +1232,13 @@ pub(crate) fn resolve_linux_host_sysroot_on<'f, H: LinuxHostFs>(
                     continue;
                 };
                 if let Some(dir) = first_candidate(libc_cflags)? {
-                    let lib_dir = resolve_nix_lib_dir(host, Some(wrapper_root), dir, env.nix_ldflags, frame)?;
-                    return Ok(Some(LinuxHostSysroot { dir, lib_dir }));
+                    let meta = resolve_nix_link_meta(host, Some(wrapper_root), dir, env.nix_ldflags, frame)?;
+                    return Ok(Some(LinuxHostSysroot {
+                        dir,
+                        lib_dir: meta.lib_dir,
+                        dynamic_linker: meta.dynamic_linker,
+                        rpaths: meta.rpaths,
+                    }));
                 }
             }
         }
@@ -1401,7 +1471,7 @@ mod linux_sysroot_tests {
         };
         assert_eq!(
             resolve_linux_host_sysroot_on(&fs, &env, &frame),
-            Ok(Some(LinuxHostSysroot { dir: "/usr", lib_dir: None }))
+            Ok(Some(LinuxHostSysroot { dir: "/usr", lib_dir: None, dynamic_linker: None, rpaths: &[] }))
         );
     }
 
@@ -1412,18 +1482,23 @@ mod linux_sysroot_tests {
         // First candidate has no features.h; second candidate does.
         fs.file("/nix/store/bbb-glibc-2.44-dev/include/features.h", "#define __GLIBC__ 2\n");
         fs.file("/nix/store/ccc-glibc-2.44/lib/crt1.o", "crt");
+        fs.file("/nix/store/ccc-glibc-2.44/lib/ld-linux-aarch64.so.1", "ldso");
         let env = LinuxSysrootEnv {
             path: None,
             nix_cflags_compile: Some(
                 "-O2 -isystem /nix/store/aaa-zlib-dev/include -idirafter /nix/store/bbb-glibc-2.44-dev/include",
             ),
-            nix_ldflags: Some("-L/nix/store/zzz-other/lib -L /nix/store/ccc-glibc-2.44/lib"),
+            nix_ldflags: Some(
+                "-L/nix/store/zzz-other/lib -L /nix/store/ccc-glibc-2.44/lib -rpath /nix/store/ccc-glibc-2.44/lib -dynamic-linker /nix/store/ccc-glibc-2.44/lib/ld-linux-aarch64.so.1",
+            ),
         };
         assert_eq!(
             resolve_linux_host_sysroot_on(&fs, &env, &frame),
             Ok(Some(LinuxHostSysroot {
                 dir: "/nix/store/bbb-glibc-2.44-dev",
                 lib_dir: Some("/nix/store/ccc-glibc-2.44/lib"),
+                dynamic_linker: Some("/nix/store/ccc-glibc-2.44/lib/ld-linux-aarch64.so.1"),
+                rpaths: &["/nix/store/ccc-glibc-2.44/lib"],
             }))
         );
 
@@ -1438,6 +1513,8 @@ mod linux_sysroot_tests {
             Ok(Some(LinuxHostSysroot {
                 dir: "/nix/store/bbb-glibc-2.44-dev",
                 lib_dir: Some("/nix/store/ccc-glibc-2.44/lib"),
+                dynamic_linker: None,
+                rpaths: &[],
             }))
         );
     }
@@ -1467,8 +1544,17 @@ mod linux_sysroot_tests {
             "/nix/store/cw-clang-wrapper-21/nix-support/libc-crt1-cflags",
             "-B/nix/store/g-glibc-2.44-57/lib/ \n",
         );
+        fs.file(
+            "/nix/store/cw-clang-wrapper-21/nix-support/libc-ldflags",
+            "-rpath /nix/store/extra-rt/lib\n",
+        );
+        fs.file(
+            "/nix/store/cw-clang-wrapper-21/nix-support/dynamic-linker",
+            "/nix/store/g-glibc-2.44-57/lib/ld-linux-aarch64.so.1\n",
+        );
         fs.file("/nix/store/g-glibc-2.44-57-dev/include/features.h", "#define __GLIBC__ 2\n");
         fs.file("/nix/store/g-glibc-2.44-57/lib/crt1.o", "crt1");
+        fs.file("/nix/store/g-glibc-2.44-57/lib/ld-linux-aarch64.so.1", "ldso");
 
         let env = LinuxSysrootEnv {
             path: Some("relative/bin:/nonexistent:/home/ix/.nix-profile/bin"),
@@ -1480,6 +1566,8 @@ mod linux_sysroot_tests {
             Ok(Some(LinuxHostSysroot {
                 dir: "/nix/store/g-glibc-2.44-57-dev",
                 lib_dir: Some("/nix/store/g-glibc-2.44-57/lib"),
+                dynamic_linker: Some("/nix/store/g-glibc-2.44-57/lib/ld-linux-aarch64.so.1"),
+                rpaths: &["/nix/store/extra-rt/lib"],
             }))
         );
     }
@@ -1595,7 +1683,7 @@ mod linux_sysroot_tests {
         assert!(cfg!(all(target_os = "linux", target_arch = "aarch64")), "requires Linux ARM64");
         use blaze_build_script::c_tasks::{Area as _, CCompiler as _, Compile, Compiled, Driver, GuestRoots, Lang};
         use blaze_proc_macro::native_c::{DiskFacts, FileArea, Laid, ShelfClang};
-        use blaze_proc_macro::native_setting::{NativeSettingError, command_native_setting, command_native_setting_with_lib};
+        use blaze_proc_macro::native_setting::{LinuxLinkInputs, NativeSettingError, command_native_setting, command_native_setting_with_link};
 
         let home = std::env::var("HOME").expect("HOME");
         let path_env = std::env::var("PATH").ok();
@@ -1612,17 +1700,26 @@ mod linux_sysroot_tests {
             .expect("Linux host sysroot must resolve");
         let alloc = blaze_own::testing::heap().alloc();
 
-        let owned = command_native_setting_with_lib(
+        let owned = command_native_setting_with_link(
             &home,
             resolved.dir,
-            resolved.lib_dir,
+            LinuxLinkInputs {
+                lib_dir: resolved.lib_dir,
+                dynamic_linker: resolved.dynamic_linker,
+                rpaths: resolved.rpaths,
+            },
             "test-nixos-sysroot",
             "aarch64-unknown-linux-gnu",
             alloc,
         )
-        .expect("command_native_setting_with_lib");
+        .expect("command_native_setting_with_link");
         if !resolved.dir.ends_with("/usr") {
             assert!(owned.sdk_lib.is_some(), "NixOS host must resolve split glibc runtime lib dir");
+            assert!(
+                owned.sdk_dynamic_linker.as_ref().is_some_and(|p| p.as_str().contains("ld-linux")),
+                "NixOS host must resolve ELF dynamic linker, got {:?}",
+                owned.sdk_dynamic_linker
+            );
         }
 
         // Negative control: empty dir without `include/features.h` fails cleanly with `NoSdk`.

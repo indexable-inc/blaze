@@ -64,7 +64,7 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AString, AVec, Alloc, String, Vec};
 use blaze_proc_macro::native_c::Laid;
 use blaze_proc_macro::native_c_tasks::{self, COMPILE_DEADLINE, CTasksSetting};
-use blaze_proc_macro::native_setting::{OwnedNativeSetting, command_native_setting_with_lib};
+use blaze_proc_macro::native_setting::{LinuxLinkInputs, OwnedNativeSetting, command_native_setting_with_link};
 use blaze_world::crate_list::CrateList;
 use bstd::cx::Cx;
 use bstd::mem::Frame;
@@ -103,6 +103,7 @@ static SNAPSHOT_PART_SEQ: AtomicU64 = AtomicU64::new(0);
 const GUEST_SDK: &str = "/sdk";
 const GUEST_SDK_EXTRA: &str = "/sdk-headers";
 const GUEST_SDK_LIB: &str = "/sdk-lib";
+const GUEST_SDK_RPATH: &str = "/sdk-rpath";
 const GUEST_SHELF: &str = "/toolchain/clang";
 /// The folder every crate's guest `OUT_DIR` is under (blaze-build-script env.rs).
 const GUEST_BUILDS: &str = "/target/debug/build";
@@ -172,7 +173,12 @@ impl fmt::Display for Said<'_> {
 #[derive(Clone, Copy)]
 pub(crate) enum TargetSdk<'e> {
     Macos(blaze_apple_sdk::Sdk<'e>),
-    LinuxHost { dir: Option<&'e str>, lib_dir: Option<&'e str> },
+    LinuxHost {
+        dir: Option<&'e str>,
+        lib_dir: Option<&'e str>,
+        dynamic_linker: Option<&'e str>,
+        rpaths: &'e [&'e str],
+    },
 }
 
 /// Target sysroot identity bytes hashed into `Toolchain::sdk` and `Setup::sdk_digest`.
@@ -249,11 +255,14 @@ fn kept<'s>(scratch: &'s Frame, words: fmt::Arguments<'_>) -> &'s str {
 fn set_up<'w>(home: Option<&str>, sdk: TargetSdk<'_>, alloc: Alloc<'static>, scratch: &'w Frame) -> Result<Setup, CTaskWhy<'w>> {
     let words = |what: fmt::Arguments<'_>| CTaskWhy::Setup { words: kept(scratch, what) };
     let Some(home) = home else { return Err(words(format_args!("HOME is not set, and the shelf and the work folder are beneath it"))) };
-    let (sdk_folder, sdk_lib) = match sdk {
-        TargetSdk::Macos(sdk) => (sdk.folder(), None),
-        TargetSdk::LinuxHost { dir, lib_dir } => (dir.unwrap_or(blaze_build_script::toolchain::LINUX_HOST_SYSROOT_DIR), lib_dir),
+    let (sdk_folder, link) = match sdk {
+        TargetSdk::Macos(sdk) => (sdk.folder(), LinuxLinkInputs::default()),
+        TargetSdk::LinuxHost { dir, lib_dir, dynamic_linker, rpaths } => (
+            dir.unwrap_or(blaze_build_script::toolchain::LINUX_HOST_SYSROOT_DIR),
+            LinuxLinkInputs { lib_dir, dynamic_linker, rpaths },
+        ),
     };
-    let setting = command_native_setting_with_lib(home, sdk_folder, sdk_lib, WORK, crate::graph::TRIPLE, alloc)
+    let setting = command_native_setting_with_link(home, sdk_folder, link, WORK, crate::graph::TRIPLE, alloc)
         .map_err(|e| words(format_args!("{e}")))?;
     let mut clang = String::from_str_in(setting.shelf.as_str(), alloc);
     clang.push_str("/bin/clang");
@@ -498,12 +507,23 @@ pub(crate) fn built_for<'s, 'm: 's>(
         digest: setup.sdk_digest,
         name: "the Linux host libc libraries",
     });
+    let mut sdk_rpaths: AVec<'_, Laid<'_>> = Vec::with_capacity_in(setup.setting.sdk_rpaths.len(), alloc);
+    for host in setup.setting.sdk_rpaths.iter() {
+        sdk_rpaths.push(Laid {
+            guest: GUEST_SDK_RPATH,
+            host: host.as_str(),
+            digest: setup.sdk_digest,
+            name: "a Linux host libc rpath root",
+        });
+    }
     let setting = CTasksSetting {
         clang: setup.clang.as_str(),
         shelf: Laid { guest: GUEST_SHELF, host: setup_shelf, digest: setup.compiler, name: "the pinned clang's shelf" },
         sdk: Laid { guest: GUEST_SDK, host: setup.setting.sdk.as_str(), digest: setup.sdk_digest, name: sdk_name },
         sdk_extra,
         sdk_lib,
+        sdk_dynamic_linker: setup.setting.sdk_dynamic_linker.as_deref(),
+        sdk_rpaths: sdk_rpaths.as_slice(),
         sysroot: setup.sysroot,
         work: setup.setting.work.as_str(),
         area: setup.area.as_str(),

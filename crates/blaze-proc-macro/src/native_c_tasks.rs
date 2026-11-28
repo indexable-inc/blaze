@@ -46,6 +46,7 @@
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::time::Duration;
+use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::Path;
 
 use blaze_build_script::c_tasks::{self, CCompiler, CStore, Compiled, FileRef, GuestRoots, Looked, Made, PlanError, Refused, Request, TaskError, Toolchain};
@@ -82,6 +83,12 @@ pub struct CTasksSetting<'s> {
     /// Optional split Linux libc runtime library directory (NixOS `<glibc-runtime>/lib`) mounted
     /// read-only and passed via `LDFLAGS` for process-tree linking under Landlock.
     pub sdk_lib: Option<Laid<'s>>,
+    /// Optional resolved ELF dynamic linker path (e.g. `<glibc-runtime>/lib/ld-linux-aarch64.so.1`)
+    /// passed as `-Wl,--dynamic-linker=<path>` when process-tree steps link executables on NixOS.
+    pub sdk_dynamic_linker: Option<&'s str>,
+    /// Optional extra runtime library search roots (`-rpath`) preserved from Nix wrapper
+    /// `libc-ldflags` / `NIX_LDFLAGS`, mounted read-only in Landlock and passed via `-Wl,-rpath`.
+    pub sdk_rpaths: &'s [Laid<'s>],
     /// Which sysroot model clang uses (`MacosSdk` vs `LinuxHost`).
     pub sysroot: Sysroot,
     /// A folder of the home's, canonical and existing: each worker's task folder is under it.
@@ -777,7 +784,6 @@ fn holds(bytes: &[u8], needle: &[u8]) -> bool {
 /// file at [`LAID_MTIME`], one that begins `#!` executable (`make` starts a tree's own
 /// `install-sh` by its path).
 fn lay_tree<'a>(entries: &[(&str, Option<&[u8]>)], folder: &str, alloc: Alloc<'a>) -> Result<(), AString<'a>> {
-    use std::os::unix::fs::PermissionsExt as _;
     let words = |text: &str| String::from_str_in(text, alloc);
     let laid_at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(LAID_MTIME);
     for (name, bytes) in entries {
@@ -817,6 +823,16 @@ impl ShelfTree<'_> {
         }
         if let Some(lib) = self.setting.sdk_lib {
             out.push((lib.host, lib.digest));
+        }
+        for rpath in self.setting.sdk_rpaths {
+            out.push((rpath.host, rpath.digest));
+        }
+        if let Some(dyn_linker) = self.setting.sdk_dynamic_linker
+            && let Some((parent, _)) = dyn_linker.rsplit_once('/')
+            && !parent.is_empty()
+            && !out.iter().any(|(seen, _)| *seen == parent)
+        {
+            out.push((parent, self.setting.sdk.digest));
         }
         out.push((self.setting.shelf.host, self.setting.shelf.digest));
         for tool in self.tools.tools {
@@ -867,6 +883,9 @@ impl TreeRunner for ShelfTree<'_> {
         if let Some(lib) = setting.sdk_lib {
             pairs.push((lib.guest, lib.host));
         }
+        for rpath in setting.sdk_rpaths {
+            pairs.push((rpath.guest, rpath.host));
+        }
         pairs.push((setting.shelf.guest, shelf));
         pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         // What a file is checked against and an error shows: every host folder, `tmp` too.
@@ -886,6 +905,25 @@ impl TreeRunner for ShelfTree<'_> {
                 held.push(path);
             }
         }
+        // `SHELF_MEMBERS_LINUX` guarantees `bin/lld` but does not require a `bin/ld.lld` alias.
+        // When linking against a split Linux libc root, resolve `<shelf>/bin/ld.lld` if present or
+        // stage `<folder>/bin/ld.lld -> <shelf>/bin/lld` so `-fuse-ld=<path>` always invokes lld
+        // in GNU ELF mode without depending on an optional shelf symlink.
+        let ld_lld_path: Option<AString<'a>> = if setting.sysroot == Sysroot::LinuxHost && setting.sdk_lib.is_some() {
+            let shelf_ld = joined(&[shelf, "/bin/ld.lld"], alloc);
+            if Path::new(shelf_ld.as_str()).exists() {
+                Some(shelf_ld)
+            } else {
+                let shelf_lld = joined(&[shelf, "/bin/lld"], alloc);
+                let staged_ld = joined(&[folder.as_str(), "/ld.lld"], alloc);
+                symlink(shelf_lld.as_str(), staged_ld.as_str())
+                    .map_err(|_| fail(&[staged_ld.as_str(), ": could not link ld.lld to shelf lld"]))?;
+                held.push(String::from_str_in(staged_ld.as_str(), alloc));
+                Some(staged_ld)
+            }
+        } else {
+            None
+        };
         for tool in self.tools.tools {
             for program in tool.programs_in(shelf, alloc) {
                 if Path::new(program.as_str()).exists() {
@@ -987,7 +1025,23 @@ impl TreeRunner for ShelfTree<'_> {
             // `CXXFLAGS`, `CPPFLAGS`, `ASFLAGS`), whether set or unset: no host folder reaches
             // any C, C++, preprocessed, or assembly object's debug information (rule 25, rule 54).
             inject_prefix_map_flags(&mut vars, &shown, alloc);
-            inject_linux_sysroot_flags(&mut vars, setting.sysroot, sdk, setting.sdk_lib.map(|l| l.host), shelf, alloc);
+            let mut rpath_hosts: AVec<'a, &str> = Vec::with_capacity_in(setting.sdk_rpaths.len(), alloc);
+            for rpath in setting.sdk_rpaths {
+                rpath_hosts.push(rpath.host);
+            }
+            inject_linux_sysroot_flags(
+                &mut vars,
+                setting.sysroot,
+                sdk,
+                LinuxTreeLink {
+                    lib_dir: setting.sdk_lib.map(|l| l.host),
+                    dynamic_linker: setting.sdk_dynamic_linker,
+                    rpaths: rpath_hosts.as_slice(),
+                    ld_lld: ld_lld_path.as_deref(),
+                },
+                shelf,
+                alloc,
+            );
             for (name, value) in tool_env.iter() {
                 vars.push((name.clone_in(alloc), value.clone_in(alloc)));
             }
@@ -1137,21 +1191,95 @@ fn inject_prefix_map_flags<'a>(
     }
 }
 
+/// Link inputs injected into `LDFLAGS` by [`inject_linux_sysroot_flags`] for Linux process trees.
+#[derive(Clone, Copy, Default)]
+struct LinuxTreeLink<'s> {
+    lib_dir: Option<&'s str>,
+    dynamic_linker: Option<&'s str>,
+    rpaths: &'s [&'s str],
+    ld_lld: Option<&'s str>,
+}
+
+/// Yields whitespace-delimited shell-like tokens from `flags` (stripping outer `"` / `'`),
+/// using only checked slicing (zero panics, zero allocations).
+fn for_each_flag_token<'a>(flags: &'a str, mut each: impl FnMut(&'a str)) {
+    let bytes = flags.as_bytes();
+    let mut at = 0usize;
+    while let Some(&b) = bytes.get(at) {
+        if b.is_ascii_whitespace() {
+            at += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            at += 1;
+            let start = at;
+            while let Some(&c) = bytes.get(at) {
+                if c == b {
+                    break;
+                }
+                at += 1;
+            }
+            if let Some(tok) = flags.get(start..at) {
+                each(tok);
+            }
+            if bytes.get(at) == Some(&b) {
+                at += 1;
+            }
+        } else {
+            let start = at;
+            while let Some(&c) = bytes.get(at) {
+                if c.is_ascii_whitespace() {
+                    break;
+                }
+                at += 1;
+            }
+            if let Some(tok) = flags.get(start..at) {
+                each(tok);
+            }
+        }
+    }
+}
+
+/// Whether `flags` already contains a Clang driver sysroot option (`--sysroot`, `--sysroot=...`,
+/// `-isysroot`, `-isysroot...`). Ignores linker-only flags such as `-Wl,--sysroot=...`.
+fn has_driver_sysroot(flags: &str) -> bool {
+    let mut found = false;
+    for_each_flag_token(flags, |tok| {
+        if tok == "--sysroot" || tok.starts_with("--sysroot=") || tok == "-isysroot" || tok.starts_with("-isysroot") {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Whether `flags` already contains a Clang driver resource-dir option (`-resource-dir` or
+/// `-resource-dir=...`).
+fn has_driver_resource_dir(flags: &str) -> bool {
+    let mut found = false;
+    for_each_flag_token(flags, |tok| {
+        if tok == "-resource-dir" || tok.starts_with("-resource-dir=") {
+            found = true;
+        }
+    });
+    found
+}
+
 /// For `Sysroot::LinuxHost`, injects:
 /// - `-resource-dir <shelf>/lib/clang/<major>` into every variable in [`PREFIX_MAP_FLAG_VARS`]
-///   that does not already specify `-resource-dir` (always required under Linux Landlock where
-///   `/proc/self/exe` is outside the roots, even when a build supplies a custom `--sysroot`);
+///   that does not already specify a driver `-resource-dir` option (always required under Linux
+///   Landlock where `/proc/self/exe` is outside the roots, even with a custom `--sysroot`);
 /// - Linux sysroot/include flags (`--sysroot=...` and, for flat NixOS roots,
 ///   `-idirafter <sdk>/include`) into every variable in [`PREFIX_MAP_FLAG_VARS`] that does not
-///   already carry `--sysroot` or `-isysroot`;
-/// - When `sdk_lib` is `Some(lib_dir)` (NixOS split glibc runtime), link flags
-///   (`-B<lib_dir> -L<lib_dir> -fuse-ld=lld -rtlib=compiler-rt --unwindlib=none`) into `LDFLAGS`
-///   so `configure`/`make` link probes find `crt1.o`, `libc.so`, and the shelf's `ld.lld`.
+///   already carry a driver `--sysroot` or `-isysroot` option (ignoring `-Wl,--sysroot=...`);
+/// - When `link.lib_dir` is `Some(lib_dir)` (NixOS split glibc runtime), link flags
+///   (`-B<lib_dir> -L<lib_dir> -Wl,-rpath,<lib_dir>`, preserved `-Wl,-rpath,<extra>`,
+///   `-Wl,--dynamic-linker=<dyn>`, `-fuse-ld=<ld_lld>`, `-rtlib=compiler-rt --unwindlib=none`)
+///   into `LDFLAGS` so `configure`/`make` link probes both link AND execute on NixOS.
 fn inject_linux_sysroot_flags<'a>(
     vars: &mut AVec<'a, (AString<'a>, AString<'a>)>,
     sysroot: Sysroot,
     sdk: &str,
-    sdk_lib: Option<&str>,
+    link: LinuxTreeLink<'_>,
     shelf: &str,
     alloc: Alloc<'a>,
 ) {
@@ -1189,8 +1317,8 @@ fn inject_linux_sysroot_flags<'a>(
         match vars.iter().rposition(|(name, _)| name.as_str() == flags) {
             Some(at) => {
                 if let Some((_, value)) = vars.get_mut(at) {
-                    let has_resource = value.as_str().contains("-resource-dir");
-                    let has_sysroot = value.as_str().contains("--sysroot") || value.as_str().contains("-isysroot");
+                    let has_resource = has_driver_resource_dir(value.as_str());
+                    let has_sysroot = has_driver_sysroot(value.as_str());
                     if !has_resource {
                         append_tokens(value, resource_arg.as_str());
                     }
@@ -1207,13 +1335,29 @@ fn inject_linux_sysroot_flags<'a>(
         }
     }
 
-    if let Some(lib_dir) = sdk_lib {
+    if let Some(lib_dir) = link.lib_dir {
         let mut ldflags: AString<'a> = String::new_in(alloc);
         ldflags.push_str("-B");
         ldflags.push_str(lib_dir);
         ldflags.push_str(" -L");
         ldflags.push_str(lib_dir);
-        ldflags.push_str(" -fuse-ld=lld -rtlib=compiler-rt --unwindlib=none");
+        ldflags.push_str(" -Wl,-rpath,");
+        ldflags.push_str(lib_dir);
+        for extra_rpath in link.rpaths {
+            if *extra_rpath != lib_dir {
+                ldflags.push_str(" -Wl,-rpath,");
+                ldflags.push_str(extra_rpath);
+            }
+        }
+        if let Some(dyn_linker) = link.dynamic_linker {
+            ldflags.push_str(" -Wl,--dynamic-linker=");
+            ldflags.push_str(dyn_linker);
+        }
+        if let Some(ld_lld) = link.ld_lld {
+            ldflags.push_str(" -fuse-ld=");
+            ldflags.push_str(ld_lld);
+        }
+        ldflags.push_str(" -rtlib=compiler-rt --unwindlib=none");
         match vars.iter().rposition(|(name, _)| name.as_str() == "LDFLAGS") {
             Some(at) => {
                 if let Some((_, value)) = vars.get_mut(at) {
@@ -1228,8 +1372,8 @@ fn inject_linux_sysroot_flags<'a>(
 #[cfg(test)]
 mod tree_spelling_tests {
     use super::{
-        AString, AVec, PREFIX_MAP_FLAG_VARS, String, Sysroot, Vec, inject_linux_sysroot_flags, inject_prefix_map_flags,
-        shelf_program, to_guest, to_host,
+        AString, AVec, LinuxTreeLink, PREFIX_MAP_FLAG_VARS, String, Sysroot, Vec, inject_linux_sysroot_flags,
+        inject_prefix_map_flags, shelf_program, to_guest, to_host,
     };
 
     /// A guest folder is made its host folder where a word or a flag's letters begin with it,
@@ -1290,18 +1434,24 @@ mod tree_spelling_tests {
         let alloc = blaze_own::testing::heap().alloc();
         let shelf = "/h/shelf";
 
-        // 1. Flat NixOS glibc-dev + split glibc runtime `lib`: injects `-resource-dir`,
-        //    `--sysroot=<sdk>`, `-idirafter <sdk>/include`, and `LDFLAGS` for linking.
+        // 1. Flat NixOS glibc-dev + split glibc runtime `lib` + dynamic linker + rpath + explicit ld.lld path.
+        //    Also checks that `-Wl,--sysroot=/custom` (a linker-only flag) does NOT suppress driver sysroot injection.
         let mut nix_vars: AVec<'_, (AString<'_>, AString<'_>)> = Vec::new_in(alloc);
-        nix_vars.push((String::from_str_in("CFLAGS", alloc), String::from_str_in("-O2", alloc)));
+        nix_vars.push((String::from_str_in("CFLAGS", alloc), String::from_str_in("-O2 -Wl,--sysroot=/linker-only", alloc)));
         nix_vars.push((String::from_str_in("CXXFLAGS", alloc), String::from_str_in("--sysroot=/custom", alloc)));
         nix_vars.push((String::from_str_in("ASFLAGS", alloc), String::from_str_in("-resource-dir /custom/res --sysroot=/custom", alloc)));
         nix_vars.push((String::from_str_in("LDFLAGS", alloc), String::from_str_in("-Wl,--as-needed", alloc)));
+        let extra_rpaths = ["/nix/store/extra-lib/lib"];
         inject_linux_sysroot_flags(
             &mut nix_vars,
             Sysroot::LinuxHost,
             "/nix/store/abc-glibc-dev",
-            Some("/nix/store/def-glibc/lib"),
+            LinuxTreeLink {
+                lib_dir: Some("/nix/store/def-glibc/lib"),
+                dynamic_linker: Some("/nix/store/def-glibc/lib/ld-linux-aarch64.so.1"),
+                rpaths: &extra_rpaths,
+                ld_lld: Some("/h/work/trees/k/bin/ld.lld"),
+            },
             shelf,
             alloc,
         );
@@ -1309,27 +1459,38 @@ mod tree_spelling_tests {
             vars.iter().rev().find(|(k, _)| k.as_str() == name).map(|(_, v)| v.as_str())
         }
         let expected_nix = "-resource-dir /h/shelf/lib/clang/23 --sysroot=/nix/store/abc-glibc-dev -idirafter /nix/store/abc-glibc-dev/include";
-        assert_eq!(lookup(&nix_vars, "CFLAGS"), Some("-O2 -resource-dir /h/shelf/lib/clang/23 --sysroot=/nix/store/abc-glibc-dev -idirafter /nix/store/abc-glibc-dev/include"));
+        // Linker-only `-Wl,--sysroot=...` must NOT suppress Clang driver sysroot injection.
+        assert_eq!(
+            lookup(&nix_vars, "CFLAGS"),
+            Some("-O2 -Wl,--sysroot=/linker-only -resource-dir /h/shelf/lib/clang/23 --sysroot=/nix/store/abc-glibc-dev -idirafter /nix/store/abc-glibc-dev/include")
+        );
         assert_eq!(lookup(&nix_vars, "CPPFLAGS"), Some(expected_nix));
-        // Custom `--sysroot` is preserved while STILL appending `-resource-dir` for Landlock.
+        // Custom driver `--sysroot` is preserved while STILL appending `-resource-dir` for Landlock.
         assert_eq!(lookup(&nix_vars, "CXXFLAGS"), Some("--sysroot=/custom -resource-dir /h/shelf/lib/clang/23"));
-        // Negative control: existing explicit `-resource-dir` and `--sysroot` are both preserved.
+        // Negative control: existing explicit driver `-resource-dir` and `--sysroot` are both preserved.
         assert_eq!(lookup(&nix_vars, "ASFLAGS"), Some("-resource-dir /custom/res --sysroot=/custom"));
-        // Split libc runtime link flags are appended to `LDFLAGS`.
+        // Split libc runtime link flags preserve rpaths, dynamic-linker, and explicit ld.lld path.
         assert_eq!(
             lookup(&nix_vars, "LDFLAGS"),
-            Some("-Wl,--as-needed -B/nix/store/def-glibc/lib -L/nix/store/def-glibc/lib -fuse-ld=lld -rtlib=compiler-rt --unwindlib=none")
+            Some("-Wl,--as-needed -B/nix/store/def-glibc/lib -L/nix/store/def-glibc/lib -Wl,-rpath,/nix/store/def-glibc/lib -Wl,-rpath,/nix/store/extra-lib/lib -Wl,--dynamic-linker=/nix/store/def-glibc/lib/ld-linux-aarch64.so.1 -fuse-ld=/h/work/trees/k/bin/ld.lld -rtlib=compiler-rt --unwindlib=none")
         );
 
         // 2. Standard FHS `/usr` root without split `sdk_lib` injects `--sysroot=/` and no `LDFLAGS`.
         let mut fhs_vars: AVec<'_, (AString<'_>, AString<'_>)> = Vec::new_in(alloc);
-        inject_linux_sysroot_flags(&mut fhs_vars, Sysroot::LinuxHost, "/usr", None, shelf, alloc);
+        inject_linux_sysroot_flags(&mut fhs_vars, Sysroot::LinuxHost, "/usr", LinuxTreeLink::default(), shelf, alloc);
         assert_eq!(lookup(&fhs_vars, "CFLAGS"), Some("-resource-dir /h/shelf/lib/clang/23 --sysroot=/"));
         assert_eq!(lookup(&fhs_vars, "LDFLAGS"), None);
 
         // 3. Negative control: macOS SDK does not receive Linux sysroot or linker flags.
         let mut mac_vars: AVec<'_, (AString<'_>, AString<'_>)> = Vec::new_in(alloc);
-        inject_linux_sysroot_flags(&mut mac_vars, Sysroot::MacosSdk, "/Library/SDKs/MacOSX.sdk", Some("/nix/store/def-glibc/lib"), shelf, alloc);
+        inject_linux_sysroot_flags(
+            &mut mac_vars,
+            Sysroot::MacosSdk,
+            "/Library/SDKs/MacOSX.sdk",
+            LinuxTreeLink { lib_dir: Some("/nix/store/def-glibc/lib"), ..LinuxTreeLink::default() },
+            shelf,
+            alloc,
+        );
         assert!(mac_vars.is_empty());
     }
 }

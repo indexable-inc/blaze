@@ -4,7 +4,8 @@ use blaze_unit_graph::UnitId;
 
 use super::{
     CInputs, ClangPin, Mode, NATIVE_EVERY_MODE, PinError, SHELF_MEMBERS_LINUX, Shelf, Sysroot, c_env, clang_major, clang_pin, depfile_reads,
-    for_each_nix_lib_candidate, for_each_nix_sysroot_candidate, headers_digest, placement, shelf_missing_for, sysroot,
+    for_each_nix_lib_candidate, for_each_nix_rpath_in_flags, for_each_nix_sysroot_candidate, headers_digest, nix_dynamic_linker_in_flags,
+    placement, shelf_missing_for, sysroot,
 };
 use crate::native::Runner;
 
@@ -170,4 +171,33 @@ fn nix_lib_candidates_parses_crt_and_library_flags() {
     );
     // Negative controls: relative paths, bare `/`, unrelated flags, dangling `-L`.
     assert!(collect("-I/nix/store/x/include -L relative/lib -B / -Wl,-rpath=/nix/store/x/lib -L").is_empty());
+}
+
+#[test]
+fn nix_dynamic_linker_and_rpath_flags_parse_raw_ld_and_wl_forms() {
+    fn rpaths(flags: &str) -> std::vec::Vec<&str> {
+        let mut out = std::vec::Vec::new();
+        for_each_nix_rpath_in_flags(flags, |dir| out.push(dir));
+        out
+    }
+
+    assert_eq!(
+        nix_dynamic_linker_in_flags("-dynamic-linker /nix/store/g-glibc/lib/ld-linux-aarch64.so.1 -rpath /nix/store/g-glibc/lib"),
+        Some("/nix/store/g-glibc/lib/ld-linux-aarch64.so.1")
+    );
+    assert_eq!(
+        nix_dynamic_linker_in_flags("-Wl,--dynamic-linker=/nix/store/g-glibc/lib/ld-linux-x86-64.so.2"),
+        Some("/nix/store/g-glibc/lib/ld-linux-x86-64.so.2")
+    );
+    assert_eq!(
+        nix_dynamic_linker_in_flags("-Wl,-dynamic-linker,/nix/store/g-glibc/lib/ld-linux-aarch64.so.1"),
+        Some("/nix/store/g-glibc/lib/ld-linux-aarch64.so.1")
+    );
+    assert_eq!(nix_dynamic_linker_in_flags("-dynamic-linker relative/ld.so -L/nix/store/g/lib"), None);
+
+    assert_eq!(
+        rpaths("-rpath /nix/store/a/lib/ -Wl,-rpath,/nix/store/b/lib:/nix/store/c/lib -R/nix/store/d/lib --rpath=/nix/store/e/lib"),
+        ["/nix/store/a/lib", "/nix/store/b/lib", "/nix/store/c/lib", "/nix/store/d/lib", "/nix/store/e/lib"]
+    );
+    assert!(rpaths("-rpath relative/lib -Wl,-rpath,/ -L/nix/store/a/lib").is_empty());
 }
