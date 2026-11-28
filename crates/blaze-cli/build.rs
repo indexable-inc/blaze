@@ -32,9 +32,10 @@ fn main() -> ExitCode {
         println!("cargo::rustc-link-arg-bins=-Wl,-dead_strip_dylibs");
     }
     // The tool's identity is the linker's id of the binary (src/build_id.rs): ld64 writes
-    // LC_UUID by default; on Linux ask for a build-id note, a digest of the output (`sha1`), so
-    // equal inputs give one id. Tests read it too, so every target gets it.
-    if os == "linux" {
+    // LC_UUID by default, and Blaze's own ELF exporter always writes a deterministic build-id
+    // note natively (`crates/blaze-export/src/elf.rs`). Under external linkers (non-wasm64
+    // build script), ask GNU ld/lld for a sha1 build-id note on Linux.
+    if os == "linux" && !cfg!(target_arch = "wasm64") {
         println!("cargo::rustc-link-arg=-Wl,--build-id=sha1");
     }
     println!("cargo::rerun-if-changed=build.rs");
