@@ -114,6 +114,7 @@ impl std::fmt::Debug for Files {
 enum Found {
     Folder,
     File(u64),
+    Link,
 }
 
 impl Files {
@@ -126,16 +127,17 @@ impl Files {
         }
     }
 
-    /// The folder on disk of `rel` (a path from the served tree's root `root`), when it is in
-    /// it. `Err`: a link out of the tree, named by the path as the macro saw it (rule 25: no
-    /// path of this machine in the words, which a names record's row may hold).
+    /// The canonical path on disk of `rel` (a path from the served tree's root `root`) together
+    /// with the canonicalized `root`, when it is inside the served tree. `Err`: a link out of the
+    /// tree, named by the path as the macro saw it (rule 25: no path of this machine in the words,
+    /// which a names record's row may hold).
     ///
     /// `root` may be relative to the folder blaze was started in, and `""` IS that folder: the
     /// checkout's form (`FetchEnv::checkout`, "" when blaze runs in the workspace's root), which
     /// a member's `Files::Member { workspace, .. }` is (blaze-cli proc_callers.rs `shown`). The OS names it `.`: `canonicalize("")` is
     /// `ENOENT`, which refused every file of every member of a checkout so started, `chdir` into
     /// `/workspace/<dir>` first (the shim's, at each call; MX 2026-11-17).
-    fn real(&self, root: &Path, rel: &str) -> Result<Option<PathBuf>, String> {
+    fn real(&self, root: &Path, rel: &str) -> Result<Option<(PathBuf, PathBuf)>, String> {
         let root = if root.as_os_str().is_empty() { Path::new(".") } else { root };
         let seen = self.seen();
         let shown = || if rel.is_empty() { seen.mount().to_owned() } else { format!("{}/{rel}", seen.mount()) };
@@ -146,7 +148,7 @@ impl Files {
         if !real.starts_with(&top) {
             return Err(format!("opened {}, a link out of {}, the tree the macro is served", shown(), seen.mount()));
         }
-        Ok(Some(real))
+        Ok(Some((real, top)))
     }
 
     /// The listed files under the folder `rel` (`""`: the package's).
@@ -189,10 +191,20 @@ impl Files {
         out
     }
 
-    fn find(&self, rel: &str) -> Result<Option<Found>, String> {
+    fn find(&self, rel: &str, follow: bool) -> Result<Option<Found>, String> {
         match self {
             Files::Folder(root) | Files::Member { workspace: root, .. } => {
-                Ok(self.real(root, rel)?.and_then(|real| stat_of(&real)).map(|(filetype, size)| if filetype == Filetype::Directory { Found::Folder } else { Found::File(size) }))
+                if follow {
+                    return Ok(self.real(root, rel)?.and_then(|(real, _)| stat_of(&real, true)));
+                }
+                if rel.is_empty() {
+                    return Ok(self.real(root, rel)?.map(|_| Found::Folder));
+                }
+                let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+                if matches!(name, "" | "." | "..") {
+                    return Ok(self.real(root, rel)?.and_then(|(real, _)| stat_of(&real, true)));
+                }
+                Ok(self.real(root, parent)?.and_then(|(parent_real, _)| stat_of(&parent_real.join(name), false)))
             }
             Files::Listed(files) => {
                 if let Some((path, commit)) = self.submodule_covering(rel) {
@@ -210,7 +222,7 @@ impl Files {
     /// The bytes of the file `rel`; `None` when absent.
     fn bytes(&self, rel: &str) -> Result<Option<Vec<u8>>, String> {
         match self {
-            Files::Folder(root) | Files::Member { workspace: root, .. } => Ok(self.real(root, rel)?.and_then(|real| std::fs::read(real).ok())),
+            Files::Folder(root) | Files::Member { workspace: root, .. } => Ok(self.real(root, rel)?.and_then(|(real, _)| std::fs::read(real).ok())),
             Files::Listed(files) => {
                 if let Some((path, commit)) = self.submodule_covering(rel) {
                     let hex = Self::submodule_hex(&commit);
@@ -221,10 +233,13 @@ impl Files {
         }
     }
 
-    /// The entries of the folder `rel`, sorted by name.
-    fn listing(&self, rel: &str) -> Result<Vec<(Vec<u8>, Filetype)>, String> {
+    /// The canonical in-tree path and entries of the folder `rel`, sorted by name.
+    fn listing(&self, rel: &str) -> Result<(PathBuf, Vec<(Vec<u8>, Filetype)>), String> {
         match self {
-            Files::Folder(root) | Files::Member { workspace: root, .. } => Ok(self.real(root, rel)?.map(|real| listing(&real)).unwrap_or_default()),
+            Files::Folder(root) | Files::Member { workspace: root, .. } => Ok(match self.real(root, rel)? {
+                Some((real, top)) => (real.strip_prefix(&top).map(Path::to_path_buf).unwrap_or_default(), listing(&real)),
+                None => Default::default(),
+            }),
             Files::Listed(files) => {
                 if let Some((path, commit)) = self.submodule_covering(rel) {
                     let hex = Self::submodule_hex(&commit);
@@ -244,7 +259,7 @@ impl Files {
                 // Sorted by full path, a folder's `name/` sorts after `name.x`: sort by name.
                 entries.sort_by(|a, b| a.0.cmp(&b.0));
                 entries.dedup_by(|a, b| a.0 == b.0);
-                Ok(entries)
+                Ok((PathBuf::from(rel), entries))
             }
         }
     }
@@ -306,7 +321,11 @@ fn listing(real: &Path) -> Vec<(Vec<u8>, Filetype)> {
     let mut entries = Vec::new();
     if let Ok(dir) = std::fs::read_dir(real) {
         for entry in dir.flatten() {
-            let filetype = if entry.path().is_dir() { Filetype::Directory } else { Filetype::RegularFile };
+            let filetype = match entry.file_type() {
+                Ok(ft) if ft.is_symlink() => Filetype::SymbolicLink,
+                Ok(ft) if ft.is_dir() => Filetype::Directory,
+                _ => Filetype::RegularFile,
+            };
             entries.push((entry.file_name().into_encoded_bytes(), filetype));
         }
     }
@@ -314,9 +333,11 @@ fn listing(real: &Path) -> Vec<(Vec<u8>, Filetype)> {
     entries
 }
 
-/// What a folder's read is answered by: its names, in order.
-fn listing_digest(entries: &[(Vec<u8>, Filetype)]) -> ContentId {
+/// What a folder's read is answered by: its canonical in-tree path and its names, in order.
+fn listing_digest(canon: &Path, entries: &[(Vec<u8>, Filetype)]) -> ContentId {
     let mut names = Vec::new();
+    names.extend_from_slice(canon.as_os_str().as_encoded_bytes());
+    names.push(0);
     for (name, filetype) in entries {
         names.extend_from_slice(name);
         names.push(0);
@@ -332,10 +353,16 @@ fn stat_digest(filetype: Filetype, size: u64) -> ContentId {
     digest(&bytes)
 }
 
-fn stat_of(path: &Path) -> Option<(Filetype, u64)> {
-    let meta = std::fs::metadata(path).ok()?;
-    let filetype = if meta.is_dir() { Filetype::Directory } else { Filetype::RegularFile };
-    Some((filetype, meta.len()))
+fn stat_of(path: &Path, follow: bool) -> Option<Found> {
+    let meta = if follow { std::fs::metadata(path) } else { std::fs::symlink_metadata(path) }.ok()?;
+    let ft = meta.file_type();
+    Some(if ft.is_symlink() {
+        Found::Link
+    } else if ft.is_dir() {
+        Found::Folder
+    } else {
+        Found::File(meta.len())
+    })
 }
 
 /// The subject of the read `Span::file` makes (server.rs): the file holding the call, as the
@@ -374,14 +401,18 @@ pub fn answer_now(package: &Package, subject: &str) -> Result<Option<ContentId>,
             EnvAnswer::Unknown => return Err(unknown()),
         },
         "file" => files.bytes(rest).map_err(UnknownSubject)?.map(|bytes| digest(&bytes)),
-        "dir" => match files.find(rest).map_err(UnknownSubject)? {
-            Some(Found::Folder) => Some(listing_digest(&files.listing(rest).map_err(UnknownSubject)?)),
+        "dir" => match files.find(rest, true).map_err(UnknownSubject)? {
+            Some(Found::Folder) => {
+                let (canon, entries) = files.listing(rest).map_err(UnknownSubject)?;
+                Some(listing_digest(&canon, &entries))
+            }
             _ => None,
         },
-        "stat" if rest.is_empty() => Some(stat_digest(Filetype::Directory, 0)),
-        "stat" => match files.find(rest).map_err(UnknownSubject)? {
+        "stat" | "lstat" if rest.is_empty() => Some(stat_digest(Filetype::Directory, 0)),
+        "stat" | "lstat" => match files.find(rest, kind == "stat").map_err(UnknownSubject)? {
             Some(Found::Folder) => Some(stat_digest(Filetype::Directory, 0)),
             Some(Found::File(size)) => Some(stat_digest(Filetype::RegularFile, size)),
+            Some(Found::Link) => Some(stat_digest(Filetype::SymbolicLink, 0)),
             None => None,
         },
         _ => return Err(unknown()),
@@ -501,8 +532,8 @@ impl Sandbox {
     }
 
     /// What `rel` is in the package, refused when a link takes it out of the package.
-    fn found(&mut self, rel: &str) -> Result<Option<Found>, Stop> {
-        self.package.files.find(rel).map_err(|why| self.refuse(why))
+    fn found(&mut self, rel: &str, follow: bool) -> Result<Option<Found>, Stop> {
+        self.package.files.find(rel, follow).map_err(|why| self.refuse(why))
     }
 
     fn opened(&mut self, fd: u32) -> Option<&mut Opened> {
@@ -615,24 +646,35 @@ impl System for Sandbox {
         if how.create() || how.truncate() || how.write() || how.append() {
             return Ok(Err(Errno::ROFS));
         }
-        let Some(found) = self.found(&rel)? else {
-            self.record(format!("file:{rel}"), None);
+        let Some(found) = self.found(&rel, true)? else {
+            self.record(format!("stat:{rel}"), None);
             return Ok(Err(Errno::NOENT));
         };
-        let opened = if let Found::Folder = found {
-            let entries = self.package.files.listing(&rel).map_err(|why| self.refuse(why))?;
-            self.record(format!("dir:{rel}"), Some(listing_digest(&entries)));
-            Opened { bytes: Vec::new(), pos: 0, dir: Some((rel, entries)) }
-        } else {
-            if how.directory() {
-                return Ok(Err(Errno::NOTDIR));
+        let opened = match found {
+            Found::Folder => {
+                let (canon, entries) = self.package.files.listing(&rel).map_err(|why| self.refuse(why))?;
+                let Some(folder) = canon.to_str() else {
+                    return Err(self.refuse(format!("opened {rel:?}, whose resolved path is not UTF-8")));
+                };
+                self.record(format!("dir:{rel}"), Some(listing_digest(&canon, &entries)));
+                Opened { bytes: Vec::new(), pos: 0, dir: Some((folder.to_owned(), entries)) }
             }
-            let Some(bytes) = self.package.files.bytes(&rel).map_err(|why| self.refuse(why))? else {
-                self.record(format!("file:{rel}"), None);
-                return Ok(Err(Errno::IO));
-            };
-            self.record(format!("file:{rel}"), Some(digest(&bytes)));
-            Opened { bytes, pos: 0, dir: None }
+            Found::File(size) => {
+                if how.directory() {
+                    self.record(format!("stat:{rel}"), Some(stat_digest(Filetype::RegularFile, size)));
+                    return Ok(Err(Errno::NOTDIR));
+                }
+                let Some(bytes) = self.package.files.bytes(&rel).map_err(|why| self.refuse(why))? else {
+                    self.record(format!("stat:{rel}"), None);
+                    return Ok(Err(Errno::IO));
+                };
+                self.record(format!("file:{rel}"), Some(digest(&bytes)));
+                Opened { bytes, pos: 0, dir: None }
+            }
+            Found::Link => {
+                self.record(format!("lstat:{rel}"), Some(stat_digest(Filetype::SymbolicLink, 0)));
+                return Ok(Err(Errno::LOOP));
+            }
         };
         let slot = match self.files.iter().position(Option::is_none) {
             Some(slot) => slot,
@@ -645,7 +687,7 @@ impl System for Sandbox {
         Ok(Ok(ROOT_FD + 1 + slot as u32))
     }
 
-    fn path_stat(&mut self, at: u32, path: &[u8], _follow: bool) -> Answer<Filestat> {
+    fn path_stat(&mut self, at: u32, path: &[u8], follow: bool) -> Answer<Filestat> {
         let rel = match self.resolve_at(at, path)? {
             Ok(rel) => rel,
             Err(errno) => return Ok(Err(errno)),
@@ -653,12 +695,14 @@ impl System for Sandbox {
         if rel.is_empty() {
             return Ok(Ok(filestat(Filetype::Directory, 0)));
         }
-        let found = match self.found(&rel)? {
+        let found = match self.found(&rel, follow)? {
             Some(Found::Folder) => Some((Filetype::Directory, 0)),
             Some(Found::File(size)) => Some((Filetype::RegularFile, size)),
+            Some(Found::Link) => Some((Filetype::SymbolicLink, 0)),
             None => None,
         };
-        self.record(format!("stat:{rel}"), found.map(|(filetype, size)| stat_digest(filetype, size)));
+        let kind = if follow { "stat" } else { "lstat" };
+        self.record(format!("{kind}:{rel}"), found.map(|(filetype, size)| stat_digest(filetype, size)));
         Ok(match found {
             Some((filetype, size)) => Ok(filestat(filetype, size)),
             None => Err(Errno::NOENT),
@@ -722,10 +766,11 @@ mod seen_tests {
             (String::from("v8"), super::ListedBytes::Submodule(oid)),
         ]));
         assert!(with_sub.bytes("Cargo.toml").expect("manifest").is_some());
-        let root_list = with_sub.listing("").expect("root listing");
+        let (_, root_list) = with_sub.listing("").expect("root listing");
         assert!(root_list.iter().any(|(name, ft)| name.as_slice() == b"v8" && *ft == blaze_wasi::Filetype::Directory));
         for bad in ["v8", "v8/include/v8.h"] {
-            assert!(with_sub.find(bad).is_err(), "{bad} find must fail closed");
+            assert!(with_sub.find(bad, true).is_err(), "{bad} find must fail closed");
+            assert!(with_sub.find(bad, false).is_err(), "{bad} lstat find must fail closed");
             assert!(with_sub.bytes(bad).is_err(), "{bad} bytes must fail closed");
             assert!(with_sub.listing(bad).is_err(), "{bad} listing must fail closed");
         }
@@ -733,6 +778,7 @@ mod seen_tests {
         assert!(super::answer_now(&sub_pkg, "file:v8/include/v8.h").is_err(), "answer_now file must propagate submodule refusal");
         assert!(super::answer_now(&sub_pkg, "dir:v8").is_err(), "answer_now dir must propagate submodule refusal");
         assert!(super::answer_now(&sub_pkg, "stat:v8").is_err(), "answer_now stat must propagate submodule refusal");
+        assert!(super::answer_now(&sub_pkg, "lstat:v8").is_err(), "answer_now lstat must propagate submodule refusal");
     }
 
     /// MX (2026-11-17): every proc-macro call written in a workspace member at a non-empty dir
@@ -925,7 +971,7 @@ mod dir_fd_tests {
             assert_eq!(read_all(&mut sandbox, link_fd), b"pub fn b() {}\n");
         }
 
-        // Absent child file/stat relative to dir_fd returns ENOENT and records absence.
+        // Absent child file/stat relative to dir_fd returns ENOENT and records type-sensitive absence.
         assert_eq!(sandbox.open(dir_fd, b"missing.rs", READ_ONLY).expect("not stopped"), Err(Errno::NOENT));
         assert_eq!(sandbox.path_stat(dir_fd, b"missing_stat.rs", true).expect("not stopped"), Err(Errno::NOENT));
 
@@ -933,15 +979,15 @@ mod dir_fd_tests {
         let subjects: Vec<&str> = sandbox.reads.iter().map(|r| r.subject.as_str()).collect();
         for expected in [
             "dir:crates/m/parts",
-            "stat:crates/m/parts/a.rs",
+            "lstat:crates/m/parts/a.rs",
             "file:crates/m/parts/a.rs",
-            "stat:crates/m/parts/sub",
+            "lstat:crates/m/parts/sub",
             "dir:crates/m/parts/sub",
             "file:crates/m/parts/sub/b.rs",
             "dir:crates/m/parts/sub/deep",
             "stat:crates/m/parts/sub/deep/c.rs",
             "file:crates/m/parts/sub/deep/c.rs",
-            "file:crates/m/parts/missing.rs",
+            "stat:crates/m/parts/missing.rs",
             "stat:crates/m/parts/missing_stat.rs",
         ] {
             assert!(subjects.contains(&expected), "missing recorded read {expected:?} in {subjects:?}");
@@ -1098,19 +1144,26 @@ mod dir_fd_tests {
             assert!(matches!(sandbox.refused, Some((ProcLimit::Paths, _))));
         }
 
-        // 5. Symlink inside subdir pointing outside workspace accessed via subdir fd -> refused.
+        // 5. Symlink inside subdir pointing outside workspace accessed via subdir fd:
+        //    `open` and `path_stat(..., follow=true)` are refused; `path_stat(..., follow=false)`
+        //    preserves final-component symlink metadata without dereferencing the target.
         #[cfg(unix)]
         {
-            for follow in [true, false] {
-                let (_pkg, mut sandbox) = member_sandbox(&tree);
-                let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
-                let Err(stat_stop) = sandbox.path_stat(dir_fd, b"escape", follow) else {
-                    panic!("symlink escape stat (follow={follow}) must be refused");
-                };
-                assert!(stat_stop.0.contains("a link out of /workspace"), "{}", stat_stop.0);
-                assert!(!stat_stop.0.contains(&ws_str), "must not leak host path: {}", stat_stop.0);
-                assert!(matches!(sandbox.refused, Some((ProcLimit::Paths, _))));
-            }
+            let (_pkg, mut sandbox) = member_sandbox(&tree);
+            let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
+            let Err(stat_stop) = sandbox.path_stat(dir_fd, b"escape", true) else {
+                panic!("symlink escape stat (follow=true) must be refused");
+            };
+            assert!(stat_stop.0.contains("a link out of /workspace"), "{}", stat_stop.0);
+            assert!(!stat_stop.0.contains(&ws_str), "must not leak host path: {}", stat_stop.0);
+            assert!(matches!(sandbox.refused, Some((ProcLimit::Paths, _))));
+
+            let (_pkg, mut sandbox) = member_sandbox(&tree);
+            let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
+            let lstat = sandbox.path_stat(dir_fd, b"escape", false).expect("lstat does not dereference target").expect("symlink exists");
+            assert_eq!(lstat.filetype, Filetype::SymbolicLink);
+            assert_eq!(lstat.size, 0, "symlink size must not leak target path length");
+
             let (_pkg, mut sandbox) = member_sandbox(&tree);
             let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
             let Err(open_stop) = sandbox.open(dir_fd, b"escape", READ_ONLY) else {
@@ -1120,5 +1173,176 @@ mod dir_fd_tests {
             assert!(!open_stop.0.contains(&ws_str), "must not leak host path: {}", open_stop.0);
             assert!(matches!(sandbox.refused, Some((ProcLimit::Paths, _))));
         }
+    }
+
+    /// Codex P1: an absent `open` (via `ROOT_FD` or via dir-fd) records a type-sensitive `stat:`
+    /// read so that when the absent path later becomes a directory (or file), `answer_now` changes
+    /// and invalidates any cached expansion. Likewise `O_DIRECTORY` on a regular file (`NOTDIR`)
+    /// records a type-sensitive `stat:` read that changes if replaced by a directory.
+    #[test]
+    fn absent_open_and_notdir_record_type_sensitive_reads_that_invalidate_on_dir_creation() {
+        let tree = make_workspace("absent_becomes_dir");
+        let (pkg, mut sandbox) = member_sandbox(&tree);
+        let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
+
+        // Probe absent paths via both dir-fd and ROOT_FD.
+        assert_eq!(sandbox.open(dir_fd, b"future_dir", READ_ONLY).expect("not stopped"), Err(Errno::NOENT));
+        assert_eq!(sandbox.open(ROOT_FD, b"/workspace/crates/m/parts/future_root_dir", READ_ONLY).expect("not stopped"), Err(Errno::NOENT));
+
+        // Probe regular file with O_DIRECTORY -> NOTDIR.
+        let dir_only = Open { dirflags: 1, oflags: 2, rights_base: 1 << 1, rights_inheriting: 0, fdflags: 0 };
+        assert_eq!(sandbox.open(dir_fd, b"a.rs", dir_only).expect("not stopped"), Err(Errno::NOTDIR));
+
+        let future_dir_read = sandbox.reads.iter().find(|r| r.subject == "stat:crates/m/parts/future_dir").expect("stat read for dir-fd absent open").clone();
+        let future_root_read = sandbox.reads.iter().find(|r| r.subject == "stat:crates/m/parts/future_root_dir").expect("stat read for ROOT_FD absent open").clone();
+        let notdir_read = sandbox.reads.iter().find(|r| r.subject == "stat:crates/m/parts/a.rs").expect("stat read for NOTDIR open").clone();
+        assert_eq!(future_dir_read.digest, None);
+        assert_eq!(future_root_read.digest, None);
+        assert!(notdir_read.digest.is_some());
+        assert_eq!(answer_now(&pkg, &future_dir_read.subject), Ok(None));
+        assert_eq!(answer_now(&pkg, &future_root_read.subject), Ok(None));
+        assert_eq!(answer_now(&pkg, &notdir_read.subject), Ok(notdir_read.digest));
+
+        // Turn both absent paths into directories, and replace `a.rs` with a directory.
+        std::fs::create_dir(tree.ws.join("crates/m/parts/future_dir")).expect("create future_dir");
+        std::fs::create_dir(tree.ws.join("crates/m/parts/future_root_dir")).expect("create future_root_dir");
+        std::fs::remove_file(tree.ws.join("crates/m/parts/a.rs")).expect("remove a.rs");
+        std::fs::create_dir(tree.ws.join("crates/m/parts/a.rs")).expect("dir at a.rs");
+
+        // Every recorded read must now disagree with `answer_now` (cache invalidation!).
+        assert_ne!(answer_now(&pkg, &future_dir_read.subject), Ok(future_dir_read.digest), "absent dir-fd open must invalidate when path becomes a directory");
+        assert_ne!(answer_now(&pkg, &future_root_read.subject), Ok(future_root_read.digest), "absent ROOT_FD open must invalidate when path becomes a directory");
+        assert_ne!(answer_now(&pkg, &notdir_read.subject), Ok(notdir_read.digest), "NOTDIR open must invalidate when file becomes a directory");
+    }
+
+    /// Codex P2 (symlink dir-fd `..` resolution): opening a directory through an in-tree symlink
+    /// `alias -> real/sub` stores the canonical in-tree target `crates/m/real/sub` on the opened
+    /// dir fd, so `../sibling.txt` resolves to `crates/m/real/sibling.txt` (NOT `crates/m/sibling.txt`),
+    /// retargeting `alias` invalidates the `dir:` digest even if the entries are identical, and
+    /// `..` climbing out of `/workspace` is still refused.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_dir_fd_resolves_dotdot_from_canonical_target_and_blocks_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let tree = make_workspace("symlink_dirfd");
+        let m = tree.ws.join("crates/m");
+        std::fs::create_dir_all(m.join("real/sub")).expect("real/sub");
+        std::fs::create_dir_all(m.join("other/sub")).expect("other/sub");
+        std::fs::write(m.join("real/sub/item.rs"), b"real item").expect("real item");
+        std::fs::write(m.join("other/sub/item.rs"), b"other item").expect("other item");
+        std::fs::write(m.join("real/sibling.txt"), b"from-real-sibling").expect("real sibling");
+        std::fs::write(m.join("sibling.txt"), b"from-wrong-lexical-sibling").expect("lexical sibling");
+        symlink("real/sub", m.join("alias")).expect("alias symlink");
+
+        let (pkg, mut sandbox) = member_sandbox(&tree);
+        let alias_fd = sandbox
+            .open(ROOT_FD, b"/workspace/crates/m/alias", READ_ONLY)
+            .expect("not stopped")
+            .expect("alias dir opens");
+
+        // `../sibling.txt` relative to `alias` (`-> real/sub`) must read `real/sibling.txt`, NOT `sibling.txt`.
+        let sib_fd = sandbox.open(alias_fd, b"../sibling.txt", READ_ONLY).expect("not stopped").expect("../sibling.txt opens");
+        assert_eq!(read_all(&mut sandbox, sib_fd), b"from-real-sibling");
+        assert!(
+            sandbox.reads.iter().any(|r| r.subject == "file:crates/m/real/sibling.txt"),
+            "read key must record resolved target path, got {:?}",
+            sandbox.reads
+        );
+        assert!(
+            !sandbox.reads.iter().any(|r| r.subject == "file:crates/m/sibling.txt"),
+            "must not read lexical sibling"
+        );
+        for read in &sandbox.reads {
+            assert_eq!(answer_now(&pkg, &read.subject), Ok(read.digest), "parity for {}", read.subject);
+        }
+
+        // Retargeting `alias` to `other/sub` (which has the exact same entry name `item.rs`!)
+        // must still change `answer_now("dir:crates/m/alias")` so cached expansions invalidate.
+        let alias_dir_read = sandbox.reads.iter().find(|r| r.subject == "dir:crates/m/alias").expect("dir read").clone();
+        std::fs::remove_file(m.join("alias")).expect("unlink alias");
+        symlink("other/sub", m.join("alias")).expect("retarget alias");
+        assert_ne!(
+            answer_now(&pkg, &alias_dir_read.subject),
+            Ok(alias_dir_read.digest),
+            "retargeting directory symlink must invalidate dir read even when listings match"
+        );
+
+        // Escape control: climbing past `/workspace` via `alias_fd` (canonical depth 4:
+        // `crates/m/real/sub`) is still refused.
+        let Err(stop) = sandbox.open(alias_fd, b"../../../../../outside/secret.txt", READ_ONLY) else {
+            panic!("escape via symlink dir fd must be refused");
+        };
+        assert!(stop.0.contains("outside /workspace"), "{}", stop.0);
+        assert!(matches!(sandbox.refused, Some((ProcLimit::Paths, _))));
+    }
+
+    /// Codex P2 (`follow=false` on `path_stat`): `path_stat(..., follow=false)` preserves
+    /// final-component `Filetype::SymbolicLink` for directory symlinks and dangling symlinks
+    /// (both via `ROOT_FD` and via dir-fd), while `follow=true` follows directory symlinks to
+    /// `Directory`, reports `NOENT` for dangling symlinks, and refuses out-of-tree targets.
+    /// Intermediate directory symlinks escaping the tree are refused even when `follow=false`.
+    #[cfg(unix)]
+    #[test]
+    fn path_stat_honors_no_follow_for_dir_and_dangling_symlinks_and_blocks_intermediate_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let tree = make_workspace("nofollow");
+        let ws_str = tree.ws.to_string_lossy().into_owned();
+        let parts = tree.ws.join("crates/m/parts");
+        symlink("sub", parts.join("dir_link")).expect("dir symlink");
+        symlink("does_not_exist", parts.join("dangling")).expect("dangling symlink");
+        symlink("../../../../outside", parts.join("out_dir_link")).expect("out-of-tree dir symlink");
+
+        let (pkg, mut sandbox) = member_sandbox(&tree);
+        let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
+
+        // `fd_readdir` listing also reports symlinks as `SymbolicLink`, not `Directory`/`RegularFile`.
+        let entries = collect_dir_entries(&mut sandbox, dir_fd);
+        assert!(entries.iter().any(|(n, ft)| n.as_slice() == b"dir_link" && *ft == Filetype::SymbolicLink), "{entries:?}");
+        assert!(entries.iter().any(|(n, ft)| n.as_slice() == b"dangling" && *ft == Filetype::SymbolicLink), "{entries:?}");
+
+        // Directory symlink: follow=false -> SymbolicLink (`lstat:`), follow=true -> Directory (`stat:`).
+        let lstat_dir = sandbox.path_stat(dir_fd, b"dir_link", false).expect("not stopped").expect("dir_link lstat");
+        assert_eq!(lstat_dir.filetype, Filetype::SymbolicLink);
+        let stat_dir = sandbox.path_stat(dir_fd, b"dir_link", true).expect("not stopped").expect("dir_link stat");
+        assert_eq!(stat_dir.filetype, Filetype::Directory);
+        // Same via ROOT_FD.
+        let root_lstat_dir = sandbox.path_stat(ROOT_FD, b"/workspace/crates/m/parts/dir_link", false).expect("not stopped").expect("root dir_link lstat");
+        assert_eq!(root_lstat_dir.filetype, Filetype::SymbolicLink);
+
+        // Dangling symlink: follow=false -> SymbolicLink (`lstat:`), follow=true -> NOENT (`stat:`).
+        let lstat_dangling = sandbox.path_stat(dir_fd, b"dangling", false).expect("not stopped").expect("dangling lstat");
+        assert_eq!(lstat_dangling.filetype, Filetype::SymbolicLink);
+        assert_eq!(sandbox.path_stat(dir_fd, b"dangling", true).expect("not stopped"), Err(Errno::NOENT));
+
+        // Verify both `lstat:` and `stat:` subjects are recorded and match `answer_now`.
+        let subjects: Vec<&str> = sandbox.reads.iter().map(|r| r.subject.as_str()).collect();
+        for expected in [
+            "lstat:crates/m/parts/dir_link",
+            "stat:crates/m/parts/dir_link",
+            "lstat:crates/m/parts/dangling",
+            "stat:crates/m/parts/dangling",
+        ] {
+            assert!(subjects.contains(&expected), "missing {expected:?} in {subjects:?}");
+        }
+        for read in &sandbox.reads {
+            assert_eq!(answer_now(&pkg, &read.subject), Ok(read.digest), "parity for {}", read.subject);
+        }
+
+        // Security control: intermediate out-of-tree directory symlink is STILL refused even with follow=false.
+        for follow in [false, true] {
+            let (_pkg, mut sb) = member_sandbox(&tree);
+            let fd = sb.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
+            let Err(stop) = sb.path_stat(fd, b"out_dir_link/secret.txt", follow) else {
+                panic!("intermediate out-of-tree symlink stat (follow={follow}) must be refused");
+            };
+            assert!(stop.0.contains("a link out of /workspace"), "{}", stop.0);
+            assert!(!stop.0.contains(&ws_str), "must not leak host path: {}", stop.0);
+            assert!(matches!(sb.refused, Some((ProcLimit::Paths, _))));
+        }
+
+        // Security control: crafted `lstat:..` directly into `answer_now` cannot escape `top`.
+        assert!(answer_now(&pkg, "lstat:..").is_err(), "crafted `lstat:..` must fail closed");
     }
 }
