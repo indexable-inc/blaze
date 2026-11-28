@@ -117,7 +117,7 @@ pub fn link<W: Width, T: Embed>(l: &mut Linker<T>) -> wasmtime::Result<()> {
     )?;
     l.func_wrap(m, "fd_fdstat_get", |mut c: Caller<'_, T>, fd: u32, out: W::Ptr| {
         call::<W, T, _>(&mut c, "fd_fdstat_get", |mem, sys| {
-            answered(sys.fd_filetype(fd)?, |filetype| mem.put_fdstat(out.into(), filetype))
+            answered(sys.fd_fdstat(fd)?, |stat| mem.put_fdstat(out.into(), &stat))
         })
     })?;
     l.func_wrap(m, "fd_fdstat_set_flags", |mut c: Caller<'_, T>, fd: u32, flags: u32| {
