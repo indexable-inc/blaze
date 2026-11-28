@@ -639,6 +639,8 @@ pub struct Layout {
     pub tail: Tail,
     /// No value of it exists.
     pub uninhabited: bool,
+    /// Single-scalar niche-encoded enum ABI (inherited through transparent wrappers).
+    pub(crate) niche_scalar: bool,
     /// The value is one scalar at offset 0 of the whole size.
     pub scalar: Option<Scalar>,
     /// The value is two scalars at offsets 0 and 8 (a wide pointer, or a newtype of one).
@@ -681,15 +683,13 @@ impl Layout {
             // A niche-encoded single-scalar enum (such as `Result<(), Error>` where
             // `struct Error(NonZeroI32)` is a plain newtype without `#[repr(transparent)]`, as
             // in `getrandom 0.3/0.4`'s `extern "Rust"` backend linked against `wasi_rt`'s
-            // `Result<(), NonZeroI32>`) crosses Rust calls as its one scalar register, matching
-            // rustc's `BackendRepr::Scalar` ABI.
-            _ if matches!(self.variants, Variants::Multiple { encoding: TagEncoding::Niche { .. }, .. }) => {
-                if let Some(s) = self.scalar {
-                    let (ty, signed) = crate::intrinsics::lir(s.prim);
-                    Ok(rust_scalar(ty, signed, self.fields != Fields::Primitive))
-                } else {
-                    Ok(Pass::Ref)
-                }
+            // `Result<(), NonZeroI32>`, or `Option<FieldlessEnum>`, and any `#[repr(transparent)]`
+            // wrapper around one such as `ManuallyDrop<E>`) crosses Rust calls as its one scalar
+            // register, matching rustc's `BackendRepr::Scalar` ABI.
+            _ if self.niche_scalar => {
+                let s = self.scalar.ok_or(Refusal::Malformed("a niche-scalar ABI type without a scalar layout"))?;
+                let (ty, signed) = crate::intrinsics::lir(s.prim);
+                Ok(rust_scalar(ty, signed, self.fields != Fields::Primitive))
             }
             _ => Ok(Pass::Ref),
         }
@@ -816,6 +816,145 @@ fn niche_single_scalar_enum_over_plain_newtype_matches_underlying_scalar_rust_pa
     // Control: the plain newtype struct itself stays indirect (`Pass::Ref`).
     let err_row = lay(&w, &mut g, &mut ls, error_i32).unwrap();
     assert_eq!(ls.get(err_row).rust_pass(g.t.view()).unwrap(), Pass::Ref);
+}
+
+#[cfg(test)]
+#[test]
+fn transparent_wrappers_preserve_niche_single_scalar_enum_rust_pass() {
+    use self::tests::{F, G, World, lay};
+    use crate::abi::Pass;
+    use blaze_lir::{Ty, func::Ext};
+    use blaze_typeck::List;
+
+    let transparent = ReprAttrs { transparent: true, ..ReprAttrs::RUST };
+    let transparent_cell = ReprAttrs { transparent: true, hide_niche: true, ..ReprAttrs::RUST };
+    let mut w = World::default();
+
+    // Inner niche-carrying types and wrappers.
+    let nz_wrapper = w.strukt(1, &[F::P(0)], transparent);
+    let plain_newtype = w.strukt(1, &[F::P(0)], ReprAttrs::RUST);
+    let result = w.def(AdtKind::Enum, 2, &[&[F::P(0)], &[F::P(1)]], ReprAttrs::RUST);
+    let option = w.option();
+    let fieldless_u8 = w.def(AdtKind::Enum, 0, &[&[], &[], &[]], ReprAttrs::RUST);
+    let fieldless_i8 = w.def(AdtKind::Enum, 0, &[&[], &[], &[]], ReprAttrs::RUST);
+    w.def_mut(fieldless_i8).discrs = vec![Some(-1), Some(0), Some(1)];
+    // Niche enum whose untagged variant holds `[ZST, NicheScalar]` (`call_ty` is the enum itself).
+    let zst_plus_niche = w.def(
+        AdtKind::Enum,
+        1,
+        &[&[], &[F::Leaf(PNode::Tuple(List::EMPTY)), F::P(0)]],
+        ReprAttrs::RUST,
+    );
+
+    // Transparent wrappers: ManuallyDrop<T>, nested Outer((), ManuallyDrop<T>),
+    // 1-variant transparent enum, and UnsafeCell<T> (transparent + hide_niche).
+    let manually_drop = w.strukt(1, &[F::P(0)], transparent);
+    let nested_outer = w.strukt(1, &[F::Leaf(PNode::Tuple(List::EMPTY)), F::AdtP(manually_drop, 0)], transparent);
+    let single_enum = w.def(AdtKind::Enum, 1, &[&[F::Leaf(PNode::Tuple(List::EMPTY)), F::P(0)]], transparent);
+    let unsafe_cell = w.strukt(1, &[F::P(0)], transparent_cell);
+
+    // Negative controls: plain non-transparent struct, #[repr(transparent)] union (MaybeUninit<T>),
+    // and multi-field non-transparent union.
+    let plain_wrap = w.strukt(1, &[F::P(0)], ReprAttrs::RUST);
+    let maybe_uninit = w.def(
+        AdtKind::Union,
+        1,
+        &[&[F::Leaf(PNode::Tuple(List::EMPTY)), F::AdtP(manually_drop, 0)]],
+        transparent,
+    );
+    let multi_union = w.def(AdtKind::Union, 1, &[&[F::P(0), F::Leaf(PNode::Uint(UintTy::U64))]], ReprAttrs::RUST);
+
+    let mut g = G::new();
+    let i32_t = g.n(PNode::Int(IntTy::I32));
+    let u32_t = g.n(PNode::Uint(UintTy::U32));
+    let u64_t = g.n(PNode::Uint(UintTy::U64));
+    let unit = g.tuple(&[]);
+    let nz_lo = g.n(PNode::ConstValue { bits: 1, ty: u32_t });
+    let nz_hi = g.n(PNode::ConstValue { bits: u32::MAX as u128, ty: u32_t });
+    let nz_range = g.t.intern_list(&[nz_lo, nz_hi]).unwrap();
+    let nz_pat = g.n(PNode::Pat(i32_t, nz_range));
+    let non_zero_i32 = g.adt(nz_wrapper, &[nz_pat]);
+    let error_i32 = g.adt(plain_newtype, &[non_zero_i32]);
+
+    let res_err_i32 = g.adt(result, &[unit, error_i32]);
+    let fl_u8_ty = g.adt(fieldless_u8, &[]);
+    let opt_fieldless_u8 = g.adt(option, &[fl_u8_ty]);
+    let fl_i8_ty = g.adt(fieldless_i8, &[]);
+    let opt_fieldless_i8 = g.adt(option, &[fl_i8_ty]);
+    let zst_niche_i32 = g.adt(zst_plus_niche, &[non_zero_i32]);
+
+    let mut ls = Layouts::new_in(std::alloc::Global);
+    let cases = [
+        ("Result<(), PlainNewtype(NonZeroI32)>", res_err_i32, Pass::Scalar { ty: Ty::I32, ext: Ext::None, agg: true }),
+        ("Option<FieldlessU8>", opt_fieldless_u8, Pass::Scalar { ty: Ty::I8, ext: Ext::Zext, agg: true }),
+        ("Option<FieldlessI8>", opt_fieldless_i8, Pass::Scalar { ty: Ty::I8, ext: Ext::Sext, agg: true }),
+        ("ZstPlusNiche<NonZeroI32>", zst_niche_i32, Pass::Scalar { ty: Ty::I32, ext: Ext::None, agg: true }),
+    ];
+
+    for (label, inner_enum, want) in cases {
+        let md = g.adt(manually_drop, &[inner_enum]);
+        let nested = g.adt(nested_outer, &[inner_enum]);
+        let one_var = g.adt(single_enum, &[inner_enum]);
+        let cell = g.adt(unsafe_cell, &[inner_enum]);
+        let single_arm_list = g.t.intern_list(&[inner_enum]).unwrap();
+        let single_arm_union = g.n(PNode::Union(single_arm_list));
+
+        for (kind, ty) in [
+            ("enum", inner_enum),
+            ("ManuallyDrop<E>", md),
+            ("Outer((), ManuallyDrop<E>)", nested),
+            ("SingleVariantEnum<E>", one_var),
+            ("UnsafeCell<E>", cell),
+            ("PNode::Union([E])", single_arm_union),
+        ] {
+            let row = lay(&w, &mut g, &mut ls, ty).unwrap();
+            assert_eq!(
+                ls.get(row).rust_pass(g.t.view()).unwrap(),
+                want,
+                "{kind} over {label} must preserve niche-scalar Rust pass"
+            );
+        }
+
+        // Negative controls: non-transparent struct, Rust `union` (including #[repr(transparent)]
+        // `MaybeUninit<E>`, matching `MaybeUninit<u32>`), and multi-arm structural union stay `Pass::Ref`.
+        let plain = g.adt(plain_wrap, &[inner_enum]);
+        let mu = g.adt(maybe_uninit, &[inner_enum]);
+        let u_adt = g.adt(multi_union, &[inner_enum]);
+        let multi_arm_list = g.t.intern_list(&[inner_enum, u64_t]).unwrap();
+        let multi_arm_union = g.n(PNode::Union(multi_arm_list));
+        for (kind, ty) in [
+            ("Plain(E)", plain),
+            ("MaybeUninit<E>", mu),
+            ("MultiUnion<E>", u_adt),
+            ("PNode::Union([E, u64])", multi_arm_union),
+        ] {
+            let row = lay(&w, &mut g, &mut ls, ty).unwrap();
+            assert_eq!(
+                ls.get(row).rust_pass(g.t.view()).unwrap(),
+                Pass::Ref,
+                "{kind} over {label} must stay indirect (Pass::Ref)"
+            );
+        }
+    }
+
+    // Confirm `MaybeUninit<u32>` agrees with `MaybeUninit<E>` (`Pass::Ref`), while
+    // `ManuallyDrop<u32>` agrees with `ManuallyDrop<Result<(), Error>>` (`Pass::Scalar(I32)`).
+    let mu_u32_ty = g.adt(maybe_uninit, &[u32_t]);
+    let mu_u32 = lay(&w, &mut g, &mut ls, mu_u32_ty).unwrap();
+    assert_eq!(ls.get(mu_u32).rust_pass(g.t.view()).unwrap(), Pass::Ref);
+    let md_u32_ty = g.adt(manually_drop, &[u32_t]);
+    let md_u32 = lay(&w, &mut g, &mut ls, md_u32_ty).unwrap();
+    assert_eq!(ls.get(md_u32).rust_pass(g.t.view()).unwrap(), Pass::Scalar { ty: Ty::I32, ext: Ext::None, agg: true });
+
+    // Multi-word niche enum (`Option<(u64, NonZeroI32)>`) has no single scalar and stays `Pass::Ref`,
+    // even inside `ManuallyDrop`.
+    let pair_ty = g.tuple(&[u64_t, non_zero_i32]);
+    let pair_niche = g.adt(option, &[pair_ty]);
+    let md_pair_niche = g.adt(manually_drop, &[pair_niche]);
+    for ty in [pair_niche, md_pair_niche] {
+        let row = lay(&w, &mut g, &mut ls, ty).unwrap();
+        assert_eq!(ls.get(row).rust_pass(g.t.view()).unwrap(), Pass::Ref);
+    }
 }
 
 /// Why a type has no layout.
@@ -979,6 +1118,7 @@ fn ty_may_unsize<'a>(mut ty: PTy, mut tys: blaze_typeck::PTys<'a>, facts: &'a dy
 /// A struct-like layout before it is a row.
 struct Uni {
     call_ty: Option<PTy>,
+    niche_scalar: bool,
     first: u32,
     len: u32,
     size: u64,
@@ -1470,6 +1610,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                 align: p.align(),
                 tail: Tail::Sized,
                 uninhabited: false,
+                niche_scalar: false,
                 scalar: Some(scalar),
                 pair: None,
                 fields: Fields::Primitive,
@@ -1485,6 +1626,7 @@ impl<A: Allocator + Clone> Layouts<A> {
             align: 0,
             tail: Tail::Sized,
             uninhabited,
+            niche_scalar: false,
             scalar: None,
             pair: None,
             fields: Fields::Struct { first: 0, len: 0 },
@@ -1506,6 +1648,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                 align: ptr_align,
                 tail: Tail::Sized,
                 uninhabited: false,
+                niche_scalar: false,
                 scalar: Some(scalar),
                 pair: None,
                 fields: Fields::Primitive,
@@ -1597,6 +1740,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                         align: ptr_align,
                         tail: Tail::Sized,
                         uninhabited: false,
+                        niche_scalar: false,
                         scalar: None,
                         pair: Some((addr, len)),
                         fields: Fields::Struct { first, len: 2 },
@@ -1627,6 +1771,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                     align,
                     tail: Tail::Slice { stride },
                     uninhabited: false,
+                    niche_scalar: false,
                     scalar: None,
                     pair: None,
                     fields: Fields::Array { elem, stride, count: 0 },
@@ -1650,6 +1795,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                     align: el.align,
                     tail: Tail::Sized,
                     uninhabited: n > 0 && el.uninhabited,
+                    niche_scalar: false,
                     scalar: None,
                     pair: None,
                     fields: Fields::Array { elem: e, stride: el.size, count: n },
@@ -1685,6 +1831,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                     let u = self.univariant(parts, Order::Decreasing, ReprAttrs::RUST, 0, 0, false, cx.scratch)?;
                     let mut row = self.struct_row(t, u);
                     row.call_ty = inner.call_ty;
+                    row.niche_scalar = inner.niche_scalar;
                     row.variants = Variants::Single { index: 0 };
                     row.discrs = discrs;
                     return self.push(row);
@@ -1738,6 +1885,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                 align: 0,
                 tail: Tail::Dyn,
                 uninhabited: false,
+                niche_scalar: false,
                 scalar: None,
                 pair: None,
                 fields: Fields::Struct { first: self.offsets.len() as u32, len: 0 },
@@ -1767,6 +1915,7 @@ impl<A: Allocator + Clone> Layouts<A> {
             align: u.align,
             tail: u.tail,
             uninhabited: u.uninhabited,
+            niche_scalar: u.niche_scalar,
             scalar: u.scalar,
             pair: u.pair,
             fields: Fields::Struct { first: u.first, len: u.len },
@@ -1923,7 +2072,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                 pair = l.pair;
             }
         }
-        Ok(Uni { call_ty: None, first, len: ids.len() as u32, size, align, tail, uninhabited, niche, scalar, pair })
+        Ok(Uni { call_ty: None, niche_scalar: false, first, len: ids.len() as u32, size, align, tail, uninhabited, niche, scalar, pair })
     }
 
     fn adt(&mut self, t: PTy, key: ItemKey, cx: &mut LayoutCx<'_, '_>, parts: &[PTy]) -> Result<LayoutId, Refusal> {
@@ -1998,6 +2147,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                     align,
                     tail: Tail::Sized,
                     uninhabited: false,
+                    niche_scalar: false,
                     scalar: None,
                     pair: None,
                     fields: Fields::Union { count: ids.len() as u32 },
@@ -2044,6 +2194,7 @@ impl<A: Allocator + Clone> Layouts<A> {
         Ok(match inner {
             Some(l) => Uni {
                 call_ty: Some(l.call_ty),
+                niche_scalar: l.niche_scalar,
                 first,
                 len: fields.len() as u32,
                 size: l.size,
@@ -2054,7 +2205,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                 scalar: l.scalar,
                 pair: l.pair,
             },
-            None => Uni { call_ty: None, first, len: fields.len() as u32, size: 0, align, tail: Tail::Sized, uninhabited: false, niche: None, scalar: None, pair: None },
+            None => Uni { call_ty: None, niche_scalar: false, first, len: fields.len() as u32, size: 0, align, tail: Tail::Sized, uninhabited: false, niche: None, scalar: None, pair: None },
         })
     }
 
@@ -2298,6 +2449,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                 align,
                 tail: Tail::Sized,
                 uninhabited: probes[v].uninhabited,
+                niche_scalar: false,
                 scalar: None,
                 pair: None,
                 fields: Fields::Struct { first: u.first, len: u.len },
@@ -2336,6 +2488,7 @@ impl<A: Allocator + Clone> Layouts<A> {
             align,
             tail: Tail::Sized,
             uninhabited: probes.iter().all(|p| p.uninhabited),
+            niche_scalar: scalar.is_some(),
             scalar,
             pair,
             fields: Fields::Struct { first: 0, len: 0 },
@@ -2359,6 +2512,7 @@ impl<A: Allocator + Clone> Layouts<A> {
             align: 0,
             tail: Tail::Sized,
             uninhabited,
+            niche_scalar: false,
             scalar: None,
             pair: None,
             fields: Fields::Struct { first: 0, len: 0 },
@@ -2411,6 +2565,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                 align,
                 tail: Tail::Sized,
                 uninhabited: u.uninhabited,
+                niche_scalar: false,
                 scalar: None,
                 pair: None,
                 fields: Fields::Struct { first: u.first, len: u.len },
@@ -2429,6 +2584,7 @@ impl<A: Allocator + Clone> Layouts<A> {
             align,
             tail: Tail::Sized,
             uninhabited,
+            niche_scalar: false,
             scalar,
             pair: None,
             fields: Fields::Struct { first: 0, len: 0 },

@@ -774,3 +774,234 @@ fn extern_weak_static_resolves_present_rust_fn_export_and_refuses_weak_foreign_f
         "expected refusal mentioning extern_weak, got: {err}",
     );
 }
+
+const TRANSPARENT_NICHE_SCALAR_ABI_PROGRAM: &str = r#"#![feature(no_core, lang_items, rustc_attrs)]
+#![no_core]
+#![no_main]
+
+#[lang = "sized"]
+trait Sized {}
+
+#[lang = "copy"]
+trait Copy {}
+
+impl Copy for () {}
+impl Copy for bool {}
+impl Copy for u8 {}
+impl Copy for i32 {}
+impl Copy for u32 {}
+impl Copy for u64 {}
+impl Copy for usize {}
+impl<T> Copy for *const T {}
+impl<T> Copy for &T {}
+
+#[repr(transparent)]
+#[rustc_layout_scalar_valid_range_start(1)]
+struct NonZeroI32(i32);
+
+struct PlainError(NonZeroI32);
+
+enum Res<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+enum Fieldless {
+    A,
+    B,
+    C,
+}
+
+struct PlainRef(&'static u8);
+
+enum Opt<T> {
+    None,
+    Some(T),
+}
+
+#[lang = "manually_drop"]
+#[repr(transparent)]
+struct ManuallyDrop<T> {
+    value: T,
+}
+
+impl<T> ManuallyDrop<T> {
+    #[inline(never)]
+    fn new(value: T) -> ManuallyDrop<T> {
+        ManuallyDrop { value }
+    }
+
+    #[inline(never)]
+    fn into_inner(slot: ManuallyDrop<T>) -> T {
+        slot.value
+    }
+}
+
+#[repr(transparent)]
+struct NestedWrap<T> {
+    _zst: (),
+    inner: ManuallyDrop<T>,
+}
+
+impl<T> NestedWrap<T> {
+    #[inline(never)]
+    fn new(value: T) -> NestedWrap<T> {
+        NestedWrap { _zst: (), inner: ManuallyDrop::new(value) }
+    }
+
+    #[inline(never)]
+    fn into_inner(self) -> T {
+        ManuallyDrop::into_inner(self.inner)
+    }
+}
+
+#[repr(transparent)]
+enum TransparentEnum<T> {
+    Only((), T),
+}
+
+impl<T> TransparentEnum<T> {
+    #[inline(never)]
+    fn new(value: T) -> TransparentEnum<T> {
+        TransparentEnum::Only((), value)
+    }
+
+    #[inline(never)]
+    fn into_inner(self) -> T {
+        match self {
+            TransparentEnum::Only((), v) => v,
+        }
+    }
+}
+
+#[repr(transparent)]
+union MaybeUninit<T> {
+    uninit: (),
+    value: ManuallyDrop<T>,
+}
+
+impl<T> MaybeUninit<T> {
+    #[inline(never)]
+    fn new(val: T) -> MaybeUninit<T> {
+        MaybeUninit { value: ManuallyDrop::new(val) }
+    }
+
+    #[inline(never)]
+    unsafe fn assume_init(self) -> T {
+        unsafe { ManuallyDrop::into_inner(self.value) }
+    }
+}
+
+static BYTE: u8 = 7;
+
+#[inline(never)]
+fn roundtrip_res(v: Res<(), PlainError>) -> i32 {
+    let mu = MaybeUninit::new(v);
+    let out = unsafe { mu.assume_init() };
+    let md = ManuallyDrop::new(out);
+    let out2 = ManuallyDrop::into_inner(md);
+    let nw = NestedWrap::new(out2);
+    let out3 = nw.into_inner();
+    let te = TransparentEnum::new(out3);
+    match te.into_inner() {
+        Res::Ok(()) => 1,
+        Res::Err(e) => e.0.0,
+    }
+}
+
+#[inline(never)]
+fn roundtrip_opt_ref(v: Opt<PlainRef>) -> i32 {
+    let mu = MaybeUninit::new(v);
+    let out = unsafe { mu.assume_init() };
+    let md = ManuallyDrop::new(out);
+    match ManuallyDrop::into_inner(md) {
+        Opt::None => 0,
+        Opt::Some(r) => *r.0 as i32,
+    }
+}
+
+#[inline(never)]
+fn roundtrip_opt_fieldless(v: Opt<Fieldless>) -> i32 {
+    let mu = MaybeUninit::new(v);
+    let out = unsafe { mu.assume_init() };
+    let md = ManuallyDrop::new(out);
+    match ManuallyDrop::into_inner(md) {
+        Opt::None => 0,
+        Opt::Some(Fieldless::A) => 1,
+        Opt::Some(Fieldless::B) => 2,
+        Opt::Some(Fieldless::C) => 3,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn main() -> i32 {
+    let a = roundtrip_res(Res::Ok(()));
+    let b = roundtrip_res(Res::Err(PlainError(unsafe { NonZeroI32(10) })));
+    let c = roundtrip_opt_ref(Opt::Some(PlainRef(&BYTE)));
+    let d = roundtrip_opt_fieldless(Opt::Some(Fieldless::B));
+    let e = unsafe { MaybeUninit::new(42u32).assume_init() } as i32;
+    let f = unsafe { MaybeUninit::new(9u64).assume_init() } as i32;
+    a + b + c + d + e + f
+}
+"#;
+
+#[test]
+fn transparent_niche_scalar_abi_links_cleanly_through_poly_canon_and_wasm64() {
+    let f = fixture(TRANSPARENT_NICHE_SCALAR_ABI_PROGRAM);
+    let entry = item_named(&f, ItemKind::Function, "main");
+    let b = builder();
+    let mut store = MemoryStore::new_in(alloc());
+    let mut walk_maker = Maker::new(reader(&f), Some(entry), &b, alloc());
+    let (walk, _counts) = walk_records(
+        entry,
+        &EveryItem,
+        &mut store,
+        &b,
+        &producer(),
+        &mut walk_maker,
+        alloc(),
+    )
+    .unwrap_or_else(|e| panic!("walk_records failed for transparent niche scalar ABI: {e}"));
+
+    assert!(
+        walk_maker.poly_stats().canonicalized_calls > 0,
+        "poly_canon must canonicalize ManuallyDrop/MaybeUninit calls for niche-scalar enums (got {:?})",
+        walk_maker.poly_stats(),
+    );
+
+    let main_sym = walk.symbol(0);
+    let mut wasm_maker = Maker::<TestGrant, SecondCheck>::of_start(
+        reader(&f),
+        Some(entry),
+        MakerStart::ByRule,
+        SecondCheck,
+        &b,
+        None,
+        alloc(),
+    );
+    let opts = Wasm64BuildOpts {
+        module_name: "transparent_niche_scalar_abi",
+        start_symbol: Some(main_sym),
+        exports: &[(main_sym, "main")],
+        export_globals: &[],
+        include_blaze_host_v1: false,
+        opts: Wasm64Opts::DEFAULT,
+    };
+    let mut wasm: AVec<'static, u8> = OwnVec::new_in(alloc());
+    let built = compile_walk_to_wasm64(
+        &walk,
+        |_| Some(TestGrant),
+        &mut wasm_maker,
+        &opts,
+        default_wasm64_import,
+        &mut wasm,
+        alloc(),
+    )
+    .unwrap_or_else(|e| panic!("compile_walk_to_wasm64 failed (call sig mismatch regression?): {e}"));
+
+    assert!(built.func_count >= 6, "expected >= 6 functions, got {}", built.func_count);
+    let checked = check_wasm64(wasm.as_slice())
+        .unwrap_or_else(|e| panic!("check_wasm64 rejected transparent niche scalar ABI module: {e}"));
+    assert!(checked.memory64);
+    assert!(checked.has_start_export);
+}
