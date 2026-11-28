@@ -32,10 +32,10 @@ use crate::columns::{CaptureKind, SigFrom};
 use crate::diag::At;
 use crate::error::{CheckError, Limit, Stop};
 use crate::ids::{ExprId, FnPtrHeader, ItemKey, LangItem, List, Mutbl, Name, PatId};
-use crate::machine::{Expectation, Flow, Frame, Machine, PendingClosure, Then};
-use crate::portable::PTy;
-use crate::ty::{Cause, Ty, TyList, TyView, TypeCtx, Var, VarKind};
-use crate::world::World;
+use crate::machine::{Expectation, Flow, Frame, Lower, Machine, PendingClosure, Then};
+use crate::portable::{PNode, PTy};
+use crate::ty::{Cause, ClosureKind, Goal, Ty, TyList, TyView, TypeCtx, Var, VarKind};
+use crate::world::{PClause, World};
 
 /// A capture walk's usage: the expression's value is taken (moved, or copied when `Copy`).
 pub(super) const USE_MOVE: u8 = 2;
@@ -116,23 +116,18 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 else {
                     return Ok(None);
                 };
-                Ok(self.ty.closure_hint(t, [fn_, fn_mut, fn_once], Name::of("Output"))?.map(|((inputs, ic, kind), out)| Expected {
-                    inputs,
-                    output: out.map(|(o, _)| o),
-                    from: sig_from_causes(ic, out.map(|(_, oc)| oc)),
-                    kind: Some(kind),
-                }))
+                self.infer_closure_hint(t, [fn_, fn_mut, fn_once], Name::of("Output"))
             }
             // rustc `deduce_closure_signature` on `ty::Dynamic`: a closure expected as
-            // `dyn FnMut(&T) + Send` (through `&`, or as `Box::new`'s argument hint:
-            // rules/expect_inputs.rs) takes the object's `Fn*` signature.
+            // `dyn FnMut(&T) + Send` (or `dyn SubTrait` where `SubTrait: Fn*`) takes the
+            // object's (or its principal's supertrait's) `Fn*` signature.
             TyView::Dynamic(rows) => {
                 let (Some(fn_), Some(fn_mut), Some(fn_once)) =
                     (self.lang(LangItem::Fn)?, self.lang(LangItem::FnMut)?, self.lang(LangItem::FnOnce)?)
                 else {
                     return Ok(None);
                 };
-                Ok(self.object_closure_sig(rows, [fn_, fn_mut, fn_once], fn_once).map(|(inputs, output, kind)| Expected {
+                Ok(self.object_closure_sig(t, rows, [fn_, fn_mut, fn_once], fn_once)?.map(|(inputs, output, kind)| Expected {
                     inputs,
                     output,
                     from: SigFrom::Object,
@@ -156,19 +151,248 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let mutable = self.lang(LangItem::AsyncFnMut)?;
         // Absent lang items cannot have a matching obligation. Include the
         // available members even in a world declaring just AsyncFnOnce.
-        Ok(self.ty.closure_hint(t, [shared.unwrap_or(once), mutable.unwrap_or(once), once], Name::of("Output"))?.map(|((inputs, ic, raw_kind), out)| {
-            let kind = match raw_kind {
-                crate::ty::ClosureKind::Fn if shared.is_some() => crate::ty::ClosureKind::Fn,
-                crate::ty::ClosureKind::FnMut if mutable.is_some() => crate::ty::ClosureKind::FnMut,
-                _ => crate::ty::ClosureKind::FnOnce,
-            };
-            Expected {
-                inputs,
-                output: out.map(|(o, _)| o),
-                from: sig_from_causes(ic, out.map(|(_, oc)| oc)),
-                kind: Some(kind),
-            }
+        let fn_traits = [shared.unwrap_or(once), mutable.unwrap_or(once), once];
+        Ok(self.infer_closure_hint(t, fn_traits, Name::of("Output"))?.map(|mut exp| {
+            exp.kind = exp.kind.map(|raw_kind| match raw_kind {
+                ClosureKind::Fn if shared.is_some() => ClosureKind::Fn,
+                ClosureKind::FnMut if mutable.is_some() => ClosureKind::FnMut,
+                _ => ClosureKind::FnOnce,
+            });
+            exp
         }))
+    }
+
+    /// Deduces a closure signature for inference variable `var` from pending obligations: first
+    /// direct `Fn*` / `AsyncFn*` obligations (`TypeCtx::closure_hint`), then supertraits of
+    /// other pending trait obligations on `var` (rustc `deduce_closure_signature_from_predicates`:
+    /// e.g. `trait ReadinessCheck: Fn() -> Pin<Box<dyn Future<Output = bool> + Send>>`).
+    fn infer_closure_hint(
+        &mut self,
+        var: Ty,
+        fn_traits: [ItemKey; 3],
+        output: Name,
+    ) -> Result<Option<Expected>, Stop> {
+        match self.ty.closure_hint(var, fn_traits, output)? {
+            Some(((inputs, ic, kind), Some((o, oc)))) => Ok(Some(Expected {
+                inputs,
+                output: Some(o),
+                from: sig_from_causes(ic, Some(oc)),
+                kind: Some(kind),
+            })),
+            Some(((inputs, ic, kind), None)) => {
+                let (seeds, _) = self.pending_var_goals(var, fn_traits, output)?;
+                let (_, elab_out) = if seeds.is_empty() {
+                    (None, None)
+                } else {
+                    self.elaborate_fn_supertraits(&seeds, fn_traits, output, Some(inputs))?
+                };
+                Ok(Some(Expected {
+                    inputs,
+                    output: elab_out,
+                    from: sig_from_causes(ic, None),
+                    kind: Some(kind),
+                }))
+            }
+            None => {
+                let (seeds, direct_projs) = self.pending_var_goals(var, fn_traits, output)?;
+                if seeds.is_empty() {
+                    return Ok(None);
+                }
+                let (found_fn, elab_out) = self.elaborate_fn_supertraits(&seeds, fn_traits, output, None)?;
+                let Some((inputs, kind)) = found_fn else {
+                    return Ok(None);
+                };
+                let out = match elab_out {
+                    Some(o) => Some(o),
+                    None => self.matching_proj_output(&direct_projs, inputs)?,
+                };
+                // No single `Fn*` clause of the callee's head carries this signature directly;
+                // flow lowering treats `SigFrom::Inferred` inputs universally without indexing
+                // into a non-`Fn*` clause's region column.
+                Ok(Some(Expected {
+                    inputs,
+                    output: out,
+                    from: SigFrom::Inferred,
+                    kind: Some(kind),
+                }))
+            }
+        }
+    }
+
+    /// Pending non-`Fn*`, non-`Sized` trait obligations whose self type resolves to `var`, plus
+    /// any pending `<var as Once<..>>::Output` projection obligations (for bounds like
+    /// `F: Sub<T, Output = R>` where `Sub<T>: Fn(T)`).
+    fn pending_var_goals(
+        &mut self,
+        var: Ty,
+        fn_traits: [ItemKey; 3],
+        output: Name,
+    ) -> Result<(Vec<(ItemKey, TyList), Alloc<'a>>, Vec<(TyList, Ty), Alloc<'a>>), Stop> {
+        let sized = self.lang(LangItem::Sized)?;
+        let once_trait = fn_traits[2];
+        let mut goals: Vec<Goal, Alloc<'a>> = Vec::new_in(self.alloc);
+        self.ty.pending_goals(&mut goals);
+        let mut seeds: Vec<(ItemKey, TyList), Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut projs: Vec<(TyList, Ty), Alloc<'a>> = Vec::new_in(self.alloc);
+        for &goal in goals.iter() {
+            match goal {
+                Goal::Trait { trait_, args }
+                    if sized != Some(trait_)
+                        && !fn_traits.contains(&trait_)
+                        && self.ty.list_len(args) > 0
+                        && self.ty.shallow_resolve(self.ty.list_get(args, 0)) == var =>
+                {
+                    seeds.push((trait_, args));
+                }
+                Goal::Projection { trait_, args, name, term }
+                    if trait_ == once_trait
+                        && name == output
+                        && self.ty.list_len(args) == 2
+                        && self.ty.shallow_resolve(self.ty.list_get(args, 0)) == var =>
+                {
+                    let tuple = self.ty.shallow_resolve(self.ty.list_get(args, 1));
+                    if let TyView::Tuple(inputs) = self.view(tuple) {
+                        projs.push((inputs, term));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok((seeds, projs))
+    }
+
+    /// Transitive BFS elaboration of supertrait bounds on `Self` (`Param(0)`) starting from
+    /// `seeds` (`(trait_, full_args_with_self)`), bounded and cycle-guarded. Substitutes generic
+    /// arguments through each hop and collects both `Fn*<(inputs..)>` trait bounds and
+    /// `<Self as Once<(inputs..)>>::Output = term` projection bounds.
+    ///
+    /// When `want_inputs` is `Some(inputs)`, skips recording new `Fn*` input tuples and only
+    /// searches for an `Output` projection whose `Args` can unify with `inputs`.
+    fn elaborate_fn_supertraits(
+        &mut self,
+        seeds: &[(ItemKey, TyList)],
+        fn_traits: [ItemKey; 3],
+        output_name: Name,
+        want_inputs: Option<TyList>,
+    ) -> Result<(Option<(TyList, ClosureKind)>, Option<Ty>), Stop> {
+        const MAX_SUPERTRAITS: usize = 64;
+        let sized = self.lang(LangItem::Sized)?;
+        let once_trait = fn_traits[2];
+        let mut work: Vec<(ItemKey, TyList), Alloc<'a>> = Vec::new_in(self.alloc);
+        for &(tr, args) in seeds {
+            if sized == Some(tr) || fn_traits.contains(&tr) {
+                continue;
+            }
+            if work.len() >= MAX_SUPERTRAITS {
+                break;
+            }
+            if !work.iter().any(|&(t, a)| t == tr && a == args) {
+                work.push((tr, args));
+            }
+        }
+        let mut found_fn: Option<(TyList, ClosureKind)> = None;
+        let mut projs: Vec<(TyList, Ty), Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut at = 0;
+        while let Some(&(cur_trait, cur_args)) = work.get(at) {
+            at += 1;
+            let Some(def) = self.reads.trait_def(cur_trait)? else { continue };
+            if def.supertraits.is_empty() || self.ty.list_len(cur_args) < def.generics {
+                continue;
+            }
+            for &clause in def.supertraits {
+                match clause {
+                    PClause::Trait { trait_: st, args: sa } => {
+                        let raw = def.types.list(sa)?;
+                        let Some(&first) = raw.first() else { continue };
+                        if def.types.node(first)? != PNode::Param(0) {
+                            continue;
+                        }
+                        if let Some(ti) = fn_traits.iter().position(|&k| k == st) {
+                            if let &[_, arg_pt] = raw
+                                && want_inputs.is_none()
+                            {
+                                let arg_ty = self.lower(def.types, arg_pt, Lower::NormalizedArgs(cur_args), Cause::Body)?;
+                                let arg_ty = self.ty.shallow_resolve(arg_ty);
+                                if let TyView::Tuple(inputs) = self.view(arg_ty) {
+                                    let kind = match ti {
+                                        0 => ClosureKind::Fn,
+                                        1 => ClosureKind::FnMut,
+                                        _ => ClosureKind::FnOnce,
+                                    };
+                                    match found_fn {
+                                        None => found_fn = Some((inputs, kind)),
+                                        Some((prev_in, prev_kind)) if prev_in == inputs && kind < prev_kind => {
+                                            found_fn = Some((prev_in, kind));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        if sized == Some(st) || work.len() >= MAX_SUPERTRAITS {
+                            continue;
+                        }
+                        let mut lowered: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(raw.len(), self.alloc);
+                        for &pt in raw {
+                            lowered.push(self.lower(def.types, pt, Lower::NormalizedArgs(cur_args), Cause::Body)?);
+                        }
+                        let next_args = self.mk_list(&lowered)?;
+                        if !work.iter().any(|&(t, a)| t == st && a == next_args) {
+                            work.push((st, next_args));
+                        }
+                    }
+                    PClause::Projection { trait_: pt, args: pa, name, term }
+                        if pt == once_trait && name == output_name =>
+                    {
+                        let raw = def.types.list(pa)?;
+                        let &[first, arg_pt] = raw else { continue };
+                        if def.types.node(first)? != PNode::Param(0) {
+                            continue;
+                        }
+                        let arg_ty = self.lower(def.types, arg_pt, Lower::NormalizedArgs(cur_args), Cause::Body)?;
+                        let arg_ty = self.ty.shallow_resolve(arg_ty);
+                        if let TyView::Tuple(proj_inputs) = self.view(arg_ty) {
+                            let out_ty = self.lower(def.types, term, Lower::NormalizedArgs(cur_args), Cause::Body)?;
+                            projs.push((proj_inputs, out_ty));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let target_inputs = match want_inputs {
+            Some(i) => Some(i),
+            None => found_fn.map(|(i, _)| i),
+        };
+        let out = match target_inputs {
+            Some(inputs) => self.matching_proj_output(&projs, inputs)?,
+            None => None,
+        };
+        Ok((found_fn, out))
+    }
+
+    /// The first `(proj_inputs, term)` whose `proj_inputs` can unify with `inputs`.
+    fn matching_proj_output(&mut self, projs: &[(TyList, Ty)], inputs: TyList) -> Result<Option<Ty>, Stop> {
+        for &(proj_in, out_ty) in projs {
+            if self.args_can_eq(proj_in, inputs)? {
+                return Ok(Some(out_ty));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether two argument-tuple lists can unify (rolled-back probe, matching `closure_hint`).
+    fn args_can_eq(&mut self, a: TyList, b: TyList) -> Result<bool, Stop> {
+        if a == b {
+            return Ok(true);
+        }
+        if self.ty.list_len(a) != self.ty.list_len(b) {
+            return Ok(false);
+        }
+        let ta = self.mk(TyView::Tuple(a))?;
+        let tb = self.mk(TyView::Tuple(b))?;
+        self.probe(|m| m.unify(ta, tb))
     }
 
     /// Where closure `e`'s signature came from ([`SigFrom`]): the expectation it took, else
@@ -188,10 +412,19 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// = R` row (library/core/src/ops/function.rs: `trait FnOnce<Args: Tuple> { type Output; }`)
     /// gives the inputs `Args` (a tuple) and the output `R`. With no such row, an `Fn*`
     /// principal's `Args` gives the inputs alone, as a variable's pending `Fn*` goal does
-    /// (`closure_hint`). `None` when no row names an `Fn*` trait at a tuple.
-    fn object_closure_sig(&mut self, rows: TyList, fn_traits: [ItemKey; 3], fn_once: ItemKey) -> Option<(TyList, Option<Ty>, Option<crate::ty::ClosureKind>)> {
+    /// (`closure_hint`); when the principal is a subtrait of `Fn*` (e.g. `dyn SubTrait` where
+    /// `trait SubTrait: Fn(i32) -> Box<dyn Trait>`), elaborates its supertraits. `None` when no
+    /// row or supertrait names an `Fn*` trait at a tuple.
+    fn object_closure_sig(
+        &mut self,
+        dyn_ty: Ty,
+        rows: TyList,
+        fn_traits: [ItemKey; 3],
+        fn_once: ItemKey,
+    ) -> Result<Option<(TyList, Option<Ty>, Option<ClosureKind>)>, Stop> {
         let output_name = Name::of("Output");
-        let mut from_principal: Option<(TyList, Option<crate::ty::ClosureKind>)> = None;
+        let mut from_principal: Option<(TyList, ClosureKind)> = None;
+        let mut other_principal: Option<(ItemKey, TyList)> = None;
         let mut from_proj: Option<(TyList, Ty)> = None;
         // Bounded by the object's rows.
         for i in 0..self.ty.list_len(rows) {
@@ -205,26 +438,49 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         from_proj = Some((inputs, self.ty.list_get(args_term, 1)));
                     }
                 }
-                TyView::ExTrait(k, args) if fn_traits.contains(&k) && self.ty.list_len(args) == 1 => {
-                    let a = self.ty.shallow_resolve(self.ty.list_get(args, 0));
-                    if let TyView::Tuple(inputs) = self.view(a) {
-                        let kind = if k == fn_traits[0] {
-                            Some(crate::ty::ClosureKind::Fn)
-                        } else if k == fn_traits[1] {
-                            Some(crate::ty::ClosureKind::FnMut)
-                        } else {
-                            Some(crate::ty::ClosureKind::FnOnce)
-                        };
-                        from_principal = Some((inputs, kind));
+                TyView::ExTrait(k, args) => {
+                    if let Some(ti) = fn_traits.iter().position(|&f| f == k)
+                        && self.ty.list_len(args) == 1
+                    {
+                        let a = self.ty.shallow_resolve(self.ty.list_get(args, 0));
+                        if let TyView::Tuple(inputs) = self.view(a) {
+                            let kind = match ti {
+                                0 => ClosureKind::Fn,
+                                1 => ClosureKind::FnMut,
+                                _ => ClosureKind::FnOnce,
+                            };
+                            from_principal = Some((inputs, kind));
+                        }
+                    } else if other_principal.is_none() {
+                        other_principal = Some((k, args));
                     }
                 }
                 _ => {}
             }
         }
-        if let Some((inputs, out)) = from_proj {
-            return Some((inputs, Some(out), from_principal.and_then(|(_, k)| k)));
+        if let Some((inputs, kind)) = from_principal {
+            let out = match from_proj {
+                Some((proj_in, proj_out)) if self.args_can_eq(proj_in, inputs)? => Some(proj_out),
+                _ => None,
+            };
+            return Ok(Some((inputs, out, Some(kind))));
         }
-        from_principal.map(|(inputs, kind)| (inputs, None, kind))
+        if let Some((principal, args_after_self)) = other_principal {
+            let self_list = self.mk_list(&[dyn_ty])?;
+            let full_args = self.concat(self_list, args_after_self)?;
+            let (found_fn, elab_out) = self.elaborate_fn_supertraits(&[(principal, full_args)], fn_traits, output_name, None)?;
+            if let Some((inputs, kind)) = found_fn {
+                let out = match from_proj {
+                    Some((proj_in, proj_out)) if self.args_can_eq(proj_in, inputs)? => Some(proj_out),
+                    _ => elab_out,
+                };
+                return Ok(Some((inputs, out, Some(kind))));
+            }
+        }
+        if let Some((inputs, out)) = from_proj {
+            return Ok(Some((inputs, Some(out), None)));
+        }
+        Ok(None)
     }
 
     /// `f.t` is the closure's type, `f.u` its output, `f.a` its return site, `f.b` the
