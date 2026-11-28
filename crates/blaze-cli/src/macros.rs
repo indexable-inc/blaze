@@ -54,7 +54,11 @@ const SUBJECT_DOMAIN: &str = "blaze-cli macro crate 1";
 // "8": proc-macro module identity bumped to form 10 (`blaze proc-macro module wasm64 10`) after
 // adding target-level `getrandom_backend="custom"` for `wasm64-blaze-wasip1` (Rule 21),
 // invalidating cached `MacroModule` task records that pointed at pre-v10 wasm64 modules.
-const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 8";
+// "9": proc-macro module identity bumped to form 11 (`blaze proc-macro module wasm64 11`) after
+// registering `blaze_wasm64_pm_shim` in `export_override_crates` so `libc::getenv` binds to
+// `blaze_wasm64_pm_shim::getenv` -> `blaze_proc_macro_64::env_var` (Rule 21), invalidating
+// cached `MacroModule` task records that pointed at stale form-10 wasm64 proc-macro modules.
+const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 9";
 const OUT_DOMAIN: &str = "blaze-cli macro module out 1";
 /// The rule a refusal of this task names.
 const RULE: &str = "macros.rs";
@@ -272,6 +276,7 @@ pub(crate) fn list(
                     wasm_graph,
                     blaze_unit_graph::UnitId(uid),
                     true,
+                    probes.shared(),
                 ) {
                     Ok(true) => match planned_entry {
                         Some(crate::engine_scripts::PlannedProbe::Failed(err)) => {
@@ -294,6 +299,7 @@ pub(crate) fn list(
                                             live_hex.as_str()
                                         )
                                         .as_str(),
+                                        probes.shared(),
                                     ),
                                 )),
                                 Err(err) => Err(MacroListFailure::Probes(err)),
@@ -303,6 +309,7 @@ pub(crate) fn list(
                             crate::scripts::ProbeSetupError::from_str(
                                 crate::scripts::ProbeErrorKind::PlannedDrift,
                                 "proc-macro has dependency build scripts at lookup time without a planned probe identity",
+                                probes.shared(),
                             ),
                         )),
                         None => match probes.dep_probe_identity_hex(cx) {
@@ -321,6 +328,7 @@ pub(crate) fn list(
                             crate::scripts::ProbeSetupError::from_str(
                                 crate::scripts::ProbeErrorKind::PlannedDrift,
                                 "proc-macro was planned with a dependency-probe identity but has no dependency build scripts at lookup time",
+                                probes.shared(),
                             ),
                         )),
                         None => Ok(ListedMacro { identity: id, dep_probes: None }),

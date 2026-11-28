@@ -248,6 +248,10 @@ pub(crate) enum V {
     Skipped(SyntaxKind),
     CfgFalse,
     Pred(CfgAnswer),
+    /// A bare string literal argument inside `CFG_COMPOSITE` (`#[cfg(version("1.76"))]`).
+    CfgStr,
+    /// A malformed non-predicate argument inside `CFG_COMPOSITE` (`version(123)`, `any(1)`).
+    CfgBad,
     Ret,
     /// `node.a` 1 with an ABI string, at the value's range.
     Abi,
@@ -1139,7 +1143,10 @@ impl<'t, 'c, 'a, 's> Machine<'t, 'c, 'a, 's> {
     fn after_child(&mut self) {
         let Some(p) = self.frames.last().copied() else { return };
         let Some(last) = self.vals.last().copied() else { return };
-        if (last.v == V::CfgFalse) && !matches!(p.kind, ATTR | CFG_ATTR_META | UNSAFE_META) && p.flags & F_SKIP == 0 {
+        if ((last.v == V::CfgFalse && !matches!(p.kind, ATTR | CFG_ATTR_META | UNSAFE_META))
+            || (p.kind == CFG_ATTR_META && last.v == V::Pred(CfgAnswer::No)))
+            && p.flags & F_SKIP == 0
+        {
             self.vals.truncate(p.base as usize);
             self.top_mut().flags |= F_DEAD;
             self.skip = 1;
@@ -2915,6 +2922,12 @@ impl<'t, 'c, 'a, 's> Machine<'t, 'c, 'a, 's> {
     fn literal(&mut self, f: &Frame, r: Range) {
         let t = self.kid(f, 0, |v| matches!(v, V::Tok(_)));
         self.done(f);
+        if self.parent_kind() == Some(CFG_ATOM) {
+            if let Some(t) = t {
+                self.vals.push(t);
+            }
+            return;
+        }
         let lit = t.and_then(|t| match t.v {
             V::Tok(kind) => lit::lit_of(kind, t.range.of(self.text())).map(|l| (l, t.range)),
             _ => None,
@@ -3250,20 +3263,44 @@ impl<'t, 'c, 'a, 's> Machine<'t, 'c, 'a, 's> {
 
     fn cfg_atom(&mut self, f: &Frame, r: Range) {
         let first = self.kid(f, 0, |v| matches!(v, V::Tok(_)));
+        let has_eq = self.has_tok(f, EQ);
         let value = self.kid(f, 0, |v| matches!(v, V::Tok(STRING)));
         self.done(f);
-        let answer = match first.map(|t| t.v) {
-            Some(V::Tok(TRUE_KW)) => CfgAnswer::Yes,
-            Some(V::Tok(FALSE_KW)) => CfgAnswer::No,
-            Some(V::Tok(_)) => {
-                let name_range = first.map_or(r, |t| t.range);
+        let parent = self.frames.last().copied();
+        let in_composite = parent.is_some_and(|p| p.kind == CFG_COMPOSITE);
+        let in_version = parent.is_some_and(|p| {
+            p.kind == CFG_COMPOSITE
+                && self
+                    .kid(&p, 0, |v| matches!(v, V::Tok(IDENT)))
+                    .is_some_and(|t| t.range.of(self.text()) == "version")
+        });
+        match first.map(|t| (t.v, t.range)) {
+            Some((V::Tok(STRING), sr)) => {
+                if in_composite {
+                    self.push(V::CfgStr, NONE, sr);
+                } else {
+                    self.diag(DiagKind::Syntax, r);
+                    self.push(V::Pred(CfgAnswer::No), NONE, r);
+                }
+            }
+            Some((V::Tok(TRUE_KW), _)) if !in_version => {
+                self.push(V::Pred(CfgAnswer::Yes), NONE, r);
+            }
+            Some((V::Tok(FALSE_KW), _)) if !in_version => {
+                self.push(V::Pred(CfgAnswer::No), NONE, r);
+            }
+            Some((V::Tok(IDENT), name_range)) if !in_version => {
+                if has_eq && value.is_none() {
+                    self.push(V::Pred(CfgAnswer::No), NONE, r);
+                    return;
+                }
                 // Copied out of the text, which an expansion lowered here may have grown.
                 let mut name = AString::new_in(self.alloc);
                 name.push_str(name_range.of(self.text()));
                 let value_owned = value.map(|v| {
                     let t = v.range.of(self.text());
                     let mut s = AString::new_in(self.alloc);
-                    s.push_str(t.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(t));
+                    s.push_str(lit::str_body(t).unwrap_or(t));
                     s
                 });
                 let name = name.as_str();
@@ -3281,48 +3318,90 @@ impl<'t, 'c, 'a, 's> Machine<'t, 'c, 'a, 's> {
                     CfgAnswer::Need => self.needs.push(r),
                     _ => self.out.cfg.push(read.encode()),
                 }
-                answer
+                self.push(V::Pred(answer), NONE, r);
             }
-            _ => CfgAnswer::Yes,
-        };
-        self.push(V::Pred(answer), NONE, r);
+            Some((V::Tok(_), _)) => {
+                if in_composite {
+                    self.push(V::CfgBad, NONE, r);
+                } else {
+                    self.diag(DiagKind::Syntax, r);
+                    self.push(V::Pred(CfgAnswer::No), NONE, r);
+                }
+            }
+            _ => {
+                self.push(V::Pred(CfgAnswer::No), NONE, r);
+            }
+        }
     }
 
     fn cfg_composite(&mut self, f: &Frame, r: Range) {
         let op: Option<&'static str> = self.kid(f, 0, |v| matches!(v, V::Tok(IDENT))).map(|t| {
-            ["all", "any", "not"].into_iter().find(|it| *it == t.range.of(self.text())).unwrap_or("")
+            ["all", "any", "not", "version"].into_iter().find(|it| *it == t.range.of(self.text())).unwrap_or("")
         });
         let mut all = CfgAnswer::Yes;
         let mut any = CfgAnswer::No;
-        let mut count = 0;
+        let mut count = 0u32;
+        let mut total_args = 0u32;
+        let mut bad = false;
+        let mut version_str: Option<Range> = None;
         let mut only = CfgAnswer::Yes;
         for v in &self.vals[f.base as usize..] {
-            if let V::Pred(a) = v.v {
-                count += 1;
-                only = a;
-                all = match (all, a) {
-                    (CfgAnswer::No, _) | (_, CfgAnswer::No) => CfgAnswer::No,
-                    (CfgAnswer::Need, _) | (_, CfgAnswer::Need) => CfgAnswer::Need,
-                    _ => CfgAnswer::Yes,
-                };
-                any = match (any, a) {
-                    (CfgAnswer::Yes, _) | (_, CfgAnswer::Yes) => CfgAnswer::Yes,
-                    (CfgAnswer::Need, _) | (_, CfgAnswer::Need) => CfgAnswer::Need,
-                    _ => CfgAnswer::No,
-                };
+            match v.v {
+                V::Pred(a) => {
+                    total_args += 1;
+                    count += 1;
+                    only = a;
+                    all = match (all, a) {
+                        (CfgAnswer::No, _) | (_, CfgAnswer::No) => CfgAnswer::No,
+                        (CfgAnswer::Need, _) | (_, CfgAnswer::Need) => CfgAnswer::Need,
+                        _ => CfgAnswer::Yes,
+                    };
+                    any = match (any, a) {
+                        (CfgAnswer::Yes, _) | (_, CfgAnswer::Yes) => CfgAnswer::Yes,
+                        (CfgAnswer::Need, _) | (_, CfgAnswer::Need) => CfgAnswer::Need,
+                        _ => CfgAnswer::No,
+                    };
+                }
+                V::CfgStr => {
+                    total_args += 1;
+                    version_str = Some(v.range);
+                }
+                V::CfgBad => {
+                    total_args += 1;
+                    bad = true;
+                }
+                _ => {}
             }
         }
         self.done(f);
         let answer = match op {
-            Some("all") => all,
-            Some("any") => any,
-            Some("not") if count == 1 => match only {
+            Some("all") if !bad && version_str.is_none() => all,
+            Some("any") if !bad && version_str.is_none() => any,
+            Some("not") if !bad && version_str.is_none() && count == 1 => match only {
                 CfgAnswer::Yes => CfgAnswer::No,
                 CfgAnswer::No => CfgAnswer::Yes,
                 CfgAnswer::Need => CfgAnswer::Need,
             },
+            Some("version") if !bad && total_args == 1 => {
+                match version_str.and_then(|sr| blaze_expand::eval_cfg_version_literal(sr.of(self.text()))) {
+                    Some(holds) => {
+                        if !self.cfg.as_deref().is_some_and(Cfg::cfg_version_enabled) {
+                            self.diag(DiagKind::UnstableCfgVersion, r);
+                            CfgAnswer::No
+                        } else if holds {
+                            CfgAnswer::Yes
+                        } else {
+                            CfgAnswer::No
+                        }
+                    }
+                    None => {
+                        self.diag(DiagKind::Syntax, r);
+                        CfgAnswer::No
+                    }
+                }
+            }
             _ => {
-                // rustc refuses an unknown predicate; so does the lowering, by a diagnostic.
+                // rustc refuses an unknown or malformed predicate; so does the lowering, by a diagnostic.
                 self.diag(DiagKind::Syntax, r);
                 CfgAnswer::No
             }

@@ -2442,6 +2442,7 @@ pub(crate) fn open_pinned_standing<R>(
         Ok(stood_root) => stood_root,
         Err(why) => return Err(EngineCheckError::StartNoAnswer { why: Some(why) }.into()),
     };
+    crate::store::Store::map_all(&mut store, cx)?;
     let snapshot = store.snapshot_in(alloc)?;
     let headers = blaze_engine::pages::Headers::Absent { since: blaze_engine::Gen(0) };
     let stored = crate::engine_answer::Stored::new(&stood_root, &snapshot, &headers, blaze_engine::pages::Check::Store, alloc);
@@ -2915,7 +2916,12 @@ fn check_and_open<R>(
             },
             None => None,
         };
-        let snapshot = if stood_root.is_some() { Some(store.snapshot_in(alloc)?) } else { None };
+        let snapshot = if stood_root.is_some() {
+            crate::store::Store::map_all(&mut store, cx)?;
+            Some(store.snapshot_in(alloc)?)
+        } else {
+            None
+        };
         let stored = match (&pointer, &stood_root, &snapshot) {
             (Some(pointer), Some(stood_root), Some(snapshot)) => {
                 Some(crate::engine_answer::Stored::new(stood_root, snapshot, &pointer.headers, blaze_engine::pages::Check::Store, alloc))
@@ -3210,6 +3216,12 @@ pub(crate) struct Checked {
     /// many units it has (engine_lints.rs, sparse rows). 0 on a certified replay (no audit).
     #[cfg(test)]
     pub(crate) lint_rows: u32,
+    /// `(mapped, named)` segments on the command's store before post-answer writes and commit/teardown.
+    #[cfg(test)]
+    pub(crate) store_segments: (u32, u32),
+    /// Whether `Store::map_all` ran on this check's command store.
+    #[cfg(test)]
+    pub(crate) store_mapped_all: bool,
     /// The `Signature` head tasks entered this request (lane RH4's edit rows count them).
     pub(crate) signatures_entered: u32,
     /// The `Lint` tasks entered this request and their findings (engine_lints.rs `seen`).
@@ -3936,6 +3948,23 @@ fn checking<'f, 's: 'f>(
             crate::engine_ready_edit::StoredBase::OtherCheckout => None,
             crate::engine_ready_edit::StoredBase::Own | crate::engine_ready_edit::StoredBase::ToolsMoved => journal.marked(&pointer.leaves, frame),
         };
+        // Map every segment within `GRACE_NS` before any potentially unbounded sweep, SDK lookup,
+        // or dep-probe resolution (full disk sweep, edited leaves, cross-checkout/tools-moved
+        // base, or `DepProbes`/`FACT_MOUNT` leaves). A pure journal-vouched 0-change warm hit
+        // without such rows skips this and stays lazy on the ~13 ms certificate fast path.
+        #[cfg(test)]
+        let skip_pre_sweep_map_all = SKIP_MAP_ALL_BEFORE_SWEEP.with(core::cell::Cell::get);
+        #[cfg(not(test))]
+        let skip_pre_sweep_map_all = false;
+        if !skip_pre_sweep_map_all
+            && (base != crate::engine_ready_edit::StoredBase::Own || sweep_may_do_io(&pointer.leaves, marked.as_deref()))
+        {
+            crate::store::Store::map_all(&mut store, cx)?;
+        }
+        #[cfg(test)]
+        if let Some(delay) = SWEEP_DELAY_BEFORE_FOLLOW.with(core::cell::Cell::get) {
+            let _ = phases.clock().sleep(cx, delay);
+        }
         let sdk_digest_fn = || match lazy_sdk {
             Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), wall_ns),
             None => Ok(blaze_build_script::facts::sdk_id_digest("")),
@@ -4033,15 +4062,25 @@ fn checking<'f, 's: 'f>(
                     live.see(blaze_screen::Step::Says);
                 }
                 *printed_out = true;
+                #[cfg(test)]
+                let store_segments = opened.lent.mapped_of_named();
                 let stood = certified(cx, root, active_view_slot, pointer, lines, filtered_arg, cert_root, adopted.is_some(), journal, &mut store, (&tools, toolchain), shown, phases, (request_mem_slot, heap), frame, out)?;
                 drop(scoped_filtered);
                 drop(cert_view_slot);
                 drop(view_slot);
+                #[cfg(test)]
+                let store_mapped_all = store.did_map_all();
                 drop(store);
                 let cleanup = finish_store_for_check(cx, opened, reuse_store, teardown, phases.clock(), err)?;
                 phases.mark_cx(cx, "store committed", frame);
                 let ignore = if adopted.is_some() { CheckoutIgnore::Ensure } else { CheckoutIgnore::AlreadyPresent };
-                return certificate_checked(cx, root, stood, sweep_counts, &journal_counts, &cleanup, phases, heap, frame, own_whole, ignore);
+                let mut checked = certificate_checked(cx, root, stood, sweep_counts, &journal_counts, &cleanup, phases, heap, frame, own_whole, ignore)?;
+                #[cfg(test)]
+                {
+                    checked.store_segments = store_segments;
+                    checked.store_mapped_all = store_mapped_all;
+                }
+                return Ok(checked);
             }
         }
     }
@@ -4075,6 +4114,13 @@ fn checking<'f, 's: 'f>(
             strategy.changed_since(cx, fs, root, opened.home.dir(), phases.clock(), whole_chosen.places(), frame)?
         };
         let whole_marked = whole_journal.marked(&whole_ptr.leaves, frame);
+        #[cfg(test)]
+        let skip_pre_sweep_map_all = SKIP_MAP_ALL_BEFORE_SWEEP.with(core::cell::Cell::get);
+        #[cfg(not(test))]
+        let skip_pre_sweep_map_all = false;
+        if !skip_pre_sweep_map_all && sweep_may_do_io(&whole_ptr.leaves, whole_marked.as_deref()) {
+            crate::store::Store::map_all(&mut store, cx)?;
+        }
         let sdk_digest_fn = || match lazy_sdk {
             Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), wall_ns),
             None => Ok(blaze_build_script::facts::sdk_id_digest("")),
@@ -4123,14 +4169,24 @@ fn checking<'f, 's: 'f>(
                     live.see(blaze_screen::Step::Says);
                 }
                 *printed_out = true;
+                #[cfg(test)]
+                let store_segments = opened.lent.mapped_of_named();
                 let stood = certified(cx, root, whole_view_slot.as_ref(), &whole_ptr, &whole_lines, filtered_arg, whole_root.as_str(), false, journal_arg, &mut store, (&tools, toolchain), shown, phases, (request_mem_slot, heap), frame, out)?;
                 drop(scoped_filtered);
                 drop(whole_view_slot);
                 drop(view_slot);
+                #[cfg(test)]
+                let store_mapped_all = store.did_map_all();
                 drop(store);
                 let cleanup = finish_store_for_check(cx, opened, reuse_store, teardown, phases.clock(), err)?;
                 phases.mark_cx(cx, "store committed", frame);
-                return certificate_checked(cx, root, stood, whole_sweep_counts, &whole_journal_counts, &cleanup, phases, heap, frame, true, CheckoutIgnore::AlreadyPresent);
+                let mut checked = certificate_checked(cx, root, stood, whole_sweep_counts, &whole_journal_counts, &cleanup, phases, heap, frame, true, CheckoutIgnore::AlreadyPresent)?;
+                #[cfg(test)]
+                {
+                    checked.store_segments = store_segments;
+                    checked.store_mapped_all = store_mapped_all;
+                }
+                return Ok(checked);
             }
             pointer = Some(whole_ptr);
             last_lines = Some(whole_lines);
@@ -4144,6 +4200,19 @@ fn checking<'f, 's: 'f>(
             journal_counts = whole_journal_counts;
             journal = whole_journal;
         }
+    }
+    // Past both certificate fast paths: map every segment named by the opened generation now
+    // (within `GRACE_NS`), before `open_fallback_base`, `layout`, `plan`, or any pool task can
+    // run past the grace window and trip `LATE_MAP` on a cold check's first `put` (when
+    // `last.is_none()` and `store.snapshot_in` is skipped). Uses parallel `CxPar` verification
+    // and marks the store whole so `store.snapshot_in` below is a no-op; both certificate fast
+    // paths above return before here and preserve lazy per-probe mapping.
+    #[cfg(test)]
+    let skip_map_all = SKIP_MAP_ALL_BEFORE_PLAN.with(core::cell::Cell::get);
+    #[cfg(not(test))]
+    let skip_map_all = false;
+    if !skip_map_all {
+        crate::store::Store::map_all(&mut store, cx)?;
     }
     // Past both certificate fast paths: materialize the request arena, phase ledger, and status
     // board once when deferred.
@@ -4520,6 +4589,10 @@ fn checking<'f, 's: 'f>(
             }
             let mut planned: SVec<'_, Planned> = SVec::new_in(alloc);
             let mut rows = Rows::new_in(frame);
+            #[cfg(test)]
+            if let Some(delay) = PLAN_DELAY_BEFORE_LAYOUT.with(core::cell::Cell::get) {
+                let _ = phases.clock().sleep(cx, delay);
+            }
             // PHASE-MEM-DEBT(Units): the layout's manifests on the process heap (units.rs `lay`, `heap:
             // &'static Heap`): the request's, read by every stage's plan.
             let mut laid_here = crate::units::lay(cx, root, &stamps, &mut rows, toolchain, heap, frame, erased.handle())?;
@@ -5347,7 +5420,11 @@ fn checking<'f, 's: 'f>(
         crate::store::Store::after_answer(&mut store, cx, &mut blaze_drive::profile::Profile::default())?;
         // Nothing read in place outlives the store's borrow of its `Lent` (engine_records.rs).
         drop(read);
+        #[cfg(test)]
+        let store_mapped_all = store.did_map_all();
         drop(store);
+        #[cfg(not(test))]
+        let store_mapped_all = false;
         let new_data_file = bodies.data_files().any(|(kind, path, _)| {
             followed_kept.as_ref().is_none_or(|f| {
                 !f.now.rows.iter().any(|leaf| leaf.kind == kind.leaf() && f.now.path(leaf) == path)
@@ -5358,13 +5435,15 @@ fn checking<'f, 's: 'f>(
             || !followed_all_kept
             || file_counts.probed > 0
             || serving.served.get().is_some();
-        Ok(blaze_own::Box::new_in((finished.causes, report, saved, stored_keys, (task_pages_read, header_pages_read, pages_read), (tally, status, oracle), accounts, macro_modules, (heap_engine, heap_lines_made, heap_printed, heap_stored), driver_line, signatures_entered, audited, leaf_set_changed), heap.alloc()))
+        Ok(blaze_own::Box::new_in((finished.causes, report, saved, stored_keys, (task_pages_read, header_pages_read, pages_read), (tally, status, oracle), accounts, macro_modules, (heap_engine, heap_lines_made, heap_printed, heap_stored), driver_line, signatures_entered, audited, leaf_set_changed, store_mapped_all), heap.alloc()))
     })?;
     // The whole cleanup line: this profile is written after the commit (store.rs).
+    #[cfg(test)]
+    let store_segments = opened.lent.mapped_of_named();
     let cleanup = finish_store_for_check(cx, opened, reuse_store, teardown, phases.clock(), err)?;
     phases.mark_cx(cx, "store committed", frame);
     own_frame(|| -> Result<BoxedChecked, CliError> {
-        let (causes, report, saved, stored_keys, (task_pages_read, header_pages_read, pages_read), (tally, status, oracle), accounts, macro_modules, (heap_engine, heap_lines_made, heap_printed, heap_stored), driver_line, signatures_entered, audited, _leaf_set_changed) = blaze_own::Box::into_inner(answered);
+        let (causes, report, saved, stored_keys, (task_pages_read, header_pages_read, pages_read), (tally, status, oracle), accounts, macro_modules, (heap_engine, heap_lines_made, heap_printed, heap_stored), driver_line, signatures_entered, audited, _leaf_set_changed, _store_mapped_all) = blaze_own::Box::into_inner(answered);
         #[cfg(test)]
         let (undefined_reads, head_rows, lint_rows) = audited;
         #[cfg(not(test))]
@@ -5477,6 +5556,10 @@ fn checking<'f, 's: 'f>(
             heads: (head_rows, u32::try_from(heads.refused.len()).unwrap_or(u32::MAX), heads.read_back),
             #[cfg(test)]
             lint_rows,
+            #[cfg(test)]
+            store_segments,
+            #[cfg(test)]
+            store_mapped_all: _store_mapped_all,
             signatures_entered,
             lints: lints.seen(&outlined),
             ownerless: (bodies.ownerless, bodies.ownerless_paths(&outlined)),
@@ -5493,6 +5576,26 @@ fn checking<'f, 's: 'f>(
             members_stood: bodies.members_stood(),
             member_rows: bodies.member_row_counts(),
         }, heap.alloc()))
+    })
+}
+
+/// Whether [`sweep::Follow::follow_served_with_sdk`] may perform unbounded filesystem I/O, SDK
+/// resolution, or dependency-probe subprocesses that could exceed `blaze_cas::plain::GRACE_NS`:
+/// true when no journal vouched (`marked.is_none()`), when any non-`HomeListing` leaf is marked
+/// for re-stat/hash, or when the leaf table holds `DepProbes` / `FACT_MOUNT` rows that
+/// `follow_served_with_sdk` always checks even when unmarked (`sweep.rs`). The two `~/.blaze`
+/// `HomeListing` rows are marked on every request (two O(1) folder stats: `journal_sweep.rs`)
+/// and alone keep lazy per-probe store mapping on the ~13 ms warm certificate fast path.
+fn sweep_may_do_io(leaves: &sweep::Leaves<'_>, marked: Option<&[bool]>) -> bool {
+    let Some(marks) = marked else { return true };
+    (0..leaves.len()).any(|i| {
+        let row = leaves.row(i);
+        if matches!(row.kind, sweep::LeafKind::HomeListing | sweep::LeafKind::MacroFiles) {
+            return false;
+        }
+        marks.get(i).copied().unwrap_or(true)
+            || row.kind == sweep::LeafKind::DepProbes
+            || (row.kind == sweep::LeafKind::ScriptFile && leaves.path(i).starts_with(sweep::FACT_MOUNT))
     })
 }
 
@@ -6091,6 +6194,10 @@ fn certificate_checked(
         heads: (0, 0, 0),
         #[cfg(test)]
         lint_rows: 0,
+        #[cfg(test)]
+        store_segments: (0, 0),
+        #[cfg(test)]
+        store_mapped_all: false,
         signatures_entered: 0,
         lints: crate::engine_lints::LintsSeen::default(),
         ownerless: (0, std::vec::Vec::new_in(std::alloc::Global)),
@@ -9040,6 +9147,66 @@ pub(crate) fn with_text_only_outlines<R>(run: impl FnOnce() -> R) -> R {
 std::thread_local! {
     static WITHOUT_FOUND_SERVE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     static FOUND_CAP_PLANT: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
+    static SKIP_MAP_ALL_BEFORE_PLAN: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static PLAN_DELAY_BEFORE_LAYOUT: core::cell::Cell<Option<core::time::Duration>> = const { core::cell::Cell::new(None) };
+    static SKIP_MAP_ALL_BEFORE_SWEEP: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static SWEEP_DELAY_BEFORE_FOLLOW: core::cell::Cell<Option<core::time::Duration>> = const { core::cell::Cell::new(None) };
+}
+
+/// Plant the pre-fix bug where `checking` skips `Store::map_all` past the certificate fast paths
+/// (so a cold check with `last.is_none()` never maps segments before `layout`/`plan`).
+#[cfg(test)]
+pub(crate) fn with_skip_map_all_before_plan<R>(run: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SKIP_MAP_ALL_BEFORE_PLAN.set(self.0);
+        }
+    }
+    let _restore = Restore(SKIP_MAP_ALL_BEFORE_PLAN.replace(true));
+    run()
+}
+
+/// Advance the check's clock by `delay` right before `units::lay` in phase setup to simulate a
+/// large workspace whose `layout` + `plan` exceeds `blaze_cas::plain::GRACE_NS`.
+#[cfg(test)]
+pub(crate) fn with_plan_delay_before_layout<R>(delay: core::time::Duration, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<core::time::Duration>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PLAN_DELAY_BEFORE_LAYOUT.set(self.0);
+        }
+    }
+    let _restore = Restore(PLAN_DELAY_BEFORE_LAYOUT.replace(Some(delay)));
+    run()
+}
+
+/// Plant the Round-1 bug where `checking` defers `Store::map_all` until after the pre-certificate
+/// sweep (`follow_served_with_sdk`) instead of mapping before an I/O-bearing sweep.
+#[cfg(test)]
+pub(crate) fn with_skip_map_all_before_sweep<R>(run: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SKIP_MAP_ALL_BEFORE_SWEEP.set(self.0);
+        }
+    }
+    let _restore = Restore(SKIP_MAP_ALL_BEFORE_SWEEP.replace(true));
+    run()
+}
+
+/// Advance the check's clock by `delay` during the pre-certificate sweep (`follow_served_with_sdk`)
+/// to simulate a large edited or cross-checkout sweep exceeding `blaze_cas::plain::GRACE_NS`.
+#[cfg(test)]
+pub(crate) fn with_sweep_delay_before_follow<R>(delay: core::time::Duration, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<core::time::Duration>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SWEEP_DELAY_BEFORE_FOLLOW.set(self.0);
+        }
+    }
+    let _restore = Restore(SWEEP_DELAY_BEFORE_FOLLOW.replace(Some(delay)));
+    run()
 }
 
 /// The most files one crate's names may find in one request (rule 18), each outlined on its

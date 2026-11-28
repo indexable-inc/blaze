@@ -1,0 +1,24 @@
+[package]
+name = "blaze-machine"
+description = "blaze's sans-IO machine and one-shot algebraic effect ABI: typed linear Request/Answer, Waiting + Ask<R, W>, Race, Batch, Call sub-machine delegation, TaskFrame cross-thread DMA-safe arena pairing, Handler/drive loop, and deterministic Script driver; `#![no_std]`, zero global heap, `#![forbid(unsafe_code)]`"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-own.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

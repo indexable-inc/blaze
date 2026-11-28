@@ -230,7 +230,7 @@ fn carries<'n, S: NamesSource<'n>>(names: S, krate: usize, text: &str, role: Rol
         return Ok(false);
     }
     let atoms = names.cfg_atoms(krate).ok_or(())?;
-    let sig = blaze_lower::lower_signature(text, names.edition_of(krate).ok_or(())?, &mut CrateCfg(atoms), alloc).map_err(|_| ())?;
+    let sig = blaze_lower::lower_signature(text, names.edition_of(krate).ok_or(())?, &mut CrateCfg::of(names, krate, atoms), alloc).map_err(|_| ())?;
     let v = sig.view();
     if role == Role::Definition && v.head[head::FLAGS] & blaze_lower::machine::sig::HAS_BODY == 0 {
         return Ok(false);
@@ -254,7 +254,7 @@ fn renamed<'n, S: NamesSource<'n>>(names: S, krate: usize, lib: LibKey, text: &s
     }
     let atoms = names.cfg_atoms(krate).ok_or(())?;
     let edition = names.edition_of(krate).ok_or(())?;
-    let sig = blaze_lower::lower_signature(text, edition, &mut CrateCfg(atoms), alloc).map_err(|_| ())?;
+    let sig = blaze_lower::lower_signature(text, edition, &mut CrateCfg::of(names, krate, atoms), alloc).map_err(|_| ())?;
     let v = sig.view();
     for &n in v.rows(v.list(head::ATTRS)).map_err(|_| ())? {
         let a = v.attr(n).map_err(|_| ())?;

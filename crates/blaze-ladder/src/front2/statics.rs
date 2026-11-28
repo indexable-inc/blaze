@@ -248,7 +248,7 @@ fn static_attrs_of<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -
     }
     let single_threaded_wasm = is_wasm && !has_atomics;
     let edition = r.names.edition_of(krate).ok_or_else(|| refuse(format!("crate {krate}'s edition was not answered by the names source")))?;
-    let sig = blaze_lower::lower_signature(f.text, edition, &mut CrateCfg(atoms), r.store.work_alloc())
+    let sig = blaze_lower::lower_signature(f.text, edition, &mut CrateCfg::of(r.names, krate, atoms), r.store.work_alloc())
         .map_err(|_| refuse(String::from("its signature needs a `cfg` the crate does not answer")))?;
     let v = sig.view();
     let mut thread_local = false;

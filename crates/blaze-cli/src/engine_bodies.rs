@@ -6252,7 +6252,8 @@ impl<'f> BodiesStage<'f> {
                 // The unit's cfg, as the names library lowered the crate (body_types.rs
                 // `Checker::holds`): what tells an entry a `cfg` left out from one the records
                 // lost ([`absent_entry`]).
-                let cfg = NamesSource::cfg_atoms(records, 0).map(|atoms| blaze_scope::task::Cfg::from_atoms(atoms, g));
+                let cfg_version = NamesSource::has_feature(records, 0, "cfg_version").unwrap_or(false);
+                let cfg = NamesSource::cfg_atoms(records, 0).map(|atoms| blaze_scope::task::Cfg::from_atoms(atoms, g).with_cfg_version(cfg_version));
                 (records, mine, row, cfg)
             });
             tally.parts.listing_list_ns = tally.parts.listing_list_ns.saturating_add(lap(handles.clock, &mut list_mark));
@@ -6473,6 +6474,7 @@ impl<'f> BodiesStage<'f> {
                                             blaze_ladder::front2::nested_exports::Reading {
                                                 edition: items.edition(),
                                                 atoms,
+                                                cfg_version: NamesSource::has_feature(records, 0, "cfg_version").unwrap_or(false),
                                                 alloc: g,
                                             },
                                         )

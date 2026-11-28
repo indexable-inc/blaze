@@ -1213,11 +1213,12 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     /// asked for as an ADT (rung x0-drop-11-zst-temporary: "a fn (asked for as an ADT)").
     fn attrs_once(&self, item: ItemKey) -> Fetch<TypeAttrs> {
         if let Some(a) = self.store.adts.get(&item) {
-            // `#[blaze::args]` (rule 83), `#[blaze::capability]`, and `#![blaze::sans_io]` marks.
+            // `#[blaze::args]` (rule 83), `#[blaze::capability]`, `#[blaze::handle]`, and `#![blaze::sans_io]` marks.
             let args = if a.args { TypeAttrs::ARGS } else { 0 };
             let capability = if a.capability { TypeAttrs::CAPABILITY } else { 0 };
+            let handle = if a.handle { TypeAttrs::HANDLE } else { 0 };
             let sans_io = if a.sans_io { TypeAttrs::SANS_IO } else { 0 };
-            let base = args | capability | sans_io;
+            let base = args | capability | handle | sans_io;
             // `repr(packed)` in any form (`packed(N)`, `C, packed`): the layout's own fact
             // (`ReprAttrs::packed`), answered for the capture analysis (TypeAttrs::PACKED).
             let packed = if a.repr.packed.is_some() { TypeAttrs::PACKED } else { 0 };

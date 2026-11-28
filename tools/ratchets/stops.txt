@@ -31,7 +31,7 @@ blaze-cbor	27
 blaze-cc	8
 blaze-cert	108
 blaze-check	196
-blaze-cli	1308
+blaze-cli	1307
 blaze-cli-spec	117
 blaze-code	94
 blaze-columns	193
@@ -51,7 +51,7 @@ blaze-drive	157
 blaze-dust	1
 blaze-ed25519	58
 blaze-emit	445
-blaze-engine	203
+blaze-engine	199
 blaze-expand	471
 blaze-export	381
 blaze-fetch	170

@@ -1774,9 +1774,10 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     } else {
         blaze_lower::ItemContext::TopLevel
     };
+    let mut crate_cfg = CrateCfg::of(names, krate, atoms);
     let lowered = match marks {
-        Some(marks) => blaze_lower::lower_body_expanding_marked_in_context_with_extensions(marks, edition, context, extensions, &mut CrateCfg(atoms), &mut values, &mut expand, alloc),
-        None => blaze_lower::lower_body_expanding_in_context_with_extensions(text, edition, context, extensions, &mut CrateCfg(atoms), &mut values, &mut expand, alloc),
+        Some(marks) => blaze_lower::lower_body_expanding_marked_in_context_with_extensions(marks, edition, context, extensions, &mut crate_cfg, &mut values, &mut expand, alloc),
+        None => blaze_lower::lower_body_expanding_in_context_with_extensions(text, edition, context, extensions, &mut crate_cfg, &mut values, &mut expand, alloc),
     };
     // D111: a body call's proc-macro read outside the member is a finding at the call, filed
     // through the item host's one filing (body_left.rs), whatever the body's own outcome.

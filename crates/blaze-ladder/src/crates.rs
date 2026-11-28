@@ -239,10 +239,7 @@ impl Toolchain {
                 // A proc macro's dependencies are the host's, not in this graph.
                 deps: if proc_macro { Vec::new() } else { row.deps().map(|(n, d)| (n.to_owned(), d as usize)).collect() },
                 proc_macro,
-                key: CrateItemKey(ContentId::of(
-                    "blaze toolchain unit",
-                    &unit_key(&krate.pack, row.features(), cfg.iter().map(|(n, v)| (n.as_str(), v.as_deref()))),
-                )),
+                key: CrateItemKey(unit_key(&krate.pack, row.features(), cfg.iter().map(|(n, v)| (n.as_str(), v.as_deref())))),
                 pack,
                 role: krate.role,
             });
@@ -284,25 +281,26 @@ fn unit_key<'f, 'c>(
     pack: &[u8; 32],
     features: impl Iterator<Item = &'f str>,
     cfg: impl Iterator<Item = (&'c str, Option<&'c str>)>,
-) -> Vec<u8> {
-    let mut out = pack.to_vec();
+) -> ContentId {
+    let mut hasher = blaze_ids::Hasher::new("blaze toolchain unit");
+    hasher.update(pack);
     for f in features {
-        out.extend_from_slice(f.as_bytes());
-        out.push(0);
+        hasher.update(f.as_bytes()).update(&[0]);
     }
-    out.push(0xff);
+    hasher.update(&[0xff]);
     for (name, value) in cfg {
-        out.extend_from_slice(name.as_bytes());
+        hasher.update(name.as_bytes());
         match value {
             Some(val) => {
-                out.push(1);
-                out.extend_from_slice(val.as_bytes());
+                hasher.update(&[1]).update(val.as_bytes());
             }
-            None => out.push(0),
+            None => {
+                hasher.update(&[0]);
+            }
         }
-        out.push(0);
+        hasher.update(&[0]);
     }
-    out
+    hasher.finish()
 }
 
 /// Either owned by [`Inputs::new`] or borrowed from a solved [`library::Library`].
@@ -468,6 +466,11 @@ impl<'t> Inputs<'t> {
         out
     }
 
+    /// The source texts table (`SourceTexts`) backing this crate set.
+    pub fn texts(&'t self) -> &'t Texts<'t> {
+        &self.texts
+    }
+
     /// Every crate's names, resolved together, held in `bump` (the caller's arena, alive as long as
     /// the names), with per-call macro scratch rolled back after each expansion.
     pub fn resolve(&'t self, crates: &[CrateInput<'t>], bump: Bump<'t>) -> Result<Names<'t>, NamesError<'t>> {
@@ -544,8 +547,9 @@ mod tests {
         let bytes = write(&[], &targets, alloc).expect("encode toolchain");
         let view = ToolchainView::open(bytes.as_slice(), ToolchainView::id_of_bytes(bytes.as_slice())).expect("open view");
 
-        let sorted_cfg = |triple: &str| -> Vec<(&str, Option<&str>)> {
-            let mut v: Vec<_> = target_cfg(&view, triple).expect("target cfg").collect();
+        let sorted_cfg = |triple: &str| {
+            let mut v = blaze_own::Vec::new_in(alloc);
+            v.extend(target_cfg(&view, triple).expect("target cfg"));
             v.sort_unstable();
             v.dedup();
             v

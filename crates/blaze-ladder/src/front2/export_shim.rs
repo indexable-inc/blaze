@@ -136,7 +136,7 @@ fn read_decl_attrs<'n, 'a, S: NamesSource<'n>>(
     let atoms = names.cfg_atoms(krate).ok_or(())?;
     let edition = names.edition_of(krate).ok_or(())?;
     let extensions = names.blaze_extensions(krate);
-    let sig = blaze_lower::lower_signature_with_extensions(text, edition, extensions, &mut CrateCfg(atoms), alloc)
+    let sig = blaze_lower::lower_signature_with_extensions(text, edition, extensions, &mut CrateCfg::of(names, krate, atoms), alloc)
         .map_err(|_| ())?;
     let v = sig.view();
     let mut link_name: Option<AString<'a>> = None;
@@ -246,7 +246,7 @@ fn exports_symbol<'n, 'a, S: NamesSource<'n>>(
     let atoms = names.cfg_atoms(krate).ok_or_else(unread)?;
     let edition = names.edition_of(krate).ok_or_else(unread)?;
     let extensions = names.blaze_extensions(krate);
-    let sig = blaze_lower::lower_signature_with_extensions(text, edition, extensions, &mut CrateCfg(atoms), alloc)
+    let sig = blaze_lower::lower_signature_with_extensions(text, edition, extensions, &mut CrateCfg::of(names, krate, atoms), alloc)
         .map_err(|_| attrs_err())?;
     let v = sig.view();
     if v.cfg_out() {
@@ -343,15 +343,12 @@ pub fn linked_crates<'n, 'a, S: NamesSource<'n>>(
     Ok(out)
 }
 
-/// Searches `crates` (already filtered to non-proc-macro crates in the program's link closure)
-/// for a strong Rust `#[no_mangle]` / `#[export_name]` function exporting `symbol`.
-///
-/// Returns `Ok(None)` when no linked Rust crate exports `symbol` (allowing the caller to fall
-/// through to `FnKind::Foreign` / `dlsym`), `Ok(Some(key))` when uniquely defined, and
-/// `Err(ExportRefused::DefinedTwice { .. })` when two or more definitions match.
-pub fn definition_in<'n, 'a, S: NamesSource<'n>>(
+/// Searches `crates` (skipping any crate in `skip`) for a strong Rust `#[no_mangle]` /
+/// `#[export_name]` function exporting `symbol`.
+fn definition_in_tier<'n, 'a, S: NamesSource<'n>>(
     names: S,
     crates: &[usize],
+    skip: &[usize],
     symbol: &str,
     sig_shape: Option<(usize, bool)>,
     alloc: Alloc<'a>,
@@ -359,7 +356,13 @@ pub fn definition_in<'n, 'a, S: NamesSource<'n>>(
     let mut found: Option<LibKey> = None;
     let mut second: Option<LibKey> = None;
     for &krate in crates {
+        if skip.contains(&krate) {
+            continue;
+        }
         let unread = || ExportRefused::Unread { symbol: own_str(symbol, alloc), krate };
+        if names.proc_macro(krate).ok_or_else(unread)? {
+            continue;
+        }
         let mut candidates: AVec<'_, LibKey> = AVec::new_in(alloc);
         let listed = names.each_export_candidate(krate, alloc, &mut |key, name, has_no_mangle, has_export_name| {
             // Fast pre-filter: a `#[no_mangle]`-only item can only export its own identifier, so
@@ -408,6 +411,35 @@ pub fn definition_in<'n, 'a, S: NamesSource<'n>>(
     Ok(found)
 }
 
+/// Searches `crates` (already filtered to non-proc-macro crates in the program's link closure)
+/// for a strong Rust `#[no_mangle]` / `#[export_name]` function exporting `symbol`.
+///
+/// When `override_crates` is non-empty (explicitly injected host runtime shim crates such as
+/// `blaze_wasm64_pm_shim` for self-compiled wasm64 proc-macros), strong definitions in
+/// `override_crates` take precedence over non-override crates. Duplicate strong definitions
+/// *within* `override_crates` or *within* non-override `crates` are still refused with
+/// [`ExportRefused::DefinedTwice`].
+///
+/// Returns `Ok(None)` when no searched crate exports `symbol` (allowing the caller to fall
+/// through to `FnKind::Foreign` / `dlsym`), `Ok(Some(key))` when uniquely defined, and
+/// `Err(ExportRefused::DefinedTwice { .. })` when two or more definitions match in the winning
+/// tier.
+pub fn definition_in<'n, 'a, S: NamesSource<'n>>(
+    names: S,
+    crates: &[usize],
+    override_crates: &[usize],
+    symbol: &str,
+    sig_shape: Option<(usize, bool)>,
+    alloc: Alloc<'a>,
+) -> Result<Option<LibKey>, ExportRefused<'a>> {
+    if !override_crates.is_empty()
+        && let Some(found) = definition_in_tier(names, override_crates, &[], symbol, sig_shape, alloc)?
+    {
+        return Ok(Some(found));
+    }
+    definition_in_tier(names, crates, override_crates, symbol, sig_shape, alloc)
+}
+
 /// The strong Rust definition exporting `symbol` in the link closure of `roots`, if any.
 pub fn definition<'n, 'a, S: NamesSource<'n>>(
     names: S,
@@ -417,7 +449,7 @@ pub fn definition<'n, 'a, S: NamesSource<'n>>(
     alloc: Alloc<'a>,
 ) -> Result<Option<LibKey>, ExportRefused<'a>> {
     let crates = linked_crates(names, roots, symbol, alloc)?;
-    definition_in(names, crates.as_slice(), symbol, sig_shape, alloc)
+    definition_in(names, crates.as_slice(), &[], symbol, sig_shape, alloc)
 }
 
 /// Resolves a declared foreign fn to its same-program Rust export's checker key, if any.
@@ -435,15 +467,17 @@ pub fn bound<'n, 'a, S: NamesSource<'n>>(
     Ok(Some(key))
 }
 
-/// Resolves a declared foreign fn using precomputed `crates`, returning its checker key if any.
+/// Resolves a declared foreign fn using precomputed `crates` and optional `override_crates`,
+/// returning its checker key if any.
 pub fn bound_in<'n, 'a, S: NamesSource<'n>>(
     names: S,
     keys: &Keys,
     crates: &[usize],
+    override_crates: &[usize],
     d: &Declared<'_>,
     alloc: Alloc<'a>,
 ) -> Result<Option<ItemKey>, ExportRefused<'a>> {
-    let Some(lib) = definition_in(names, crates, d.symbol.as_str(), Some((d.params, d.c_variadic)), alloc)? else {
+    let Some(lib) = definition_in(names, crates, override_crates, d.symbol.as_str(), Some((d.params, d.c_variadic)), alloc)? else {
         return Ok(None);
     };
     let key = keys.item(lib).map_err(|_| ExportRefused::KeyClash { symbol: own_str(d.symbol.as_str(), alloc) })?;

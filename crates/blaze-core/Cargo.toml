@@ -15,6 +15,7 @@ doctest = false
 
 [dependencies]
 blaze-hash.workspace = true
+blaze-machine.workspace = true
 blaze-mem.workspace = true
 # D169's meter: an effect's kind (`Effect::metered`), opens (descriptors.rs), lock waits
 # (lock.rs) and parks (wait.rs) add to the thread's cells.

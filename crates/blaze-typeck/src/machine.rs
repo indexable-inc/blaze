@@ -442,6 +442,7 @@ pub(crate) struct MachineSnapshot<S> {
     union_pats: usize,
     inferred_err_coercions: usize,
     deferred_try_obs: usize,
+    deferred_dyn_unsizes: usize,
 }
 
 /// Per-match narrowing state for a structural union scrutinee (`rules/control.rs`).
@@ -698,6 +699,11 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     /// finalized in `finish_body`, preventing `impl<T> From<T> for T` from binding `inferred_err_var`
     /// prematurely to the first `?` error type.
     pub deferred_try_obs: Vec<(ItemKey, TyList, Cause), Alloc<'a>>,
+    /// Unsizing pairs `(source, target)` deferred while `source` held an unresolved variable,
+    /// alias, or opaque type facing a `dyn` object (`coerce_unsized` / `coerce_unsized_adt`):
+    /// consulted by `resolve_dyn_metadata_unsized` when a pending `<V as Pointee>::Metadata ==
+    /// DynMetadata<dyn T>` obligation also constrains the same variable `V`.
+    pub deferred_dyn_unsizes: Vec<(Ty, Ty), Alloc<'a>>,
 }
 
 impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
@@ -835,6 +841,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             inferred_err_var: None,
             inferred_err_coercions: Vec::new_in(alloc),
             deferred_try_obs: Vec::new_in(alloc),
+            deferred_dyn_unsizes: Vec::new_in(alloc),
             alloc,
         })
     }
@@ -1300,9 +1307,23 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
 
     // Selection.
 
+    /// Selects all obligations provable now, resolving any type variable uniquely pinned by both
+    /// `<V as Pointee>::Metadata == DynMetadata<dyn T>` and a deferred unsizing to `dyn U`.
+    fn select_fixed_point(&mut self) -> Result<(), Stop> {
+        const MAX_DYN_META_ROUNDS: u32 = 16;
+        self.ty.select_where_possible(&mut self.reads)?;
+        for _ in 0..MAX_DYN_META_ROUNDS {
+            if self.deferred_dyn_unsizes.is_empty() || !self.resolve_dyn_metadata_unsized()? {
+                break;
+            }
+            self.ty.select_where_possible(&mut self.reads)?;
+        }
+        Ok(())
+    }
+
     /// `select_obligations_where_possible`, reporting what failed (E0277).
     pub(crate) fn select(&mut self) -> Result<(), Stop> {
-        self.ty.select_where_possible(&mut self.reads)?;
+        self.select_fixed_point()?;
         self.report_fulfill_errors(false)
     }
 
@@ -1311,6 +1332,9 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     pub(crate) fn select_all(&mut self) -> Result<(), Stop> {
         // A direct forwarding await may have completed a witness during body analysis.
         self.bind_witnesses(true)?;
+        if !self.deferred_dyn_unsizes.is_empty() {
+            self.select_fixed_point()?;
+        }
         self.ty.select_all(&mut self.reads)?;
         self.report_fulfill_errors(true)?;
         // Every obligation has now been decided, stalled, or reported. Flow consumes
@@ -2204,6 +2228,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             union_pats: self.union_pats.len(),
             inferred_err_coercions: self.inferred_err_coercions.len(),
             deferred_try_obs: self.deferred_try_obs.len(),
+            deferred_dyn_unsizes: self.deferred_dyn_unsizes.len(),
         }
     }
 
@@ -2236,6 +2261,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.union_pats.truncate(s.union_pats);
         self.inferred_err_coercions.truncate(s.inferred_err_coercions);
         self.deferred_try_obs.truncate(s.deferred_try_obs);
+        self.deferred_dyn_unsizes.truncate(s.deferred_dyn_unsizes);
     }
 
     /// Runs `f` in a snapshot that is always rolled back (`probe`).

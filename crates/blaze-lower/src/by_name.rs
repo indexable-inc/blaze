@@ -960,6 +960,10 @@ impl<C: ExpandCx> ExpandCx for BodyCx<'_, '_, '_, C> {
         crate::cfg_outcome(predicate, &mut **self.cfg.borrow_mut(), self.alloc)
     }
 
+    fn cfg_version_enabled(&self) -> bool {
+        self.cfg.borrow().cfg_version_enabled()
+    }
+
     fn include(&self, path: &str, how: blaze_expand::IncludeAs) -> Result<blaze_expand::Included<'_>, blaze_expand::HostError> {
         self.host.include(path, how)
     }

@@ -183,6 +183,10 @@ pub(crate) struct TakePlant {
     /// The take stops (as a crash would) once this many records are put or found.
     #[cfg(test)]
     pub stop_after: Option<u32>,
+    /// Planted bug: defer `map_all` until after `read_to_end(Object::Prefix)` instead of mapping
+    /// existing local segments before the potentially multi-read prefix fetch.
+    #[cfg(test)]
+    pub map_after_prefix: bool,
 }
 
 impl TakePlant {
@@ -193,6 +197,8 @@ impl TakePlant {
         root_each_segment: false,
         #[cfg(test)]
         stop_after: None,
+        #[cfg(test)]
+        map_after_prefix: false,
     };
 }
 
@@ -389,6 +395,19 @@ fn take_counted<D: Driver, O: Origin + ?Sized>(
     let alloc = *lent.alloc();
     let mut place = PlainPlace::new(lent, false);
     let mut bytes: std::vec::Vec<u8, StoreAlloc> = std::vec::Vec::new_in(alloc);
+    let map_existing = |place: &PlainPlace<'_, D>| -> Result<(), TakeError> {
+        // Map any existing local segments within `GRACE_NS` before potentially multi-read origin
+        // prefix and segment fetches can run past the grace window and trip `LATE_MAP` (rule 54).
+        match cx {
+            Some(cx) => place.map_all_par(&super::CxPar::new(cx)),
+            None => place.map_all(),
+        }
+        .map_err(TakeError::Place)
+    };
+    #[cfg(test)]
+    let map_before_prefix = !plant.map_after_prefix;
+    #[cfg(not(test))]
+    let map_before_prefix = true;
     // 1. Head + prefix:
     //    - On an already-rooted home past the freshness window, ask the 192-byte Head first so
     //      `How::Current` transfers zero prefix bytes.
@@ -407,12 +426,18 @@ fn take_counted<D: Driver, O: Origin + ?Sized>(
             taken.how = How::Current;
             return Ok(());
         }
+        if map_before_prefix {
+            map_existing(&place)?;
+        }
         read_to_end(origin, Object::Prefix, PREFIX_MOST, &mut bytes, clock)?;
         if bytes.len() < HEAD_LEN || bytes[..HEAD_LEN] != checked[..] {
             return Err(TakeError::Moved);
         }
         (head, checked)
     } else {
+        if map_before_prefix {
+            map_existing(&place)?;
+        }
         read_to_end(origin, Object::Prefix, PREFIX_MOST, &mut bytes, clock)?;
         let head_slice = bytes.get(..HEAD_LEN).unwrap_or(bytes.as_slice());
         let head = Head::decode(head_slice, Namespace::PUBLIC, &SetCheck { set, keys, seen: floor }).map_err(refused)?;
@@ -445,6 +470,10 @@ fn take_counted<D: Driver, O: Origin + ?Sized>(
     }
 
     let rows = prefixed.rows.as_slice();
+    #[cfg(test)]
+    if plant.map_after_prefix && !rows.is_empty() {
+        map_existing(&place)?;
+    }
     let mut wave_start = 0usize;
     while wave_start < rows.len() {
         let wave_end = (wave_start + SEGMENT_IN_FLIGHT).min(rows.len());
@@ -1079,5 +1108,170 @@ mod pipeline_tests {
             "single-wave take must coalesce all segment puts + root + floor into ONE atomic commit"
         );
         assert_eq!(named_by_root(&lent, &world.records), Ok(Some(usize::try_from(N).unwrap_or(0))));
+    }
+
+    /// A slow `Object::Prefix` fetch exceeding `GRACE_NS` on a store that already holds unmapped
+    /// local segments MUST NOT trip `LATE_MAP`:
+    /// - Negative control (`TakePlant::map_after_prefix`): deferring `map_all` until after
+    ///   `read_to_end(Object::Prefix)` trips `LATE_MAP` on both unrooted and rooted-upgrade takes.
+    /// - Positive (`TakePlant::NONE`): existing local segments are mapped BEFORE `Object::Prefix`
+    ///   is fetched, so both unrooted and rooted-upgrade takes succeed past `GRACE_NS`.
+    #[test]
+    fn slow_prefix_fetch_past_grace_maps_existing_segments_before_prefix_read() {
+        use core::time::Duration;
+        use blaze_cas::plain::GRACE_NS;
+        use blaze_drive::Key;
+        use blaze_ids::ContentId;
+        use blaze_remote::read::{Object, Origin, OriginError};
+        use super::super::plain_place::PlainPlace;
+        use super::super::published_e2e_tests::{plant, planted};
+        use super::super::CommandLent;
+        use super::tests::{SMALL_SEGMENTS, publish_sized};
+        use super::FRESH_NS;
+
+        struct SlowPrefixOrigin<'a> {
+            inner: FolderOrigin<'a>,
+            io: &'a bstd::io::Io,
+            lent: &'a CommandLent,
+            delay: Duration,
+            mapped_at_prefix: Option<(u32, u32)>,
+        }
+
+        impl Origin for SlowPrefixOrigin<'_> {
+            fn read(&mut self, object: &Object, at: u64, into: &mut [u8], deadline_ns: u64) -> Result<usize, OriginError> {
+                let is_prefix = matches!(object, Object::Prefix);
+                if is_prefix && self.mapped_at_prefix.is_none() {
+                    self.mapped_at_prefix = Some(self.lent.mapped_of_named());
+                }
+                let got = self.inner.read(object, at, into, deadline_ns)?;
+                if is_prefix {
+                    self.io.with_sim(|sim| sim.advance(self.delay)).expect("advance sim past GRACE_NS");
+                }
+                Ok(got)
+            }
+        }
+
+        let past_grace = Duration::from_nanos(GRACE_NS + 5_000_000_000);
+        let pub_key = Signer::from_seed(&SEED).public();
+        let world = world(91);
+
+        // Seed `/b` with one unrelated local segment so reopening `/b` starts with `mapped == 0, named == 1`.
+        {
+            let cx = world.io.cx(BUDGET, TASK_FRAME).expect("root context");
+            let (_home, lent) = developer_home(&world.io, &cx, "/b", 10);
+            let mut place = PlainPlace::new(&lent, false);
+            let key = Key(ContentId([0xA5; 32]));
+            place.put(key, false, b"existing local record").expect("put seed record");
+            place.pin("test.existing.segment", &[key]).expect("pin seed record");
+            place.commit().expect("commit seed segment");
+        }
+
+        // --- Case 1: unrooted home with existing committed segment ---
+        // Negative control: mapping after `Object::Prefix` trips `LATE_MAP`.
+        {
+            let cx = world.io.cx(BUDGET, TASK_FRAME).expect("root context");
+            let (_home, lent) = developer_home(&world.io, &cx, "/b", 11);
+            assert_eq!(lent.mapped_of_named(), (0, 1), "reopened store starts lazy with 1 unmapped segment");
+            let clock = world.io.need_clock().expect("clock");
+            let dir = world.io.need_fs().expect("fs").open_dir(&cx, &path(&set_path("o"))).expect("origin dir");
+            let mut origin = SlowPrefixOrigin {
+                inner: FolderOrigin { cx: &cx, folder: &dir },
+                io: &world.io,
+                lent: &lent,
+                delay: past_grace,
+                mapped_at_prefix: None,
+            };
+            let err = take_from(&mut origin, &[pub_key], set_id(), &lent, TOOLCHAIN, &clock, TakePlant { map_after_prefix: true, ..TakePlant::NONE })
+                .err()
+                .expect("planted map_after_prefix must fail with LATE_MAP when prefix exceeds GRACE_NS");
+            assert_eq!(origin.mapped_at_prefix, Some((0, 1)), "planted control left segment unmapped during prefix read");
+            let msg = format!("{err}");
+            assert!(msg.contains("more than the grace period after the open"), "expected LATE_MAP, got: {msg}");
+        }
+
+        // Positive: mapping before `Object::Prefix` maps existing segments inside `GRACE_NS` and succeeds.
+        {
+            let cx = world.io.cx(BUDGET, TASK_FRAME).expect("root context");
+            let (_home, lent) = developer_home(&world.io, &cx, "/b", 12);
+            assert_eq!(lent.mapped_of_named(), (0, 1), "reopened store starts lazy with 1 unmapped segment");
+            let clock = world.io.need_clock().expect("clock");
+            let dir = world.io.need_fs().expect("fs").open_dir(&cx, &path(&set_path("o"))).expect("origin dir");
+            let mut origin = SlowPrefixOrigin {
+                inner: FolderOrigin { cx: &cx, folder: &dir },
+                io: &world.io,
+                lent: &lent,
+                delay: past_grace,
+                mapped_at_prefix: None,
+            };
+            let taken = take_from(&mut origin, &[pub_key], set_id(), &lent, TOOLCHAIN, &clock, TakePlant::NONE)
+                .expect("unrooted take with slow prefix past GRACE_NS must succeed");
+            assert_eq!(origin.mapped_at_prefix, Some((1, 1)), "existing segment must be mapped BEFORE prefix fetch");
+            assert_eq!(taken.how, How::Took);
+            assert_eq!(taken.records, N);
+            assert_eq!(named_by_root(&lent, &world.records), Ok(Some(usize::try_from(N).unwrap_or(0))));
+        }
+
+        // --- Case 2: rooted home past freshness window when origin publishes a newer generation ---
+        let updated_records = planted(0..N + 1, 8);
+        {
+            let cx = world.io.cx(BUDGET, TASK_FRAME).expect("root context");
+            let (_a2, lent_a2) = plant(&world.io, &cx, "/a2", &updated_records, false);
+            let _ = publish_sized(&world.io, &cx, &lent_a2, "o", SMALL_SEGMENTS);
+        }
+        world.io.with_sim(|sim| sim.advance(Duration::from_nanos(FRESH_NS + 1_000_000_000))).expect("advance past FRESH_NS");
+
+        // Negative control on rooted generation upgrade:
+        {
+            let cx = world.io.cx(BUDGET, TASK_FRAME).expect("root context");
+            let (_home, lent) = developer_home(&world.io, &cx, "/b", 13);
+            let (mapped_open, named_open) = lent.mapped_of_named();
+            assert_eq!(mapped_open, 0);
+            assert!(named_open >= 2, "rooted store holds multiple committed segments, got {named_open}");
+            let clock = world.io.need_clock().expect("clock");
+            let dir = world.io.need_fs().expect("fs").open_dir(&cx, &path(&set_path("o"))).expect("origin dir");
+            let mut origin = SlowPrefixOrigin {
+                inner: FolderOrigin { cx: &cx, folder: &dir },
+                io: &world.io,
+                lent: &lent,
+                delay: past_grace,
+                mapped_at_prefix: None,
+            };
+            let err = take_from(&mut origin, &[pub_key], set_id(), &lent, TOOLCHAIN, &clock, TakePlant { map_after_prefix: true, ..TakePlant::NONE })
+                .err()
+                .expect("planted map_after_prefix on rooted upgrade must fail with LATE_MAP");
+            let (mapped_at_prefix, named_at_prefix) = origin.mapped_at_prefix.expect("prefix was fetched");
+            assert!(mapped_at_prefix < named_at_prefix, "planted control left segment(s) unmapped at prefix fetch ({mapped_at_prefix}/{named_at_prefix})");
+            let msg = format!("{err}");
+            assert!(msg.contains("more than the grace period after the open"), "expected LATE_MAP, got: {msg}");
+        }
+
+        // Positive on rooted generation upgrade:
+        {
+            let cx = world.io.cx(BUDGET, TASK_FRAME).expect("root context");
+            let (_home, lent) = developer_home(&world.io, &cx, "/b", 14);
+            let clock = world.io.need_clock().expect("clock");
+            let dir = world.io.need_fs().expect("fs").open_dir(&cx, &path(&set_path("o"))).expect("origin dir");
+            let mut origin = SlowPrefixOrigin {
+                inner: FolderOrigin { cx: &cx, folder: &dir },
+                io: &world.io,
+                lent: &lent,
+                delay: past_grace,
+                mapped_at_prefix: None,
+            };
+            let taken = take_from(&mut origin, &[pub_key], set_id(), &lent, TOOLCHAIN, &clock, TakePlant::NONE)
+                .expect("rooted upgrade with slow prefix past GRACE_NS must succeed");
+            let (mapped_at_prefix, named_at_prefix) = origin.mapped_at_prefix.expect("prefix was fetched");
+            assert!(named_at_prefix >= 2);
+            assert_eq!(mapped_at_prefix, named_at_prefix, "all existing segments must be mapped BEFORE prefix fetch on rooted upgrade");
+            assert_eq!(taken.how, How::Took);
+            assert_eq!(taken.generation, 2, "origin bumped to generation 2");
+            assert_eq!(taken.head_reads, 1, "rooted upgrade must still check Object::Head first");
+            assert_eq!(taken.records, 1, "only the 1 newly published record is written on gen-2 upgrade");
+            assert_eq!(taken.already, N, "the {N} gen-1 records are already present");
+            assert!(
+                matches!(named_by_root(&lent, &updated_records), Ok(Some(count)) if count >= usize::try_from(N + 1).unwrap_or(0)),
+                "every rooted record must verify against updated_records"
+            );
+        }
     }
 }

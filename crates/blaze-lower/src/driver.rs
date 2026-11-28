@@ -564,7 +564,7 @@ fn first_word_mark(stream: &TokenStream<'_>, from: usize) -> Option<crate::mark_
 /// `#[derive(..)]`/`#[derive_const(..)]` read in order. `None` when the item's `cfg` is false or
 /// an attribute is refused (the derives are not run then either).
 fn derive_marks<'a>(probe: TokenStream<'a>, cfg: &mut dyn Cfg, alloc: Alloc<'a>) -> Option<AVec<'a, Option<crate::mark_site::TextMark>>> {
-    let mut walk = blaze_expand::ItemAttrs::new(probe);
+    let mut walk = blaze_expand::ItemAttrs::new(probe).with_cfg_version(cfg.cfg_version_enabled());
     loop {
         let next = walk.next(&mut |name, value| match cfg.atom(name, value) {
             CfgAnswer::Yes => Ok(true),
@@ -857,7 +857,7 @@ impl<'a> Driver<'_, 'a> {
             },
         };
         let cfg = &mut *self.cfg;
-        let derives = blaze_expand::ItemAttrs::new(tokens).derives(&mut |name, value| match cfg.atom(name, value) {
+        let derives = blaze_expand::ItemAttrs::new(tokens).with_cfg_version(cfg.cfg_version_enabled()).derives(&mut |name, value| match cfg.atom(name, value) {
             CfgAnswer::Yes => Ok(true),
             CfgAnswer::No => Ok(false),
             CfgAnswer::Need => Err(()),
@@ -906,7 +906,8 @@ impl<'a> Driver<'_, 'a> {
             return false;
         }
         let Ok(tokens) = blaze_expand::lex(at.item_text(), self.edition, self.alloc) else { return false };
-        let mut walk = blaze_expand::ItemAttrs::new(tokens);
+        let cfg_version = self.cfg.cfg_version_enabled();
+        let mut walk = blaze_expand::ItemAttrs::new(tokens).with_cfg_version(cfg_version);
         // When a macro wrote the item, a probe of the same tokens carrying their marks, walked in
         // step with `walk` (the same `cfg_attr`s applied, so the same indices): an attribute's
         // path is read by its first word's mark. A probe that cannot be made or that leaves step
@@ -914,7 +915,7 @@ impl<'a> Driver<'_, 'a> {
         let mut probe = match own.filter(|w| w.any_marked()) {
             None => None,
             Some(w) => match w.probe(at.item_text(), self.edition, self.alloc) {
-                Some(p) => Some(blaze_expand::ItemAttrs::new(p)),
+                Some(p) => Some(blaze_expand::ItemAttrs::new(p).with_cfg_version(cfg_version)),
                 None => {
                     self.stats.macro_calls_failed += 1;
                     return true;
@@ -986,7 +987,7 @@ impl<'a> Driver<'_, 'a> {
                             },
                         };
                         let cfg = &mut *self.cfg;
-                        let derives = blaze_expand::ItemAttrs::new(walk.item().clone()).derives(&mut |name, value| match cfg.atom(name, value) {
+                        let derives = blaze_expand::ItemAttrs::new(walk.item().clone()).with_cfg_version(cfg.cfg_version_enabled()).derives(&mut |name, value| match cfg.atom(name, value) {
                             CfgAnswer::Yes => Ok(true),
                             CfgAnswer::No => Ok(false),
                             CfgAnswer::Need => Err(()),

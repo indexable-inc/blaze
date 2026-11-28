@@ -963,7 +963,7 @@ fn count(c: &CrateNames<'static>, std_absent: bool) -> Counts {
     }
     for note in c.tree.notes.iter() {
         let example = match note {
-            WalkNote::BothFiles { at: loc } | WalkNote::TooManyModules { at: loc } => at(c, *loc),
+            WalkNote::BothFiles { at: loc } | WalkNote::TooManyModules { at: loc } | WalkNote::UnstableCfgVersion { at: loc } => at(c, *loc),
             WalkNote::NeitherFile { at: loc, name, .. } =>format!("{}: mod {name}", at(c, *loc)),
             WalkNote::PathFileNotFound { at: loc, path } => format!("{}: {path}", at(c, *loc)),
             WalkNote::PathValueRefused { at: loc, refusal } => format!("{}: {refusal}", at(c, *loc)),

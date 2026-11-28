@@ -226,10 +226,10 @@ impl FnHeader {
         Cast::<u32, u16>::truncate(self.0 >> 16)
     }
 
-    /// Attaches an explicit Blaze effect list (`expect(..)`) into header bits `10..15`.
-    /// Bit 10 marks an explicit list; bits 11..14 store the 4-bit [`crate::effect_ty::EffectSet`].
+    /// Attaches an explicit Blaze effect list (`expect(..)`) into header bits `10..=15`.
+    /// Bit 10 marks an explicit list; bits `11..=15` store the 5-bit [`crate::effect_ty::EffectSet`].
     pub const fn with_effects(self, effects: crate::effect_ty::EffectSet) -> FnHeader {
-        let cleared = self.0 & !(0b1_1111 << 10);
+        let cleared = self.0 & !(0b11_1111 << 10);
         let mask = (1u32 << 10) | (Cast::<u8, u32>::widen(effects.bits()) << 11);
         FnHeader(cleared | mask)
     }
@@ -239,7 +239,7 @@ impl FnHeader {
         if self.0 & (1 << 10) == 0 {
             None
         } else {
-            let bits = Cast::<u32, u8>::truncate((self.0 >> 11) & 0b1111);
+            let bits = Cast::<u32, u8>::truncate((self.0 >> 11) & 0b1_1111);
             Some(crate::effect_ty::EffectSet::from_bits(bits))
         }
     }

@@ -773,6 +773,10 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     /// Root crate indices defining this program's link closure for same-program export binding
     /// (`front.index.scope()` over solved names; `{0} ∪ lang_crates` over per-program records).
     export_roots: AVec<'n, usize>,
+    /// Explicitly injected host runtime shim crate indices (empty by default; `[shim_idx]` for
+    /// self-compiled wasm64 proc-macros) whose strong `#[no_mangle]` / `#[export_name]` exports
+    /// take precedence over non-override crates in [`crate::front2::export_shim::bound_in`].
+    export_override_crates: AVec<'n, usize>,
     /// Each foreign declaration bound to a same-program Rust export (or cached as external C
     /// `None`) once per program (front_end.rs `ExportBindings`).
     export_bindings: RefCell<front_end::ExportBindings<'n>>,
@@ -937,6 +941,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             definers: crate::front2::tait::Definers::new_in(alloc),
             internal_bindings: RefCell::new(front_end::InternalBindings::new_in(alloc)),
             export_roots,
+            export_override_crates: AVec::new_in(alloc),
             export_bindings: RefCell::new(front_end::ExportBindings::new_in(alloc)),
             site_cache: RefCell::new(seam_rules::SiteCache::new_in(alloc)),
             member_rows: Map::new_in(alloc),
@@ -952,6 +957,25 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             counts: LazyCounts::default(),
             alloc,
         })
+    }
+
+    /// Registers explicitly injected host runtime shim crates whose strong `#[no_mangle]` /
+    /// `#[export_name]` exports take precedence over non-override crates during same-program
+    /// export binding (and extends `export_roots` so their link closure is included).
+    /// Must be called before any body is checked; resets cached export bindings.
+    pub fn set_export_override_crates(&mut self, crates: &[usize]) {
+        self.export_override_crates.clear();
+        self.export_override_crates.extend_from_slice(crates);
+        self.export_override_crates.sort_unstable();
+        self.export_override_crates.dedup();
+        for &krate in self.export_override_crates.iter() {
+            if self.export_roots.scan_for(&krate).is_none() {
+                self.export_roots.push(krate);
+            }
+        }
+        self.export_roots.sort_unstable();
+        self.export_roots.dedup();
+        self.export_bindings.get_mut().clear_cache();
     }
 
     /// Attaches a command-scoped [`SharedLazyFrontHandle`] cache shared across parallel export

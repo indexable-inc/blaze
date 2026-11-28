@@ -93,7 +93,7 @@ pub(super) fn expand_type_text<'n, 'a, 't, S: NamesSource<'n>>(
     // front2/type_marks.rs.
     let scoped = super::type_marks::Marked { scoped: ScopedBy { names, module, prepared: None, blocks: None }, marks };
     let mut expand = ByName::with_names(&scoped, NoHost, alloc);
-    let lowered = blaze_lower::lower_type_text_expanding(text, edition, &mut CrateCfg(atoms), &mut expand, alloc)
+    let lowered = blaze_lower::lower_type_text_expanding(text, edition, &mut CrateCfg::of(names, krate, atoms), &mut expand, alloc)
         .map_err(|e| Why::TypeMacro(format!("`{text}`: {e}").into_boxed_str(), r))?;
     let root = lowered.view().type_root().ok_or_else(|| Why::TypeMacro(format!("`{text}` expanded to no type").into_boxed_str(), r))?;
     let marks_bytes = lowered

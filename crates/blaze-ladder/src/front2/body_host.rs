@@ -253,6 +253,7 @@ pub struct BodyHost<'h, F = fn() -> Option<FilePaths<'h>>, G = fn() -> Option<Pl
     shown_file: core::cell::OnceCell<Option<AString<'h>>>,
     module_path: Option<&'h str>,
     atoms: &'h [(&'h str, Option<&'h str>)],
+    cfg_version: bool,
     alloc: Alloc<'h>,
 }
 
@@ -299,6 +300,7 @@ impl<'h> BodyHost<'h> {
             shown_file: core::cell::OnceCell::new(),
             module_path: names.module_path(module),
             atoms: names.cfg_atoms(krate).unwrap_or(&[]),
+            cfg_version: names.has_feature(krate, "cfg_version").unwrap_or(false),
             alloc,
         }
     }
@@ -325,7 +327,11 @@ impl<'h, F: FnOnce() -> Option<FilePaths<'h>>, G: FnOnce() -> Option<Placed<'h>>
 
     /// The crate's cfg atoms: a predicate is true exactly when the crate is compiled with it.
     fn cfg(&self, predicate: &TokenStream<'_>) -> Result<bool, HostError> {
-        blaze_lower::cfg_outcome(predicate, &mut CrateCfg(self.atoms), self.alloc)
+        blaze_lower::cfg_outcome(predicate, &mut CrateCfg::with_version(self.atoms, self.cfg_version), self.alloc)
+    }
+
+    fn cfg_version_enabled(&self) -> bool {
+        self.cfg_version
     }
 
     fn include(&self, written: &str, _how: IncludeAs) -> Result<Included<'_>, HostError> {
@@ -467,6 +473,7 @@ mod tests {
             shown_file: core::cell::OnceCell::new(),
             module_path: Some("tempo_node::rpc"),
             atoms: &[("unix", None)],
+            cfg_version: false,
             alloc: Alloc::global(),
         }
     }
