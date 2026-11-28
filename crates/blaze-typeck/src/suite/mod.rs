@@ -125,6 +125,7 @@ mod promote;
 mod reborrow_capture;
 mod impl_for_object;
 mod blanket_beside_own_impl;
+mod coerce_many_lub;
 mod coerce_target_obligations;
 mod env_supertrait_assoc_bound;
 mod env_where_projection_rhs;

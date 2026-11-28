@@ -368,6 +368,8 @@ pub(crate) struct CoerceMany {
     pub first_source: u32,
     /// Last index into `Machine::coerce_sources` for this site (`u32::MAX` when empty).
     pub last_source: u32,
+    /// First index into `Machine::coerce_sources` for this site's `!` sources (`u32::MAX` when empty).
+    pub first_never: u32,
 }
 
 /// An enclosing loop or block that a `break` may leave (`BreakableCtxt`).
@@ -1040,6 +1042,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             pushed: 0,
             first_source: u32::MAX,
             last_source: u32::MAX,
+            first_never: u32::MAX,
         });
         Ok(at)
     }
@@ -1054,20 +1057,49 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         };
         let cm = self.coerce_many[site as usize];
         let ty = self.try_structurally_resolve(ty)?;
-        let merged = cm.final_ty.unwrap_or(cm.expected);
+        let merged = self.ty.shallow_resolve(cm.final_ty.unwrap_or(cm.expected));
         if self.is_err(ty) || self.is_err(merged) {
             self.coerce_many[site as usize].final_ty = Some(self.common.err);
             return Ok(());
         }
+        // A diverging source (`!`) does not constrain the site's type yet; its `NeverToAny`
+        // adjustment is recorded once the site's final merged type is settled in
+        // `coerce_many_complete`.
+        if let Some(e) = e
+            && self.is_never(ty)
+        {
+            let idx = u32::try_from(self.coerce_sources.len())
+                .map_err(|_| CheckError::Limit(Limit::Table))?;
+            let prev = self.coerce_many[site as usize].first_never;
+            self.coerce_sources.push((e, prev));
+            self.coerce_many[site as usize].first_never = idx;
+            return Ok(());
+        }
+        // When `expected` is an unconstrained general type variable (e.g. `?V` from `&[?V]`),
+        // do not eagerly unify it on source 0: later sources may widen the LUB (e.g. `&String`
+        // then `&str` -> `&str`) before the outer coercion unifies the finished site with `?V`.
+        // Keep eager binding for defining opaque hidden-type vars and `Result<_, _>` inferred
+        // error vars, which represent concrete body-level obligations rather than open LUB vars.
+        let unconstrained_expected = cm.pushed == 0
+            && self.is_ty_var(merged)
+            && self.active_inferred_err_var() != Some(merged)
+            && !self.is_defining_var(merged);
         let ok = match e {
             None => {
                 // A block with no tail, or a `break`/`return` with no value: `()` is unified,
                 // not coerced.
-                if self.unify(cm.expected, ty)? { Some(cm.expected) } else { None }
+                if unconstrained_expected {
+                    Some(ty)
+                } else if self.unify(merged, ty)? {
+                    Some(merged)
+                } else {
+                    None
+                }
             }
+            Some(_) if unconstrained_expected => Some(ty),
             Some(e) if cm.pushed == 0 => {
-                // The first source is coerced to the expected type.
-                if self.coerce(Some(e), ty, cm.expected, false)? { Some(cm.expected) } else { None }
+                // The first source is coerced to the concrete expected type.
+                if self.coerce(Some(e), ty, merged, false)? { Some(merged) } else { None }
             }
             Some(e) => self.coercion_lub(site, e, merged, ty)?,
         };
@@ -1076,9 +1108,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 let entry = &mut self.coerce_many[site as usize];
                 entry.final_ty = Some(t);
                 entry.pushed += 1;
-                if let Some(e) = e
-                    && !self.is_never(ty)
-                {
+                if let Some(e) = e {
                     let idx = u32::try_from(self.coerce_sources.len())
                         .map_err(|_| CheckError::Limit(Limit::Table))?;
                     self.coerce_sources.push((e, u32::MAX));
@@ -1133,12 +1163,54 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         Ok(None)
     }
 
-    /// `CoerceMany::complete`: the merged type, or `!` when nothing was pushed.
-    pub(crate) fn coerce_many_complete(&mut self, site: u32) -> Ty {
-        match self.coerce_many[site as usize].final_ty {
-            Some(t) => t,
-            None => self.common.never,
+    /// Whether `t` (already shallow-resolved) is the hidden-type variable of an opaque this body
+    /// defines (`rules/opaque_def.rs`).
+    fn is_defining_var(&mut self, t: Ty) -> bool {
+        for i in 0..self.defining.len() {
+            let v = self.defining[i].1;
+            if self.ty.shallow_resolve(v) == t {
+                return true;
+            }
         }
+        false
+    }
+
+    /// `CoerceMany::complete`: the merged type, or `!` when nothing was pushed.
+    pub(crate) fn coerce_many_complete(&mut self, site: u32) -> Result<Ty, Stop> {
+        let cm = self.coerce_many[site as usize];
+        let final_ty = match cm.final_ty {
+            Some(t) => t,
+            None if cm.first_never != u32::MAX => {
+                let expected = self.ty.shallow_resolve(cm.expected);
+                if self.is_err(expected) {
+                    expected
+                } else if self.is_ty_var(expected) && self.active_inferred_err_var() != Some(expected) {
+                    // Queue a defining opaque hidden-type var itself for diverging fallback so
+                    // `fn f() -> impl Sized { panic!() }` resolves its hidden type to `!`; for
+                    // an unconstrained outer var, use a fresh diverging var instead of binding it.
+                    let v = if self.is_defining_var(expected) {
+                        expected
+                    } else {
+                        self.fresh()?
+                    };
+                    self.diverging.push(v);
+                    v
+                } else {
+                    expected
+                }
+            }
+            None => return Ok(self.common.never),
+        };
+        if !self.is_err(final_ty) {
+            let mut cur = cm.first_never;
+            while cur != u32::MAX {
+                let Ok(ix) = usize::try_from(cur) else { break };
+                let (e, next) = self.coerce_sources[ix];
+                self.adjust.push((e, AdjustKind::NeverToAny, final_ty));
+                cur = next;
+            }
+        }
+        Ok(final_ty)
     }
 
     // Types.
