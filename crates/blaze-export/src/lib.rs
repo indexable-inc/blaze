@@ -52,7 +52,7 @@ pub mod wasm64;
 pub use error::ExportError;
 pub use export::{Exported, Panics, export, export_par};
 pub use par::{ExportLinkTimes, ExportRunner, SequentialExportRunner};
-pub use input::{CExport, Data, DataPlace, DataWord, Entry, Function, Panic, Platform, Profile, ProgramIn, Tier, TlsRuntime};
+pub use input::{CExport, Data, DataPlace, DataWord, Entry, Function, InitStatic, Panic, Platform, Profile, ProgramIn, Tier, TlsRuntime};
 pub use lir_wasm64::{
     LirWasm64Error, LirWasm64Func, LirWasm64Global, LirWasm64GlobalValue, LirWasm64Import,
     LirWasm64Module, LirWasm64RelocTarget, LirWasm64Static, LirWasm64StaticReloc,

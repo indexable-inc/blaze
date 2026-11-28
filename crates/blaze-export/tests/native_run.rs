@@ -237,6 +237,7 @@ fn cxx_throw_is_caught_inside_the_native_code() {
         profile: None,
         natives: Some(&image),
         exports: &[],
+        inits: &[],
         symbol_names: &[],
     };
     let status = export_and_run(&program, &dir);
@@ -347,6 +348,7 @@ fn run_callback_program(name: &str, without_rows: bool) -> ExitStatus {
         profile: None,
         natives: Some(&image),
         exports: &exports,
+        inits: &[],
         symbol_names: &[],
     };
     let status = export_and_run(&program, &dir);

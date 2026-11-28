@@ -108,7 +108,7 @@ fn functions_of<'r>(records: &'r [AVec<'static, u8>; 3]) -> [Function<'r>; 3] {
 }
 
 fn program<'r>(functions: &'r [Function<'r>], personality: Option<Symbol>) -> ProgramIn<'r> {
-    ProgramIn { name: "unwinds", functions, data: &[], entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality, tls: None, profile: None, natives: None, exports: &[], symbol_names: &[] }
+    ProgramIn { name: "unwinds", functions, data: &[], entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality, tls: None, profile: None, natives: None, exports: &[], inits: &[], symbol_names: &[] }
 }
 
 fn get32(b: &[u8], at: usize) -> u32 {

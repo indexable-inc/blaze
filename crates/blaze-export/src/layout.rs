@@ -35,7 +35,7 @@ use blaze_ids::Hasher;
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::error::ExportError;
-use crate::input::{Data, DataPlace, Profile, Tier};
+use crate::input::{Data, DataPlace, InitStatic, Profile, Tier};
 use crate::par::{ExportLinkTimes, ExportRunner, SequentialExportRunner};
 
 const FOLD_DOMAIN: &str = "blaze-export fold 1";
@@ -141,9 +141,14 @@ pub struct Laid<'a, 'r> {
     /// The bytes kept after the code for the unwind tables: what eh_out.rs `eh_room` measured
     /// (the layout's `tail`). `eh_sections` refuses tables past it in every build.
     pub tables_room: u64,
-    /// When `Some(at)`, an 8-byte `__mod_init_func` slot in `konst` (macOS TLS startup
-    /// initializer, `S_MOD_INIT_FUNC_POINTERS`).
-    pub mod_init_at: Option<u64>,
+    /// When `Some((at, len))`, the contiguous initializer pointer array in `konst`
+    /// (`__DATA_CONST,__mod_init_func` on Mach-O, `DT_INIT_ARRAY`/`DT_INIT_ARRAYSZ` on ELF),
+    /// holding any macOS TLS startup initializer, all Rust `InitStatic`s sorted by priority, and
+    /// any trailing slice reserved for native C `Region::Inits` on ELF.
+    pub inits: Option<(u64, u64)>,
+    /// When `Some(at)`, the image offset inside `inits` reserved for `native_merge::merge_elf` to
+    /// redirect native C `Region::Inits` relocations into the single ELF `DT_INIT_ARRAY`.
+    pub native_inits_at: Option<u64>,
     /// Whether the program has a Rust thread-local runtime (`TlsRuntime`): Linux emits `PT_TLS`
     /// for the per-thread `ROOT` slot.
     pub has_tls: bool,
@@ -273,12 +278,22 @@ fn find_data(data: &[Data<'_>], by_target: &[u32], target: Target) -> Option<usi
 pub(crate) struct TlsPlan {
     /// The `Space::Static` symbol of the 40-byte `Desc` synthesized in writable data.
     pub descriptor: Symbol,
-    /// On macOS, the `tls_init` function symbol placed in `__DATA_CONST,__mod_init_func`.
-    /// `None` on Linux (where the start wrapper calls `tls_init` directly).
-    pub mod_init_fn: Option<Symbol>,
     /// Initial value of `DESC.root`: `0` on macOS (written by `tls_init` at startup as
     /// `key * 8`); `TLS_ROOT_OFFSET | ROOT_OWN` on Linux (`PT_TLS` static TLS slot).
     pub initial_root: u64,
+}
+
+/// Initializer table layout inputs for [`lay_out_const_and_data`].
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct InitPlan<'a> {
+    /// On macOS, the `tls_init` function symbol placed first in `__DATA_CONST,__mod_init_func`.
+    /// `None` on Linux (where the start wrapper calls `tls_init` directly).
+    pub tls_init_fn: Option<Symbol>,
+    /// Rust `#[link_section = ".init_array..."]` / `"__DATA,__mod_init_func"` statics.
+    pub statics: &'a [InitStatic],
+    /// On Linux ELF, when both Rust `statics` and native C `Region::Inits` are present, trailing
+    /// zeroed bytes reserved at the end of `Laid::inits` for native C initializers.
+    pub native_tail_len: u64,
 }
 
 /// Returns the image offset of an in-image function, static, or vtable target (including the
@@ -324,14 +339,16 @@ pub(crate) struct ConstAndData<'a> {
     pub(crate) const_at: u64,
     pub(crate) konst: AVec<'a, u8>,
     pub(crate) got_at: u64,
-    pub(crate) mod_init_at: Option<u64>,
+    pub(crate) inits: Option<(u64, u64)>,
+    pub(crate) tls_init_at: Option<u64>,
+    pub(crate) tls_init_fn: Option<Symbol>,
+    pub(crate) native_inits_at: Option<u64>,
     pub(crate) tls_indices_at: u64,
     pub(crate) tls_rows_at: u64,
     pub(crate) tls_desc: Option<(Symbol, u64)>,
     /// Sorted by `Symbol`: `(symbol, datum_index)` for every `Space::Tls` datum; its position is
     /// the thread-local's 0-based index in `DESC.vars` and `tls_indices_at`.
     pub(crate) tls_targets: AVec<'a, (Symbol, u32)>,
-    pub(crate) tls_plan: Option<TlsPlan>,
     pub(crate) relro_at: AVec<'a, u64>,
     pub(crate) data_home: AVec<'a, u64>,
     pub(crate) data_at: u64,
@@ -363,7 +380,7 @@ impl ConstAndData<'_> {
     }
 }
 
-/// Lays out the const region (writer's head, GOT, optional `__mod_init_func`, TLS index words,
+/// Lays out the const region (writer's head, GOT, optional initializer array, TLS index words,
 /// TLS `VarRow` table, relro parts, read-only data & TLS templates) and the data region
 /// (writable data, optional TLS `Desc`, then zeroed data), refusing images past [`IMAGE_LIMIT`].
 #[allow(clippy::too_many_arguments)]
@@ -375,6 +392,7 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
     by_target: &[u32],
     imports_len: usize,
     tls_plan: Option<TlsPlan>,
+    init_plan: InitPlan<'_>,
     text_end: u64,
     plan: Plan,
     tail: u64,
@@ -382,6 +400,55 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
 ) -> Result<ConstAndData<'a>, ExportError> {
     let n = members.len();
     let page = plan.page;
+    // Resolve, validate, deduplicate, and priority-sort Rust initializer statics (ascending
+    // `.init_array.<N>` priority, then unsuffixed `.init_array` / `__mod_init_func`, tie-broken
+    // by symbol for byte-exact determinism).
+    let mut is_init: AVec<'_, bool> = Vec::from_elem_in(false, data.len(), alloc);
+    let mut sorted_inits: AVec<'_, u32> = Vec::with_capacity_in(init_plan.statics.len(), alloc);
+    let mut rust_inits_bytes = 0u64;
+    if !init_plan.statics.is_empty() {
+        let mut raw_inits: AVec<'_, InitStatic> = Vec::with_capacity_in(init_plan.statics.len(), alloc);
+        raw_inits.extend_from_slice(init_plan.statics);
+        raw_inits.sort_unstable_by(|a, b| {
+            a.symbol
+                .cmp(&b.symbol)
+                .then_with(|| a.priority.unwrap_or(u32::MAX).cmp(&b.priority.unwrap_or(u32::MAX)))
+        });
+        raw_inits.dedup_by(|later, kept| later.symbol == kept.symbol);
+        raw_inits.sort_unstable_by(|a, b| {
+            a.priority
+                .unwrap_or(u32::MAX)
+                .cmp(&b.priority.unwrap_or(u32::MAX))
+                .then_with(|| a.symbol.cmp(&b.symbol))
+        });
+        for init in raw_inits.iter() {
+            let target = Target { space: Space::Static, symbol: init.symbol };
+            let Some(d) = find_data(data, by_target, target) else {
+                return Err(ExportError::InitNotPlaced { symbol: init.symbol });
+            };
+            let Some(datum) = data.get(d) else {
+                return Err(ExportError::InitNotPlaced { symbol: init.symbol });
+            };
+            if matches!(datum.place, DataPlace::Zeroed { .. }) {
+                return Err(ExportError::InitBadDatum { symbol: init.symbol, why: "zeroed initializer static has no function pointers" });
+            }
+            if datum.bytes.is_empty() || !datum.bytes.len().is_multiple_of(8) {
+                return Err(ExportError::InitBadDatum { symbol: init.symbol, why: "initializer static length must be a non-zero multiple of 8 bytes" });
+            }
+            let d_u32 = u32::try_from(d).map_err(|_| ExportError::TooLarge { what: "an initializer datum index", len: u64::try_from(d).unwrap_or(u64::MAX) })?;
+            if let Some(flag) = is_init.get_mut(d) {
+                *flag = true;
+            }
+            sorted_inits.push(d_u32);
+            rust_inits_bytes = rust_inits_bytes.saturating_add(u64::try_from(datum.bytes.len()).unwrap_or(u64::MAX));
+        }
+    }
+    if !init_plan.native_tail_len.is_multiple_of(8) {
+        return Err(ExportError::TooLarge { what: "unaligned native Inits tail", len: init_plan.native_tail_len });
+    }
+    let total_inits_bytes = (if init_plan.tls_init_fn.is_some() { 8u64 } else { 0u64 })
+        .saturating_add(rust_inits_bytes)
+        .saturating_add(init_plan.native_tail_len);
     // Gather all `Space::Tls` data in deterministic symbol order (already sorted in `by_target`).
     let mut tls_targets: AVec<'a, (Symbol, u32)> = Vec::new_in(alloc);
     for &d in by_target.iter() {
@@ -395,14 +462,11 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
     if tls_count > TLS_CAP {
         return Err(ExportError::TooLarge { what: "the thread-local table's CAP (65536)", len: tls_count });
     }
-    // The const region: the writer's head, the GOT, optional `__mod_init_func`, TLS index words,
+    // The const region: the writer's head, the GOT, optional initializer array, TLS index words,
     // TLS `VarRow` table, relro parts, read-only data and TLS templates.
     let const_at = up(text_end + tail, page);
     // Pre-compute exact `konst` and `data` byte sizes so neither vector reallocates on large binaries.
-    let mut est_konst = up(const_at + plan.const_head, 8) - const_at + 8 * imports_len as u64;
-    if tls_plan.and_then(|t| t.mod_init_fn).is_some() {
-        est_konst += 8;
-    }
+    let mut est_konst = up(const_at + plan.const_head, 8) - const_at + 8 * imports_len as u64 + total_inits_bytes;
     let est_post_tables = est_konst;
     if !tls_targets.is_empty() {
         est_konst = up(const_at + est_konst, 16) - const_at;
@@ -419,7 +483,11 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
     }
     let mut est_data = 0u64;
     for &d in by_target.iter() {
-        let Some(datum) = data.get(usize::try_from(d).unwrap_or(usize::MAX)) else {
+        let idx = usize::try_from(d).unwrap_or(usize::MAX);
+        if is_init.get(idx).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(datum) = data.get(idx) else {
             continue;
         };
         let in_const = match datum.target.space {
@@ -444,15 +512,33 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
     pad_to(&mut konst, const_at, 8);
     let got_at = const_at + konst.len() as u64;
     konst.resize(konst.len() + 8 * imports_len, 0);
-    let mod_init_at = match tls_plan.and_then(|t| t.mod_init_fn) {
-        Some(_) => {
-            let at = const_at + u64::try_from(konst.len()).unwrap_or(u64::MAX);
-            konst.resize(konst.len() + 8, 0);
-            Some(at)
+    let mut data_home: AVec<'a, u64> = Vec::from_elem_in(0, data.len(), alloc);
+    let inits_start = const_at + u64::try_from(konst.len()).unwrap_or(u64::MAX);
+    let tls_init_at = init_plan.tls_init_fn.map(|_| {
+        let at = const_at + u64::try_from(konst.len()).unwrap_or(u64::MAX);
+        konst.resize(konst.len() + 8, 0);
+        at
+    });
+    for &d in sorted_inits.iter() {
+        let idx = usize::try_from(d).unwrap_or(usize::MAX);
+        if let Some(datum) = data.get(idx) {
+            if let Some(slot) = data_home.get_mut(idx) {
+                *slot = const_at + u64::try_from(konst.len()).unwrap_or(u64::MAX);
+            }
+            konst.extend_from_slice(datum.bytes);
         }
-        None => None,
+    }
+    let native_inits_at = if init_plan.native_tail_len > 0 {
+        let at = const_at + u64::try_from(konst.len()).unwrap_or(u64::MAX);
+        let tail_usize = usize::try_from(init_plan.native_tail_len)
+            .map_err(|_| ExportError::TooLarge { what: "native Inits tail", len: init_plan.native_tail_len })?;
+        konst.resize(konst.len() + tail_usize, 0);
+        Some(at)
+    } else {
+        None
     };
-    // Keep `__const` (everything after `__got` and optional `__mod_init_func`) 16-byte aligned
+    let inits = (total_inits_bytes > 0).then_some((inits_start, total_inits_bytes));
+    // Keep `__const` (everything after `__got` and optional initializer array) 16-byte aligned
     // when non-empty so Mach-O's `__const` section header (`align = 4`) matches its start address.
     let post_tables = konst.len();
     if !tls_targets.is_empty() {
@@ -481,9 +567,12 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
         relro_at[i as usize] = const_at + konst.len() as u64;
         konst.extend_from_slice(relro);
     }
-    let mut data_home: AVec<'a, u64> = Vec::from_elem_in(0, data.len(), alloc);
     for &d in by_target.iter() {
-        let Some(datum) = data.get(usize::try_from(d).unwrap_or(usize::MAX)) else {
+        let idx = usize::try_from(d).unwrap_or(usize::MAX);
+        if is_init.get(idx).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(datum) = data.get(idx) else {
             continue;
         };
         let in_const = match datum.target.space {
@@ -496,7 +585,9 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
                 pad_to(&mut konst, const_at, 16);
             }
             pad_to(&mut konst, const_at, u64::from(datum.align));
-            data_home[d as usize] = const_at + konst.len() as u64;
+            if let Some(slot) = data_home.get_mut(idx) {
+                *slot = const_at + konst.len() as u64;
+            }
             konst.extend_from_slice(datum.bytes);
         }
     }
@@ -524,12 +615,18 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
     let data_at = up(const_at + konst.len() as u64, page);
     let mut bytes: AVec<'a, u8> = Vec::with_capacity_in(usize::try_from(est_data).unwrap_or(0), alloc);
     for &d in by_target.iter() {
-        let Some(datum) = data.get(usize::try_from(d).unwrap_or(usize::MAX)) else {
+        let idx = usize::try_from(d).unwrap_or(usize::MAX);
+        if is_init.get(idx).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(datum) = data.get(idx) else {
             continue;
         };
         if datum.target.space != Space::Tls && datum.place == DataPlace::Writable {
             pad_to(&mut bytes, data_at, u64::from(datum.align));
-            data_home[d as usize] = data_at + bytes.len() as u64;
+            if let Some(slot) = data_home.get_mut(idx) {
+                *slot = data_at + bytes.len() as u64;
+            }
             bytes.extend_from_slice(datum.bytes);
         }
     }
@@ -545,14 +642,20 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
     let zero_at = up(data_at + bytes.len() as u64, 16);
     let mut zero_end = zero_at;
     for &d in by_target.iter() {
-        let Some(datum) = data.get(usize::try_from(d).unwrap_or(usize::MAX)) else {
+        let idx = usize::try_from(d).unwrap_or(usize::MAX);
+        if is_init.get(idx).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(datum) = data.get(idx) else {
             continue;
         };
         if datum.target.space != Space::Tls
             && let DataPlace::Zeroed { len } = datum.place
         {
             zero_end = up(zero_end, u64::from(datum.align));
-            data_home[d as usize] = zero_end;
+            if let Some(slot) = data_home.get_mut(idx) {
+                *slot = zero_end;
+            }
             zero_end += len;
         }
     }
@@ -564,12 +667,14 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
         const_at,
         konst,
         got_at,
-        mod_init_at,
+        inits,
+        tls_init_at,
+        tls_init_fn: init_plan.tls_init_fn,
+        native_inits_at,
         tls_indices_at,
         tls_rows_at,
         tls_desc,
         tls_targets,
-        tls_plan,
         relro_at,
         data_home,
         data_at,
@@ -833,12 +938,14 @@ impl<'a> ConstAndData<'a> {
             const_at,
             mut konst,
             got_at,
-            mod_init_at,
+            inits,
+            tls_init_at,
+            tls_init_fn,
+            native_inits_at,
             tls_indices_at: _,
             tls_rows_at,
             tls_desc,
             tls_targets,
-            tls_plan,
             relro_at,
             data_home,
             data_at,
@@ -866,7 +973,7 @@ impl<'a> ConstAndData<'a> {
         }
         fixups.reserve(est_fixups.saturating_sub(fixups.len()));
         // Emit `__mod_init_func` rebase (macOS TLS startup initializer).
-        if let (Some(at), Some(init_sym)) = (mod_init_at, tls_plan.and_then(|t| t.mod_init_fn))
+        if let (Some(at), Some(init_sym)) = (tls_init_at, tls_init_fn)
             && let Some(target) = home_of(Target { space: Space::Func, symbol: init_sym })
         {
             fixups.push(Fixup { at, to: FixTo::Rebase { target } });
@@ -992,7 +1099,8 @@ impl<'a> ConstAndData<'a> {
             placed,
             placed_member,
             tables_room: tail,
-            mod_init_at,
+            inits,
+            native_inits_at,
             has_tls,
             tls_count,
         })
@@ -1808,10 +1916,11 @@ pub fn lay_out<'a, 'r>(
     tail: u64,
     alloc: Alloc<'a>,
 ) -> Result<Laid<'a, 'r>, ExportError> {
-    lay_out_with_tls(members, data, entry, profile, plan, tail, None, alloc)
+    lay_out_with_tls(members, data, entry, profile, plan, tail, None, InitPlan::default(), alloc)
 }
 
-/// [`lay_out`] with an optional Rust thread-local runtime plan ([`TlsPlan`]).
+/// [`lay_out`] with optional Rust thread-local runtime ([`TlsPlan`]) and initializer table
+/// ([`InitPlan`]) plans.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lay_out_with_tls<'a, 'r>(
     members: &[Member<'r>],
@@ -1821,10 +1930,11 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
     plan: Plan,
     tail: u64,
     tls_plan: Option<TlsPlan>,
+    init_plan: InitPlan<'_>,
     alloc: Alloc<'a>,
 ) -> Result<Laid<'a, 'r>, ExportError> {
     let mut times = ExportLinkTimes::default();
-    lay_out_with_tls_par(members, data, entry, profile, plan, tail, tls_plan, alloc, &SequentialExportRunner, &mut times)
+    lay_out_with_tls_par(members, data, entry, profile, plan, tail, tls_plan, init_plan, alloc, &SequentialExportRunner, &mut times)
 }
 
 /// Parallel [`lay_out_with_tls`]: hashes equal-record fold digests in parallel, pre-sizes `text`,
@@ -1840,6 +1950,7 @@ pub(crate) fn lay_out_with_tls_par<'a, 'r, R: ExportRunner>(
     plan: Plan,
     tail: u64,
     tls_plan: Option<TlsPlan>,
+    init_plan: InitPlan<'_>,
     alloc: Alloc<'a>,
     runner: &R,
     times: &mut ExportLinkTimes,
@@ -1976,7 +2087,7 @@ pub(crate) fn lay_out_with_tls_par<'a, 'r, R: ExportRunner>(
     }
     dedup_imports(&mut imports);
 
-    let regions = lay_out_const_and_data(members, &order, &rep, data, &by_target, imports.len(), tls_plan, text_end, plan, tail, alloc)?;
+    let regions = lay_out_const_and_data(members, &order, &rep, data, &by_target, imports.len(), tls_plan, init_plan, text_end, plan, tail, alloc)?;
     let indices = FastIndices::build(members, data, &imports, alloc);
 
     // Single exact allocation for `text`, then fused parallel copy + ARM64 relocation patching
