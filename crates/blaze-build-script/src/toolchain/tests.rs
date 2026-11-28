@@ -3,8 +3,8 @@ use blaze_pins::CLANG_JSON as PIN;
 use blaze_unit_graph::UnitId;
 
 use super::{
-    CInputs, ClangPin, Mode, NATIVE_EVERY_MODE, PinError, SHELF_MEMBERS_LINUX, Shelf, Sysroot, c_env, clang_major, clang_pin, depfile_reads, headers_digest,
-    placement, shelf_missing_for, sysroot,
+    CInputs, ClangPin, Mode, NATIVE_EVERY_MODE, PinError, SHELF_MEMBERS_LINUX, Shelf, Sysroot, c_env, clang_major, clang_pin, depfile_reads,
+    for_each_nix_sysroot_candidate, headers_digest, placement, shelf_missing_for, sysroot,
 };
 use crate::native::Runner;
 
@@ -121,4 +121,33 @@ fn the_mode_decides_the_runner() {
     // native (its C compile).
     assert_eq!(placement(spawns, Mode::Check, "libusb1-sys"), Runner::Wasm);
     assert_eq!(placement(spawns, Mode::Build, "libusb1-sys"), native);
+}
+
+#[test]
+fn nix_sysroot_candidates_parses_isystem_and_idirafter_flags() {
+    fn collect(flags: &str) -> std::vec::Vec<&str> {
+        let mut out = std::vec::Vec::new();
+        for_each_nix_sysroot_candidate(flags, |dir| out.push(dir));
+        out
+    }
+
+    // Real NixOS `nix-support/libc-cflags` shape (trailing space + -fmacro-prefix-map ignored).
+    let libc_cflags = "-idirafter /nix/store/2gh2-glibc-2.44-57-dev/include -fmacro-prefix-map=/nix/store/2gh2-glibc-2.44-57-dev/include=/nix/store/eeee-glibc-2.44-57-dev/include ";
+    assert_eq!(collect(libc_cflags), ["/nix/store/2gh2-glibc-2.44-57-dev"]);
+
+    // Joined, quoted, trailing-slash, and multiple flags in `NIX_CFLAGS_COMPILE`.
+    let nix_cflags = r#"-O2 -isystem/nix/store/aaa-foo-dev/include -isystem "/nix/store/bbb-glibc-dev/include/" -idirafter '/nix/store/ccc-bar-dev/include' -idirafter/nix/store/ddd-baz-dev/include"#;
+    assert_eq!(
+        collect(nix_cflags),
+        [
+            "/nix/store/aaa-foo-dev",
+            "/nix/store/bbb-glibc-dev",
+            "/nix/store/ccc-bar-dev",
+            "/nix/store/ddd-baz-dev",
+        ]
+    );
+
+    // Negative controls: non-matching flags, relative paths, non-`/include` dirs, bare `/include`, dangling flag.
+    let non_matching = "-I/nix/store/xxx/include -isystem relative/include -isystem /nix/store/xxx/not-include -isystem /nix/store/xxx/myinclude -idirafter /include -isystem";
+    assert!(collect(non_matching).is_empty(), "non-matching flags must yield no candidates");
 }

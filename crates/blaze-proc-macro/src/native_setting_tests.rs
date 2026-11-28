@@ -231,7 +231,28 @@ fn linux_host_native_setting_accepts_linux_shelf_and_features_h() {
     fs::write(sdk.join(LINUX_HOST_SYSROOT_MARKER), b"#define __GLIBC__ 2\n").expect("features.h");
     let owned = command_native_setting(home_s, sdk_s, "test", LINUX_HOST, alloc).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(owned.sysroot, Sysroot::LinuxHost);
+    assert_eq!(owned.sdk_extra, None);
     assert_eq!(owned.shelf.as_str().rsplit('/').next(), Some(LINUX_PIN_HEX));
     assert_eq!(owned.sdk_version.len(), 64);
+
+    // NixOS split kernel headers: `<sdk>/include/linux` symlinks to a separate store root.
+    // `sdk_extra` records that root for Landlock, and `sdk_version` moves when `linux/version.h` changes.
+    #[cfg(unix)]
+    {
+        let headers = home.join("linux-headers-7.2");
+        fs::create_dir_all(headers.join("include/linux")).expect("linux headers dir");
+        fs::write(headers.join("include/linux/version.h"), b"#define LINUX_VERSION_CODE 1\n").expect("version.h");
+        std::os::unix::fs::symlink(headers.join("include/linux"), sdk.join("include/linux")).expect("symlink linux");
+
+        let split_a = command_native_setting(home_s, sdk_s, "test", LINUX_HOST, alloc).unwrap_or_else(|e| panic!("{e}"));
+        let expected_extra = fs::canonicalize(&headers).expect("canon headers");
+        assert_eq!(split_a.sdk_extra.as_ref().map(|s| s.as_str()), expected_extra.to_str());
+        assert_eq!(split_a.sdk_version.len(), 64);
+        assert_ne!(split_a.sdk_version.as_str(), owned.sdk_version.as_str());
+
+        fs::write(headers.join("include/linux/version.h"), b"#define LINUX_VERSION_CODE 2\n").expect("version.h v2");
+        let split_b = command_native_setting(home_s, sdk_s, "test", LINUX_HOST, alloc).unwrap_or_else(|e| panic!("{e}"));
+        assert_ne!(split_a.sdk_version.as_str(), split_b.sdk_version.as_str());
+    }
     let _ = fs::remove_dir_all(&home);
 }

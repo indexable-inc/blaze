@@ -77,6 +77,8 @@ pub struct CTasksSetting<'s> {
     /// The shelf and the SDK, laid (their digests are the toolchain's identity).
     pub shelf: Laid<'s>,
     pub sdk: Laid<'s>,
+    /// Optional extra read-only root for split Linux kernel headers (NixOS `linux-headers`).
+    pub sdk_extra: Option<Laid<'s>>,
     /// Which sysroot model clang uses (`MacosSdk` vs `LinuxHost`).
     pub sysroot: Sysroot,
     /// A folder of the home's, canonical and existing: each worker's task folder is under it.
@@ -541,6 +543,7 @@ fn worker<'b>(
             clang: setting.clang,
             shelf: setting.shelf,
             sdk: setting.sdk,
+            sdk_extra: setting.sdk_extra,
             sysroot: setting.sysroot,
             sources: sources[job.state as usize],
             roots,
@@ -806,6 +809,9 @@ impl ShelfTree<'_> {
             out.push((laid.host, laid.digest));
         }
         out.push((self.setting.sdk.host, self.setting.sdk.digest));
+        if let Some(extra) = self.setting.sdk_extra {
+            out.push((extra.host, extra.digest));
+        }
         out.push((self.setting.shelf.host, self.setting.shelf.digest));
         for tool in self.tools.tools {
             let digest = self.tools.keys.iter().find(|key| key.name == tool.name).map_or([0; 32], |key| key.digest);
@@ -849,6 +855,9 @@ impl TreeRunner for ShelfTree<'_> {
             pairs.push((laid.guest, laid.host));
         }
         pairs.push((setting.sdk.guest, sdk));
+        if let Some(extra) = setting.sdk_extra {
+            pairs.push((extra.guest, extra.host));
+        }
         pairs.push((setting.shelf.guest, shelf));
         pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         // What a file is checked against and an error shows: every host folder, `tmp` too.

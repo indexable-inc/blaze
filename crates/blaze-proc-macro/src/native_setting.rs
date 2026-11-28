@@ -52,6 +52,9 @@ pub struct OwnedNativeSetting<'a> {
     pub shelf: AString<'a>,
     /// The resolved SDK/sysroot folder.
     pub sdk: AString<'a>,
+    /// Optional extra read-only root for split Linux kernel headers (e.g. NixOS where
+    /// `<glibc-dev>/include/linux` symlinks into `/nix/store/<hash>-linux-headers-<ver>/include/linux`).
+    pub sdk_extra: Option<AString<'a>>,
     /// The SDK's `Version` (macOS) or marker SHA-256 hex (Linux host).
     pub sdk_version: AString<'a>,
     /// Which sysroot model `pins/clang.json` selected for the host.
@@ -277,8 +280,33 @@ pub fn native_setting<'a>(
         Sysroot::LinuxHost => toolchain::LINUX_HOST_SYSROOT_MARKER,
         Sysroot::Pinned { .. } => return Err(NativeSettingError::PinnedSysroot { host }),
     };
+    let read_file = |path: &str| fs::read(path);
     let settings_path = text(&[sdk.as_str(), "/", marker_rel], alloc);
-    let settings = fs::read(settings_path.as_str()).map_err(|error| NativeSettingError::NoSdk { path: settings_path.clone(), error })?;
+    let settings = read_file(settings_path.as_str()).map_err(|error| NativeSettingError::NoSdk { path: settings_path.clone(), error })?;
+    let sdk_extra = match sysroot {
+        Sysroot::LinuxHost => {
+            // On NixOS, `<glibc-dev>/include/linux` (and `asm/`, `asm-generic/`) symlinks into a
+            // separate `/nix/store/<hash>-linux-headers-<ver>/include/...` store path. Mount that
+            // root read-only beside `sdk` so Landlock permits following kernel-header symlinks.
+            let linux_inc = text(&[sdk.as_str(), "/include/linux"], alloc);
+            match resolved(&linux_inc, |path, error| NativeSettingError::NoSdk { path, error }, alloc) {
+                Ok(real_linux) => {
+                    let inside_sdk = real_linux.as_str().strip_prefix(sdk.as_str()).is_some_and(|rest| rest.starts_with('/'));
+                    if inside_sdk {
+                        None
+                    } else {
+                        real_linux
+                            .as_str()
+                            .strip_suffix("/include/linux")
+                            .filter(|root| !root.is_empty())
+                            .map(|root| String::from_str_in(root, alloc))
+                    }
+                }
+                Err(_) => None,
+            }
+        }
+        Sysroot::MacosSdk | Sysroot::Pinned { .. } => None,
+    };
     let sdk_version = match sysroot {
         Sysroot::MacosSdk => {
             let Some(version) = core::str::from_utf8(&settings).ok().and_then(sdk_version) else {
@@ -286,7 +314,24 @@ pub fn native_setting<'a>(
             };
             String::from_str_in(version, alloc)
         }
-        Sysroot::LinuxHost => hex(&blaze_sha256::digest(&settings), alloc),
+        Sysroot::LinuxHost => {
+            let extra_version = sdk_extra.as_ref().and_then(|extra| {
+                let ver_path = text(&[extra.as_str(), "/include/linux/version.h"], alloc);
+                read_file(ver_path.as_str()).ok()
+            });
+            match extra_version {
+                Some(ver_bytes) => {
+                    let mut sha = blaze_sha256::Sha256::new();
+                    sha.update(b"blaze linux-host sysroot 1\0");
+                    sha.update(&u64::try_from(settings.len()).unwrap_or(u64::MAX).to_le_bytes());
+                    sha.update(&settings);
+                    sha.update(&u64::try_from(ver_bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+                    sha.update(&ver_bytes);
+                    hex(&sha.finish(), alloc)
+                }
+                None => hex(&blaze_sha256::digest(&settings), alloc),
+            }
+        }
         Sysroot::Pinned { .. } => return Err(NativeSettingError::PinnedSysroot { host }),
     };
 
@@ -294,5 +339,5 @@ pub fn native_setting<'a>(
     fs::create_dir_all(work.as_str()).map_err(|error| NativeSettingError::Work { path: work.clone(), error })?;
     let work = resolved(&work, |path, error| NativeSettingError::Work { path, error }, alloc)?;
 
-    Ok(OwnedNativeSetting { shelf, sdk, sdk_version, sysroot, work, deadline: NATIVE_RUN_DEADLINE })
+    Ok(OwnedNativeSetting { shelf, sdk, sdk_extra, sdk_version, sysroot, work, deadline: NATIVE_RUN_DEADLINE })
 }

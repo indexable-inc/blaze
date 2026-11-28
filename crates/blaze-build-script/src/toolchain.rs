@@ -137,6 +137,83 @@ pub const LINUX_HOST_SYSROOT_DIR: &str = "/usr";
 /// Marker header under a Linux host sysroot whose bytes identify the host C library headers.
 pub const LINUX_HOST_SYSROOT_MARKER: &str = "include/features.h";
 
+/// Yields each candidate Linux host sysroot root directory named by `-isystem` or `-idirafter`
+/// flags in `flags` (e.g. `NIX_CFLAGS_COMPILE` or a Nix wrapper's `nix-support/libc-cflags`).
+///
+/// Recognizes separated (`-idirafter /nix/store/.../include`, `-isystem "/nix/store/.../include"`)
+/// and joined (`-isystem/nix/store/.../include`, `-idirafter/nix/store/.../include`) forms.
+/// Only absolute include directories ending in `/include` (after trimming trailing slashes) with
+/// a non-empty parent root are yielded, as that parent root (e.g. `/nix/store/...-glibc-dev`).
+/// Sans-IO: no filesystem access; callers check `<candidate>/include/features.h`.
+pub fn for_each_nix_sysroot_candidate<'a>(flags: &'a str, mut each: impl FnMut(&'a str)) {
+    let bytes = flags.as_bytes();
+    let mut at = 0usize;
+    let mut expect_dir = false;
+    let next_token = |at: &mut usize| -> Option<&'a str> {
+        while let Some(&b) = bytes.get(*at) {
+            if !b.is_ascii_whitespace() {
+                break;
+            }
+            *at += 1;
+        }
+        let &quote = bytes.get(*at)?;
+        if quote == b'"' || quote == b'\'' {
+            *at += 1;
+            let start = *at;
+            while let Some(&b) = bytes.get(*at) {
+                if b == quote {
+                    break;
+                }
+                *at += 1;
+            }
+            let token = flags.get(start..*at)?;
+            if bytes.get(*at) == Some(&quote) {
+                *at += 1;
+            }
+            Some(token)
+        } else {
+            let start = *at;
+            while let Some(&b) = bytes.get(*at) {
+                if b.is_ascii_whitespace() {
+                    break;
+                }
+                *at += 1;
+            }
+            flags.get(start..*at)
+        }
+    };
+    let mut emit_dir = |raw: &'a str| {
+        let trimmed = raw.trim_end_matches('/');
+        if trimmed.starts_with('/')
+            && let Some(root) = trimmed.strip_suffix("/include")
+            && !root.is_empty()
+        {
+            each(root);
+        }
+    };
+    while let Some(token) = next_token(&mut at) {
+        if expect_dir {
+            expect_dir = false;
+            emit_dir(token);
+            continue;
+        }
+        if token == "-isystem" || token == "-idirafter" {
+            expect_dir = true;
+            continue;
+        }
+        if let Some(dir) = token.strip_prefix("-isystem").or_else(|| token.strip_prefix("-idirafter"))
+            && !dir.is_empty()
+        {
+            let unquoted = dir
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| dir.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                .unwrap_or(dir);
+            emit_dir(unquoted);
+        }
+    }
+}
+
 /// Where a target's C library headers come from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sysroot {

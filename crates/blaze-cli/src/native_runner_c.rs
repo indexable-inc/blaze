@@ -101,6 +101,7 @@ static SNAPSHOT_PART_SEQ: AtomicU64 = AtomicU64::new(0);
 /// `SDKROOT`) and the shelf. They show only in the prefix maps, so in no output of two
 /// checkouts differently (rule 25).
 const GUEST_SDK: &str = "/sdk";
+const GUEST_SDK_EXTRA: &str = "/sdk-headers";
 const GUEST_SHELF: &str = "/toolchain/clang";
 /// The folder every crate's guest `OUT_DIR` is under (blaze-build-script env.rs).
 const GUEST_BUILDS: &str = "/target/debug/build";
@@ -165,11 +166,12 @@ impl fmt::Display for Said<'_> {
     }
 }
 
-/// Target C library sysroot for [`CTasks`]: macOS Apple SDK or Linux host `/usr`.
+/// Target C library sysroot for [`CTasks`]: macOS Apple SDK or Linux host sysroot (`/usr` on FHS
+/// Linux, or NixOS glibc-dev resolved at the command's edge).
 #[derive(Clone, Copy)]
 pub(crate) enum TargetSdk<'e> {
     Macos(blaze_apple_sdk::Sdk<'e>),
-    LinuxHost,
+    LinuxHost { dir: Option<&'e str> },
 }
 
 /// Target sysroot identity bytes hashed into `Toolchain::sdk` and `Setup::sdk_digest`.
@@ -248,7 +250,7 @@ fn set_up<'w>(home: Option<&str>, sdk: TargetSdk<'_>, alloc: Alloc<'static>, scr
     let Some(home) = home else { return Err(words(format_args!("HOME is not set, and the shelf and the work folder are beneath it"))) };
     let sdk_folder = match sdk {
         TargetSdk::Macos(sdk) => sdk.folder(),
-        TargetSdk::LinuxHost => blaze_build_script::toolchain::LINUX_HOST_SYSROOT_DIR,
+        TargetSdk::LinuxHost { dir } => dir.unwrap_or(blaze_build_script::toolchain::LINUX_HOST_SYSROOT_DIR),
     };
     let setting = command_native_setting(home, sdk_folder, WORK, crate::graph::TRIPLE, alloc).map_err(|e| words(format_args!("{e}")))?;
     let mut clang = String::from_str_in(setting.shelf.as_str(), alloc);
@@ -268,7 +270,7 @@ fn set_up<'w>(home: Option<&str>, sdk: TargetSdk<'_>, alloc: Alloc<'static>, scr
     let area = String::from_str_in(real, alloc);
     let sdk_key = match sdk {
         TargetSdk::Macos(sdk) => SdkKey::Macos(sdk.identity().key()),
-        TargetSdk::LinuxHost => {
+        TargetSdk::LinuxHost { .. } => {
             let bytes = hex32(setting.sdk_version.as_str())
                 .ok_or_else(|| words(format_args!("Linux host sysroot digest is malformed: {}", setting.sdk_version.as_str())))?;
             SdkKey::LinuxHost(bytes)
@@ -482,10 +484,17 @@ pub(crate) fn built_for<'s, 'm: 's>(
         blaze_build_script::toolchain::Sysroot::LinuxHost => "the Linux host sysroot",
         blaze_build_script::toolchain::Sysroot::Pinned { .. } => "the pinned sysroot",
     };
+    let sdk_extra = setup.setting.sdk_extra.as_ref().map(|host| Laid {
+        guest: GUEST_SDK_EXTRA,
+        host: host.as_str(),
+        digest: setup.sdk_digest,
+        name: "the Linux host kernel headers",
+    });
     let setting = CTasksSetting {
         clang: setup.clang.as_str(),
         shelf: Laid { guest: GUEST_SHELF, host: setup_shelf, digest: setup.compiler, name: "the pinned clang's shelf" },
         sdk: Laid { guest: GUEST_SDK, host: setup.setting.sdk.as_str(), digest: setup.sdk_digest, name: sdk_name },
+        sdk_extra,
         sysroot: setup.sysroot,
         work: setup.setting.work.as_str(),
         area: setup.area.as_str(),
