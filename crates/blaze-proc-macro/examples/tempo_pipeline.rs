@@ -712,8 +712,8 @@ fn main() {
         // A crate with no module lists no exports here, so a call of it reads as unresolved
         // (its exports are in its source, which this example does not read).
         let exports = match procs.exports(key) {
-            Some(exports) => exports,
-            None => {
+            Ok(Some(exports)) => exports,
+            Ok(None) | Err(_) => {
                 println!("macro crate {name} {version}: no module");
                 &[]
             }

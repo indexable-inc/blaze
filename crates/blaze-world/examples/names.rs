@@ -1095,8 +1095,8 @@ impl SourceTexts<'static> for Timed<'_> {
         self.procs?.keys[krate]
     }
 
-    fn proc_exports(&self, krate: usize) -> Option<&'static [blaze_scope::task::ProcExport<'static>]> {
-        self.procs?.exports[krate]
+    fn proc_exports(&self, krate: usize) -> Result<Option<&'static [blaze_scope::task::ProcExport<'static>]>, &'static str> {
+        Ok(self.procs.and_then(|p| p.exports.get(krate).copied().flatten()))
     }
 
     fn run_proc_macro<'b>(
@@ -1204,7 +1204,9 @@ fn procs_of<P: blaze_world::Packages<'static>>(store: &FsPath, out: &FsPath, roo
         .map(|key| {
             let key = (*key)?;
             let list: Vec<blaze_scope::task::ProcExport<'static>> = procs
-                .exports(key)?
+                .exports(key)
+                .ok()
+                .flatten()?
                 .iter()
                 .map(|e| blaze_scope::task::ProcExport { kind: e.kind, name: String::leak(e.name.clone()), helpers: String::leak(e.helpers.join(", ")) })
                 .collect();

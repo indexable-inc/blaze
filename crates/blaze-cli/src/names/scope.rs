@@ -193,7 +193,7 @@ impl<'t, 'n> SourceTexts<'n> for ParTexts<'t, 'n> {
         self.inner.proc_macro_key(krate)
     }
 
-    fn proc_exports(&self, krate: usize) -> Option<&'n [ProcExport<'n>]> {
+    fn proc_exports(&self, krate: usize) -> Result<Option<&'n [ProcExport<'n>]>, &'n str> {
         self.inner.proc_exports(krate)
     }
 

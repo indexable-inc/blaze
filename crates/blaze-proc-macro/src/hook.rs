@@ -395,14 +395,17 @@ impl<'r> ProcMacros<'r> {
         }
     }
 
-    /// The macros `key`'s module exports: `Some(macros)` when `key` is registered and has a
-    /// loaded module (including an empty slice when the module exports zero macros), or `None`
-    /// when `key` is not registered or has no module.
-    pub fn exports(&self, key: CrateItemKey) -> Option<&[Exported]> {
-        match self.crates.iter().find(|it| it.key == key).map(MacroCrate::resolve_module) {
-            Some(Ok(module)) => Some(&module.macros),
-            _ => None,
-        }
+    /// The macros `key`'s module exports:
+    /// - `Ok(Some(macros))` when `key` is registered and has a loaded module (including an empty
+    ///   slice when the module exports zero macros),
+    /// - `Ok(None)` when `key` is not registered with this runner,
+    /// - `Err(error)` when `key` is registered but its module is missing or unreadable (never
+    ///   silently collapsed to `Ok(None)`, rule 3).
+    pub fn exports(&self, key: CrateItemKey) -> Result<Option<&[Exported]>, &ModuleError> {
+        let Some(krate) = self.crates.iter().find(|it| it.key == key) else {
+            return Ok(None);
+        };
+        krate.resolve_module().map(|module| Some(module.macros.as_slice()))
     }
 
     /// Each registered crate: its key, `name version`, and whether it has a module.
@@ -1025,9 +1028,12 @@ mod listed_dir_tests {
             Err(ModuleError::Missing { name: "missing_macros".into(), version: "0.1.0".into(), key: "missing".into() }),
         );
 
-        assert_eq!(procs.exports(key_with), Some(exported.as_slice()));
-        assert_eq!(procs.exports(key_empty), Some(&[][..]));
-        assert_eq!(procs.exports(key_missing), None);
-        assert_eq!(procs.exports(key_unknown), None);
+        assert_eq!(procs.exports(key_with).ok().flatten(), Some(exported.as_slice()));
+        assert_eq!(procs.exports(key_empty).ok().flatten(), Some(&[][..]));
+        assert!(
+            matches!(procs.exports(key_missing), Err(ModuleError::Missing { .. })),
+            "missing registered module must return Err(ModuleError::Missing), not Ok(None)"
+        );
+        assert_eq!(procs.exports(key_unknown).ok(), Some(None));
     }
 }

@@ -751,11 +751,18 @@ impl<'f> NamesStage<'f> {
                     });
                     let script = names.script_of(at).map(|script| lookup(&self.made, name, script, failed_out)).transpose()?;
                     let macro_module = macro_module_input(&self.made, names.list(), at, failed_out);
-                    let gate = match (runner, world.refusal(at), script) {
-                        (Err(words), _, _) => Err(Blocked::Runner(words)),
-                        (_, Some(why), _) => Err(Blocked::Shelf(why)),
-                        (_, _, Some((input, true))) => Err(Blocked::Script(input.name)),
-                        (Ok(procs), None, _) => Ok(procs),
+                    let gate = match (runner, world.refusal(at), script, macro_module) {
+                        (Err(words), _, _, _) => Err(Blocked::Runner(words)),
+                        (_, Some(why), _, _) => Err(Blocked::Shelf(why)),
+                        (_, _, Some((input, true)), _) => Err(Blocked::Script(input.name)),
+                        (_, _, _, Some((input, true))) => Err(Blocked::MacroModule(input.name)),
+                        (Ok(procs), None, _, _) => match procs.and_then(|p| p.exports_of(at).err()) {
+                            Some(error) => {
+                                let krate = crates.get(at).map_or("", |c| c.input.name);
+                                Err(Blocked::ProcModule(blaze_own::format_in!(&own, "crate `{krate}`: {error}").into_bump_str()))
+                            }
+                            None => Ok(procs),
+                        },
                     };
                     let script_bytes = match (gate.is_ok(), script) {
                         (true, Some((input, _))) => {
@@ -827,7 +834,11 @@ impl<'f> NamesStage<'f> {
                                     let why = Why::Refused { what: "a crate the toolchain shelf cannot build", rule: crate::names::RULE };
                                     return Ok(fail(why, Some(blaze_own::format_in!(alloc, "crate `{}`: {reason}", crates[at].input.name))));
                                 }
-                                Err(Blocked::Script(on)) => return Ok(fail(Why::Waited { on }, None)),
+                                Err(Blocked::Script(on)) | Err(Blocked::MacroModule(on)) => return Ok(fail(Why::Waited { on }, None)),
+                                Err(Blocked::ProcModule(message)) => {
+                                    let why = Why::Refused { what: "a proc-macro crate's compiled module is unavailable", rule: crate::names::RULE };
+                                    return Ok(fail(why, Some(blaze_own::String::from_str_in(message, alloc))));
+                                }
                                 Ok(procs) => procs,
                             };
                             for dep in &mut deps {
@@ -1705,11 +1716,15 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         let script = names.script_of(at).map(|script| lookup(&stage.made, name, script, stage.failed_out)).transpose()?;
         let macro_module = macro_module_input(&stage.made, names.list(), at, stage.failed_out);
         let refused = |what| Why::Refused { what, rule: crate::names::RULE };
-        let mut gate = match (runner, world.refusal(at), script) {
-            (Err(words), _, _) => Err((refused("the proc-macro runner could not be made"), Some(blaze_own::String::from_str_in(words, alloc)))),
-            (_, Some(reason), _) => Err((refused("a crate the toolchain shelf cannot build"), Some(blaze_own::format_in!(alloc, "crate `{krate}`: {reason}")))),
-            (_, _, Some((input, true))) => Err((Why::Waited { on: input.name }, None)),
-            (Ok(procs), None, _) => Ok(procs),
+        let mut gate = match (runner, world.refusal(at), script, macro_module) {
+            (Err(words), _, _, _) => Err((refused("the proc-macro runner could not be made"), Some(blaze_own::String::from_str_in(words, alloc)))),
+            (_, Some(reason), _, _) => Err((refused("a crate the toolchain shelf cannot build"), Some(blaze_own::format_in!(alloc, "crate `{krate}`: {reason}")))),
+            (_, _, Some((input, true)), _) => Err((Why::Waited { on: input.name }, None)),
+            (_, _, _, Some((input, true))) => Err((Why::Waited { on: input.name }, None)),
+            (Ok(procs), None, _, _) => match proc_module_gate(procs, at, krate, alloc) {
+                Some(blocked) => Err(blocked),
+                None => Ok(procs),
+            },
         };
         let script_bytes = match (gate.is_ok(), script) {
             (true, Some((input, _))) => Some((input, self.frame.alloc(work::payload(cx, store, &input, self.frame)?).payload())),
@@ -1975,6 +1990,24 @@ enum Blocked<'j> {
     Runner(&'j str),
     Shelf(&'j blaze_scope::units::UnitsError<'j>),
     Script(Name),
+    MacroModule(Name),
+    ProcModule(&'j str),
+}
+
+/// Checks whether a proc-macro crate's registered module in `procs` is unavailable (missing or
+/// unreadable), returning a typed `Why::Refused` gate error instead of letting `CrateScope`
+/// silently fall back to parsing source text (rule 3).
+fn proc_module_gate<'a>(
+    procs: Option<&crate::proc_runner::ProcRunner<'_>>,
+    at: usize,
+    krate: &str,
+    alloc: SharedAlloc<'a>,
+) -> Option<(Why, Option<blaze_own::String<SharedAlloc<'a>>>)> {
+    let error = procs?.exports_of(at).err()?;
+    Some((
+        Why::Refused { what: "a proc-macro crate's compiled module is unavailable", rule: crate::names::RULE },
+        Some(blaze_own::format_in!(alloc, "crate `{krate}`: {error}")),
+    ))
 }
 
 /// The input `name` (a dependency's names or the crate's script) as made so far. A name not in
@@ -3454,5 +3487,50 @@ mod proc_macro_reads_tests {
             crate::names::crate_scope_source(key, false),
             "proc-macro CrateScope source must move off pre-fix cached records"
         );
+
+        // Failed `MacroModule` blocks `CrateScope` (`failure_reads` records `ABSENT` so recovery wakes it).
+        let reads_fail = failure_reads(&[], None, None, Some((in_fail, absent_fail)), heap.shared());
+        assert_eq!(reads_fail.as_slice(), &[(CellId { of: mm, cell: WHOLE }, blaze_drive::key::ABSENT)]);
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn proc_module_gate_refuses_unavailable_registered_module_without_text_fallback() {
+        use blaze_expand::ProcKind;
+        use blaze_id::CrateItemKey;
+        use blaze_proc_macro::module::{Exported, ModuleError, ModuleRecord};
+
+        let heap = blaze_own::testing::heap();
+        let env = crate::proc_runner::TestProcEnv::new(heap);
+        let loaded = ModuleRecord {
+            key: std::string::String::from("ok"),
+            name: std::string::String::from("askama_macros"),
+            version: std::string::String::from("0.15.6"),
+            wasm_sha256: std::string::String::from("00"),
+            macros: std::vec![Exported { index: 0, kind: ProcKind::Derive, name: "Template".into(), helpers: std::vec!["template".into()] }],
+            decls: std::string::String::from("_DECLS"),
+            dir: std::path::PathBuf::new(),
+            compiled: std::path::PathBuf::new(),
+            native_dylib: None,
+        };
+        let runner = env.runner(std::vec![
+            (0, CrateItemKey(ContentId([1; 32])), "askama_macros", Ok(loaded)),
+            (
+                1,
+                CrateItemKey(ContentId([2; 32])),
+                "missing_macros",
+                Err(ModuleError::Missing { name: "missing_macros".into(), version: "0.1.0".into(), key: "missing".into() }),
+            ),
+        ]);
+
+        assert!(proc_module_gate(Some(&runner), 0, "askama_macros", heap.shared()).is_none(), "loaded module passes gate");
+        assert!(proc_module_gate(Some(&runner), 9, "regular_crate", heap.shared()).is_none(), "unregistered non-proc-macro crate passes gate");
+        assert!(proc_module_gate(None, 0, "askama_macros", heap.shared()).is_none(), "no runner passes gate");
+
+        let (why, words) = proc_module_gate(Some(&runner), 1, "missing_macros", heap.shared())
+            .expect("missing registered proc-macro module must be refused at gate");
+        assert!(matches!(why, Why::Refused { what: "a proc-macro crate's compiled module is unavailable", .. }));
+        let msg = words.expect("refusal message");
+        assert!(msg.as_str().contains("missing_macros"), "refusal message must name the crate: {}", msg.as_str());
     }
 }

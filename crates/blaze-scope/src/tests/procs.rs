@@ -193,8 +193,8 @@ pub struct Point;
         fn proc_macro_key(&self, krate: usize) -> Option<CrateItemKey> {
             (krate == 1).then_some(RUNNER)
         }
-        fn proc_exports(&self, krate: usize) -> Option<&'static [ProcExport<'static>]> {
-            (krate == 1).then_some(&LIST[..])
+        fn proc_exports(&self, krate: usize) -> Result<Option<&'static [ProcExport<'static>]>, &'static str> {
+            Ok((krate == 1).then_some(&LIST[..]))
         }
     }
     static LISTED: Listed = Listed;
