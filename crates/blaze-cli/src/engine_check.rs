@@ -568,8 +568,10 @@ pub(crate) struct LazySdk<'f> {
     fs: &'f bstd::fs::Fs,
     sdkroot: Option<&'f str>,
     xcrun_env: crate::sdk::XcrunEnv<'f>,
+    linux_sysroot_env: crate::sdk::LinuxSysrootEnv<'f>,
     frame: &'f Frame,
     resolved: core::cell::OnceCell<Result<blaze_apple_sdk::Sdk<'f>, blaze_apple_sdk::SdkRefused<'f>>>,
+    linux_sysroot: core::cell::OnceCell<Result<Option<crate::sdk::LinuxHostSysroot<'f>>, crate::sdk::LinuxSysrootError<'f>>>,
 }
 
 impl<'f> LazySdk<'f> {
@@ -619,6 +621,14 @@ impl<'f> LazySdk<'f> {
         wall_ns: u64,
     ) -> Result<blaze_apple_sdk::Sdk<'f>, blaze_apple_sdk::SdkRefused<'f>> {
         self.resolve_raw(cx, blaze_home, wall_ns).0
+    }
+
+    /// Resolves the Linux host sysroot root directory lazily on first demand (at most once per
+    /// command via `OnceCell`, 0 ms cost on macOS and pure-Rust checks/runs).
+    fn resolve_linux_sysroot(&self) -> Result<Option<crate::sdk::LinuxHostSysroot<'f>>, crate::sdk::LinuxSysrootError<'f>> {
+        *self.linux_sysroot.get_or_init(|| {
+            crate::sdk::resolve_linux_host_sysroot(&self.linux_sysroot_env, self.frame)
+        })
     }
 
     fn sdk_digest(&self, cx: &Cx, blaze_home: Option<&Dir<ReadWrite>>, wall_ns: u64) -> Result<[u8; 32], CliError> {
@@ -777,8 +787,14 @@ fn edge_at<'l, R>(
             home: var("HOME"),
             toolchains: var("TOOLCHAINS"),
         },
+        linux_sysroot_env: crate::sdk::LinuxSysrootEnv {
+            path: var("PATH"),
+            nix_cflags_compile: var("NIX_CFLAGS_COMPILE"),
+            nix_ldflags: var("NIX_LDFLAGS"),
+        },
         frame,
         resolved: core::cell::OnceCell::new(),
+        linux_sysroot: core::cell::OnceCell::new(),
     };
     let sdk = Err(blaze_apple_sdk::SdkRefused::Neither { xcrun: blaze_apple_sdk::XcrunFailed::NotMacos });
     // The checkout's absolute root: the one resolution of the start folder a command makes
@@ -922,6 +938,9 @@ pub(crate) struct Standing<'r, 'm> {
     /// Deferred macOS SDK resolver (covariant in `'r`, backed by `LazySdk`'s `OnceCell`) and
     /// already-opened `~/.blaze` directory so pure-Rust starts pay 0 ms for SDK probing.
     sdk_resolver: &'r dyn Fn(&Cx, Option<&Dir<ReadWrite>>, u64) -> Result<blaze_apple_sdk::Sdk<'r>, blaze_apple_sdk::SdkRefused<'r>>,
+    /// Deferred Linux host sysroot resolver (backed by `LazySdk`'s `OnceCell`, using only the
+    /// edge-injected `PATH`, `NIX_CFLAGS_COMPILE`, and `NIX_LDFLAGS`).
+    linux_sysroot_resolver: crate::native_runner_c::LinuxSysrootResolver<'r>,
     home_dir: Option<&'r Dir<ReadWrite>>,
     /// Check-time command probes (`SharedCommandProbes`) carried into start-time proc-macro
     /// runners (`RunProcs`) so `run`/`test`/`export` reuse the exact probe/pin snapshot that
@@ -977,6 +996,13 @@ impl<'r, 'm> Standing<'r, 'm> {
         let sdk = (self.sdk_resolver)(cx, self.home_dir, self.lent.wall_ns());
         self.place.sdk = sdk;
         sdk
+    }
+
+    /// Returns the lazy Linux host sysroot resolver (backed by `LazySdk`'s `OnceCell`) so
+    /// [`crate::native_runner_c::CTasks`] defers host-sysroot discovery until a crate actually
+    /// has deferred C requests.
+    pub(crate) fn linux_sysroot_resolver(&self) -> crate::native_runner_c::LinuxSysrootResolver<'r> {
+        self.linux_sysroot_resolver
     }
     /// E2's answer (engine_run_answer.rs) over the stored rows and the store: what run_ids.rs
     /// walks for the body ids and reads each body's facts from.
@@ -2394,8 +2420,14 @@ pub(crate) fn open_pinned_standing<R>(
             home: var("HOME").or(Some(store_home)),
             toolchains: var("TOOLCHAINS"),
         },
+        linux_sysroot_env: crate::sdk::LinuxSysrootEnv {
+            path: var("PATH"),
+            nix_cflags_compile: var("NIX_CFLAGS_COMPILE"),
+            nix_ldflags: var("NIX_LDFLAGS"),
+        },
         frame,
         resolved: core::cell::OnceCell::new(),
+        linux_sysroot: core::cell::OnceCell::new(),
     };
     let sdk = Err(blaze_apple_sdk::SdkRefused::Neither { xcrun: blaze_apple_sdk::XcrunFailed::NotMacos });
     let served = crate::engine_script_reads::Served::at_edge(cx.is_simulated(), checkout_abs, frame)
@@ -2478,6 +2510,7 @@ pub(crate) fn open_pinned_standing<R>(
     let sdk_resolver = |cx: &Cx, home_dir: Option<&Dir<ReadWrite>>, wall_ns: u64| {
         lazy_sdk.resolve_on_demand(cx, home_dir, wall_ns)
     };
+    let linux_sysroot_resolver = || lazy_sdk.resolve_linux_sysroot();
     let command_probes = crate::scripts::SharedCommandProbes::new();
     let _ = seed_pinned_dep_probes(
         cx,
@@ -2515,6 +2548,7 @@ pub(crate) fn open_pinned_standing<R>(
         picked: Some(picked),
         test_packages: None,
         sdk_resolver: &sdk_resolver,
+        linux_sysroot_resolver: &linux_sysroot_resolver,
         home_dir: Some(opened.home.dir()),
         probes: &command_probes,
     };
@@ -2962,6 +2996,7 @@ fn check_and_open<R>(
         let sdk_resolver = |cx: &Cx, home_dir: Option<&Dir<ReadWrite>>, wall_ns: u64| {
             lazy_sdk.resolve_on_demand(cx, home_dir, wall_ns)
         };
+        let linux_sysroot_resolver = || lazy_sdk.resolve_linux_sysroot();
         let standing = match (pointer.as_ref(), rows.as_ref(), stored.as_ref(), graph) {
             (Some(pointer), Some(rows_ref), Some(stored_ref), Some(graph)) if refused.get().is_none() => {
                 let records: &dyn crate::engine_run_answer::Records = stored_ref;
@@ -2990,6 +3025,7 @@ fn check_and_open<R>(
                     picked,
                     test_packages: selected_packages,
                     sdk_resolver: &sdk_resolver,
+                    linux_sysroot_resolver: &linux_sysroot_resolver,
                     home_dir: Some(opened.home.dir()),
                     probes: &command_probes,
                 })

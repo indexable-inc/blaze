@@ -806,7 +806,7 @@ fn prepare_crates<'r, 'm: 's, 's>(
                 return Err(NativeError::Sdk { words: held(bstd::mem::format_in!(scratch, "{why}").as_str(), ask) });
             }
         },
-        Platform::LinuxArm64 => (None, crate::native_runner_c::TargetSdk::LinuxHost),
+        Platform::LinuxArm64 => (None, crate::native_runner_c::TargetSdk::LinuxHost(standing.linux_sysroot_resolver())),
     };
     // Disjoint fields: the ask and the readers are shared, the store is the one mutable borrow.
     let (ask, names, graph) = (&standing.native, standing.names, standing.graph);

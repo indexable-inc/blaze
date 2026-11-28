@@ -231,7 +231,148 @@ fn linux_host_native_setting_accepts_linux_shelf_and_features_h() {
     fs::write(sdk.join(LINUX_HOST_SYSROOT_MARKER), b"#define __GLIBC__ 2\n").expect("features.h");
     let owned = command_native_setting(home_s, sdk_s, "test", LINUX_HOST, alloc).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(owned.sysroot, Sysroot::LinuxHost);
+    assert_eq!(owned.sdk_extra, None);
     assert_eq!(owned.shelf.as_str().rsplit('/').next(), Some(LINUX_PIN_HEX));
     assert_eq!(owned.sdk_version.len(), 64);
+
+    // NixOS split kernel headers: `<sdk>/include/linux` symlinks to a separate store root.
+    // `sdk_extra` records that root for Landlock, and `sdk_version` commits to every header file
+    // byte under both `<sdk>/include` and `<sdk_extra>/include` (e.g. changing `asm/errno.h`
+    // while keeping `features.h` and `linux/version.h` identical must move `sdk_version`), while
+    // remaining path-independent across two identical copies at different directories.
+    #[cfg(unix)]
+    {
+        let headers = home.join("linux-headers-7.2");
+        fs::create_dir_all(headers.join("include/linux")).expect("linux headers dir");
+        fs::create_dir_all(headers.join("include/asm")).expect("asm headers dir");
+        fs::write(headers.join("include/linux/version.h"), b"#define LINUX_VERSION_CODE 1\n").expect("version.h");
+        fs::write(headers.join("include/asm/errno.h"), b"#define EINVAL 22\n").expect("asm/errno.h");
+        std::os::unix::fs::symlink(headers.join("include/linux"), sdk.join("include/linux")).expect("symlink linux");
+        std::os::unix::fs::symlink(headers.join("include/asm"), sdk.join("include/asm")).expect("symlink asm");
+
+        let split_a = command_native_setting(home_s, sdk_s, "test", LINUX_HOST, alloc).unwrap_or_else(|e| panic!("{e}"));
+        let expected_extra = fs::canonicalize(&headers).expect("canon headers");
+        assert_eq!(split_a.sdk_extra.as_ref().map(|s| s.as_str()), expected_extra.to_str());
+        assert_eq!(split_a.sdk_version.len(), 64);
+        assert_ne!(split_a.sdk_version.as_str(), owned.sdk_version.as_str());
+
+        // Identical header bytes in a different directory produce the exact same path-independent `sdk_version`.
+        let sdk_copy = home.join("glibc-copy");
+        let headers_copy = home.join("linux-headers-copy");
+        fs::create_dir_all(sdk_copy.join("include")).expect("copy inc");
+        fs::create_dir_all(headers_copy.join("include/linux")).expect("copy linux");
+        fs::create_dir_all(headers_copy.join("include/asm")).expect("copy asm");
+        fs::write(sdk_copy.join(LINUX_HOST_SYSROOT_MARKER), b"#define __GLIBC__ 2\n").expect("copy features.h");
+        fs::write(headers_copy.join("include/linux/version.h"), b"#define LINUX_VERSION_CODE 1\n").expect("copy version.h");
+        fs::write(headers_copy.join("include/asm/errno.h"), b"#define EINVAL 22\n").expect("copy asm/errno.h");
+        std::os::unix::fs::symlink(headers_copy.join("include/linux"), sdk_copy.join("include/linux")).expect("copy symlink linux");
+        std::os::unix::fs::symlink(headers_copy.join("include/asm"), sdk_copy.join("include/asm")).expect("copy symlink asm");
+        let split_copy = command_native_setting(home_s, sdk_copy.to_str().expect("utf8"), "test", LINUX_HOST, alloc)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(split_a.sdk_version.as_str(), split_copy.sdk_version.as_str());
+
+        // Changing an arbitrary header (`asm/errno.h`) while keeping `features.h` and `linux/version.h`
+        // unchanged MUST invalidate `sdk_version`.
+        fs::write(headers.join("include/asm/errno.h"), b"#define EINVAL 22\n#define EAGAIN 11\n").expect("asm/errno.h v2");
+        let split_b = command_native_setting(home_s, sdk_s, "test", LINUX_HOST, alloc).unwrap_or_else(|e| panic!("{e}"));
+        assert_ne!(split_a.sdk_version.as_str(), split_b.sdk_version.as_str());
+
+        // Retargeting a directory symlink (`include/asm` from `arch-a` to `arch-b` while BOTH
+        // target trees remain present on disk) MUST move `sdk_version`.
+        let retarget_sdk = home.join("glibc-retarget");
+        fs::create_dir_all(retarget_sdk.join("include/arch-a")).expect("arch-a");
+        fs::create_dir_all(retarget_sdk.join("include/arch-b")).expect("arch-b");
+        fs::write(retarget_sdk.join(LINUX_HOST_SYSROOT_MARKER), b"#define __GLIBC__ 2\n").expect("retarget features.h");
+        fs::write(retarget_sdk.join("include/arch-a/errno.h"), b"#define EINVAL 22\n").expect("arch-a errno.h");
+        fs::write(retarget_sdk.join("include/arch-b/errno.h"), b"#define EINVAL 99\n").expect("arch-b errno.h");
+        std::os::unix::fs::symlink(retarget_sdk.join("include/arch-a"), retarget_sdk.join("include/asm")).expect("asm -> arch-a");
+        let retarget_a = command_native_setting(home_s, retarget_sdk.to_str().expect("utf8"), "test", LINUX_HOST, alloc)
+            .unwrap_or_else(|e| panic!("{e}"));
+        fs::remove_file(retarget_sdk.join("include/asm")).expect("rm asm link");
+        std::os::unix::fs::symlink(retarget_sdk.join("include/arch-b"), retarget_sdk.join("include/asm")).expect("asm -> arch-b");
+        let retarget_b = command_native_setting(home_s, retarget_sdk.to_str().expect("utf8"), "test", LINUX_HOST, alloc)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_ne!(
+            retarget_a.sdk_version.as_str(),
+            retarget_b.sdk_version.as_str(),
+            "retargeting directory symlink include/asm must move sdk_version even when both target dirs stay on disk"
+        );
+
+        // Split libc runtime `sdk_lib` is canonicalized, stored, and hashed into `sdk_version`:
+        // changing any link input (e.g. `crt1.o`) invalidates `sdk_version`.
+        let libc_lib = home.join("glibc-2.44/lib");
+        fs::create_dir_all(&libc_lib).expect("glibc lib");
+        fs::write(libc_lib.join("crt1.o"), b"crt-v1").expect("crt1.o");
+        fs::write(libc_lib.join("libc.so"), b"GROUP ( libc.so.6 )\n").expect("libc.so");
+        let libc_lib_s = libc_lib.to_str().expect("utf8");
+        let with_lib_a = crate::native_setting::command_native_setting_with_lib(
+            home_s,
+            sdk_s,
+            Some(libc_lib_s),
+            "test",
+            LINUX_HOST,
+            alloc,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let expected_lib = fs::canonicalize(&libc_lib).expect("canon lib");
+        assert_eq!(with_lib_a.sdk_lib.as_ref().map(|s| s.as_str()), expected_lib.to_str());
+        assert_ne!(with_lib_a.sdk_version.as_str(), split_b.sdk_version.as_str());
+
+        fs::write(libc_lib.join("crt1.o"), b"crt-v2").expect("crt1.o v2");
+        let with_lib_b = crate::native_setting::command_native_setting_with_lib(
+            home_s,
+            sdk_s,
+            Some(libc_lib_s),
+            "test",
+            LINUX_HOST,
+            alloc,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_ne!(with_lib_a.sdk_version.as_str(), with_lib_b.sdk_version.as_str());
+
+        // Negative control: a symlink loop on `<sdk>/include/linux` propagates `NoSdk` naming
+        // `include/linux` instead of silently dropping `sdk_extra`.
+        let broken_sdk = home.join("glibc-broken");
+        fs::create_dir_all(broken_sdk.join("include")).expect("broken inc");
+        fs::write(broken_sdk.join(LINUX_HOST_SYSROOT_MARKER), b"#define __GLIBC__ 2\n").expect("broken features.h");
+        std::os::unix::fs::symlink(broken_sdk.join("include/linux"), broken_sdk.join("include/linux")).expect("loop symlink");
+        let loop_err = command_native_setting(home_s, broken_sdk.to_str().expect("utf8"), "test", LINUX_HOST, alloc)
+            .expect_err("symlink loop on include/linux must fail with NoSdk");
+        match loop_err {
+            NativeSettingError::NoSdk { path, .. } => {
+                assert!(path.as_str().ends_with("/include/linux"), "expected include/linux path, got {}", path.as_str());
+            }
+            other => panic!("expected NoSdk, got {other}"),
+        }
+
+        // Negative control: symlinks to non-regular targets (`/dev/zero`, `/dev/null`, and a real
+        // Unix FIFO) inside a non-FHS sysroot must be rejected immediately as `NoSdk` without
+        // opening or blocking.
+        let fifo_dir = home.join("fifo-target");
+        fs::create_dir_all(&fifo_dir).expect("fifo dir");
+        let fifo_path = fifo_dir.join("hang.fifo");
+        let fifo_c = std::ffi::CString::new(fifo_path.to_str().expect("utf8 fifo")).expect("cstr");
+        // SAFETY: `fifo_c` is a valid NUL-terminated path pointing into our temp test dir.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0, "mkfifo failed");
+
+        for (tag, target) in [
+            ("dev-null", std::path::Path::new("/dev/null")),
+            ("dev-zero", std::path::Path::new("/dev/zero")),
+            ("fifo", fifo_path.as_path()),
+        ] {
+            let hostile_sdk = home.join(format!("glibc-hostile-{tag}"));
+            fs::create_dir_all(hostile_sdk.join("include")).expect("hostile inc");
+            fs::write(hostile_sdk.join(LINUX_HOST_SYSROOT_MARKER), b"#define __GLIBC__ 2\n").expect("hostile features.h");
+            std::os::unix::fs::symlink(target, hostile_sdk.join("include/hostile.h")).expect("hostile symlink");
+            let err = command_native_setting(home_s, hostile_sdk.to_str().expect("utf8"), "test", LINUX_HOST, alloc)
+                .expect_err("non-regular symlink target must be refused immediately");
+            match err {
+                NativeSettingError::NoSdk { path, .. } => {
+                    assert!(path.as_str().ends_with("/include/hostile.h"), "expected hostile.h path for {tag}, got {}", path.as_str());
+                }
+                other => panic!("expected NoSdk for {tag}, got {other}"),
+            }
+        }
+    }
     let _ = fs::remove_dir_all(&home);
 }
