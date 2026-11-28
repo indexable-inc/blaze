@@ -405,16 +405,21 @@ impl Tree {
                     .map_err(|e| blaze_own::format_in!(alloc, "cannot open `{rel}`: {e}"))?;
                 let cap = usize::try_from(meta.len()).unwrap_or(0);
                 let mut buf: blaze_own::AVec<'a, u8> = blaze_own::Vec::with_capacity_in(cap, alloc);
+                const MAX_EINTR_RETRIES: u32 = 16;
                 let mut chunk = [0u8; 8192];
+                let mut eintr_retries: u32 = 0;
                 loop {
                     match IoRead::read(&mut file, &mut chunk) {
                         Ok(0) => break,
                         Ok(n) => {
+                            eintr_retries = 0;
                             if let Some(slice) = chunk.get(..n) {
                                 buf.extend_from_slice(slice);
                             }
                         }
-                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                        Err(e) if e.kind() == ErrorKind::Interrupted && eintr_retries < MAX_EINTR_RETRIES => {
+                            eintr_retries += 1;
+                        }
                         Err(e) => return Err(blaze_own::format_in!(alloc, "cannot read `{rel}`: {e}")),
                     }
                 }

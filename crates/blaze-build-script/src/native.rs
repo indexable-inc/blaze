@@ -1353,6 +1353,7 @@ fn scan_source_core<'s, S: ScanSink<'s>>(
     let mut excluded_depth: usize = 0;
     let mut paren_depth: usize = 0;
     let mut pending_excluded = false;
+    let mut pending_excluded_host_active = false;
     let mut pending_depth: usize = 0;
     let mut stmt_needs_semi = false;
     let mut pending_path_attr: Option<StrLit<'s>> = None;
@@ -1361,7 +1362,10 @@ fn scan_source_core<'s, S: ScanSink<'s>>(
     let mut pending_macro_use_depth: usize = 0;
     let mut pending_macro_export = false;
     let mut pending_macro_export_depth: usize = 0;
+    let mut pending_diverging_cfg_attr = false;
+    let mut pending_diverging_cfg_attr_depth: usize = 0;
     let mut pending_inline_mod: Option<PendingInlineMod<'s>> = None;
+    let mut imported_std_env = false;
     let mut prev: Option<Token<'s>> = None;
     let mut prev_prev: Option<Token<'s>> = None;
     let mut path_segs: [&'s str; MAX_QUAL_SEGS] = [""; MAX_QUAL_SEGS];
@@ -1427,9 +1431,28 @@ fn scan_source_core<'s, S: ScanSink<'s>>(
                         *slot = true;
                         excluded_depth += 1;
                     }
-                } else if attr_cfg.wasi == TriBool::False && excluded_depth == 0 {
-                    pending_excluded = true;
-                    pending_depth = brace_depth;
+                } else if excluded_depth == 0 {
+                    if attr_cfg.wasi == TriBool::False {
+                        if pending_excluded && pending_depth == brace_depth {
+                            pending_excluded_host_active &= attr_cfg.host != TriBool::False;
+                        } else {
+                            pending_excluded = true;
+                            pending_excluded_host_active = attr_cfg.host != TriBool::False;
+                            pending_depth = brace_depth;
+                        }
+                    } else if pending_excluded && pending_depth == brace_depth {
+                        pending_excluded_host_active &= attr_cfg.host != TriBool::False;
+                    }
+                }
+            }
+            if attr.diverging_cfg_attr {
+                if inner {
+                    if excluded_depth == 0 {
+                        return Some(NativeSourceReason::HostFamilyCfg);
+                    }
+                } else {
+                    pending_diverging_cfg_attr = true;
+                    pending_diverging_cfg_attr_depth = brace_depth;
                 }
             }
             if !inner && let Some(path_val) = attr.path {
@@ -1497,10 +1520,12 @@ fn scan_source_core<'s, S: ScanSink<'s>>(
                 lex = look;
                 if pending_excluded && brace_depth == pending_depth && !stmt_needs_semi {
                     pending_excluded = false;
+                    pending_excluded_host_active = false;
                 }
                 pending_path_attr = None;
                 pending_macro_use = false;
                 pending_macro_export = false;
+                pending_diverging_cfg_attr = false;
                 prev_prev = prev;
                 prev = Some(close);
                 path_len = 0;
@@ -1519,10 +1544,21 @@ fn scan_source_core<'s, S: ScanSink<'s>>(
                     stmt_needs_semi = true;
                 }
                 Token::Ident("fn") => {
+                    if is_root
+                        && brace_depth == 0
+                        && excluded_depth == 0
+                        && pending_excluded_host_active
+                    {
+                        let mut look = lex;
+                        if look.next_token() == Some(Token::Ident("main")) {
+                            return Some(NativeSourceReason::HostFamilyCfg);
+                        }
+                    }
                     stmt_needs_semi = false;
                 }
                 Token::Semi => {
                     pending_excluded = false;
+                    pending_excluded_host_active = false;
                     stmt_needs_semi = false;
                 }
                 _ => {}
@@ -1572,6 +1608,9 @@ fn scan_source_core<'s, S: ScanSink<'s>>(
                 if pending_macro_export_depth == brace_depth {
                     pending_macro_export = false;
                 }
+                if pending_diverging_cfg_attr_depth == brace_depth {
+                    pending_diverging_cfg_attr = false;
+                }
             }
             Token::RBrace => {
                 if brace_overflow > 0 {
@@ -1592,11 +1631,13 @@ fn scan_source_core<'s, S: ScanSink<'s>>(
                 if pending_excluded {
                     if new_depth < pending_depth {
                         pending_excluded = false;
+                        pending_excluded_host_active = false;
                         stmt_needs_semi = false;
                     } else if new_depth == pending_depth && !stmt_needs_semi {
                         let mut look = lex;
                         if look.next_token() != Some(Token::Ident("else")) {
                             pending_excluded = false;
+                            pending_excluded_host_active = false;
                         }
                     }
                 }
@@ -1609,6 +1650,9 @@ fn scan_source_core<'s, S: ScanSink<'s>>(
                 if new_depth <= pending_macro_export_depth {
                     pending_macro_export = false;
                 }
+                if new_depth <= pending_diverging_cfg_attr_depth {
+                    pending_diverging_cfg_attr = false;
+                }
             }
             Token::Semi => {
                 if brace_depth == pending_path_depth {
@@ -1620,12 +1664,18 @@ fn scan_source_core<'s, S: ScanSink<'s>>(
                 if brace_depth == pending_macro_export_depth {
                     pending_macro_export = false;
                 }
+                if brace_depth == pending_diverging_cfg_attr_depth {
+                    pending_diverging_cfg_attr = false;
+                }
                 pending_inline_mod = None;
             }
             _ => {}
         }
 
         if !is_excluded {
+            if pending_diverging_cfg_attr && pending_diverging_cfg_attr_depth == brace_depth {
+                return Some(NativeSourceReason::HostFamilyCfg);
+            }
             match tok {
                 Token::Ident("std") if is_root_std_path(prev, prev_prev) => {
                     let mut look = lex;
@@ -1642,11 +1692,46 @@ fn scan_source_core<'s, S: ScanSink<'s>>(
                                     _ => {}
                                 }
                             }
-                            Some(Token::LBrace) if std_group_mentions_host_os(&mut look, 0) => {
-                                return Some(NativeSourceReason::HostOsStd);
+                            Some(Token::Ident("env")) => match look.next_token() {
+                                Some(Token::ColonColon) => match look.next_token() {
+                                    Some(Token::Ident("consts")) => {
+                                        return Some(NativeSourceReason::HostFamilyCfg);
+                                    }
+                                    Some(Token::LBrace) => {
+                                        let (has_consts, has_self) = env_group_scan(&mut look, 0);
+                                        if has_self {
+                                            imported_std_env = true;
+                                        }
+                                        if has_consts {
+                                            return Some(NativeSourceReason::HostFamilyCfg);
+                                        }
+                                    }
+                                    _ => {}
+                                },
+                                Some(Token::Semi | Token::Comma | Token::RBrace) => {
+                                    imported_std_env = true;
+                                }
+                                _ => {}
+                            },
+                            Some(Token::LBrace) => {
+                                let (reason, saw_env) = std_group_native_reason(&mut look, 0);
+                                if saw_env {
+                                    imported_std_env = true;
+                                }
+                                if let Some(reason) = reason {
+                                    return Some(reason);
+                                }
                             }
                             _ => {}
                         }
+                    }
+                }
+                Token::Ident("env") if imported_std_env && prev != Some(Token::ColonColon) => {
+                    let mut look = lex;
+                    if look.next_token() == Some(Token::ColonColon)
+                        && look.next_token() == Some(Token::Ident("consts"))
+                    {
+                        return Some(NativeSourceReason::HostFamilyCfg);
                     }
                 }
                 Token::Ident("extern") => {
@@ -2543,59 +2628,141 @@ fn os_group_mentions_host_os(lex: &mut Lexer<'_>, depth: usize) -> bool {
     }
 }
 
-/// Inspects a grouped `use std::{ ... }` list right after `{` for any `os::unix`, `os::linux`,
-/// `os::macos`, or nested `os::{ ... }` branch referencing a host-only OS module.
-fn std_group_mentions_host_os(lex: &mut Lexer<'_>, depth: usize) -> bool {
+/// Inspects a grouped `use std::env::{ ... }` list right after `{` for `consts` (whose items
+/// `OS`, `ARCH`, `FAMILY`, `DLL_*`, `EXE_*` all diverge between Unix hosts and WASI) and `self`
+/// (which brings `env` into scope for later `env::consts::*` paths).
+fn env_group_scan(lex: &mut Lexer<'_>, depth: usize) -> (bool, bool) {
     if depth > 16 {
         skip_delimited(lex, Token::LBrace, Token::RBrace);
-        return false;
+        return (false, false);
     }
+    let mut has_self = false;
     loop {
         match lex.next_token() {
-            None | Some(Token::RBrace) => return false,
+            None | Some(Token::RBrace) => return (false, has_self),
+            Some(Token::Comma) => continue,
+            Some(Token::Ident("consts")) => return (true, has_self),
+            Some(Token::Ident("self")) => {
+                has_self = true;
+                if !skip_group_item(lex) {
+                    return (false, has_self);
+                }
+            }
+            Some(Token::LBrace) => {
+                skip_delimited(lex, Token::LBrace, Token::RBrace);
+                if !skip_group_item(lex) {
+                    return (false, has_self);
+                }
+            }
+            Some(_) => {
+                if !skip_group_item(lex) {
+                    return (false, has_self);
+                }
+            }
+        }
+    }
+}
+
+/// Inspects a grouped `use std::{ ... }` list right after `{` for any `os::{unix,linux,macos}`
+/// branch or `env::consts` branch, also reporting whether bare `env` (or `env::{self, ...}`)
+/// was imported so subsequent `env::consts::*` paths are recognized.
+fn std_group_native_reason(lex: &mut Lexer<'_>, depth: usize) -> (Option<NativeSourceReason>, bool) {
+    if depth > 16 {
+        skip_delimited(lex, Token::LBrace, Token::RBrace);
+        return (None, false);
+    }
+    let mut saw_env = false;
+    loop {
+        match lex.next_token() {
+            None | Some(Token::RBrace) => return (None, saw_env),
             Some(Token::Comma) => continue,
             Some(Token::Ident("os")) => match lex.next_token() {
                 Some(Token::ColonColon) => match lex.next_token() {
-                    Some(Token::Ident("unix" | "linux" | "macos")) => return true,
+                    Some(Token::Ident("unix" | "linux" | "macos")) => {
+                        return (Some(NativeSourceReason::HostOsStd), saw_env);
+                    }
                     Some(Token::LBrace) => {
                         if os_group_mentions_host_os(lex, depth + 1) {
-                            return true;
+                            return (Some(NativeSourceReason::HostOsStd), saw_env);
                         }
                         if !skip_group_item(lex) {
-                            return false;
+                            return (None, saw_env);
                         }
                     }
-                    Some(Token::RBrace) | None => return false,
+                    Some(Token::RBrace) | None => return (None, saw_env),
                     Some(Token::Comma) => continue,
                     Some(_) => {
                         if !skip_group_item(lex) {
-                            return false;
+                            return (None, saw_env);
                         }
                     }
                 },
-                Some(Token::RBrace) | None => return false,
+                Some(Token::RBrace) | None => return (None, saw_env),
                 Some(Token::Comma) => continue,
                 Some(Token::LBrace) => {
                     skip_delimited(lex, Token::LBrace, Token::RBrace);
                     if !skip_group_item(lex) {
-                        return false;
+                        return (None, saw_env);
                     }
                 }
                 Some(_) => {
                     if !skip_group_item(lex) {
-                        return false;
+                        return (None, saw_env);
+                    }
+                }
+            },
+            Some(Token::Ident("env")) => match lex.next_token() {
+                Some(Token::ColonColon) => match lex.next_token() {
+                    Some(Token::Ident("consts")) => {
+                        return (Some(NativeSourceReason::HostFamilyCfg), saw_env);
+                    }
+                    Some(Token::LBrace) => {
+                        let (has_consts, has_self) = env_group_scan(lex, depth + 1);
+                        if has_self {
+                            saw_env = true;
+                        }
+                        if has_consts {
+                            return (Some(NativeSourceReason::HostFamilyCfg), saw_env);
+                        }
+                        if !skip_group_item(lex) {
+                            return (None, saw_env);
+                        }
+                    }
+                    Some(Token::RBrace) | None => return (None, saw_env),
+                    Some(Token::Comma) => continue,
+                    Some(_) => {
+                        if !skip_group_item(lex) {
+                            return (None, saw_env);
+                        }
+                    }
+                },
+                Some(Token::RBrace) => return (None, true),
+                Some(Token::Comma) => {
+                    saw_env = true;
+                    continue;
+                }
+                None => return (None, true),
+                Some(Token::LBrace) => {
+                    skip_delimited(lex, Token::LBrace, Token::RBrace);
+                    if !skip_group_item(lex) {
+                        return (None, saw_env);
+                    }
+                }
+                Some(_) => {
+                    if !skip_group_item(lex) {
+                        return (None, saw_env);
                     }
                 }
             },
             Some(Token::LBrace) => {
                 skip_delimited(lex, Token::LBrace, Token::RBrace);
                 if !skip_group_item(lex) {
-                    return false;
+                    return (None, saw_env);
                 }
             }
             Some(_) => {
                 if !skip_group_item(lex) {
-                    return false;
+                    return (None, saw_env);
                 }
             }
         }
@@ -2675,32 +2842,155 @@ struct ParsedAttr<'a> {
     path: Option<StrLit<'a>>,
     macro_use: bool,
     macro_export: bool,
+    /// True when a `cfg_attr(pred, ...)` with a host-vs-WASI diverging predicate conditionally
+    /// applies a placement-affecting attribute (`path = "..."`, `cfg(...)`, `macro_use`, or
+    /// `macro_export`).
+    diverging_cfg_attr: bool,
+}
+
+impl CfgEval {
+    const ALWAYS_TRUE: Self = Self { host: TriBool::True, wasi: TriBool::True, family_div: false };
+
+    fn and(self, other: Self) -> Self {
+        let host = self.host.and(other.host);
+        let wasi = self.wasi.and(other.wasi);
+        let same_known = matches!(
+            (host, wasi),
+            (TriBool::False, TriBool::False) | (TriBool::True, TriBool::True)
+        );
+        Self { host, wasi, family_div: !same_known && (self.family_div || other.family_div) }
+    }
 }
 
 /// Consumes the body of an attribute `[...]` (starting immediately after `[`) and extracts any
-/// `cfg(...)` evaluation, `path = "..."` value, `macro_use`, or `macro_export`.
+/// `cfg(...)` evaluation, `path = "..."` value, `macro_use`, `macro_export`, or `cfg_attr(...)`.
 fn parse_attr<'a>(lex: &mut Lexer<'a>, cfg: ScriptCfg<'_>) -> ParsedAttr<'a> {
     let mut look = *lex;
-    let mut out = ParsedAttr { cfg: None, path: None, macro_use: false, macro_export: false };
-    match look.next_token() {
-        Some(Token::Ident("cfg")) if look.next_token() == Some(Token::LParen) => {
-            out.cfg = Some(eval_cfg_pair(&mut look, cfg, 0));
-        }
-        Some(Token::Ident("path")) if look.next_token() == Some(Token::Eq) => {
-            if let Some(val) = str_literal(look.next_token()) {
-                out.path = Some(val);
+    let mut out = ParsedAttr {
+        cfg: None,
+        path: None,
+        macro_use: false,
+        macro_export: false,
+        diverging_cfg_attr: false,
+    };
+    parse_attr_item(&mut look, cfg, CfgEval::ALWAYS_TRUE, 0, &mut out);
+    skip_delimited(lex, Token::LBracket, Token::RBracket);
+    out
+}
+
+/// Parses one attribute item (`cfg(...)`, `path = "..."`, `macro_use`, `macro_export`, or
+/// `cfg_attr(pred, attr1, attr2, ...)`) under an accumulated `guard` from enclosing `cfg_attr`s.
+fn parse_attr_item<'a>(
+    lex: &mut Lexer<'a>,
+    cfg: ScriptCfg<'_>,
+    guard: CfgEval,
+    depth: usize,
+    out: &mut ParsedAttr<'a>,
+) {
+    if depth > 16 {
+        return;
+    }
+    let Some(Token::Ident(name)) = lex.next_token() else { return };
+    match name {
+        "cfg" => {
+            if lex.next_token() == Some(Token::LParen) {
+                let ev = eval_cfg_pair(lex, cfg, 0);
+                skip_delimited(lex, Token::LParen, Token::RParen);
+                if guard.diverges_host_vs_wasi() {
+                    out.diverging_cfg_attr = true;
+                } else if guard.wasi == TriBool::True && guard.host == TriBool::True {
+                    out.cfg = Some(match out.cfg {
+                        Some(prev) => prev.and(ev),
+                        None => ev,
+                    });
+                }
             }
         }
-        Some(Token::Ident("macro_use")) => {
-            out.macro_use = true;
+        "path" => {
+            if lex.next_token() == Some(Token::Eq)
+                && let Some(val) = str_literal(lex.next_token())
+            {
+                if guard.diverges_host_vs_wasi() {
+                    out.diverging_cfg_attr = true;
+                } else if guard.wasi == TriBool::True && guard.host == TriBool::True {
+                    out.path = Some(val);
+                }
+            }
         }
-        Some(Token::Ident("macro_export")) => {
-            out.macro_export = true;
+        "macro_use" => {
+            if guard.diverges_host_vs_wasi() {
+                out.diverging_cfg_attr = true;
+            } else if guard.wasi == TriBool::True && guard.host == TriBool::True {
+                out.macro_use = true;
+            }
+        }
+        "macro_export" => {
+            if guard.diverges_host_vs_wasi() {
+                out.diverging_cfg_attr = true;
+            } else if guard.wasi == TriBool::True && guard.host == TriBool::True {
+                out.macro_export = true;
+            }
+        }
+        "cfg_attr" => {
+            if lex.next_token() != Some(Token::LParen) {
+                return;
+            }
+            let pred = eval_cfg_pair(lex, cfg, 0);
+            let combined = guard.and(pred);
+            // Expect `,` separating predicate from the conditional attribute list.
+            if lex.next_token() != Some(Token::Comma) {
+                skip_delimited(lex, Token::LParen, Token::RParen);
+                return;
+            }
+            // If `combined` is known-false on BOTH host and WASI, none of the inner attributes apply.
+            if combined.host == TriBool::False && combined.wasi == TriBool::False {
+                skip_delimited(lex, Token::LParen, Token::RParen);
+                return;
+            }
+            loop {
+                let mut peek = *lex;
+                match peek.next_token() {
+                    None | Some(Token::RParen) => {
+                        *lex = peek;
+                        break;
+                    }
+                    Some(Token::Comma) => {
+                        *lex = peek;
+                        continue;
+                    }
+                    _ => {}
+                }
+                parse_attr_item(lex, cfg, combined, depth + 1, out);
+                // Advance to the next top-level `,` or closing `)` of this `cfg_attr(...)`.
+                let mut paren_d: usize = 0;
+                let mut bracket_d: usize = 0;
+                let mut brace_d: usize = 0;
+                let mut finished_cfg_attr = false;
+                while let Some(tok) = lex.next_token() {
+                    match tok {
+                        Token::LParen => paren_d += 1,
+                        Token::RParen => {
+                            if paren_d == 0 && bracket_d == 0 && brace_d == 0 {
+                                finished_cfg_attr = true;
+                                break;
+                            }
+                            paren_d = paren_d.saturating_sub(1);
+                        }
+                        Token::LBracket => bracket_d += 1,
+                        Token::RBracket => bracket_d = bracket_d.saturating_sub(1),
+                        Token::LBrace => brace_d += 1,
+                        Token::RBrace => brace_d = brace_d.saturating_sub(1),
+                        Token::Comma if paren_d == 0 && bracket_d == 0 && brace_d == 0 => break,
+                        _ => {}
+                    }
+                }
+                if finished_cfg_attr {
+                    break;
+                }
+            }
         }
         _ => {}
     }
-    skip_delimited(lex, Token::LBracket, Token::RBracket);
-    out
 }
 
 fn eq_opt(actual: Option<&str>, expected: &str) -> TriBool {

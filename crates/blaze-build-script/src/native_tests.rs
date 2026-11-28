@@ -600,6 +600,63 @@ fn concrete_host_cfg_and_unit_features_and_test_cfg() {
         source_requires_native_with_cfg(gated_items, linux_native_feat),
         Some(NativeSourceReason::HostOsStd)
     );
+
+    // 3. Host-gated `#[cfg(...)] fn main()` entry points MUST classify Native, while
+    //    dead-on-host `#[cfg(windows)] fn main()` and non-main `#[cfg(unix)] fn helper()` stay Wasm.
+    for src in [
+        "#[cfg(unix)]\nfn main() {}",
+        "#[cfg(unix)]\n#[allow(dead_code)]\npub fn main() {}",
+        "#[cfg(target_os = \"linux\")]\nfn main() {}",
+    ] {
+        assert_eq!(
+            source_requires_native_with_cfg(src, linux_arm),
+            Some(NativeSourceReason::HostFamilyCfg),
+            "expected host-gated main to classify Native: {src}"
+        );
+    }
+    for wasm_src in [
+        "#[cfg(windows)]\nfn main() {}",
+        "#[cfg(target_os = \"macos\")]\nfn main() {}",
+        "#[cfg(unix)]\n#[cfg(windows)]\nfn main() {}",
+        "#[cfg(unix)]\nfn helper() { use std::os::unix::io::AsRawFd; }\nfn main() {}",
+        "#[cfg(unix)]\nmod sub { fn main() {} }\nfn main() {}",
+    ] {
+        assert_eq!(
+            source_requires_native_with_cfg(wasm_src, linux_arm),
+            None,
+            "expected Wasm-safe for: {wasm_src}"
+        );
+    }
+
+    // 4. Target-dependent `std::env::consts::*` references classify Native across direct,
+    //    grouped, and `use std::env;` forms, while `std::env::var(...)` stays Wasm.
+    for env_const_src in [
+        "fn main() { println!(\"cargo:rustc-cfg=os_{}\", std::env::consts::OS); }",
+        "fn main() { let _ = ::std::env::consts::ARCH; }",
+        "use std::env::consts::FAMILY;\nfn main() { let _ = FAMILY; }",
+        "use std::env::{var, consts::EXE_SUFFIX};\nfn main() { let _ = (var(\"X\"), EXE_SUFFIX); }",
+        "use std::{env::consts::DLL_SUFFIX};\nfn main() { let _ = DLL_SUFFIX; }",
+        "use std::env;\nfn main() { let _ = env::consts::OS; }",
+        "use std::env::{self, var};\nfn main() { let _ = (var(\"X\"), env::consts::ARCH); }",
+        "use std::{fs, env};\nfn main() { let _ = env::consts::FAMILY; }",
+    ] {
+        assert_eq!(
+            source_requires_native_with_cfg(env_const_src, linux_arm),
+            Some(NativeSourceReason::HostFamilyCfg),
+            "expected HostFamilyCfg for std::env::consts usage: {env_const_src}"
+        );
+    }
+    for env_safe_src in [
+        "use std::env;\nfn main() { let _ = env::var(\"CARGO_CFG_TARGET_OS\"); }",
+        "#[cfg(unix)]\nfn f() { let _ = std::env::consts::OS; }\nfn main() {}",
+        "mod env { pub mod consts { pub const OS: &str = \"custom\"; } }\nfn main() { let _ = env::consts::OS; }",
+    ] {
+        assert_eq!(
+            source_requires_native_with_cfg(env_safe_src, linux_arm),
+            None,
+            "expected Wasm-safe for: {env_safe_src}"
+        );
+    }
 }
 
 #[test]
@@ -903,7 +960,59 @@ fn source_tree_inspects_submodules_path_attr_and_include_files() {
         Ok(Some(NativeSourceReason::HostOsStd))
     );
 
-    // 14. Exceeding MAX_SCRIPT_FILES (256) returns typed ScriptSourceError::TooManyFiles rather
+    // 14. `#[cfg_attr(pred, path = "...")]` resolves active paths, ignores inactive paths,
+    //     and classifies diverging host-vs-WASI module path switches as Native (while ignoring
+    //     non-placement lint attributes like `#[cfg_attr(unix, allow(dead_code))]`).
+    assert_eq!(
+        scan(&[
+            ("build.rs", "#[cfg_attr(unix, path = \"host.rs\")]\nmod imp;\nfn main() {}"),
+            ("host.rs", "pub fn f() {}"),
+            ("imp.rs", "pub fn f() {}"),
+        ]),
+        Ok(Some(NativeSourceReason::HostFamilyCfg))
+    );
+    assert_eq!(
+        scan(&[
+            ("build.rs", "#[cfg_attr(windows, path = \"win.rs\")]\nmod imp;\nfn main() {}"),
+            ("win.rs", "use std::os::unix::io::AsRawFd;"),
+            ("imp.rs", "pub fn f() {}"),
+        ]),
+        Ok(None)
+    );
+    assert_eq!(
+        scan(&[
+            ("build.rs", "#[cfg_attr(unix, allow(dead_code))]\nfn main() {}"),
+        ]),
+        Ok(None)
+    );
+    assert_eq!(
+        scan_with(
+            linux_with_native,
+            &[
+                ("build.rs", "#[cfg_attr(feature = \"native\", allow(dead_code), path = \"alt.rs\")]\nmod imp;\nfn main() {}"),
+                ("alt.rs", "extern \"C\" { fn ioctl(); }"),
+                ("imp.rs", "pub fn f() {}"),
+            ]
+        ),
+        Ok(Some(NativeSourceReason::ExternC))
+    );
+    assert_eq!(
+        scan(&[
+            ("build.rs", "#[cfg_attr(not(windows), cfg_attr(unix, path = \"host.rs\"))]\nmod imp;\nfn main() {}"),
+            ("host.rs", "pub fn f() {}"),
+        ]),
+        Ok(Some(NativeSourceReason::HostFamilyCfg))
+    );
+    assert_eq!(
+        scan(&[
+            ("build.rs", "#[cfg_attr(windows, cfg_attr(unix, path = \"host.rs\"))]\nmod imp;\nfn main() {}"),
+            ("host.rs", "use std::os::unix::io::AsRawFd;"),
+            ("imp.rs", "pub fn f() {}"),
+        ]),
+        Ok(None)
+    );
+
+    // 15. Exceeding MAX_SCRIPT_FILES (256) returns typed ScriptSourceError::TooManyFiles rather
     //     than silently treating an incomplete scan as Wasm-safe.
     let mut chain: std::vec::Vec<(std::string::String, std::string::String)> = std::vec::Vec::new();
     chain.push(("build.rs".to_owned(), "include!(\"f1.rs\");\nfn main() {}".to_owned()));
