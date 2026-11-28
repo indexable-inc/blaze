@@ -4286,21 +4286,35 @@ mod tests {
         }
     }
 
-    /// Positive + negative proof (Rule 23) that `open_command_c_probes` isolates `elf_record_dir`
-    /// onto its own dedicated `Io` (distinct from `blaze_v2` / `HermeticClangProbe.io`):
-    /// 1. `elf_record_dir` has an independent driver world (`!hermetic.io.shares_world(...)`) and
-    ///    writes directly under `.blaze/v2/build-script/records/elf-inodes-v1/`.
-    /// 2. While `hermetic.io`'s driver poll lock is held busy by a long wait on a background
-    ///    thread, `DirInodeRecordIo` over the isolated `elf_record_dir` completes immediately under
-    ///    a tight 200ms deadline, whereas the negative control (`DirInodeRecordIo` sharing
-    ///    `hermetic.io`, the pre-fix configuration) times out with a typed `Fault::HostStopped`
-    ///    (`Stopped::Deadline`) instead of opaque `Fault::Host { code: 110 }`.
-    /// 3. If `.blaze/v2/build-script/records/elf-inodes-v1` is a regular file, `open_command_c_probes`
-    ///    refuses loudly with `CProbeSetting::Unavailable` rather than silently downgrading.
+    /// Positive + negative proof (Rules 3, 19, 23, 43) that `open_command_c_probes` isolates
+    /// `elf_record_dir` onto its own dedicated `Io` (distinct from `blaze_v2` /
+    /// `HermeticClangProbe.io`):
+    /// 1. Native `open_command_c_probes` creates `elf_record_dir` on an independent driver world
+    ///    (`!hermetic.io.shares_world(...)`) writing directly under
+    ///    `.blaze/v2/build-script/records/elf-inodes-v1/`.
+    /// 2. Deterministic simulation contention proof (zero real threads, zero wall-clock sleeps)
+    ///    with a planted pre-fix control (`ElfIoPlant::SharedWithProbeIo`): while `probe_io` has
+    ///    reads held (`Sim::hold_reads`), `DirInodeRecordIo` on the isolated `elf_record_dir`
+    ///    world completes cleanly under both an isolated `Cx` and a `probe_io`-hosted `Cx`,
+    ///    whereas the planted pre-fix shared-`Io` case deterministically stops at its virtual
+    ///    deadline with typed `Fault::HostStopped { call: "read elf inode record", why:
+    ///    Stopped::Deadline { .. } }` (never collapsing to opaque `Fault::Host { code: 110 }`).
+    ///    Pre-cancelled callers also surface typed `Fault::HostStopped { why: Stopped::Cancelled }`.
+    /// 3. If `.blaze/v2/build-script/records/elf-inodes-v1` is a regular file,
+    ///    `open_command_c_probes` refuses loudly with `CProbeSetting::Unavailable` rather than
+    ///    silently downgrading.
     #[cfg(target_os = "linux")]
     #[test]
     fn open_command_c_probes_isolates_elf_record_io_and_reports_typed_deadline_stop() {
         use bstd::procs::hermetic::{DirInodeRecordIo, ELF_INODE_RECORD_SUBDIR, Fault, InodeRecordIo, RecordRead};
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum ElfIoPlant {
+            /// Post-fix: `elf_record_dir` sits on its own dedicated `Io`.
+            Isolated,
+            /// Planted pre-fix bug: `elf_record_dir` shares `probe_io` (`blaze_v2.subdir(...)`).
+            SharedWithProbeIo,
+        }
 
         let heap = blaze_own::testing::heap();
         let alloc = heap.alloc();
@@ -4351,7 +4365,7 @@ mod tests {
             "HermeticClangProbe::elf_record_io must select elf_record_dir's dedicated Io"
         );
 
-        // Publish a sample record through the isolated `elf_record_dir` and verify path parity.
+        // Publish and read back through the isolated `elf_record_dir` and verify path parity.
         let sample_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let payload = b"isolated-elf-inode-record-payload";
         let pub_cx = elf_dir
@@ -4366,57 +4380,160 @@ mod tests {
             .join(ELF_INODE_RECORD_SUBDIR)
             .join(sample_key);
         assert!(on_disk.is_file(), "expected record at {}", on_disk.display());
-
-        // 2. Causal contention proof (Rule 23): hold `hermetic.io`'s driver poll lock busy on a
-        //    background thread for 800ms.
-        let busy_io = blaze_own::Share::share(&hermetic.io);
-        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let started_bg = std::sync::Arc::clone(&started);
-        let holder = std::thread::spawn(move || {
-            let clock = busy_io.need_clock().expect("probe clock");
-            let sleep_cx = busy_io
-                .cx(super::Duration::from_secs(5), bstd::mem::TASK_FRAME)
-                .expect("sleep cx");
-            started_bg.store(true, super::Ordering::Release);
-            let _ = clock.sleep(&sleep_cx, super::Duration::from_millis(800));
-        });
-        while !started.load(super::Ordering::Acquire) {
-            std::thread::yield_now();
-        }
-        // Let the sleeper enter `driver.poll(...)` under `hermetic.io`'s world lock.
-        std::thread::sleep(super::Duration::from_millis(40));
-
-        // Positive: isolated `elf_record_dir` completes well within 200ms while `hermetic.io` is busy.
-        let fast_cx = tmp_io
-            .cx(super::Duration::from_millis(200), bstd::mem::TASK_FRAME)
-            .expect("fast cx");
-        let got = DirInodeRecordIo::new(elf_dir, &fast_cx)
+        match DirInodeRecordIo::new(elf_dir, &pub_cx)
             .read_bounded(sample_key, 4096)
-            .expect("isolated elf_record_dir read must not block on busy hermetic.io");
-        match got {
+            .expect("read back via isolated elf_record_dir")
+        {
             RecordRead::Bytes(bytes) => assert_eq!(bytes.as_slice(), payload),
-            other => panic!("expected RecordRead::Bytes, got {}", matches!(other, RecordRead::Absent)),
+            other => panic!("expected RecordRead::Bytes, got absent={}", matches!(other, RecordRead::Absent)),
         }
 
-        // Negative control (pre-fix shared Io): a Dir sharing `hermetic.io` queues behind the
-        // 800ms poll lock and stops with typed `Fault::HostStopped { why: Stopped::Deadline .. }`.
-        let shared_rel_str = format!(".blaze/v2/{ELF_INODE_RECORD_SUBDIR}");
-        let shared_rel = bstd::path::Path::new(&shared_rel_str).expect("shared rel");
-        let shared_elf_dir = hermetic.work_base_dir.subdir(&shared_rel);
-        assert!(shared_elf_dir.world().shares_world(&hermetic.io));
-        let short_cx = tmp_io
-            .cx(super::Duration::from_millis(120), bstd::mem::TASK_FRAME)
-            .expect("short cx");
-        let err = match DirInodeRecordIo::new(&shared_elf_dir, &short_cx).read_bounded(sample_key, 4096) {
-            Ok(_) => panic!("shared-Io negative control must time out while hermetic.io is busy"),
-            Err(fault) => fault,
-        };
-        assert!(
-            matches!(err, Fault::HostStopped { why: bstd::Stopped::Deadline { .. }, .. }),
-            "shared-Io timeout must preserve typed Fault::HostStopped(Deadline), got: {err:?}"
-        );
+        // 2. Deterministic simulation contention proof with planted pre-fix control (zero real
+        //    threads, zero wall-clock sleeps): `probe_io` models a contended 30s probe driver
+        //    (`max_latency = 30s` + held syncs/lists), while `isolated_elf_io` remains fast and
+        //    independent.
+        let run_sim = |seed: u64, elf_latency_us: u64, plant: ElfIoPlant| -> Result<(), std::string::String> {
+            let mut probe_world = bstd::io::SimWorld::new(seed, bstd::io::Limits::USUAL);
+            probe_world.faults = blaze_core::sim::Faults {
+                max_latency: super::Duration::from_secs(30),
+                ..blaze_core::sim::Faults::default()
+            };
+            let probe_io = bstd::io::Io::simulated(probe_world);
 
-        holder.join().expect("join busy hermetic.io sleeper");
+            let mut elf_world = bstd::io::SimWorld::new(seed ^ 0x51a7_cafe, bstd::io::Limits::USUAL);
+            elf_world.faults = blaze_core::sim::Faults {
+                max_latency: super::Duration::from_micros(elf_latency_us),
+                ..blaze_core::sim::Faults::default()
+            };
+            let isolated_elf_io = bstd::io::Io::simulated(elf_world);
+
+            // Virtual-clock setup (300 virtual seconds = 0ms real time) seeds both worlds cleanly.
+            let probe_setup_cx = probe_io
+                .cx(super::Duration::from_secs(300), bstd::mem::TASK_FRAME)
+                .map_err(|e| std::format!("probe setup cx: {e}"))?;
+            let elf_setup_cx = isolated_elf_io
+                .cx(super::Duration::from_secs(300), bstd::mem::TASK_FRAME)
+                .map_err(|e| std::format!("elf setup cx: {e}"))?;
+
+            let probe_root = probe_io.need_fs().map_err(|e| std::format!("probe fs: {e}"))?.root();
+            let isolated_root = isolated_elf_io.need_fs().map_err(|e| std::format!("elf fs: {e}"))?.root();
+            let shelf_rel = bstd::path::Path::new("shelf").map_err(|_| "shelf rel")?;
+            let work_rel = bstd::path::Path::new("work").map_err(|_| "work rel")?;
+            let elf_sub = bstd::path::Path::new(ELF_INODE_RECORD_SUBDIR).map_err(|_| "elf sub")?;
+            let shelf_cap = probe_root
+                .make_dir(&probe_setup_cx, &shelf_rel, bstd::fs::Durable::No)
+                .map_err(|e| std::format!("mkdir shelf: {e}"))?;
+            let work_base = probe_root
+                .make_dir(&probe_setup_cx, &work_rel, bstd::fs::Durable::No)
+                .map_err(|e| std::format!("mkdir work: {e}"))?;
+
+            let shared_elf_dir = probe_root.subdir(&elf_sub);
+            let isolated_elf_dir = isolated_root.subdir(&elf_sub);
+            DirInodeRecordIo::new(&shared_elf_dir, &probe_setup_cx)
+                .publish_atomic(sample_key, payload)
+                .map_err(|e| std::format!("seed shared elf record: {e:?}"))?;
+            DirInodeRecordIo::new(&isolated_elf_dir, &elf_setup_cx)
+                .publish_atomic(sample_key, payload)
+                .map_err(|e| std::format!("seed isolated elf record: {e:?}"))?;
+
+            let chosen_elf_dir = match plant {
+                ElfIoPlant::Isolated => isolated_elf_dir,
+                ElfIoPlant::SharedWithProbeIo => shared_elf_dir,
+            };
+            let sim_hermetic = super::HermeticClangProbe::from_shelf_dir(
+                blaze_own::Share::share(&probe_io),
+                shelf_cap,
+                work_base,
+                Some(chosen_elf_dir),
+                "tasks",
+                Path::new("/shelf"),
+                "x86_64-unknown-linux-gnu",
+                None,
+                Path::new("/work/tasks").to_path_buf(),
+                alloc,
+            )
+            .map_err(|e| std::format!("from_shelf_dir: {e}"))?;
+            let sim_elf_dir = sim_hermetic.elf_record_dir.as_ref().ok_or("missing elf_record_dir")?;
+
+            // Also deterministically hold syncs and directory listings on `probe_io` so cold-miss
+            // publish/prune paths are proven isolated too.
+            let held_dir = blaze_core::FileName::new(ELF_INODE_RECORD_SUBDIR).ok_or("held dir name")?;
+            let held_dir2 = blaze_core::FileName::new(ELF_INODE_RECORD_SUBDIR).ok_or("held dir name 2")?;
+            probe_io
+                .with_sim(|sim| {
+                    sim.hold_syncs(held_dir);
+                    sim.hold_lists(held_dir2);
+                })
+                .ok_or("expected sim probe_io")?;
+
+            // Lookup through `sim_hermetic.elf_record_io()` AND through a `probe_io`-hosted caller
+            // `Cx` (matching both `BoundHermetic::id` and `run_in_task_dir` pre/post-exec calls).
+            let elf_cx = sim_hermetic
+                .elf_record_io()
+                .cx(super::Duration::from_millis(5), bstd::mem::TASK_FRAME)
+                .map_err(|e| std::format!("elf cx: {e}"))?;
+            let probe_caller_cx = probe_io
+                .cx(super::Duration::from_millis(5), bstd::mem::TASK_FRAME)
+                .map_err(|e| std::format!("probe caller cx: {e}"))?;
+
+            for (label, cx) in [("elf_record_io", &elf_cx), ("probe_caller_cx", &probe_caller_cx)] {
+                match DirInodeRecordIo::new(sim_elf_dir, cx).read_bounded(sample_key, 4096) {
+                    Ok(RecordRead::Bytes(bytes)) if bytes.as_slice() == payload => {}
+                    Ok(_) => return Err(std::format!("seed {seed} ({label}): unexpected record payload")),
+                    Err(fault) => {
+                        return Err(std::format!("seed {seed} ({label}): contended read fault: {fault:?}"));
+                    }
+                }
+            }
+
+            // Cold-miss publish + prune must also bypass contended `probe_io`.
+            let sample_key2 = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+            DirInodeRecordIo::new(sim_elf_dir, &elf_cx)
+                .publish_atomic(sample_key2, payload)
+                .map_err(|fault| std::format!("seed {seed}: contended publish fault: {fault:?}"))?;
+            DirInodeRecordIo::new(sim_elf_dir, &elf_cx)
+                .prune_to_cap(16, sample_key2)
+                .map_err(|fault| std::format!("seed {seed}: contended prune fault: {fault:?}"))?;
+
+            // Pre-cancelled caller must surface typed `Fault::HostStopped(Cancelled)`, never errno 110.
+            let mut cancel_fault: Option<Fault> = None;
+            let _ = elf_cx.scope_with(|scope| {
+                scope.cancel();
+                cancel_fault = DirInodeRecordIo::new(sim_elf_dir, scope.cx())
+                    .read_bounded(sample_key, 4096)
+                    .err();
+            });
+            match cancel_fault {
+                Some(Fault::HostStopped {
+                    call: "elf inode record context",
+                    why: bstd::Stopped::Cancelled { .. },
+                }) => {}
+                other => {
+                    return Err(std::format!(
+                        "seed {seed}: expected HostStopped(Cancelled), got {other:?}"
+                    ));
+                }
+            }
+            Ok(())
+        };
+
+        for (seed, elf_latency_us) in [(1u64, 0u64), (7, 50), (42, 100), (99, 250)] {
+            run_sim(seed, elf_latency_us, ElfIoPlant::Isolated)
+                .unwrap_or_else(|e| panic!("isolated elf_record_dir must succeed under contended probe_io: {e}"));
+
+            let planted_err = run_sim(seed, elf_latency_us, ElfIoPlant::SharedWithProbeIo)
+                .expect_err("planted SharedWithProbeIo control must fail under contended probe_io");
+            assert!(
+                planted_err.contains("HostStopped")
+                    && planted_err.contains("open elf inode record")
+                    && planted_err.contains("Deadline"),
+                "planted SharedWithProbeIo must surface typed HostStopped(Deadline) on open elf inode record, got: {planted_err}"
+            );
+            assert!(
+                !planted_err.contains("code: 110"),
+                "planted timeout must not collapse to opaque errno 110: {planted_err}"
+            );
+        }
 
         // 3. Negative refusal test (Rule 3): a regular file at the ELF inode-record path must make
         //    `open_command_c_probes` return `Unavailable` loudly instead of silently dropping it.
