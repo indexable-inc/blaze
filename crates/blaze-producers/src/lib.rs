@@ -106,8 +106,10 @@ pub struct Digests<'a> {
     /// In [`ROWS`] order.
     pub rows: [(Row, Digest<'a>); Row::COUNT - 1],
     /// Relative to the workspace root, sorted, each once: the root manifest, the lock, the
-    /// pins folder, every crate manifest read, and each top-level entry of each digested
-    /// crate (`src`, `build.rs`, `Cargo.toml`, ...; a directory stands for all under it).
+    /// pins folder (and its traversed subdirectories), every crate manifest read, and each
+    /// digested crate's root directory, top-level entries, and traversed source subdirectories
+    /// (watching the crate root ensures adding a new `build.rs` or top-level source file
+    /// invalidates build scripts).
     pub watch: Vec<Text<'a>, Alloc<'a>>,
 }
 
@@ -116,7 +118,8 @@ pub struct SingleDigest<'a> {
     pub row: Row,
     pub digest: Digest<'a>,
     /// Relative to the workspace root, sorted, each once: only the manifests, lock, pins, and
-    /// top-level entries of crates inside this row's closure.
+    /// directories/entries of crates inside this row's closure (including each reached crate's
+    /// root directory so newly added `build.rs` files trigger reruns).
     pub watch: Vec<Text<'a>, Alloc<'a>>,
 }
 
@@ -124,7 +127,8 @@ pub struct SingleDigest<'a> {
 pub struct CratesDigest<'a> {
     pub digest: Digest<'a>,
     /// Relative to the workspace root, sorted, each once: only the manifests, lock, pins, and
-    /// top-level entries of crates inside the requested closure.
+    /// directories/entries of crates inside the requested closure (including each reached crate's
+    /// root directory so newly added `build.rs` files trigger reruns).
     pub watch: Vec<Text<'a>, Alloc<'a>>,
 }
 
@@ -519,6 +523,12 @@ impl<'a> Walk<'a> {
                 }
             }
             Job::Dir(at, top) => {
+                // Watch every traversed reached directory itself (including each reached crate's
+                // root directory when `top` is true, and nested source subdirectories) so Cargo
+                // reruns `build.rs` if a new `build.rs` or `.rs` file is added there (Rule 21).
+                if !path.is_empty() {
+                    self.watch.push(text(path.as_str(), alloc));
+                }
                 for entry in sorted.iter() {
                     if entry.name.starts_with('.') || (top && entry.is_dir && NOT_BUILT.contains(&entry.name)) {
                         continue;
@@ -541,8 +551,8 @@ impl<'a> Walk<'a> {
                 }
                 if path.as_str() == PINS {
                     self.pins_listed = true;
-                    self.watch.push(path);
                 }
+                self.watch.push(path);
             }
             job => {
                 self.asked = Some((job, path));

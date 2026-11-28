@@ -285,6 +285,35 @@ mod tests {
                 "editing unrelated {rel} must keep pack_file_items_key warm (Rule 52)"
             );
         }
+
+        // Watch list emitted by `build.rs` must include reached crate root directories (even when
+        // no `build.rs` exists yet) and source subdirectories so Cargo reruns `build.rs` if a new
+        // `build.rs` or `.rs` file is added inside any reached crate (Rule 21).
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut pfi_walk = Walk::for_crates(&PACK_FILE_ITEMS_ROOTS, alloc).expect("for_crates pack-file-items");
+        drive_walk_with_override(&workspace_root, &mut pfi_walk, None);
+        let pfi = pfi_walk.finish_crates("pack-file-items").expect("finish_crates");
+        for expected in [
+            "crates/blaze-file-items",
+            "crates/blaze-file-items/src",
+            "crates/blaze-file-items/src/walk",
+            "crates/blaze-drive",
+            "crates/blaze-drive/src",
+            "crates/blaze-surface",
+            "crates/parser",
+            "pins",
+        ] {
+            assert!(
+                pfi.watch.iter().any(|w| w.as_str() == expected),
+                "pack-file-items watch must include `{expected}` so newly added files trigger build.rs reruns"
+            );
+        }
+        for excluded in ["crates/blaze-emit", "crates/blaze-lir", "crates/blaze-ladder"] {
+            assert!(
+                !pfi.watch.iter().any(|w| w.as_str() == excluded),
+                "unrelated codegen crate root `{excluded}` must NOT be in pack-file-items watch"
+            );
+        }
     }
 
     /// Rule 21 guardrail for `crates/blaze-ladder/Cargo.toml`'s
