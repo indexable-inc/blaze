@@ -7580,10 +7580,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 // expression has an extended temporary scope then so does its operand" (`let x =
                 // &mk().f;` extends `mk()`; an arm's `&mk().f` died at the arm's end otherwise).
                 if let Expr::Ref { operand, .. } = self.expr(e)? {
-                    self.extend_root(p, operand)?;
                     if self.const_init && m == Mutbl::Not {
                         self.promote_const_init_temp(p, operand, e)?;
                     }
+                    self.extend_root(p, operand)?;
                 }
             }
         }

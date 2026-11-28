@@ -1976,14 +1976,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         stack.extend_from_slice(es);
                     }
                 }
-                Expr::Struct { fields, rest, .. } => {
+                Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
                     if let Some(fs) = self.body.field_inits.get(fields.range()) {
                         for f in fs {
                             stack.push(f.expr);
                         }
                     }
-                    if let Some(r) = rest {
-                        stack.push(r);
+                    if let blaze_typeck::StructBase::Expr(b) = base {
+                        stack.push(b);
                     }
                 }
                 _ => {}

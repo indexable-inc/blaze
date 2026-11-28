@@ -89,14 +89,14 @@ fn own_bodies_move_and_borrow_checked() {
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
     let mut world = ProjectWorld::new(&names, &frame, &sources, heap.alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let bodies = world.bodies(heap.alloc());
+    let bodies = world.listed_with(blaze_ladder::front2::project_records::Listing::FnsAndInitializers, heap.alloc());
     let name_of = |b: &BodyRef<'_>| -> String {
         match b {
             BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name).unwrap_or("?").to_string(),
             BodyRef::Member { name, .. } => name.to_string(),
         }
     };
-    let find = |n: &str| bodies.iter().find(|(b, _)| name_of(b) == n).map(|(b, _)| *b).unwrap_or_else(|| panic!("`{n}` listed"));
+    let find = |n: &str| bodies.iter().find(|l| name_of(&l.body) == n).map(|l| l.body).unwrap_or_else(|| panic!("`{n}` listed"));
     let text_of = |b: BodyRef<'_>| {
         let k = match b {
             BodyRef::Free(k) => k,
@@ -387,14 +387,14 @@ fn async_implied_bounds_and_concrete_type_outlives() {
     let sources = [SourceFile { path: "src/main.rs", text: ASYNC_AND_TYPE_OUTLIVES_MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
     let mut world = ProjectWorld::new(&names, &frame, &sources, heap.alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let bodies = world.bodies(heap.alloc());
+    let bodies = world.listed_with(blaze_ladder::front2::project_records::Listing::FnsAndInitializers, heap.alloc());
     let name_of = |b: &BodyRef<'_>| -> String {
         match b {
             BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name).unwrap_or("?").to_string(),
             BodyRef::Member { name, .. } => name.to_string(),
         }
     };
-    let find = |n: &str| bodies.iter().find(|(b, _)| name_of(b) == n).map(|(b, _)| *b).unwrap_or_else(|| panic!("`{n}` listed"));
+    let find = |n: &str| bodies.iter().find(|l| name_of(&l.body) == n).map(|l| l.body).unwrap_or_else(|| panic!("`{n}` listed"));
     let text_of = |b: BodyRef<'_>| {
         let k = match b {
             BodyRef::Free(k) => k,
@@ -593,14 +593,14 @@ fn async_block_future_output_slots() {
     let sources = [SourceFile { path: "src/main.rs", text: FUTURE_OUTPUT_SLOTS_MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
     let mut world = ProjectWorld::new(&names, &frame, &sources, heap.alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let bodies = world.bodies(heap.alloc());
+    let bodies = world.listed_with(blaze_ladder::front2::project_records::Listing::FnsAndInitializers, heap.alloc());
     let name_of = |b: &BodyRef<'_>| -> String {
         match b {
             BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name).unwrap_or("?").to_string(),
             BodyRef::Member { name, .. } => name.to_string(),
         }
     };
-    let find = |n: &str| bodies.iter().find(|(b, _)| name_of(b) == n).map(|(b, _)| *b).unwrap_or_else(|| panic!("`{n}` listed"));
+    let find = |n: &str| bodies.iter().find(|l| name_of(&l.body) == n).map(|l| l.body).unwrap_or_else(|| panic!("`{n}` listed"));
     let text_of = |b: BodyRef<'_>| {
         let k = match b {
             BodyRef::Free(k) => k,
@@ -783,8 +783,14 @@ impl<'a, T> OutlivesToken<'a, T> {
     }
 }
 
-const PROMOTED_OUTLIVES: &'static OutlivesToken<'static, &'static u8> = &OutlivesToken::new(&1u8);
-const NON_FREEZE_CELL: &'static core::cell::Cell<u8> = &core::cell::Cell::new(1u8);
+const PROMOTED_OUTLIVES: &'static OutlivesToken<'static, &'static u8> = {
+    let r = &OutlivesToken::new(&1u8);
+    r
+};
+const NON_FREEZE_CELL: &'static core::cell::Cell<u8> = {
+    let r = &core::cell::Cell::new(1u8);
+    r
+};
 
 struct StaticToken<'a, T>(PhantomData<&'a ()>, PhantomData<T>);
 impl<T: Copy> Copy for StaticToken<'static, T> {}
@@ -879,7 +885,7 @@ fn copy_proj_region_wrong_out_err<'a, T: Has<'a, Out = u16>>(p: ProjToken<'a, T>
 
 fn dyn_expect_destructuring_reassign_err(
     s: Vec<Reader>,
-    non_static: (Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool>>, u32),
+    non_static: (Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool + Send + Sync>>, u32),
 ) {
     let mut readers = s;
     let _other;
@@ -1194,14 +1200,14 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
     let sources = [SourceFile { path: "src/main.rs", text: DYN_AND_COPY_MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
     let mut world = ProjectWorld::new(&names, &frame, &sources, heap.alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let bodies = world.bodies(heap.alloc());
+    let bodies = world.listed_with(blaze_ladder::front2::project_records::Listing::FnsAndInitializers, heap.alloc());
     let name_of = |b: &BodyRef<'_>| -> String {
         match b {
             BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name).unwrap_or("?").to_string(),
             BodyRef::Member { name, .. } => name.to_string(),
         }
     };
-    let find = |n: &str| bodies.iter().find(|(b, _)| name_of(b) == n).map(|(b, _)| *b).unwrap_or_else(|| panic!("`{n}` listed"));
+    let find = |n: &str| bodies.iter().find(|l| name_of(&l.body) == n).map(|l| l.body).unwrap_or_else(|| panic!("`{n}` listed"));
     let text_of = |b: BodyRef<'_>| {
         let k = match b {
             BodyRef::Free(k) => k,

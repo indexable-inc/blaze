@@ -350,44 +350,41 @@ fn read_copy_impl<'a>(store: &Store<'_>, langs: super::BorrowLangs, adt: tc::Ite
     let [sized, meta_sized, pointee_sized, destruct] = langs.relates_nothing;
     let sized = sized.or_else(|| store.sized.map(checker_of));
     let adt_preds = store.preds.get(&adt)?;
-    // Lazily populated mapping from impl lifetime param index to ADT lifetime param index,
-    // read from `imp`'s self_ty region column when `imp` has a `RegionOutlives` clause.
-    let mut lt_map: Option<AVec<'a, Option<u32>>> = None;
+    // Always verify that `imp`'s self-type ADT lifetime slots are unconstrained (distinct
+    // `Region::Param`s). If the impl fixes `'static` (e.g. `Copy for StaticToken<'static, T>`)
+    // or equates two lifetimes (e.g. `Copy for SamePair<'a, 'a, T>`), return `None` so
+    // region-aware `inst_is_copy` enforces the exact lifetime obligations.
+    let adt_lts = usize::try_from(store.adts.get(&adt)?.lifetimes).ok()?;
+    let mut lt_map: AVec<'a, Option<u32>> = AVec::new_in(alloc);
+    if adt_lts > 0 {
+        let reader = store.regions.reader(store.work_alloc());
+        let (self_col, _) = reader.impl_header(imp).ok()?;
+        let self_slice = self_col.as_slice();
+        if self_slice.len() < adt_lts {
+            return None;
+        }
+        for (j, &r) in self_slice.get(..adt_lts)?.iter().enumerate() {
+            let Region::Param(imp_p) = r else {
+                return None;
+            };
+            let pi = usize::try_from(imp_p).ok()?;
+            if lt_map.len() <= pi {
+                lt_map.resize(pi + 1, None);
+            }
+            if let Some(entry) = lt_map.get_mut(pi) {
+                if entry.is_some() {
+                    return None;
+                }
+                *entry = u32::try_from(j).ok();
+            }
+        }
+    }
     for c in store.preds.get(&imp)?.clauses.iter() {
         if let tc::PClause::RegionOutlives { long, short } = *c {
-            let map = match &mut lt_map {
-                Some(m) => m,
-                slot @ None => {
-                    let reader = store.regions.reader(store.work_alloc());
-                    let adt_lts = usize::try_from(store.adts.get(&adt)?.lifetimes).ok()?;
-                    let (self_col, _) = reader.impl_header(imp).ok()?;
-                    let self_slice = self_col.as_slice();
-                    if self_slice.len() < adt_lts {
-                        return None;
-                    }
-                    let mut m: AVec<'a, Option<u32>> = AVec::new_in(alloc);
-                    for (j, &r) in self_slice.get(..adt_lts)?.iter().enumerate() {
-                        if let Region::Param(imp_p) = r {
-                            let pi = usize::try_from(imp_p).ok()?;
-                            if m.len() <= pi {
-                                m.resize(pi + 1, None);
-                            }
-                            if let Some(entry) = m.get_mut(pi) {
-                                if entry.is_some() {
-                                    // Same impl lifetime bound twice on the ADT: cannot invert uniquely.
-                                    return None;
-                                }
-                                *entry = u32::try_from(j).ok();
-                            }
-                        }
-                    }
-                    slot.insert(m)
-                }
-            };
             let map_reg = |r: Region| -> Option<Region> {
                 match r {
                     Region::Static => Some(Region::Static),
-                    Region::Param(p) => usize::try_from(p).ok().and_then(|pi| map.get(pi).copied().flatten()).map(Region::Param),
+                    Region::Param(p) => usize::try_from(p).ok().and_then(|pi| lt_map.get(pi).copied().flatten()).map(Region::Param),
                     Region::Late { .. } => None,
                 }
             };
