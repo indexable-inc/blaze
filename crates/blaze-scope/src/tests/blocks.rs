@@ -1148,6 +1148,15 @@ pub struct S {
     pub b: [u8; make_len!()],
 }
 pub struct T(#[cfg(any())] pub [u8; missing!()], #[cfg(all())] pub [u8; make_len!()]);
+pub enum E {
+    #[cfg_attr(all(), non_exhaustive)]
+    V([u8; make_len!()]),
+}
+pub fn g(
+    #[cfg_attr(all(), cfg(any()))] _disabled: [u8; missing!()],
+    #[cfg_attr(any(), cfg(any()))] _kept: [u8; make_len!()],
+    #[cfg_attr(all(), cfg(all()))] _enabled: [u8; make_len!()],
+) {}
 "#;
 
 static CFG_GATED_HEAD_MACRO_CALLS_TEXTS: Texts = Texts(&[&[("/user/lib.rs", CFG_GATED_HEAD_MACRO_CALLS)]]);

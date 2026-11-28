@@ -2150,21 +2150,39 @@ pub struct T(
     #[cfg(all())] pub [u8; make_len!()],
 );
 
+pub enum NonExh {
+    #[cfg_attr(all(), non_exhaustive)]
+    V([u8; make_len!()]),
+}
+
+pub fn g(
+    #[cfg_attr(all(), cfg(any()))] _gone: [u8; missing!()],
+    #[cfg_attr(any(), cfg(any()))] _kept: [u8; make_len!()],
+    #[cfg_attr(all(), cfg(all()))] _ok: [u8; make_len!()],
+) {}
+
 fn fn_ok() { f([0u8; 2]); }
 fn fn_bad() { f([0u8; 3]); }
 fn struct_ok() -> S { S { ok: [0u8; 2] } }
 fn struct_bad() -> S { S { ok: [0u8; 3] } }
 fn tuple_ok() -> T { T([0u8; 2]) }
 fn tuple_bad() -> T { T([0u8; 3]) }
+fn enum_ok() -> NonExh { NonExh::V([0u8; 2]) }
+fn enum_bad() -> NonExh { NonExh::V([0u8; 3]) }
+fn cfg_attr_ok() { g([0u8; 2], [0u8; 2]); }
+fn cfg_attr_bad() { g([0u8; 2], [0u8; 3]); }
 fn main() {}
 ";
     let got = check_fns(
         TEXT,
-        &["fn_ok", "fn_bad", "struct_ok", "struct_bad", "tuple_ok", "tuple_bad"],
+        &[
+            "fn_ok", "fn_bad", "struct_ok", "struct_bad", "tuple_ok", "tuple_bad",
+            "enum_ok", "enum_bad", "cfg_attr_ok", "cfg_attr_bad",
+        ],
     );
     expect(
         "cfg-gated head macro calls",
         &got,
-        &[true, false, true, false, true, false],
+        &[true, false, true, false, true, false, true, false, true, false],
     );
 }

@@ -314,10 +314,169 @@ pub fn may_write_block(text: &str) -> bool {
     text.contains('!') || WORDS.into_iter().any(|word| text.contains(word))
 }
 
-/// Calls `f` with the byte range in `text` of every outer `#[cfg(...)]` or `#[cfg_attr(...)]`
-/// attribute inside `range` (skipping `#![...]` inner attributes and non-cfg attributes such as
-/// `#[serde(...)]`, `#[doc = ...]`, `#[allow(...)]`, `#[default]`).
-pub fn for_each_cfg_attr(text: &str, range: Range, mut f: impl FnMut(Range)) {
+/// One piece of a filtered `#[cfg(...)]` or gating `#[cfg_attr(...)]` attribute emitted by
+/// [`for_each_cfg_attr`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CfgEmit<'a> {
+    /// Synthetic wrapper text (`"#[cfg_attr("`, `", "`, `")]\n"`, `"\n"`).
+    Lit(&'a str),
+    /// A verbatim slice of the source `text` (so callers can remap token marks via `Copied`).
+    Src(Range),
+}
+
+/// Calls `f` with the [`CfgEmit`] pieces of every gating outer `#[cfg(...)]` attribute (and
+/// every gating `cfg(...)` payload inside `#[cfg_attr(pred, ...)]`, recursively) found in
+/// `range`, skipping `#![...]` inner attributes and non-gating attributes or `cfg_attr`
+/// payloads such as `non_exhaustive`, `derive(...)`, `allow(...)`, `doc = ...`, or `serde(...)`.
+pub fn for_each_cfg_attr(text: &str, range: Range, mut f: impl FnMut(CfgEmit<'_>)) {
+    const MAX_CFG_ATTR_DEPTH: usize = 16;
+
+    /// Classifies an attribute body (`cfg(...)`, `core::cfg(...)`, `cfg_attr(...)`, etc.),
+    /// returning `(is_cfg, is_cfg_attr, parens_inner_range_in_slice)` when the attribute has a
+    /// balanced `(...)` argument list.
+    fn classify_attr_body(slice: &str) -> (bool, bool, Option<(usize, usize)>) {
+        let mut at = 0usize;
+        let mut is_cfg = false;
+        let mut is_cfg_attr = false;
+        let mut in_path = true;
+        let mut open_inner: Option<usize> = None;
+        let mut depth = 0u32;
+        for tok in tokenize(slice, FrontmatterAllowed::No, Cpu::BASELINE) {
+            let t_start = at;
+            let Ok(len) = usize::try_from(tok.len) else {
+                return (false, false, None);
+            };
+            at += len;
+            let kind = tok.kind;
+            if matches!(kind, TokenKind::Whitespace | TokenKind::LineComment { .. } | TokenKind::BlockComment { .. }) {
+                continue;
+            }
+            if in_path {
+                match kind {
+                    TokenKind::Ident => {
+                        let w = slice.get(t_start..at);
+                        is_cfg = w == Some("cfg");
+                        is_cfg_attr = w == Some("cfg_attr");
+                    }
+                    TokenKind::Colon => {}
+                    TokenKind::OpenParen if is_cfg || is_cfg_attr => {
+                        in_path = false;
+                        open_inner = Some(at);
+                        depth = 1;
+                    }
+                    _ => return (false, false, None),
+                }
+            } else {
+                match kind {
+                    TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => {
+                        depth = depth.saturating_add(1);
+                    }
+                    TokenKind::CloseParen | TokenKind::CloseBracket | TokenKind::CloseBrace => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return if kind == TokenKind::CloseParen {
+                                (is_cfg, is_cfg_attr, open_inner.map(|s| (s, t_start)))
+                            } else {
+                                (false, false, None)
+                            };
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (false, false, None)
+    }
+
+    /// Calls `each` with the trimmed byte range (relative to `slice`) of every non-empty
+    /// top-level comma-separated argument in `slice`.
+    fn for_each_top_arg(slice: &str, mut each: impl FnMut(usize, usize)) {
+        let mut depth = 0u32;
+        let mut arg_start = 0usize;
+        let mut at = 0usize;
+        let emit_trimmed = |s: usize, e: usize, each: &mut dyn FnMut(usize, usize)| {
+            let Some(part) = slice.get(s..e) else { return };
+            let lead = part.len() - part.trim_start().len();
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                each(s + lead, s + lead + trimmed.len());
+            }
+        };
+        for tok in tokenize(slice, FrontmatterAllowed::No, Cpu::BASELINE) {
+            let t_start = at;
+            let Ok(len) = usize::try_from(tok.len) else {
+                return;
+            };
+            at += len;
+            match tok.kind {
+                TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => {
+                    depth = depth.saturating_add(1);
+                }
+                TokenKind::CloseParen | TokenKind::CloseBracket | TokenKind::CloseBrace => {
+                    depth = depth.saturating_sub(1);
+                }
+                TokenKind::Comma if depth == 0 => {
+                    emit_trimmed(arg_start, t_start, &mut each);
+                    arg_start = at;
+                }
+                _ => {}
+            }
+        }
+        if depth == 0 {
+            emit_trimmed(arg_start, slice.len(), &mut each);
+        }
+    }
+
+    /// Walks the arguments of a `cfg_attr(pred, payload...)` at byte offset `base` in `text`,
+    /// emitting `#[cfg_attr(p0, cfg_attr(p1, ..., cfg(...)))]` for each gating `cfg` leaf.
+    fn walk_cfg_attr(
+        text: &str,
+        base: usize,
+        inner: &str,
+        preds: &mut [Range; MAX_CFG_ATTR_DEPTH],
+        depth: usize,
+        f: &mut impl FnMut(CfgEmit<'_>),
+    ) {
+        if depth >= MAX_CFG_ATTR_DEPTH {
+            return;
+        }
+        let mut got_pred = false;
+        for_each_top_arg(inner, |s, e| {
+            let (Ok(abs_s), Ok(abs_e)) = (u32::try_from(base + s), u32::try_from(base + e)) else {
+                return;
+            };
+            if !got_pred {
+                got_pred = true;
+                if let Some(slot) = preds.get_mut(depth) {
+                    *slot = Range { start: abs_s, end: abs_e };
+                }
+                return;
+            }
+            let Some(item) = inner.get(s..e) else { return };
+            let (is_cfg, is_cfg_attr, parens) = classify_attr_body(item);
+            if is_cfg && parens.is_some() {
+                f(CfgEmit::Lit("#["));
+                if let Some(active) = preds.get(..=depth) {
+                    for &p in active {
+                        f(CfgEmit::Lit("cfg_attr("));
+                        f(CfgEmit::Src(p));
+                        f(CfgEmit::Lit(", "));
+                    }
+                    f(CfgEmit::Src(Range { start: abs_s, end: abs_e }));
+                    for _ in active {
+                        f(CfgEmit::Lit(")"));
+                    }
+                }
+                f(CfgEmit::Lit("]\n"));
+            } else if is_cfg_attr
+                && let Some((ps, pe)) = parens
+                && let Some(nested_inner) = item.get(ps..pe)
+            {
+                walk_cfg_attr(text, base + s + ps, nested_inner, preds, depth + 1, f);
+            }
+        });
+    }
+
     if range.end <= range.start {
         return;
     }
@@ -335,11 +494,11 @@ pub fn for_each_cfg_attr(text: &str, range: Range, mut f: impl FnMut(Range)) {
         Idle,
         Pound { start: usize },
         SkipInner { depth: u32 },
-        Path { start: usize, is_cfg: bool },
-        Body { start: usize, depth: u32, is_cfg: bool },
+        Attr { start: usize, body_start: usize, depth: u32 },
     }
     let mut state = State::Idle;
     let mut at = 0usize;
+    let mut preds = [Range { start: 0, end: 0 }; MAX_CFG_ATTR_DEPTH];
     for tok in tokenize(slice, FrontmatterAllowed::No, Cpu::BASELINE) {
         let t_start = at;
         let Ok(len) = usize::try_from(tok.len) else {
@@ -361,7 +520,7 @@ pub fn for_each_cfg_attr(text: &str, range: Range, mut f: impl FnMut(Range)) {
                 }
             }
             State::Pound { start } => match kind {
-                TokenKind::OpenBracket => State::Path { start, is_cfg: false },
+                TokenKind::OpenBracket => State::Attr { start, body_start: at, depth: 1 },
                 TokenKind::Bang => State::SkipInner { depth: 0 },
                 TokenKind::Pound => State::Pound { start: t_start },
                 _ => State::Idle,
@@ -378,40 +537,34 @@ pub fn for_each_cfg_attr(text: &str, range: Range, mut f: impl FnMut(Range)) {
                     State::SkipInner { depth }
                 }
             }
-            State::Path { start, is_cfg } => match kind {
-                TokenKind::Ident => {
-                    let w = slice.get(t_start..at);
-                    State::Path { start, is_cfg: matches!(w, Some("cfg" | "cfg_attr")) }
-                }
-                TokenKind::Colon => State::Path { start, is_cfg },
-                TokenKind::CloseBracket => {
-                    if is_cfg
-                        && let (Ok(s), Ok(e)) = (u32::try_from(r_start + start), u32::try_from(r_start + at))
-                    {
-                        f(Range { start: s, end: e });
-                    }
-                    State::Idle
-                }
-                _ if open => State::Body { start, depth: 2, is_cfg },
-                _ => State::Body { start, depth: 1, is_cfg: false },
-            },
-            State::Body { start, depth, is_cfg } => {
+            State::Attr { start, body_start, depth } => {
                 if open {
-                    State::Body { start, depth: depth.saturating_add(1), is_cfg }
+                    State::Attr { start, body_start, depth: depth.saturating_add(1) }
                 } else if close {
                     let next = depth - 1;
                     if next == 0 {
-                        if is_cfg
-                            && let (Ok(s), Ok(e)) = (u32::try_from(r_start + start), u32::try_from(r_start + at))
+                        if kind == TokenKind::CloseBracket
+                            && let Some(body) = slice.get(body_start..t_start)
                         {
-                            f(Range { start: s, end: e });
+                            let (is_cfg, is_cfg_attr, parens) = classify_attr_body(body);
+                            if is_cfg && parens.is_some() {
+                                if let (Ok(s), Ok(e)) = (u32::try_from(r_start + start), u32::try_from(r_start + at)) {
+                                    f(CfgEmit::Src(Range { start: s, end: e }));
+                                    f(CfgEmit::Lit("\n"));
+                                }
+                            } else if is_cfg_attr
+                                && let Some((ps, pe)) = parens
+                                && let Some(inner) = body.get(ps..pe)
+                            {
+                                walk_cfg_attr(text, r_start + body_start + ps, inner, &mut preds, 0, &mut f);
+                            }
                         }
                         State::Idle
                     } else {
-                        State::Body { start, depth: next, is_cfg }
+                        State::Attr { start, body_start, depth: next }
                     }
                 } else {
-                    State::Body { start, depth, is_cfg }
+                    State::Attr { start, body_start, depth }
                 }
             }
         };
@@ -1744,7 +1897,6 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
     let mut top_angle_depth = 0u32;
     let mut top_elem_attrs: Option<Range> = None;
     let mut top_attr_start: Option<u32> = None;
-    let mut top_attr_end = 0u32;
     let mut top_elem_fresh = false;
     // The listed call whose arguments are open: `(is_head_call, index)`.
     let mut open_call: Option<(bool, usize)> = None;
@@ -2060,8 +2212,7 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                                 if was_inner {
                                     top_attr_start = None;
                                 } else {
-                                    top_attr_end = offset(at);
-                                    top_elem_attrs = outer_attrs(text, top_attr_start, top_attr_end);
+                                    top_elem_attrs = outer_attrs(text, top_attr_start, offset(at));
                                 }
                             }
                             _ => {}
@@ -2151,7 +2302,6 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                         if top_angle_depth == 1 {
                             top_elem_attrs = None;
                             top_attr_start = None;
-                            top_attr_end = 0;
                             top_elem_fresh = true;
                         }
                     }
@@ -2160,14 +2310,12 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                         if top_angle_depth == 0 {
                             top_elem_attrs = None;
                             top_attr_start = None;
-                            top_attr_end = 0;
                             top_elem_fresh = false;
                         }
                     }
                     (TokenKind::Comma, _) if top_angle_depth == 1 => {
                         top_elem_attrs = None;
                         top_attr_start = None;
-                        top_attr_end = 0;
                         top_elem_fresh = true;
                     }
                     _ => {}
@@ -3174,9 +3322,34 @@ fn h() {
         assert_eq!(n.head_calls.len(), 2);
         assert_eq!(&fn_src[n.head_calls[0].attrs.start as usize..n.head_calls[0].attrs.end as usize], "#[allow(unused)] #[cfg(any())]");
         assert_eq!(&fn_src[n.head_calls[1].attrs.start as usize..n.head_calls[1].attrs.end as usize], "#[cfg(all())]");
-        let mut cfgs = blaze_own::AVec::new_in(heap.alloc());
-        super::for_each_cfg_attr(fn_src, n.head_calls[0].attrs, |r| cfgs.push(&fn_src[r.start as usize..r.end as usize]));
-        assert_eq!(cfgs.as_slice(), &["#[cfg(any())]"]);
+        let mut cfgs = blaze_own::AString::new_in(heap.alloc());
+        super::for_each_cfg_attr(fn_src, n.head_calls[0].attrs, |piece| match piece {
+            super::CfgEmit::Lit(s) => cfgs.push_str(s),
+            super::CfgEmit::Src(r) => cfgs.push_str(&fn_src[r.start as usize..r.end as usize]),
+        });
+        assert_eq!(cfgs.as_str(), "#[cfg(any())]\n");
+
+        // `cfg_attr` with only non-gating payloads emits nothing; mixed/nested `cfg_attr` emits
+        // ONLY the gating `cfg(...)` payload wrapped in its predicate(s).
+        let render_cfg = |src: &str| {
+            let mut out = blaze_own::AString::new_in(heap.alloc());
+            super::for_each_cfg_attr(src, blaze_surface::Range { start: 0, end: src.len() as u32 }, |piece| match piece {
+                super::CfgEmit::Lit(s) => out.push_str(s),
+                super::CfgEmit::Src(r) => out.push_str(&src[r.start as usize..r.end as usize]),
+            });
+            out
+        };
+        assert_eq!(render_cfg("#[cfg_attr(all(), non_exhaustive)]").as_str(), "");
+        assert_eq!(render_cfg("#[cfg_attr(all(), non_exhaustive, derive(Debug))]").as_str(), "");
+        assert_eq!(render_cfg("#[cfg_attr(all(), cfg(any()))]").as_str(), "#[cfg_attr(all(), cfg(any()))]\n");
+        assert_eq!(
+            render_cfg("#[cfg_attr(all(), non_exhaustive, cfg(any()), allow(dead_code))]").as_str(),
+            "#[cfg_attr(all(), cfg(any()))]\n"
+        );
+        assert_eq!(
+            render_cfg("#[cfg_attr(all(), non_exhaustive, cfg_attr(any(), derive(Clone), cfg(any())))]").as_str(),
+            "#[cfg_attr(all(), cfg_attr(any(), cfg(any())))]\n"
+        );
 
         // Tuple struct fields: cfg(any()) stays on field 0 and clears on `,`.
         let tup_src = "struct T(#[cfg(any())] pub [u8; missing!()], [u8; make_len!()]);";

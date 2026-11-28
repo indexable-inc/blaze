@@ -154,17 +154,19 @@ pub(crate) fn emit_cfg_attrs(
     out: &mut AString<'_>,
     copied: &mut dyn FnMut(crate::crate_roots::Copied),
 ) {
-    blaze_file_items::nested::for_each_cfg_attr(text, range, |r| {
-        if let (Ok(start), Ok(end)) = (usize::try_from(r.start), usize::try_from(r.end))
-            && let Some(attr) = text.get(start..end)
-        {
-            copied(crate::crate_roots::Copied {
-                from: r.start,
-                to: u32::try_from(out.len()).unwrap_or(u32::MAX),
-                len: r.end.saturating_sub(r.start),
-            });
-            out.push_str(attr);
-            out.push_str("\n");
+    blaze_file_items::nested::for_each_cfg_attr(text, range, |piece| match piece {
+        blaze_file_items::nested::CfgEmit::Lit(s) => out.push_str(s),
+        blaze_file_items::nested::CfgEmit::Src(r) => {
+            if let (Ok(start), Ok(end)) = (usize::try_from(r.start), usize::try_from(r.end))
+                && let Some(part) = text.get(start..end)
+            {
+                copied(crate::crate_roots::Copied {
+                    from: r.start,
+                    to: u32::try_from(out.len()).unwrap_or(u32::MAX),
+                    len: r.end.saturating_sub(r.start),
+                });
+                out.push_str(part);
+            }
         }
     });
 }
