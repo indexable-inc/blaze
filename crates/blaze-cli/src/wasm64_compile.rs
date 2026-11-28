@@ -67,10 +67,17 @@ pub(crate) use blaze_toolchain::{WASM64_TARGET, WASM64_TARGET_EXTRA_CFGS};
 /// The exported global name holding `&'static [Client]` in self-compiled proc-macro modules.
 const PROC_MACRO_DECLS_GLOBAL: &str = "__rustc_proc_macro_decls_blaze__";
 
-/// Virtual reservation for the scratch arena of one on-demand wasm64 compile (costs zero physical
-/// pages until touched; unmapped on return). Growing LIR/Wasm worklist structures use `heap_alloc`
-/// so old buffers are freed on realloc; this frame only holds resolved scope/items records.
-const COMPILE_FRAME_RESERVE: usize = 2 << 30;
+/// Soft cap for the scratch arena of one on-demand wasm64 compile (`Frame::with_reserve` commits
+/// zero pages until touched and unmaps on drop). Large proc-macros (e.g. `sqlx-macros`) resolve
+/// 50–150+ transitive crates into this frame while per-crate solver/call scratch is reclaimed via
+/// [`CompilePar`]; growing LIR/Wasm worklists use `heap_alloc`.
+const COMPILE_FRAME_RESERVE: usize = 8 << 30;
+
+/// Resident budget kept warm in `CompilePar::call_frame` between macro calls (one 2 MiB chunk):
+/// tiny macro calls incur zero trim syscalls while oversized calls (e.g. `write_records_opt` on
+/// `core`) immediately return excess pages to the OS, and `solve_scratch` trims `call_frame` to 0
+/// once per crate.
+const COMPILE_CALL_SCRATCH_KEEP: usize = 2 << 20;
 
 /// Atomic counter for unique staging directory names during atomic module publication.
 static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -767,14 +774,26 @@ impl<'f> SourceRecords<'f> for PackDir<'f> {
     }
 }
 
-/// Serial `Par` whose macro-expansion scratch resets per call.
+/// Serial `Par` whose macro-expansion (`call_scratch`) and cell-solver (`solve_scratch`) working
+/// graphs run in dedicated resettable frames, and which disables `Tables::by_place` (never read
+/// by record-based wasm64 compilation).
 struct CompilePar {
-    frame: RefCell<Option<Frame>>,
+    call_frame: RefCell<Frame>,
+    solve_frame: RefCell<Frame>,
 }
 
 impl CompilePar {
-    fn new() -> Self {
-        Self { frame: RefCell::new(Frame::new(Tag::Expand).ok()) }
+    fn new() -> Result<Self, SelfCompileError> {
+        let call_frame = Frame::new(Tag::Expand).map_err(|_| {
+            SelfCompileError::Failed("failed to reserve wasm64 call scratch frame".into())
+        })?;
+        let solve_frame = Frame::new(Tag::Nameres).map_err(|_| {
+            SelfCompileError::Failed("failed to reserve wasm64 solve scratch frame".into())
+        })?;
+        Ok(Self {
+            call_frame: RefCell::new(call_frame),
+            solve_frame: RefCell::new(solve_frame),
+        })
     }
 }
 
@@ -784,17 +803,28 @@ impl Par for CompilePar {
     }
 
     fn call_scratch(&self, work: &mut dyn FnMut(Alloc<'_>)) -> Scratch {
-        let Ok(mut slot) = self.frame.try_borrow_mut() else {
-            return Scratch::Kept;
-        };
-        let Some(frame) = slot.as_mut() else {
-            return Scratch::Kept;
-        };
+        let mut frame = self.call_frame.borrow_mut();
         frame.scope(|f| {
             let erased = Erased::new(f);
             work(erased.handle());
         });
+        frame.trim(COMPILE_CALL_SCRATCH_KEEP);
         Scratch::Reset
+    }
+
+    fn solve_scratch(&self, work: &mut dyn FnMut(Alloc<'_>)) -> Scratch {
+        let mut solve = self.solve_frame.borrow_mut();
+        solve.scope(|f| {
+            let erased = Erased::new(f);
+            work(erased.handle());
+        });
+        solve.trim(0);
+        self.call_frame.borrow_mut().trim(0);
+        Scratch::Reset
+    }
+
+    fn track_by_place(&self) -> bool {
+        false
     }
 }
 
@@ -3062,7 +3092,7 @@ fn compile_unit_in<'a>(
         },
         frame,
     ));
-    let par = CompilePar::new();
+    let par = CompilePar::new()?;
     let sysroot_dir = store
         .join("wasm64-sysroot-v2")
         .join(wasm64_sysroot_dir_name(tc_id, producers, alloc).as_str());
@@ -3080,6 +3110,8 @@ fn compile_unit_in<'a>(
             let name = crates.get(at).map_or("<unknown>", |c| c.name);
             classify_scope_resolve_error(name, &e)
         })?;
+    // Release `call_frame` and `solve_frame` before record encoding and wasm64 codegen.
+    drop(par);
 
     // Extract proc-macro exports in exact `_DECLS` order (including macro-generated
     // `#[proc_macro*]` items such as `derive_more-impl`'s `create_derive!`) if in ProcMacro mode.
@@ -6535,5 +6567,315 @@ pub fn pkg_version(_input: TokenStream) -> TokenStream {\n\
         assert_ne!(got_v1, got_v2, "editing either colliding non-UTF-8 file must invalidate path_pkg_files_digest");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn compile_par_solve_scratch_reclaims_trims_and_controls_against_kept() {
+        assert!(
+            COMPILE_FRAME_RESERVE >= 8 << 30,
+            "multi-crate wasm64 compile frame must reserve at least 8 GiB (got {COMPILE_FRAME_RESERVE})"
+        );
+        let par = CompilePar::new().expect("CompilePar::new");
+        assert!(!par.track_by_place(), "CompilePar must disable Tables::by_place for record-only solves");
+
+        const ITERATIONS: usize = 8;
+        const SOLVE_BYTES: usize = 3 << 20;
+        const CALL_BYTES: usize = 5 << 20;
+
+        // Positive: `CompilePar::solve_scratch` runs in its own frame, allows nested `call_scratch`,
+        // keeps 0 bytes in the caller's main `bump`, and trims committed pages back to 0.
+        let main_frame = Frame::with_reserve(64 << 20, Tag::Other).expect("main frame");
+        let main_erased = Erased::new(&main_frame);
+        let main_alloc = main_erased.handle();
+        let solve_hook = |work: &mut dyn FnMut(Alloc<'_>)| par.solve_scratch(work);
+        let call_hook = |work: &mut dyn FnMut(Alloc<'_>)| par.call_scratch(work);
+
+        for i in 0..ITERATIONS {
+            let mut ran_solve = false;
+            let mut ran_nested_call = false;
+            let solve_mode = par.solve_scratch(&mut |s_alloc| {
+                ran_solve = true;
+                let mut buf = OwnVec::<u8, Alloc<'_>>::with_capacity_in(SOLVE_BYTES, s_alloc);
+                buf.resize(SOLVE_BYTES, u8::try_from(i).expect("iter byte"));
+                core::hint::black_box(buf.as_slice());
+
+                // Nested `call_scratch` inside `solve_scratch` (matches `lower_crate` and `solve_and_write`).
+                let call_mode = par.call_scratch(&mut |c_alloc| {
+                    ran_nested_call = true;
+                    let mut cbuf = OwnVec::<u8, Alloc<'_>>::with_capacity_in(CALL_BYTES, c_alloc);
+                    cbuf.resize(CALL_BYTES, 0xAB);
+                    core::hint::black_box(cbuf.as_slice());
+                });
+                assert_eq!(call_mode, Scratch::Reset);
+                assert_eq!(par.call_frame.borrow().used(), 0, "call_scratch must roll back after call");
+                assert!(
+                    par.call_frame.borrow().committed() <= COMPILE_CALL_SCRATCH_KEEP,
+                    "oversized call_scratch ({CALL_BYTES} B) must trim back to <= {COMPILE_CALL_SCRATCH_KEEP} B (got {})",
+                    par.call_frame.borrow().committed()
+                );
+            });
+            assert_eq!(solve_mode, Scratch::Reset);
+            assert!(ran_solve && ran_nested_call);
+            assert_eq!(par.solve_frame.borrow().used(), 0, "solve_scratch must roll back after solve");
+            assert_eq!(par.solve_frame.borrow().committed(), 0, "solve_scratch must trim(0) after solve");
+            assert_eq!(par.call_frame.borrow().committed(), 0, "solve_scratch must trim call_frame to 0 per crate");
+        }
+        // Exercise `Scratch::run` with interleaved permanent output in `main_frame` (the exact
+        // pattern of `cells::solve_and_write`, which writes solved scopes into `bump` while its
+        // `Cells`/`WriteIndex`/`SolverScratch` are still alive in `solve_scratch`):
+        // under `CompilePar`, solver/call scratch lives in separate frames so `main_frame` keeps
+        // only the tiny permanent outputs.
+        const OUTPUT_BYTES: usize = 64;
+        for i in 0..ITERATIONS {
+            let sum: usize = Scratch::run(&solve_hook, main_alloc, |s_alloc| {
+                let mut buf = OwnVec::<u8, Alloc<'_>>::with_capacity_in(SOLVE_BYTES, s_alloc);
+                buf.resize(SOLVE_BYTES, u8::try_from(i).expect("iter byte"));
+                let nested = Scratch::run(&call_hook, main_alloc, |c_alloc| {
+                    let mut cbuf = OwnVec::<u8, Alloc<'_>>::with_capacity_in(CALL_BYTES, c_alloc);
+                    cbuf.resize(CALL_BYTES, 2);
+                    cbuf.len()
+                });
+                let kept_slice = main_frame.alloc_slice_copy(&[u8::try_from(i).expect("iter byte"); OUTPUT_BYTES]);
+                core::hint::black_box(kept_slice);
+                buf.len() + nested
+            });
+            assert_eq!(sum, SOLVE_BYTES + CALL_BYTES);
+        }
+        assert!(
+            main_frame.used() <= ITERATIONS * OUTPUT_BYTES * 2,
+            "CompilePar must keep only permanent outputs in main_frame, not solver scratch (used {} B)",
+            main_frame.used()
+        );
+        assert_eq!(par.solve_frame.borrow().committed(), 0);
+        assert_eq!(par.call_frame.borrow().committed(), 0);
+
+        // Negative control: default `Serial` returns `Scratch::Kept`, so `Scratch::run` puts
+        // solver scratch into `control_frame` right before the permanent output; the permanent
+        // output pins the bump cursor so dropping solver scratch cannot reclaim it.
+        let control_frame = Frame::with_reserve(64 << 20, Tag::Other).expect("control frame");
+        let control_erased = Erased::new(&control_frame);
+        let control_alloc = control_erased.handle();
+        assert!(Serial.track_by_place(), "control Serial defaults track_by_place to true");
+        let serial_solve_hook = |work: &mut dyn FnMut(Alloc<'_>)| Serial.solve_scratch(work);
+        for i in 0..ITERATIONS {
+            assert_eq!(Serial.solve_scratch(&mut |_| {}), Scratch::Kept);
+            Scratch::run(&serial_solve_hook, control_alloc, |s_alloc| {
+                let mut buf = OwnVec::<u8, Alloc<'_>>::with_capacity_in(SOLVE_BYTES, s_alloc);
+                buf.resize(SOLVE_BYTES, u8::try_from(i).expect("iter byte"));
+                let kept_slice = control_frame.alloc_slice_copy(&[u8::try_from(i).expect("iter byte"); OUTPUT_BYTES]);
+                core::hint::black_box((buf.as_slice(), kept_slice));
+            });
+        }
+        assert!(
+            control_frame.used() >= ITERATIONS * SOLVE_BYTES,
+            "negative control (Scratch::Kept) must accumulate solver scratch in main frame ({} < {})",
+            control_frame.used(),
+            ITERATIONS * SOLVE_BYTES
+        );
+    }
+
+    #[test]
+    fn compile_par_resolve_kept_multi_crate_skips_by_place_reclaims_solver_scratch_and_matches_records() {
+        use core::fmt::Write as _;
+
+        // Negative control reproducing pre-fix `CompilePar`: resets `call_scratch` only,
+        // leaves `solve_scratch` as default `Scratch::Kept` and `track_by_place` as `true`.
+        struct PreFixCompilePar {
+            call_frame: RefCell<Frame>,
+        }
+
+        impl Par for PreFixCompilePar {
+            fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut AVec<'_, T>) {
+                Serial.map(n, f, out);
+            }
+
+            fn call_scratch(&self, work: &mut dyn FnMut(Alloc<'_>)) -> Scratch {
+                let mut frame = self.call_frame.borrow_mut();
+                frame.scope(|f| {
+                    let erased = Erased::new(f);
+                    work(erased.handle());
+                });
+                Scratch::Reset
+            }
+        }
+
+        struct NoCacheKept;
+        impl Kept for NoCacheKept {
+            fn find(&self, _krate: usize) -> Option<(&[u8], &[u8], &[u8])> {
+                None
+            }
+            fn made(&self, _krate: usize, _record: &[u8], _inner: &[u8], _read: &[u8]) {}
+        }
+
+        struct MultiSources<'a>(&'a [(&'a str, &'a str)]);
+        impl<'a> SourceTexts<'a> for MultiSources<'a> {
+            fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+                self.0.get(krate).and_then(|&(root, text)| (path == root).then_some(text))
+            }
+        }
+
+        let mut dep_a_src = std::string::String::from(
+            "#![no_core]\n\
+pub trait Tag { fn id() -> u32; }\n\
+#[macro_export]\n\
+macro_rules! make_items {\n\
+    ($name:ident, $n:literal) => {\n\
+        pub struct $name { pub v: u32 }\n\
+        impl $crate::Tag for $name { fn id() -> u32 { $n } }\n\
+        impl $name { pub fn get(&self) -> u32 { self.v } }\n\
+    };\n\
+}\n",
+        );
+        for i in 0..80u32 {
+            let _ = writeln!(dep_a_src, "make_items!(DepA{i}, {i});");
+        }
+
+        let mut dep_b_src = std::string::String::from("#![no_core]\npub use dep_a::Tag;\n");
+        for i in 0..80u32 {
+            let _ = writeln!(dep_b_src, "dep_a::make_items!(DepB{i}, {i});");
+        }
+
+        let mut root_src = std::string::String::from(
+            "#![no_core]\npub use dep_a::Tag;\npub use dep_b::DepB0;\n",
+        );
+        for i in 0..80u32 {
+            let _ = writeln!(root_src, "dep_a::make_items!(RootItem{i}, {i});");
+        }
+
+        let implicit_rust = blaze_unit_graph::Implicit {
+            std: blaze_unit_graph::StdIs::Rust,
+            prelude: blaze_unit_graph::Prelude::Rust(edition::Edition::Edition2021),
+            proc_macro: false,
+            entry: false,
+        };
+        let deps_b = [("dep_a", 0usize)];
+        let deps_root = [("dep_a", 0usize), ("dep_b", 1usize)];
+        let crates = [
+            CrateInput {
+                name: "dep_a",
+                key: CrateItemKey(ContentId::of("wasm64-compile-par-test", b"dep_a")),
+                edition: Edition::E2021,
+                implicit: implicit_rust,
+                root: "/dep_a/lib.rs",
+                shown_from: "/",
+                features: &[],
+                deps: &[],
+                cfg: &[],
+                script: None,
+            },
+            CrateInput {
+                name: "dep_b",
+                key: CrateItemKey(ContentId::of("wasm64-compile-par-test", b"dep_b")),
+                edition: Edition::E2021,
+                implicit: implicit_rust,
+                root: "/dep_b/lib.rs",
+                shown_from: "/",
+                features: &[],
+                deps: &deps_b,
+                cfg: &[],
+                script: None,
+            },
+            CrateInput {
+                name: "root_pm",
+                key: CrateItemKey(ContentId::of("wasm64-compile-par-test", b"root_pm")),
+                edition: Edition::E2021,
+                implicit: implicit_rust,
+                root: "/root_pm/lib.rs",
+                shown_from: "/",
+                features: &[],
+                deps: &deps_root,
+                cfg: &[],
+                script: None,
+            },
+        ];
+        let files = [
+            ("/dep_a/lib.rs", dep_a_src.as_str()),
+            ("/dep_b/lib.rs", dep_b_src.as_str()),
+            ("/root_pm/lib.rs", root_src.as_str()),
+        ];
+        let sources = MultiSources(&files);
+
+        type EncodedCrate = (
+            std::vec::Vec<u8>,
+            std::vec::Vec<u8>,
+            std::vec::Vec<u8>,
+            std::vec::Vec<u8>,
+            usize,
+        );
+        let run_with = |par: &dyn Fn() -> (usize, std::vec::Vec<EncodedCrate>)| par();
+
+        let (control_peak, control_records) = run_with(&|| {
+            let home = Frame::with_reserve(128 << 20, Tag::Other).expect("control home");
+            let erased = Erased::new(&home);
+            let bump = erased.bump();
+            let alloc = bump.alloc();
+            let par = PreFixCompilePar {
+                call_frame: RefCell::new(Frame::new(Tag::Expand).expect("control call frame")),
+            };
+            let ready = Ready::serial(core::time::Duration::from_secs(60));
+            let (solved, _) = resolve_kept(&crates, Sysroot::default(), &sources, &par, &ready, &NoCacheKept, bump)
+                .expect("control resolve_kept");
+            let peak = home.peak();
+            let mut out = std::vec::Vec::new();
+            for entry in solved.iter() {
+                let Solved::Solved(scope) = entry else { panic!("expected Solved"); };
+                let nr = names_record::encode(scope.names, alloc).expect("control names_record");
+                let ir = items_record::encode(scope.names, alloc).expect("control items_record");
+                out.push((
+                    scope.record.as_slice().to_vec(),
+                    scope.inner.as_slice().to_vec(),
+                    nr.as_slice().to_vec(),
+                    ir.as_slice().to_vec(),
+                    scope.names.tables.by_place.len(),
+                ));
+            }
+            (peak, out)
+        });
+
+        let (fixed_peak, fixed_records) = run_with(&|| {
+            let home = Frame::with_reserve(128 << 20, Tag::Other).expect("fixed home");
+            let erased = Erased::new(&home);
+            let bump = erased.bump();
+            let alloc = bump.alloc();
+            let par = CompilePar::new().expect("CompilePar::new");
+            let ready = Ready::serial(core::time::Duration::from_secs(60));
+            let (solved, _) = resolve_kept(&crates, Sysroot::default(), &sources, &par, &ready, &NoCacheKept, bump)
+                .expect("fixed resolve_kept");
+            let peak = home.peak();
+            assert_eq!(par.solve_frame.borrow().committed(), 0, "solve_frame must be trimmed to 0 after resolve_kept");
+            assert!(
+                par.call_frame.borrow().committed() <= COMPILE_CALL_SCRATCH_KEEP,
+                "call_frame must stay bounded by COMPILE_CALL_SCRATCH_KEEP after resolve_kept"
+            );
+            let mut out = std::vec::Vec::new();
+            for entry in solved.iter() {
+                let Solved::Solved(scope) = entry else { panic!("expected Solved"); };
+                let nr = names_record::encode(scope.names, alloc).expect("fixed names_record");
+                let ir = items_record::encode(scope.names, alloc).expect("fixed items_record");
+                out.push((
+                    scope.record.as_slice().to_vec(),
+                    scope.inner.as_slice().to_vec(),
+                    nr.as_slice().to_vec(),
+                    ir.as_slice().to_vec(),
+                    scope.names.tables.by_place.len(),
+                ));
+            }
+            (peak, out)
+        });
+
+        assert_eq!(fixed_records.len(), crates.len());
+        assert_eq!(control_records.len(), crates.len());
+        for (idx, (ctrl, fixed)) in control_records.iter().zip(fixed_records.iter()).enumerate() {
+            assert!(ctrl.4 > 0, "negative control crate {idx} must populate Tables::by_place");
+            assert_eq!(fixed.4, 0, "CompilePar crate {idx} must skip Tables::by_place");
+            assert_eq!(ctrl.0, fixed.0, "crate {idx} exports record must be byte-identical");
+            assert_eq!(ctrl.1, fixed.1, "crate {idx} inner record must be byte-identical");
+            assert_eq!(ctrl.2, fixed.2, "crate {idx} names_record must be byte-identical");
+            assert_eq!(ctrl.3, fixed.3, "crate {idx} items_record must be byte-identical");
+        }
+        assert!(
+            fixed_peak < control_peak,
+            "CompilePar (solve_scratch + !track_by_place) must keep main frame peak strictly below pre-fix control ({fixed_peak} >= {control_peak})"
+        );
     }
 }
