@@ -2400,6 +2400,25 @@ struct Wrapper {
     a: a::Rec,
     b: b::Rec,
 }
+struct WrapA(a::Rec);
+struct WrapB(b::Rec);
+enum Choice {
+    A(a::Rec),
+    B(b::Rec),
+}
+struct GenSink<T>(T);
+impl GenSink<u8> {
+    fn take(&self, r: a::Rec) -> isize { r.n }
+    fn assoc(r: a::Rec) -> isize { r.n }
+}
+impl GenSink<u16> {
+    fn take(&self, r: b::Rec) -> isize { r.n }
+    fn assoc(r: b::Rec) -> isize { r.n }
+}
+mod m1 { pub mod m2 { pub mod m3 { pub mod m4 { pub mod m5 { pub mod m6 { pub mod m7 { pub mod m8 { pub mod m9 {
+    pub const N: isize = 1;
+    pub type Rec = { n: isize = { enum E { V = N } E::V as isize } };
+} } } } } } } } }
 fn both_in_one_fn(_: a::Rec, _: b::Rec) {
     let _x: a::Rec = { .. };
     let _y: b::Rec = { .. };
@@ -2419,6 +2438,27 @@ fn both_assoc_calls_in_one_fn() -> isize {
 }
 fn both_struct_fields_in_one_fn() -> Wrapper {
     Wrapper { a: { .. }, b: { .. } }
+}
+fn both_tuple_structs_in_one_fn() -> (WrapA, WrapB) {
+    (WrapA({ .. }), WrapB({ .. }))
+}
+fn both_tuple_variants_in_one_fn() -> (Choice, Choice) {
+    (Choice::A({ .. }), Choice::B({ .. }))
+}
+fn both_generic_impl_methods_in_one_fn(s8: &GenSink<u8>, s16: &GenSink<u16>) -> isize {
+    s8.take({ .. }) + s16.take({ .. })
+}
+fn both_generic_let_methods_in_one_fn() -> isize {
+    let s8: GenSink<u8> = GenSink(0);
+    let s16: GenSink<u16> = GenSink(0);
+    s8.take({ .. }) + s16.take({ .. })
+}
+fn both_generic_turbofish_assoc_in_one_fn() -> isize {
+    GenSink::<u8>::assoc({ .. }) + GenSink::<u16>::assoc({ .. })
+}
+fn both_deep_alias_in_one_fn() {
+    let _x: m1::m2::m3::m4::m5::m6::m7::m8::m9::Rec = { .. };
+    let _y: b::Rec = { .. };
 }
 fn both_match_many_arms_in_one_fn(k: u32) -> isize {
     let ra: a::Rec = match k {
@@ -2512,6 +2552,12 @@ fn main() {}
         &["both_local_methods_in_one_fn"][..],
         &["both_assoc_calls_in_one_fn"][..],
         &["both_struct_fields_in_one_fn"][..],
+        &["both_tuple_structs_in_one_fn"][..],
+        &["both_tuple_variants_in_one_fn"][..],
+        &["both_generic_impl_methods_in_one_fn"][..],
+        &["both_generic_let_methods_in_one_fn"][..],
+        &["both_generic_turbofish_assoc_in_one_fn"][..],
+        &["both_deep_alias_in_one_fn"][..],
     ] {
         let fn_key = lookup(Namespace::Values, segs);
         let body = lower_fn(&names, prepared, &mut keys, &mut store, fn_key).unwrap_or_else(|e| panic!("lower {segs:?}: {e}"));
@@ -2748,17 +2794,33 @@ macro_rules! ty_enum_hygiene {
         }]
     };
 }
+#[macro_export]
+macro_rules! def_fn_with_ret {
+    ($name:ident, $ret:ty) => {
+        pub fn $name() -> $ret {
+            let _ = $crate::N;
+            [0u8; 3]
+        }
+    };
+}
 ";
     const APP: &str = "
 pub const N: isize = 99;
 pub const EXTRA: usize = 77;
+pub const INV_N: usize = 3;
+macro_rules! app_ret {
+    () => { [u8; crate::INV_N] };
+}
 type A = dep::ty_enum_hygiene!();
 fn ret_ty() -> dep::ty_enum_hygiene!() { [0u8; 8] }
+dep::def_fn_with_ret!(gen_unmarked_ret, app_ret!());
 
 fn alias_ok(x: A) -> [u8; 8] { x }
 fn alias_bad(x: A) -> [u8; 9] { x }
 fn ret_ok() -> [u8; 8] { ret_ty() }
 fn ret_bad() -> [u8; 9] { ret_ty() }
+fn gen_ret_ok() -> [u8; 3] { gen_unmarked_ret() }
+fn gen_ret_bad() -> [u8; 4] { gen_unmarked_ret() }
 fn main() {}
 ";
 
@@ -2797,7 +2859,7 @@ fn main() {}
     let mut store = Store::new(front.index.lang("sized"), &frame, alloc);
     let (mut buckets, mut consts) = (None, Consts::default());
     let mut got = blaze_own::AVec::new_in(alloc);
-    for &n in &["alias_ok", "alias_bad", "ret_ok", "ret_bad"] {
+    for &n in &["alias_ok", "alias_bad", "ret_ok", "ret_bad", "gen_ret_ok", "gen_ret_bad"] {
         let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &[n] }, alloc).unwrap_or_else(|e| panic!("`{n}`: {e}"));
         let k = found.whole(1).unwrap_or_else(|| panic!("`{n}` not named")).key;
         let mut lens = 0;
@@ -2827,5 +2889,5 @@ fn main() {}
         };
         got.push((n.to_string(), outcome));
     }
-    expect("cross-crate type macro with $crate hygiene and local enum", &got, &[true, false, true, false]);
+    expect("cross-crate type macro with $crate hygiene and local enum", &got, &[true, false, true, false, true, false]);
 }

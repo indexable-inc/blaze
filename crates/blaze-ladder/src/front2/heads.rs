@@ -4278,14 +4278,15 @@ impl<'n> Store<'n> {
         marks: Option<TextMarks<'_>>,
         v: &View<'_>,
         p: blaze_typeck::PathIdx,
+        alloc: Alloc<'_>,
     ) -> Option<LibKey> {
         let pr = v.path(p).ok()?;
         let rows = v.segments(pr).ok()?;
-        let mut segs: [&str; 8] = [""; 8];
-        if rows.is_empty() || rows.len() > segs.len() {
+        if rows.is_empty() {
             return None;
         }
-        for (idx, &row) in rows.iter().enumerate() {
+        let mut segs: blaze_own::Vec<&str, Alloc<'_>> = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
+        for &row in rows {
             let seg = lf::Segment::decode(row).ok()?;
             let text = match (seg.kind, seg.name) {
                 (lf::SegKind::Ident, Some(n)) => blaze_scope::task::unraw(v.name_text(n).ok()?),
@@ -4295,13 +4296,11 @@ impl<'n> Store<'n> {
                 (lf::SegKind::DollarCrate, _) => "$crate",
                 _ => return None,
             };
-            let slot = segs.get_mut(idx)?;
-            *slot = text;
+            segs.push(text);
         }
-        let slice = segs.get(..rows.len())?;
         let resolver = Paths { names };
-        let target = super::item_site::resolve_written(&resolver, marks, module, v, p, pr.absolute, slice, crate::resolve::Ns::Type, Range::new(0, 0)).ok()?;
-        (target.kind == crate::resolve::Kind::TypeAlias && usize::try_from(target.consumed).ok() == Some(slice.len())).then_some(target.key)
+        let target = super::item_site::resolve_written(&resolver, marks, module, v, p, pr.absolute, segs.as_slice(), crate::resolve::Ns::Type, Range::new(0, 0)).ok()?;
+        (target.kind == crate::resolve::Kind::TypeAlias && usize::try_from(target.consumed).ok() == Some(segs.len())).then_some(target.key)
     }
 
     /// Returns the owner-scoped `field_defaults` key for type `ty_id` in `v` (written in
@@ -4318,7 +4317,7 @@ impl<'n> Store<'n> {
     ) -> Option<ItemKey> {
         match v.ty(ty_id).ok()? {
             lf::TypeRef::Record(_) => self.record_type_defaults.get(&(owner_lib, ty_id.0)).copied(),
-            lf::TypeRef::Path(p) => Self::resolve_record_alias(names, module, marks, v, p).and_then(|al| self.alias_record_defaults.get(&al).copied()),
+            lf::TypeRef::Path(p) => Self::resolve_record_alias(names, module, marks, v, p, self.work_alloc()).and_then(|al| self.alias_record_defaults.get(&al).copied()),
             _ => None,
         }
     }
@@ -7262,7 +7261,7 @@ impl<'n> Store<'n> {
                         }
                         let base_rk = base_schema.defaults_key();
                         let spread_alias = match v.ty(f.ty) {
-                            Ok(lf::TypeRef::Path(p)) => Self::resolve_record_alias(names, env.module, marks, v, p),
+                            Ok(lf::TypeRef::Path(p)) => Self::resolve_record_alias(names, env.module, marks, v, p, alloc),
                             _ => None,
                         };
                         let owner_lib_for_spread = owner.map_or(lib, |(k, _)| k);
@@ -7494,7 +7493,7 @@ impl<'n> Store<'n> {
         let rb = Builder {
             resolver: Paths { names },
             heads: &self.maps,
-            marks: if expanded.is_some() { exp_marks.or(marks) } else { marks },
+            marks: if expanded.is_some() { exp_marks } else { marks },
             owner,
             expanded: ret_expanded,
         };

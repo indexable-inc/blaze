@@ -2136,7 +2136,9 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             store.register_record_defaults(names, keys, rec_lib, rec_owner, &body_env, text_marks, &view).map_err(|why| BodyError::Record { item, owner, why })?;
         }
         if view_has_rec_expr {
-            collect_record_expr_defaults(names, keys, store, owner, rec_lib, module, self_, text_marks, &view, typeck.root, &mut typeck.record_expr_defaults);
+            let mut collected = blaze_own::Vec::new_in(store.work_alloc());
+            collect_record_expr_defaults(names, keys, store, owner, rec_lib, module, self_, text_marks, &view, &typeck, &tys, &mut collected);
+            typeck.record_expr_defaults.extend_from_slice(&collected);
         }
     }
 
@@ -2182,10 +2184,21 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
     self_: SelfTy,
     marks: Option<TextMarks<'_>>,
     v: &View<'_>,
-    root: ExprId,
+    typeck: &TypeckBody<'_>,
+    body_tys: &OwnTys<'_>,
     out: &mut blaze_own::AVec<'_, (ExprId, ItemKey)>,
 ) {
     let work_alloc = store.work_alloc();
+    let root = typeck.root;
+
+    #[derive(Clone, Copy)]
+    struct RecvTy {
+        adt_ck: ItemKey,
+        /// Concrete receiver `PTy` and whether it lives in `body_tys` (`true`) or `store.tys` (`false`).
+        pty: Option<(PTy, bool)>,
+        /// Explicit turbofish generic arguments in `typeck.type_lists` (in `body_tys`), if written.
+        explicit_args: Option<blaze_typeck::List>,
+    }
 
     fn push_record_target(v: &View<'_>, root_expr: ExprId, srk: ItemKey, work_alloc: Alloc<'_>, out: &mut blaze_own::AVec<'_, (ExprId, ItemKey)>) {
         let mut stack: blaze_own::Vec<ExprId, Alloc<'_>> = blaze_own::Vec::new_in(work_alloc);
@@ -2308,13 +2321,14 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
         }
     }
 
-    fn path_segments<'v>(v: &'v View<'_>, p: blaze_typeck::PathIdx, out_segs: &mut [&'v str; 8]) -> Option<(bool, usize)> {
+    fn path_segments<'v, 'w>(v: &'v View<'_>, p: blaze_typeck::PathIdx, work_alloc: Alloc<'w>) -> Option<(bool, blaze_own::Vec<&'v str, Alloc<'w>>)> {
         let pr = v.path(p).ok()?;
         let rows = v.segments(pr).ok()?;
-        if rows.is_empty() || rows.len() > out_segs.len() {
+        if rows.is_empty() {
             return None;
         }
-        for (idx, &row) in rows.iter().enumerate() {
+        let mut segs: blaze_own::Vec<&'v str, Alloc<'w>> = blaze_own::Vec::with_capacity_in(rows.len(), work_alloc);
+        for &row in rows {
             let seg = blaze_lower::form::Segment::decode(row).ok()?;
             let text = match (seg.kind, seg.name) {
                 (blaze_lower::form::SegKind::Ident, Some(n)) => blaze_scope::task::unraw(v.name_text(n).ok()?),
@@ -2325,10 +2339,9 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
                 (blaze_lower::form::SegKind::DollarCrate, _) => "$crate",
                 _ => return None,
             };
-            let slot = out_segs.get_mut(idx)?;
-            *slot = text;
+            segs.push(text);
         }
-        Some((pr.absolute, rows.len()))
+        Some((pr.absolute, segs))
     }
 
     fn crate_of_ck<'n, S: NamesSource<'n>>(names: S, ck: ItemKey) -> Option<usize> {
@@ -2337,21 +2350,152 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
         names.crate_of(LibKey(blaze_ids::ContentId(bytes)))
     }
 
-    fn pty_to_adt_ck(store: &Store<'_>, ty: PTy) -> Option<ItemKey> {
-        let mut cur = ty;
+    fn peel_adt_in(tys: &blaze_typeck::PTys<'_>, mut ty: PTy) -> Option<(ItemKey, PTy)> {
         for _ in 0..8 {
-            match store.tys.view().get(cur).copied()? {
-                blaze_typeck::PNode::Adt(adt_ck, _) => return Some(adt_ck),
-                blaze_typeck::PNode::Ref(_, inner) | blaze_typeck::PNode::Ptr(_, inner) => cur = inner,
+            match tys.get(ty).copied()? {
+                blaze_typeck::PNode::Adt(adt_ck, _) => return Some((adt_ck, ty)),
+                blaze_typeck::PNode::Ref(_, inner) | blaze_typeck::PNode::Ptr(_, inner) => ty = inner,
                 _ => return None,
             }
         }
         None
     }
 
-    fn self_adt_ck(store: &Store<'_>, self_: SelfTy) -> Option<ItemKey> {
+    fn pty_to_recv(store: &Store<'_>, body_tys: &OwnTys<'_>, ty: PTy, in_body: bool) -> Option<RecvTy> {
+        let (adt_ck, adt_pty) = if in_body {
+            let view = body_tys.view(&store.tys).ok()?;
+            peel_adt_in(&view, ty)?
+        } else {
+            let view = store.tys.view();
+            peel_adt_in(&view, ty)?
+        };
+        Some(RecvTy { adt_ck, pty: Some((adt_pty, in_body)), explicit_args: None })
+    }
+
+    fn self_recv(store: &Store<'_>, body_tys: &OwnTys<'_>, self_: SelfTy) -> Option<RecvTy> {
         let SelfTy::Ty(ty, _) = self_ else { return None };
-        pty_to_adt_ck(store, ty)
+        pty_to_recv(store, body_tys, ty, false)
+    }
+
+    /// Structural match of an impl's `self_ty` (in `impl_tys`) against a receiver type (in
+    /// `recv_tys`). Returns `Some(wildcards)` counting `PNode::Param` wildcard positions matched
+    /// (lower is more specific), or `None` when concrete types/arguments disagree.
+    fn match_pty_pair(
+        impl_tys: &blaze_typeck::PTys<'_>,
+        recv_tys: &blaze_typeck::PTys<'_>,
+        impl_root: PTy,
+        recv_root: PTy,
+        work_alloc: Alloc<'_>,
+    ) -> Option<u32> {
+        let mut stack: blaze_own::Vec<(PTy, PTy), Alloc<'_>> = blaze_own::Vec::new_in(work_alloc);
+        stack.push((impl_root, recv_root));
+        let mut wildcards = 0u32;
+        while let Some((it, rt)) = stack.pop() {
+            let in_ = impl_tys.get(it).copied()?;
+            let rn_ = recv_tys.get(rt).copied()?;
+            if matches!(in_, blaze_typeck::PNode::Param(_)) {
+                wildcards = wildcards.saturating_add(1);
+                continue;
+            }
+            if matches!(rn_, blaze_typeck::PNode::Infer | blaze_typeck::PNode::Error) {
+                continue;
+            }
+            match (in_, rn_) {
+                (blaze_typeck::PNode::Adt(k1, l1), blaze_typeck::PNode::Adt(k2, l2)) if k1 == k2 && l1.len == l2.len => {
+                    let s1 = impl_tys.list(l1).ok()?;
+                    let s2 = recv_tys.list(l2).ok()?;
+                    for (&a, &b) in s1.iter().zip(s2.iter()) {
+                        stack.push((a, b));
+                    }
+                }
+                (blaze_typeck::PNode::Tuple(l1), blaze_typeck::PNode::Tuple(l2)) if l1.len == l2.len => {
+                    let s1 = impl_tys.list(l1).ok()?;
+                    let s2 = recv_tys.list(l2).ok()?;
+                    for (&a, &b) in s1.iter().zip(s2.iter()) {
+                        stack.push((a, b));
+                    }
+                }
+                (blaze_typeck::PNode::Ref(m1, a), blaze_typeck::PNode::Ref(m2, b)) if m1 == m2 => stack.push((a, b)),
+                (blaze_typeck::PNode::Ptr(m1, a), blaze_typeck::PNode::Ptr(m2, b)) if m1 == m2 => stack.push((a, b)),
+                (blaze_typeck::PNode::Slice(a), blaze_typeck::PNode::Slice(b)) => stack.push((a, b)),
+                (blaze_typeck::PNode::Array(a, c1), blaze_typeck::PNode::Array(b, c2)) if c1 == c2 => stack.push((a, b)),
+                (blaze_typeck::PNode::Record(s1, l1), blaze_typeck::PNode::Record(s2, l2)) if s1 == s2 && l1.len == l2.len => {
+                    let s1 = impl_tys.list(l1).ok()?;
+                    let s2 = recv_tys.list(l2).ok()?;
+                    for (&a, &b) in s1.iter().zip(s2.iter()) {
+                        stack.push((a, b));
+                    }
+                }
+                (a, b) if a == b => {}
+                _ => return None,
+            }
+        }
+        Some(wildcards)
+    }
+
+    fn impl_matches_recv(
+        store: &Store<'_>,
+        body_tys: &OwnTys<'_>,
+        typeck: &TypeckBody<'_>,
+        impl_self_ty: PTy,
+        recv: RecvTy,
+        work_alloc: Alloc<'_>,
+    ) -> Option<u32> {
+        let impl_tys = store.tys.view();
+        let blaze_typeck::PNode::Adt(impl_ck, impl_args) = impl_tys.get(impl_self_ty).copied()? else {
+            return None;
+        };
+        if impl_ck != recv.adt_ck {
+            return None;
+        }
+        if let Some((r_pty, in_body)) = recv.pty {
+            return if in_body {
+                let recv_tys = body_tys.view(&store.tys).ok()?;
+                match_pty_pair(&impl_tys, &recv_tys, impl_self_ty, r_pty, work_alloc)
+            } else {
+                match_pty_pair(&impl_tys, &impl_tys, impl_self_ty, r_pty, work_alloc)
+            };
+        }
+        if let Some(exp_list) = recv.explicit_args {
+            let impl_slice = impl_tys.list(impl_args).ok()?;
+            let exp_slice = typeck.type_lists.get(exp_list.range())?;
+            if impl_slice.len() != exp_slice.len() {
+                return None;
+            }
+            let recv_tys = body_tys.view(&store.tys).ok()?;
+            let mut wildcards = 0u32;
+            for (&ia, &ea) in impl_slice.iter().zip(exp_slice.iter()) {
+                wildcards = wildcards.saturating_add(match_pty_pair(&impl_tys, &recv_tys, ia, ea, work_alloc)?);
+            }
+            return Some(wildcards);
+        }
+        // No concrete receiver generic arguments known: only match unparameterized impls or
+        // fully-generic `impl<T> S<T>` (never guess a concrete specialization like `impl S<u8>`).
+        let impl_slice = impl_tys.list(impl_args).ok()?;
+        let mut wildcards = 0u32;
+        for &ia in impl_slice {
+            if matches!(impl_tys.get(ia), Some(blaze_typeck::PNode::Param(_))) {
+                wildcards = wildcards.saturating_add(1);
+            } else {
+                return None;
+            }
+        }
+        Some(wildcards)
+    }
+
+    fn tc_path_of(typeck: &TypeckBody<'_>, expr: ExprId) -> Option<blaze_typeck::PathIdx> {
+        match typeck.exprs.get(usize::try_from(expr.0).ok()?).copied()? {
+            blaze_typeck::Expr::Path(p) | blaze_typeck::Expr::Struct { path: p, .. } => Some(p),
+            _ => None,
+        }
+    }
+
+    fn path_segment_args(typeck: &TypeckBody<'_>, tc_p: Option<blaze_typeck::PathIdx>, seg_idx: usize) -> Option<blaze_typeck::List> {
+        let p = tc_p?;
+        let bp = typeck.paths.get(usize::try_from(p.0).ok()?)?;
+        let segs = typeck.segments.get(bp.segments.range())?;
+        let seg = segs.get(seg_idx)?;
+        (seg.generic_args.len > 0).then_some(seg.generic_args)
     }
 
     fn resolve_path_adt<'n, S: NamesSource<'n>>(
@@ -2362,34 +2506,39 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
         self_: SelfTy,
         marks: Option<TextMarks<'_>>,
         v: &View<'_>,
+        typeck: &TypeckBody<'_>,
+        body_tys: &OwnTys<'_>,
         p: blaze_typeck::PathIdx,
+        tc_p: Option<blaze_typeck::PathIdx>,
         ns: crate::resolve::Ns,
-    ) -> Option<(Option<LibKey>, ItemKey, u32)> {
-        let mut segs: [&str; 8] = [""; 8];
-        let (absolute, len) = path_segments(v, p, &mut segs)?;
-        let slice = segs.get(..len)?;
+        work_alloc: Alloc<'_>,
+    ) -> Option<(Option<LibKey>, RecvTy, u32)> {
+        let (absolute, segs) = path_segments(v, p, work_alloc)?;
+        let slice = segs.as_slice();
         if !absolute && slice == ["Self"] {
-            return self_adt_ck(store, self_).map(|ck| (None, ck, 0));
+            return self_recv(store, body_tys, self_).map(|r| (None, r, 0));
         }
         let resolver = Paths { names };
         let target = super::item_site::resolve_written(&resolver, marks, module, v, p, absolute, slice, ns, Range::new(0, 0)).ok()?;
         if usize::try_from(target.consumed).ok() != Some(slice.len()) {
             return None;
         }
+        let explicit_args = path_segment_args(typeck, tc_p, slice.len().saturating_sub(1));
         match target.kind {
             crate::resolve::Kind::Struct | crate::resolve::Kind::Enum | crate::resolve::Kind::Union => {
                 let _ = keys.item(target.key);
-                Some((Some(target.key), checker_of(target.key), 0))
+                Some((Some(target.key), RecvTy { adt_ck: checker_of(target.key), pty: None, explicit_args }, 0))
             }
             crate::resolve::Kind::Variant { adt, index } => {
                 let _ = keys.item(adt);
-                Some((Some(adt), checker_of(adt), index))
+                let adt_args = slice.len().checked_sub(2).and_then(|i| path_segment_args(typeck, tc_p, i));
+                Some((Some(adt), RecvTy { adt_ck: checker_of(adt), pty: None, explicit_args: adt_args }, index))
             }
             crate::resolve::Kind::TypeAlias => {
                 let _ = keys.item(target.key);
                 let _ = store.ensure(names, keys, Want::Head(target.key));
                 let (_, alias_ty) = store.maps.aliases.get(&target.key).copied().flatten()?;
-                pty_to_adt_ck(store, alias_ty).map(|ck| (None, ck, 0))
+                pty_to_recv(store, body_tys, alias_ty, false).map(|r| (None, r, 0))
             }
             _ => None,
         }
@@ -2403,12 +2552,18 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
         self_: SelfTy,
         marks: Option<TextMarks<'_>>,
         v: &View<'_>,
+        typeck: &TypeckBody<'_>,
+        body_tys: &OwnTys<'_>,
         mut ty_id: lf::TypeId,
-    ) -> Option<ItemKey> {
+        work_alloc: Alloc<'_>,
+    ) -> Option<RecvTy> {
         for _ in 0..8 {
             match v.ty(ty_id).ok()? {
                 lf::TypeRef::Ref { inner, .. } | lf::TypeRef::Ptr { inner, .. } => ty_id = inner,
-                lf::TypeRef::Path(p) => return resolve_path_adt(names, store, keys, module, self_, marks, v, p, crate::resolve::Ns::Type).map(|(_, ck, _)| ck),
+                lf::TypeRef::Path(p) => {
+                    return resolve_path_adt(names, store, keys, module, self_, marks, v, typeck, body_tys, p, None, crate::resolve::Ns::Type, work_alloc)
+                        .map(|(_, r, _)| r);
+                }
                 _ => return None,
             }
         }
@@ -2419,12 +2574,14 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
         names: S,
         keys: &mut Keys,
         store: &mut Store<'n>,
-        adt_ck: ItemKey,
+        body_tys: &OwnTys<'_>,
+        typeck: &TypeckBody<'_>,
+        recv: RecvTy,
         module: LibKey,
         method_name: &str,
         work_alloc: Alloc<'_>,
     ) -> Option<ItemKey> {
-        let adt_krate = crate_of_ck(names, adt_ck)?;
+        let adt_krate = crate_of_ck(names, recv.adt_ck)?;
         let mut impls: blaze_own::Vec<LibKey, Alloc<'_>> = blaze_own::Vec::new_in(work_alloc);
         names.each_impl(adt_krate, &mut |at| {
             let mut has_member = false;
@@ -2437,29 +2594,29 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
                 impls.push(at.key);
             }
         });
-        let mut trait_match: Option<(LibKey, ItemKey)> = None;
+        let mut best_inherent: Option<(u32, LibKey, ItemKey)> = None;
+        let mut best_trait: Option<(u32, LibKey, ItemKey)> = None;
         let method_nm = Name::of(method_name);
         for &imp_lib in impls.iter() {
             let imp_ck = checker_of(imp_lib);
             if !store.impls.contains_key(&imp_ck) {
                 let _ = store.ensure(names, keys, Want::Impl(imp_lib));
             }
-            let Some(ih) = store.impls.get(&imp_ck) else { continue };
-            let self_matches = matches!(store.tys.view().get(ih.self_ty).copied(), Some(blaze_typeck::PNode::Adt(ck, _)) if ck == adt_ck);
-            if !self_matches {
+            let Some((self_ty, is_inherent, mk)) = store.impls.get(&imp_ck).and_then(|ih| {
+                let mk = ih.fns.iter().find_map(|&(nm, mk)| (nm == method_nm).then_some(mk))?;
+                Some((ih.self_ty, ih.trait_.is_none(), mk))
+            }) else {
                 continue;
-            }
-            let Some(mk) = ih.fns.iter().find_map(|&(nm, mk)| (nm == method_nm).then_some(mk)) else { continue };
-            if ih.trait_.is_none() {
-                if !store.fns.contains_key(&mk) {
-                    let _ = store.ensure(names, keys, Want::MemberFn(imp_lib, mk));
-                }
-                return Some(mk);
-            } else if trait_match.is_none() {
-                trait_match = Some((imp_lib, mk));
+            };
+            let Some(wildcards) = impl_matches_recv(store, body_tys, typeck, self_ty, recv, work_alloc) else {
+                continue;
+            };
+            let slot = if is_inherent { &mut best_inherent } else { &mut best_trait };
+            if slot.is_none_or(|(best_w, _, _)| wildcards < best_w) {
+                *slot = Some((wildcards, imp_lib, mk));
             }
         }
-        if let Some((imp_lib, mk)) = trait_match {
+        if let Some((_, imp_lib, mk)) = best_inherent.or(best_trait) {
             if !store.fns.contains_key(&mk) {
                 let _ = store.ensure(names, keys, Want::MemberFn(imp_lib, mk));
             }
@@ -2495,16 +2652,31 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
         self_: SelfTy,
         marks: Option<TextMarks<'_>>,
         v: &View<'_>,
+        typeck: &TypeckBody<'_>,
+        body_tys: &OwnTys<'_>,
         p: blaze_typeck::PathIdx,
+        tc_p: Option<blaze_typeck::PathIdx>,
         work_alloc: Alloc<'_>,
     ) -> Option<ItemKey> {
-        let mut segs: [&str; 8] = [""; 8];
-        let (absolute, len) = path_segments(v, p, &mut segs)?;
-        let slice = segs.get(..len)?;
+        // Qualified path `<T>::method` or `<T as Tr>::method` via `typeck.paths` anchor.
+        if let Some(tp) = tc_p
+            && let Some(bp) = typeck.paths.get(usize::try_from(tp.0).ok()?)
+            && let Some(anchor) = bp.anchor
+        {
+            let (_, segs) = path_segments(v, p, work_alloc)?;
+            if let Some(&method) = segs.last()
+                && let Some(recv) = pty_to_recv(store, body_tys, anchor.ty, true)
+            {
+                return find_method_on_adt(names, keys, store, body_tys, typeck, recv, module, method, work_alloc);
+            }
+            return None;
+        }
+        let (absolute, segs) = path_segments(v, p, work_alloc)?;
+        let slice = segs.as_slice();
         if !absolute && slice.len() == 2 && slice.first() == Some(&"Self") {
             let method = *slice.get(1)?;
-            let adt_ck = self_adt_ck(store, self_)?;
-            return find_method_on_adt(names, keys, store, adt_ck, module, method, work_alloc);
+            let recv = self_recv(store, body_tys, self_)?;
+            return find_method_on_adt(names, keys, store, body_tys, typeck, recv, module, method, work_alloc);
         }
         let resolver = Paths { names };
         if let Ok(target) = super::item_site::resolve_written(&resolver, marks, module, v, p, absolute, slice, crate::resolve::Ns::Value, Range::new(0, 0))
@@ -2522,17 +2694,19 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
             && let Ok(target) = super::item_site::resolve_written(&resolver, marks, module, v, p, absolute, type_segs, crate::resolve::Ns::Type, Range::new(0, 0))
             && usize::try_from(target.consumed).ok() == Some(type_segs.len())
         {
+            let explicit_args = path_segment_args(typeck, tc_p, type_segs.len().saturating_sub(1));
             match target.kind {
                 crate::resolve::Kind::Struct | crate::resolve::Kind::Enum | crate::resolve::Kind::Union => {
                     let _ = keys.item(target.key);
-                    return find_method_on_adt(names, keys, store, checker_of(target.key), module, method, work_alloc);
+                    let recv = RecvTy { adt_ck: checker_of(target.key), pty: None, explicit_args };
+                    return find_method_on_adt(names, keys, store, body_tys, typeck, recv, module, method, work_alloc);
                 }
                 crate::resolve::Kind::TypeAlias => {
                     let _ = keys.item(target.key);
                     let _ = store.ensure(names, keys, Want::Head(target.key));
                     let (_, alias_ty) = store.maps.aliases.get(&target.key).copied().flatten()?;
-                    let adt_ck = pty_to_adt_ck(store, alias_ty)?;
-                    return find_method_on_adt(names, keys, store, adt_ck, module, method, work_alloc);
+                    let recv = pty_to_recv(store, body_tys, alias_ty, false)?;
+                    return find_method_on_adt(names, keys, store, body_tys, typeck, recv, module, method, work_alloc);
                 }
                 crate::resolve::Kind::Trait => {
                     let _ = store.ensure(names, keys, Want::Members(target.key));
@@ -2547,6 +2721,52 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
         None
     }
 
+    /// Resolves a tuple-struct or tuple-variant constructor call path (`A(...)`, `E::V(...)`,
+    /// `Self::V(...)`) to `(adt_lib_opt, adt_ck, variant_index)`.
+    fn resolve_callee_ctor<'n, S: NamesSource<'n>>(
+        names: S,
+        keys: &mut Keys,
+        store: &mut Store<'n>,
+        module: LibKey,
+        self_: SelfTy,
+        marks: Option<TextMarks<'_>>,
+        v: &View<'_>,
+        body_tys: &OwnTys<'_>,
+        p: blaze_typeck::PathIdx,
+        work_alloc: Alloc<'_>,
+    ) -> Option<(Option<LibKey>, ItemKey, u32)> {
+        let (absolute, segs) = path_segments(v, p, work_alloc)?;
+        let slice = segs.as_slice();
+        if !absolute && slice.len() == 2 && slice.first() == Some(&"Self") {
+            let vname = Name::of(*slice.get(1)?);
+            let recv = self_recv(store, body_tys, self_)?;
+            if !store.adts.contains_key(&recv.adt_ck)
+                && let Some(&Origin::Item(adt_lib)) = keys.origin(recv.adt_ck)
+            {
+                let _ = store.ensure(names, keys, Want::Adt(adt_lib));
+            }
+            let adt = store.adts.get(&recv.adt_ck)?;
+            let vi = adt.variants.iter().position(|var| var.name == vname)?;
+            return u32::try_from(vi).ok().map(|v_u32| (None, recv.adt_ck, v_u32));
+        }
+        let resolver = Paths { names };
+        let target = super::item_site::resolve_written(&resolver, marks, module, v, p, absolute, slice, crate::resolve::Ns::Value, Range::new(0, 0)).ok()?;
+        if usize::try_from(target.consumed).ok() != Some(slice.len()) {
+            return None;
+        }
+        match target.kind {
+            crate::resolve::Kind::Struct => {
+                let _ = keys.item(target.key);
+                Some((Some(target.key), checker_of(target.key), 0))
+            }
+            crate::resolve::Kind::Variant { adt, index } => {
+                let _ = keys.item(adt);
+                Some((Some(adt), checker_of(adt), index))
+            }
+            _ => None,
+        }
+    }
+
     fn resolve_expr_adt<'n, S: NamesSource<'n>>(
         names: S,
         keys: &mut Keys,
@@ -2555,12 +2775,14 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
         self_: SelfTy,
         marks: Option<TextMarks<'_>>,
         v: &View<'_>,
+        typeck: &TypeckBody<'_>,
+        body_tys: &OwnTys<'_>,
         local_tys: &blaze_hash::HashMap<lf::PatId, lf::TypeId, Alloc<'_>>,
-        local_adts: &blaze_hash::HashMap<lf::PatId, ItemKey, Alloc<'_>>,
+        local_adts: &blaze_hash::HashMap<lf::PatId, RecvTy, Alloc<'_>>,
         mut expr: ExprId,
         depth: u32,
         work_alloc: Alloc<'_>,
-    ) -> Option<ItemKey> {
+    ) -> Option<RecvTy> {
         if depth > 8 {
             return None;
         }
@@ -2571,54 +2793,60 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
                 | blaze_lower::Expr::Unary { op: lf::UnOp::Deref, operand: inner } => expr = inner,
                 blaze_lower::Expr::Block { tail: Some(tail), .. } => expr = tail,
                 blaze_lower::Expr::Local { pat, path } => {
+                    if let Some(&recv) = local_adts.get(&pat) {
+                        return Some(recv);
+                    }
                     if let Some(&ty_id) = local_tys.get(&pat) {
-                        return resolve_type_adt(names, store, keys, module, self_, marks, v, ty_id);
+                        return resolve_type_adt(names, store, keys, module, self_, marks, v, typeck, body_tys, ty_id, work_alloc);
                     }
-                    if let Some(&adt_ck) = local_adts.get(&pat) {
-                        return Some(adt_ck);
-                    }
-                    let mut segs: [&str; 8] = [""; 8];
-                    if let Some((false, 1)) = path_segments(v, path, &mut segs)
-                        && segs.first() == Some(&"self")
+                    if let Some((false, segs)) = path_segments(v, path, work_alloc)
+                        && segs.as_slice() == ["self"]
                     {
-                        return self_adt_ck(store, self_);
+                        return self_recv(store, body_tys, self_);
                     }
                     return None;
                 }
                 blaze_lower::Expr::Struct { path, .. } => {
-                    return resolve_path_adt(names, store, keys, module, self_, marks, v, path, crate::resolve::Ns::Type).map(|(_, ck, _)| ck);
+                    return resolve_path_adt(names, store, keys, module, self_, marks, v, typeck, body_tys, path, tc_path_of(typeck, expr), crate::resolve::Ns::Type, work_alloc)
+                        .map(|(_, r, _)| r);
                 }
                 blaze_lower::Expr::Path(p) => {
-                    return resolve_path_adt(names, store, keys, module, self_, marks, v, p, crate::resolve::Ns::Value).map(|(_, ck, _)| ck);
+                    return resolve_path_adt(names, store, keys, module, self_, marks, v, typeck, body_tys, p, tc_path_of(typeck, expr), crate::resolve::Ns::Value, work_alloc)
+                        .map(|(_, r, _)| r);
                 }
                 blaze_lower::Expr::Call { callee, .. } => {
-                    if let Ok(blaze_lower::Expr::Path(p)) = v.expr(callee)
-                        && let Some(fn_ck) = resolve_callee_fn(names, keys, store, module, self_, marks, v, p, work_alloc)
-                        && let Some(fh) = store.fns.get(&fn_ck)
-                    {
-                        return pty_to_adt_ck(store, fh.output);
+                    if let Ok(blaze_lower::Expr::Path(p)) = v.expr(callee) {
+                        let tc_p = tc_path_of(typeck, callee);
+                        if let Some(fn_ck) = resolve_callee_fn(names, keys, store, module, self_, marks, v, typeck, body_tys, p, tc_p, work_alloc)
+                            && let Some(fh) = store.fns.get(&fn_ck)
+                        {
+                            return pty_to_recv(store, body_tys, fh.output, false);
+                        }
+                        if let Some((_, recv, _)) = resolve_path_adt(names, store, keys, module, self_, marks, v, typeck, body_tys, p, tc_p, crate::resolve::Ns::Value, work_alloc) {
+                            return Some(recv);
+                        }
                     }
                     return None;
                 }
                 blaze_lower::Expr::MethodCall { row, .. } => {
                     let mc = lf::MethodCall::decode(v.row(row).ok()?).ok()?;
-                    let recv_adt = resolve_expr_adt(names, keys, store, module, self_, marks, v, local_tys, local_adts, mc.receiver, depth + 1, work_alloc)?;
+                    let recv = resolve_expr_adt(names, keys, store, module, self_, marks, v, typeck, body_tys, local_tys, local_adts, mc.receiver, depth + 1, work_alloc)?;
                     let method_name = blaze_scope::task::unraw(v.name_text(mc.name).ok()?);
-                    let fn_ck = find_method_on_adt(names, keys, store, recv_adt, module, method_name, work_alloc)?;
+                    let fn_ck = find_method_on_adt(names, keys, store, body_tys, typeck, recv, module, method_name, work_alloc)?;
                     let fh = store.fns.get(&fn_ck)?;
-                    return pty_to_adt_ck(store, fh.output);
+                    return pty_to_recv(store, body_tys, fh.output, false);
                 }
                 blaze_lower::Expr::Field { base, name } => {
-                    let base_ck = resolve_expr_adt(names, keys, store, module, self_, marks, v, local_tys, local_adts, base, depth + 1, work_alloc)?;
-                    if !store.adts.contains_key(&base_ck)
-                        && let Some(&Origin::Item(base_lib)) = keys.origin(base_ck)
+                    let base_recv = resolve_expr_adt(names, keys, store, module, self_, marks, v, typeck, body_tys, local_tys, local_adts, base, depth + 1, work_alloc)?;
+                    if !store.adts.contains_key(&base_recv.adt_ck)
+                        && let Some(&Origin::Item(base_lib)) = keys.origin(base_recv.adt_ck)
                     {
                         let _ = store.ensure(names, keys, Want::Adt(base_lib));
                     }
                     let fname = Name(v.name(name).ok()?);
-                    let adt = store.adts.get(&base_ck)?;
+                    let adt = store.adts.get(&base_recv.adt_ck)?;
                     let field_ty = adt.fields.iter().find(|f| f.name == fname)?.ty;
-                    return pty_to_adt_ck(store, field_ty);
+                    return pty_to_recv(store, body_tys, field_ty, false);
                 }
                 _ => return None,
             }
@@ -2626,13 +2854,13 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
     }
 
     let mut local_tys: blaze_hash::HashMap<lf::PatId, lf::TypeId, Alloc<'_>> = blaze_hash::HashMap::new_in(work_alloc);
-    let mut local_adts: blaze_hash::HashMap<lf::PatId, ItemKey, Alloc<'_>> = blaze_hash::HashMap::new_in(work_alloc);
+    let mut local_adts: blaze_hash::HashMap<lf::PatId, RecvTy, Alloc<'_>> = blaze_hash::HashMap::new_in(work_alloc);
     let mut local_rec_defaults: blaze_hash::HashMap<lf::PatId, ItemKey, Alloc<'_>> = blaze_hash::HashMap::new_in(work_alloc);
     if let Some((_, param_pats)) = v.body() {
         if let Some(fh) = store.fns.get(&owner) {
             for (&pat_raw, &input_pty) in param_pats.iter().zip(fh.inputs.iter()) {
-                if let Some(adt_ck) = pty_to_adt_ck(store, input_pty) {
-                    local_adts.insert(lf::PatId(pat_raw), adt_ck);
+                if let Some(recv) = pty_to_recv(store, body_tys, input_pty, false) {
+                    local_adts.insert(lf::PatId(pat_raw), recv);
                 }
             }
         }
@@ -2652,13 +2880,18 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
         if let Ok(blaze_lower::Stmt::Let { pat, ty, init, .. }) = v.stmt(blaze_lower::StmtId(idx)) {
             if let Some(t) = ty {
                 local_tys.insert(pat, t);
+                if let Some(blaze_typeck::Stmt::Let { ty: Some(pty), .. }) = typeck.stmts.get(i).copied()
+                    && let Some(recv) = pty_to_recv(store, body_tys, pty, true)
+                {
+                    local_adts.insert(pat, recv);
+                }
                 if let Some(init) = init {
                     bind_expr_to_type(names, store, rec_lib, module, marks, v, init, t, work_alloc, out);
                 }
             } else if let Some(init) = init
-                && let Some(adt) = resolve_expr_adt(names, keys, store, module, self_, marks, v, &local_tys, &local_adts, init, 0, work_alloc)
+                && let Some(recv) = resolve_expr_adt(names, keys, store, module, self_, marks, v, typeck, body_tys, &local_tys, &local_adts, init, 0, work_alloc)
             {
-                local_adts.insert(pat, adt);
+                local_adts.insert(pat, recv);
             }
         }
     }
@@ -2675,15 +2908,30 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
                 if let Ok(arg_ids) = v.ids(args)
                     && arg_ids.iter().any(|&id| expr_targets_record(v, ExprId(id), work_alloc))
                     && let Ok(blaze_lower::Expr::Path(p)) = v.expr(callee)
-                    && let Some(fn_ck) = resolve_callee_fn(names, keys, store, module, self_, marks, v, p, work_alloc)
-                    && let Some(fn_recs) = store.fn_record_defaults.get(&fn_ck)
                 {
-                    for &(pos, srk) in fn_recs.iter() {
-                        if let Some(pi) = pos
-                            && let Ok(pi_usize) = usize::try_from(pi)
-                            && let Some(&arg_id) = arg_ids.get(pi_usize)
+                    if let Some(fn_ck) = resolve_callee_fn(names, keys, store, module, self_, marks, v, typeck, body_tys, p, tc_path_of(typeck, callee), work_alloc) {
+                        if let Some(fn_recs) = store.fn_record_defaults.get(&fn_ck) {
+                            for &(pos, srk) in fn_recs.iter() {
+                                if let Some(pi) = pos
+                                    && let Ok(pi_usize) = usize::try_from(pi)
+                                    && let Some(&arg_id) = arg_ids.get(pi_usize)
+                                {
+                                    push_record_target(v, ExprId(arg_id), srk, work_alloc, out);
+                                }
+                            }
+                        }
+                    } else if let Some((adt_lib, adt_ck, variant)) = resolve_callee_ctor(names, keys, store, module, self_, marks, v, body_tys, p, work_alloc) {
+                        if !store.adts.contains_key(&adt_ck)
+                            && let Some(lib) = adt_lib
                         {
-                            push_record_target(v, ExprId(arg_id), srk, work_alloc, out);
+                            let _ = store.ensure(names, keys, Want::Adt(lib));
+                        }
+                        for (pos, &arg_id) in arg_ids.iter().enumerate() {
+                            if let Ok(pos_u32) = u32::try_from(pos)
+                                && let Some(&srk) = store.adt_field_record_defaults.get(&(adt_ck, variant, Name::of_index(pos_u32)))
+                            {
+                                push_record_target(v, ExprId(arg_id), srk, work_alloc, out);
+                            }
                         }
                     }
                 }
@@ -2694,10 +2942,10 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
                     && let Ok(arg_ids) = v.ids(mc.args)
                     && arg_ids.iter().any(|&id| expr_targets_record(v, ExprId(id), work_alloc))
                     && let Ok(raw_name) = v.name_text(mc.name)
-                    && let Some(recv_adt) = resolve_expr_adt(names, keys, store, module, self_, marks, v, &local_tys, &local_adts, mc.receiver, 0, work_alloc)
+                    && let Some(recv) = resolve_expr_adt(names, keys, store, module, self_, marks, v, typeck, body_tys, &local_tys, &local_adts, mc.receiver, 0, work_alloc)
                 {
                     let method_name = blaze_scope::task::unraw(raw_name);
-                    if let Some(fn_ck) = find_method_on_adt(names, keys, store, recv_adt, module, method_name, work_alloc)
+                    if let Some(fn_ck) = find_method_on_adt(names, keys, store, body_tys, typeck, recv, module, method_name, work_alloc)
                         && let Some(fn_recs) = store.fn_record_defaults.get(&fn_ck)
                     {
                         let shift = usize::from(store.fns.get(&fn_ck).is_some_and(|fh| fh.self_param));
@@ -2716,9 +2964,9 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
             Ok(blaze_lower::Expr::Struct { path, fields, .. }) => {
                 if let Ok(rows) = v.rows(fields)
                     && rows.iter().any(|&r| lf::FieldInit::decode(r).is_ok_and(|fi| expr_targets_record(v, fi.expr, work_alloc)))
-                    && let Some((adt_lib, adt_ck, variant)) = resolve_path_adt(names, store, keys, module, self_, marks, v, path, crate::resolve::Ns::Type)
+                    && let Some((adt_lib, recv, variant)) = resolve_path_adt(names, store, keys, module, self_, marks, v, typeck, body_tys, path, tc_path_of(typeck, ExprId(idx)), crate::resolve::Ns::Type, work_alloc)
                 {
-                    if !store.adts.contains_key(&adt_ck)
+                    if !store.adts.contains_key(&recv.adt_ck)
                         && let Some(lib) = adt_lib
                     {
                         let _ = store.ensure(names, keys, Want::Adt(lib));
@@ -2726,7 +2974,7 @@ fn collect_record_expr_defaults<'n, S: NamesSource<'n>>(
                     for &row in rows {
                         if let Ok(fi) = lf::FieldInit::decode(row)
                             && let Ok(name_hash) = v.name(fi.name)
-                            && let Some(&srk) = store.adt_field_record_defaults.get(&(adt_ck, variant, Name(name_hash)))
+                            && let Some(&srk) = store.adt_field_record_defaults.get(&(recv.adt_ck, variant, Name(name_hash)))
                         {
                             push_record_target(v, fi.expr, srk, work_alloc, out);
                         }

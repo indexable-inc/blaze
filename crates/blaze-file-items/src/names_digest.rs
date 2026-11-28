@@ -196,7 +196,14 @@ fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[
             // `Outline::surface()` stable; shadowed macro definitions are guarded in
             // `engine_names.rs` (`has_shadowed_expr_macro`).
             let sig = item.text(text, item.signature);
-            if body_holds_items || crate::nested::has_writing_block(sig) {
+            let sig_writes = crate::nested::has_writing_block(sig);
+            if sig_writes {
+                // Signature-level head blocks/macros are not covered by `engine_names.rs`'s
+                // `body_holds_items` shadow guard, so hash the signature itself whenever it
+                // writes a block or calls a macro (e.g. a shadowed `line!(A)` -> `line!(B)`).
+                sink.id(&item.signature_hash);
+            }
+            if body_holds_items {
                 whole |= crate::nested::digest_body_blocks(item.range.of(text), alloc, &mut |bytes| {
                     sink.part(bytes);
                 });
@@ -205,10 +212,11 @@ fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[
         ItemDetail::Struct => {
             sink.part(&form(text, item));
             let body = item.range.of(text);
+            // ADTs are not guarded by `engine_names.rs`'s `body_holds_items` shadow check, so
+            // any ADT with a writing block or direct macro call (which may shadow a name in
+            // `STD_EXPR_MACROS`) hashes whole.
             if crate::nested::adt_has_writing_block(body) {
-                whole |= crate::nested::digest_body_blocks(body, alloc, &mut |bytes| {
-                    sink.part(bytes);
-                });
+                whole = true;
             }
         }
         ItemDetail::Variant { discriminant: _ } => {
@@ -217,25 +225,19 @@ fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[
         ItemDetail::Enum | ItemDetail::Union => {
             let body = item.range.of(text);
             if crate::nested::adt_has_writing_block(body) {
-                whole |= crate::nested::digest_body_blocks(body, alloc, &mut |bytes| {
-                    sink.part(bytes);
-                });
+                whole = true;
             }
         }
         ItemDetail::Trait => {
             let head = crate::nested::trait_head(item.range.of(text));
             if crate::nested::has_writing_block(head) {
-                whole |= crate::nested::digest_body_blocks(head, alloc, &mut |bytes| {
-                    sink.part(bytes);
-                });
+                sink.part(head.as_bytes());
             }
         }
         ItemDetail::TraitAlias | ItemDetail::TypeAlias => {
             let body = item.range.of(text);
             if crate::nested::has_writing_block(body) {
-                whole |= crate::nested::digest_body_blocks(body, alloc, &mut |bytes| {
-                    sink.part(bytes);
-                });
+                whole = true;
             }
         }
         ItemDetail::Field { ty: _, default: _ } => {}
@@ -531,5 +533,21 @@ mod tests {
             crate::outline(raw_on, Edition::E2024, alloc).surface(),
             "changing #[r#cfg] on a scanned head block param must move Outline::surface()"
         );
+
+        // Round 15 P1 #5: editing arguments of a potentially shadowed std expr macro (`line!(A)`
+        // -> `line!(B)`) inside ADT / alias / trait / fn signatures MUST move `Outline::surface()`.
+        for (what, before, after) in [
+            ("struct field", "struct S { x: [u8; line!(A)] }\n", "struct S { x: [u8; line!(B)] }\n"),
+            ("enum variant", "enum E { V([u8; line!(A)]) }\n", "enum E { V([u8; line!(B)]) }\n"),
+            ("type alias", "type A = [u8; line!(A)];\n", "type A = [u8; line!(B)];\n"),
+            ("trait where", "trait T where [(); line!(A)]: {}\n", "trait T where [(); line!(B)]: {}\n"),
+            ("fn signature", "fn f(_: [u8; line!(A)]) {}\n", "fn f(_: [u8; line!(B)]) {}\n"),
+        ] {
+            assert_ne!(
+                crate::outline(before, Edition::E2024, alloc).surface(),
+                crate::outline(after, Edition::E2024, alloc).surface(),
+                "changing shadowed `line!(A)` -> `line!(B)` in {what} must move Outline::surface()"
+            );
+        }
     }
 }
