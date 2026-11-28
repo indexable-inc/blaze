@@ -201,6 +201,8 @@ fn every_node_kind_has_a_plain_name() {
         SyntaxKind::SPEC_CLAUSE,
         SyntaxKind::UNION_TYPE,
         SyntaxKind::RECORD_TYPE,
+        SyntaxKind::DO_EXPR,
+        SyntaxKind::DEFER_EXPR,
     ];
     let nodes = (SyntaxKind::ABI as u16..=SyntaxKind::YIELD_EXPR as u16).map(SyntaxKind::from).chain(late);
     let missing: Vec<SyntaxKind> = nodes.filter(|&k| syntax_name(k).is_none()).collect();

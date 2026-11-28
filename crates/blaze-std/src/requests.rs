@@ -40,6 +40,14 @@ use core::{fmt, time::Duration};
 
 use blaze_h1::{ContentRange, Follow, HeaderFault, Range, Redirects};
 
+/// Explicit sans-IO HTTP/1.1 exchange state machine over [`blaze_machine::Machine`] and
+/// [`blaze_h1`].
+pub mod machine;
+pub use machine::{
+    ConnHandle, HttpExchangeError, HttpExchangeMachine, HttpExchangeOpts, HttpExchangeOut,
+    HttpExchangePlant, HttpScriptAns, HttpStepAns, HttpStepReq, TransportError, encode_request_in,
+};
+
 use crate::{
     Plant, Stopped,
     clock::Clock,

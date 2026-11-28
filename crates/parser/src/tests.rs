@@ -1,4 +1,5 @@
 mod comptime;
+mod do_expr;
 mod lex_once;
 mod nightly_items;
 mod outline_lex;

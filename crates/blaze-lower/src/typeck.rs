@@ -1594,6 +1594,8 @@ impl Conv<'_, '_, '_, '_, '_> {
             }
             Expr::Underscore => tc::Expr::Underscore,
             Expr::Await(e) => tc::Expr::Await(e),
+            Expr::Do(e) => tc::Expr::Do(e),
+            Expr::Defer(e) => tc::Expr::Defer(e),
             Expr::InlineFor { pat, iter, body } => {
                 let kind = if let Some((lhs, rhs)) = zip_fields_call(self.v, iter)? {
                     InlineForKind::Zip { lhs, rhs }
@@ -2164,6 +2166,8 @@ fn wire_inline_fors<'a>(out: &mut TypeckBody<'a>, alloc: Alloc<'a>) {
                     | tc::Expr::RawRef { operand: x, .. }
                     | tc::Expr::Cast { operand: x, .. }
                     | tc::Expr::Await(x)
+                    | tc::Expr::Do(x)
+                    | tc::Expr::Defer(x)
                     | tc::Expr::AsyncBlock { body: x, .. } => work.push(Work::Expr(x)),
                     tc::Expr::Break { value, .. } | tc::Expr::Return { value } => {
                         if let Some(x) = value {

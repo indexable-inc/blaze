@@ -862,6 +862,10 @@ pub enum Expr {
     Underscore,
     /// `operand.await`, in an async body.
     Await(ExprId),
+    /// `operand.do`, one-shot lexical algebraic effect suspension.
+    Do(ExprId),
+    /// `defer { body }`, lexical scope-exit cleanup block.
+    Defer(ExprId),
     /// An anonymous structural record literal (`#![blaze::records]`): `{ name: "x", depth: 2, .. }`.
     Record { fields: List, base: StructBase },
     /// Comptime field unrolling (`inline for pat in iter { body }`): preserved intact rather than
@@ -1002,6 +1006,8 @@ impl Expr {
                 Node { a: fields.start, b: fields.len, c, ..n(37).with(k) }
             }
             E::InlineFor { pat, iter, body } => Node { a: pat.0, b: iter.0, c: body.0, ..n(38) },
+            E::Do(e) => Node { a: e.0, ..n(39) },
+            E::Defer(e) => Node { a: e.0, ..n(40) },
         }
     }
 
@@ -1106,6 +1112,8 @@ impl Expr {
                 },
             },
             38 => E::InlineFor { pat: PatId(n.a), iter: ExprId(n.b), body: ExprId(n.c) },
+            39 => E::Do(ExprId(n.a)),
+            40 => E::Defer(ExprId(n.a)),
             _ => return Err(err),
         })
     }

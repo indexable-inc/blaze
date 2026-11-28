@@ -202,3 +202,5 @@ pub(crate) const SPEC_CLAUSE: u16 = 343;
 pub(crate) const UNION_TYPE: u16 = 345;
 pub(crate) const RECORD_TYPE: u16 = 346;
 pub(crate) const LAZY_BODY: u16 = 347;
+pub(crate) const DO_EXPR: u16 = 349;
+pub(crate) const DEFER_EXPR: u16 = 350;

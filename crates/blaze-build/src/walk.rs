@@ -3327,7 +3327,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 Expr::Closure { body: c, .. } => kids.push((c, true)),
                 Expr::FormatArgs { args, .. } => kids.extend(list(args)?.iter().map(|&c| (c, false))),
                 Expr::Asm { operands, .. } => asm::asm_kids(body, operands, &mut kids)?,
-                Expr::Await(c) => kids.push((c, false)),
+                Expr::Await(c) | Expr::Do(c) | Expr::Defer(c) => kids.push((c, false)),
                 Expr::AsyncBlock { body: c, .. } => kids.push((c, true)),
                 Expr::Underscore | Expr::OffsetOf { .. } => {}
                 Expr::RawRef { operand: c, .. } => kids.push((c, false)),
@@ -6735,6 +6735,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Expr::FormatArgs { args, uses } => self.format_args(e, args, uses)?,
             // coroutine.rs: the operand, then `Task::Await`; the state, its tag `Unresumed`.
             Expr::Await(operand) => self.await_operand(e, operand)?,
+            Expr::Do(_) => return Err(unsupported(e, "`.do` suspension (lowered by coroutine pass)")),
+            Expr::Defer(_) => return Err(unsupported(e, "`defer` block (lowered by coroutine pass)")),
             Expr::AsyncBlock { .. } => self.coroutine_value(e)?,
             // walk/asm.rs: the operands' values and places, then `Task::Asm`.
             Expr::Asm { .. } => self.asm_operands(e)?,

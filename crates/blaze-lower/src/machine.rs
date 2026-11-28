@@ -2560,6 +2560,22 @@ impl<'t, 'c, 'a, 's> Machine<'t, 'c, 'a, 's> {
                 self.push(V::Expr, e.0, r);
                 return;
             }
+            DO_EXPR => {
+                let e = self.first(f, V::Expr);
+                self.done(f);
+                let e = e.map_or_else(|| self.put_expr(Expr::Missing, r), |e| ExprId(e.id));
+                let e = self.do_op(e, r);
+                self.push(V::Expr, e.0, r);
+                return;
+            }
+            DEFER_EXPR => {
+                let e = self.first(f, V::Expr);
+                self.done(f);
+                let e = e.map_or_else(|| self.put_expr(Expr::Missing, r), |e| ExprId(e.id));
+                let e = self.defer_op(e, r);
+                self.push(V::Expr, e.0, r);
+                return;
+            }
             CLOSURE_EXPR => self.closure(f, r),
             // `builtin # format_args("..", args)`, the expander's `format_args!` once its
             // template is expanded: its arguments lowered here as any expression (from the

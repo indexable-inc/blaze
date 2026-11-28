@@ -7,6 +7,10 @@ use std::{format, string::String, vec, vec::Vec};
 use blaze_id::{ContentId, ItemKey};
 use blaze_sim::{Broke, Config, Tape};
 
+use crate::effect_ty::{
+    EffectPolyError, EffectRow, EffectRowSet, EffectSet, EffectVar, LoweringMode, MAX_ROW_VARS, check_dyn_fn_effects,
+    check_higher_order_call, specialize_call,
+};
 use crate::infer::Plant;
 use crate::{
     AllInvariant, CanonBuf, DefaultNames, IntTy, Mode, Mutability, Node, Out, PTys, Region, Ty, TyCx, Tys, UintTy,
@@ -902,4 +906,234 @@ fn var_node_names_each_variable_and_nothing_past_the_count() {
         let past = cx.vars.var_count(kind) as u32;
         assert_eq!(cx.var_node(VarId { kind, index: past }), None, "{kind:?}");
     }
+}
+
+// ---- effect polymorphism & tail-resumptive specialization ----------------------------------
+
+/// `fn map<T, U, / E>(f: fn(T) -> U / E) -> .. / E` compiles as a plain direct function with zero
+/// coroutine state-machine overhead when instantiated with a pure (or non-suspending) closure, and
+/// lowers to `MachineCoroutine` when instantiated with `SUSPEND`.
+#[test]
+fn effect_poly_map_pure_vs_suspend_lowering_mode() {
+    let e = EffectVar(0);
+    let map_row = EffectRow::poly(EffectSet::PURE, e);
+    assert_eq!(map_row.lowering_mode(), None, "uninstantiated polymorphic row has no fixed lowering mode");
+
+    // Pure closure -> zero state-machine overhead (`PlainFn`).
+    let pure_inst = map_row.instantiate(e, EffectSet::PURE);
+    assert_eq!(pure_inst, EffectRow::Concrete(EffectSet::PURE));
+    assert_eq!(pure_inst.lowering_mode(), Some(LoweringMode::PlainFn));
+    assert_eq!(
+        check_higher_order_call(map_row, EffectSet::PURE, EffectSet::PURE),
+        Ok((EffectSet::PURE, LoweringMode::PlainFn))
+    );
+    assert_eq!(
+        specialize_call(EffectRowSet::from_row(map_row), &[(e, EffectSet::PURE)], EffectSet::PURE),
+        Ok((EffectSet::PURE, LoweringMode::PlainFn))
+    );
+
+    // Non-suspending effects (e.g. `ALLOC | PANIC`) also stay `PlainFn`.
+    let alloc_panic = EffectSet::ALLOC.union(EffectSet::PANIC);
+    assert_eq!(
+        check_higher_order_call(map_row, alloc_panic, alloc_panic),
+        Ok((alloc_panic, LoweringMode::PlainFn))
+    );
+
+    // Suspending closure -> lowers through `blaze-machine` (`MachineCoroutine`).
+    let suspend_inst = map_row.instantiate(e, EffectSet::SUSPEND);
+    assert_eq!(suspend_inst, EffectRow::Concrete(EffectSet::SUSPEND));
+    assert_eq!(suspend_inst.lowering_mode(), Some(LoweringMode::MachineCoroutine));
+    assert_eq!(
+        check_higher_order_call(map_row, EffectSet::SUSPEND, EffectSet::SUSPEND),
+        Ok((EffectSet::SUSPEND, LoweringMode::MachineCoroutine))
+    );
+    assert_eq!(
+        specialize_call(EffectRowSet::from_row(map_row), &[(e, EffectSet::SUSPEND)], EffectSet::SUSPEND),
+        Ok((EffectSet::SUSPEND, LoweringMode::MachineCoroutine))
+    );
+
+    // A polymorphic row that already carries `SUSPEND` in its base is immediately `MachineCoroutine`.
+    let always_suspend = EffectRow::poly(EffectSet::SUSPEND, e);
+    assert_eq!(always_suspend.lowering_mode(), Some(LoweringMode::MachineCoroutine));
+    assert_eq!(EffectRowSet::from_row(always_suspend).lowering_mode(), Some(LoweringMode::MachineCoroutine));
+}
+
+/// Multi-variable `zip_with(f / e1, g / e2) -> / (alloc | e1 | e2)` combines rows with
+/// `EffectRowSet::union`, deduplicates variables, specializes to `PlainFn` for `(PURE, PURE)` and
+/// `MachineCoroutine` for `(PURE, SUSPEND)`, and enforces the inline variable bound.
+#[test]
+fn effect_poly_zip_with_multi_var_union_and_specialization() {
+    let e1 = EffectVar(1);
+    let e2 = EffectVar(2);
+    let f_row = EffectRowSet::poly(EffectSet::ALLOC, e1);
+    let g_row = EffectRowSet::poly(EffectSet::PURE, e2);
+
+    let zip_row = f_row.union(g_row).expect("two vars fit in inline row set");
+    let zip_rev = g_row.union(f_row).expect("union is commutative");
+    assert_eq!(zip_row, zip_rev, "canonical variable order makes union commutative");
+    assert_eq!(zip_row.base(), EffectSet::ALLOC);
+    assert_eq!(zip_row.vars(), &[e1, e2]);
+    assert_eq!(zip_row.var_count(), 2);
+    assert_eq!(zip_row.as_concrete(), None);
+    assert!(zip_row.may_suspend());
+    assert_eq!(zip_row.lowering_mode(), None);
+
+    // Union deduplicates shared variables cleanly.
+    let deduped = zip_row.union(EffectRowSet::poly(EffectSet::PURE, e1)).expect("dedup keeps var count at 2");
+    assert_eq!(deduped, zip_row);
+
+    // `(PURE, PURE)` -> `ALLOC`, `PlainFn` (no coroutine overhead).
+    let pure_call = specialize_call(zip_row, &[(e1, EffectSet::PURE), (e2, EffectSet::PURE)], EffectSet::ALLOC);
+    assert_eq!(pure_call, Ok((EffectSet::ALLOC, LoweringMode::PlainFn)));
+    let pure_row = zip_row.instantiate_one(e1, EffectSet::PURE).instantiate_one(e2, EffectSet::PURE);
+    assert_eq!(pure_row.as_concrete(), Some(EffectSet::ALLOC));
+    assert!(!pure_row.may_suspend());
+    assert_eq!(pure_row.lowering_mode(), Some(LoweringMode::PlainFn));
+
+    // `(PURE, SUSPEND)` -> `ALLOC | SUSPEND`, `MachineCoroutine`.
+    let alloc_suspend = EffectSet::ALLOC.union(EffectSet::SUSPEND);
+    let suspend_call =
+        specialize_call(zip_row, &[(e1, EffectSet::PURE), (e2, EffectSet::SUSPEND)], alloc_suspend);
+    assert_eq!(suspend_call, Ok((alloc_suspend, LoweringMode::MachineCoroutine)));
+
+    // Partial instantiation: binding `e2` to `SUSPEND` fixes `MachineCoroutine` even before `e1` is bound.
+    let partial_suspend = zip_row.instantiate_one(e2, EffectSet::SUSPEND);
+    assert_eq!(partial_suspend.vars(), &[e1]);
+    assert_eq!(partial_suspend.as_concrete(), None);
+    assert!(partial_suspend.may_suspend());
+    assert_eq!(partial_suspend.lowering_mode(), Some(LoweringMode::MachineCoroutine));
+
+    // Partial instantiation with `PURE` leaves lowering undetermined until `e2` is known.
+    let partial_pure = zip_row.instantiate_one(e1, EffectSet::PURE);
+    assert_eq!(partial_pure.vars(), &[e2]);
+    assert!(partial_pure.may_suspend());
+    assert_eq!(partial_pure.lowering_mode(), None);
+
+    // Exceeding `MAX_ROW_VARS` fails with `TooManyEffectVars`.
+    let mut row = EffectRowSet::PURE;
+    for i in 0..u32::try_from(MAX_ROW_VARS).unwrap_or(4) {
+        row = row.union(EffectRowSet::poly(EffectSet::PURE, EffectVar(i))).expect("within MAX_ROW_VARS");
+    }
+    assert_eq!(row.var_count(), MAX_ROW_VARS);
+    let overflow = row.union(EffectRowSet::poly(EffectSet::PURE, EffectVar(99)));
+    assert_eq!(overflow, Err(EffectPolyError::TooManyEffectVars { max: MAX_ROW_VARS }));
+}
+
+/// `dyn Fn` object-safety: non-suspending callbacks (`ALLOC | PANIC`, `PURE`) coerce when within
+/// the allowed effect set, while any `SUSPEND` callback is rejected with `SuspendBehindDyn`.
+#[test]
+fn effect_poly_dyn_fn_object_safety_and_subtyping() {
+    let alloc_panic = EffectSet::ALLOC.union(EffectSet::PANIC);
+    assert_eq!(check_dyn_fn_effects(alloc_panic, alloc_panic), Ok(()));
+    assert_eq!(check_dyn_fn_effects(alloc_panic, EffectSet::ALL), Ok(()));
+    assert_eq!(check_dyn_fn_effects(EffectSet::PURE, alloc_panic), Ok(()));
+
+    // Exceeding `dyn Fn`'s allowed effects fails with `EffectExceedsAllowed`.
+    assert_eq!(
+        check_dyn_fn_effects(alloc_panic, EffectSet::ALLOC),
+        Err(EffectPolyError::EffectExceedsAllowed { required: alloc_panic, allowed: EffectSet::ALLOC })
+    );
+
+    // `SUSPEND` is refused behind `dyn Fn` even when `allowed` includes `SUSPEND` or `ALL`.
+    assert_eq!(
+        check_dyn_fn_effects(EffectSet::SUSPEND, EffectSet::SUSPEND),
+        Err(EffectPolyError::SuspendBehindDyn { callback_effects: EffectSet::SUSPEND })
+    );
+    let alloc_suspend = EffectSet::ALLOC.union(EffectSet::SUSPEND);
+    assert_eq!(
+        check_dyn_fn_effects(alloc_suspend, EffectSet::ALL),
+        Err(EffectPolyError::SuspendBehindDyn { callback_effects: alloc_suspend })
+    );
+}
+
+/// `specialize_call` enforces caller effect allowances (`EffectExceedsAllowed`) and rejects
+/// partially bound polymorphic rows (`UnboundEffectVar`).
+#[test]
+fn effect_poly_specialize_call_rejects_disallowed_and_unbound() {
+    let e1 = EffectVar(10);
+    let e2 = EffectVar(20);
+
+    // Pure `expect()` caller refuses a `SUSPEND` instantiation of `map`.
+    let map_row = EffectRowSet::poly(EffectSet::PURE, e1);
+    assert_eq!(
+        specialize_call(map_row, &[(e1, EffectSet::SUSPEND)], EffectSet::PURE),
+        Err(EffectPolyError::EffectExceedsAllowed { required: EffectSet::SUSPEND, allowed: EffectSet::PURE })
+    );
+
+    // `expect(alloc)` caller refuses `ALLOC | SUSPEND`.
+    let alloc_map = EffectRowSet::poly(EffectSet::ALLOC, e1);
+    let alloc_suspend = EffectSet::ALLOC.union(EffectSet::SUSPEND);
+    assert_eq!(
+        specialize_call(alloc_map, &[(e1, EffectSet::SUSPEND)], EffectSet::ALLOC),
+        Err(EffectPolyError::EffectExceedsAllowed { required: alloc_suspend, allowed: EffectSet::ALLOC })
+    );
+
+    // Missing binding for `e2` fails with `UnboundEffectVar(e2)`.
+    let zip_row = EffectRowSet::poly(EffectSet::ALLOC, e1)
+        .union(EffectRowSet::poly(EffectSet::PURE, e2))
+        .expect("two vars fit");
+    assert_eq!(
+        specialize_call(zip_row, &[(e1, EffectSet::PURE)], EffectSet::ALL),
+        Err(EffectPolyError::UnboundEffectVar(e2))
+    );
+    // When both are unbound, the smallest canonical var (`e1`) is reported deterministically.
+    assert_eq!(
+        specialize_call(zip_row, &[], EffectSet::ALL),
+        Err(EffectPolyError::UnboundEffectVar(e1))
+    );
+}
+
+/// Algebraic laws of `EffectRowSet`: commutativity, idempotence, instantiation order-independence,
+/// and exact agreement among `as_concrete`, `may_suspend`, and `lowering_mode`.
+#[test]
+fn effect_row_set_algebra_properties() {
+    fn draw_set(tape: &Tape, name: &'static str) -> EffectSet {
+        EffectSet::from_bits(tape.int_in(0u8..=31, name))
+    }
+    fn draw_row(tape: &Tape) -> EffectRowSet {
+        let mut row = EffectRowSet::concrete(draw_set(tape, "base"));
+        let n = tape.index(3, "nvars");
+        for _ in 0..n {
+            let v = EffectVar(tape.int_in(0u32..=5, "var"));
+            if let Ok(next) = row.union(EffectRowSet::poly(EffectSet::PURE, v)) {
+                row = next;
+            }
+        }
+        row
+    }
+    blaze_sim::check(Config::cases(400), |tape| {
+
+        let a = draw_row(tape);
+        let b = draw_row(tape);
+
+        // Idempotence and commutativity of `union`.
+        oracle(a.union(a) == Ok(a), || format!("union not idempotent for {a:?}"))?;
+        oracle(a.union(b) == b.union(a), || format!("union not commutative for {a:?} and {b:?}"))?;
+
+        // `instantiate_one` commutes across distinct variables.
+        let v1 = EffectVar(tape.int_in(0u32..=5, "v1"));
+        let v2 = EffectVar(tape.int_in(0u32..=5, "v2"));
+        let s1 = draw_set(tape, "s1");
+        let s2 = draw_set(tape, "s2");
+        if v1 != v2 {
+            let ab = a.instantiate_one(v1, s1).instantiate_one(v2, s2);
+            let ba = a.instantiate_one(v2, s2).instantiate_one(v1, s1);
+            oracle(ab == ba, || format!("instantiate_one order changed result: {ab:?} vs {ba:?}"))?;
+        }
+
+        // Consistency of `as_concrete`, `may_suspend`, and `lowering_mode`.
+        oracle(a.as_concrete().is_some() == a.vars().is_empty(), || format!("as_concrete disagrees with vars: {a:?}"))?;
+        let expected_may_suspend = a.base().contains(EffectSet::SUSPEND) || !a.vars().is_empty();
+        oracle(a.may_suspend() == expected_may_suspend, || format!("may_suspend wrong for {a:?}"))?;
+        let expected_mode = if a.base().contains(EffectSet::SUSPEND) {
+            Some(LoweringMode::MachineCoroutine)
+        } else if let Some(c) = a.as_concrete() {
+            Some(LoweringMode::for_effects(c))
+        } else {
+            None
+        };
+        oracle(a.lowering_mode() == expected_mode, || {
+            format!("lowering_mode {:?} != expected {:?} for {a:?}", a.lowering_mode(), expected_mode)
+        })
+    });
 }

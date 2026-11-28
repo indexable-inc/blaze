@@ -91,6 +91,7 @@
 //! | [`record`] | zero-copy records | blaze-format |
 //! | [`report`] | what a program says, as data | blaze-report |
 //! | [`cli`] | declarative `#![no_std]` CLI parser (clap replacement: nested subcommands, aliases, typo hints, ANSI `--help`) | new |
+//! | [`machine`] | sans-IO state-machine and one-shot algebraic effect ABI (`Machine`, `Request`, `Waiting`, `Ask`, `Race`, `Batch`, `Call`, `TaskFrame`, `Handler`, `drive`, `Script`) | blaze-machine |
 //! | [`quic`], [`http`] | sans-IO QUIC (WebTransport over HTTP/3) and HTTP/1.1 | blaze-http |
 //! | [`test`] | `#[bstd::test]` and its runner, the simulation, the model checker, allocation counting | new, blaze-core, blaze-check, blaze-alloc-count |
 //!
@@ -258,6 +259,9 @@ pub mod local;
 pub mod locale;
 /// Bounded LZ4 Raw Block and LZ4 Frame v1.6.4 compression and decompression (`XXH32` checksums).
 pub mod lz4;
+/// Sans-IO state-machine and one-shot algebraic effect ABI (`Machine`, `Request`, `Waiting`,
+/// `Ask`, `Race`, `Batch`, `Call`, `TaskFrame`, `Handler`, `drive`, `Script`; `blaze-machine`).
+pub use blaze_machine as machine;
 /// Bounded, non-recursive CommonMark + GFM Markdown parser with HTML and ANSI terminal renderers.
 pub mod markdown;
 pub mod mem;

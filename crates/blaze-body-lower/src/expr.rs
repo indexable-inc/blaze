@@ -894,6 +894,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             Expr::Closure { .. } => self.closure_into(dest, e),
             Expr::FormatArgs { .. } => self.refuse(Construct::FormatArgs, e),
             Expr::Await(operand) => self.await_into(dest, e, operand),
+            Expr::Do(_) | Expr::Defer(_) => self.refuse(Construct::Await, e),
             Expr::AsyncBlock { .. } => self.coroutine_into(dest, e),
             Expr::OffsetOf { .. } => self.refuse(Construct::OffsetOf, e),
             Expr::Asm { arch, pieces, operands, options, clobber_abis } => {

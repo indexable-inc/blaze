@@ -1681,6 +1681,8 @@ fn collect_break_targets<A: Allocator + Copy>(body: &BodyView<'_>, nested_root: 
                     | Expr::RawRef { operand: i, .. }
                     | Expr::Cast { operand: i, .. }
                     | Expr::Await(i)
+                    | Expr::Do(i)
+                    | Expr::Defer(i)
                     | Expr::Let { init: i, .. } => stack.push(i),
                     Expr::Return { value } => {
                         if let Some(v) = value {
@@ -6286,6 +6288,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 self.tasks.push(Task::AwaitDone(e));
                 self.tasks.push(Task::Eval(op, false));
             }
+            Expr::Do(_) | Expr::Defer(_) => return self.refuse(Form::Await, e),
             Expr::Underscore => return self.refuse(Form::Malformed, e),
             Expr::Asm { operands, options, .. } => {
                 let Some(ops) = body.asm_operands.get(operands.range()) else {
@@ -7567,6 +7570,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 | Expr::Become { .. }
                 | Expr::Closure { .. }
                 | Expr::Await(_)
+                | Expr::Do(_)
+                | Expr::Defer(_)
                 | Expr::AsyncBlock { .. }
                 | Expr::Underscore
                 | Expr::Asm { .. } => return Ok(false),

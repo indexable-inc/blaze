@@ -87,6 +87,8 @@ pub fn syntax_name(kind: SyntaxKind) -> Option<&'static str> {
         ASSOC_TYPE_ARG => "an associated type argument or bound",
         ATTR => "an attribute `#[..]`",
         AWAIT_EXPR => "`.await`",
+        DO_EXPR => "`.do`",
+        DEFER_EXPR => "`defer`",
         BECOME_EXPR => "a `become` tail call",
         BIN_EXPR => "a binary operator",
         BLOCK_EXPR => "a block `{ .. }`",

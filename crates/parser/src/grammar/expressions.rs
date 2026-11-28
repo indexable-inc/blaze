@@ -548,6 +548,15 @@ if p.nth(nth1) == T![await] {
     return Ok(m.complete(p, AWAIT_EXPR));
 }
 
+if p.nth(nth1) == T![do] {
+    let m = lhs.precede(p);
+    if !FLOAT_RECOVERY {
+        p.bump(T![.]);
+    }
+    p.bump(T![do]);
+    return Ok(m.complete(p, DO_EXPR));
+}
+
 if p.at(T![..=]) || p.at(T![..]) {
     return Err(lhs);
 }

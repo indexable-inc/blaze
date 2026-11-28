@@ -62,6 +62,8 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 | Expr::Cast { operand: c, .. }
                 | Expr::Repeat { elem: c, .. }
                 | Expr::Await(c)
+                | Expr::Do(c)
+                | Expr::Defer(c)
                 | Expr::Become { value: c }
                 | Expr::AsyncBlock { body: c, .. } => expr_stack.push(c),
                 Expr::Closure { params, body, .. } => {

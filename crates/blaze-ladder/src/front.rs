@@ -1135,6 +1135,7 @@ fn trait_lang(name: &str) -> Option<LangItem> {
         "from" => LangItem::From,
         "blaze_enum" => LangItem::Enum,
         "blaze_unit_enum" => LangItem::UnitEnum,
+        "blaze_request" => LangItem::Request,
         _ => return None,
     })
 }

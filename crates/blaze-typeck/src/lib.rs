@@ -305,5 +305,7 @@ fn walk<W: World, C: TypeCtx>(m: &mut Machine<'_, '_, '_, '_, W, C>) -> Result<(
     // Opt-in checked complexity cost contracts (`#[blaze::cost(..)]`, rules/cost.rs).
     m.cost_contract()?;
     // Sans-IO capability firewall (`#[blaze::capability]` in `#![blaze::sans_io]` ADTs).
-    m.capability_in_sans_io()
+    m.capability_in_sans_io()?;
+    // No local borrow held across a `.do` suspension point (rules/do_expr.rs).
+    m.local_borrow_across_do()
 }

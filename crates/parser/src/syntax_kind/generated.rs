@@ -372,6 +372,14 @@ pub enum SyntaxKind {
     // Contextual `inline` keyword before `for` (`inline for x in expr { ... }`), after the
     // others too so every earlier kind keeps its discriminant.
     INLINE_KW,
+    // Postfix `.do` suspension expression (`expr.do`, docs/v2/plan/design/sans-io-machines.md),
+    // after the others too so every earlier kind keeps its discriminant.
+    DO_EXPR,
+    // Lexical `defer { ... }` cleanup expression (`docs/v2/plan/design/sans-io-machines.md`),
+    // after the others too so every earlier kind keeps its discriminant.
+    DEFER_EXPR,
+    // Contextual `defer` keyword before `{` (`defer { ... }`), after the others too.
+    DEFER_KW,
     #[doc(hidden)]
     __LAST,
 }
@@ -494,6 +502,8 @@ impl SyntaxKind {
             | UNION_TYPE
             | RECORD_TYPE
             | LAZY_BODY
+            | DO_EXPR
+            | DEFER_EXPR
             | OR_PAT
             | PARAM
             | PARAM_LIST
@@ -725,6 +735,7 @@ impl SyntaxKind {
             REQUIRES_KW => Some("requires"),
             UNIQ_KW => Some("uniq"),
             INLINE_KW => Some("inline"),
+            DEFER_KW => Some("defer"),
             YEET_KW => Some("yeet"),
             ASYNC_KW => Some("async"),
             AWAIT_KW => Some("await"),
@@ -845,6 +856,7 @@ impl SyntaxKind {
             REQUIRES_KW => true,
             UNIQ_KW => true,
             INLINE_KW => true,
+            DEFER_KW => true,
             YEET_KW => true,
             _ => false,
         }
@@ -953,6 +965,7 @@ impl SyntaxKind {
             REQUIRES_KW => true,
             UNIQ_KW => true,
             INLINE_KW => true,
+            DEFER_KW => true,
             YEET_KW => true,
             _ => false,
         }
@@ -1222,6 +1235,7 @@ macro_rules ! T_ {
     [requires] => { $ crate :: SyntaxKind :: REQUIRES_KW };
     [uniq] => { $ crate :: SyntaxKind :: UNIQ_KW };
     [inline] => { $ crate :: SyntaxKind :: INLINE_KW };
+    [defer] => { $ crate :: SyntaxKind :: DEFER_KW };
     [yeet] => { $ crate :: SyntaxKind :: YEET_KW };
     [async] => { $ crate :: SyntaxKind :: ASYNC_KW };
     [await] => { $ crate :: SyntaxKind :: AWAIT_KW };

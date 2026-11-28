@@ -874,6 +874,12 @@ fn lint_finding<'a, 'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, f: &blaze_ty
             }
             text.push_str(": pass capabilities as method arguments instead of storing them in sans-IO data");
         }
+        blaze_typeck::TypedFinding::LocalBorrowAcrossDo { .. } => {
+            text.push_str(
+                "local variable is borrowed across a `.do` suspension point: \
+                 move owned values or arena-allocated data across `.do` so the compiled state machine remains movable without `Pin`",
+            );
+        }
     }
     BodyLintFinding { lint: f.lint(), text, start: at.start, end: at.end }
 }

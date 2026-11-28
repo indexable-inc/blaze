@@ -414,6 +414,68 @@ fn an_async_body_converts_with_its_output() {
     }
 }
 
+/// Postfix `.do` lowers to `blaze_typeck::Expr::Do` without requiring `async`, and chains cleanly.
+#[test]
+fn postfix_do_lowers_to_typeck_expr_do() {
+    use crate::typeck::{Refused, Types, to_typeck};
+    use blaze_typeck::{PNode, PTy, PortableTys};
+    struct U8;
+    impl Types for U8 {
+        fn ty(&mut self, _: &View<'_>, _: TypeId, tys: &mut PortableTys<'_>) -> Result<PTy, Refused> {
+            tys.intern(PNode::Uint(blaze_typeck::UintTy::U8)).map_err(Refused::Check)
+        }
+        fn const_arg(&mut self, view: &View<'_>, c: ConstIdx, _: &mut PortableTys<'_>) -> Result<PTy, Refused> {
+            Err(crate::typeck::no_const_arg(view, c))
+        }
+        fn repeat_len(&mut self, _: &View<'_>, _: ExprId) -> Result<u64, Refused> {
+            Ok(0)
+        }
+    }
+    let mut tys = PortableTys::new_in(Alloc::global());
+    for (text, want_dos) in [
+        ("fn f(x: R) { x.do; }", 1usize),
+        ("fn f(dir: D, opts: O) { dir.open_write(opts).do.flush().do; }", 2usize),
+        ("fn f(a: R) { let _ = a.do.b; }", 1usize),
+    ] {
+        let l = body(text);
+        assert!(l.view().diags.is_empty(), "{text}: {:?}", l.view().diags);
+        let b = to_typeck(&l.view(), blaze_typeck::ItemKey(0), &mut tys, &mut U8, Alloc::global()).expect(text);
+        let dos = b.exprs.iter().filter(|e| matches!(e, blaze_typeck::Expr::Do(_))).count();
+        assert_eq!(dos, want_dos, "{text}: exprs={:?}", b.exprs);
+        assert_eq!(b.coroutine, None, "{text}: `.do` does not wrap in async coroutine");
+    }
+    assert_body("fn f(x: R) { x.do }", &["(do x@p"]);
+}
+
+/// Lexical `defer { ... }` lowers to `blaze_typeck::Expr::Defer` containing its block body
+/// (including nested `Expr::Do`) and dumps as `(defer ...)`.
+#[test]
+fn defer_block_lowers_to_typeck_expr_defer() {
+    use crate::typeck::{Refused, Types, to_typeck};
+    use blaze_typeck::{PNode, PTy, PortableTys};
+    struct U8;
+    impl Types for U8 {
+        fn ty(&mut self, _: &View<'_>, _: TypeId, tys: &mut PortableTys<'_>) -> Result<PTy, Refused> {
+            tys.intern(PNode::Uint(blaze_typeck::UintTy::U8)).map_err(Refused::Check)
+        }
+        fn const_arg(&mut self, view: &View<'_>, c: ConstIdx, _: &mut PortableTys<'_>) -> Result<PTy, Refused> {
+            Err(crate::typeck::no_const_arg(view, c))
+        }
+        fn repeat_len(&mut self, _: &View<'_>, _: ExprId) -> Result<u64, Refused> {
+            Ok(0)
+        }
+    }
+    let mut tys = PortableTys::new_in(Alloc::global());
+    let text = "fn f(x: R) { defer { x.do; }; }";
+    let l = body(text);
+    assert!(l.view().diags.is_empty(), "{text}: {:?}", l.view().diags);
+    let b = to_typeck(&l.view(), blaze_typeck::ItemKey(0), &mut tys, &mut U8, Alloc::global()).expect(text);
+    let defers = b.exprs.iter().filter(|e| matches!(e, blaze_typeck::Expr::Defer(_))).count();
+    let dos = b.exprs.iter().filter(|e| matches!(e, blaze_typeck::Expr::Do(_))).count();
+    assert_eq!((defers, dos), (1, 1), "{text}: exprs={:?}", b.exprs);
+    assert_body(text, &["(defer (block", "(do x@p"]);
+}
+
 /// rustc's `lower_coroutine_body_with_moved_arguments`: a plain binding is moved by a `let`
 /// of the same name, any other pattern through `__argN`.
 #[test]

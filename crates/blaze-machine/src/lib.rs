@@ -10,11 +10,14 @@
 //! - [`Ask`]: a linear request paired with a disjoint [`Waiting`] continuation state. Because each
 //!   transition consumes resources (e.g. moving a linear `File` into `Close`, or moving an owned
 //!   DMA buffer into `ReadInto`), there are no self-borrows and no `Pin`.
-//! - [`Race`] and [`Batch`]: first-class structured concurrency combinators (`select` and
-//!   bounded-N `io_uring` fan-out) directly as requests.
+//! - [`Race`], [`Batch`], and [`Chain`]: first-class structured concurrency and linked-SQE
+//!   combinators (`select`, bounded-N `io_uring` fan-out, and `IOSQE_IO_LINK` chaining) directly
+//!   as requests.
 //! - [`Call`]: structured sub-machine delegation without flattening the child's states or requests.
 //! - [`TaskFrame`]: pairs an owned chunked bump arena with a paused machine state for zero-`Pin`
 //!   cross-thread migration and enforces that cancelled kernel DMA buffers drain before arena reset.
+//! - [`graph`]: unified `#![no_std]` machine state-graph verifier and Lean 4 transition-system
+//!   emitter.
 //! - [`Handler`] + [`drive`]: the one execution loop shared by `IoUring`, `Kqueue`, `SimHandler`,
 //!   and deterministic [`Script`] unit tests.
 
@@ -30,6 +33,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod graph;
 pub mod script;
 pub mod task_frame;
 
@@ -40,6 +44,10 @@ use core::fmt;
 
 use blaze_own::FixedVec;
 
+pub use graph::{
+    EdgeKind, GraphEdge, GraphError, GraphPlant, HandleOp, HandleSlot, MAX_GRAPH_STATES,
+    MachineGraph, StateId, StateNode, emit_lean, verify_graph, verify_graph_with,
+};
 pub use script::{Expect, Script, ScriptError};
 pub use task_frame::{DmaTicket, FrameBusy, TaskFrame, TaskFramePlant};
 
@@ -263,6 +271,45 @@ pub enum RaceOutcome<A, B> {
 
 impl<A: Request, B: Request> Request for Race<A, B> {
     type Answer<'s> = RaceOutcome<A::Answer<'s>, B::Answer<'s>>;
+}
+
+/// Linked sequential request (`IOSQE_IO_LINK`): submits `first` and, if `first` succeeds without
+/// cancelling, submits `second` in the same kernel submission chain (e.g. `WriteFrom -> Flush`).
+///
+/// If `first` fails or cancels, the driver skips/cancels `second` (`ECANCELED`) and delivers
+/// [`ChainOutcome::FirstOnly`].
+#[blaze::linear]
+#[derive(Debug, PartialEq, Eq)]
+pub struct Chain<A, B> {
+    pub first: A,
+    pub second: B,
+}
+
+impl<A, B> Chain<A, B> {
+    #[inline]
+    pub const fn new(first: A, second: B) -> Self {
+        Self { first, second }
+    }
+
+    #[blaze::consumes]
+    #[inline]
+    pub fn split(self) -> (A, B) {
+        (self.first, self.second)
+    }
+}
+
+/// Outcome of a linked [`Chain`] (`IOSQE_IO_LINK`) request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainOutcome<A, B> {
+    /// Both `first` and `second` completed.
+    Both(A, B),
+    /// Only `first` completed; `second` was skipped/`ECANCELED` because `first` failed or
+    /// cancelled.
+    FirstOnly(A),
+}
+
+impl<A: Request, B: Request> Request for Chain<A, B> {
+    type Answer<'s> = ChainOutcome<A::Answer<'s>, B::Answer<'s>>;
 }
 
 /// Bounded-N fan-out request (`CAP` inline slots, zero heap allocation) for saturating `io_uring`
