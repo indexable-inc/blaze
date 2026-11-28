@@ -22,7 +22,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::{fs::File, io::{ErrorKind, Read as IoRead}, path::{Path, PathBuf}};
 use std::sync::Arc;
 
 use blaze_build_script::key::{CMode, RunLimits};
@@ -361,6 +361,66 @@ impl Tree {
     /// out of the tree.
     pub fn file(&self, rel: &str) -> Option<Vec<u8>> {
         self.file_bytes(rel).ok().flatten().map(Cow::into_owned)
+    }
+
+    /// Reads the bytes of `rel` without process-heap `Vec<u8>` allocation: [`Tree::Mem`] borrows
+    /// the stored slice directly, while [`Tree::Dir`] streams into an `AVec<u8>` backed by `alloc`.
+    /// Returns `Ok(Some(R))` when present, `Ok(None)` when absent or a directory, or `Err` on
+    /// symlink escape, unpopulated submodule, or I/O error.
+    pub fn with_file_bytes_in<'a, R>(
+        &self,
+        rel: &str,
+        alloc: Alloc<'a>,
+        visit: impl FnOnce(&[u8]) -> R,
+    ) -> Result<Option<R>, blaze_own::AString<'a>> {
+        match self {
+            Tree::Mem { files, .. } => {
+                if let Some((submodule, commit)) = self.submodule_covering(rel) {
+                    let mut hex = blaze_own::AString::new_in(alloc);
+                    for byte in commit {
+                        let _ = core::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+                    }
+                    return Err(blaze_own::format_in!(
+                        alloc,
+                        "`{rel}` is inside unpopulated git submodule `{submodule}` at commit {}",
+                        hex.as_str()
+                    ));
+                }
+                let Ok(at) = files.binary_search_by(|(path, _)| path.as_str().cmp(rel)) else {
+                    return Ok(None);
+                };
+                let Some((_, bytes)) = files.get(at) else { return Ok(None) };
+                Ok(Some(visit(bytes.as_slice())))
+            }
+            Tree::Dir(root) => {
+                let Some((path, meta)) = disk_node(root, rel, blaze_own::planted::NoPlant)
+                    .map_err(|e| blaze_own::format_in!(alloc, "{e}"))?
+                else {
+                    return Ok(None);
+                };
+                if meta.is_dir() {
+                    return Ok(None);
+                }
+                let mut file = File::open(&path)
+                    .map_err(|e| blaze_own::format_in!(alloc, "cannot open `{rel}`: {e}"))?;
+                let cap = usize::try_from(meta.len()).unwrap_or(0);
+                let mut buf: blaze_own::AVec<'a, u8> = blaze_own::Vec::with_capacity_in(cap, alloc);
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match IoRead::read(&mut file, &mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if let Some(slice) = chunk.get(..n) {
+                                buf.extend_from_slice(slice);
+                            }
+                        }
+                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(blaze_own::format_in!(alloc, "cannot read `{rel}`: {e}")),
+                    }
+                }
+                Ok(Some(visit(buf.as_slice())))
+            }
+        }
     }
 
     fn submodule_covering(&self, rel: &str) -> Option<(&str, [u8; 20])> {

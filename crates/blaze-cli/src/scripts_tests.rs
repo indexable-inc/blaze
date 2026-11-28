@@ -209,31 +209,47 @@ fn scripts_no_sdk_refusal_names_both_attempts() {
     println!("refusal names both");
 }
 
-/// Placement parity across `blaze-proc-macro::native_unit::placed_in_store_with_source`,
-/// `blaze-proc-macro::script_unit::script_source_in_tree`, and `blaze-cli::scripts::placement`
-/// (Rule 30 single source of truth): every call site agrees on protobuf codegen closures
-/// (`raft-proto`, `codex-code-mode-protocol`), host-OS source (`kvm-ioctls`, `rustler`), and
-/// pure-Rust negative controls (`psm`, `anyhow`, `libsqlite3-sys` raw string).
+/// Placement parity across `blaze-proc-macro::native_unit::placed_in_store_with_lock_and_source`,
+/// `blaze-proc-macro::script_unit::classify_script_tree_in`, and `blaze-cli::scripts::placement`
+/// (Rule 30 single source of truth): every call site agrees on crates.io vs local protobuf codegen
+/// closures (`raft-proto` vs local `protobuf-build`), host-OS source (`kvm-ioctls`, `rustler`),
+/// external submodules (`mod host;`) / `include!`, and pure-Rust negative controls (`psm`,
+/// `anyhow`, `libsqlite3-sys` raw string, unused `macro_rules!`).
 #[test]
 fn scripts_placement_parity_with_proc_macro_and_tree_source() {
-    use blaze_proc_macro::native_unit::placed_in_store_with_source;
+    use blaze_manifest::lock::Lock;
+    use blaze_proc_macro::native_unit::placed_in_store_with_lock_and_source;
     use blaze_proc_macro::script_sandbox::{ScriptRoot, mem_tree_with_submodules};
-    use blaze_proc_macro::script_unit::script_source_in_tree;
+    use blaze_proc_macro::script_unit::classify_script_tree_in;
 
     use super::{MODE, RanAs, placement};
 
     let alloc = blaze_own::testing::heap().alloc();
+    let lock_text = "version = 4\n\n\
+        [[package]]\nname = \"kvm-ioctls\"\nversion = \"1.0.0\"\n\n\
+        [[package]]\nname = \"rustler\"\nversion = \"1.0.0\"\n\n\
+        [[package]]\nname = \"raft-proto\"\nversion = \"1.0.0\"\n\n\
+        [[package]]\nname = \"protobuf-build\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
+        [[package]]\nname = \"pure-crate\"\nversion = \"1.0.0\"\n\n\
+        [[package]]\nname = \"protobuf-build\"\nversion = \"0.1.0\"\n";
+    let lock = Lock::read(lock_text.as_bytes(), alloc.clone()).expect("lock");
+
     let mut units = AVec::new_in(alloc.clone());
     // 0: kvm-ioctls (0 build-deps, host-OS std + unsafe extern "C" in build.rs)
     units.push(unit(0, "kvm-ioctls", UnitKind::BuildScript, &[], None, None));
     // 1: rustler (0 build-deps, cfg!(target_family = "unix") in build.rs)
     units.push(unit(1, "rustler", UnitKind::BuildScript, &[], None, None));
-    // 2: raft-proto -> protobuf-build (3)
+    // 2: raft-proto -> crates.io protobuf-build (3)
     units.push(unit(2, "raft-proto", UnitKind::BuildScript, &[3], None, None));
     units.push(unit(3, "protobuf-build", UnitKind::Lib, &[], None, None));
-    // 4: pure crate (0 build-deps, guarded #[cfg(unix)] / raw string / dtolnay linux check)
+    // 4: pure crate (0 build-deps, guarded #[cfg(unix)] / raw string / dtolnay linux check / unused macro_rules!)
     units.push(unit(4, "pure-crate", UnitKind::BuildScript, &[], None, None));
-    for id in [0usize, 1, 2, 4] {
+    // 5: pure crate depending on LOCAL (non-crates.io) `protobuf-build` (6) -> MUST stay Wasm!
+    units.push(unit(4, "pure-local-dep", UnitKind::BuildScript, &[6], None, None));
+    units.push(unit(5, "protobuf-build", UnitKind::Lib, &[], None, None));
+    // 7: script with `mod host;` where `host.rs` uses std::os::unix -> MUST classify Native!
+    units.push(unit(4, "submod-host", UnitKind::BuildScript, &[], None, None));
+    for id in [0usize, 1, 2, 4, 5, 7] {
         units[id].root = t("build.rs");
     }
     let graph = UnitGraph { units, resolver: Resolver::V3, meta: AVec::new_in(alloc.clone()), left_out: AVec::new_in(alloc.clone()) };
@@ -241,39 +257,52 @@ fn scripts_placement_parity_with_proc_macro_and_tree_source() {
     let empty_home = "/nonexistent-blaze-t2-parity-home";
     let empty_store = std::path::Path::new(empty_home).join(super::STORE_UNDER_HOME);
 
-    let cases: &[(UnitId, &str, RanAs)] = &[
+    let cases: &[(UnitId, &[(&str, &str)], RanAs)] = &[
         (
             UnitId(0),
-            "fn f() { use std::os::unix::io::AsRawFd; unsafe extern \"C\" { fn ioctl(); } }",
+            &[("build.rs", "fn f() { use std::os::unix::io::AsRawFd; unsafe extern \"C\" { fn ioctl(); } }")],
             RanAs::Native,
         ),
         (
             UnitId(1),
-            "fn main() { if cfg!(target_family = \"unix\") {} else { panic!(); } }",
+            &[("build.rs", "fn main() { if cfg!(target_family = \"unix\") {} else { panic!(); } }")],
             RanAs::Native,
         ),
-        (UnitId(2), "fn main() {}", RanAs::Native),
+        (UnitId(2), &[("build.rs", "fn main() {}")], RanAs::Native),
         (
             UnitId(4),
-            "#[cfg(unix)] let x = { use std::os::unix::fs::MetadataExt; 1 }; fn main() { let _ = r#\"extern \"C\" {\"#; if cfg!(target_os = \"linux\") {} }",
+            &[(
+                "build.rs",
+                "macro_rules! ffi { () => { extern \"C\" { fn f(); } }; } #[cfg(unix)] let x = { use std::os::unix::fs::MetadataExt; 1 }; fn main() { let _ = r#\"extern \"C\" {\"#; if cfg!(target_os = \"linux\") {} }",
+            )],
             RanAs::Wasm,
+        ),
+        (UnitId(5), &[("build.rs", "fn main() {}")], RanAs::Wasm),
+        (
+            UnitId(7),
+            &[
+                ("build.rs", "mod host;\nfn main() { host::probe(); }"),
+                ("host.rs", "pub fn probe() { use std::os::unix::io::AsRawFd; }"),
+            ],
+            RanAs::Native,
         ),
     ];
 
-    for &(script_id, src, expected) in cases {
-        let tree = mem_tree_with_submodules([("build.rs", src.as_bytes())], [], "", None);
+    for &(script_id, files, expected) in cases {
+        let tree = mem_tree_with_submodules(files.iter().map(|(p, s)| (*p, s.as_bytes())), [], "", None);
         let root = ScriptRoot::package();
-        let read_src = script_source_in_tree(&tree, &root, "build.rs", alloc.clone()).expect("build.rs in mem tree");
-        assert_eq!(read_src.as_str(), src);
+        let source_reason = classify_script_tree_in(&tree, &root, "build.rs", true, alloc.clone(), |_, _| {})
+            .expect("build.rs tree must classify without error");
 
-        let via_cli = placement(Some(empty_home), &graph, script_id, Some(read_src.as_str()), alloc.clone());
-        let via_proc_macro = RanAs::of(&placed_in_store_with_source(
+        let via_cli = placement(Some(empty_home), &graph, Some(&lock), script_id, source_reason, alloc.clone());
+        let via_proc_macro = RanAs::of(&placed_in_store_with_lock_and_source(
             &empty_store,
             &graph,
+            Some(&lock),
             script_id,
             MODE,
             crate::graph::TRIPLE,
-            Some(read_src.as_str()),
+            source_reason,
             alloc.clone(),
         ));
         assert_eq!(via_cli, expected, "cli placement mismatch for {:?}", script_id);

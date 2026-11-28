@@ -55,12 +55,12 @@ pub use blaze_build_script::toolchain::MACOS_MIN;
 /// [`NativeSetting`] (made once by [`crate::native_setting::command_native_setting`]) or is
 /// refused by name ([`NativeUnitError::NoNativeSetting`]); it is never tried as wasm (rule 3).
 pub fn placed(graph: &UnitGraph<'_>, script: UnitId, mode: Mode, alloc: Alloc<'_>) -> Runner {
-    placed_with_source(graph, script, mode, None, alloc)
+    placed_with_lock_and_source(graph, None, script, mode, None, alloc)
 }
 
 /// Like [`placed`], also inspecting `script_source` (when `Some`) via
 /// [`native::placement_with_source`] so build scripts with 0 build-dependencies that reference
-/// host-OS `std::os::*`, `extern "C" { ... }` blocks, or `cfg!(target_family = "unix")` are
+/// host-OS `std::os::*`, `extern "C" { ... }` blocks, or host-vs-WASI diverging `cfg!(...)` are
 /// deterministically placed on [`Runner::Native`] before compilation or execution (rules 3, 30, 54).
 pub fn placed_with_source(
     graph: &UnitGraph<'_>,
@@ -69,14 +69,41 @@ pub fn placed_with_source(
     script_source: Option<&str>,
     alloc: Alloc<'_>,
 ) -> Runner {
-    let package = graph.units.get(script.index()).map_or("", |u| u.name.as_str());
-    native::placement_with_source(
-        native::closure(graph, script, alloc),
-        mode,
-        package,
+    placed_with_lock_and_source(
+        graph,
+        None,
         script,
-        script_source,
+        mode,
+        script_source.and_then(native::source_requires_native),
+        alloc,
     )
+}
+
+/// Source-qualified and source-tree-aware placement: when `lock` is `Some`, qualifies
+/// [`native::NO_WASM_CLASS`] entries strictly by crates.io registry origin
+/// (`LockSource::is_crates_io()`) so local/path/git/alt-registry packages sharing a crates.io
+/// name are never falsely forced native; combines with `source_reason` from
+/// [`native::source_tree_requires_native`] (rules 3, 30, 54).
+pub fn placed_with_lock_and_source(
+    graph: &UnitGraph<'_>,
+    lock: Option<&blaze_manifest::lock::Lock<'_>>,
+    script: UnitId,
+    mode: Mode,
+    source_reason: Option<native::NativeSourceReason>,
+    alloc: Alloc<'_>,
+) -> Runner {
+    let package = graph.units.get(script.index()).map_or("", |u| u.name.as_str());
+    let closure = match lock {
+        Some(lock) => native::closure_with_source(graph, script, alloc, |u| {
+            if lock.packages.get(u.package.index()).is_some_and(|p| p.source.is_crates_io()) {
+                native::PackageSource::CratesIo
+            } else {
+                native::PackageSource::Other
+            }
+        }),
+        None => native::closure(graph, script, alloc),
+    };
+    native::placement_with_source_reason(closure, mode, package, script, source_reason)
 }
 
 /// Like [`placed`], but honors the D175 zero-Wasm fast path: whenever `store` holds a native
@@ -91,7 +118,7 @@ pub fn placed_in_store(
     host: &str,
     alloc: Alloc<'_>,
 ) -> Runner {
-    placed_in_store_with_source(store, graph, script, mode, host, None, alloc)
+    placed_in_store_with_lock_and_source(store, graph, None, script, mode, host, None, alloc)
 }
 
 /// Like [`placed_in_store`], also honoring deterministic pre-run source classification via
@@ -105,7 +132,31 @@ pub fn placed_in_store_with_source(
     script_source: Option<&str>,
     alloc: Alloc<'_>,
 ) -> Runner {
-    let base = placed_with_source(graph, script, mode, script_source, alloc);
+    placed_in_store_with_lock_and_source(
+        store,
+        graph,
+        None,
+        script,
+        mode,
+        host,
+        script_source.and_then(native::source_requires_native),
+        alloc,
+    )
+}
+
+/// Source-qualified and source-tree-aware store placement (rules 3, 30, 54).
+#[allow(clippy::too_many_arguments)]
+pub fn placed_in_store_with_lock_and_source(
+    store: &Path,
+    graph: &UnitGraph<'_>,
+    lock: Option<&blaze_manifest::lock::Lock<'_>>,
+    script: UnitId,
+    mode: Mode,
+    host: &str,
+    source_reason: Option<native::NativeSourceReason>,
+    alloc: Alloc<'_>,
+) -> Runner {
+    let base = placed_with_lock_and_source(graph, lock, script, mode, source_reason, alloc);
     if matches!(base, Runner::Native { .. }) {
         return base;
     }
@@ -1195,6 +1246,38 @@ mod tests {
                 Runner::Native { because: UnitId(6) }
             );
         }
+
+        // Source-qualified NO_WASM_CLASS check: a local path package named `prost-build` MUST NOT
+        // be forced native, while crates.io `prost-build` MUST be forced native.
+        let lock_text = "version = 4\n\n\
+            [[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+            [[package]]\nname = \"prost-build\"\nversion = \"0.1.0\"\n\n\
+            [[package]]\nname = \"prost-build\"\nversion = \"0.14.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+        let lock = blaze_manifest::lock::Lock::read(lock_text.as_bytes(), alloc).expect("lock");
+        let mut q_units = AVec::new_in(alloc);
+        let mut app_local = unit("app", UnitKind::BuildScript, &[1], None);
+        app_local.package = LockId(0);
+        let mut local_prost = unit("prost-build", UnitKind::Lib, &[], None);
+        local_prost.package = LockId(1);
+        let mut app_reg = unit("app", UnitKind::BuildScript, &[3], None);
+        app_reg.package = LockId(0);
+        let mut reg_prost = unit("prost-build", UnitKind::Lib, &[], None);
+        reg_prost.package = LockId(2);
+        q_units.push(app_local); // 0
+        q_units.push(local_prost); // 1
+        q_units.push(app_reg); // 2
+        q_units.push(reg_prost); // 3
+        let q_graph = UnitGraph { units: q_units, resolver: Resolver::V3, meta: AVec::new_in(alloc), left_out: AVec::new_in(alloc) };
+        assert_eq!(
+            super::placed_in_store_with_lock_and_source(empty_store, &q_graph, Some(&lock), UnitId(0), Mode::Check, host, None, alloc),
+            Runner::Wasm,
+            "local/workspace prost-build must stay Wasm"
+        );
+        assert_eq!(
+            super::placed_in_store_with_lock_and_source(empty_store, &q_graph, Some(&lock), UnitId(2), Mode::Check, host, None, alloc),
+            Runner::Native { because: UnitId(3) },
+            "crates.io prost-build must be Native"
+        );
     }
 
     #[test]

@@ -140,6 +140,9 @@ pub enum NamesError {
     /// Under test only: the list just written answers otherwise than the world it was written
     /// from ([`Names::list_differences`], the oracle every test world's discovery runs).
     ListDiffers { differences: usize },
+    /// A build script's source file could not be read or decoded as UTF-8 during Tier-2 native
+    /// placement (rules 3, 21, 54): refused loudly instead of silently assuming Wasm.
+    ScriptSource { package: String, path: String, why: String },
 }
 
 impl core::fmt::Display for NamesError {
@@ -168,6 +171,9 @@ impl core::fmt::Display for NamesError {
             NamesError::ListFact { row, what } => write!(f, "the crate list's row {row}: {what} (names.rs `of_list`)"),
             NamesError::ListDiffers { differences } => {
                 write!(f, "the crate list written answers {differences} fact(s) otherwise than its own world (names.rs `differences_from`, the tests' oracle)")
+            }
+            NamesError::ScriptSource { package, path, why } => {
+                write!(f, "the build script of `{package}` at `{path}` could not be read for placement: {why}")
             }
         }
     }
@@ -1872,22 +1878,23 @@ fn make_world<'f>(
         &script_scratch,
         |at, script_id| {
             let script = &graph.units[script_id.index()];
-            let base_ran_as = crate::scripts::placement(Some(home), graph, script_id, None, heap);
+            let base_ran_as = crate::scripts::placement(Some(home), graph, Some(lock), script_id, None, heap);
             let ran_as = if base_ran_as == crate::scripts::RanAs::Native {
                 base_ran_as
             } else {
                 let shown_from = world.crates.get(at).map(|krate| krate.input.shown_from).unwrap_or("");
-                let script_source = read_script_source_in_world(
+                let source_reason = classify_script_source_in_world(
                     &span_cx,
                     &reader.root,
                     &env.fs,
                     world.texts.packs(),
                     lazy_trees,
+                    script.name.as_str(),
                     shown_from,
                     script.root.as_str(),
                     &io_scratch,
-                );
-                let placed = crate::scripts::placement(Some(home), graph, script_id, script_source, heap);
+                )?;
+                let placed = crate::scripts::placement(Some(home), graph, Some(lock), script_id, source_reason, heap);
                 io_scratch.reset();
                 placed
             };
@@ -1967,43 +1974,108 @@ struct ComputedScript {
     deps: Option<&'static str>,
 }
 
-/// Reads a build script's root file (`script_root`, package-relative) from either the checkout
+fn script_source_error(package: &str, path: &str, why: &str) -> NamesError {
+    NamesError::ScriptSource { package: package.into(), path: path.into(), why: why.into() }
+}
+
+/// Classifies a build script's full source tree (`script_root` plus active external `mod`,
+/// `#[path = "..."] mod`, and static `include!("...")` files) from either the checkout
 /// (`tree == 0`), an already-opened pack (`packs[tree - 1]`), or an on-demand lazy pack
 /// (`lazy_trees`), allocating only in `scratch`.
-#[expect(clippy::too_many_arguments, reason = "world source reader over checkout, fs, packs, lazy_trees, shown_from, root, and scratch")]
-fn read_script_source_in_world<'s>(
+///
+/// Refuses missing root files, corrupt/unreadable pack entries, missing lazy packs, and
+/// non-UTF-8 files with [`NamesError::ScriptSource`] instead of silently assuming Wasm.
+#[expect(clippy::too_many_arguments, reason = "world source classifier over checkout, fs, packs, lazy_trees, package, shown_from, root, and scratch")]
+fn classify_script_source_in_world<'s>(
     cx: &Cx,
     checkout: &Dir<ReadOnly>,
     fs: &bstd::fs::Fs,
     packs: &[PackView<'s>],
     lazy_trees: Option<&'s crate::body_types::SyncLazyTrees<'s>>,
+    package: &str,
     shown_from: &str,
     script_root: &str,
     scratch: &'s Frame,
-) -> Option<&'s str> {
-    let rest = shown_from.strip_prefix('/')?;
-    let (tree_str, dir_part) = rest.split_once('/')?;
-    let tree_k: usize = tree_str.parse().ok()?;
-    let dir = dir_part.trim_end_matches('/');
-    let rel = script_root.trim_start_matches("./");
-    let full = if dir.is_empty() {
-        blaze_own::String::from_str_in(rel, scratch)
-    } else {
-        bstd::mem::format_in!(scratch, "{dir}/{rel}")
+) -> Result<Option<blaze_build_script::native::NativeSourceReason>, NamesError> {
+    let Some(rest) = shown_from.strip_prefix('/') else {
+        return Err(script_source_error(package, script_root, "missing tree root prefix in world"));
     };
-    if tree_k == 0 {
-        let path = Path::new(full.as_str()).ok()?;
-        let mut bytes = Bytes::new_in(scratch, "script source for Tier-2 placement");
-        checkout.read_all(cx, &path, &mut bytes).ok()?;
-        let text = core::str::from_utf8(bytes.as_slice()).ok()?;
-        Some(scratch.alloc_str(text))
+    let Some((tree_str, dir_part)) = rest.split_once('/') else {
+        return Err(script_source_error(package, script_root, "malformed tree path in world"));
+    };
+    let Ok(tree_k) = tree_str.parse::<usize>() else {
+        return Err(script_source_error(package, script_root, "non-numeric tree id in world"));
+    };
+    let dir = dir_part.trim_end_matches('/');
+    let erased = blaze_own::Erased::new(scratch);
+    let alloc = erased.handle();
+    let pack_view = if tree_k == 0 {
+        None
     } else if let Some(lazy) = lazy_trees {
-        lazy.read_str(cx, fs, scratch, tree_k, full.as_str())
+        match lazy.tree(cx, fs, scratch, tree_k) {
+            Some(view) => Some(view),
+            None => {
+                let why = lazy.refused().unwrap_or("lazy source pack could not be opened");
+                return Err(script_source_error(package, script_root, why));
+            }
+        }
     } else {
-        let view = packs.get(tree_k.checked_sub(1)?)?;
-        let bytes = view.read_slice(full.as_str(), scratch).ok().flatten()?;
-        core::str::from_utf8(bytes).ok()
-    }
+        match tree_k.checked_sub(1).and_then(|idx| packs.get(idx)).copied() {
+            Some(view) => Some(view),
+            None => return Err(script_source_error(package, script_root, "source pack tree index out of range")),
+        }
+    };
+
+    blaze_build_script::native::source_tree_requires_native(script_root, alloc, |rel, is_root, visit| {
+        let full = if dir.is_empty() {
+            blaze_own::String::from_str_in(rel, alloc)
+        } else {
+            blaze_own::format_in!(alloc, "{dir}/{rel}")
+        };
+        if tree_k == 0 {
+            let path = Path::new(full.as_str()).map_err(|err| {
+                let msg = blaze_own::format_in!(alloc, "invalid path: {err}");
+                script_source_error(package, full.as_str(), msg.as_str())
+            })?;
+            let mut bytes = Bytes::new_in(scratch, "script source for Tier-2 placement");
+            if let Err(err) = checkout.read_all(cx, &path, &mut bytes) {
+                if matches!(err.kind, bstd::fs::FsKind::NotFound | bstd::fs::FsKind::IsADirectory) && !is_root {
+                    return Ok(false);
+                }
+                let msg = blaze_own::format_in!(alloc, "{err}");
+                return Err(script_source_error(package, full.as_str(), msg.as_str()));
+            }
+            let text = core::str::from_utf8(bytes.as_slice()).map_err(|err| {
+                let msg = blaze_own::format_in!(alloc, "not valid UTF-8: {err}");
+                script_source_error(package, full.as_str(), msg.as_str())
+            })?;
+            visit(text);
+            Ok(true)
+        } else {
+            let Some(view) = pack_view else {
+                return Err(script_source_error(package, full.as_str(), "source pack unavailable"));
+            };
+            let bytes = match view.read_slice(full.as_str(), scratch) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => {
+                    if is_root {
+                        return Err(script_source_error(package, full.as_str(), "build-script root missing from pack"));
+                    }
+                    return Ok(false);
+                }
+                Err(why) => {
+                    let msg = blaze_own::format_in!(alloc, "pack entry failed to decode: {}", blaze_text::Shown(&why));
+                    return Err(script_source_error(package, full.as_str(), msg.as_str()));
+                }
+            };
+            let text = core::str::from_utf8(bytes).map_err(|err| {
+                let msg = blaze_own::format_in!(alloc, "not valid UTF-8: {err}");
+                script_source_error(package, full.as_str(), msg.as_str())
+            })?;
+            visit(text);
+            Ok(true)
+        }
+    })
 }
 
 /// Evaluates `compute(crate_at, script_id)` at most once per unique `script_id` across all crate
@@ -2565,6 +2637,65 @@ mod unresolved_tests {
         })
         .expect("ok");
         assert_eq!(d_wasm, None);
+    }
+
+    #[test]
+    fn classify_script_source_in_world_refuses_missing_and_non_utf8_sources() {
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(77, bstd::io::Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, 4 << 20).expect("cx");
+        let fs = io.need_fs().expect("fs");
+        let root_rw = fs.open_dir(&cx, &bstd::path::Path::new("ws").expect("ws")).expect("open ws");
+        root_rw
+            .publish(
+                &cx,
+                &bstd::path::Path::new("bad_utf8/build.rs").expect("p"),
+                bstd::fs::Content::bytes(&[0xff, 0xfe, 0xfd]),
+                bstd::fs::Durable::No,
+            )
+            .expect("publish");
+        root_rw
+            .publish(
+                &cx,
+                &bstd::path::Path::new("submod/build.rs").expect("p"),
+                bstd::fs::Content::bytes(b"mod host;\nfn main() {}\n"),
+                bstd::fs::Durable::No,
+            )
+            .expect("publish");
+        root_rw
+            .publish(
+                &cx,
+                &bstd::path::Path::new("submod/host.rs").expect("p"),
+                bstd::fs::Content::bytes(b"pub fn f() { use std::os::unix::io::AsRawFd; }\n"),
+                bstd::fs::Durable::No,
+            )
+            .expect("publish");
+        let ro = root_rw.read_only();
+        let scratch = bstd::mem::Frame::new(bstd::mem::Tag::Other).expect("scratch");
+
+        // Missing root file MUST return Err(NamesError::ScriptSource), NOT Ok(None).
+        let missing = super::classify_script_source_in_world(&cx, &ro, &fs, &[], None, "missing-pkg", "/0/missing/", "build.rs", &scratch);
+        assert!(
+            matches!(missing, Err(super::NamesError::ScriptSource { ref package, .. }) if package == "missing-pkg"),
+            "missing build.rs must refuse with NamesError::ScriptSource: {missing:?}"
+        );
+
+        // Non-UTF-8 build.rs MUST return Err(NamesError::ScriptSource), NOT Ok(None).
+        let non_utf8 = super::classify_script_source_in_world(&cx, &ro, &fs, &[], None, "bad-utf8", "/0/bad_utf8/", "build.rs", &scratch);
+        assert!(
+            matches!(non_utf8, Err(super::NamesError::ScriptSource { ref package, ref why, .. }) if package == "bad-utf8" && why.contains("UTF-8")),
+            "non-UTF-8 build.rs must refuse with NamesError::ScriptSource: {non_utf8:?}"
+        );
+
+        // Out-of-range pack tree index MUST return Err(NamesError::ScriptSource).
+        let missing_pack = super::classify_script_source_in_world(&cx, &ro, &fs, &[], None, "packed", "/5/", "build.rs", &scratch);
+        assert!(
+            matches!(missing_pack, Err(super::NamesError::ScriptSource { ref package, .. }) if package == "packed"),
+            "missing pack must refuse with NamesError::ScriptSource: {missing_pack:?}"
+        );
+
+        // Positive control: submodule with std::os::unix classifies Native.
+        let submod = super::classify_script_source_in_world(&cx, &ro, &fs, &[], None, "submod", "/0/submod/", "build.rs", &scratch);
+        assert_eq!(submod.expect("submod ok"), Some(blaze_build_script::native::NativeSourceReason::HostOsStd));
     }
 }
 

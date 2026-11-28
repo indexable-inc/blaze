@@ -827,20 +827,53 @@ pub fn prepare_viewing_on<'a>(
     Ok(Prepared { loaded, script, env })
 }
 
-/// Reads the UTF-8 source text of a build script's root file (`unit.root`, package-relative) from
-/// `tree` under `root` for pre-run Tier-2 native placement (`placed_in_store_with_source`).
-pub fn script_source_in_tree<'a>(tree: &Tree, root: &ScriptRoot, unit_root: &str, alloc: Alloc<'a>) -> Option<blaze_own::AString<'a>> {
-    let script_rel = unit_root.trim_start_matches("./");
-    let bytes = match root.seen() {
-        blaze_expand::seen::SeenRoot::Package => tree.file(script_rel)?,
-        blaze_expand::seen::SeenRoot::Member { dir } if dir.is_empty() => tree.file(script_rel)?,
-        blaze_expand::seen::SeenRoot::Member { dir } => {
-            let full = blaze_own::format_in!(alloc, "{dir}/{script_rel}");
-            tree.file(full.as_str())?
+/// Classifies a build script's full source tree (`unit_root` plus active external `mod`,
+/// `#[path = "..."] mod`, and static `include!("...")` files) inside `tree` under `root` without
+/// process-heap `Vec<u8>` double-copy (uses [`Tree::with_file_bytes_in`] +
+/// [`blaze_build_script::native::source_tree_requires_native`]).
+///
+/// Calls `on_file(rel_path, source_text)` for each inspected file (enabling snapshot
+/// fingerprinting in callers). When `require_root` is `true`, a missing root file returns `Err`.
+pub fn classify_script_tree_in<'a>(
+    tree: &Tree,
+    root: &ScriptRoot,
+    unit_root: &str,
+    require_root: bool,
+    alloc: Alloc<'a>,
+    mut on_file: impl FnMut(&str, &str),
+) -> Result<Option<blaze_build_script::native::NativeSourceReason>, blaze_own::AString<'a>> {
+    blaze_build_script::native::source_tree_requires_native(unit_root, alloc, |rel, is_root, visit| {
+        let mut tree_path = blaze_own::AString::new_in(alloc);
+        match root.seen() {
+            blaze_expand::seen::SeenRoot::Package => tree_path.push_str(rel),
+            blaze_expand::seen::SeenRoot::Member { dir } if dir.is_empty() => tree_path.push_str(rel),
+            blaze_expand::seen::SeenRoot::Member { dir } => {
+                tree_path.push_str(dir);
+                tree_path.push('/');
+                tree_path.push_str(rel);
+            }
         }
-    };
-    let text = core::str::from_utf8(&bytes).ok()?;
-    Some(blaze_own::String::from_str_in(text, alloc))
+        let mut utf8_err: Option<blaze_own::AString<'a>> = None;
+        let found = tree.with_file_bytes_in(tree_path.as_str(), alloc, |bytes| match core::str::from_utf8(bytes) {
+            Ok(text) => {
+                on_file(rel, text);
+                visit(text);
+            }
+            Err(err) => {
+                utf8_err = Some(blaze_own::format_in!(alloc, "`{}` is not valid UTF-8: {err}", tree_path.as_str()));
+            }
+        })?;
+        if let Some(err) = utf8_err {
+            return Err(err);
+        }
+        if found.is_none() {
+            if is_root && require_root {
+                return Err(blaze_own::format_in!(alloc, "build-script root `{}` is missing", tree_path.as_str()));
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    })
 }
 
 /// `script`'s outputs, run as wasm, or native when [`placed`] says so for the setting's mode
@@ -862,16 +895,8 @@ pub fn outputs<'a>(
     if unit.kind != UnitKind::BuildScript {
         return Err(UnitScriptError::NotAScript { unit: script });
     }
-    let script_source = script_source_in_tree(&tree, &root, unit.root.as_str(), alloc);
-    match crate::native_unit::placed_in_store_with_source(
-        setting.store,
-        graph,
-        script,
-        setting.mode,
-        setting.host,
-        script_source.as_ref().map(|s| s.as_str()),
-        alloc,
-    ) {
+    let runner = resolve_tree_runner(setting, graph, script, unit, &tree, &root, alloc);
+    match runner {
         Runner::Wasm => {
             let prepared = prepare(runtime, setting, graph, script, tree, root, deps, alloc)?;
             runtime.run(&prepared.loaded, prepared.script, &prepared.env, alloc).map_err(UnitScriptError::Script)
@@ -904,6 +929,32 @@ pub fn outputs_viewing<'a>(
     outputs_viewing_on(runtime, setting, graph, script, None, tree, root, deps, producers, alloc)
 }
 
+fn resolve_tree_runner(
+    setting: &Setting<'_>,
+    graph: &UnitGraph<'_>,
+    script: UnitId,
+    unit: &Unit<'_>,
+    tree: &Tree,
+    root: &ScriptRoot,
+    alloc: Alloc<'_>,
+) -> Runner {
+    let base = crate::native_unit::placed_in_store(setting.store, graph, script, setting.mode, setting.host, alloc);
+    if matches!(base, Runner::Native { .. }) {
+        return base;
+    }
+    let source_reason = classify_script_tree_in(tree, root, unit.root.as_str(), false, alloc, |_, _| {}).ok().flatten();
+    crate::native_unit::placed_in_store_with_lock_and_source(
+        setting.store,
+        graph,
+        None,
+        script,
+        setting.mode,
+        setting.host,
+        source_reason,
+        alloc,
+    )
+}
+
 /// [`outputs_viewing`] for the side whose cfg is `side_cfg` ([`prepare_viewing_on`]). A script
 /// placed native is refused when given a side's cfg ([`UnitScriptError::NativeOnSide`]): the
 /// native runner builds for the machine. `None`: as [`outputs_viewing`].
@@ -920,20 +971,34 @@ pub fn outputs_viewing_on<'a>(
     producers: &[(&str, &DepProducer)],
     alloc: Alloc<'a>,
 ) -> Result<ScriptRun<'a>, UnitScriptError> {
+    outputs_viewing_on_placed(runtime, setting, graph, script, side_cfg, tree, root, deps, producers, None, alloc)
+}
+
+/// Like [`outputs_viewing_on`], honoring a pre-verified `planned_runner` (when `Some`) so
+/// execution never independently recomputes a conflicting placement after planning (Rule 21).
+#[allow(clippy::too_many_arguments)]
+pub fn outputs_viewing_on_placed<'a>(
+    runtime: &ScriptRuntime,
+    setting: &Setting<'_>,
+    graph: &UnitGraph<'_>,
+    script: UnitId,
+    side_cfg: Option<&[CfgAtom<'_>]>,
+    tree: Tree,
+    root: ScriptRoot,
+    deps: &[DepMetadata<'_>],
+    producers: &[(&str, &DepProducer)],
+    planned_runner: Option<Runner>,
+    alloc: Alloc<'a>,
+) -> Result<ScriptRun<'a>, UnitScriptError> {
     let unit = graph.units.get(script.index()).ok_or(UnitScriptError::NotAScript { unit: script })?;
     if unit.kind != UnitKind::BuildScript {
         return Err(UnitScriptError::NotAScript { unit: script });
     }
-    let script_source = script_source_in_tree(&tree, &root, unit.root.as_str(), alloc);
-    match crate::native_unit::placed_in_store_with_source(
-        setting.store,
-        graph,
-        script,
-        setting.mode,
-        setting.host,
-        script_source.as_ref().map(|s| s.as_str()),
-        alloc,
-    ) {
+    let runner = match planned_runner {
+        Some(runner) => runner,
+        None => resolve_tree_runner(setting, graph, script, unit, &tree, &root, alloc),
+    };
+    match runner {
         Runner::Wasm => {
             let file_area = setting.store.join(blaze_build_script::outputs::FILE_AREA);
             let viewed = dep_mount::view_with_area(&tree, Some(&file_area), producers, deps, alloc)
@@ -1053,9 +1118,26 @@ pub fn outputs_given<'a>(
     given: &[GivenRun<'_>],
     alloc: Alloc<'a>,
 ) -> Result<ScriptRun<'a>, UnitScriptError> {
+    outputs_given_placed(runtime, setting, graph, script, side_cfg, tree, root, given, None, alloc)
+}
+
+/// Like [`outputs_given`], executing strictly under `planned_runner` when provided (Rule 21).
+#[allow(clippy::too_many_arguments)]
+pub fn outputs_given_placed<'a>(
+    runtime: &ScriptRuntime,
+    setting: &Setting<'_>,
+    graph: &UnitGraph<'_>,
+    script: UnitId,
+    side_cfg: Option<&[CfgAtom<'_>]>,
+    tree: Tree,
+    root: ScriptRoot,
+    given: &[GivenRun<'_>],
+    planned_runner: Option<Runner>,
+    alloc: Alloc<'a>,
+) -> Result<ScriptRun<'a>, UnitScriptError> {
     let served = served_links(graph, script, given)?;
     let producers: Vec<(&str, &DepProducer)> = served.producers.iter().map(|(links, producer)| (*links, producer)).collect();
-    outputs_viewing_on(runtime, setting, graph, script, side_cfg, tree, root, &served.deps, &producers, alloc)
+    outputs_viewing_on_placed(runtime, setting, graph, script, side_cfg, tree, root, &served.deps, &producers, planned_runner, alloc)
 }
 
 /// The build-script units whose metadata `script` is given: for each direct dependency of the

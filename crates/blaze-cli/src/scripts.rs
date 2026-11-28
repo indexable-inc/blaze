@@ -54,7 +54,7 @@ use blaze_drive::{Input, Kind, Name, Task, Want};
 use blaze_ids::ContentId;
 use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::{AVec, Alloc, Erased};
-use blaze_proc_macro::native_unit::{NativeSetting, placed_in_store_with_source, placed_with_source};
+use blaze_proc_macro::native_unit::{NativeSetting, placed_in_store_with_lock_and_source, placed_with_lock_and_source};
 use blaze_proc_macro::script::ScriptRuntime;
 use blaze_proc_macro::script_sandbox::{ScriptRoot, Tree, dir_tree, mem_tree_with_submodules};
 use blaze_proc_macro::script_unit::{self, Setting, links_closure};
@@ -114,52 +114,103 @@ pub(crate) fn run_is_public(crate_public: bool, ran_as: RanAs) -> bool {
 pub(crate) fn placement(
     home: Option<&str>,
     graph: &UnitGraph<'_>,
+    lock: Option<&Lock<'_>>,
     script: UnitId,
-    script_source: Option<&str>,
+    source_reason: Option<blaze_build_script::native::NativeSourceReason>,
     alloc: Alloc<'_>,
 ) -> RanAs {
     match home {
         Some(home) => {
             let store = Path::new(home).join(STORE_UNDER_HOME);
-            RanAs::of(&placed_in_store_with_source(&store, graph, script, MODE, crate::graph::TRIPLE, script_source, alloc))
+            RanAs::of(&placed_in_store_with_lock_and_source(
+                &store,
+                graph,
+                lock,
+                script,
+                MODE,
+                crate::graph::TRIPLE,
+                source_reason,
+                alloc,
+            ))
         }
-        None => RanAs::of(&placed_with_source(graph, script, MODE, script_source, alloc)),
+        None => RanAs::of(&placed_with_lock_and_source(graph, lock, script, MODE, source_reason, alloc)),
     }
 }
 
-/// Reads the UTF-8 source text of a build script's root file (`script_root`, package-relative)
-/// from `files` into `scratch` without global heap allocation, for pre-run Tier-2 placement.
-fn read_script_source_in_files<'s>(
+/// Classifies a build script's full source tree (`script_root` plus active external `mod`,
+/// `#[path = "..."] mod`, and static `include!("...")` files) from `files` into `scratch` without
+/// global heap allocation, computing a SHA-256 snapshot fingerprint over all inspected files.
+/// Refuses missing root files, corrupt/unreadable pack entries, and non-UTF-8 sources instead of
+/// assuming Wasm.
+fn classify_script_source_in_files<'s>(
     cx: &Cx,
     checkout: &Dir<bstd::fs::ReadOnly>,
-    files: &Files<'s>,
+    files: &Files<'_>,
     script_root: &str,
     scratch: &'s Frame,
-) -> Option<&'s str> {
-    let rel = script_root.trim_start_matches("./");
-    match files {
-        Files::Member { dir } | Files::External { dir } => {
-            let full = if dir.is_empty() {
-                blaze_own::String::from_str_in(rel, scratch)
-            } else {
-                bstd::mem::format_in!(scratch, "{dir}/{rel}")
-            };
-            let path = bstd::path::Path::new(full.as_str()).ok()?;
-            let mut bytes = bstd::mem::Bytes::new_in(scratch, "script source for Tier-2 placement");
-            checkout.read_all(cx, &path, &mut bytes).ok()?;
-            let text = core::str::from_utf8(bytes.as_slice()).ok()?;
-            Some(scratch.alloc_str(text))
+) -> Result<(Option<blaze_build_script::native::NativeSourceReason>, [u8; 32]), &'s str> {
+    let erased = blaze_own::Erased::new(scratch);
+    let alloc = erased.handle();
+    let mut hasher = blaze_proc_macro::module::FilesHasher::new();
+    let reason = blaze_build_script::native::source_tree_requires_native(script_root, alloc, |rel, is_root, visit| {
+        match files {
+            Files::Member { dir } | Files::External { dir } => {
+                let full = if dir.is_empty() {
+                    blaze_own::String::from_str_in(rel, alloc)
+                } else {
+                    blaze_own::format_in!(alloc, "{dir}/{rel}")
+                };
+                let path = bstd::path::Path::new(full.as_str()).map_err(|err| {
+                    let msg = blaze_own::format_in!(alloc, "invalid path `{}`: {err}", full.as_str());
+                    &*scratch.alloc_str(msg.as_str())
+                })?;
+                let mut bytes = bstd::mem::Bytes::new_in(scratch, "script source for Tier-2 placement");
+                if let Err(err) = checkout.read_all(cx, &path, &mut bytes) {
+                    if matches!(err.kind, bstd::fs::FsKind::NotFound | bstd::fs::FsKind::IsADirectory) && !is_root {
+                        return Ok(false);
+                    }
+                    let msg = blaze_own::format_in!(alloc, "cannot read `{}`: {err}", full.as_str());
+                    return Err(&*scratch.alloc_str(msg.as_str()));
+                }
+                let text = core::str::from_utf8(bytes.as_slice()).map_err(|err| {
+                    let msg = blaze_own::format_in!(alloc, "`{}` is not valid UTF-8: {err}", full.as_str());
+                    &*scratch.alloc_str(msg.as_str())
+                })?;
+                hasher.update_file(rel, text.as_bytes());
+                visit(text);
+                Ok(true)
+            }
+            Files::Pack { view, dir, .. } => {
+                let full = if dir.is_empty() {
+                    blaze_own::String::from_str_in(rel, alloc)
+                } else {
+                    blaze_own::format_in!(alloc, "{dir}/{rel}")
+                };
+                let bytes = match view.read_slice(full.as_str(), scratch) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => {
+                        if is_root {
+                            let msg = blaze_own::format_in!(alloc, "build-script root `{}` is missing from pack", full.as_str());
+                            return Err(&*scratch.alloc_str(msg.as_str()));
+                        }
+                        return Ok(false);
+                    }
+                    Err(why) => {
+                        let msg = blaze_own::format_in!(alloc, "pack entry `{}` failed to decode: {}", full.as_str(), blaze_text::Shown(&why));
+                        return Err(&*scratch.alloc_str(msg.as_str()));
+                    }
+                };
+                let text = core::str::from_utf8(bytes).map_err(|err| {
+                    let msg = blaze_own::format_in!(alloc, "`{}` is not valid UTF-8: {err}", full.as_str());
+                    &*scratch.alloc_str(msg.as_str())
+                })?;
+                hasher.update_file(rel, text.as_bytes());
+                visit(text);
+                Ok(true)
+            }
         }
-        Files::Pack { view, dir, .. } => {
-            let full = if dir.is_empty() {
-                blaze_own::String::from_str_in(rel, scratch)
-            } else {
-                bstd::mem::format_in!(scratch, "{dir}/{rel}")
-            };
-            let bytes = view.read_slice(full.as_str(), scratch).ok().flatten()?;
-            core::str::from_utf8(bytes).ok()
-        }
-    }
+    })?;
+    Ok((reason, hasher.finish()))
 }
 
 /// A `Script` record's payload split into how it ran and its outputs record (`bzbsout`, read
@@ -1282,6 +1333,13 @@ pub(crate) struct ScriptJob<'j> {
     /// Transitive build-dependency digest (`deps <sha256>`, rule 21) when the build script has
     /// build-dependencies; `None` when it has none.
     deps_digest: Option<&'j str>,
+    /// The verified planned runner matching the `RanAs` that named the `Script` and `MacroModule`
+    /// tasks: reused directly at execution time (Rule 21, never independently recomputed).
+    planned_runner: Runner,
+    /// When source classification participated in `planned_runner`, the exact `NativeSourceReason`
+    /// and SHA-256 snapshot fingerprint observed at job preparation time so `run` refuses any
+    /// mid-command source mutation as a hole instead of filing a mismatched payload.
+    planned_source: Option<(Option<blaze_build_script::native::NativeSourceReason>, [u8; 32])>,
 }
 
 /// What a member build script's reads of the checkout give (engine_scripts.rs sets it).
@@ -1587,21 +1645,70 @@ pub(crate) fn job<'f: 'j, 'j>(
         Ok(scratch) => scratch,
         Err(error) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{error}")), hole: true }),
     };
-    let ran_as = {
-        let script_source = read_script_source_in_files(&cx, &root.read_only(), &files, unit.root.as_str(), &io_scratch);
+    let planned_ran_as = module_row.ran_as;
+    let (planned_runner, planned_source) = {
         let erased = blaze_own::Erased::new(frame);
-        let placed = RanAs::of(&placed_in_store_with_source(
+        let base_runner = placed_in_store_with_lock_and_source(
             &shared.store,
             graph,
+            Some(lock),
             script,
             MODE,
             crate::graph::TRIPLE,
-            script_source,
+            None,
             erased.handle(),
-        ));
+        );
+        let (runner, source_snap) = if matches!(base_runner, Runner::Native { .. }) {
+            (base_runner, None)
+        } else {
+            let (reason, fingerprint) = match classify_script_source_in_files(
+                &cx,
+                &root.read_only(),
+                &files,
+                unit.root.as_str(),
+                &io_scratch,
+            ) {
+                Ok(classified) => classified,
+                Err(why) => {
+                    return Ok(Prepared::Said {
+                        what: "a build script's source could not be read",
+                        words: said(jobs, format_args!("the build script of {} {}: {why}", unit.name.as_str(), unit.version.as_str())),
+                        hole: true,
+                    });
+                }
+            };
+            let runner = placed_in_store_with_lock_and_source(
+                &shared.store,
+                graph,
+                Some(lock),
+                script,
+                MODE,
+                crate::graph::TRIPLE,
+                reason,
+                erased.handle(),
+            );
+            (runner, Some((reason, fingerprint)))
+        };
         io_scratch.reset();
-        placed
+        if RanAs::of(&runner) != planned_ran_as {
+            return Ok(Prepared::Said {
+                what: "a build script's placement changed since planning",
+                words: said(
+                    jobs,
+                    format_args!(
+                        "the build script of {} {} was planned as {:?}, but its current source/store classifies as {:?} (rule 21)",
+                        unit.name.as_str(),
+                        unit.version.as_str(),
+                        planned_ran_as,
+                        RanAs::of(&runner),
+                    ),
+                ),
+                hole: true,
+            });
+        }
+        (runner, source_snap)
     };
+    let ran_as = planned_ran_as;
     let dep_files = &mut scripts.dep_files;
     let deps_digest = match blaze_proc_macro::script_unit::script_deps_digest_with(
         graph,
@@ -1640,7 +1747,19 @@ pub(crate) fn job<'f: 'j, 'j>(
         Ok(folded) => folded,
         Err(error) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{error}")), hole: true }),
     };
-    Ok(Prepared::Ready(ScriptJob { name: task.name, shared, script, side, cfg, files, producers: producers.into_bump_slice(), checkout: CheckoutReads::Hole, deps_digest }))
+    Ok(Prepared::Ready(ScriptJob {
+        name: task.name,
+        shared,
+        script,
+        side,
+        cfg,
+        files,
+        producers: producers.into_bump_slice(),
+        checkout: CheckoutReads::Hole,
+        deps_digest,
+        planned_runner,
+        planned_source,
+    }))
 }
 
 /// Folds the dependency build-script probe identity digest into `deps_digest` ONLY for
@@ -1780,18 +1899,34 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
         Ok(served) => served,
         Err(ran) => return ran,
     };
-    // The one choice point (D112 / D175 / Tier-2 pre-run), before anything runs: a script placed
-    // native needs the command's native setting, or fails naming why it has none.
-    let script_source = script_unit::script_source_in_tree(&tree, &root, unit.root.as_str(), alloc);
-    let runner = placed_in_store_with_source(
-        &shared.store,
-        graph,
-        job.script,
-        MODE,
-        crate::graph::TRIPLE,
-        script_source.as_ref().map(|s| s.as_str()),
-        alloc,
-    );
+    // Reuse the verified planned runner that named the `Script` and `MacroModule` tasks (Rule 21).
+    // When source classification participated in placement, re-verify the live source-tree snapshot
+    // against the planned `(reason, fingerprint)` and refuse any mid-command mutation as a hole
+    // rather than silently running Native under a Wasm key (or vice versa).
+    if let Some((planned_reason, planned_fingerprint)) = job.planned_source {
+        let mut hasher = blaze_proc_macro::module::FilesHasher::new();
+        let live_reason = match script_unit::classify_script_tree_in(&tree, &root, unit.root.as_str(), true, alloc, |rel, text| {
+            hasher.update_file(rel, text.as_bytes());
+        }) {
+            Ok(reason) => reason,
+            Err(why) => {
+                return failed(
+                    "a build script's source could not be read",
+                    format_args!("the build script of {package}: {}", why.as_str()),
+                    true,
+                );
+            }
+        };
+        let live_fingerprint = hasher.finish();
+        if live_reason != planned_reason || live_fingerprint != planned_fingerprint {
+            return failed(
+                "a build script's source changed since planning",
+                format_args!("the build script of {package} changed during the command (rule 21); refusing stale placement"),
+                true,
+            );
+        }
+    }
+    let runner = job.planned_runner;
     let ran_as = RanAs::of(&runner);
     let native = match (runner, &shared.native) {
         // No SDK: a function of the run's key, which holds "no SDK" ([`Shared::no_sdk`]), so
@@ -1851,7 +1986,18 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
     // stay a hole rather than filing a failure without `cc-probe` read dependencies.
     let failed_hole = (is_checkout && matches!(job.checkout, CheckoutReads::Kept { .. }))
         || (cfg!(target_os = "linux") && ran_as == RanAs::Wasm);
-    let ran = match script_unit::outputs_given(&shared.runtime, &setting, graph, job.script, side_cfg.as_ref().map(|atoms| atoms.as_slice()), tree, root, &given, alloc) {
+    let ran = match script_unit::outputs_given_placed(
+        &shared.runtime,
+        &setting,
+        graph,
+        job.script,
+        side_cfg.as_ref().map(|atoms| atoms.as_slice()),
+        tree,
+        root,
+        &given,
+        Some(runner),
+        alloc,
+    ) {
         Ok(ran) => ran,
         Err(error) => return failed("a build script failed", format_args!("the build script of {package} failed: {error}"), failed_hole),
     };

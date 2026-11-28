@@ -7,8 +7,9 @@ use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKin
 use edition::PackageEdition;
 
 use crate::native::{
-    Closure, NO_WASM_CLASS, NativeSourceReason, Runner, closure, placement_with_source,
-    source_requires_native,
+    Closure, NO_WASM_CLASS, NativeSourceReason, PackageSource, Runner, closure,
+    closure_with_source, placement_with_source, source_requires_native,
+    source_tree_requires_native,
 };
 use crate::toolchain::Mode;
 
@@ -326,4 +327,192 @@ fn negative_controls_stay_wasm() {
         source_requires_native(not_windows_active_on_wasi),
         Some(NativeSourceReason::HostOsStd)
     );
+
+    // 10. Unused macro_rules! definitions containing extern blocks / std::os::unix / cfg!(unix)
+    //     MUST stay Wasm (unexpanded macro bodies are not compiled code).
+    let unused_macro_rules = r#"
+        macro_rules! ffi {
+            () => {
+                use std::os::unix::io::AsRawFd;
+                extern "C" { fn f(); }
+                let _ = cfg!(unix);
+            };
+        }
+        macro_rules! ffi_parens ( () => ( extern "C" { fn g(); } ) );
+        macro_rules! ffi_brackets [ () => [ extern "C" { fn h(); } ] ];
+        fn main() {
+            println!("cargo:rerun-if-changed=build.rs");
+        }
+    "#;
+    assert_eq!(source_requires_native(unused_macro_rules), None);
+
+    // 11. Identical-on-host-and-WASI cfg! macros stay Wasm (`windows`, `not(windows)`,
+    //     `any(unix, target_os = "wasi")`, `all(windows, unix)`).
+    let identical_cfgs = r#"
+        fn main() {
+            if cfg!(windows)
+                || cfg!(not(windows))
+                || cfg!(any(unix, target_os = "wasi"))
+                || cfg!(all(windows, unix))
+                || cfg!(feature = "foo")
+                || cfg!(debug_assertions)
+            {
+                println!("ok");
+            }
+        }
+    "#;
+    assert_eq!(source_requires_native(identical_cfgs), None);
+}
+
+#[test]
+fn negated_and_diverging_cfg_macros_and_crate_level_cfg_classify_native() {
+    // Negated & host-vs-WASI diverging cfg! macros must classify Native.
+    for src in [
+        r#"fn main() { if cfg!(not(unix)) { panic!("non-unix"); } }"#,
+        r#"fn main() { if cfg!(not(target_family = "unix")) {} }"#,
+        r#"fn main() { if cfg!(target_os = "wasi") {} }"#,
+        r#"fn main() { if cfg!(not(target_os = "wasi")) {} }"#,
+        r#"fn main() { if cfg!(target_family = "wasm") {} }"#,
+        r#"fn main() { if cfg!(any(unix, windows)) {} }"#,
+        r#"fn main() { if cfg!(all(not(windows), not(unix))) {} }"#,
+        r#"fn main() { if cfg!(all(unix, feature = "extra")) {} }"#,
+    ] {
+        assert_eq!(
+            source_requires_native(src),
+            Some(NativeSourceReason::HostFamilyCfg),
+            "expected HostFamilyCfg for: {src}"
+        );
+    }
+
+    // Crate-level `#![cfg(...)]` gating the script to Unix/Linux/not-wasm must classify Native.
+    for src in [
+        "#![cfg(unix)]\nfn main() {}",
+        "#![cfg(target_os = \"linux\")]\nfn main() {}",
+        "#![cfg(not(target_family = \"wasm\"))]\nfn main() {}",
+        "#![cfg(all(unix, feature = \"foo\"))]\nfn main() {}",
+    ] {
+        assert_eq!(
+            source_requires_native(src),
+            Some(NativeSourceReason::HostFamilyCfg),
+            "expected crate-level HostFamilyCfg for: {src}"
+        );
+    }
+
+    // Crate-level `#![cfg(windows)]` is dead on both supported Unix hosts and WASI -> None.
+    assert_eq!(source_requires_native("#![cfg(windows)]\nfn main() {}"), None);
+}
+
+#[test]
+fn source_tree_inspects_submodules_path_attr_and_include_files() {
+    let alloc = Alloc::global();
+
+    let scan = |files: &[(&str, &str)]| -> Result<Option<NativeSourceReason>, &'static str> {
+        source_tree_requires_native("build.rs", alloc, |rel, _is_root, visit| {
+            if let Some((_, text)) = files.iter().find(|(p, _)| *p == rel) {
+                visit(text);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })
+    };
+
+    // 1. `mod host;` -> `host.rs` using std::os::unix
+    assert_eq!(
+        scan(&[
+            ("build.rs", "mod host;\nfn main() { host::probe(); }"),
+            ("host.rs", "pub fn probe() { use std::os::unix::io::AsRawFd; }"),
+        ]),
+        Ok(Some(NativeSourceReason::HostOsStd))
+    );
+
+    // 2. Nested `mod host;` -> `host/mod.rs` -> `mod ffi;` -> `host/ffi.rs` with extern "C"
+    assert_eq!(
+        scan(&[
+            ("build.rs", "mod host;\nfn main() {}"),
+            ("host/mod.rs", "mod ffi;"),
+            ("host/ffi.rs", "unsafe extern \"C\" { fn ioctl(); }"),
+        ]),
+        Ok(Some(NativeSourceReason::ExternC))
+    );
+
+    // 3. `#[path = "helpers/probe.rs"] mod probe;`
+    assert_eq!(
+        scan(&[
+            ("build.rs", "#[path = \"helpers/probe.rs\"] mod probe;\nfn main() {}"),
+            ("helpers/probe.rs", "pub fn f() { let _ = cfg!(not(unix)); }"),
+        ]),
+        Ok(Some(NativeSourceReason::HostFamilyCfg))
+    );
+
+    // 4. `include!("extra.rs");`
+    assert_eq!(
+        scan(&[
+            ("build.rs", "include!(\"extra.rs\");\nfn main() {}"),
+            ("extra.rs", "extern \"C\" { fn access(); }"),
+        ]),
+        Ok(Some(NativeSourceReason::ExternC))
+    );
+
+    // 5. Negative control: `#[cfg(unix)] mod unix_only;` MUST NOT be followed under WASI.
+    assert_eq!(
+        scan(&[
+            ("build.rs", "#[cfg(unix)]\nmod unix_only;\nfn main() {}"),
+            ("unix_only.rs", "use std::os::unix::io::AsRawFd;"),
+        ]),
+        Ok(None)
+    );
+
+    // 6. Negative control: cyclic include! terminates cleanly.
+    assert_eq!(
+        scan(&[
+            ("build.rs", "include!(\"a.rs\");\nfn main() {}"),
+            ("a.rs", "include!(\"build.rs\");"),
+        ]),
+        Ok(None)
+    );
+
+    // 7. Read error propagation: caller error is returned, never collapsed to Wasm.
+    let err = source_tree_requires_native("build.rs", alloc, |_rel, _is_root, _visit| -> Result<bool, &'static str> {
+        Err("corrupt pack")
+    });
+    assert_eq!(err, Err("corrupt pack"));
+}
+
+#[test]
+fn no_wasm_class_requires_crates_io_source_identity() {
+    let alloc = Alloc::global();
+    let mut units = AVec::new_in(alloc);
+    let mut app_bs = unit("app", UnitKind::BuildScript, &[1]);
+    app_bs.package = LockId(0);
+    let mut dep = unit("prost-build", UnitKind::Lib, &[]);
+    dep.package = LockId(1);
+    units.push(app_bs);
+    units.push(dep);
+    let graph = UnitGraph {
+        units,
+        resolver: Resolver::V3,
+        meta: AVec::new_in(alloc),
+        left_out: AVec::new_in(alloc),
+    };
+
+    // Local/workspace/git/alt-registry `prost-build` (`PackageSource::Other`) stays Wasm!
+    let local_closure = closure_with_source(&graph, UnitId(0), alloc, |_| PackageSource::Other);
+    assert_eq!(local_closure, Closure { runner: Runner::Wasm, no_wasm: None });
+    assert_eq!(
+        placement_with_source(local_closure, Mode::Check, "app", UnitId(0), Some("fn main() {}")),
+        Runner::Wasm
+    );
+
+    // Crates.io `prost-build` (`PackageSource::CratesIo`) is forced Native in every mode!
+    let crates_io_closure = closure_with_source(&graph, UnitId(0), alloc, |u| {
+        if u.package == LockId(1) { PackageSource::CratesIo } else { PackageSource::Other }
+    });
+    assert_eq!(crates_io_closure.no_wasm, Some(UnitId(1)));
+    for mode in [Mode::Check, Mode::Build, Mode::Run] {
+        assert_eq!(
+            placement_with_source(crates_io_closure, mode, "app", UnitId(0), Some("fn main() {}")),
+            Runner::Native { because: UnitId(1) }
+        );
+    }
 }

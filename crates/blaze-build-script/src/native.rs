@@ -11,8 +11,8 @@
 //! macOS Seatbelt profile and the Linux Landlock ruleset from one [`bstd::procs::hermetic::HermeticSpec`].
 #![blaze::sans_io]
 
-use blaze_own::{AVec, Alloc, Vec};
-use blaze_unit_graph::{UnitGraph, UnitId};
+use blaze_own::{AString, AVec, Alloc, String, Vec};
+use blaze_unit_graph::{Unit, UnitGraph, UnitId};
 
 /// The crates that make a build script start a compiler or load libclang: `cc` (a C or C++
 /// compiler and `ar`), `cmake` (cmake, then the compiler), `bindgen` and `clang-sys` (libclang
@@ -21,8 +21,9 @@ use blaze_unit_graph::{UnitGraph, UnitId};
 /// wasm runner's probe shim answers.
 pub const TOOLCHAIN_CLASS: [&str; 5] = ["bindgen", "cc", "clang-sys", "cmake", "pkg-config"];
 
-/// The crates that do not compile for `wasm32-wasip1` / `wasm64-blaze-wasip1`: a script whose
-/// dependency closure holds one has no wasm module in any mode, so it runs native in `check` too
+/// The crates.io crates that do not compile for `wasm32-wasip1` / `wasm64-blaze-wasip1`: a script
+/// whose dependency closure holds one (qualified by crates.io registry source identity via
+/// [`closure_with_source`]) has no wasm module in any mode, so it runs native in `check` too
 /// ([`crate::toolchain::placement`]). `libloading` has no `Library` on wasi; `clang-sys` needs it
 /// (its `runtime` feature, bindgen's default) or links libclang (`static`); `bindgen` holds
 /// `clang-sys`. Protobuf/gRPC codegen build-deps (`prost-build`, `protobuf-build`,
@@ -42,9 +43,19 @@ pub const NO_WASM_CLASS: [&str; 8] = [
     "tonic-prost-build",
 ];
 
+/// Source-identity class of a dependency package for [`closure_with_source`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PackageSource {
+    /// Official crates.io registry (`LockSource::is_crates_io()`).
+    CratesIo,
+    /// Workspace member, local path, git, or alternate registry package: never matched against
+    /// crates.io-specific [`NO_WASM_CLASS`] entries by bare name alone.
+    Other,
+}
+
 /// Why a build script's own Rust source text requires Tier-2 native host execution
-/// ([`source_requires_native`]). Decided deterministically before compilation or execution
-/// (rules 3 and 54).
+/// ([`source_requires_native`], [`source_tree_requires_native`]). Decided deterministically
+/// before compilation or execution (rules 3 and 54).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NativeSourceReason {
     /// Unconditional reference to host-OS-specific `std::os::{unix,linux,macos,fd}` APIs
@@ -55,8 +66,9 @@ pub enum NativeSourceReason {
     /// `extern { ... }`, or `unsafe extern ... { ... }`), not guarded by a WASI-excluding
     /// `#[cfg(...)]`.
     ExternC,
-    /// Runtime host-OS-family check (`cfg!(target_family = "unix")` or `cfg!(unix)`) that
-    /// expects the build script itself to run on a Unix host rather than WASI.
+    /// Crate-level `#![cfg(...)]` or runtime `cfg!(...)` predicate whose value diverges between
+    /// the supported Unix host and WASI (e.g. `cfg!(target_family = "unix")`, `cfg!(unix)`,
+    /// `cfg!(not(unix))`, `cfg!(target_os = "wasi")`, or crate-level `#![cfg(unix)]`).
     HostFamilyCfg,
 }
 
@@ -84,18 +96,36 @@ pub fn runner(graph: &UnitGraph<'_>, script: UnitId, alloc: Alloc<'_>) -> Runner
     closure(graph, script, alloc).runner
 }
 
-/// What `script`'s dependency closure says: native when a unit of a package named in
-/// [`TOOLCHAIN_CLASS`] or [`NO_WASM_CLASS`] is in it, else wasm; and its least
-/// [`NO_WASM_CLASS`] unit. The walk keeps its own stack (no recursion) and visits each unit once.
+/// What `script`'s dependency closure says when no lockfile source metadata is available:
+/// treats every unit as [`PackageSource::CratesIo`]. Prefer [`closure_with_source`] whenever
+/// lockfile package origins are available so local/path/git/alt-registry packages sharing a
+/// crates.io name are not misclassified.
 pub fn closure(graph: &UnitGraph<'_>, script: UnitId, alloc: Alloc<'_>) -> Closure {
+    closure_with_source(graph, script, alloc, |_| PackageSource::CratesIo)
+}
+
+/// Source-qualified version of [`closure`]: [`NO_WASM_CLASS`] matches a dependency unit ONLY when
+/// `package_source(unit.package) == PackageSource::CratesIo`, so an unrelated local workspace,
+/// path, git, or alternate-registry crate sharing a legal name such as `prost-build` or
+/// `tonic-build` is never falsely forced onto the native runner.
+///
+/// The walk keeps its own stack (no recursion) and visits each unit once.
+pub fn closure_with_source(
+    graph: &UnitGraph<'_>,
+    script: UnitId,
+    alloc: Alloc<'_>,
+    mut package_source: impl FnMut(&Unit<'_>) -> PackageSource,
+) -> Closure {
     let count = graph.units.len();
     let mut seen: AVec<'_, bool> = Vec::with_capacity_in(count, alloc);
     for _ in 0..count {
         seen.push(false);
     }
     let mut stack: AVec<'_, UnitId> = Vec::new_in(alloc);
-    for dep in graph.units[script.0 as usize].deps.iter() {
-        stack.push(dep.unit);
+    if let Some(root) = graph.units.get(script.index()) {
+        for dep in root.deps.iter() {
+            stack.push(dep.unit);
+        }
     }
     let least = |held: Option<UnitId>, at: UnitId| {
         Some(match held {
@@ -106,14 +136,16 @@ pub fn closure(graph: &UnitGraph<'_>, script: UnitId, alloc: Alloc<'_>) -> Closu
     let mut because: Option<UnitId> = None;
     let mut no_wasm: Option<UnitId> = None;
     while let Some(at) = stack.pop() {
-        let index = at.0 as usize;
-        if seen[index] {
+        let index = at.index();
+        let Some(already) = seen.get_mut(index) else { continue };
+        if *already {
             continue;
         }
-        seen[index] = true;
-        let unit = &graph.units[index];
+        *already = true;
+        let Some(unit) = graph.units.get(index) else { continue };
         let name = unit.name.as_str();
-        let cannot_be_wasm = NO_WASM_CLASS.binary_search(&name).is_ok();
+        let is_crates_io = package_source(unit) == PackageSource::CratesIo;
+        let cannot_be_wasm = is_crates_io && NO_WASM_CLASS.binary_search(&name).is_ok();
         if cannot_be_wasm {
             no_wasm = least(no_wasm, at);
         }
@@ -131,14 +163,34 @@ pub fn closure(graph: &UnitGraph<'_>, script: UnitId, alloc: Alloc<'_>) -> Closu
     Closure { runner, no_wasm }
 }
 
+/// Single source of truth for deterministic pre-run build-script placement (rule 30) given an
+/// already-computed [`NativeSourceReason`] from [`source_requires_native`] or
+/// [`source_tree_requires_native`].
+pub fn placement_with_source_reason(
+    closure: Closure,
+    mode: crate::toolchain::Mode,
+    package: &str,
+    script: UnitId,
+    source_reason: Option<NativeSourceReason>,
+) -> Runner {
+    let base = crate::toolchain::placement(closure, mode, package);
+    if matches!(base, Runner::Native { .. }) {
+        return base;
+    }
+    if source_reason.is_some() {
+        return Runner::Native { because: script };
+    }
+    base
+}
+
 /// Single source of truth for deterministic pre-run build-script placement (rule 30): combines
 /// closure-based placement ([`crate::toolchain::placement`]) with static inspection of the build
 /// script's own Rust source ([`source_requires_native`]).
 ///
 /// When `source` is `Some(src)` and [`source_requires_native`] detects an unguarded host-OS API,
-/// `extern "..." { ... }` block, or Unix host-family `cfg!(...)`, places the script on
-/// [`Runner::Native`] (`because: script`) in every mode before any compilation or execution
-/// begins (rules 3 and 54).
+/// `extern "..." { ... }` block, crate-level `#![cfg(...)]`, or host-vs-WASI diverging
+/// `cfg!(...)`, places the script on [`Runner::Native`] (`because: script`) in every mode before
+/// any compilation or execution begins (rules 3 and 54).
 pub fn placement_with_source(
     closure: Closure,
     mode: crate::toolchain::Mode,
@@ -146,24 +198,180 @@ pub fn placement_with_source(
     script: UnitId,
     source: Option<&str>,
 ) -> Runner {
-    let base = crate::toolchain::placement(closure, mode, package);
-    if matches!(base, Runner::Native { .. }) {
-        return base;
-    }
-    if let Some(src) = source
-        && source_requires_native(src).is_some()
-    {
-        return Runner::Native { because: script };
-    }
-    base
+    placement_with_source_reason(closure, mode, package, script, source.and_then(source_requires_native))
 }
 
-/// Inspects a build script's Rust source text (zero allocations, sans-IO, exact Rust lexical
-/// scanning) and returns `Some(reason)` when the source unconditionally requires Tier-2 native
-/// host execution rather than `wasm32-wasip1` / `wasm64-blaze-wasip1`.
+/// Maximum number of distinct files inspected by [`source_tree_requires_native`] for one build
+/// script (cycle and pathological fan-out bound, rule 18).
+const MAX_SCRIPT_FILES: usize = 256;
+
+/// Inspects a build script's root file and every active submodule (`mod foo;`,
+/// `#[path = "..."] mod foo;`) and static `include!("...")` file reachable from it, using
+/// `read_file` to load each package-relative path.
+///
+/// `read_file(rel, is_root, visit)` calls `visit(source_text)` and returns `Ok(true)` when the
+/// file exists, `Ok(false)` when absent (used to probe `foo.rs` before `foo/mod.rs`), or `Err(e)`
+/// on any read/decode failure (which is propagated immediately rather than assuming Wasm).
+pub fn source_tree_requires_native<E, F>(
+    root_rel: &str,
+    alloc: Alloc<'_>,
+    mut read_file: F,
+) -> Result<Option<NativeSourceReason>, E>
+where
+    F: FnMut(&str, bool, &mut dyn FnMut(&str)) -> Result<bool, E>,
+{
+    enum Pending<'a> {
+        Root(AString<'a>),
+        Exact(AString<'a>),
+        Module { primary: AString<'a>, fallback: AString<'a> },
+    }
+
+    let Some(norm_root) = normalize_rel_path("", root_rel, alloc) else {
+        return Ok(None);
+    };
+
+    let mut visited: AVec<'_, AString<'_>> = Vec::new_in(alloc);
+    let mut queue: AVec<'_, Pending<'_>> = Vec::new_in(alloc);
+    queue.push(Pending::Root(norm_root));
+
+    let mut head: usize = 0;
+    while let Some(item) = queue.get(head) {
+        head += 1;
+        if visited.len() >= MAX_SCRIPT_FILES {
+            break;
+        }
+        let (is_root, primary_str, fallback_str) = match item {
+            Pending::Root(p) => (true, p.as_str(), None),
+            Pending::Exact(p) => (false, p.as_str(), None),
+            Pending::Module { primary, fallback } => (false, primary.as_str(), Some(fallback.as_str())),
+        };
+
+        let p_copy = String::from_str_in(primary_str, alloc);
+        let fb_copy = fallback_str.map(|fb| String::from_str_in(fb, alloc));
+
+        let mut scanned_ok = false;
+        let mut discovered: AVec<'_, ChildRef<'_>> = Vec::new_in(alloc);
+        let mut reason_hit: Option<NativeSourceReason> = None;
+
+        if !visited.iter().any(|seen| seen.as_str() == p_copy.as_str()) {
+            let existed = read_file(p_copy.as_str(), is_root, &mut |text| {
+                reason_hit = scan_source(text, is_root, p_copy.as_str(), Some(&mut discovered), alloc);
+            })?;
+            if existed {
+                scanned_ok = true;
+                visited.push(p_copy);
+            }
+        } else {
+            scanned_ok = true;
+        }
+
+        if let Some(reason) = reason_hit {
+            return Ok(Some(reason));
+        }
+
+        if !scanned_ok
+            && let Some(fb) = fb_copy
+            && !visited.iter().any(|seen| seen.as_str() == fb.as_str())
+        {
+            let existed = read_file(fb.as_str(), false, &mut |text| {
+                reason_hit = scan_source(text, false, fb.as_str(), Some(&mut discovered), alloc);
+            })?;
+            if existed {
+                visited.push(fb);
+            }
+            if let Some(reason) = reason_hit {
+                return Ok(Some(reason));
+            }
+        }
+
+        for child in discovered {
+            if visited.len() + queue.len().saturating_sub(head) >= MAX_SCRIPT_FILES * 2 {
+                break;
+            }
+            match child {
+                ChildRef::Exact(path) => queue.push(Pending::Exact(path)),
+                ChildRef::Module { primary, fallback } => queue.push(Pending::Module { primary, fallback }),
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Inspects a single build script's Rust source text (zero allocations, sans-IO, exact Rust
+/// lexical scanning) and returns `Some(reason)` when the source unconditionally requires Tier-2
+/// native host execution rather than `wasm32-wasip1` / `wasm64-blaze-wasip1`.
 pub fn source_requires_native(source: &str) -> Option<NativeSourceReason> {
+    scan_source_no_alloc(source)
+}
+
+enum ChildRef<'a> {
+    Exact(AString<'a>),
+    Module { primary: AString<'a>, fallback: AString<'a> },
+}
+
+fn dir_of(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some((dir, _)) => dir,
+        None => "",
+    }
+}
+
+fn normalize_rel_path<'a>(base_dir: &str, rel: &str, alloc: Alloc<'a>) -> Option<AString<'a>> {
+    if rel.is_empty() || rel.starts_with('/') {
+        return None;
+    }
+    let mut segs: AVec<'_, &str> = Vec::new_in(alloc);
+    for seg in base_dir.split('/') {
+        if !seg.is_empty() && seg != "." {
+            segs.push(seg);
+        }
+    }
+    for seg in rel.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop()?;
+            }
+            part => segs.push(part),
+        }
+    }
+    if segs.is_empty() {
+        return None;
+    }
+    let mut out = String::new_in(alloc);
+    for (idx, seg) in segs.iter().enumerate() {
+        if idx > 0 {
+            out.push('/');
+        }
+        out.push_str(seg);
+    }
+    Some(out)
+}
+
+fn scan_source_no_alloc(source: &str) -> Option<NativeSourceReason> {
+    scan_source_core(source, true, "", None)
+}
+
+fn scan_source<'a>(
+    source: &str,
+    is_root: bool,
+    current_rel: &str,
+    children: Option<&mut AVec<'a, ChildRef<'a>>>,
+    alloc: Alloc<'a>,
+) -> Option<NativeSourceReason> {
+    scan_source_core(source, is_root, current_rel, children.map(|out| (out, alloc)))
+}
+
+fn scan_source_core<'a>(
+    source: &str,
+    is_root: bool,
+    current_rel: &str,
+    mut child_sink: Option<(&mut AVec<'a, ChildRef<'a>>, Alloc<'a>)>,
+) -> Option<NativeSourceReason> {
     let mut lex = Lexer::new(source);
     let mut brace_stack = [false; 64];
+    let mut mod_stack: [Option<&str>; 64] = [None; 64];
     let mut brace_len: usize = 0;
     let mut brace_overflow: usize = 0;
     let mut excluded_depth: usize = 0;
@@ -171,6 +379,9 @@ pub fn source_requires_native(source: &str) -> Option<NativeSourceReason> {
     let mut pending_excluded = false;
     let mut pending_depth: usize = 0;
     let mut stmt_needs_semi = false;
+    let mut pending_path_attr: Option<&str> = None;
+    let mut pending_path_depth: usize = 0;
+    let mut pending_inline_mod: Option<&str> = None;
     let mut prev: Option<Token<'_>> = None;
     let mut prev_prev: Option<Token<'_>> = None;
 
@@ -197,27 +408,69 @@ pub fn source_requires_native(source: &str) -> Option<NativeSourceReason> {
                 }
             };
             lex = look;
-            let cfg_excluded = parse_attr_and_check_wasi_excluded(&mut lex);
-            if cfg_excluded {
+            let attr = parse_attr(&mut lex);
+            if let Some(cfg) = attr.cfg {
                 if inner {
                     if brace_depth == 0 {
-                        return None;
-                    }
-                    if brace_overflow == 0
+                        // Crate-level `#![cfg(...)]`: if false on WASI but not known-false on
+                        // Unix host (e.g. `#![cfg(unix)]`, `#![cfg(target_os = "linux")]`,
+                        // `#![cfg(not(target_family = "wasm"))]`), compiling on WASI strips
+                        // `main()` and fails -> must run native! If false on BOTH host and WASI
+                        // (e.g. `#![cfg(windows)]`), the crate is inactive on both -> None.
+                        if cfg.wasi == TriBool::False {
+                            return if cfg.host != TriBool::False {
+                                Some(NativeSourceReason::HostFamilyCfg)
+                            } else {
+                                None
+                            };
+                        }
+                    } else if cfg.wasi == TriBool::False
+                        && brace_overflow == 0
                         && let Some(slot) = brace_len.checked_sub(1).and_then(|idx| brace_stack.get_mut(idx))
                         && !*slot
                     {
                         *slot = true;
                         excluded_depth += 1;
                     }
-                } else if excluded_depth == 0 {
+                } else if cfg.wasi == TriBool::False && excluded_depth == 0 {
                     pending_excluded = true;
                     pending_depth = brace_depth;
                 }
             }
+            if !inner && let Some(path_val) = attr.path {
+                pending_path_attr = Some(path_val);
+                pending_path_depth = brace_depth;
+            }
             prev_prev = prev;
             prev = Some(Token::RBracket);
             continue;
+        }
+
+        // Skip unexpanded `macro_rules! name { ... }` / `(...)` / `[...]` token trees completely
+        // so tokens inside macro definitions are never misclassified as compiled code.
+        if tok == Token::Ident("macro_rules") {
+            let mut look = lex;
+            if look.next_token() == Some(Token::Bang)
+                && matches!(look.next_token(), Some(Token::Ident(_)))
+                && let Some(open) = look.next_token()
+                && let Some(close) = closing_delim(open)
+            {
+                skip_delimited(&mut look, open, close);
+                if open != Token::LBrace {
+                    let mut after = look;
+                    if after.next_token() == Some(Token::Semi) {
+                        look = after;
+                    }
+                }
+                lex = look;
+                if pending_excluded && brace_depth == pending_depth && !stmt_needs_semi {
+                    pending_excluded = false;
+                }
+                pending_path_attr = None;
+                prev_prev = prev;
+                prev = Some(close);
+                continue;
+            }
         }
 
         let is_excluded = excluded_depth > 0 || pending_excluded;
@@ -249,12 +502,19 @@ pub fn source_requires_native(source: &str) -> Option<NativeSourceReason> {
                 let this_excluded = pending_excluded && brace_depth == pending_depth;
                 if let Some(slot) = brace_stack.get_mut(brace_len) {
                     *slot = this_excluded;
+                    if let Some(mod_slot) = mod_stack.get_mut(brace_len) {
+                        *mod_slot = pending_inline_mod.take();
+                    }
                     brace_len += 1;
                 } else {
+                    pending_inline_mod = None;
                     brace_overflow += 1;
                 }
                 if this_excluded {
                     excluded_depth += 1;
+                }
+                if pending_path_depth == brace_depth {
+                    pending_path_attr = None;
                 }
             }
             Token::RBrace => {
@@ -264,6 +524,9 @@ pub fn source_requires_native(source: &str) -> Option<NativeSourceReason> {
                     brace_len = new_len;
                     if brace_stack.get(brace_len).copied().unwrap_or(false) {
                         excluded_depth = excluded_depth.saturating_sub(1);
+                    }
+                    if let Some(mod_slot) = mod_stack.get_mut(brace_len) {
+                        *mod_slot = None;
                     }
                 }
                 let new_depth = brace_len + brace_overflow;
@@ -278,6 +541,15 @@ pub fn source_requires_native(source: &str) -> Option<NativeSourceReason> {
                         }
                     }
                 }
+                if new_depth <= pending_path_depth {
+                    pending_path_attr = None;
+                }
+            }
+            Token::Semi => {
+                if brace_depth == pending_path_depth {
+                    pending_path_attr = None;
+                }
+                pending_inline_mod = None;
             }
             _ => {}
         }
@@ -318,8 +590,59 @@ pub fn source_requires_native(source: &str) -> Option<NativeSourceReason> {
                         && let Some(close) = closing_delim(open)
                     {
                         let mut body = look;
-                        if cfg_macro_requires_unix_family(&mut body, 0) {
+                        let ev = eval_cfg_pair(&mut body, 0);
+                        if ev.diverges_host_vs_wasi() {
                             return Some(NativeSourceReason::HostFamilyCfg);
+                        }
+                        skip_delimited(&mut look, open, close);
+                        lex = look;
+                        prev_prev = prev;
+                        prev = Some(close);
+                        continue;
+                    }
+                }
+                Token::Ident("mod") => {
+                    let mut look = lex;
+                    if let Some(Token::Ident(mod_name)) = look.next_token() {
+                        let attr_path = if pending_path_depth == brace_depth {
+                            pending_path_attr.take()
+                        } else {
+                            None
+                        };
+                        match look.next_token() {
+                            Some(Token::Semi) => {
+                                if let Some((ref mut out, alloc)) = child_sink {
+                                    push_external_mod_ref(
+                                        out,
+                                        is_root,
+                                        current_rel,
+                                        mod_stack.get(..brace_len).unwrap_or(&[]),
+                                        mod_name,
+                                        attr_path,
+                                        alloc,
+                                    );
+                                }
+                            }
+                            Some(Token::LBrace) => {
+                                pending_inline_mod = Some(attr_path.unwrap_or(mod_name));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Token::Ident("include") => {
+                    let mut look = lex;
+                    if look.next_token() == Some(Token::Bang)
+                        && let Some(open) = look.next_token()
+                        && let Some(close) = closing_delim(open)
+                    {
+                        let mut body = look;
+                        if let Some(Token::Str(inc_path)) = body.next_token()
+                            && body.next_token() == Some(close)
+                            && let Some((ref mut out, alloc)) = child_sink
+                            && let Some(resolved) = normalize_rel_path(dir_of(current_rel), inc_path, alloc)
+                        {
+                            out.push(ChildRef::Exact(resolved));
                         }
                         skip_delimited(&mut look, open, close);
                         lex = look;
@@ -330,6 +653,13 @@ pub fn source_requires_native(source: &str) -> Option<NativeSourceReason> {
                 }
                 _ => {}
             }
+        } else if tok == Token::Ident("mod") {
+            let mut look = lex;
+            if let Some(Token::Ident(mod_name)) = look.next_token()
+                && look.next_token() == Some(Token::LBrace)
+            {
+                pending_inline_mod = Some(mod_name);
+            }
         }
 
         prev_prev = prev;
@@ -337,6 +667,55 @@ pub fn source_requires_native(source: &str) -> Option<NativeSourceReason> {
     }
 
     None
+}
+
+fn push_external_mod_ref<'a>(
+    out: &mut AVec<'a, ChildRef<'a>>,
+    is_root: bool,
+    current_rel: &str,
+    inline_mods: &[Option<&str>],
+    mod_name: &str,
+    path_attr: Option<&str>,
+    alloc: Alloc<'a>,
+) {
+    // Base directory for child modules following Rust's standard module-file rules:
+    // crate root (`build.rs`, `build/main.rs`) and `mod.rs` resolve relative to their directory;
+    // any other module file (`foo.rs`) resolves relative to `foo/`.
+    let file_base = if is_root || current_rel == "mod.rs" || current_rel.ends_with("/mod.rs") {
+        dir_of(current_rel)
+    } else {
+        current_rel.strip_suffix(".rs").unwrap_or(current_rel)
+    };
+    let mut base = String::from_str_in(file_base, alloc);
+    for seg in inline_mods.iter().flatten() {
+        if !base.is_empty() {
+            base.push('/');
+        }
+        base.push_str(seg);
+    }
+    if let Some(explicit) = path_attr {
+        let explicit_base = if inline_mods.iter().any(|m| m.is_some()) {
+            base.as_str()
+        } else {
+            dir_of(current_rel)
+        };
+        if let Some(resolved) = normalize_rel_path(explicit_base, explicit, alloc) {
+            out.push(ChildRef::Exact(resolved));
+        }
+        return;
+    }
+    let mut primary_rel = String::with_capacity_in(mod_name.len() + 3, alloc);
+    primary_rel.push_str(mod_name);
+    primary_rel.push_str(".rs");
+    let mut fallback_rel = String::with_capacity_in(mod_name.len() + 7, alloc);
+    fallback_rel.push_str(mod_name);
+    fallback_rel.push_str("/mod.rs");
+    if let (Some(primary), Some(fallback)) = (
+        normalize_rel_path(base.as_str(), primary_rel.as_str(), alloc),
+        normalize_rel_path(base.as_str(), fallback_rel.as_str(), alloc),
+    ) {
+        out.push(ChildRef::Module { primary, fallback });
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -457,7 +836,6 @@ impl<'a> Lexer<'a> {
     }
 
     fn scan_quoted_string(&mut self) -> &'a str {
-        // Opening `"` already verified at `self.at`.
         self.at += 1;
         let start = self.at;
         let mut end = self.at;
@@ -479,10 +857,8 @@ impl<'a> Lexer<'a> {
     }
 
     fn scan_char_or_lifetime(&mut self) {
-        // Opening `'` at `self.at`.
         self.at += 1;
         if self.peek_byte(0) == Some(b'\\') {
-            // Escaped char literal: `'\\`, `'\''`, `'\n'`, `'\u{...}'`, etc.
             self.at += 1;
             if self.peek_byte(0).is_some() {
                 self.at += 1;
@@ -498,11 +874,9 @@ impl<'a> Lexer<'a> {
         if let Some(ch) = self.rest().chars().next() {
             let after = ch.len_utf8();
             if self.peek_byte(after) == Some(b'\'') {
-                // Single-char literal `'x'`.
                 self.at += after + 1;
                 return;
             }
-            // Lifetime `'a`, `'static`, `'_`, `'r#foo`.
             if ch == 'r' && self.peek_byte(1) == Some(b'#') {
                 self.at += 2;
             }
@@ -511,7 +885,6 @@ impl<'a> Lexer<'a> {
     }
 
     fn scan_byte_char_literal(&mut self) {
-        // `b'` at `self.at`.
         self.at += 2;
         while let Some(b) = self.peek_byte(0) {
             if b == b'\\' {
@@ -559,7 +932,6 @@ impl<'a> Lexer<'a> {
                     return Some(Token::RawStr);
                 }
                 if self.peek_byte(1) == Some(b'#') {
-                    // Raw identifier `r#ident`: never treated as a keyword (`r#extern` != `extern`).
                     self.at += 2;
                     self.skip_ident_tail();
                     return Some(Token::Other);
@@ -758,8 +1130,7 @@ fn brace_group_mentions_host_os(lex: &mut Lexer<'_>) -> bool {
     false
 }
 
-/// 3-valued truth value of a `#[cfg(...)]` predicate evaluated on a WASI target
-/// (`target_family = "wasm"`, `target_os = "wasi"`).
+/// 3-valued truth value of a `cfg` predicate on a target class.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TriBool {
     True,
@@ -767,44 +1138,111 @@ enum TriBool {
     Unknown,
 }
 
-/// Consumes the body of an attribute `[...]` (starting immediately after `[`) and returns `true`
-/// if it is `cfg(...)` that evaluates to `TriBool::False` on WASI.
-fn parse_attr_and_check_wasi_excluded(lex: &mut Lexer<'_>) -> bool {
-    let mut look = *lex;
-    let excluded = if look.next_token() == Some(Token::Ident("cfg")) && look.next_token() == Some(Token::LParen) {
-        eval_cfg_wasi(&mut look, 0) == TriBool::False
-    } else {
-        false
-    };
-    skip_delimited(lex, Token::LBracket, Token::RBracket);
-    excluded
+impl TriBool {
+    fn not(self) -> Self {
+        match self {
+            TriBool::True => TriBool::False,
+            TriBool::False => TriBool::True,
+            TriBool::Unknown => TriBool::Unknown,
+        }
+    }
+
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (TriBool::False, _) | (_, TriBool::False) => TriBool::False,
+            (TriBool::True, TriBool::True) => TriBool::True,
+            _ => TriBool::Unknown,
+        }
+    }
+
+    fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (TriBool::True, _) | (_, TriBool::True) => TriBool::True,
+            (TriBool::False, TriBool::False) => TriBool::False,
+            _ => TriBool::Unknown,
+        }
+    }
 }
 
-fn eval_cfg_wasi(lex: &mut Lexer<'_>, depth: usize) -> TriBool {
-    if depth > 16 {
-        return TriBool::Unknown;
+/// Simultaneous evaluation of a `cfg` predicate on supported Unix hosts (`unix = true`,
+/// `windows = false`, `target_family = "unix"`, `target_os != "wasi"`) and on WASI
+/// (`unix = false`, `windows = false`, `target_family = "wasm"`, `target_os = "wasi"`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CfgEval {
+    host: TriBool,
+    wasi: TriBool,
+    /// True when the predicate depends on a host-vs-WASI family/OS distinction (`unix`,
+    /// `target_family = "unix"`, `target_family = "wasm"`, `target_os = "wasi"`,
+    /// `target_arch = "wasm32" | "wasm64"`) that is not short-circuited to the same truth value
+    /// on both targets.
+    ///
+    /// Deliberately `false` for `target_os = "linux"` / `"macos"`, which pure-Rust Wasm scripts
+    /// (`anyhow`, `proc-macro2`, `thiserror`) use for best-effort host cleanup quirks and evaluate
+    /// safely under WASI.
+    family_div: bool,
+}
+
+impl CfgEval {
+    const UNKNOWN: Self = Self { host: TriBool::Unknown, wasi: TriBool::Unknown, family_div: false };
+
+    fn diverges_host_vs_wasi(self) -> bool {
+        self.family_div
+            || matches!(
+                (self.host, self.wasi),
+                (TriBool::True, TriBool::False) | (TriBool::False, TriBool::True)
+            )
     }
-    let Some(tok) = lex.next_token() else { return TriBool::Unknown };
-    let Token::Ident(name) = tok else { return TriBool::Unknown };
+}
+
+struct ParsedAttr<'a> {
+    cfg: Option<CfgEval>,
+    path: Option<&'a str>,
+}
+
+/// Consumes the body of an attribute `[...]` (starting immediately after `[`) and extracts any
+/// `cfg(...)` evaluation or `path = "..."` value.
+fn parse_attr<'a>(lex: &mut Lexer<'a>) -> ParsedAttr<'a> {
+    let mut look = *lex;
+    let mut out = ParsedAttr { cfg: None, path: None };
+    match look.next_token() {
+        Some(Token::Ident("cfg")) if look.next_token() == Some(Token::LParen) => {
+            out.cfg = Some(eval_cfg_pair(&mut look, 0));
+        }
+        Some(Token::Ident("path")) if look.next_token() == Some(Token::Eq) => {
+            if let Some(Token::Str(val)) = look.next_token() {
+                out.path = Some(val);
+            }
+        }
+        _ => {}
+    }
+    skip_delimited(lex, Token::LBracket, Token::RBracket);
+    out
+}
+
+fn eval_cfg_pair(lex: &mut Lexer<'_>, depth: usize) -> CfgEval {
+    if depth > 16 {
+        return CfgEval::UNKNOWN;
+    }
+    let Some(Token::Ident(name)) = lex.next_token() else { return CfgEval::UNKNOWN };
     let mut look = *lex;
     match look.next_token() {
         Some(Token::LParen) => {
             *lex = look;
             match name {
                 "all" => {
-                    let mut acc = TriBool::True;
+                    let mut host = TriBool::True;
+                    let mut wasi = TriBool::True;
+                    let mut any_div = false;
                     loop {
                         let mut peek = *lex;
                         if matches!(peek.next_token(), None | Some(Token::RParen)) {
                             *lex = peek;
                             break;
                         }
-                        let sub = eval_cfg_wasi(lex, depth + 1);
-                        acc = match (acc, sub) {
-                            (TriBool::False, _) | (_, TriBool::False) => TriBool::False,
-                            (TriBool::True, TriBool::True) => TriBool::True,
-                            _ => TriBool::Unknown,
-                        };
+                        let sub = eval_cfg_pair(lex, depth + 1);
+                        host = host.and(sub.host);
+                        wasi = wasi.and(sub.wasi);
+                        any_div |= sub.family_div;
                         let mut after = *lex;
                         match after.next_token() {
                             Some(Token::Comma) => *lex = after,
@@ -818,22 +1256,26 @@ fn eval_cfg_wasi(lex: &mut Lexer<'_>, depth: usize) -> TriBool {
                             }
                         }
                     }
-                    acc
+                    let same_known = matches!(
+                        (host, wasi),
+                        (TriBool::False, TriBool::False) | (TriBool::True, TriBool::True)
+                    );
+                    CfgEval { host, wasi, family_div: !same_known && any_div }
                 }
                 "any" => {
-                    let mut acc = TriBool::False;
+                    let mut host = TriBool::False;
+                    let mut wasi = TriBool::False;
+                    let mut any_div = false;
                     loop {
                         let mut peek = *lex;
                         if matches!(peek.next_token(), None | Some(Token::RParen)) {
                             *lex = peek;
                             break;
                         }
-                        let sub = eval_cfg_wasi(lex, depth + 1);
-                        acc = match (acc, sub) {
-                            (TriBool::True, _) | (_, TriBool::True) => TriBool::True,
-                            (TriBool::False, TriBool::False) => TriBool::False,
-                            _ => TriBool::Unknown,
-                        };
+                        let sub = eval_cfg_pair(lex, depth + 1);
+                        host = host.or(sub.host);
+                        wasi = wasi.or(sub.wasi);
+                        any_div |= sub.family_div;
                         let mut after = *lex;
                         match after.next_token() {
                             Some(Token::Comma) => *lex = after,
@@ -847,141 +1289,66 @@ fn eval_cfg_wasi(lex: &mut Lexer<'_>, depth: usize) -> TriBool {
                             }
                         }
                     }
-                    acc
+                    let same_known = matches!(
+                        (host, wasi),
+                        (TriBool::True, TriBool::True) | (TriBool::False, TriBool::False)
+                    );
+                    CfgEval { host, wasi, family_div: !same_known && any_div }
                 }
                 "not" => {
-                    let sub = eval_cfg_wasi(lex, depth + 1);
+                    let sub = eval_cfg_pair(lex, depth + 1);
                     let mut after = *lex;
                     if after.next_token() == Some(Token::RParen) {
                         *lex = after;
                     } else {
                         skip_delimited(lex, Token::LParen, Token::RParen);
                     }
-                    match sub {
-                        TriBool::True => TriBool::False,
-                        TriBool::False => TriBool::True,
-                        TriBool::Unknown => TriBool::Unknown,
-                    }
+                    CfgEval { host: sub.host.not(), wasi: sub.wasi.not(), family_div: sub.family_div }
                 }
                 _ => {
                     skip_delimited(lex, Token::LParen, Token::RParen);
-                    TriBool::Unknown
+                    CfgEval::UNKNOWN
                 }
             }
         }
         Some(Token::Eq) => {
             *lex = look;
-            let val = match lex.next_token() {
-                Some(Token::Str(s)) => s,
-                _ => return TriBool::Unknown,
-            };
+            let Some(Token::Str(val)) = lex.next_token() else { return CfgEval::UNKNOWN };
             match (name, val) {
-                ("target_family", "wasm") => TriBool::True,
-                ("target_family", _) => TriBool::False,
-                ("target_os", "wasi") => TriBool::True,
-                ("target_os", _) => TriBool::False,
-                ("target_arch", "wasm32" | "wasm64") => TriBool::Unknown,
-                ("target_arch", _) => TriBool::False,
-                ("target_env", "gnu" | "msvc" | "musl" | "sgx" | "ohos") => TriBool::False,
-                _ => TriBool::Unknown,
+                ("target_family", "unix") => {
+                    CfgEval { host: TriBool::True, wasi: TriBool::False, family_div: true }
+                }
+                ("target_family", "wasm") => {
+                    CfgEval { host: TriBool::False, wasi: TriBool::True, family_div: true }
+                }
+                ("target_family", _) => {
+                    CfgEval { host: TriBool::False, wasi: TriBool::False, family_div: false }
+                }
+                ("target_os", "wasi") => {
+                    CfgEval { host: TriBool::False, wasi: TriBool::True, family_div: true }
+                }
+                ("target_os", "windows") => {
+                    CfgEval { host: TriBool::False, wasi: TriBool::False, family_div: false }
+                }
+                ("target_os", _) => {
+                    CfgEval { host: TriBool::Unknown, wasi: TriBool::False, family_div: false }
+                }
+                ("target_arch", "wasm32" | "wasm64") => {
+                    CfgEval { host: TriBool::False, wasi: TriBool::Unknown, family_div: true }
+                }
+                ("target_arch", _) => {
+                    CfgEval { host: TriBool::Unknown, wasi: TriBool::False, family_div: false }
+                }
+                ("target_env", "gnu" | "msvc" | "musl" | "sgx" | "ohos") => {
+                    CfgEval { host: TriBool::Unknown, wasi: TriBool::False, family_div: false }
+                }
+                _ => CfgEval::UNKNOWN,
             }
         }
         _ => match name {
-            "unix" | "windows" => TriBool::False,
-            _ => TriBool::Unknown,
+            "unix" => CfgEval { host: TriBool::True, wasi: TriBool::False, family_div: true },
+            "windows" => CfgEval { host: TriBool::False, wasi: TriBool::False, family_div: false },
+            _ => CfgEval::UNKNOWN,
         },
-    }
-}
-
-/// Returns `true` when a runtime `cfg!(...)` predicate checks specifically for a Unix host family
-/// (`cfg!(target_family = "unix")` or `cfg!(unix)`), without matching WASI/Wasm.
-///
-/// Deliberately does NOT match `cfg!(target_os = "linux")` / `cfg!(target_os = "macos")` /
-/// `cfg!(windows)`, which pure-Rust Wasm scripts (`anyhow`, `proc-macro2`, `thiserror`) use for
-/// best-effort host quirks (e.g. Linux `ENOTEMPTY` cleanup) and work cleanly under WASI.
-fn cfg_macro_requires_unix_family(lex: &mut Lexer<'_>, depth: usize) -> bool {
-    if depth > 16 {
-        return false;
-    }
-    let Some(Token::Ident(name)) = lex.next_token() else { return false };
-    let mut look = *lex;
-    match look.next_token() {
-        Some(Token::LParen) => {
-            *lex = look;
-            match name {
-                "all" => {
-                    let mut saw_unix = false;
-                    let mut saw_wasi = false;
-                    loop {
-                        let mut peek = *lex;
-                        if matches!(peek.next_token(), None | Some(Token::RParen)) {
-                            *lex = peek;
-                            break;
-                        }
-                        let mut eval_copy = *lex;
-                        if eval_cfg_wasi(&mut eval_copy, depth + 1) == TriBool::True {
-                            saw_wasi = true;
-                        }
-                        if cfg_macro_requires_unix_family(lex, depth + 1) {
-                            saw_unix = true;
-                        }
-                        let mut after = *lex;
-                        match after.next_token() {
-                            Some(Token::Comma) => *lex = after,
-                            Some(Token::RParen) | None => {
-                                *lex = after;
-                                break;
-                            }
-                            _ => {
-                                skip_delimited(lex, Token::LParen, Token::RParen);
-                                break;
-                            }
-                        }
-                    }
-                    saw_unix && !saw_wasi
-                }
-                "any" => {
-                    let mut saw_unix = false;
-                    let mut handles_wasi = false;
-                    loop {
-                        let mut peek = *lex;
-                        if matches!(peek.next_token(), None | Some(Token::RParen)) {
-                            *lex = peek;
-                            break;
-                        }
-                        let mut eval_copy = *lex;
-                        if eval_cfg_wasi(&mut eval_copy, depth + 1) == TriBool::True {
-                            handles_wasi = true;
-                        }
-                        if cfg_macro_requires_unix_family(lex, depth + 1) {
-                            saw_unix = true;
-                        }
-                        let mut after = *lex;
-                        match after.next_token() {
-                            Some(Token::Comma) => *lex = after,
-                            Some(Token::RParen) | None => {
-                                *lex = after;
-                                break;
-                            }
-                            _ => {
-                                skip_delimited(lex, Token::LParen, Token::RParen);
-                                break;
-                            }
-                        }
-                    }
-                    saw_unix && !handles_wasi
-                }
-                _ => {
-                    skip_delimited(lex, Token::LParen, Token::RParen);
-                    false
-                }
-            }
-        }
-        Some(Token::Eq) => {
-            *lex = look;
-            let Some(Token::Str(val)) = lex.next_token() else { return false };
-            name == "target_family" && val == "unix"
-        }
-        _ => name == "unix",
     }
 }
