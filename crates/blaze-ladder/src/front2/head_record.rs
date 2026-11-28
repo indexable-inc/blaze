@@ -207,7 +207,8 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// 44: `FnQualifiers` bit 7 carries `#[rustc_deprecated_safe_2024]` (`TypeAttrs::DEPRECATED_SAFE_2024`).
 /// 45: `TraitHead::self_outlives_params` and `HeadRef::Trait::super_lifetimes` carry parameterized
 /// `Self: 'a` and supertrait lifetime edges for RFC 1156 default trait object lifetimes.
-pub const VERSION: u32 = 45;
+/// 46: `AdtRow` carries `handle` (`#[blaze::handle]`, two-tier sans-IO firewall) after `capability`.
+pub const VERSION: u32 = 46;
 /// The digest domains: the record's out digest, a fn text's check, the regions digest.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -1402,6 +1403,7 @@ fn encode_into_scratch<'b>(
             })?;
             o.flag(row.args);
             o.flag(row.capability);
+            o.flag(row.handle);
             o.flag(row.sans_io);
             o.coherence_marks(row.marks);
             o.u32(row.lifetimes);
@@ -3630,6 +3632,7 @@ impl<'r> In<'r, '_, '_, '_> {
         };
         let args = self.flag("an ADT's `#[blaze::args]` mark")?;
         let capability = self.flag("an ADT's `#[blaze::capability]` mark")?;
+        let handle = self.flag("an ADT's `#[blaze::handle]` mark")?;
         let sans_io = self.flag("an ADT's `#![blaze::sans_io]` scope mark")?;
         let marks = self.coherence_marks()?;
         let lifetimes = self.u32("an ADT's declared lifetime arity")?;
@@ -3670,7 +3673,7 @@ impl<'r> In<'r, '_, '_, '_> {
         })?;
         let fieldless = self.opt("a fieldless enum's variant count", |r| r.u32("a fieldless enum's variant count"))?;
         let field_regions = super::borrows::FieldRegions::new(field_region_at, field_region_list, self.alloc);
-        let row = AdtRow { kind, generics, variants, fields, field_vis, repr, valid, discrs, args, capability, sans_io, marks, lifetimes, field_regions };
+        let row = AdtRow { kind, generics, variants, fields, field_vis, repr, valid, discrs, args, capability, handle, sans_io, marks, lifetimes, field_regions };
         if row.field_vis.len() != row.fields.len() {
             return Err(E::Shape { what: "an ADT's field visibilities are not one per field" });
         }
@@ -4044,6 +4047,7 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(r1.repr == r2.repr && r1.valid == r2.valid, "an ADT's repr");
             need!(r1.args == r2.args, "an ADT's `#[blaze::args]` mark");
             need!(r1.capability == r2.capability, "an ADT's `#[blaze::capability]` mark");
+            need!(r1.handle == r2.handle, "an ADT's `#[blaze::handle]` mark");
             need!(r1.sans_io == r2.sans_io, "an ADT's `#![blaze::sans_io]` scope mark");
             need!(r1.marks == r2.marks, "an ADT's coherence marks");
             need!(r1.lifetimes == r2.lifetimes, "an ADT's declared lifetime arity");

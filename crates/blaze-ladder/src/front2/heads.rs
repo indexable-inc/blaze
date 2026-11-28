@@ -1135,6 +1135,10 @@ pub struct AdtRow {
     /// any type defined in a `#![blaze::sans_io]` crate or module. Answered as
     /// [`tc::TypeAttrs::CAPABILITY`].
     pub capability: bool,
+    /// Marked `#[blaze::handle]` (`docs/v2/plan/design/sans-io-machines.md`, section 2): an inert
+    /// generational handle token allowed inside `#![blaze::sans_io]` ADTs and itself checked to
+    /// store no `#[blaze::capability]` fields. Answered as [`tc::TypeAttrs::HANDLE`].
+    pub handle: bool,
     /// Defined inside a `#![blaze::sans_io]` crate or module (or marked `#[blaze::sans_io]`):
     /// checked by `blaze::capability_in_sans_io` (`blaze-typeck` `rules/capability.rs`). Answered
     /// as [`tc::TypeAttrs::SANS_IO`].
@@ -1179,6 +1183,11 @@ fn is_args_attr(path: &str) -> bool {
 /// Whether an attribute's path, as written, is `blaze::capability` (spaces around `::` allowed).
 fn is_capability_attr(path: &str) -> bool {
     path.split_once("::").is_some_and(|(tool, rest)| tool.trim() == "blaze" && rest.trim() == "capability")
+}
+
+/// Whether an attribute's path, as written, is `blaze::handle` (spaces around `::` allowed).
+fn is_handle_attr(path: &str) -> bool {
+    path.split_once("::").is_some_and(|(tool, rest)| tool.trim() == "blaze" && rest.trim() == "handle")
 }
 
 /// Whether an attribute's path, as written, is `blaze::sans_io` (spaces around `::` allowed).
@@ -6047,6 +6056,7 @@ impl<'n> Store<'n> {
         let mut valid = blaze_build::layout::ValidRange::default();
         let mut args = false;
         let mut capability = false;
+        let mut handle = false;
         let mut sans_io = false;
         let coherence = self.adt_declarations.get(&ck).ok_or(Why::Need(key))?.marks;
         let attrs = v.list(head::ATTRS);
@@ -6069,6 +6079,7 @@ impl<'n> Store<'n> {
             }
             args |= is_args_attr(path);
             capability |= is_capability_attr(path);
+            handle |= is_handle_attr(path);
             sans_io |= is_sans_io_attr(path);
         }
         sans_io |= names.in_sans_io_scope(key, module);
@@ -6078,7 +6089,7 @@ impl<'n> Store<'n> {
         let field_regions = super::borrows::FieldRegions::new(field_region_at, field_region_list, self.tys.alloc());
         let auto_copy = is_auto_copy_pub_view(names, key, module, kind, v)?;
         self.auto_copy_pub.insert(ck, auto_copy);
-        self.adts.insert(ck, AdtRow { kind, generics, variants, fields, field_vis, repr, valid, discrs, args, capability, sans_io, marks: coherence, lifetimes, field_regions });
+        self.adts.insert(ck, AdtRow { kind, generics, variants, fields, field_vis, repr, valid, discrs, args, capability, handle, sans_io, marks: coherence, lifetimes, field_regions });
         self.adt_life_from_view(names, keys, key, module, v);
         Ok(())
     }

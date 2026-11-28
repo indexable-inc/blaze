@@ -1,13 +1,11 @@
 ---
 status: plan
-summary: "Proper sans-IO for bstd: logic returns typed requests and is resumed with their answers; explicit state machines with their edges in each state's signature (`type Asks`, `type Next = A | B | Fail<E>`), handles in place of names, capability methods that build a request and never wait, one driver loop, and the order in which bstd and the IO-doing crates move."
+summary: "Unified PL end state for sans-IO and effects in blaze: one-shot lexical algebraic effects and linear typestate at the surface, compiling to one zero-alloc, zero-Pin sans-IO Machine ABI (`Waiting` + `Ask<R, W>`, `Race`, `Batch`, `Call`, `TaskFrame`, `Handler`/`Script`), generational branded handles (`#[blaze::handle]` vs `#[blaze::capability]`), owned zero-copy DMA buffers, and staged waves across compiler, blaze-machine, blaze-core, and bstd."
 date: 2026-11-27
 ---
-# Proper sans-IO: typed requests and explicit state machines
+# One-shot lexical algebraic effects and the sans-IO machine ABI
 
-The owner's decisions of 2026-11-27 (decision D234). Nothing here is built on main yet; the
-interface crate, the typed requests and the first ports are being written on the branch
-`dedup-1127`.
+The owner's decisions of 2026-11-27 (decision D234, refined to the long-term PL end state).
 
 ## Why
 
@@ -19,193 +17,215 @@ marked `#![blaze::sans_io]`, and direct IO inside logic across `blaze-cli`, `bla
 `blaze-fetch`, `blaze-cas`, `blaze-world`, `blaze-remote`, `bgit`, `blaze-launch-rt`, the harness
 daemon and `scripts`.
 
-Sans-IO here means: logic never performs or waits for IO. It returns a request value and is
-resumed with that request's answer. Only a driver performs requests.
+From a PL perspective, **manual sans-IO is not the best surface programming model—it is the
+compilation target (the runtime ABI) of one-shot lexical algebraic effects**:
 
-Every tradeoff below is weighed for a model writing and reading the code, not a person: writing
-text is free; what costs is state the code does not show, a mistake no type catches, and text a
-later session must reload. So the explicit form is preferred even at several times the length.
+- **Pure transforms & codecs** (`blaze-h1`, `blaze-vt`, `blaze-cbor`, `rustls`, compiler passes)
+  have an empty effect row: plain functions and byte-in/byte-out cores that never name `Request`
+  or `Handle`.
+- **Protocols & durability cores** (`blaze-cas` journals, retry/backoff, watchdogs, schedulers,
+  transport lifecycles) use **explicit state-graph machines** (`Waiting` + `Ask<R, W>` + typestate
+  handles), where every state and legal transition is visible in the types for models and Lean
+  refinement proofs.
+- **Workflows & orchestration** (`bgit`'s 207 IO sites, `blaze-cli`, `dir walk`, `tree copy`,
+  `blaze-fetch`, `scripts`) use **direct-style one-shot lexical algebraic effects** with explicit
+  suspension markers at every yield site, effect rows reusing `A | B` unions (`EffectSet::SUSPEND`),
+  and the no-local-borrow rule—compiled by `blaze-lir/coroutine.rs` into the **exact same
+  zero-`Pin` sans-IO Machine ABI**.
 
-## 1. The interface (`crates/blaze-machine`, `#![no_std]`, no allocation)
+Every tradeoff below is weighed for a model writing and reading the code, hardware-floor execution
+(`io_uring`, Apple Silicon, zero global heap), deterministic simulation (`blaze-sim` / `Sim`), and
+formal verification (Lean Interaction Trees + transition-system refinement).
+
+## 1. The machine ABI (`crates/blaze-machine`, `#![no_std]`, zero global heap)
+
+Every transition **consumes** the current state (or starting inputs) and returns an anonymous union
+(`A | B`, or `Step<R, W, T, E>` in Rust-edition crates) of:
+
+- `Ask<R, W>` — a linear typed request `R: Request` paired with the disjoint waiting state
+  `W: Waiting<Ctx, Waits = R>`. Because the transition consumes resources into `R` directly (e.g.
+  `file.close()` moves `File` into `Close`, and `ReadInto` takes an owned `DmaBuf`), there is no
+  `asks(&self)` borrow trap, no self-referential state, and no `Pin`.
+- `Call<Child, K>` — structured sub-machine delegation without flattening the child's internal
+  states or requests into the parent.
+- `Done<T>` / `Fail<E>` — terminal outcomes.
 
 ```rust
-/// Something a machine may ask for. The answer's type is fixed by the request.
-pub trait Request { type Answer<'s>; }
-
-/// One state of an explicit machine. Its signature is its node in the graph.
-pub trait State: Sized {
-    type Asks: Request;   // or a union of requests: `Recv | Timer`
-    type Next;            // every state it may go to: `Sending | ReadingHead | Fail<FetchError>`
-    fn asks(&self) -> Self::Asks;
-    #[blaze::consumes]
-    fn resume(self, answer: <Self::Asks as Request>::Answer<'_>) -> Self::Next;
+/// Something a machine may ask a handler to perform. The answer's type is fixed by the request.
+pub trait Request: Sized {
+    type Answer<'s>;
 }
 
-pub struct Done<T>(pub T);   // terminal members of a `Next`
-pub struct Fail<E>(pub E);
-```
-
-No new syntax and no macro: a state is a type with an ordinary impl. Each of these is a
-compile-time check:
-
-| Property | How it is held |
-|---|---|
-| A state goes only where its `Next` says | the return type |
-| A state reaches every member of its `Next` | a declared target no path produces is an error at the impl |
-| A state is resumed only with its request's answer | `Request::Answer`; no "out of step" arm can be written |
-| A transition cannot be forgotten | `resume` consumes the state (`#[blaze::consumes]`, the linearity check) |
-| A request is performed or cancelled, never dropped | requests are `#[blaze::linear]` |
-| Data that exists in one state is not visible in another | it is a field of that state's type |
-
-The whole graph is recovered from the start state by compile-time reflection over `Next`: the
-machine's enum, its size, a state nothing reaches, a state with no path to an end, and a
-transition table for tools. Cancellation and the deadline are answers every state can receive,
-with a default (`Fail(Stopped)`) that a state may override.
-
-Until anonymous unions carry this on the front end, a state's `Next` is a hand-written enum named
-`<State>Next`, one variant per target; the trait accepts both.
-
-### What a machine looks like
-
-```rust
-struct Sending { conn: ConnId, sent: usize }
-
-impl State for Sending {
-    type Asks = Send;
-    type Next = Sending | ReadingHead | Fail<FetchError>;
-
-    fn asks(&self) -> Send { self.conn.send(&self.request[self.sent..]) }
+/// One waiting state of an explicit machine. Its signature is its node in the graph.
+pub trait Waiting<Ctx = ()>: Sized {
+    type Waits: Request;
+    type Next; // e.g. Ask<SendFrom, Sending> | Ask<Close, ClosingOnErr> | Done<Resp> | Fail<FetchError>
 
     #[blaze::consumes]
-    fn resume(self, answer: Result<usize, NetError>) -> Self::Next {
-        match answer {
-            Ok(n) if self.sent + n < self.request.len() => Sending { sent: self.sent + n, ..self },
-            Ok(_)  => ReadingHead { conn: self.conn, head: FrameVec::new() },
-            Err(e) => Fail(FetchError::Send(e)),
-        }
+    fn resume(self, answer: <Self::Waits as Request>::Answer<'_>, cx: &mut Ctx) -> Self::Next;
+
+    /// Called on external cancellation or deadline expiry under a bounded grace budget.
+    #[blaze::consumes]
+    fn on_cancel(self, _cx: &mut Ctx) -> CancelAction<Self::Next> {
+        CancelAction::Abandon
     }
 }
 ```
 
-`match` is kept for decisions inside a state on data. It is not the dispatcher between states.
+### Concurrency and batching are first-class requests
 
-### The compiled form
+A single-op ping-pong loop cannot saturate `io_uring` or handle duplex child pipes (`stdout` +
+`stderr` + exit without deadlocking). `blaze-machine` defines structured concurrency combinators
+directly as `Request`s:
 
-A direct-style function may also be compiled into a machine: it suspends at each IO call and
-carries a `suspend` effect in its type; a function without that effect provably yields no IO.
-One rule keeps the result plain movable data with no `Pin`: **a compiled coroutine may not hold
-a borrow of its own local across a suspension point.** What must survive a suspension is owned,
-or lives in the task's arena. It is for short linear sequences; anything with branching, retries,
-timeouts or more than one kind of input is an explicit machine. Specified here, built after the
-explicit form.
+- **`Race<A, B>`** (product submitted, sum returned): submits both `A` and `B`, resumes on the
+  first completion (`RaceOutcome::First` / `RaceOutcome::Second`), and cancels the loser—holding
+  any owned DMA buffer lent to the loser until the kernel's cancel CQE drains.
+- **`Batch<R, const CAP: usize>`** (bounded-N fan-out): submits up to `CAP` requests into one
+  `io_uring` batch (directory walks, tree copies, pipelined CAS/HTTP fetches) and yields
+  completions (`BatchReady { index, answer }`) as they land.
 
-Whether a paused machine may resume on another thread is a property of its type: only if what
-it holds across the suspension is `Send`. Reading a thread-local or holding a lock across a
-suspension is refused. Open: a task is its frame plus its paused state, which points into that
-frame; the pair moved together is safe though neither half is. How the pair is typed for a
-pooled driver is to be designed and proven by an interleaving test.
+### Compile-time guarantees
 
-## 2. Handles (`blaze-core`, module `handle`)
+| Property | How it is held |
+|---|---|
+| A state goes only where its `Next` says | the return type (`A \| B` or `Step`) |
+| A state reaches every member of its `Next` | generic-body reachability check (excluding `!` arms) |
+| Every state reaches an end or explicit loop | reflected graph check (`Done`, `Fail`, or `#[blaze::loop_state]`) |
+| A state is resumed only with its request's answer | `Request::Answer<'_>`; no "out of step" arm can be written |
+| A transition cannot be forgotten | `resume` consumes `self` (`#[blaze::consumes]`) |
+| A request is performed or cancelled, never dropped | requests are `#[blaze::linear]` |
+| Normal `Fail(e)` paths close their handles | linear handle has no `Drop`; only `Stopped` abandons |
+| Data that exists in one state is invisible in another | field of that state's type |
+| `resume` allocates only through an explicit arena | `&mut Ctx` carries `&BrandedBump<'id, Frame>` (`drop-with.md`) |
 
-An open resource is named by a handle, not by a path string in each request and not by an OS
-descriptor: `Handle<K> { slot: u32, generation: u32 }`, 8 bytes, with `FileId`, `DirId`,
-`ConnId`, `ListenerId`, `SocketId`, `ChildId`, `WatchId`, `MapId`, `LockId`. A slot's generation
-rises on reuse, so a stale handle is refused by name. Slots are issued in the order opens
-complete, which is deterministic in the simulation. A handle has no key encoding and is never
-written to a record. User code never sees one: it is a private field of a capability
-(`File<ReadOnly>`, `Dir`, `Conn`, `Child`), which is linear where it must be closed.
+### `TaskFrame`: cross-thread migration without `Pin`
 
-### Closing: there is no `Drop` that does IO
+A paused machine paired with its bump arena is safe to move across worker threads without `Pin`:
+under [drop-with.md](drop-with.md), `FrameVec<'id, T>` and `Ref32<'id, T>` store `NonNull<T>` into
+heap-allocated arena chunks (or relative 32-bit offsets) and **zero** back-pointers to the `Frame`
+header struct itself. `TaskFrame` pairs the owned arena with an existentially branded machine state
+(`Send` iff the state's payload is `Send`) and tracks `in_flight_dma: u32`: resetting or dropping
+the arena while a cancelled kernel DMA operation is still in flight is refused until all cancelled
+CQEs drain (preventing kernel DMA use-after-free by construction).
 
-Dropping a value cannot perform IO in this world, because nothing but a driver performs IO. So
-closing is a request like any other, and the capability that holds a handle is linear:
+### One-shot lexical algebraic effects (the compiled direct-style form)
+
+A direct-style function over lexical branded capabilities (`fs: Fs<'h>`, `net: Net<'h>`,
+`clk: Clock<'h>`) carries `EffectSet::SUSPEND` in `FnHeader` (bit 15, packed beside
+`PANIC | ALLOC | BLOCK | DIVERGE` with zero ABI overhead) and an effect row on `A | B`:
+
+- **Tail-resumptive operations** (`Clock::now`, `Rng::next`, `Alloc`) inline directly with zero
+  suspension frame.
+- **Suspending operations** are explicitly marked at every call site (so every yield, interleaving,
+  cancellation, and crash point stays visible in source) and obey the **no-local-borrow across
+  suspension** rule: values live across a yield are owned or in the task's `Frame`.
+- `blaze-lir/coroutine.rs` lowers suspending functions to the **exact same `Machine` ABI** as
+  explicit state-graph machines, driven by the same `Handler` (`IoUring`, `Kqueue`, `Sim`,
+  `Script`).
+- Effect polymorphism (`fn map<T, U, E>(.., f: fn(T) -> U / E) -> .. / E`) removes `sync`/`async`
+  function coloring across `bstd`. Suspending effects are monomorphized statically (not behind
+  unboxed `dyn Fn`); tail-resumptive effects work behind `dyn` freely.
+- Continuations are strictly **one-shot linear**, so linear handles and typestate protocols
+  (`UnflushedFile -> flush() -> FlushedFile -> rename()`) hold across suspension points.
+
+## 2. Two-tier capabilities and generational handles (`blaze-core`, module `handle`)
+
+The compiler enforces a clean two-tier boundary ([drop-with.md](drop-with.md) §6):
+
+- **`#[blaze::capability]`** — executing/ambient authority (`Io`, `Cx`, `Alloc`, `BrandedBump`,
+  `BrandedAlloc`, `RankedLock`). Forbidden in `#![blaze::sans_io]` ADT fields
+  (`blaze::capability_in_sans_io`). Passed only as method arguments or held by drivers.
+- **`#[blaze::handle]`** — inert 8-byte generational tokens (`File<'io, Mode>`, `Dir<'io, Mode>`,
+  `Conn<'io>`, `Listener<'io>`, `Socket<'io>`, `Child<'io>`, `Watch<'io>`, `Map<'io>`,
+  `Lock<'io>`). Permitted inside `#![blaze::sans_io]` state structs; themselves checked to store no
+  `#[blaze::capability]` fields.
 
 ```rust
-file.close() -> Close        // consumes the `File`; Answer = Result<(), FsError>
+#[blaze::handle]
+pub struct Handle<'io, K> {
+    slot: u32,
+    generation: NonZeroU32, // starts at 1; slot permanently retired at u32::MAX; Option<Handle> == 8 B
+    _brand: Brand<'io>,
+    _kind: PhantomData<K>,
+}
 ```
 
-- A state that holds a `File` must end by going to a state that asks `Close`, or hand the file
-  on in its `Next`. Letting it fall out of scope is a compile error, the same rule as an
-  `UnmanagedVec` that must be given its allocator to free (`drop-with.md`).
-- The error of a close is an answer the machine sees. `Drop` could only have ignored it.
-- Cancellation is the one case logic cannot handle itself: a cancelled or failed machine is
-  discarded with its handles still open. The driver's table records which task owns each handle
-  and closes them when the task ends. That is the backstop, not the path: a handle the driver
-  had to reclaim from a task that ended normally is counted and reported as a leak.
-- Buffers lent to a pending request (`ReadInto`) return in its answer; on cancellation the
-  driver returns them when the cancelled operation completes, never before.
+- **Deterministic slots:** issued in open-completion order in `Sim`; stale handles are refused by
+  name with `(slot, expected_gen, found_gen)`; handles are never serialized to records.
+- **Typestate durability:** writable files start as `File<'io, Unflushed>`; `flush()` consumes
+  `Unflushed` and returns `File<'io, Flushed>` in its answer, making durability ordering
+  (`write -> flush -> rename`) checkable in types.
+- **No `Drop` that does IO:** closing is `file.close() -> Close`, consuming the linear `File` and
+  returning `Result<(), FsError>`.
+  - **Normal `Fail(e)` paths** must close their handles (or return them in `Fail` to the caller).
+  - **External cancellation (`Stopped`)** runs `on_cancel` under a bounded `GraceBudget` or
+    abandons handles to `HandleTable::reclaim_task(task_id, normal_exit)`.
+  - **Loud leak detection:** reclaiming any handle on a normal exit (`Done`/`Fail`) returns a typed
+    `LeakedHandles` error (hard failure in `Sim` and tests, never a silent counter).
 
-## 3. Requests (`blaze-core`, module `request`)
+## 3. Zero-alloc typed requests (`blaze-core`, module `request`)
 
-One type per thing a driver can do, replacing the single `Effect` enum (63 variants) and `Done`
-enum at the surface. Each is linear, has private fields, is made only by a method on the
-capability that authorises it, and has a typed answer and a typed error.
+One linear `#[blaze::linear]` type per operation replaces the 63-variant `Effect` and `Done` enums
+at the surface, using `#[blaze::args]` `*Opts` structs (rule 83) and strong newtypes (`ByteOffset`,
+`ByteLen`, `MaxBytes`; rule 73):
 
-```rust
-#[blaze::linear]
-pub struct Read { file: FileId, at: u64, len: u32 }
-impl Request for Read { type Answer<'s> = Result<&'s [u8], FsError>; }   // lent for one step
+- **Owned DMA buffers (`DmaBuf`):** `ReadInto`, `WriteFrom`, `ReadAll`, `SendFrom`, `RecvInto`,
+  `List`, and `Spawn` output take caller-owned buffers (from `Frame` or registered `Spans`) with
+  explicit byte caps (`MaxBytes`) and return the buffer in `Answer` (`FilledBuf` / `BufError`). A
+  driver **never** allocates on the global heap for a caller (`Done::Read(Vec<u8>)` is deleted,
+  not wrapped).
+- **Capped lent reads:** `Read` returns `Result<&'s [u8], FsError>` backed by the driver's
+  per-worker scratch ring and statically/explicitly capped to `LENT_READ_MAX`.
+- **Absent is never empty:** `FsError::NotFound` is always an explicit error (`ReadAll` never maps
+  missing files to `[]`).
 
-#[blaze::linear]
-pub struct ReadInto<'a> { file: FileId, at: u64, into: &'a mut [u8] }
-impl<'a> Request for ReadInto<'a> { type Answer<'s> = Result<Filled<'a>, FsError>; }
-```
+Groups: `file` (`Open`, `Close`, `Read`, `ReadInto`, `ReadMany`, `WriteFrom`, `Flush`, `Barrier`,
+`Truncate`, `Lock`, `Unlock`, `Map`, `MapWrite`), `path` (`ReadAll`, `Write`, `Rename`, `Remove`,
+`MakeDir`, `List`, `Stat`, `Link`, `CopyData`, `Mode`, `Times`, `SyncDir`), `watch`, `net`, `proc`,
+`stdio`, `time`, `random`, `trust`, `host`.
 
-- An answer lends the driver's bytes for one step, or the request carries the caller's arena
-  buffer and the answer returns it filled. A driver never allocates on the global heap for a
-  caller (today `Done::Read(Vec<u8>)` does).
-- Every size is stated (`len: u32`, `most: u64`).
-- "Absent" is never read as "empty": `NotFound` is an error the caller matches (today
-  `Effect::ReadAll` reads a missing file as empty).
+## 4. Capabilities, handlers, and drivers (`bstd`)
 
-Groups: `file` (by handle: `Open`, `Close`, `Read`, `ReadInto`, `ReadMany`, `WriteAt`,
-`WriteFrom`, `Flush`, `Truncate`, `Lock`, `Unlock`, `Map`, `MapWrite`), `path` (one-shot by `Dir`
-and relative path: `ReadAll`, `Write`, `Append`, `Rename`, `Remove`, `MakeDir`, `List`, `Stat`,
-`Link`, `CopyData`, `Mode`, `Times`, `SyncDir`, and the rest of today's by-name effects),
-`watch`, `net`, `proc`, `stdio`, `time`, `random`, `trust`, `host`. Each request converts to the
-existing `Effect` and builds its answer from `Done`, so the native driver, the simulation and
-every existing effect test keep working underneath.
+- Capability methods build requests and take no `cx`: `file.read_into(ReadIntoOpts { .. })`.
+- Outside a machine/effectful function, `cx.run(request)` performs one request under the task's
+  deadline; refused in `#![blaze::sans_io]` code.
+- `Handler` + `drive(handler, cx, machine)` is the one execution loop for `IoUring`, `Kqueue`,
+  `SimHandler` (over `blaze_core::sim::Sim`), and `Script` (deterministic unit-test transcripts
+  with zero simulator).
 
-## 4. Capabilities and drivers (bstd)
+## 5. Order (compiler & ABI first, workflows on lexical effects)
 
-A capability method builds a request; it does not wait and takes no `cx`:
-`file.read_at(at, len) -> Read`. Outside a machine, the one way to perform a request is
-`cx.run(request)`, a driver-side call that waits under the task's deadline; the lint refuses it
-in any crate marked `#![blaze::sans_io]`. bstd's call-and-wait methods are replaced by these two
-halves in one batch by a rewriter, not kept beside them.
-
-`drive(io, cx, machine)` is the one loop (ask, perform, answer, repeat) for the native driver and
-the simulation. `Script` drives a machine in a test from a list of expected requests and the
-answers to give; a mismatch is a typed failure naming the step, and no simulator is needed.
-
-## 5. Order
-
-| Step | What | Effort |
+| Wave | What | Effort |
 |---|---|---|
-| 1 | `blaze-machine`: the traits, `Script`, two real machines ported (`blaze-h1`, `blaze-fetch`) | `[███░░░░░░░]` |
-| 2 | Handles and typed requests for every effect, with the caller's buffer | `[████░░░░░░]` |
-| 3 | Capability methods build requests; `cx.run`; `drive`; the rewriter over bstd's 232 calls and their callers | `[█████░░░░░]` |
-| 4 | bstd's multi-step operations as machines: directory walk, tree copy, spawn-and-collect, HTTP exchange, git fetch, the start-up spec read | `[████████░░]` |
-| 5 | The crates that do IO: logic into machines, one thin driver each, ported once onto the arena collections of `drop-with.md` in the same pass | `[██████████]` |
-| 6 | The lint becomes an error: no waiting call in `#![blaze::sans_io]` code | `[██░░░░░░░░]` |
-| 7 | The compiled form: the `suspend` effect, coroutine lowering, the no-local-borrow check | `[████████░░]` |
-
-Steps 1 to 3 are one wave. STEP 5 IS A MULTI-DAY TASK: `bgit` alone has 207 direct IO sites.
+| 1 | **ABI & compiler foundation (built first):** `EffectSet::SUSPEND` (`FnHeader` bit 15); `#[blaze::handle]` two-tier firewall (`blaze-surface`, `blaze-typeck`, `blaze-ladder`); `crates/blaze-machine` (`Request`, `Waiting`, `Ask`, `Race`, `Batch`, `Call`, `Machine`, `TaskFrame`, `Handler`, `Script`); `crates/blaze-core/{handle,request}` (`Handle<'io, K>`, `HandleTable`, typestate `File`, `DmaBuf`, `SimHandler` + DSTs) | `[████░░░░░░]` |
+| 2 | **Compiler lexical effects & lowering:** one-shot `perform` syntax, effect rows over `A \| B`, no-local-borrow check, `blaze-lir/coroutine.rs` lowering to `Machine` ABI, `DropWith<C>` / linear-across-yield | `[███████░░░]` |
+| 3 | **Whole-tree port (one pass):** capability methods return requests with `#[blaze::args]` `*Opts` + `ByteOffset`/`ByteLen`; delete `Done::Read(Vec<u8>)`; port protocols/journals (`blaze-cas`, `blaze-h1-net`, `blaze-fetch` transport) as explicit typestate `Machine`s and workflows (`bgit`, `blaze-cli`, `dir walk`, `tree copy`, `scripts`) directly onto lexical effects + `drop-with.md` arenas | `[████████░░]` |
 
 ## 6. How it is proven
 
-- The interface: a simulation that drives each ported machine with an oracle and a planted bug
-  (a machine that mishandles a short read is caught by its script).
-- Requests: each one's round trip through `Effect` and `Done` under the existing simulation, so
-  byte-for-byte the driver sees what it saw before.
-- Handles: a stale handle after close is refused; ids replay identically from one seed.
-- The rewriter: bstd's own tests and the hello-world smoke on the exact tree.
-- Each ported crate: its tests driven by `Script` with no simulated world, plus one run under the
-  simulation with failures injected.
+- **Compiler checks:** unit tests in `blaze-ty` (`SUSPEND` subtyping, `FnHeader` packing, `EffectRow`),
+  `blaze-surface` (`handle` tool attr), and `blaze-typeck` (two-tier `#[blaze::capability]` vs
+  `#[blaze::handle]` firewall, including rejecting a handle that tries to smuggle a capability).
+- **Machine ABI & `Script`:** explicit transport machine (`HttpExchange` with partial writes/reads,
+  `Race<Recv, Timer>` timeout, mandatory `Close` on error) plus planted-bug controls (short-read
+  mishandling and skipped close caught by `Script`).
+- **Handle table & DMA cancellation DST (`blaze-sim`):** interleaved multi-task open/close/cancel
+  with slot reuse, generation exhaustion retirement (`u32::MAX`), task reclamation isolation, leak
+  failure on normal exit, and in-flight DMA drain before `TaskFrame` reset—each with a planted-bug
+  control the oracle catches.
+- **Durability & crash DST (`SimHandler` over `blaze_core::sim::Sim`):** typed `WriteFrom` +
+  `Flush` + `Rename` machine under faults, short writes, ENOSPC, and power-cut crashes verifying
+  typestate durability ordering and `NotFound` != empty.
+- **Formal verification path:** Lean Interaction Trees for effectful workflows and Lean transition
+  system refinement for explicit protocol/durability `Machine`s.
 
-## 7. The losing alternative
+## 7. Losing alternatives
 
-`async`/`await` on a blaze executor: familiar, and the compiler already makes the state machines.
-Rejected because `Future` and `Waker` bring an ambient reactor back, self-referential futures
-need `Pin`, and a future's states and edges are invisible in its signature, which is the
-opposite of what a model reading the code needs.
+- **Rust `async`/`await` (`Future` + `Waker` + `Pin`):** ambient reactor, viral function coloring,
+  self-referential `Pin`, invisible state graphs, and linear values cannot survive dropped futures.
+- **Manual sans-IO state structs for every workflow:** great runtime ABI and protocol form, but
+  hand-lowering 200+ IO sites in `bgit`/`blaze-cli` before building coroutine lowering creates
+  unnecessary boilerplate where one-shot lexical algebraic effects compile to the exact same ABI.
+- **Stackful fibers / multi-shot continuations:** per-task stacks hurt `one-memory-measure`, hide
+  yield/crash points, and multi-shot breaks linear types (`File` could be closed twice).

@@ -80,9 +80,11 @@ pub(crate) fn check_adt_capabilities_in<'a, W: World>(
 ) -> Result<Vec<CapabilityFinding<'a>, Alloc<'a>>, Stop> {
     let mut out: Vec<CapabilityFinding<'a>, Alloc<'a>> = Vec::new_in(alloc);
     let attrs = reads.attrs(adt)?;
-    // Fast path: non-sans-IO ADTs and `#[blaze::capability]` definitions themselves (e.g.
-    // `BrandedAlloc` wrapping `Alloc`) are allowed to contain capabilities.
-    if !attrs.is_sans_io() || attrs.is_capability() {
+    // Fast path: non-sans-IO, non-handle ADTs and `#[blaze::capability]` definitions themselves
+    // (e.g. `BrandedAlloc` wrapping `Alloc`) are allowed to contain capabilities.
+    // A `#[blaze::handle]` ADT is allowed as a field inside `#![blaze::sans_io]` states, so it is
+    // checked here to guarantee it never smuggles an executing `#[blaze::capability]` field.
+    if (!attrs.is_sans_io() && !attrs.is_handle()) || attrs.is_capability() {
         return Ok(out);
     }
     let Some(def) = reads.adt(adt)? else {
