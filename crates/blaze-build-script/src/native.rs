@@ -58,9 +58,9 @@ pub enum PackageSource {
 /// before compilation or execution (rules 3 and 54).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NativeSourceReason {
-    /// Unconditional reference to host-OS-specific `std::os::{unix,linux,macos,fd}` APIs
+    /// Unconditional reference to host-OS-specific `std::os::{unix,linux,macos}` APIs
     /// (absent on `wasm32-wasip1` / `wasm64-blaze-wasip1`), not guarded by a WASI-excluding
-    /// `#[cfg(...)]`.
+    /// `#[cfg(...)]`. (`std::os::fd` is exposed on `target_os = "wasi"` and stays Wasm.)
     HostOsStd,
     /// Unconditional foreign-function block (`extern "C" { ... }`, `extern "system" { ... }`,
     /// `extern { ... }`, or `unsafe extern ... { ... }`), not guarded by a WASI-excluding
@@ -203,20 +203,35 @@ pub fn placement_with_source(
 
 /// Maximum number of distinct files inspected by [`source_tree_requires_native`] for one build
 /// script (cycle and pathological fan-out bound, rule 18).
-const MAX_SCRIPT_FILES: usize = 256;
+pub const MAX_SCRIPT_FILES: usize = 256;
+
+/// Maximum nesting depth when scanning nested `macro_rules!` transcriber bodies.
+const MAX_MACRO_DEPTH: usize = 8;
+
+/// Failure while inspecting a build script's source tree ([`source_tree_requires_native`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ScriptSourceError<'a, E> {
+    /// Underlying file read / decode error returned by the caller's reader callback.
+    Read(E),
+    /// The reachable module/`include!` graph exceeded [`MAX_SCRIPT_FILES`]; refused rather than
+    /// treating an incomplete scan as proof that no native requirement exists (rules 18 and 54).
+    TooManyFiles { limit: usize, path: AString<'a> },
+}
 
 /// Inspects a build script's root file and every active submodule (`mod foo;`,
-/// `#[path = "..."] mod foo;`) and static `include!("...")` file reachable from it, using
-/// `read_file` to load each package-relative path.
+/// `#[path = "..."] mod foo;`) and static `include!("...")` / `include!(r#"..."#)` file
+/// reachable from it, using `read_file` to load each package-relative path.
 ///
 /// `read_file(rel, is_root, visit)` calls `visit(source_text)` and returns `Ok(true)` when the
 /// file exists, `Ok(false)` when absent (used to probe `foo.rs` before `foo/mod.rs`), or `Err(e)`
-/// on any read/decode failure (which is propagated immediately rather than assuming Wasm).
-pub fn source_tree_requires_native<E, F>(
+/// on any read/decode failure (propagated as [`ScriptSourceError::Read`]). Source trees that
+/// exceed [`MAX_SCRIPT_FILES`] are refused with [`ScriptSourceError::TooManyFiles`] rather than
+/// silently treated as Wasm-safe.
+pub fn source_tree_requires_native<'a, E, F>(
     root_rel: &str,
-    alloc: Alloc<'_>,
+    alloc: Alloc<'a>,
     mut read_file: F,
-) -> Result<Option<NativeSourceReason>, E>
+) -> Result<Option<NativeSourceReason>, ScriptSourceError<'a, E>>
 where
     F: FnMut(&str, bool, &mut dyn FnMut(&str)) -> Result<bool, E>,
 {
@@ -234,12 +249,11 @@ where
     let mut queue: AVec<'_, Pending<'_>> = Vec::new_in(alloc);
     queue.push(Pending::Root(norm_root));
 
+    let mut sink = TreeSink::new(alloc);
     let mut head: usize = 0;
+
     while let Some(item) = queue.get(head) {
         head += 1;
-        if visited.len() >= MAX_SCRIPT_FILES {
-            break;
-        }
         let (is_root, primary_str, fallback_str) = match item {
             Pending::Root(p) => (true, p.as_str(), None),
             Pending::Exact(p) => (false, p.as_str(), None),
@@ -250,13 +264,16 @@ where
         let fb_copy = fallback_str.map(|fb| String::from_str_in(fb, alloc));
 
         let mut scanned_ok = false;
-        let mut discovered: AVec<'_, ChildRef<'_>> = Vec::new_in(alloc);
         let mut reason_hit: Option<NativeSourceReason> = None;
 
         if !visited.iter().any(|seen| seen.as_str() == p_copy.as_str()) {
+            if visited.len() >= MAX_SCRIPT_FILES {
+                return Err(ScriptSourceError::TooManyFiles { limit: MAX_SCRIPT_FILES, path: p_copy });
+            }
             let existed = read_file(p_copy.as_str(), is_root, &mut |text| {
-                reason_hit = scan_source(text, is_root, p_copy.as_str(), Some(&mut discovered), alloc);
-            })?;
+                reason_hit = scan_source_core(text, is_root, p_copy.as_str(), 0, &mut sink);
+            })
+            .map_err(ScriptSourceError::Read)?;
             if existed {
                 scanned_ok = true;
                 visited.push(p_copy);
@@ -273,9 +290,13 @@ where
             && let Some(fb) = fb_copy
             && !visited.iter().any(|seen| seen.as_str() == fb.as_str())
         {
+            if visited.len() >= MAX_SCRIPT_FILES {
+                return Err(ScriptSourceError::TooManyFiles { limit: MAX_SCRIPT_FILES, path: fb });
+            }
             let existed = read_file(fb.as_str(), false, &mut |text| {
-                reason_hit = scan_source(text, false, fb.as_str(), Some(&mut discovered), alloc);
-            })?;
+                reason_hit = scan_source_core(text, false, fb.as_str(), 0, &mut sink);
+            })
+            .map_err(ScriptSourceError::Read)?;
             if existed {
                 visited.push(fb);
             }
@@ -284,9 +305,38 @@ where
             }
         }
 
-        for child in discovered {
+        if let Some(reason) = sink.propagate_invoked_macros() {
+            return Ok(Some(reason));
+        }
+
+        for child in sink.take_top_children() {
+            let already_seen = match &child {
+                ChildRef::Exact(path) => {
+                    visited.iter().any(|seen| seen.as_str() == path.as_str())
+                        || queue.get(head..).unwrap_or(&[]).iter().any(|pending| match pending {
+                            Pending::Root(p) | Pending::Exact(p) => p.as_str() == path.as_str(),
+                            Pending::Module { .. } => false,
+                        })
+                }
+                ChildRef::Module { primary, fallback } => {
+                    visited.iter().any(|seen| seen.as_str() == primary.as_str() || seen.as_str() == fallback.as_str())
+                        || queue.get(head..).unwrap_or(&[]).iter().any(|pending| match pending {
+                            Pending::Module { primary: qp, fallback: qf } => {
+                                qp.as_str() == primary.as_str() && qf.as_str() == fallback.as_str()
+                            }
+                            _ => false,
+                        })
+                }
+            };
+            if already_seen {
+                continue;
+            }
             if visited.len() + queue.len().saturating_sub(head) >= MAX_SCRIPT_FILES * 2 {
-                break;
+                let path = match child {
+                    ChildRef::Exact(path) => path,
+                    ChildRef::Module { primary, .. } => primary,
+                };
+                return Err(ScriptSourceError::TooManyFiles { limit: MAX_SCRIPT_FILES, path });
             }
             match child {
                 ChildRef::Exact(path) => queue.push(Pending::Exact(path)),
@@ -308,6 +358,297 @@ pub fn source_requires_native(source: &str) -> Option<NativeSourceReason> {
 enum ChildRef<'a> {
     Exact(AString<'a>),
     Module { primary: AString<'a>, fallback: AString<'a> },
+}
+
+trait ScanSink<'s> {
+    fn push_external_mod(
+        &mut self,
+        is_root: bool,
+        current_rel: &str,
+        inline_mods: &[Option<&str>],
+        mod_name: &str,
+        path_attr: Option<&str>,
+    );
+    fn push_include(&mut self, current_rel: &str, inc_path: &str);
+    fn push_invocation(&mut self, name: &'s str);
+    fn enter_macro(&mut self, name: &'s str) -> Option<(usize, Option<usize>)>;
+    fn leave_macro(&mut self, def_id: usize, prev_active: Option<usize>, reason: Option<NativeSourceReason>);
+}
+
+const MAX_STACK_MACRO_DEFS: usize = 64;
+const MAX_STACK_MACRO_CALLEES: usize = 16;
+const MAX_STACK_INVOKED: usize = 128;
+
+#[derive(Clone, Copy)]
+struct StackMacroDef<'s> {
+    name: &'s str,
+    reason: Option<NativeSourceReason>,
+    callees: [&'s str; MAX_STACK_MACRO_CALLEES],
+    callees_len: usize,
+    invoked: bool,
+}
+
+impl<'s> StackMacroDef<'s> {
+    const EMPTY: Self = Self {
+        name: "",
+        reason: None,
+        callees: [""; MAX_STACK_MACRO_CALLEES],
+        callees_len: 0,
+        invoked: false,
+    };
+}
+
+struct StackSink<'s> {
+    defs: [StackMacroDef<'s>; MAX_STACK_MACRO_DEFS],
+    defs_len: usize,
+    top_invoked: [&'s str; MAX_STACK_INVOKED],
+    top_invoked_len: usize,
+    top_invoked_overflow: bool,
+    active_def: Option<usize>,
+    matching_only: bool,
+}
+
+impl<'s> StackSink<'s> {
+    fn new() -> Self {
+        Self {
+            defs: [StackMacroDef::EMPTY; MAX_STACK_MACRO_DEFS],
+            defs_len: 0,
+            top_invoked: [""; MAX_STACK_INVOKED],
+            top_invoked_len: 0,
+            top_invoked_overflow: false,
+            active_def: None,
+            matching_only: false,
+        }
+    }
+
+    fn resolve_invoked_macros(&mut self) -> Option<NativeSourceReason> {
+        for inv in self.top_invoked.get(..self.top_invoked_len).unwrap_or(&[]) {
+            for def in self.defs.get_mut(..self.defs_len).unwrap_or(&mut []) {
+                if def.name == *inv {
+                    def.invoked = true;
+                }
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for i in 0..self.defs_len {
+                let Some(def) = self.defs.get(i).copied() else { continue };
+                if !def.invoked {
+                    continue;
+                }
+                if let Some(reason) = def.reason {
+                    return Some(reason);
+                }
+                for callee in def.callees.get(..def.callees_len).unwrap_or(&[]) {
+                    for other in self.defs.get_mut(..self.defs_len).unwrap_or(&mut []) {
+                        if !other.invoked && other.name == *callee {
+                            other.invoked = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+impl<'s> ScanSink<'s> for StackSink<'s> {
+    fn push_external_mod(
+        &mut self,
+        _is_root: bool,
+        _current_rel: &str,
+        _inline_mods: &[Option<&str>],
+        _mod_name: &str,
+        _path_attr: Option<&str>,
+    ) {
+    }
+
+    fn push_include(&mut self, _current_rel: &str, _inc_path: &str) {}
+
+    fn push_invocation(&mut self, name: &'s str) {
+        if self.matching_only {
+            for def in self.defs.get_mut(..self.defs_len).unwrap_or(&mut []) {
+                if def.name == name {
+                    def.invoked = true;
+                }
+            }
+            return;
+        }
+        if let Some(id) = self.active_def {
+            if let Some(def) = self.defs.get_mut(id) {
+                if def.callees.get(..def.callees_len).unwrap_or(&[]).contains(&name) {
+                    return;
+                }
+                if let Some(slot) = def.callees.get_mut(def.callees_len) {
+                    *slot = name;
+                    def.callees_len += 1;
+                }
+            }
+            return;
+        }
+        if self.top_invoked.get(..self.top_invoked_len).unwrap_or(&[]).contains(&name) {
+            return;
+        }
+        if let Some(slot) = self.top_invoked.get_mut(self.top_invoked_len) {
+            *slot = name;
+            self.top_invoked_len += 1;
+        } else {
+            self.top_invoked_overflow = true;
+        }
+    }
+
+    fn enter_macro(&mut self, name: &'s str) -> Option<(usize, Option<usize>)> {
+        if self.matching_only {
+            return None;
+        }
+        let id = self.defs_len;
+        let slot = self.defs.get_mut(id)?;
+        *slot = StackMacroDef { name, ..StackMacroDef::EMPTY };
+        self.defs_len += 1;
+        let prev = self.active_def;
+        self.active_def = Some(id);
+        Some((id, prev))
+    }
+
+    fn leave_macro(&mut self, def_id: usize, prev_active: Option<usize>, reason: Option<NativeSourceReason>) {
+        if let Some(def) = self.defs.get_mut(def_id) {
+            def.reason = reason;
+        }
+        self.active_def = prev_active;
+    }
+}
+
+struct TreeMacroDef<'a> {
+    name: AString<'a>,
+    reason: Option<NativeSourceReason>,
+    callees: AVec<'a, AString<'a>>,
+    children: AVec<'a, ChildRef<'a>>,
+    resolved: bool,
+}
+
+struct TreeSink<'a> {
+    alloc: Alloc<'a>,
+    defs: AVec<'a, TreeMacroDef<'a>>,
+    invoked: AVec<'a, AString<'a>>,
+    top_children: AVec<'a, ChildRef<'a>>,
+    active_def: Option<usize>,
+}
+
+impl<'a> TreeSink<'a> {
+    fn new(alloc: Alloc<'a>) -> Self {
+        Self {
+            alloc,
+            defs: Vec::new_in(alloc),
+            invoked: Vec::new_in(alloc),
+            top_children: Vec::new_in(alloc),
+            active_def: None,
+        }
+    }
+
+    fn take_top_children(&mut self) -> AVec<'a, ChildRef<'a>> {
+        core::mem::replace(&mut self.top_children, Vec::new_in(self.alloc))
+    }
+
+    fn record_top_invoked(&mut self, name: &str) {
+        if !self.invoked.iter().any(|existing| existing.as_str() == name) {
+            self.invoked.push(String::from_str_in(name, self.alloc));
+        }
+    }
+
+    fn propagate_invoked_macros(&mut self) -> Option<NativeSourceReason> {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let len = self.defs.len();
+            for i in 0..len {
+                let is_ready = self.defs.get(i).is_some_and(|def| {
+                    !def.resolved && self.invoked.iter().any(|inv| inv.as_str() == def.name.as_str())
+                });
+                if !is_ready {
+                    continue;
+                }
+                let Some(def) = self.defs.get_mut(i) else { continue };
+                def.resolved = true;
+                changed = true;
+                if let Some(reason) = def.reason {
+                    return Some(reason);
+                }
+                let callees = core::mem::replace(&mut def.callees, Vec::new_in(self.alloc));
+                let children = core::mem::replace(&mut def.children, Vec::new_in(self.alloc));
+                for callee in callees {
+                    if !self.invoked.iter().any(|existing| existing.as_str() == callee.as_str()) {
+                        self.invoked.push(callee);
+                    }
+                }
+                for child in children {
+                    self.top_children.push(child);
+                }
+            }
+        }
+        None
+    }
+}
+
+impl<'s, 'a> ScanSink<'s> for TreeSink<'a> {
+    fn push_external_mod(
+        &mut self,
+        is_root: bool,
+        current_rel: &str,
+        inline_mods: &[Option<&str>],
+        mod_name: &str,
+        path_attr: Option<&str>,
+    ) {
+        let out = match self.active_def.and_then(|id| self.defs.get_mut(id)) {
+            Some(def) => &mut def.children,
+            None => &mut self.top_children,
+        };
+        push_external_mod_ref(out, is_root, current_rel, inline_mods, mod_name, path_attr, self.alloc);
+    }
+
+    fn push_include(&mut self, current_rel: &str, inc_path: &str) {
+        if let Some(resolved) = normalize_rel_path(dir_of(current_rel), inc_path, self.alloc) {
+            let out = match self.active_def.and_then(|id| self.defs.get_mut(id)) {
+                Some(def) => &mut def.children,
+                None => &mut self.top_children,
+            };
+            out.push(ChildRef::Exact(resolved));
+        }
+    }
+
+    fn push_invocation(&mut self, name: &'s str) {
+        if let Some(id) = self.active_def {
+            if let Some(def) = self.defs.get_mut(id)
+                && !def.callees.iter().any(|existing| existing.as_str() == name)
+            {
+                def.callees.push(String::from_str_in(name, self.alloc));
+            }
+            return;
+        }
+        self.record_top_invoked(name);
+    }
+
+    fn enter_macro(&mut self, name: &'s str) -> Option<(usize, Option<usize>)> {
+        let id = self.defs.len();
+        self.defs.push(TreeMacroDef {
+            name: String::from_str_in(name, self.alloc),
+            reason: None,
+            callees: Vec::new_in(self.alloc),
+            children: Vec::new_in(self.alloc),
+            resolved: false,
+        });
+        let prev = self.active_def;
+        self.active_def = Some(id);
+        Some((id, prev))
+    }
+
+    fn leave_macro(&mut self, def_id: usize, prev_active: Option<usize>, reason: Option<NativeSourceReason>) {
+        if let Some(def) = self.defs.get_mut(def_id) {
+            def.reason = reason;
+        }
+        self.active_def = prev_active;
+    }
 }
 
 fn dir_of(path: &str) -> &str {
@@ -350,24 +691,60 @@ fn normalize_rel_path<'a>(base_dir: &str, rel: &str, alloc: Alloc<'a>) -> Option
 }
 
 fn scan_source_no_alloc(source: &str) -> Option<NativeSourceReason> {
-    scan_source_core(source, true, "", None)
+    let mut sink = StackSink::new();
+    if let Some(reason) = scan_source_core(source, true, "", 0, &mut sink) {
+        return Some(reason);
+    }
+    if sink.defs_len == 0 {
+        return None;
+    }
+    if sink.top_invoked_overflow {
+        sink.matching_only = true;
+        sink.active_def = None;
+        let _ = scan_source_core(source, true, "", 0, &mut sink);
+    }
+    sink.resolve_invoked_macros()
 }
 
-fn scan_source<'a>(
-    source: &str,
-    is_root: bool,
+fn scan_macro_rules_transcribers<'s, S: ScanSink<'s>>(
+    body_src: &'s str,
     current_rel: &str,
-    children: Option<&mut AVec<'a, ChildRef<'a>>>,
-    alloc: Alloc<'a>,
+    macro_depth: usize,
+    sink: &mut S,
 ) -> Option<NativeSourceReason> {
-    scan_source_core(source, is_root, current_rel, children.map(|out| (out, alloc)))
+    let mut rule_lex = Lexer::new(body_src);
+    let mut def_reason: Option<NativeSourceReason> = None;
+    while let Some(tok) = rule_lex.next_token() {
+        if tok == Token::Semi {
+            continue;
+        }
+        let Some(m_close) = closing_delim(tok) else {
+            break;
+        };
+        skip_delimited(&mut rule_lex, tok, m_close);
+        if rule_lex.next_token() != Some(Token::FatArrow) {
+            break;
+        }
+        let Some(t_open) = rule_lex.next_token() else { break };
+        let Some(t_close) = closing_delim(t_open) else { break };
+        let t_start = rule_lex.at;
+        let t_end = skip_delimited_end(&mut rule_lex, t_open, t_close);
+        if let Some(transcriber) = body_src.get(t_start..t_end)
+            && let Some(reason) = scan_source_core(transcriber, false, current_rel, macro_depth, sink)
+        {
+            def_reason = Some(reason);
+            break;
+        }
+    }
+    def_reason
 }
 
-fn scan_source_core<'a>(
-    source: &str,
+fn scan_source_core<'s, S: ScanSink<'s>>(
+    source: &'s str,
     is_root: bool,
     current_rel: &str,
-    mut child_sink: Option<(&mut AVec<'a, ChildRef<'a>>, Alloc<'a>)>,
+    macro_depth: usize,
+    sink: &mut S,
 ) -> Option<NativeSourceReason> {
     let mut lex = Lexer::new(source);
     let mut brace_stack = [false; 64];
@@ -412,12 +789,15 @@ fn scan_source_core<'a>(
             if let Some(cfg) = attr.cfg {
                 if inner {
                     if brace_depth == 0 {
-                        // Crate-level `#![cfg(...)]`: if false on WASI but not known-false on
-                        // Unix host (e.g. `#![cfg(unix)]`, `#![cfg(target_os = "linux")]`,
+                        // Crate-level `#![cfg(...)]` (when `is_root`): if false on WASI but not
+                        // known-false on Unix host (e.g. `#![cfg(unix)]`, `#![cfg(target_os = "linux")]`,
                         // `#![cfg(not(target_family = "wasm"))]`), compiling on WASI strips
-                        // `main()` and fails -> must run native! If false on BOTH host and WASI
-                        // (e.g. `#![cfg(windows)]`), the crate is inactive on both -> None.
+                        // `main()` and fails -> must run native. In a submodule (`!is_root`), a
+                        // top-level `#![cfg(...)]` that is false on WASI disables only that module.
                         if cfg.wasi == TriBool::False {
+                            if !is_root {
+                                return None;
+                            }
                             return if cfg.host != TriBool::False {
                                 Some(NativeSourceReason::HostFamilyCfg)
                             } else {
@@ -446,21 +826,33 @@ fn scan_source_core<'a>(
             continue;
         }
 
-        // Skip unexpanded `macro_rules! name { ... }` / `(...)` / `[...]` token trees completely
-        // so tokens inside macro definitions are never misclassified as compiled code.
+        // Handle `macro_rules! name { ... }` / `(...)` / `[...]`: never treat unexpanded tokens as
+        // directly compiled code, but record active definitions so macros that ARE invoked in
+        // active code still propagate their native requirements and child files.
         if tok == Token::Ident("macro_rules") {
             let mut look = lex;
             if look.next_token() == Some(Token::Bang)
-                && matches!(look.next_token(), Some(Token::Ident(_)))
+                && let Some(Token::Ident(macro_name)) = look.next_token()
                 && let Some(open) = look.next_token()
                 && let Some(close) = closing_delim(open)
             {
-                skip_delimited(&mut look, open, close);
+                let body_start = look.at;
+                let body_end = skip_delimited_end(&mut look, open, close);
                 if open != Token::LBrace {
                     let mut after = look;
                     if after.next_token() == Some(Token::Semi) {
                         look = after;
                     }
+                }
+                let is_excluded = excluded_depth > 0 || pending_excluded;
+                if !is_excluded
+                    && macro_depth < MAX_MACRO_DEPTH
+                    && let Some(body_src) = lex.src.get(body_start..body_end)
+                    && let Some((def_id, prev_active)) = sink.enter_macro(macro_name)
+                {
+                    let def_reason =
+                        scan_macro_rules_transcribers(body_src, current_rel, macro_depth + 1, sink);
+                    sink.leave_macro(def_id, prev_active, def_reason);
                 }
                 lex = look;
                 if pending_excluded && brace_depth == pending_depth && !stmt_needs_semi {
@@ -558,15 +950,20 @@ fn scan_source_core<'a>(
             match tok {
                 Token::Ident("std") if is_root_std_path(prev, prev_prev) => {
                     let mut look = lex;
-                    if look.next_token() == Some(Token::ColonColon)
-                        && look.next_token() == Some(Token::Ident("os"))
-                        && look.next_token() == Some(Token::ColonColon)
-                    {
+                    if look.next_token() == Some(Token::ColonColon) {
                         match look.next_token() {
-                            Some(Token::Ident("unix" | "linux" | "macos" | "fd")) => {
-                                return Some(NativeSourceReason::HostOsStd);
+                            Some(Token::Ident("os")) if look.next_token() == Some(Token::ColonColon) => {
+                                match look.next_token() {
+                                    Some(Token::Ident("unix" | "linux" | "macos")) => {
+                                        return Some(NativeSourceReason::HostOsStd);
+                                    }
+                                    Some(Token::LBrace) if os_group_mentions_host_os(&mut look, 0) => {
+                                        return Some(NativeSourceReason::HostOsStd);
+                                    }
+                                    _ => {}
+                                }
                             }
-                            Some(Token::LBrace) if brace_group_mentions_host_os(&mut look) => {
+                            Some(Token::LBrace) if std_group_mentions_host_os(&mut look, 0) => {
                                 return Some(NativeSourceReason::HostOsStd);
                             }
                             _ => {}
@@ -577,7 +974,7 @@ fn scan_source_core<'a>(
                     let mut look = lex;
                     match look.next_token() {
                         Some(Token::LBrace) => return Some(NativeSourceReason::ExternC),
-                        Some(Token::Str(_)) if look.next_token() == Some(Token::LBrace) => {
+                        Some(Token::Str(_) | Token::RawStr(_)) if look.next_token() == Some(Token::LBrace) => {
                             return Some(NativeSourceReason::ExternC);
                         }
                         _ => {}
@@ -611,17 +1008,13 @@ fn scan_source_core<'a>(
                         };
                         match look.next_token() {
                             Some(Token::Semi) => {
-                                if let Some((ref mut out, alloc)) = child_sink {
-                                    push_external_mod_ref(
-                                        out,
-                                        is_root,
-                                        current_rel,
-                                        mod_stack.get(..brace_len).unwrap_or(&[]),
-                                        mod_name,
-                                        attr_path,
-                                        alloc,
-                                    );
-                                }
+                                sink.push_external_mod(
+                                    is_root,
+                                    current_rel,
+                                    mod_stack.get(..brace_len).unwrap_or(&[]),
+                                    mod_name,
+                                    attr_path,
+                                );
                             }
                             Some(Token::LBrace) => {
                                 pending_inline_mod = Some(attr_path.unwrap_or(mod_name));
@@ -637,18 +1030,25 @@ fn scan_source_core<'a>(
                         && let Some(close) = closing_delim(open)
                     {
                         let mut body = look;
-                        if let Some(Token::Str(inc_path)) = body.next_token()
+                        if let Some(inc_path) = str_literal(body.next_token())
                             && body.next_token() == Some(close)
-                            && let Some((ref mut out, alloc)) = child_sink
-                            && let Some(resolved) = normalize_rel_path(dir_of(current_rel), inc_path, alloc)
                         {
-                            out.push(ChildRef::Exact(resolved));
+                            sink.push_include(current_rel, inc_path);
                         }
                         skip_delimited(&mut look, open, close);
                         lex = look;
                         prev_prev = prev;
                         prev = Some(close);
                         continue;
+                    }
+                }
+                Token::Ident(name) if !is_rust_keyword(name) => {
+                    let mut look = lex;
+                    if look.next_token() == Some(Token::Bang)
+                        && let Some(open) = look.next_token()
+                        && closing_delim(open).is_some()
+                    {
+                        sink.push_invocation(name);
                     }
                 }
                 _ => {}
@@ -722,8 +1122,9 @@ fn push_external_mod_ref<'a>(
 enum Token<'a> {
     Ident(&'a str),
     Str(&'a str),
-    RawStr,
+    RawStr(&'a str),
     ColonColon,
+    FatArrow,
     Pound,
     Bang,
     Eq,
@@ -736,6 +1137,57 @@ enum Token<'a> {
     LBrace,
     RBrace,
     Other,
+}
+
+fn str_literal(tok: Option<Token<'_>>) -> Option<&str> {
+    match tok {
+        Some(Token::Str(s) | Token::RawStr(s)) => Some(s),
+        _ => None,
+    }
+}
+
+fn is_rust_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "as" | "async"
+            | "await"
+            | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "fn"
+            | "for"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "pub"
+            | "ref"
+            | "return"
+            | "self"
+            | "Self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "type"
+            | "unsafe"
+            | "use"
+            | "where"
+            | "while"
+            | "yield"
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -808,7 +1260,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn try_scan_raw_string(&mut self, prefix_len: usize) -> bool {
+    fn try_scan_raw_string(&mut self, prefix_len: usize) -> Option<&'a str> {
         let mut off = prefix_len;
         let mut hashes: usize = 0;
         while self.peek_byte(off) == Some(b'#') {
@@ -816,23 +1268,26 @@ impl<'a> Lexer<'a> {
             off += 1;
         }
         if self.peek_byte(off) != Some(b'"') {
-            return false;
+            return None;
         }
         self.at += off + 1;
+        let start = self.at;
+        let mut end = self.at;
         while let Some(b) = self.peek_byte(0) {
-            self.at += 1;
             if b == b'"' {
                 let mut matched = 0;
-                while matched < hashes && self.peek_byte(matched) == Some(b'#') {
+                while matched < hashes && self.peek_byte(1 + matched) == Some(b'#') {
                     matched += 1;
                 }
                 if matched == hashes {
-                    self.at += hashes;
+                    end = self.at;
+                    self.at += 1 + hashes;
                     break;
                 }
             }
+            self.at += 1;
         }
-        true
+        Some(self.src.get(start..end).unwrap_or(""))
     }
 
     fn scan_quoted_string(&mut self) -> &'a str {
@@ -928,8 +1383,8 @@ impl<'a> Lexer<'a> {
                 Some(Token::Other)
             }
             b'r' => {
-                if self.try_scan_raw_string(1) {
-                    return Some(Token::RawStr);
+                if let Some(raw) = self.try_scan_raw_string(1) {
+                    return Some(Token::RawStr(raw));
                 }
                 if self.peek_byte(1) == Some(b'#') {
                     self.at += 2;
@@ -945,14 +1400,14 @@ impl<'a> Lexer<'a> {
                 if self.peek_byte(1) == Some(b'"') {
                     self.at += 1;
                     let _ = self.scan_quoted_string();
-                    return Some(Token::RawStr);
+                    return Some(Token::Other);
                 }
                 if b == b'b' && self.peek_byte(1) == Some(b'\'') {
                     self.scan_byte_char_literal();
                     return Some(Token::Other);
                 }
-                if self.peek_byte(1) == Some(b'r') && self.try_scan_raw_string(2) {
-                    return Some(Token::RawStr);
+                if self.peek_byte(1) == Some(b'r') && self.try_scan_raw_string(2).is_some() {
+                    return Some(Token::Other);
                 }
                 let start = self.at;
                 self.at += 1;
@@ -972,8 +1427,13 @@ impl<'a> Lexer<'a> {
                 Some(Token::Bang)
             }
             b'=' => {
-                self.at += 1;
-                Some(Token::Eq)
+                if self.peek_byte(1) == Some(b'>') {
+                    self.at += 2;
+                    Some(Token::FatArrow)
+                } else {
+                    self.at += 1;
+                    Some(Token::Eq)
+                }
             }
             b',' => {
                 self.at += 1;
@@ -1044,14 +1504,23 @@ fn closing_delim(open: Token<'_>) -> Option<Token<'_>> {
 }
 
 fn skip_delimited(lex: &mut Lexer<'_>, open: Token<'_>, close: Token<'_>) {
+    let _ = skip_delimited_end(lex, open, close);
+}
+
+fn skip_delimited_end(lex: &mut Lexer<'_>, open: Token<'_>, close: Token<'_>) -> usize {
     let mut depth: usize = 1;
-    while let Some(tok) = lex.next_token() {
+    loop {
+        lex.skip_ws_and_comments();
+        let tok_start = lex.at;
+        let Some(tok) = lex.next_token() else {
+            return lex.src.len();
+        };
         if tok == open {
             depth += 1;
         } else if tok == close {
             depth -= 1;
             if depth == 0 {
-                break;
+                return tok_start;
             }
         }
     }
@@ -1099,35 +1568,111 @@ fn is_root_std_path(prev: Option<Token<'_>>, prev_prev: Option<Token<'_>>) -> bo
     }
 }
 
-/// Inspects a grouped `use std::os::{ ... }` list right after `{` for `unix`, `linux`, `macos`,
-/// or `fd` at top level of the group.
-fn brace_group_mentions_host_os(lex: &mut Lexer<'_>) -> bool {
-    let mut depth: usize = 1;
-    let mut at_item_start = true;
+/// Skips the remainder of one comma-separated item inside a `{ ... }` `use` tree group.
+/// Returns `true` when another item follows (stopped at `,`), or `false` when the enclosing
+/// group ended (stopped at `}` or EOF).
+fn skip_group_item(lex: &mut Lexer<'_>) -> bool {
+    let mut nested: usize = 0;
     while let Some(tok) = lex.next_token() {
         match tok {
-            Token::LBrace => {
-                depth += 1;
-                at_item_start = false;
-            }
+            Token::LBrace => nested += 1,
             Token::RBrace => {
-                depth -= 1;
-                if depth == 0 {
+                if nested == 0 {
                     return false;
                 }
+                nested -= 1;
             }
-            Token::Comma if depth == 1 => {
-                at_item_start = true;
-            }
-            Token::Ident("unix" | "linux" | "macos" | "fd") if depth == 1 && at_item_start => {
-                return true;
-            }
-            _ => {
-                at_item_start = false;
-            }
+            Token::Comma if nested == 0 => return true,
+            _ => {}
         }
     }
     false
+}
+
+/// Inspects a grouped `use std::os::{ ... }` list right after `{` for `unix`, `linux`, or `macos`
+/// at top level of the group (`std::os::fd` is exposed on WASI and stays Wasm).
+fn os_group_mentions_host_os(lex: &mut Lexer<'_>, depth: usize) -> bool {
+    if depth > 16 {
+        skip_delimited(lex, Token::LBrace, Token::RBrace);
+        return false;
+    }
+    loop {
+        match lex.next_token() {
+            None | Some(Token::RBrace) => return false,
+            Some(Token::Comma) => continue,
+            Some(Token::Ident("unix" | "linux" | "macos")) => return true,
+            Some(Token::LBrace) => {
+                skip_delimited(lex, Token::LBrace, Token::RBrace);
+                if !skip_group_item(lex) {
+                    return false;
+                }
+            }
+            Some(_) => {
+                if !skip_group_item(lex) {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+/// Inspects a grouped `use std::{ ... }` list right after `{` for any `os::unix`, `os::linux`,
+/// `os::macos`, or nested `os::{ ... }` branch referencing a host-only OS module.
+fn std_group_mentions_host_os(lex: &mut Lexer<'_>, depth: usize) -> bool {
+    if depth > 16 {
+        skip_delimited(lex, Token::LBrace, Token::RBrace);
+        return false;
+    }
+    loop {
+        match lex.next_token() {
+            None | Some(Token::RBrace) => return false,
+            Some(Token::Comma) => continue,
+            Some(Token::Ident("os")) => match lex.next_token() {
+                Some(Token::ColonColon) => match lex.next_token() {
+                    Some(Token::Ident("unix" | "linux" | "macos")) => return true,
+                    Some(Token::LBrace) => {
+                        if os_group_mentions_host_os(lex, depth + 1) {
+                            return true;
+                        }
+                        if !skip_group_item(lex) {
+                            return false;
+                        }
+                    }
+                    Some(Token::RBrace) | None => return false,
+                    Some(Token::Comma) => continue,
+                    Some(_) => {
+                        if !skip_group_item(lex) {
+                            return false;
+                        }
+                    }
+                },
+                Some(Token::RBrace) | None => return false,
+                Some(Token::Comma) => continue,
+                Some(Token::LBrace) => {
+                    skip_delimited(lex, Token::LBrace, Token::RBrace);
+                    if !skip_group_item(lex) {
+                        return false;
+                    }
+                }
+                Some(_) => {
+                    if !skip_group_item(lex) {
+                        return false;
+                    }
+                }
+            },
+            Some(Token::LBrace) => {
+                skip_delimited(lex, Token::LBrace, Token::RBrace);
+                if !skip_group_item(lex) {
+                    return false;
+                }
+            }
+            Some(_) => {
+                if !skip_group_item(lex) {
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 /// 3-valued truth value of a `cfg` predicate on a target class.
@@ -1209,7 +1754,7 @@ fn parse_attr<'a>(lex: &mut Lexer<'a>) -> ParsedAttr<'a> {
             out.cfg = Some(eval_cfg_pair(&mut look, 0));
         }
         Some(Token::Ident("path")) if look.next_token() == Some(Token::Eq) => {
-            if let Some(Token::Str(val)) = look.next_token() {
+            if let Some(val) = str_literal(look.next_token()) {
                 out.path = Some(val);
             }
         }
@@ -1313,7 +1858,7 @@ fn eval_cfg_pair(lex: &mut Lexer<'_>, depth: usize) -> CfgEval {
         }
         Some(Token::Eq) => {
             *lex = look;
-            let Some(Token::Str(val)) = lex.next_token() else { return CfgEval::UNKNOWN };
+            let Some(val) = str_literal(lex.next_token()) else { return CfgEval::UNKNOWN };
             match (name, val) {
                 ("target_family", "unix") => {
                     CfgEval { host: TriBool::True, wasi: TriBool::False, family_div: true }

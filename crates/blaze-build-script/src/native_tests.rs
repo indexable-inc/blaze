@@ -7,9 +7,9 @@ use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKin
 use edition::PackageEdition;
 
 use crate::native::{
-    Closure, NO_WASM_CLASS, NativeSourceReason, PackageSource, Runner, closure,
-    closure_with_source, placement_with_source, source_requires_native,
-    source_tree_requires_native,
+    Closure, MAX_SCRIPT_FILES, NO_WASM_CLASS, NativeSourceReason, PackageSource, Runner,
+    ScriptSourceError, closure, closure_with_source, placement_with_source,
+    source_requires_native, source_tree_requires_native,
 };
 use crate::toolchain::Mode;
 
@@ -144,18 +144,32 @@ fn kvm_ioctls_host_os_std_and_unsafe_extern_c_classify_native() {
     "#;
     assert_eq!(source_requires_native(unsafe_extern_system), Some(NativeSourceReason::ExternC));
 
-    let global_std_os_fd = r#"
+    let global_std_os_unix = r#"
         fn main() {
-            let _ = ::std::os::fd::AsRawFd::as_raw_fd;
+            let _ = ::std::os::unix::io::AsRawFd::as_raw_fd;
         }
     "#;
-    assert_eq!(source_requires_native(global_std_os_fd), Some(NativeSourceReason::HostOsStd));
+    assert_eq!(source_requires_native(global_std_os_unix), Some(NativeSourceReason::HostOsStd));
 
     let grouped_std_os = r#"
         use std::os::{unix::io::AsRawFd};
         fn main() {}
     "#;
     assert_eq!(source_requires_native(grouped_std_os), Some(NativeSourceReason::HostOsStd));
+
+    // Nested grouped `std::{ ... }` imports referencing `os::{unix,linux,macos}` classify Native.
+    for grouped in [
+        "use std::{env, os::unix::fs::MetadataExt};\nfn main() {}",
+        "use ::std::{fs::{File, OpenOptions}, os::{self, linux::fs::MetadataExt}};\nfn main() {}",
+        "use std::os::{fd::{AsFd, OwnedFd}, unix::io::AsRawFd};\nfn main() {}",
+        "use std::{env::var, os::fd::AsFd, os::macos::fs::MetadataExt};\nfn main() {}",
+    ] {
+        assert_eq!(
+            source_requires_native(grouped),
+            Some(NativeSourceReason::HostOsStd),
+            "expected HostOsStd for grouped import: {grouped}"
+        );
+    }
 
     let wasm_closure = Closure { runner: Runner::Wasm, no_wasm: None };
     for mode in [Mode::Check, Mode::Build, Mode::Run] {
@@ -362,6 +376,102 @@ fn negative_controls_stay_wasm() {
         }
     "#;
     assert_eq!(source_requires_native(identical_cfgs), None);
+
+    // 12. `std::os::fd` is exposed on `target_os = "wasi"` and MUST stay Wasm in direct, global,
+    //     and grouped import forms.
+    for fd_src in [
+        "use std::os::fd::AsFd;\nfn main() {}",
+        "fn main() { let _ = ::std::os::fd::AsRawFd::as_raw_fd; }",
+        "use std::{env, os::fd::{AsFd, OwnedFd}};\nfn main() {}",
+        "use std::os::{fd::{AsFd, OwnedFd}, raw::c_int};\nfn main() {}",
+    ] {
+        assert_eq!(
+            source_requires_native(fd_src),
+            None,
+            "expected Wasm-safe for std::os::fd script: {fd_src}"
+        );
+    }
+
+    // 13. Macro invocations inside WASI-excluded `#[cfg(unix)]` items and `#[cfg(unix)]`
+    //     macro_rules! definitions MUST NOT trigger native placement.
+    let guarded_macro_use = r#"
+        macro_rules! use_unix {
+            () => { use std::os::unix::fs::MetadataExt; };
+        }
+        #[cfg(unix)]
+        fn unix_only() {
+            use_unix!();
+        }
+        #[cfg(unix)]
+        macro_rules! unix_def {
+            () => { extern "C" { fn f(); } };
+        }
+        #[cfg(not(unix))]
+        macro_rules! unix_def {
+            () => {};
+        }
+        fn main() {
+            #[cfg(unix)]
+            use_unix!();
+            unix_def!();
+        }
+    "#;
+    assert_eq!(source_requires_native(guarded_macro_use), None);
+}
+
+#[test]
+fn invoked_macro_rules_preserve_native_requirements() {
+    // Direct invocation of a macro_rules! expanding to std::os::unix.
+    let direct = r#"
+        macro_rules! use_unix {
+            () => { use std::os::unix::fs::MetadataExt; };
+        }
+        fn main() {
+            use_unix!();
+        }
+    "#;
+    assert_eq!(source_requires_native(direct), Some(NativeSourceReason::HostOsStd));
+
+    // Transitive macro_rules! invocation (`outer!` -> `inner!` -> `extern "C"`).
+    let transitive = r#"
+        macro_rules! inner {
+            () => { extern "C" { fn f(); } };
+        }
+        macro_rules! outer {
+            () => { inner!(); };
+        }
+        fn main() {
+            outer!();
+        }
+    "#;
+    assert_eq!(source_requires_native(transitive), Some(NativeSourceReason::ExternC));
+
+    // Matcher containing `#[cfg(unix)]` must NOT suppress scanning the transcriber body.
+    let cfg_in_matcher = r#"
+        macro_rules! m {
+            (#[cfg(unix)] $i:ident) => {
+                extern "C" { fn $i(); }
+            };
+        }
+        fn main() {
+            m!(#[cfg(unix)] probe);
+        }
+    "#;
+    assert_eq!(source_requires_native(cfg_in_matcher), Some(NativeSourceReason::ExternC));
+
+    // Invoked macro whose own transcriber guards host-OS with `#[cfg(unix)]` stays Wasm.
+    let guarded_inside_macro = r#"
+        macro_rules! maybe_unix {
+            () => {
+                #[cfg(unix)]
+                use std::os::unix::fs::MetadataExt;
+            };
+        }
+        fn main() {
+            maybe_unix!();
+        }
+    "#;
+    assert_eq!(source_requires_native(guarded_inside_macro), None);
 }
 
 #[test]
@@ -406,7 +516,7 @@ fn negated_and_diverging_cfg_macros_and_crate_level_cfg_classify_native() {
 fn source_tree_inspects_submodules_path_attr_and_include_files() {
     let alloc = Alloc::global();
 
-    let scan = |files: &[(&str, &str)]| -> Result<Option<NativeSourceReason>, &'static str> {
+    let scan = |files: &[(&str, &str)]| -> Result<Option<NativeSourceReason>, ScriptSourceError<'static, &'static str>> {
         source_tree_requires_native("build.rs", alloc, |rel, _is_root, visit| {
             if let Some((_, text)) = files.iter().find(|(p, _)| *p == rel) {
                 visit(text);
@@ -476,7 +586,83 @@ fn source_tree_inspects_submodules_path_attr_and_include_files() {
     let err = source_tree_requires_native("build.rs", alloc, |_rel, _is_root, _visit| -> Result<bool, &'static str> {
         Err("corrupt pack")
     });
-    assert_eq!(err, Err("corrupt pack"));
+    assert_eq!(err, Err(ScriptSourceError::Read("corrupt pack")));
+
+    // 8. Raw-string `include!(r#"host.rs"#)` and `#[path = r#"helpers/probe.rs"#] mod probe;`.
+    assert_eq!(
+        scan(&[
+            ("build.rs", "include!(r#\"host.rs\"#);\nfn main() {}"),
+            ("host.rs", "use std::os::unix::io::AsRawFd;"),
+        ]),
+        Ok(Some(NativeSourceReason::HostOsStd))
+    );
+    assert_eq!(
+        scan(&[
+            ("build.rs", "#[path = r#\"helpers/probe.rs\"#]\nmod probe;\nfn main() {}"),
+            ("helpers/probe.rs", "extern \"C\" { fn ioctl(); }"),
+        ]),
+        Ok(Some(NativeSourceReason::ExternC))
+    );
+
+    // 9. Cross-file invoked macro_rules! (`macros.rs` defines macro, `build.rs` invokes it) and
+    //    invoked macro expanding to `include!("host.rs")`.
+    assert_eq!(
+        scan(&[
+            ("build.rs", "#[macro_use]\nmod macros;\nfn main() { use_unix!(); }"),
+            ("macros.rs", "macro_rules! use_unix { () => { use std::os::unix::fs::MetadataExt; }; }"),
+        ]),
+        Ok(Some(NativeSourceReason::HostOsStd))
+    );
+    assert_eq!(
+        scan(&[
+            ("build.rs", "macro_rules! load_host { () => { include!(\"host.rs\"); }; }\nfn main() { load_host!(); }"),
+            ("host.rs", "extern \"C\" { fn access(); }"),
+        ]),
+        Ok(Some(NativeSourceReason::ExternC))
+    );
+    assert_eq!(
+        scan(&[
+            ("build.rs", "macro_rules! load_host { () => { include!(\"host.rs\"); }; }\nfn main() {}"),
+            ("host.rs", "extern \"C\" { fn access(); }"),
+        ]),
+        Ok(None)
+    );
+
+    // 10. Submodule-level `#![cfg(unix)]` disables only that submodule under WASI (does NOT strip
+    //     crate `main()`), so it stays Wasm.
+    assert_eq!(
+        scan(&[
+            ("build.rs", "mod unix_only;\nfn main() {}"),
+            ("unix_only.rs", "#![cfg(unix)]\nuse std::os::unix::io::AsRawFd;"),
+        ]),
+        Ok(None)
+    );
+
+    // 11. Exceeding MAX_SCRIPT_FILES (256) returns typed ScriptSourceError::TooManyFiles rather
+    //     than silently treating an incomplete scan as Wasm-safe.
+    let mut chain: std::vec::Vec<(std::string::String, std::string::String)> = std::vec::Vec::new();
+    chain.push(("build.rs".to_owned(), "include!(\"f1.rs\");\nfn main() {}".to_owned()));
+    for i in 1..=MAX_SCRIPT_FILES {
+        let next = i + 1;
+        let body = if i < MAX_SCRIPT_FILES {
+            format!("include!(\"f{next}.rs\");")
+        } else {
+            "use std::os::unix::io::AsRawFd;".to_owned()
+        };
+        chain.push((format!("f{i}.rs"), body));
+    }
+    let over_limit = source_tree_requires_native("build.rs", alloc, |rel, _is_root, visit| -> Result<bool, &'static str> {
+        if let Some((_, text)) = chain.iter().find(|(p, _)| p == rel) {
+            visit(text);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    });
+    assert!(
+        matches!(over_limit, Err(ScriptSourceError::TooManyFiles { limit: MAX_SCRIPT_FILES, .. })),
+        "expected TooManyFiles error for >{MAX_SCRIPT_FILES} files, got: {over_limit:?}"
+    );
 }
 
 #[test]

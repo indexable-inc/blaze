@@ -104,6 +104,9 @@ pub enum UnitScriptError {
     /// A script placed native (D112) asked to run for a side's cfg (`target`): the native
     /// runner builds for the machine, never for that side (ruling D115 (2), rule 3).
     NativeOnSide { package: String, target: String },
+    /// Inspecting the script's source tree to classify Wasm vs Native placement failed
+    /// (e.g. non-UTF-8 source, read failure, or exceeding the file scan limit; rule 54).
+    ScriptSource { package: blaze_own::AString<'static>, why: blaze_own::AString<'static> },
 }
 
 impl std::fmt::Display for UnitScriptError {
@@ -132,6 +135,7 @@ impl std::fmt::Display for UnitScriptError {
                 f,
                 "the build script of {package} runs native (D112), and a native run builds for the machine, not for `{target}`: it is not run for that side (D115 (2))"
             ),
+            UnitScriptError::ScriptSource { package, why } => write!(f, "the build script of {package}: {why}"),
         }
     }
 }
@@ -874,6 +878,12 @@ pub fn classify_script_tree_in<'a>(
         }
         Ok(true)
     })
+    .map_err(|err| match err {
+        blaze_build_script::native::ScriptSourceError::Read(e) => e,
+        blaze_build_script::native::ScriptSourceError::TooManyFiles { limit, path } => {
+            blaze_own::format_in!(alloc, "build-script source tree exceeded {limit} files at `{}`", path.as_str())
+        }
+    })
 }
 
 /// `script`'s outputs, run as wasm, or native when [`placed`] says so for the setting's mode
@@ -895,7 +905,7 @@ pub fn outputs<'a>(
     if unit.kind != UnitKind::BuildScript {
         return Err(UnitScriptError::NotAScript { unit: script });
     }
-    let runner = resolve_tree_runner(setting, graph, script, unit, &tree, &root, alloc);
+    let runner = resolve_tree_runner(setting, graph, script, unit, &tree, &root, alloc)?;
     match runner {
         Runner::Wasm => {
             let prepared = prepare(runtime, setting, graph, script, tree, root, deps, alloc)?;
@@ -937,13 +947,18 @@ fn resolve_tree_runner(
     tree: &Tree,
     root: &ScriptRoot,
     alloc: Alloc<'_>,
-) -> Runner {
+) -> Result<Runner, UnitScriptError> {
     let base = crate::native_unit::placed_in_store(setting.store, graph, script, setting.mode, setting.host, alloc);
     if matches!(base, Runner::Native { .. }) {
-        return base;
+        return Ok(base);
     }
-    let source_reason = classify_script_tree_in(tree, root, unit.root.as_str(), false, alloc, |_, _| {}).ok().flatten();
-    crate::native_unit::placed_in_store_with_lock_and_source(
+    let source_reason = classify_script_tree_in(tree, root, unit.root.as_str(), false, alloc, |_, _| {}).map_err(|why| {
+        UnitScriptError::ScriptSource {
+            package: blaze_own::AString::from_str_in(&package(unit), Alloc::global()),
+            why: blaze_own::AString::from_str_in(why.as_str(), Alloc::global()),
+        }
+    })?;
+    Ok(crate::native_unit::placed_in_store_with_lock_and_source(
         setting.store,
         graph,
         None,
@@ -952,7 +967,7 @@ fn resolve_tree_runner(
         setting.host,
         source_reason,
         alloc,
-    )
+    ))
 }
 
 /// [`outputs_viewing`] for the side whose cfg is `side_cfg` ([`prepare_viewing_on`]). A script
@@ -996,7 +1011,7 @@ pub fn outputs_viewing_on_placed<'a>(
     }
     let runner = match planned_runner {
         Some(runner) => runner,
-        None => resolve_tree_runner(setting, graph, script, unit, &tree, &root, alloc),
+        None => resolve_tree_runner(setting, graph, script, unit, &tree, &root, alloc)?,
     };
     match runner {
         Runner::Wasm => {

@@ -209,6 +209,13 @@ fn classify_script_source_in_files<'s>(
                 Ok(true)
             }
         }
+    })
+    .map_err(|err| match err {
+        blaze_build_script::native::ScriptSourceError::Read(e) => e,
+        blaze_build_script::native::ScriptSourceError::TooManyFiles { limit, path } => {
+            let msg = blaze_own::format_in!(alloc, "build-script source tree exceeded {limit} files at `{}`", path.as_str());
+            &*scratch.alloc_str(msg.as_str())
+        }
     })?;
     Ok((reason, hasher.finish()))
 }

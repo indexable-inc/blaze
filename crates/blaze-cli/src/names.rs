@@ -2076,6 +2076,13 @@ fn classify_script_source_in_world<'s>(
             Ok(true)
         }
     })
+    .map_err(|err| match err {
+        blaze_build_script::native::ScriptSourceError::Read(e) => e,
+        blaze_build_script::native::ScriptSourceError::TooManyFiles { limit, path } => {
+            let msg = blaze_own::format_in!(alloc, "build-script source tree exceeded {limit} files");
+            script_source_error(package, path.as_str(), msg.as_str())
+        }
+    })
 }
 
 /// Evaluates `compute(crate_at, script_id)` at most once per unique `script_id` across all crate
