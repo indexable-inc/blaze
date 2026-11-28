@@ -602,7 +602,7 @@ const LAID_MTIME: u64 = 946_684_800;
 /// The runner's form, in the tree's key (c_tasks_tree.rs `TreeInputs::runner`): what
 /// [`ShelfTree`] adds to the environment and how it lays the state. A change to either is a
 /// new form.
-pub const TREE_RUNNER: &str = "native_c_tasks ShelfTree 1";
+pub const TREE_RUNNER: &str = "native_c_tasks ShelfTree 2";
 
 /// The host tools one crate's tree may start (pins/clang.json `host_tools`, `granted` to its
 /// package), each by its SHA-256 (native_runner_c.rs), and the OS build their libraries and
@@ -780,6 +780,11 @@ fn holds(bytes: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle)
 }
 
+/// Writes `bytes` to `path` inside a process tree's staging directory.
+fn write_tree_file<E>(path: &str, bytes: &[u8], on_err: impl FnOnce(&dyn fmt::Display) -> E) -> Result<(), E> {
+    std::fs::write(path, bytes).map_err(|e| on_err(&e))
+}
+
 /// Lays `entries` (an `OUT_DIR` state: c_tasks.rs `laid_state`) at `folder`, made anew: each
 /// file at [`LAID_MTIME`], one that begins `#!` executable (`make` starts a tree's own
 /// `install-sh` by its path).
@@ -791,18 +796,18 @@ fn lay_tree<'a>(entries: &[(&str, Option<&[u8]>)], folder: &str, alloc: Alloc<'a
             return Err(words(&format!("the state names `{name}`, which is not a path under OUT_DIR")));
         }
         let path = format!("{folder}/{name}");
-        let failed = |e: std::io::Error| words(&format!("{path}: {e}"));
+        let failed = |e: &dyn fmt::Display| words(&format!("{path}: {e}"));
         match bytes {
-            None => std::fs::create_dir_all(&path).map_err(failed)?,
+            None => std::fs::create_dir_all(&path).map_err(|e| failed(&e))?,
             Some(bytes) => {
                 if let Some((parent, _)) = path.rsplit_once('/') {
-                    std::fs::create_dir_all(parent).map_err(failed)?;
+                    std::fs::create_dir_all(parent).map_err(|e| failed(&e))?;
                 }
-                std::fs::write(&path, bytes).map_err(failed)?;
-                let file = std::fs::File::options().write(true).open(&path).map_err(failed)?;
-                file.set_modified(laid_at).map_err(failed)?;
+                write_tree_file(&path, bytes, failed)?;
+                let file = std::fs::File::options().write(true).open(&path).map_err(|e| failed(&e))?;
+                file.set_modified(laid_at).map_err(|e| failed(&e))?;
                 let mode = if bytes.starts_with(b"#!") { 0o755 } else { 0o644 };
-                file.set_permissions(std::fs::Permissions::from_mode(mode)).map_err(failed)?;
+                file.set_permissions(std::fs::Permissions::from_mode(mode)).map_err(|e| failed(&e))?;
             }
         }
     }
@@ -924,6 +929,41 @@ impl TreeRunner for ShelfTree<'_> {
         } else {
             None
         };
+        // Stage Linux Clang config files inside `<folder>/` (outside `<folder>/out`) and apply
+        // them via `CCC_OVERRIDE_OPTIONS="#^--config=<path>"` rather than injecting host paths
+        // into `CFLAGS`/`LDFLAGS`. That keeps `configure`-generated `Makefile`/`config.status`
+        // free of host `sdk`, `sdk_lib`, `sdk_rpaths`, `dynamic_linker`, `shelf`, and `folder`
+        // paths so step 6 never triggers `TreeRan::HostPath`, while still giving every `clang` /
+        // `clang++` invocation `-resource-dir`, `--sysroot`, `-ffile-prefix-map`, and Nix link
+        // flags automatically.
+        let linux_clang_cfgs: Option<(AString<'a>, AString<'a>)> = if setting.sysroot == Sysroot::LinuxHost {
+            let mut rpath_hosts: AVec<'a, &str> = Vec::with_capacity_in(setting.sdk_rpaths.len(), alloc);
+            for rpath in setting.sdk_rpaths {
+                rpath_hosts.push(rpath.host);
+            }
+            let link = LinuxTreeLink {
+                lib_dir: setting.sdk_lib.map(|l| l.host),
+                dynamic_linker: setting.sdk_dynamic_linker,
+                rpaths: rpath_hosts.as_slice(),
+                ld_lld: ld_lld_path.as_deref(),
+            };
+            let cfg_default = joined(&[folder.as_str(), "/clang.cfg"], alloc);
+            let cfg_custom = joined(&[folder.as_str(), "/clang-custom-sysroot.cfg"], alloc);
+            if cfg_default.as_str().bytes().any(|b| b.is_ascii_whitespace()) {
+                return Err(fail(&[cfg_default.as_str(), ": process-tree clang config path contains whitespace"]));
+            }
+            let default_text = format_linux_clang_cfg(sdk, link, &shown, shelf, true, alloc);
+            write_tree_file(cfg_default.as_str(), default_text.as_bytes(), |_| {
+                fail(&[cfg_default.as_str(), ": could not write process-tree clang config"])
+            })?;
+            let custom_text = format_linux_clang_cfg(sdk, link, &shown, shelf, false, alloc);
+            write_tree_file(cfg_custom.as_str(), custom_text.as_bytes(), |_| {
+                fail(&[cfg_custom.as_str(), ": could not write process-tree custom-sysroot clang config"])
+            })?;
+            Some((cfg_default, cfg_custom))
+        } else {
+            None
+        };
         for tool in self.tools.tools {
             for program in tool.programs_in(shelf, alloc) {
                 if Path::new(program.as_str()).exists() {
@@ -1021,27 +1061,15 @@ impl TreeRunner for ShelfTree<'_> {
             if !set(&vars, "RANLIB") {
                 vars.push((String::from_str_in("RANLIB", alloc), joined(&[shelf, "/bin/llvm-ar s"], alloc)));
             }
-            // The maps on every compiler flag var the tree's compiles may take (`CFLAGS`,
-            // `CXXFLAGS`, `CPPFLAGS`, `ASFLAGS`), whether set or unset: no host folder reaches
-            // any C, C++, preprocessed, or assembly object's debug information (rule 25, rule 54).
-            inject_prefix_map_flags(&mut vars, &shown, alloc);
-            let mut rpath_hosts: AVec<'a, &str> = Vec::with_capacity_in(setting.sdk_rpaths.len(), alloc);
-            for rpath in setting.sdk_rpaths {
-                rpath_hosts.push(rpath.host);
+            // On Linux, all `-resource-dir`, `--sysroot`, `-ffile-prefix-map`, and split-libc link
+            // flags live in `<folder>/clang.cfg` via `CCC_OVERRIDE_OPTIONS` so `CFLAGS` and
+            // `LDFLAGS` carry no host paths into generated `Makefile` / `config.status` files.
+            // On macOS, inject `-ffile-prefix-map` directly into compiler flag vars as before.
+            if let Some((cfg_default, cfg_custom)) = linux_clang_cfgs.as_ref() {
+                inject_linux_clang_override(&mut vars, cfg_default.as_str(), cfg_custom.as_str(), alloc);
+            } else {
+                inject_prefix_map_flags(&mut vars, &shown, alloc);
             }
-            inject_linux_sysroot_flags(
-                &mut vars,
-                setting.sysroot,
-                sdk,
-                LinuxTreeLink {
-                    lib_dir: setting.sdk_lib.map(|l| l.host),
-                    dynamic_linker: setting.sdk_dynamic_linker,
-                    rpaths: rpath_hosts.as_slice(),
-                    ld_lld: ld_lld_path.as_deref(),
-                },
-                shelf,
-                alloc,
-            );
             for (name, value) in tool_env.iter() {
                 vars.push((name.clone_in(alloc), value.clone_in(alloc)));
             }
@@ -1252,128 +1280,154 @@ fn has_driver_sysroot(flags: &str) -> bool {
     found
 }
 
-/// Whether `flags` already contains a Clang driver resource-dir option (`-resource-dir` or
-/// `-resource-dir=...`).
-fn has_driver_resource_dir(flags: &str) -> bool {
-    let mut found = false;
-    for_each_flag_token(flags, |tok| {
-        if tok == "-resource-dir" || tok.starts_with("-resource-dir=") {
-            found = true;
+/// Whether any compiler flag variable in [`PREFIX_MAP_FLAG_VARS`] already carries a Clang driver
+/// sysroot option (`--sysroot` or `-isysroot`, ignoring `-Wl,--sysroot=...`).
+fn any_driver_sysroot(vars: &AVec<'_, (AString<'_>, AString<'_>)>) -> bool {
+    for var_name in PREFIX_MAP_FLAG_VARS {
+        if let Some(at) = vars.iter().rposition(|(name, _)| name.as_str() == var_name)
+            && let Some((_, value)) = vars.get(at)
+            && has_driver_sysroot(value.as_str())
+        {
+            return true;
         }
-    });
-    found
+    }
+    false
 }
 
-/// For `Sysroot::LinuxHost`, injects:
-/// - `-resource-dir <shelf>/lib/clang/<major>` into every variable in [`PREFIX_MAP_FLAG_VARS`]
-///   that does not already specify a driver `-resource-dir` option (always required under Linux
-///   Landlock where `/proc/self/exe` is outside the roots, even with a custom `--sysroot`);
-/// - Linux sysroot/include flags (`--sysroot=...` and, for flat NixOS roots,
-///   `-idirafter <sdk>/include`) into every variable in [`PREFIX_MAP_FLAG_VARS`] that does not
-///   already carry a driver `--sysroot` or `-isysroot` option (ignoring `-Wl,--sysroot=...`);
+/// Appends `text` as a double-quoted Clang config-file token (escaping `\` and `"`), followed by
+/// a newline.
+fn push_cfg_quoted<'a>(out: &mut AString<'a>, text: &str) {
+    out.push('"');
+    for ch in text.chars() {
+        if ch == '\\' || ch == '"' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out.push('\n');
+}
+
+/// Formats a Clang config file (`--config=<path>`) for a `Sysroot::LinuxHost` process tree:
+/// - `-resource-dir <shelf>/lib/clang/<major>` (always required under Linux Landlock where
+///   `/proc/self/exe` is outside the roots, even when the step sets a custom `--sysroot`);
+/// - `--sysroot=<prefix>` when `include_sysroot` is `true` (stripping trailing `/usr` for FHS
+///   roots so `/usr` -> `--sysroot=/`, or using flat NixOS `<sdk>` directly so Clang searches
+///   `<sdk>/include` without leaking `<sdk>/include` if a user CLI `--sysroot=/custom` overrides);
+/// - `-ffile-prefix-map=<host>=<guest>` for every pair in `shown` so debug info stays free of
+///   host folders (rule 25, rule 54);
 /// - When `link.lib_dir` is `Some(lib_dir)` (NixOS split glibc runtime), link flags
-///   (`-B<lib_dir> -L<lib_dir> -Wl,-rpath,<lib_dir>`, preserved `-Wl,-rpath,<extra>`,
-///   `-Wl,--dynamic-linker=<dyn>`, `-fuse-ld=<ld_lld>`, `-rtlib=compiler-rt --unwindlib=none`)
-///   into `LDFLAGS` so `configure`/`make` link probes both link AND execute on NixOS.
-fn inject_linux_sysroot_flags<'a>(
-    vars: &mut AVec<'a, (AString<'a>, AString<'a>)>,
-    sysroot: Sysroot,
+///   (`-B<lib_dir>`, `-L<lib_dir>`, `-Wl,-rpath,<lib_dir>`, preserved `-Wl,-rpath,<extra>`,
+///   `-Wl,--dynamic-linker=<dyn>`, `-fuse-ld=<ld_lld>`, `-rtlib=compiler-rt`, `--unwindlib=none`);
+/// - `-Wno-unused-command-line-argument` so link-only options in the config never warn on `-c`.
+fn format_linux_clang_cfg<'a>(
     sdk: &str,
     link: LinuxTreeLink<'_>,
+    shown: &[(&str, &str)],
     shelf: &str,
+    include_sysroot: bool,
     alloc: Alloc<'a>,
-) {
-    if sysroot != Sysroot::LinuxHost {
-        return;
-    }
+) -> AString<'a> {
     let major = blaze_build_script::toolchain::clang_major(blaze_pins::CLANG_JSON).unwrap_or("23");
-    let mut resource_arg: AString<'a> = String::new_in(alloc);
-    resource_arg.push_str("-resource-dir ");
-    resource_arg.push_str(shelf);
-    resource_arg.push_str("/lib/clang/");
-    resource_arg.push_str(major);
+    let mut cfg: AString<'a> = String::new_in(alloc);
 
-    let mut sysroot_args: AVec<'a, AString<'a>> = Vec::new_in(alloc);
-    crate::native_c::push_linux_sysroot_flags(sdk, &mut sysroot_args, alloc);
-    let mut sysroot_text: AString<'a> = String::new_in(alloc);
-    for (at, arg) in sysroot_args.iter().enumerate() {
-        if at > 0 {
-            sysroot_text.push(' ');
-        }
-        sysroot_text.push_str(arg.as_str());
+    cfg.push_str("-resource-dir\n");
+    let mut resource_dir = String::from_str_in(shelf, alloc);
+    resource_dir.push_str("/lib/clang/");
+    resource_dir.push_str(major);
+    push_cfg_quoted(&mut cfg, resource_dir.as_str());
+
+    if include_sysroot {
+        let prefix = match sdk.strip_suffix("/usr") {
+            Some("") => "/",
+            Some(parent) => parent,
+            None => sdk,
+        };
+        let mut sysroot_arg = String::from_str_in("--sysroot=", alloc);
+        sysroot_arg.push_str(prefix);
+        push_cfg_quoted(&mut cfg, sysroot_arg.as_str());
     }
 
-    let append_tokens = |target: &mut AString<'a>, extra: &str| {
-        if extra.is_empty() {
-            return;
-        }
-        if !target.is_empty() {
-            target.push(' ');
-        }
-        target.push_str(extra);
-    };
-
-    for flags in PREFIX_MAP_FLAG_VARS {
-        match vars.iter().rposition(|(name, _)| name.as_str() == flags) {
-            Some(at) => {
-                if let Some((_, value)) = vars.get_mut(at) {
-                    let has_resource = has_driver_resource_dir(value.as_str());
-                    let has_sysroot = has_driver_sysroot(value.as_str());
-                    if !has_resource {
-                        append_tokens(value, resource_arg.as_str());
-                    }
-                    if !has_sysroot {
-                        append_tokens(value, sysroot_text.as_str());
-                    }
-                }
-            }
-            None => {
-                let mut combined = String::from_str_in(resource_arg.as_str(), alloc);
-                append_tokens(&mut combined, sysroot_text.as_str());
-                vars.push((String::from_str_in(flags, alloc), combined));
-            }
-        }
+    for (guest, host) in shown.iter() {
+        let mut map = String::from_str_in("-ffile-prefix-map=", alloc);
+        map.push_str(host);
+        map.push('=');
+        map.push_str(guest);
+        push_cfg_quoted(&mut cfg, map.as_str());
     }
 
     if let Some(lib_dir) = link.lib_dir {
-        let mut ldflags: AString<'a> = String::new_in(alloc);
-        ldflags.push_str("-B");
-        ldflags.push_str(lib_dir);
-        ldflags.push_str(" -L");
-        ldflags.push_str(lib_dir);
-        ldflags.push_str(" -Wl,-rpath,");
-        ldflags.push_str(lib_dir);
+        let mut b_flag = String::from_str_in("-B", alloc);
+        b_flag.push_str(lib_dir);
+        push_cfg_quoted(&mut cfg, b_flag.as_str());
+
+        let mut l_flag = String::from_str_in("-L", alloc);
+        l_flag.push_str(lib_dir);
+        push_cfg_quoted(&mut cfg, l_flag.as_str());
+
+        let mut rpath_flag = String::from_str_in("-Wl,-rpath,", alloc);
+        rpath_flag.push_str(lib_dir);
+        push_cfg_quoted(&mut cfg, rpath_flag.as_str());
+
         for extra_rpath in link.rpaths {
             if *extra_rpath != lib_dir {
-                ldflags.push_str(" -Wl,-rpath,");
-                ldflags.push_str(extra_rpath);
+                let mut extra_flag = String::from_str_in("-Wl,-rpath,", alloc);
+                extra_flag.push_str(extra_rpath);
+                push_cfg_quoted(&mut cfg, extra_flag.as_str());
             }
         }
         if let Some(dyn_linker) = link.dynamic_linker {
-            ldflags.push_str(" -Wl,--dynamic-linker=");
-            ldflags.push_str(dyn_linker);
+            let mut dyn_flag = String::from_str_in("-Wl,--dynamic-linker=", alloc);
+            dyn_flag.push_str(dyn_linker);
+            push_cfg_quoted(&mut cfg, dyn_flag.as_str());
         }
         if let Some(ld_lld) = link.ld_lld {
-            ldflags.push_str(" -fuse-ld=");
-            ldflags.push_str(ld_lld);
+            let mut ld_flag = String::from_str_in("-fuse-ld=", alloc);
+            ld_flag.push_str(ld_lld);
+            push_cfg_quoted(&mut cfg, ld_flag.as_str());
         }
-        ldflags.push_str(" -rtlib=compiler-rt --unwindlib=none");
-        match vars.iter().rposition(|(name, _)| name.as_str() == "LDFLAGS") {
-            Some(at) => {
-                if let Some((_, value)) = vars.get_mut(at) {
-                    append_tokens(value, ldflags.as_str());
+        cfg.push_str("-rtlib=compiler-rt\n");
+        cfg.push_str("--unwindlib=none\n");
+    }
+
+    cfg.push_str("-Wno-unused-command-line-argument\n");
+    cfg
+}
+
+/// Injects `CCC_OVERRIDE_OPTIONS="#^--config=<cfg>"` for a Linux process-tree step, selecting
+/// `cfg_custom_sysroot` when any compiler flag variable already sets a driver `--sysroot` or
+/// `-isysroot` (ignoring `-Wl,--sysroot=...`) and `cfg_default` otherwise. Leaves `CFLAGS`,
+/// `CXXFLAGS`, `CPPFLAGS`, `ASFLAGS`, and `LDFLAGS` untouched so generated `Makefile` /
+/// `config.status` files stay free of host paths.
+fn inject_linux_clang_override<'a>(
+    vars: &mut AVec<'a, (AString<'a>, AString<'a>)>,
+    cfg_default: &str,
+    cfg_custom_sysroot: &str,
+    alloc: Alloc<'a>,
+) {
+    let chosen = if any_driver_sysroot(vars) { cfg_custom_sysroot } else { cfg_default };
+    let mut override_val = String::from_str_in("#^--config=", alloc);
+    override_val.push_str(chosen);
+    match vars.iter().rposition(|(name, _)| name.as_str() == "CCC_OVERRIDE_OPTIONS") {
+        Some(at) => {
+            if let Some((_, existing)) = vars.get_mut(at) {
+                let rest = existing.as_str().strip_prefix('#').unwrap_or(existing.as_str()).trim();
+                if !rest.is_empty() {
+                    override_val.push(' ');
+                    override_val.push_str(rest);
                 }
+                *existing = override_val;
             }
-            None => vars.push((String::from_str_in("LDFLAGS", alloc), ldflags)),
         }
+        None => vars.push((String::from_str_in("CCC_OVERRIDE_OPTIONS", alloc), override_val)),
     }
 }
 
 #[cfg(test)]
 mod tree_spelling_tests {
     use super::{
-        AString, AVec, LinuxTreeLink, PREFIX_MAP_FLAG_VARS, String, Sysroot, Vec, inject_linux_sysroot_flags,
-        inject_prefix_map_flags, shelf_program, to_guest, to_host,
+        AString, AVec, LinuxTreeLink, PREFIX_MAP_FLAG_VARS, String, TREE_RUNNER, Vec, format_linux_clang_cfg, holds,
+        inject_linux_clang_override, inject_prefix_map_flags, shelf_program, to_guest, to_host,
     };
 
     /// A guest folder is made its host folder where a word or a flag's letters begin with it,
@@ -1396,6 +1450,11 @@ mod tree_spelling_tests {
         assert_eq!(shelf_program("g++"), Some("bin/clang++"));
         assert_eq!(shelf_program("ar"), Some("bin/llvm-ar"));
         assert_eq!(shelf_program("ccache"), None);
+    }
+
+    #[test]
+    fn tree_runner_version_is_bumped_for_linux_config_injection() {
+        assert_eq!(TREE_RUNNER, "native_c_tasks ShelfTree 2");
     }
 
     #[test]
@@ -1430,67 +1489,105 @@ mod tree_spelling_tests {
     }
 
     #[test]
-    fn linux_sysroot_flags_are_injected_into_process_tree_compiler_vars() {
+    fn linux_process_tree_uses_clang_cfg_and_keeps_configure_outputs_free_of_host_paths() {
         let alloc = blaze_own::testing::heap().alloc();
         let shelf = "/h/shelf";
-
-        // 1. Flat NixOS glibc-dev + split glibc runtime `lib` + dynamic linker + rpath + explicit ld.lld path.
-        //    Also checks that `-Wl,--sysroot=/custom` (a linker-only flag) does NOT suppress driver sysroot injection.
-        let mut nix_vars: AVec<'_, (AString<'_>, AString<'_>)> = Vec::new_in(alloc);
-        nix_vars.push((String::from_str_in("CFLAGS", alloc), String::from_str_in("-O2 -Wl,--sysroot=/linker-only", alloc)));
-        nix_vars.push((String::from_str_in("CXXFLAGS", alloc), String::from_str_in("--sysroot=/custom", alloc)));
-        nix_vars.push((String::from_str_in("ASFLAGS", alloc), String::from_str_in("-resource-dir /custom/res --sysroot=/custom", alloc)));
-        nix_vars.push((String::from_str_in("LDFLAGS", alloc), String::from_str_in("-Wl,--as-needed", alloc)));
+        let folder = "/h/work/trees/abc";
+        let shown = [
+            ("/out", "/h/work/trees/abc/out"),
+            ("/sdk", "/nix/store/abc-glibc-dev"),
+            ("/sdk-lib", "/nix/store/def-glibc/lib"),
+            ("/sdk-rpath", "/nix/store/extra-lib/lib"),
+            ("/toolchain/clang", shelf),
+            ("/tmp", "/h/work/trees/abc/tmp"),
+        ];
         let extra_rpaths = ["/nix/store/extra-lib/lib"];
-        inject_linux_sysroot_flags(
-            &mut nix_vars,
-            Sysroot::LinuxHost,
-            "/nix/store/abc-glibc-dev",
-            LinuxTreeLink {
-                lib_dir: Some("/nix/store/def-glibc/lib"),
-                dynamic_linker: Some("/nix/store/def-glibc/lib/ld-linux-aarch64.so.1"),
-                rpaths: &extra_rpaths,
-                ld_lld: Some("/h/work/trees/k/bin/ld.lld"),
-            },
-            shelf,
-            alloc,
+        let nix_link = LinuxTreeLink {
+            lib_dir: Some("/nix/store/def-glibc/lib"),
+            dynamic_linker: Some("/nix/store/def-glibc/lib/ld-linux-aarch64.so.1"),
+            rpaths: &extra_rpaths,
+            ld_lld: Some("/h/work/trees/abc/ld.lld"),
+        };
+
+        // 1. Default NixOS clang.cfg includes resource-dir, --sysroot, prefix maps, and Nix link flags.
+        let cfg_default_text = format_linux_clang_cfg("/nix/store/abc-glibc-dev", nix_link, &shown, shelf, true, alloc);
+        assert_eq!(
+            cfg_default_text.as_str(),
+            concat!(
+                "-resource-dir\n",
+                "\"/h/shelf/lib/clang/23\"\n",
+                "\"--sysroot=/nix/store/abc-glibc-dev\"\n",
+                "\"-ffile-prefix-map=/h/work/trees/abc/out=/out\"\n",
+                "\"-ffile-prefix-map=/nix/store/abc-glibc-dev=/sdk\"\n",
+                "\"-ffile-prefix-map=/nix/store/def-glibc/lib=/sdk-lib\"\n",
+                "\"-ffile-prefix-map=/nix/store/extra-lib/lib=/sdk-rpath\"\n",
+                "\"-ffile-prefix-map=/h/shelf=/toolchain/clang\"\n",
+                "\"-ffile-prefix-map=/h/work/trees/abc/tmp=/tmp\"\n",
+                "\"-B/nix/store/def-glibc/lib\"\n",
+                "\"-L/nix/store/def-glibc/lib\"\n",
+                "\"-Wl,-rpath,/nix/store/def-glibc/lib\"\n",
+                "\"-Wl,-rpath,/nix/store/extra-lib/lib\"\n",
+                "\"-Wl,--dynamic-linker=/nix/store/def-glibc/lib/ld-linux-aarch64.so.1\"\n",
+                "\"-fuse-ld=/h/work/trees/abc/ld.lld\"\n",
+                "-rtlib=compiler-rt\n",
+                "--unwindlib=none\n",
+                "-Wno-unused-command-line-argument\n",
+            )
         );
+
+        // 2. Custom-sysroot variant keeps `-resource-dir`, prefix maps, and link flags while omitting `--sysroot`.
+        let cfg_custom_text = format_linux_clang_cfg("/nix/store/abc-glibc-dev", nix_link, &shown, shelf, false, alloc);
+        assert!(cfg_custom_text.as_str().contains("\"/h/shelf/lib/clang/23\""));
+        assert!(!cfg_custom_text.as_str().contains("--sysroot="));
+
+        // 3. Standard FHS `/usr` without split `sdk_lib` emits `--sysroot=/` and no Nix link flags.
+        let cfg_fhs = format_linux_clang_cfg("/usr", LinuxTreeLink::default(), &[("/out", "/h/out")], shelf, true, alloc);
+        assert!(cfg_fhs.as_str().contains("\"--sysroot=/\"\n"));
+        assert!(!cfg_fhs.as_str().contains("-Wl,--dynamic-linker="));
+        assert!(!cfg_fhs.as_str().contains("-fuse-ld="));
+
+        // 4. `inject_linux_clang_override` routes `-Wl,--sysroot=/linker-only` to default config,
+        //    routes driver `--sysroot` / `-isysroot` to custom-sysroot config, preserves existing
+        //    `CCC_OVERRIDE_OPTIONS`, and leaves `CFLAGS`/`LDFLAGS` completely free of host paths.
         fn lookup<'a>(vars: &'a AVec<'_, (AString<'_>, AString<'_>)>, name: &str) -> Option<&'a str> {
             vars.iter().rev().find(|(k, _)| k.as_str() == name).map(|(_, v)| v.as_str())
         }
-        let expected_nix = "-resource-dir /h/shelf/lib/clang/23 --sysroot=/nix/store/abc-glibc-dev -idirafter /nix/store/abc-glibc-dev/include";
-        // Linker-only `-Wl,--sysroot=...` must NOT suppress Clang driver sysroot injection.
-        assert_eq!(
-            lookup(&nix_vars, "CFLAGS"),
-            Some("-O2 -Wl,--sysroot=/linker-only -resource-dir /h/shelf/lib/clang/23 --sysroot=/nix/store/abc-glibc-dev -idirafter /nix/store/abc-glibc-dev/include")
-        );
-        assert_eq!(lookup(&nix_vars, "CPPFLAGS"), Some(expected_nix));
-        // Custom driver `--sysroot` is preserved while STILL appending `-resource-dir` for Landlock.
-        assert_eq!(lookup(&nix_vars, "CXXFLAGS"), Some("--sysroot=/custom -resource-dir /h/shelf/lib/clang/23"));
-        // Negative control: existing explicit driver `-resource-dir` and `--sysroot` are both preserved.
-        assert_eq!(lookup(&nix_vars, "ASFLAGS"), Some("-resource-dir /custom/res --sysroot=/custom"));
-        // Split libc runtime link flags preserve rpaths, dynamic-linker, and explicit ld.lld path.
-        assert_eq!(
-            lookup(&nix_vars, "LDFLAGS"),
-            Some("-Wl,--as-needed -B/nix/store/def-glibc/lib -L/nix/store/def-glibc/lib -Wl,-rpath,/nix/store/def-glibc/lib -Wl,-rpath,/nix/store/extra-lib/lib -Wl,--dynamic-linker=/nix/store/def-glibc/lib/ld-linux-aarch64.so.1 -fuse-ld=/h/work/trees/k/bin/ld.lld -rtlib=compiler-rt --unwindlib=none")
-        );
+        let cfg_def_path = "/h/work/trees/abc/clang.cfg";
+        let cfg_cus_path = "/h/work/trees/abc/clang-custom-sysroot.cfg";
 
-        // 2. Standard FHS `/usr` root without split `sdk_lib` injects `--sysroot=/` and no `LDFLAGS`.
-        let mut fhs_vars: AVec<'_, (AString<'_>, AString<'_>)> = Vec::new_in(alloc);
-        inject_linux_sysroot_flags(&mut fhs_vars, Sysroot::LinuxHost, "/usr", LinuxTreeLink::default(), shelf, alloc);
-        assert_eq!(lookup(&fhs_vars, "CFLAGS"), Some("-resource-dir /h/shelf/lib/clang/23 --sysroot=/"));
-        assert_eq!(lookup(&fhs_vars, "LDFLAGS"), None);
+        let mut nix_vars: AVec<'_, (AString<'_>, AString<'_>)> = Vec::new_in(alloc);
+        nix_vars.push((String::from_str_in("CFLAGS", alloc), String::from_str_in("-O2 -Wl,--sysroot=/linker-only", alloc)));
+        nix_vars.push((String::from_str_in("LDFLAGS", alloc), String::from_str_in("-Wl,--as-needed", alloc)));
+        inject_linux_clang_override(&mut nix_vars, cfg_def_path, cfg_cus_path, alloc);
+        assert_eq!(lookup(&nix_vars, "CCC_OVERRIDE_OPTIONS"), Some("#^--config=/h/work/trees/abc/clang.cfg"));
+        assert_eq!(lookup(&nix_vars, "CFLAGS"), Some("-O2 -Wl,--sysroot=/linker-only"));
+        assert_eq!(lookup(&nix_vars, "LDFLAGS"), Some("-Wl,--as-needed"));
 
-        // 3. Negative control: macOS SDK does not receive Linux sysroot or linker flags.
-        let mut mac_vars: AVec<'_, (AString<'_>, AString<'_>)> = Vec::new_in(alloc);
-        inject_linux_sysroot_flags(
-            &mut mac_vars,
-            Sysroot::MacosSdk,
-            "/Library/SDKs/MacOSX.sdk",
-            LinuxTreeLink { lib_dir: Some("/nix/store/def-glibc/lib"), ..LinuxTreeLink::default() },
-            shelf,
-            alloc,
+        // Simulated `configure` output (`Makefile` / `config.status`) recording effective `CFLAGS`
+        // and `LDFLAGS` must pass step 6's host-path check with zero `TreeRan::HostPath` matches.
+        let generated_makefile = std::format!(
+            "CFLAGS = {}\nCXXFLAGS = {}\nCPPFLAGS = {}\nASFLAGS = {}\nLDFLAGS = {}\n",
+            lookup(&nix_vars, "CFLAGS").unwrap_or(""),
+            lookup(&nix_vars, "CXXFLAGS").unwrap_or(""),
+            lookup(&nix_vars, "CPPFLAGS").unwrap_or(""),
+            lookup(&nix_vars, "ASFLAGS").unwrap_or(""),
+            lookup(&nix_vars, "LDFLAGS").unwrap_or(""),
         );
-        assert!(mac_vars.is_empty());
+        let leaked_host = shown
+            .iter()
+            .map(|(_, host)| *host)
+            .find(|host| holds(generated_makefile.as_bytes(), host.as_bytes()))
+            .or_else(|| holds(generated_makefile.as_bytes(), folder.as_bytes()).then_some(folder));
+        assert_eq!(leaked_host, None, "generated Makefile must not contain any host folder: {generated_makefile}");
+
+        // Explicit driver `-isysroot` selects the custom-sysroot config and preserves existing override options.
+        let mut custom_vars: AVec<'_, (AString<'_>, AString<'_>)> = Vec::new_in(alloc);
+        custom_vars.push((String::from_str_in("CXXFLAGS", alloc), String::from_str_in("-isysroot /custom", alloc)));
+        custom_vars.push((String::from_str_in("CCC_OVERRIDE_OPTIONS", alloc), String::from_str_in("#+-O1", alloc)));
+        inject_linux_clang_override(&mut custom_vars, cfg_def_path, cfg_cus_path, alloc);
+        assert_eq!(
+            lookup(&custom_vars, "CCC_OVERRIDE_OPTIONS"),
+            Some("#^--config=/h/work/trees/abc/clang-custom-sysroot.cfg +-O1")
+        );
     }
 }

@@ -940,7 +940,7 @@ pub(crate) struct Standing<'r, 'm> {
     sdk_resolver: &'r dyn Fn(&Cx, Option<&Dir<ReadWrite>>, u64) -> Result<blaze_apple_sdk::Sdk<'r>, blaze_apple_sdk::SdkRefused<'r>>,
     /// Deferred Linux host sysroot resolver (backed by `LazySdk`'s `OnceCell`, using only the
     /// edge-injected `PATH`, `NIX_CFLAGS_COMPILE`, and `NIX_LDFLAGS`).
-    linux_sysroot_resolver: &'r dyn Fn() -> Result<Option<crate::sdk::LinuxHostSysroot<'r>>, crate::sdk::LinuxSysrootError<'r>>,
+    linux_sysroot_resolver: crate::native_runner_c::LinuxSysrootResolver<'r>,
     home_dir: Option<&'r Dir<ReadWrite>>,
     /// Check-time command probes (`SharedCommandProbes`) carried into start-time proc-macro
     /// runners (`RunProcs`) so `run`/`test`/`export` reuse the exact probe/pin snapshot that
@@ -998,10 +998,11 @@ impl<'r, 'm> Standing<'r, 'm> {
         sdk
     }
 
-    /// Resolves the Linux host C library sysroot root directory lazily on first demand (at most
-    /// once per command via `LazySdk`'s `OnceCell`).
-    pub(crate) fn resolve_linux_sysroot(&self) -> Result<Option<crate::sdk::LinuxHostSysroot<'r>>, crate::sdk::LinuxSysrootError<'r>> {
-        (self.linux_sysroot_resolver)()
+    /// Returns the lazy Linux host sysroot resolver (backed by `LazySdk`'s `OnceCell`) so
+    /// [`crate::native_runner_c::CTasks`] defers host-sysroot discovery until a crate actually
+    /// has deferred C requests.
+    pub(crate) fn linux_sysroot_resolver(&self) -> crate::native_runner_c::LinuxSysrootResolver<'r> {
+        self.linux_sysroot_resolver
     }
     /// E2's answer (engine_run_answer.rs) over the stored rows and the store: what run_ids.rs
     /// walks for the body ids and reads each body's facts from.
