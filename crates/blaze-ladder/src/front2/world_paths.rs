@@ -217,7 +217,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
         }
         let mut use_dollar = None;
         if let Some(row) = via_use {
-            let expanded = match expand_local_use(&self.store.locals, self.owner, at_module, row, written.get(1..).unwrap_or(&[]), alloc) {
+            let expanded = match expand_local_use(self.names, &self.store.locals, self.owner, self.module, row, written.get(1..).unwrap_or(&[]), alloc) {
                 Ok(e) => e,
                 Err(gap) => return self.gap(Gap::Local(gap)),
             };
@@ -270,7 +270,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                     && local_type.is_none()
                     && let Some(row) = self.store.locals.find(self.owner, Some(scope.0), first, LocalNs::Value)
                     && row.kind == LocalKind::Use
-                    && let Ok(expanded) = expand_local_use(&self.store.locals, self.owner, self.module, row, &[], alloc)
+                    && let Ok(expanded) = expand_local_use(self.names, &self.store.locals, self.owner, self.module, row, &[], alloc)
                     && let Ok(t) = self.resolver().path_with(expanded.module, expanded.dollar, expanded.abs, &expanded.segments, Ns::Type)
                 {
                     return Ok(Err(PathMiss::At { segment: 0, after: None, why: MissWhy::NotAValue(checker_of(t.key)) }));
@@ -474,9 +474,12 @@ pub(super) struct ExpandedLocalUse<'a, 'b, 'l> {
 /// Rewrites a path starting at a block-local `use` row `row` (followed by `tail`), following
 /// chained block-local `use` rows (`use a::b as c; use c::d;`) and placing the final prefix at
 /// its block module when it names a block-local item (`LocalKind::in_block_module`).
+/// Opaque macro-generated import heads (`first_mark` with `Transparency::Opaque`) stop before
+/// caller-local lookup and resolve at their mark's definition site via [`super::item_site::site_in`].
 /// Cycle detection tracks visited `(key, scope, range, name)` rows rather than imposing a fixed
 /// hop limit, so arbitrarily deep valid chains resolve while cyclic imports terminate cleanly.
-pub(super) fn expand_local_use<'a, 'b, 'l: 'a>(
+pub(super) fn expand_local_use<'n, 'a, 'b, 'l: 'a, S: super::source::NamesSource<'n>>(
+    names: S,
     locals: &super::locals::Locals<'l>,
     owner: blaze_typeck::ItemKey,
     default_module: blaze_id::ItemKey,
@@ -496,11 +499,8 @@ pub(super) fn expand_local_use<'a, 'b, 'l: 'a>(
     let first_id = (row.key, row.scope, row.range, row.name);
     let mut visited: OwnVec<(blaze_id::ItemKey, u32, blaze_surface::Range, &'l str), Alloc<'b>> = OwnVec::new_in(alloc);
     loop {
-        if abs {
-            break;
-        }
         let Some(&head) = prefix.first() else { break };
-        if matches!(head, "self" | "super" | "crate" | "$crate" | "Self" | "{{root}}") {
+        if !super::scope_table::invocation_name(abs, head, first_mark) {
             break;
         }
         let Some(item) = locals.find(owner, Some(cur_scope), head, LocalNs::Type) else { break };
@@ -545,7 +545,16 @@ pub(super) fn expand_local_use<'a, 'b, 'l: 'a>(
     for &seg in tail.iter() {
         prefix.push(seg, alloc);
     }
-    let dollar = if abs { None } else { super::glob_uses::dollar_of(prefix.first().copied(), first_mark) };
+    let (module, dollar) = if local_type.is_some() {
+        (module, None)
+    } else if let Some(&head) = prefix.first()
+        && let Ok(site) = super::item_site::site_in(names, first_mark, head, abs, module)
+    {
+        (site.module, site.dollar_crate)
+    } else {
+        let dollar = if abs { None } else { super::glob_uses::dollar_of(prefix.first().copied(), first_mark) };
+        (module, dollar)
+    };
     Ok(ExpandedLocalUse { abs, segments: prefix, module, dollar, local_type })
 }
 
@@ -649,7 +658,7 @@ where
         dollar = hit.dollar;
         resolver.path_with(at_module, dollar, resolved_abs, &through, ns).ok()?
     } else if let Some(row) = via_use {
-        let expanded = expand_local_use(locals, owner, at_module, row, texts.get(1..).unwrap_or(&[]), alloc).ok()?;
+        let expanded = expand_local_use(resolver.names, locals, owner, module, row, texts.get(1..).unwrap_or(&[]), alloc).ok()?;
         shift = u32::try_from(expanded.segments.len().saturating_sub(texts.len())).ok()?;
         at_module = expanded.module;
         resolved_abs = expanded.abs;

@@ -2479,6 +2479,47 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.mk_list(&v)
     }
 
+    /// Checks written `ConstValue` generic arguments on an ADT in a body against the ADT's
+    /// declared const-parameter types (e.g. `let _: S<N>;` where `S<const B: bool>` and
+    /// `const N: u8 = 1` must report E0308). Only reads `const_params(k)` when at least one
+    /// argument is a `ConstValue`.
+    fn check_adt_const_args(&mut self, k: ItemKey, args: TyList, cause: Cause) -> Result<TyList, Stop> {
+        let len = self.ty.list_len(args);
+        let mut has_const_val = false;
+        for i in 0..len {
+            if matches!(self.view(self.ty.list_get(args, i)), TyView::ConstValue { .. }) {
+                has_const_val = true;
+                break;
+            }
+        }
+        if !has_const_val {
+            return Ok(args);
+        }
+        let consts = self.reads.const_params(k)?;
+        let use_site = if matches!(cause, Cause::Body) { At::Expr(self.body.root) } else { At::of(cause) };
+        let empty = self.mk_list(&[])?;
+        let mut replaced: Option<Vec<Ty, Alloc<'a>>> = None;
+        for i in 0..len {
+            let arg = self.ty.list_get(args, i);
+            let TyView::ConstValue { ty: found, .. } = self.view(arg) else { continue };
+            let Some(declared) = consts.type_of(i) else { continue };
+            let d = self.lower(consts.types, declared, Lower::Args(empty), cause)?;
+            if !self.demand_eq(use_site, d, found)? {
+                let fresh = self.ty.fresh(VarKind::Const)?;
+                let list = replaced.get_or_insert_with(|| self.list(args));
+                if let Ok(idx) = usize::try_from(i)
+                    && let Some(slot) = list.get_mut(idx)
+                {
+                    *slot = fresh;
+                }
+            }
+        }
+        match replaced {
+            Some(v) => self.mk_list(&v),
+            None => Ok(args),
+        }
+    }
+
     fn lower_node(&mut self, at: PTy, node: PNode, types: PTys<'_>, memo: &mut Lowered<'a>, mode: Lower, cause: Cause) -> Result<Ty, Stop> {
         // A trait fn's `impl Trait` at a concrete `Self` (rules/rpitit_use.rs): the projection
         // it is in Rust (RFC 3425; the Reference, "Impl trait"), which the impl's row
@@ -2520,7 +2561,11 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             }
             PNode::Slice(t) => TyView::Slice(Self::lowered(memo, t)?),
             PNode::Pat(t, l) => TyView::Pat(Self::lowered(memo, t)?, self.lowered_list(memo, types, l)?),
-            PNode::Adt(k, l) => TyView::Adt(k, self.lowered_list(memo, types, l)?),
+            PNode::Adt(k, l) => {
+                let args = self.lowered_list(memo, types, l)?;
+                let args = if matches!(mode, Lower::Body) { self.check_adt_const_args(k, args, cause)? } else { args };
+                TyView::Adt(k, args)
+            }
             PNode::FnDef(k, l) => TyView::FnDef(k, self.lowered_list(memo, types, l)?),
             PNode::FnPtr(l, h) => TyView::FnPtr(self.lowered_list(memo, types, l)?, h),
             // A closure of another body: its identity from the record, its signature and kind

@@ -207,7 +207,7 @@ pub(super) fn use_is_type_only<'n, 'l, 'a, S: super::source::NamesSource<'n>>(
 where
     'l: 'a,
 {
-    let Ok(expanded) = super::world_paths::expand_local_use(locals, owner, module, *row, &[], alloc) else {
+    let Ok(expanded) = super::world_paths::expand_local_use(paths.names, locals, owner, module, *row, &[], alloc) else {
         return false;
     };
     !paths.resolves_exact(expanded.module, expanded.dollar, expanded.abs, &expanded.segments, crate::resolve::Ns::Value)

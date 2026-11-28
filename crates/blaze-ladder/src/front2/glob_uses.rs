@@ -299,19 +299,30 @@ pub fn any_glob(locals: &Locals<'_>, owner: ItemKey) -> bool {
     false
 }
 
-/// A glob row's own start, when its path says where it is read (the module doc): `None` for a
-/// plain first segment no block's item or named import takes.
-fn row_start<'n, 'a>(locals: &Locals<'n>, module: LibKey, body: ItemKey, row: &Row<'n>, alloc: Alloc<'a>) -> Result<Option<Start<'a>>, LocalGap>
+/// A glob or named `use` row's own start, when its path says where it is read (the module doc):
+/// `None` for a plain invocation-site first segment no block's item or named import takes.
+fn row_start<'n, 'l, 'a, S: NamesSource<'n>>(
+    names: S,
+    locals: &Locals<'l>,
+    module: LibKey,
+    body: ItemKey,
+    row: &Row<'l>,
+    alloc: Alloc<'a>,
+) -> Result<Option<Start<'a>>, LocalGap>
 where
-    'n: 'a,
+    'l: 'a,
 {
     let mut path: AVec<'a, &'a str> = AVec::new_in(alloc);
     let Some(&first) = row.path.first() else { return Ok(Some(Start { abs: row.abs, at: module, path, dollar: None })) };
-    if row.abs || is_head(first) {
+    if !super::scope_table::invocation_name(row.abs, first, row.first_mark) {
         path.extend_from_slice(row.path);
-        // A `$crate` a macro wrote: the macro's crate, by the row's first segment's mark.
-        let dollar = if row.abs { None } else { dollar_of(Some(first), row.first_mark) };
-        return Ok(Some(Start { abs: row.abs, at: module, path, dollar }));
+        // A `$crate` a macro wrote or an opaque macro-generated import head resolves at its
+        // mark's definition site, never through caller-local `use` rows.
+        let (at, dollar) = match super::item_site::site_in(names, row.first_mark, first, row.abs, module) {
+            Ok(site) => (site.module, site.dollar_crate),
+            Err(_) => (module, if row.abs { None } else { dollar_of(Some(first), row.first_mark) }),
+        };
+        return Ok(Some(Start { abs: row.abs, at, path, dollar }));
     }
     let gap = LocalGap { item: row.key, form: THROUGH_LOCAL, range: row.range };
     match locals.find(body, Some(row.scope), first, LocalNs::Type) {
@@ -324,12 +335,12 @@ where
             }
             None => Err(gap),
         },
-        // A named import: its path stands for the name (its first segment's mark with it).
+        // A named import (possibly chained or ending in an opaque macro import): expand through
+        // `expand_local_use` so cycle checks and def-site mark resolution stay in one place.
         Some(local) if local.kind == LocalKind::Use => {
-            path.extend_from_slice(local.path);
-            path.extend_from_slice(&row.path[1..]);
-            let dollar = if local.abs { None } else { dollar_of(local.path.first().copied(), local.first_mark) };
-            Ok(Some(Start { abs: local.abs, at: module, path, dollar }))
+            let expanded = super::world_paths::expand_local_use(names, locals, body, module, *row, &[], alloc)?;
+            path.extend_from_slice(&expanded.segments);
+            Ok(Some(Start { abs: expanded.abs, at: expanded.module, path, dollar: expanded.dollar }))
         }
         Some(_) => Err(gap),
     }
@@ -395,7 +406,7 @@ where
             for row in b.rows.iter().filter(|r| r.scope == here && r.kind == LocalKind::Use && r.name == name) {
                 let mut written: AVec<'a, &'a str> = AVec::new_in(alloc);
                 written.extend_from_slice(row.path);
-                uses.push(UseAt { depth, bound: Some(name), start: row_start(locals, module, body, row, alloc)?, written, item: row.key, range: row.range });
+                uses.push(UseAt { depth, bound: Some(name), start: row_start(paths.names, locals, module, body, row, alloc)?, written, item: row.key, range: row.range });
             }
         }
         if let Some(binding) = super::scope_table::direct_name_in(b, here, name, ns, depth, alloc, paths.names, b.names_of_blocks)? {
@@ -407,7 +418,7 @@ where
         for row in b.rows.iter().filter(|r| r.scope == here && is_glob(r)) {
             let mut written: AVec<'a, &'a str> = AVec::new_in(alloc);
             written.extend_from_slice(row.path);
-            uses.push(UseAt { depth, bound: None, start: row_start(locals, module, body, row, alloc)?, written, item: row.key, range: row.range });
+            uses.push(UseAt { depth, bound: None, start: row_start(paths.names, locals, module, body, row, alloc)?, written, item: row.key, range: row.range });
             has_glob_or_direct = true;
         }
         at = b.parents.get(here as usize).copied().flatten();

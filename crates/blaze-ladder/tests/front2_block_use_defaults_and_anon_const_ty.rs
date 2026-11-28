@@ -32,7 +32,7 @@ use blaze_own::Alloc;
 use blaze_scope::names::{self, Written};
 use blaze_surface::{Namespace, PathKind};
 
-const PRELUDE: &str = r#"#![feature(no_core, lang_items)]
+const PRELUDE: &str = r#"#![feature(no_core, lang_items, decl_macro)]
 #![no_core]
 #![no_main]
 
@@ -299,6 +299,37 @@ fn pos_local_type_alias_defaults() -> m::Map<u8, i32> {
     LocalMap::<u8>::new(1, 2)
 }
 
+mod def_mod {
+    pub mod m {
+        pub struct S<T, U = i32>(pub T, pub U);
+        impl<T, U> S<T, U> {
+            pub fn new(t: T, u: U) -> Self {
+                S(t, u)
+            }
+        }
+    }
+    pub macro emit_use($x:ident) {
+        use m::S as $x;
+    }
+}
+
+mod wrong {
+    pub struct S;
+}
+
+fn pos_opaque_macro_use_ignores_caller_local_m() -> def_mod::m::S<u8, i32> {
+    use crate::wrong as m;
+    def_mod::emit_use!(X);
+    X::<u8>::new(1, 2)
+}
+
+fn pos_opaque_macro_use_chained_ignores_caller_local_m() -> def_mod::m::S<u8, i32> {
+    use crate::wrong as m;
+    def_mod::emit_use!(A);
+    use A as X;
+    X::<u8>::new(1, 2)
+}
+
 fn neg_block_use_too_few_required_args() -> m::Map<i32, i32> {
     use m::Map;
     Map::<i32>::new(1, 2)
@@ -319,6 +350,8 @@ fn neg_cyclic_local_use_terminates() {
         "pos_local_var_does_not_shadow_type_path",
         "pos_local_struct_defaults",
         "pos_local_type_alias_defaults",
+        "pos_opaque_macro_use_ignores_caller_local_m",
+        "pos_opaque_macro_use_chained_ignores_caller_local_m",
         "neg_block_use_too_few_required_args",
         "neg_cyclic_local_use_terminates",
     ];
@@ -381,14 +414,34 @@ fn neg_inferred_method_const_bool_for_usize() -> usize {
     let c = impl_::Caller;
     c.take_usize::<{ impl_::HasNewTextSignature::<impl_::Driver>::VALUE }>()
 }
+
+struct BoolS<const B: bool>;
+
+fn pos_bare_local_const_matching_ty() {
+    const FLAG: bool = true;
+    let _: BoolS<FLAG>;
+}
+
+fn neg_bare_local_const_wrong_ty() {
+    const N: u8 = 1;
+    let _: BoolS<N>;
+}
+
+fn neg_bare_local_const_wrong_ty_expr_path() -> i32 {
+    const N: u8 = 1;
+    crate::m::PyClassDocGenerator::<crate::m::Driver, N>::DOC_PIECES
+}
 "#;
     let items = [
         "POS_PYCLASS_DOC",
         "pos_inferred_method_const_bool",
+        "pos_bare_local_const_matching_ty",
         "NEG_LOCAL_CONST_USIZE_FOR_BOOL",
         "NEG_LOCAL_CONST_BOOL_FOR_USIZE",
         "neg_inferred_method_const_u8_for_bool",
         "neg_inferred_method_const_bool_for_usize",
+        "neg_bare_local_const_wrong_ty",
+        "neg_bare_local_const_wrong_ty_expr_path",
     ];
     let got = check_items(text, &items);
     for (name, outcome) in &got {

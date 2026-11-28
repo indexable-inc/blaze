@@ -1612,16 +1612,22 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                             let is_type = local_type || (!is_const && (param.is_some() || names_a_type()));
                             if is_type {
                                 self.path_ty(tys, env, v, tp, &[])?
-                            } else if let Ok(Some(super::const_open::LocalArg::Const(bits, _))) = local {
-                                // The constant's bits in the parameter's type, as a module
-                                // constant's are (`const_term`). A scalar parameter only: a
-                                // fieldless enum's value is its variant under the enum's key
-                                // (const_enum.rs), which a body's constant's bits are not.
+                            } else if let Ok(Some(super::const_open::LocalArg::Const(bits, eval_ty))) = local {
+                                // The constant's bits in its evaluated primitive type (falling
+                                // back to the parameter's expected type only when evaluation
+                                // carried no primitive type), as `const_term` does for module
+                                // constants. A scalar parameter only: a fieldless enum's value
+                                // is its variant under the enum's key (const_enum.rs), which a
+                                // body's constant's bits are not.
                                 let ty = self.const_want(tys, env, v, target, index, ar)?;
                                 if !matches!(tys.view().get(ty), Some(PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Infer | PNode::Error)) {
                                     return Err(Why::Unsupported("a const argument naming a `const` the body declares, for a parameter whose type is no integer, `bool` or `char`", ar));
                                 }
-                                intern(tys, PNode::ConstValue { ty, bits })?
+                                let val_ty = match eval_ty {
+                                    Some(prim) => intern(tys, prim)?,
+                                    None => ty,
+                                };
+                                intern(tys, PNode::ConstValue { ty: val_ty, bits })?
                             } else if let Err(why) = local {
                                 // A body's constant not evaluated yet (`Why::NeedConst`: the
                                 // driver evaluates it and lowers again), or a body's value
