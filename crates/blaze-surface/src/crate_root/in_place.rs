@@ -12,6 +12,7 @@ use blaze_id::{CrateItemKey, ItemKey};
 use super::{CrateRootHead, CrateRootRoot, CrateRootView};
 use crate::column::{key_of_word, text_of};
 use crate::kind::MacroShapes;
+use crate::path::NameListView;
 
 impl<'a> CrateRootView<'a> {
     /// The record in `buffer` with no check at all: O(1), no allocation.
@@ -45,6 +46,7 @@ impl<'a> CrateRootView<'a> {
             externs: field!(root, CrateRootRoot, externs).items().as_slice(),
             deps: field!(root, CrateRootRoot, deps).items().as_slice(),
             macro_use: field!(root, CrateRootRoot, macro_use).items().as_slice(),
+            macro_use_names: field!(root, CrateRootRoot, macro_use_names).items().as_slice(),
             macro_exports: field!(root, CrateRootRoot, macro_exports).items().as_slice(),
             tools: field!(root, CrateRootRoot, tools).items().as_slice(),
             builtin_attrs: field!(root, CrateRootRoot, builtin_attrs).items().as_slice(),
@@ -53,9 +55,21 @@ impl<'a> CrateRootView<'a> {
         }
     }
 
-    /// The `i`th crate of the `#[macro_use]` prelude, by its root module.
-    pub fn macro_use_at(&self, i: usize) -> Option<ItemKey> {
-        self.macro_use.get(i).map(|key| ItemKey(*key))
+    /// Number of entries in the `#[macro_use]` prelude.
+    pub fn macro_use_len(&self) -> usize {
+        self.macro_use.len()
+    }
+
+    /// The `i`th entry of the `#[macro_use]` prelude: its crate root and whether its allowlist
+    /// admits `name`.
+    pub fn macro_use_at(&self, i: usize, name: &str) -> Option<(ItemKey, bool)> {
+        let row = self.macro_use.get(i)?;
+        let allowed = row.all
+            || self
+                .macro_use_names
+                .get(row.names.to_usize())
+                .is_some_and(|slice| NameListView::new(slice, self.strings).contains(name));
+        Some((ItemKey(row.root), allowed))
     }
 
     /// The `#[macro_export]` macro written in source named `name`, the one of least key when

@@ -1585,7 +1585,7 @@ struct Lowering<'a> {
     at: AVec<'a, usize>,
     tables: Tables<'a>,
     prelude: Option<PreludeImport<'a, 'a>>,
-    macro_use: AVec<'a, &'a str>,
+    macro_use: AVec<'a, crate::task::MacroUseImport<'a, 'a>>,
     macro_exports: AVec<'a, (&'a str, ItemKey, MacroShapes)>,
     /// The files' bodies that may write an impl in a block, in module then text order.
     bodies: AVec<'a, crate::task::BodySrc<'a>>,
@@ -1683,7 +1683,7 @@ pub(crate) fn resolve_one_with<'a, 'r, 'p: 'a, S: SourceTexts<'a>, P: Par>(
     let needs_tree_record = par.names_groups()
         || par.names_members().is_some()
         || par.block_scopes() == crate::surface::BlockScopes::Bodies;
-    let tree_record: &'a [u8] = match &record {
+    let mut tree_record: &'a [u8] = match &record {
         Some((bytes, _)) => bytes,
         None if needs_tree_record => {
             let written = tree_record_of(&set, &tree, &decls, &low.tables.macros, &low.tables.enums, &cfg, edition, &crate_root_record.tools, root_attrs, root_bytes, bump);
@@ -1712,7 +1712,7 @@ pub(crate) fn resolve_one_with<'a, 'r, 'p: 'a, S: SourceTexts<'a>, P: Par>(
     let mut fill: Fill<'a, &'a str> = Fill::new_in(alloc);
     fill.first = first;
     let added_externs: AVec<'a, (&'a str, ItemKey)>;
-    let added_macro_use: AVec<'a, ItemKey>;
+    let final_macro_use: Option<AVec<'a, blaze_surface::MacroUseCrate<'a, &'a str>>>;
     let shapes: AVec<'a, crate::GroupShape<'a>>;
     let cuts: AVec<'a, ((ItemKey, u32), u32)>;
     {
@@ -1799,7 +1799,7 @@ pub(crate) fn resolve_one_with<'a, 'r, 'p: 'a, S: SourceTexts<'a>, P: Par>(
         }
         fill.done = solved.done;
         added_externs = solved.added_externs;
-        added_macro_use = solved.added_macro_use;
+        final_macro_use = solved.final_macro_use;
         shapes = solved.groups;
         cuts = solved.cuts;
     }
@@ -1807,19 +1807,31 @@ pub(crate) fn resolve_one_with<'a, 'r, 'p: 'a, S: SourceTexts<'a>, P: Par>(
     // items' names too (libc's `cfg_if! { extern crate rustc_std_workspace_core as core; }`
     // under `no_core`), which a walk over the record (names.rs `walk`, `lexical`) reads; none of
     // them was in it before (cells R8), so the merge only adds.
+    let mut root_changed = false;
     if !added_externs.is_empty() {
         crate_root_record.extern_prelude.extend_from_slice(&added_externs);
         crate_root_record.extern_prelude.sort_by(|a, b| a.0.cmp(b.0));
         crate_root_record.extern_prelude.dedup_by_key(|it| it.0);
+        root_changed = true;
     }
-    // Macro-written root `#[macro_use] extern crate` items' dependency roots also belong in the
-    // crate root record's `#[macro_use]` prelude (e.g. reqwest's `if_hyper! { #[macro_use]
-    // extern crate doc_comment; }`), preserving order so downstream lexical lookups and body
-    // solves see them too.
-    for root in added_macro_use {
-        if crate_root_record.macro_use.scan_for(&root).is_none() {
-            crate_root_record.macro_use.push(root);
-        }
+    // Macro-written root `#[macro_use] extern crate` items' dependency roots (and allowlists) also
+    // belong in the crate root record's `#[macro_use]` prelude in canonical expanded source order
+    // (e.g. reqwest's `if_hyper! { #[macro_use] extern crate doc_comment; }`), so downstream
+    // lexical lookups, body solves, and incremental one-group solves all see them.
+    if let Some(macro_use) = final_macro_use {
+        crate_root_record.macro_use = macro_use;
+        root_changed = true;
+    }
+    if root_changed && !tree_record.is_empty() {
+        let updated_root = crate_root_record
+            .write(alloc)
+            .map_err(|e| NamesError::RootRecord { krate: input.name, error: RecordError::Refused(e) })?;
+        let updated_root = aligned(&updated_root, bump);
+        let mut tr = TreeRecord::read(tree_record, alloc)
+            .map_err(|error| NamesError::TreeRecord { krate: input.name, error })?;
+        tr.crate_root = updated_root;
+        let rewritten = tr.write(alloc).map_err(|error| NamesError::TreeRecord { krate: input.name, error })?;
+        tree_record = aligned(&rewritten, bump);
     }
     // Synthesize the proc-macro crate's `_DECLS` harness static AFTER macro expansion completes
     // so macro-generated `#[proc_macro*]` exports (e.g. `derive_more-impl`'s `create_derive!`)
@@ -2446,7 +2458,13 @@ fn root_record_of<'a>(
     // there. The written name is read from the root's own text; one a root macro call writes
     // is not seen (stated gap).
     if let Some(name) = plan.injected.filter(|name| input.edition == Edition::E2015 || !root_binds_type(&low.decls[0], name)) {
-        low.decls[0].extern_crates.push(ExternCrateDecl { target: ExternTarget::Dep(name), rename: Rename::Same, vis: WrittenVis::Private, macro_use: true });
+        low.decls[0].extern_crates.push(ExternCrateDecl {
+            target: ExternTarget::Dep(name),
+            rename: Rename::Same,
+            vis: WrittenVis::Private,
+            macro_use: blaze_surface::MacroUse::None,
+            pos: 0,
+        });
     }
     let root_input = RootInput {
         krate: input.key,

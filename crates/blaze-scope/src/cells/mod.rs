@@ -797,9 +797,46 @@ struct Outer<'a, N> {
     /// The `#[macro_use]` prelude of other crates' exported macros is not empty: a macro name
     /// that misses before it is not known here.
     macro_use: bool,
-    /// The dependency root modules macro-written root `#[macro_use] extern crate` items added
-    /// to `Cells::macro_use`, in the order added.
-    added_macro_use: AVec<'a, ItemKey>,
+    /// Whether any macro-expanded root `#[macro_use] extern crate` mutated `Cells::macro_use`.
+    macro_use_changed: bool,
+}
+
+/// One entry in `Cells::macro_use`: the dependency root module, optional selective allowlist,
+/// and canonical expanded source-order key.
+struct MacroUseSlot<'a, N> {
+    root: ItemKey,
+    only: Option<AVec<'a, N>>,
+    /// Canonical source-order path `[root_pos, ..., item_pos]` for root-text and macro-expanded
+    /// `#[macro_use] extern crate` entries; `None` for injected `std`/`core` or pre-loaded
+    /// `CrateRoot` entries when root text is not read.
+    order: Option<AVec<'a, u32>>,
+    base_idx: u32,
+}
+
+impl<N: PartialEq> MacroUseSlot<'_, N> {
+    fn allows(&self, name: N) -> bool {
+        match &self.only {
+            None => true,
+            Some(names) => names.scan_for(&name).is_some(),
+        }
+    }
+
+    fn same_filter(&self, only: &Option<AVec<'_, N>>) -> bool {
+        match (&self.only, only) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a[..] == b[..],
+            _ => false,
+        }
+    }
+
+    fn cmp_order(&self, other: &Self) -> core::cmp::Ordering {
+        match (&self.order, &other.order) {
+            (None, None) => self.base_idx.cmp(&other.base_idx),
+            (None, Some(_)) => core::cmp::Ordering::Less,
+            (Some(_), None) => core::cmp::Ordering::Greater,
+            (Some(a), Some(b)) => a[..].cmp(&b[..]).then_with(|| self.base_idx.cmp(&other.base_idx)),
+        }
+    }
 }
 
 pub(crate) struct Cells<'a, N> {
@@ -892,8 +929,8 @@ pub(crate) struct Cells<'a, N> {
     enum_mods: ABTreeSet<'a, ModId>,
     /// The crate's edition: what `::name` starts from.
     edition: Edition,
-    /// The `#[macro_use]` prelude's crates' root modules, in order (their exported macros).
-    macro_use: AVec<'a, ItemKey>,
+    /// The `#[macro_use]` prelude's crates in canonical expanded source order.
+    macro_use: AVec<'a, MacroUseSlot<'a, N>>,
     /// Every dependency by name, sorted (the root record's): what an `extern crate` names.
     dep_roots: AVec<'a, (N, ItemKey)>,
     /// The `extern crate` items naming no dependency: the module and the name written.
@@ -1363,7 +1400,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 foreign: ABTreeMap::new_in(alloc),
                 foreign_open: false,
                 macro_use: false,
-                added_macro_use: AVec::new_in(alloc),
+                macro_use_changed: false,
             },
             tools: AVec::new_in(alloc),
             builtin_attrs: AVec::new_in(alloc),
@@ -1776,7 +1813,16 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 // The outer scopes (R6, R8): sorted already by the record's rule.
                 self.outer.externs.extend_from_slice(&r.extern_prelude);
                 self.outer.macro_use = !r.macro_use.is_empty();
-                self.macro_use.extend_from_slice(&r.macro_use);
+                let alloc = self.alloc;
+                for (idx, entry) in r.macro_use.iter().enumerate() {
+                    let only = entry.only.as_ref().map(|names| AVec::from_slice_in(names, alloc));
+                    self.macro_use.push(MacroUseSlot {
+                        root: entry.root,
+                        only,
+                        order: None,
+                        base_idx: u32::try_from(idx).unwrap_or(u32::MAX),
+                    });
+                }
                 self.edition = r.head.edition;
                 r.head.prelude
             })
@@ -1854,7 +1900,53 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
         for (k, ec) in d.extern_crates.iter().enumerate() {
             let vis = self.import_vis(m, &ec.vis, vis::VisAt { module: m, frag: fid, ord: (vis::ORD_EXTERN_CRATE, k as u32) })?;
-            self.extern_crate(m, ec.target, ec.rename, vis, ec.macro_use, fid, up.is_some())?;
+            self.extern_crate(m, ec.target, ec.rename, vis, &ec.macro_use, ec.pos, fid, up)?;
+        }
+        if m == self.root && up.is_none() {
+            // Pair root-text `#[macro_use] extern crate` declarations (from the tail so any
+            // leading injected `std`/`core` entry keeps `order = None` ahead of all user items)
+            // with their exact root-text `pos`, so later macro-expanded `#[macro_use]` items
+            // interleave into canonical source order regardless of expansion schedule.
+            let mut search_end = self.macro_use.len();
+            for ec in d.extern_crates.iter().rev() {
+                if ec.macro_use.is_none() {
+                    continue;
+                }
+                let ExternTarget::Dep(written) = ec.target else { continue };
+                let Ok(idx) = self.dep_roots.binary_search_by(|dep| dep.0.cmp(&written)) else { continue };
+                let Some(&(_, root)) = self.dep_roots.get(idx) else { continue };
+                let only = match &ec.macro_use {
+                    blaze_surface::MacroUse::None => continue,
+                    blaze_surface::MacroUse::All => None,
+                    blaze_surface::MacroUse::Only(names) => Some(AVec::from_slice_in(names, alloc)),
+                };
+                let mut matched = None;
+                for pos in (0..search_end).rev() {
+                    if let Some(slot) = self.macro_use.get(pos)
+                        && slot.order.is_none()
+                        && slot.root == root
+                        && slot.same_filter(&only)
+                    {
+                        matched = Some(pos);
+                        break;
+                    }
+                }
+                let mut order = AVec::with_capacity_in(1, alloc);
+                order.push(ec.pos);
+                if let Some(pos) = matched {
+                    if let Some(slot) = self.macro_use.get_mut(pos) {
+                        slot.order = Some(order);
+                    }
+                    search_end = pos;
+                } else {
+                    self.insert_macro_use(MacroUseSlot {
+                        root,
+                        only,
+                        order: Some(order),
+                        base_idx: u32::MAX,
+                    });
+                }
+            }
         }
         for r in d.macro_rules.iter() {
             let def = Def { key: r.def, kind: DefKind::Macro(r.shapes) };
@@ -2042,16 +2134,39 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// place of a dependency's: `.. as n;` beside a dependency's `n` is R8's error (rustc's
     /// "macro-expanded `extern crate` items cannot shadow names passed with `--extern`"). The
     /// root text's own are in the root record's extern prelude already.
+    /// Canonical expanded source-order path `[root_pos, ..., pos]` for an item at `pos` inside a
+    /// fragment whose parent call is `up`.
+    fn order_for(&self, up: Option<(FragId, u32)>, pos: u32) -> AVec<'a, u32> {
+        let mut path = AVec::new_in(self.alloc);
+        path.push(pos);
+        let mut cur = up;
+        while let Some((pf, ppos)) = cur {
+            path.push(ppos);
+            cur = usize::try_from(pf).ok().and_then(|i| self.frags.get(i)).and_then(|f| f.up);
+        }
+        path.reverse();
+        path
+    }
+
+    /// Inserts a `#[macro_use]` entry into `self.macro_use` in canonical expanded source order.
+    fn insert_macro_use(&mut self, slot: MacroUseSlot<'a, N>) {
+        let at = self.macro_use.partition_point(|existing| existing.cmp_order(&slot) != core::cmp::Ordering::Greater);
+        self.macro_use.insert(at, slot);
+        self.outer.macro_use = true;
+    }
+
     fn extern_crate(
         &mut self,
         m: ModId,
         target: ExternTarget<N>,
         rename: Rename<N>,
         vis: Visibility,
-        macro_use: bool,
+        macro_use: &blaze_surface::MacroUse<AVec<'_, N>>,
+        pos: u32,
         fid: FragId,
-        expanded: bool,
+        up: Option<(FragId, u32)>,
     ) -> Result<(), CellError> {
+        let expanded = up.is_some();
         let (root, written) = match target {
             ExternTarget::Dep(name) => (self.dep_roots.binary_search_by(|d| d.0.cmp(&name)).ok().map(|k| self.dep_roots[k].1), Some(name)),
             ExternTarget::SelfCrate => (Some(self.modules[self.root as usize].key), None),
@@ -2067,14 +2182,28 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             }
             return Ok(());
         };
-        // A macro-written root `#[macro_use] extern crate dep;` (including `as alias` and `as _`)
-        // adds `dep`'s root to the `#[macro_use]` prelude (Reference `names.preludes.macro_use`).
-        // Root-text items are already in `self.macro_use` from the crate root record. Only
-        // dependency crates (not `extern crate self`) at the crate root enter this prelude.
-        if expanded && macro_use && m == self.root && written.is_some() && self.macro_use.scan_for(&root).is_none() {
-            self.macro_use.push(root);
-            self.outer.macro_use = true;
-            self.outer.added_macro_use.push(root);
+        // A macro-written root `#[macro_use] extern crate dep;` (including `as alias`, `as _`, and
+        // selective `#[macro_use(a, b)]`) adds `dep`'s root to the `#[macro_use]` prelude in
+        // canonical expanded source order (Reference `names.preludes.macro_use`). Root-text items
+        // are already in `self.macro_use` from the crate root record and have their `order`
+        // attached in `read_fragment`. Only dependency crates (not `extern crate self`) at the
+        // crate root enter this prelude.
+        if expanded && m == self.root && written.is_some() {
+            let only = match macro_use {
+                blaze_surface::MacroUse::None => None,
+                blaze_surface::MacroUse::All => Some(None),
+                blaze_surface::MacroUse::Only(names) => Some(Some(AVec::from_slice_in(names, self.alloc))),
+            };
+            if let Some(only) = only {
+                let order = self.order_for(up, pos);
+                self.insert_macro_use(MacroUseSlot {
+                    root,
+                    only,
+                    order: Some(order),
+                    base_idx: u32::MAX,
+                });
+                self.outer.macro_use_changed = true;
+            }
         }
         let Some(name) = bound else { return Ok(()) };
         if self.plant == CellPlant::ExternCrateBindsNothing {
@@ -3375,9 +3504,10 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             return Step::Done(Some(Value::Found(Def::module(k), Visibility::Public)));
         }
         if ns == Namespace::Macros && self.outer.macro_use {
-            // The `#[macro_use]` prelude: the macros each such crate's root exports, the first
-            // crate's that has the name (Reference `names.preludes.macro_use`). Macros 2.0
-            // (`pub macro`) are scoped like normal items and never enter this prelude.
+            // The `#[macro_use]` prelude: the macros each such crate's root exports, later
+            // `#[macro_use] extern crate` items shadowing earlier ones (Reference
+            // `names.preludes.macro_use`). Macros 2.0 (`pub macro`) are scoped like normal items
+            // and never enter this prelude.
             let in_macro_use = |v: Value| match v {
                 Value::Found(d, Visibility::Public) | Value::Ambiguous(d, Visibility::Public) => {
                     matches!(d.kind, DefKind::Macro(s) if s.in_macro_use_prelude())
@@ -3385,8 +3515,13 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 _ => false,
             };
             let mut unknown = false;
-            for k in 0..self.macro_use.len() {
-                let Some(r) = self.module_at(self.macro_use[k]) else {
+            for k in (0..self.macro_use.len()).rev() {
+                let Some(slot) = self.macro_use.get(k) else { continue };
+                if !slot.allows(name) {
+                    continue;
+                }
+                let root = slot.root;
+                let Some(r) = self.module_at(root) else {
                     unknown = true;
                     continue;
                 };
@@ -3704,6 +3839,15 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 Some(o) => {
                     if self.plant == CellPlant::OutwardWaits
                         && let Some(j) = self.growing(m, me, guess)
+                    {
+                        return Step::Wait(Node::Item(j));
+                    }
+                    // A macro lookup taking an outer candidate (from an earlier `#[macro_use]`
+                    // crate, built-in attributes, or the standard prelude) waits while a
+                    // crate-root call may still emit `#[macro_use] extern crate ...` that shadows
+                    // it, keeping resolution independent of expansion order.
+                    if ns == Namespace::Macros
+                        && let Some(j) = self.growing(self.root, me, guess)
                     {
                         return Step::Wait(Node::Item(j));
                     }

@@ -416,9 +416,16 @@ impl<'w, 'a> RootRead<&'a str> for ValueRoot<'w, 'a> {
         }
     }
 
-    fn macro_use(self, i: usize) -> Option<ItemKey> {
+    fn macro_use_len(self) -> usize {
         match self {
-            ValueRoot::Own(root) => <&'w CrateRootBuilder<'w, &'a str> as RootRead<&'a str>>::macro_use(root, i),
+            ValueRoot::Own(root) => <&'w CrateRootBuilder<'w, &'a str> as RootRead<&'a str>>::macro_use_len(root),
+            ValueRoot::Dep { .. } => 0,
+        }
+    }
+
+    fn macro_use(self, i: usize, name: &'a str) -> Option<(ItemKey, bool)> {
+        match self {
+            ValueRoot::Own(root) => <&'w CrateRootBuilder<'w, &'a str> as RootRead<&'a str>>::macro_use(root, i, name),
             ValueRoot::Dep { .. } => None,
         }
     }

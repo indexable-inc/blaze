@@ -76,7 +76,7 @@ impl<'a, N: Name> Touched<'a, N> {
             }
             for e in a.extern_crates.iter() {
                 if !b.extern_crates.iter().any(|o| o == e) {
-                    if e.macro_use {
+                    if e.macro_use.is_some() {
                         t.wild = true;
                         return t;
                     }

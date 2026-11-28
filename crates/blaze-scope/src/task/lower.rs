@@ -26,8 +26,8 @@ use blaze_own::{AString, AVec, Alloc, BString, Bump};
 use blaze_surface::{
     AttrKind, BuiltinAttr, BuiltinDerive, CallRole, CallShape, ChildModDecl, CrateRootBuilder, CrateRootHead, DeclaredItem,
     DeclsBuilder, Def, DefKind, Dep, Edition, ExternCrateDecl, ExternTarget, Item, ItemDetail, ItemIndex, ItemKind,
-    MacroCallDecl, MacroRulesDecl, MacroShapes, Namespace, Path, PathKind, ProcKind, Range, Rename, UseDecl, UseForm,
-    WrittenVis,
+    MacroCallDecl, MacroRulesDecl, MacroShapes, MacroUse, MacroUseCrate, Namespace, Path, PathKind, ProcKind, Range,
+    Rename, UseDecl, UseForm, WrittenVis,
 };
 
 use blaze_surface::builtin_attrs::{BUILTIN_ATTRS, PRELUDE_ATTR_MACROS, read_by_toolchain};
@@ -569,7 +569,23 @@ impl<'s, 'a> Cfg<'s, 'a> {
                     attrs.macro_export = true;
                     attrs.local_inner |= args(content).contains("local_inner_macros");
                 }
-                "macro_use" => attrs.macro_use = true,
+                "macro_use" => {
+                    attrs.macro_use = true;
+                    let after_head = skip_attr_trivia(content.get(head(content).len()..).unwrap_or(""));
+                    if after_head.starts_with('(') {
+                        for part in SplitTop::new(args(content)) {
+                            let s = skip_attr_trivia(part);
+                            let rest = s.strip_prefix("r#").unwrap_or(s);
+                            let end = rest.bytes().take_while(|&b| b.is_ascii_alphanumeric() || b == b'_').count();
+                            let ident = rest.get(..end).unwrap_or("");
+                            if !ident.is_empty() {
+                                attrs.macro_use_names.push(ident);
+                            }
+                        }
+                    } else {
+                        attrs.macro_use_all = true;
+                    }
+                }
                 // The Reference, `attributes.testing.test.enabled`: "Test functions are only
                 // compiled when in test mode"; out of it the item is gone as a false `cfg`'s
                 // is (quick-xml's `#[test] fn pi() { use pretty_assertions::assert_eq; .. }`
@@ -913,6 +929,10 @@ pub struct Attrs<'t, 'a> {
     pub macro_export: bool,
     pub local_inner: bool,
     pub macro_use: bool,
+    /// Bare `#[macro_use]` (without an allowlist): imports every exported macro.
+    pub macro_use_all: bool,
+    /// Names listed in `#[macro_use(name1, name2)]` attributes on this item.
+    pub macro_use_names: AVec<'a, &'t str>,
     pub lang: Option<&'t str>,
     /// `lang = <macro call>`, read by [`read_call`] where the edition is known.
     pub lang_call: Option<AttrCall<'t>>,
@@ -1034,6 +1054,8 @@ impl<'a> Attrs<'_, 'a> {
             macro_export: false,
             local_inner: false,
             macro_use: false,
+            macro_use_all: false,
+            macro_use_names: AVec::new_in(alloc),
             lang: None,
             lang_call: None,
             path_call: None,
@@ -2528,6 +2550,14 @@ pub struct LowerNote<'t> {
     pub in_expansion: bool,
 }
 
+/// One `#[macro_use] extern crate` lowered from a fragment: the dependency name written and an
+/// optional selective allowlist (`None` = bare `#[macro_use]`, `Some(names)` = `#[macro_use(..)]`).
+#[derive(Debug)]
+pub struct MacroUseImport<'t, 'a> {
+    pub name: &'t str,
+    pub only: Option<AVec<'a, &'t str>>,
+}
+
 /// One fragment lowered: a module's own text, or one call's expansion.
 #[derive(Debug)]
 pub struct Lowered<'t, 'a, 's> {
@@ -2540,8 +2570,8 @@ pub struct Lowered<'t, 'a, 's> {
     /// Where each of `decls.uses` is written, by index.
     pub use_locs: AVec<'a, Loc>,
     pub prelude: Option<PreludeImport<'t, 'a>>,
-    /// The crates of `#[macro_use] extern crate x;` items, by the name written.
-    pub macro_use: AVec<'a, &'t str>,
+    /// The crates of `#[macro_use] extern crate x;` items, by the name written and optional allowlist.
+    pub macro_use: AVec<'a, MacroUseImport<'t, 'a>>,
     /// Each item's text (an impl's too).
     pub texts: AVec<'s, ItemText<'t>>,
     /// The items and members whose body may write an impl in a block ([`BodySrc`]).
@@ -3313,12 +3343,28 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
                     Rename::To("_") => Rename::Underscore,
                     other => other,
                 };
-                if attrs.macro_use {
-                    if let ExternTarget::Dep(written) = target {
-                        self.out.macro_use.push(written);
+                let pos = self.next_pos();
+                let macro_use = if !attrs.macro_use {
+                    MacroUse::None
+                } else if attrs.macro_use_all {
+                    MacroUse::All
+                } else {
+                    let mut names = AVec::from_slice_in(&attrs.macro_use_names, self.alloc);
+                    names.sort_unstable();
+                    names.dedup();
+                    MacroUse::Only(names)
+                };
+                if let ExternTarget::Dep(written) = target {
+                    match &macro_use {
+                        MacroUse::None => {}
+                        MacroUse::All => self.out.macro_use.push(MacroUseImport { name: written, only: None }),
+                        MacroUse::Only(names) => self.out.macro_use.push(MacroUseImport {
+                            name: written,
+                            only: Some(AVec::from_slice_in(names, self.alloc)),
+                        }),
                     }
                 }
-                self.out.decls.extern_crates.push(ExternCrateDecl { target, rename, vis, macro_use: attrs.macro_use });
+                self.out.decls.extern_crates.push(ExternCrateDecl { target, rename, vis, macro_use, pos });
             }
             ItemDetail::ExternBlock { .. } => return true,
             ItemDetail::MacroRules { exported } => {
@@ -3635,9 +3681,9 @@ pub struct RootInput<'r, 't, 'a> {
     /// The root's `#[prelude_import]`.
     pub prelude_import: Option<&'r PreludeImport<'t, 'a>>,
     /// The root's `extern crate` items (the injected one included).
-    pub extern_crates: &'r [ExternCrateDecl<&'t str, Path<'a, &'t str>>],
-    /// The root's `#[macro_use] extern crate` names, in order.
-    pub macro_use: &'r [&'t str],
+    pub extern_crates: &'r [ExternCrateDecl<&'t str, Path<'a, &'t str>, AVec<'a, &'t str>>],
+    /// The root's `#[macro_use] extern crate` items, in order.
+    pub macro_use: &'r [MacroUseImport<'t, 'a>],
     /// Every `#[macro_export]` `macro_rules!` of the crate's text, in module order.
     pub macro_exports: &'r [(&'t str, ItemKey, MacroShapes)],
 }
@@ -3775,16 +3821,15 @@ pub fn crate_root<'t, 'a>(
     // The `#[macro_use]` prelude: the injected crate's, then the root's `#[macro_use] extern
     // crate` items in order.
     if let Some(injected) = plan.macro_use {
-        cr.macro_use.push(injected);
+        cr.macro_use.push(MacroUseCrate::all(injected));
     }
-    for &name in input.macro_use {
-        match plan.deps.iter().find(|d| d.name == name) {
+    for entry in input.macro_use {
+        match plan.deps.iter().find(|d| d.name == entry.name) {
             Some(d) => {
-                if !cr.macro_use.contains(&d.root) {
-                    cr.macro_use.push(d.root);
-                }
+                let only = entry.only.as_ref().map(|names| AVec::from_slice_in(names, alloc));
+                cr.macro_use.push(MacroUseCrate { root: d.root, only });
             }
-            None => notes.push(RootNote::MacroUseNotInGraph { name }),
+            None => notes.push(RootNote::MacroUseNotInGraph { name: entry.name }),
         }
     }
     let mut exports: AVec<'a, (&'t str, ItemKey, MacroShapes)> = AVec::new_in(alloc);

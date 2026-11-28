@@ -15,7 +15,8 @@ use super::{KRATE, NAMES, SPACES, file, key, name, small};
 use crate::{
     AmbiguityKind, AnonImport, Binding, BindingState, BuildError, CallRole, CallShape, ChildModDecl,
     CrateRootBuilder, CrateRootHead, CrateRootView, DeclaredItem, DeclsBuilder, Def, DefKind, Dep,
-    Edition, ExternCrateDecl, ExternTarget, MacroCallDecl, MacroRulesDecl, MacroShapes, ModuleDeclsView,
+    Edition, ExternCrateDecl, ExternTarget, MacroCallDecl, MacroRulesDecl, MacroShapes, MacroUse,
+    MacroUseCrate, ModuleDeclsView,
     ModuleInfo, Origin, Path, PathKind, Rename, ScopeBuilder, ScopeEntry, ScopeError, ScopeView,
     Site, TextualDef, TextualMark, Unresolved, UseDecl, UseForm, UseSite, Visibility, WrittenVis,
 };
@@ -267,7 +268,18 @@ fn module_decls_round_trip_in_source_order() {
                 true => ExternTarget::SelfCrate,
                 false => ExternTarget::Dep(name(tape)),
             };
-            decls.extern_crates.push(ExternCrateDecl { target, rename: rename(tape), vis: written(tape), macro_use: tape.coin("extern_macro_use") });
+            let macro_use = match tape.below(3, "extern_macro_use") {
+                0 => MacroUse::None,
+                1 => MacroUse::All,
+                _ => {
+                    let mut list = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
+                    for _ in 0..tape.below(3, "macro_use_names") {
+                        list.push(name(tape));
+                    }
+                    MacroUse::Only(list)
+                }
+            };
+            decls.extern_crates.push(ExternCrateDecl { target, rename: rename(tape), vis: written(tape), macro_use, pos: 15 });
         }
         if tape.coin("a macro_rules") {
             decls.macro_rules.push(MacroRulesDecl { name: name(tape), def: key(150), pos: 20, export: tape.coin("export"), shapes: shapes(tape) });
@@ -322,7 +334,8 @@ fn a_crate_root_reads_back_sorted_and_refuses_two_crates_of_one_name() {
         out.extern_prelude.push(("me", key(200)));
         out.tools.extend_from_slice(&["blaze", "blaze"]);
         out.features.extend_from_slice(&["never_type", "default_field_values", "never_type"]);
-        out.macro_use.push(key(7));
+        out.macro_use.push(MacroUseCrate::all(key(7)));
+        out.macro_use.push(MacroUseCrate::only(key(8), blaze_own::AVec::from_slice_in(&["b", "a", "b"], blaze_own::testing::heap().alloc())));
         out.macro_exports.push(("m", key(30), MacroShapes::ATTR.with(CallShape::FnLike)));
         out
     };
@@ -334,7 +347,10 @@ fn a_crate_root_reads_back_sorted_and_refuses_two_crates_of_one_name() {
     assert!(view.externs().eq([("alloc", key(8)), ("core", key(7)), ("me", key(200))]));
     assert_eq!((view.extern_crate("core"), view.extern_crate("std")), (Some(key(7)), None));
     assert_eq!(view.dep("alloc"), Some(alloc));
-    assert!(view.tools().eq(["blaze"]) && view.macro_use().eq([key(7)]));
+    assert!(view.tools().eq(["blaze"]) && view.macro_use().eq([key(7), key(8)]));
+    assert_eq!(view.macro_use_at(0, "anything"), Some((key(7), true)));
+    assert_eq!(view.macro_use_at(1, "a"), Some((key(8), true)));
+    assert_eq!(view.macro_use_at(1, "c"), Some((key(8), false)));
     // The root's `#![feature(..)]` names, sorted and once each, found by name.
     assert!(view.features().eq(["default_field_values", "never_type"]));
     assert!(view.has_feature("default_field_values") && !view.has_feature("let_chains"));

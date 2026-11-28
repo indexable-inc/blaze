@@ -149,7 +149,8 @@ pub use scope::{ReadEntry, ReadList, Resolved, Saw};
 pub use blaze_surface::{
     AmbiguityKind, AnonImport, Binding, BindingState, CallShape, ChildModDecl, CrateRootBuilder,
     CrateRootHead, DeclaredItem, DeclsBuilder, Def, DefKind, Dep, Edition, ExpandedDecls,
-    ExternCrateDecl, ExternTarget, GlobEdge, MacroCallDecl, MacroRulesDecl, MacroShapes, ModuleInfo,
+    ExternCrateDecl, ExternTarget, GlobEdge, MacroCallDecl, MacroRulesDecl, MacroShapes, MacroUse,
+    MacroUseCrate, ModuleInfo, NameListView,
     Namespace, Origin, Path, PathKind, Rename, ScopeBuilder, ScopeEntry, ScopeError, Site,
     TextualDef, TextualMark, Unresolved, UseDecl, UseForm, UseSite, Visibility, VisibilityClass,
     WrittenVis, globs_digest, Asker, Node, Passed, SeenFrom, Sources, Through, through,

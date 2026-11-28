@@ -86,7 +86,9 @@ pub use crate::crate_graph::{
     CrateFlags, CrateGraphView, CrateIndex, CrateInput, DepEdge, DepInput, EdgeFlags,
     GRAPH_SCHEMA, GraphError, MAX_CRATES, MAX_EXTERN_NAME, Members, build_crate_graph,
 };
-pub use crate::crate_root::{CrateRootBuilder, CrateRootHead, CrateRootView, DEFAULT_RECURSION_LIMIT, Dep};
+pub use crate::crate_root::{
+    CrateRootBuilder, CrateRootHead, CrateRootView, DEFAULT_RECURSION_LIMIT, Dep, MacroUseCrate,
+};
 pub use crate::error::{BuildError, NotBuilt, SurfaceError};
 pub use crate::file_items::{
     Attr, AttrKind, AttrSpan, ChildItems, ErrorOrigin, FileItem, FileItems, FileItemsView, Item,
@@ -128,7 +130,7 @@ pub use crate::module_scope::{
     Unresolved, UseSite, globs_digest, textual_digest, GLOBS_DOMAIN, TEXTUAL_DOMAIN,
 };
 pub use crate::names::{ModuleFile, ModuleFileView, TextualEntry, TextualEntryView};
-pub use crate::path::{ExternTarget, Path, PathKind, PathView, Rename, UseForm};
+pub use crate::path::{ExternTarget, MacroUse, NameListView, Path, PathKind, PathView, Rename, UseForm};
 pub use crate::proof::HasText;
 pub use crate::shape::{
     FloatWidth, IntWidth, Mutability, SelfShape, Shape, ShapeError, UintWidth,

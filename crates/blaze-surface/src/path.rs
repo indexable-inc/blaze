@@ -157,6 +157,103 @@ pub enum UseForm<N> {
     Glob,
 }
 
+/// What macros a `#[macro_use] extern crate` item imports into the `#[macro_use]` prelude.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MacroUse<L> {
+    /// No `#[macro_use]` attribute.
+    None,
+    /// Bare `#[macro_use]`: every exported macro at the dependency's crate root.
+    All,
+    /// `#[macro_use(name1, name2, ...)]`: only the named exported macros (an empty list imports none).
+    Only(L),
+}
+
+byte_enum! {
+    /// [`MacroUse`]'s byte in a record.
+    pub(crate) enum MacroUseTag, refused as "a byte that is no macro_use form" {
+        None = 0 => "none",
+        All = 1 => "all",
+        Only = 2 => "only",
+    }
+}
+
+impl<L> MacroUse<L> {
+    pub fn is_none(&self) -> bool {
+        matches!(self, MacroUse::None)
+    }
+
+    pub fn is_some(&self) -> bool {
+        !self.is_none()
+    }
+
+    pub fn as_ref(&self) -> MacroUse<&L> {
+        match self {
+            MacroUse::None => MacroUse::None,
+            MacroUse::All => MacroUse::All,
+            MacroUse::Only(names) => MacroUse::Only(names),
+        }
+    }
+
+    pub fn map<M>(self, f: impl FnOnce(L) -> M) -> MacroUse<M> {
+        match self {
+            MacroUse::None => MacroUse::None,
+            MacroUse::All => MacroUse::All,
+            MacroUse::Only(names) => MacroUse::Only(f(names)),
+        }
+    }
+}
+
+/// A list of names read in place from a record.
+#[derive(Clone, Copy)]
+pub struct NameListView<'a> {
+    names: &'a [Text],
+    strings: &'a str,
+}
+
+impl<'a> NameListView<'a> {
+    pub(crate) fn new(names: &'a [Text], strings: &'a str) -> NameListView<'a> {
+        NameListView { names, strings }
+    }
+
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &'a str> + use<'a> {
+        let strings = self.strings;
+        self.names.iter().map(move |text| text_of(strings, *text))
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        let strings = self.strings;
+        self.names.iter().any(|text| text_of(strings, *text) == name)
+    }
+
+    pub fn to_vec_in<'b>(&self, alloc: Alloc<'b>) -> AVec<'b, &'a str> {
+        let mut out = AVec::with_capacity_in(self.names.len(), alloc);
+        out.extend(self.iter());
+        out
+    }
+}
+
+impl PartialEq for NameListView<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for NameListView<'_> {}
+
+impl fmt::Debug for NameListView<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
 /// Which crate an `extern crate` names.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ExternTarget<N> {
