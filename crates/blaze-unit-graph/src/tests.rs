@@ -1975,3 +1975,280 @@ fn host_units_resolver_v1_unifies_features_from_inactive_linux_and_active_wasi_b
     feats.sort();
     assert_eq!(feats.as_slice(), ["feat_a", "feat_b"], "resolver 1 must unify inactive Linux `feat_a` with active WASI `feat_b`");
 }
+
+/// Regression for Wave 14 PR 3 (`libc 0.2.191` wasm64 failure): a package (`libc`) reached on the
+/// host graph ONLY through a `cfg(unix)` proc-macro dependency has a `Host`-side `BuildScript`
+/// (`features = ["default", "std"]`). Under `wasm64-blaze-wasip1` (`cfg(unix)` is false), no
+/// server unit points `server.build_script = Some(libc_bs)` (`saw_server == false`).
+/// Storing `feature_side: HostFeatureSide` explicitly on `Unit` (and persisting it in `BUG5`
+/// records) must keep `host_unit_side` returning `HostFeatureSide::Host` both before and after
+/// `record::encode`/`record::decode`.
+#[test]
+fn host_only_build_script_preserves_host_feature_side_in_wasm64_without_server_and_across_record() {
+    let linux_desc = {
+        let mut cfg = Vec::new_in(a());
+        cfg.push(CfgAtom::flag("unix", a()));
+        cfg.push(CfgAtom::pair("target_os", "linux", a()));
+        TargetDesc::new("x86_64-unknown-linux-gnu", cfg, a())
+    };
+    let wasi_desc = {
+        let mut cfg = Vec::new_in(a());
+        cfg.push(CfgAtom::pair("target_os", "wasi", a()));
+        TargetDesc::new("wasm64-blaze-wasip1", cfg, a())
+    };
+
+    let ps = vec![
+        // 0: app depends on proc-macro `pm`
+        pkg("app").member().dep(dep("pm")),
+        // 1: pm depends on `libc` ONLY under `cfg(unix)` (with default+std features)
+        pkg("pm").proc_macro().dep(dep("libc").on("cfg(unix)")),
+        // 2: libc has build.rs and default -> std
+        pkg("libc").build().feature("default", &["std"]).feature("std", &[]),
+    ];
+    let text = lock_text(&ps);
+    let lock = Lock::read(text.as_bytes(), a()).expect("lock");
+
+    let mut ask_roots = Vec::new_in(a());
+    ask_roots.push(LockId(0));
+    let ask = Ask { roots: ask_roots, features: Vec::new_in(a()), all_features: false, no_default_features: false, tests: false };
+    let mut host_res = Resolution::new(&lock, &linux_desc, &linux_desc, &ask, Resolver::V2, a());
+    host_res.member(LockId(0), ps[0].facts()).expect("app");
+    for i in 1..ps.len() {
+        host_res.package(LockId(i as u32), Some(ps[i].facts())).expect("pkg");
+    }
+    let host_graph = match host_res.pass().expect("host pass") {
+        Pass::Done(g) => g,
+        _ => panic!("expected Done on host"),
+    };
+
+    let (host_libc_idx, host_libc_bs) = host_graph
+        .units
+        .iter()
+        .enumerate()
+        .find(|(_, u)| u.name.as_str() == "libc" && u.kind == UnitKind::BuildScript)
+        .expect("host libc build script");
+    assert_eq!(host_libc_bs.feature_side, HostFeatureSide::Host);
+    assert_eq!(host_graph.host_unit_side(UnitId(host_libc_idx as u32)), HostFeatureSide::Host);
+    assert!(host_libc_bs.features.iter().map(|f| f.as_str()).eq(["default", "std"]));
+
+    // Seed wasm64 host-unit resolution from all BuildScript/ProcMacro units of host_graph.
+    let mut wasm_roots = Vec::new_in(a());
+    for (idx, unit) in host_graph.units.iter().enumerate() {
+        let kind = match unit.kind {
+            UnitKind::BuildScript => HostUnitKind::BuildScript,
+            UnitKind::ProcMacro => HostUnitKind::ProcMacro,
+            _ => continue,
+        };
+        let mut features = Vec::new_in(a());
+        for f in unit.features.iter() {
+            features.push(f.clone());
+        }
+        wasm_roots.push(HostUnitAsk {
+            package: unit.package,
+            kind,
+            side: host_graph.host_unit_side(UnitId(idx as u32)),
+            features,
+        });
+    }
+    let mut wasm_res = Resolution::for_host_units(&lock, &wasi_desc, wasm_roots, Resolver::V2, a());
+    host_res.move_packages_into(&mut wasm_res).expect("move packages");
+    let wasm_graph = match wasm_res.pass().expect("wasm64 pass") {
+        Pass::Done(g) => g,
+        _ => panic!("expected Done on wasm64"),
+    };
+
+    // On WASI (`cfg(unix)` false), `libc` has NO Lib server unit (`saw_server == false`).
+    assert!(
+        !wasm_graph.units.iter().any(|u| u.name.as_str() == "libc" && u.kind == UnitKind::Lib),
+        "cfg(unix) is false on WASI so libc has no Lib server unit"
+    );
+    let (wasm_libc_idx, wasm_libc_bs) = wasm_graph
+        .units
+        .iter()
+        .enumerate()
+        .find(|(_, u)| u.name.as_str() == "libc" && u.kind == UnitKind::BuildScript)
+        .expect("wasm64 libc build script");
+    assert_eq!(wasm_libc_bs.feature_side, HostFeatureSide::Host);
+    assert_eq!(wasm_graph.host_unit_side(UnitId(wasm_libc_idx as u32)), HostFeatureSide::Host);
+    assert!(wasm_libc_bs.features.iter().map(|f| f.as_str()).eq(["default", "std"]));
+
+    // Encode/decode round-trip must preserve `feature_side == HostFeatureSide::Host` even with no server.
+    let encoded = record::encode(&wasm_graph, &wasi_desc, &wasi_desc, a()).expect("encode wasm graph");
+    let decoded = record::decode(&encoded, a()).expect("decode wasm graph");
+    let decoded_bs = &decoded.graph.units[wasm_libc_idx];
+    assert_eq!(decoded_bs.feature_side, HostFeatureSide::Host);
+    assert_eq!(decoded.graph.host_unit_side(UnitId(wasm_libc_idx as u32)), HostFeatureSide::Host);
+    assert_eq!(
+        record::encode(&decoded.graph, &decoded.target, &decoded.host, a()).expect("re-encode").as_slice(),
+        encoded.as_slice()
+    );
+}
+
+/// Dual-side build script with identical features on BOTH `Target` and `Host` sides, where NEITHER
+/// side has a server unit in the `wasm64-blaze-wasip1` graph: both units must remain distinct,
+/// keep their exact `HostFeatureSide`, and survive `record::encode`/`record::decode`.
+#[test]
+fn dual_side_same_feature_build_scripts_stay_distinct_in_wasm64_without_servers() {
+    let linux_desc = {
+        let mut cfg = Vec::new_in(a());
+        cfg.push(CfgAtom::flag("unix", a()));
+        cfg.push(CfgAtom::pair("target_os", "linux", a()));
+        TargetDesc::new("x86_64-unknown-linux-gnu", cfg, a())
+    };
+    let wasi_desc = {
+        let mut cfg = Vec::new_in(a());
+        cfg.push(CfgAtom::pair("target_os", "wasi", a()));
+        TargetDesc::new("wasm64-blaze-wasip1", cfg, a())
+    };
+
+    let ps = vec![
+        // 0: app depends on `libc` (Target) and `pm` (ProcMacro)
+        pkg("app").member().dep(dep("libc")).dep(dep("pm")),
+        // 1: pm depends on `libc` ONLY under `cfg(unix)` (Host) with the exact same default+std features
+        pkg("pm").proc_macro().dep(dep("libc").on("cfg(unix)")),
+        // 2: libc has build.rs and default -> std
+        pkg("libc").build().feature("default", &["std"]).feature("std", &[]),
+    ];
+    let text = lock_text(&ps);
+    let lock = Lock::read(text.as_bytes(), a()).expect("lock");
+
+    let mut ask_roots = Vec::new_in(a());
+    ask_roots.push(LockId(0));
+    let ask = Ask { roots: ask_roots, features: Vec::new_in(a()), all_features: false, no_default_features: false, tests: false };
+    let mut host_res = Resolution::new(&lock, &linux_desc, &linux_desc, &ask, Resolver::V2, a());
+    host_res.member(LockId(0), ps[0].facts()).expect("app");
+    for i in 1..ps.len() {
+        host_res.package(LockId(i as u32), Some(ps[i].facts())).expect("pkg");
+    }
+    let host_graph = match host_res.pass().expect("host pass") {
+        Pass::Done(g) => g,
+        _ => panic!("expected Done on host"),
+    };
+
+    let mut wasm_roots = Vec::new_in(a());
+    for (idx, unit) in host_graph.units.iter().enumerate() {
+        let kind = match unit.kind {
+            UnitKind::BuildScript => HostUnitKind::BuildScript,
+            UnitKind::ProcMacro => HostUnitKind::ProcMacro,
+            _ => continue,
+        };
+        let mut features = Vec::new_in(a());
+        for f in unit.features.iter() {
+            features.push(f.clone());
+        }
+        wasm_roots.push(HostUnitAsk {
+            package: unit.package,
+            kind,
+            side: host_graph.host_unit_side(UnitId(idx as u32)),
+            features,
+        });
+    }
+    let mut wasm_res = Resolution::for_host_units(&lock, &wasi_desc, wasm_roots, Resolver::V2, a());
+    host_res.move_packages_into(&mut wasm_res).expect("move packages");
+    let wasm_graph = match wasm_res.pass().expect("wasm64 pass") {
+        Pass::Done(g) => g,
+        _ => panic!("expected Done on wasm64"),
+    };
+
+    let encoded = record::encode(&wasm_graph, &wasi_desc, &wasi_desc, a()).expect("encode wasm graph");
+    let decoded = record::decode(&encoded, a()).expect("decode wasm graph");
+
+    for graph in [&wasm_graph, &decoded.graph] {
+        assert!(!graph.units.iter().any(|u| u.name.as_str() == "libc" && u.kind == UnitKind::Lib));
+        let mut sides = Vec::new_in(a());
+        for (idx, u) in graph.units.iter().enumerate() {
+            if u.name.as_str() == "libc" && u.kind == UnitKind::BuildScript {
+                assert!(u.features.iter().map(|f| f.as_str()).eq(["default", "std"]));
+                sides.push(graph.host_unit_side(UnitId(idx as u32)));
+            }
+        }
+        sides.sort();
+        assert_eq!(sides.as_slice(), [HostFeatureSide::Target, HostFeatureSide::Host]);
+    }
+}
+
+/// Under resolver 1, `ProcMacro` units must still report `HostFeatureSide::Host` from
+/// `host_unit_side` (so `Resolution::for_host_units` walks their normal dependencies), while
+/// unified `BuildScript` units consistently carry `HostFeatureSide::Target` across host and wasm64.
+#[test]
+fn resolver_v1_host_unit_side_keeps_proc_macro_host_and_build_script_target() {
+    let linux_desc = {
+        let mut cfg = Vec::new_in(a());
+        cfg.push(CfgAtom::flag("unix", a()));
+        cfg.push(CfgAtom::pair("target_os", "linux", a()));
+        TargetDesc::new("x86_64-unknown-linux-gnu", cfg, a())
+    };
+    let wasi_desc = {
+        let mut cfg = Vec::new_in(a());
+        cfg.push(CfgAtom::pair("target_os", "wasi", a()));
+        TargetDesc::new("wasm64-blaze-wasip1", cfg, a())
+    };
+
+    let ps = vec![
+        pkg("app").member().dep(dep("pm")),
+        pkg("pm").proc_macro().build().dep(dep("helper")),
+        pkg("helper").feature("default", &["std"]).feature("std", &[]),
+    ];
+    let text = lock_text(&ps);
+    let lock = Lock::read(text.as_bytes(), a()).expect("lock");
+
+    let mut ask_roots = Vec::new_in(a());
+    ask_roots.push(LockId(0));
+    let ask = Ask { roots: ask_roots, features: Vec::new_in(a()), all_features: false, no_default_features: false, tests: false };
+    let mut host_res = Resolution::new(&lock, &linux_desc, &linux_desc, &ask, Resolver::V1, a());
+    host_res.member(LockId(0), ps[0].facts()).expect("app");
+    for i in 1..ps.len() {
+        host_res.package(LockId(i as u32), Some(ps[i].facts())).expect("pkg");
+    }
+    let host_graph = match host_res.pass().expect("host pass") {
+        Pass::Done(g) => g,
+        _ => panic!("expected Done on host"),
+    };
+
+    let mut wasm_roots = Vec::new_in(a());
+    for (idx, unit) in host_graph.units.iter().enumerate() {
+        let kind = match unit.kind {
+            UnitKind::BuildScript => {
+                assert_eq!(host_graph.host_unit_side(UnitId(idx as u32)), HostFeatureSide::Target);
+                HostUnitKind::BuildScript
+            }
+            UnitKind::ProcMacro => {
+                assert_eq!(host_graph.host_unit_side(UnitId(idx as u32)), HostFeatureSide::Host);
+                HostUnitKind::ProcMacro
+            }
+            _ => continue,
+        };
+        let mut features = Vec::new_in(a());
+        for f in unit.features.iter() {
+            features.push(f.clone());
+        }
+        wasm_roots.push(HostUnitAsk {
+            package: unit.package,
+            kind,
+            side: host_graph.host_unit_side(UnitId(idx as u32)),
+            features,
+        });
+    }
+    let mut wasm_res = Resolution::for_host_units(&lock, &wasi_desc, wasm_roots, Resolver::V1, a());
+    host_res.move_packages_into(&mut wasm_res).expect("move packages");
+    let wasm_graph = match wasm_res.pass().expect("wasm64 pass") {
+        Pass::Done(g) => g,
+        _ => panic!("expected Done on wasm64"),
+    };
+
+    let pm_wasm = wasm_graph
+        .units
+        .iter()
+        .find(|u| u.name.as_str() == "pm" && u.kind == UnitKind::ProcMacro)
+        .expect("wasm pm");
+    assert_eq!(pm_wasm.deps.len(), 1, "ProcMacro on resolver 1 must still walk its normal dep `helper`");
+    let helper_wasm = &wasm_graph.units[pm_wasm.deps[0].unit.index()];
+    assert!(helper_wasm.features.iter().map(|f| f.as_str()).eq(["default", "std"]));
+    let (pm_bs_idx, _) = wasm_graph
+        .units
+        .iter()
+        .enumerate()
+        .find(|(_, u)| u.name.as_str() == "pm" && u.kind == UnitKind::BuildScript)
+        .expect("wasm pm build script");
+    assert_eq!(wasm_graph.host_unit_side(UnitId(pm_bs_idx as u32)), HostFeatureSide::Target);
+}

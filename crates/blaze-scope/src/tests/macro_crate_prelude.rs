@@ -72,6 +72,7 @@ fn unit(package: u32, name: &str, kind: UnitKind<'static>, for_host: bool, deps:
         version: t("0.1.0"),
         kind,
         for_host,
+        feature_side: if for_host { blaze_unit_graph::HostFeatureSide::Host } else { blaze_unit_graph::HostFeatureSide::Target },
         edition: edition(),
         crate_name: t(name),
         root: t("src/lib.rs"),

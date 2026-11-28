@@ -295,7 +295,7 @@ crates/blaze-ui/src/slug.rs	BZG1_MAGIC	not persisted: static site font outline t
 crates/blaze-ui/src/slug.rs	BZG1_VERSION	not persisted: static site font outline table built by gen/glyphtable.ts
 crates/blaze-unicode/src/lib.rs	UNICODE_VERSION	none
 crates/blaze-unicode/src/tables.rs	UNICODE_VERSION	none
-crates/blaze-unit-graph/src/record.rs	MAGIC	none
+crates/blaze-unit-graph/src/record.rs	MAGIC	test previous_magic_bug4_is_refused
 crates/blaze-unit-graph/src/sources.rs	LAYOUT_PASSES	none
 crates/blaze-wasi/src/seed.rs	VERSION	not persisted: the ABI's version
 crates/blaze-watch/src/frame.rs	VERSION	none

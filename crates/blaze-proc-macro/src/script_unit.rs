@@ -1325,6 +1325,7 @@ mod tests {
             version: Text::from_str_in("0.1.0", alloc),
             kind: UnitKind::BuildScript,
             for_host: true,
+            feature_side: blaze_unit_graph::HostFeatureSide::Target,
             edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
             crate_name: Text::from_str_in("build_script_build", alloc),
             root: Text::from_str_in("build.rs", alloc),
@@ -1340,6 +1341,7 @@ mod tests {
             version: Text::from_str_in("1.1.4", alloc),
             kind: UnitKind::Lib,
             for_host: true,
+            feature_side: blaze_unit_graph::HostFeatureSide::Host,
             edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
             crate_name: Text::from_str_in("rustix", alloc),
             root: Text::from_str_in("src/lib.rs", alloc),
@@ -1387,6 +1389,7 @@ mod tests {
             version: Text::from_str_in("0.1.0", alloc),
             kind: UnitKind::BuildScript,
             for_host: true,
+            feature_side: blaze_unit_graph::HostFeatureSide::Target,
             edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
             crate_name: Text::from_str_in("build_script_build", alloc),
             root: Text::from_str_in("build.rs", alloc),
@@ -1433,6 +1436,7 @@ mod tests {
                 version: Text::from_str_in("0.1.0", alloc),
                 kind,
                 for_host: true,
+                feature_side: blaze_unit_graph::HostFeatureSide::Target,
                 edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
                 crate_name: Text::from_str_in(name, alloc),
                 root: Text::from_str_in(if name == "app" { "build.rs" } else { "src/lib.rs" }, alloc),
@@ -1509,6 +1513,7 @@ mod tests {
                 version: Text::from_str_in("0.1.0", alloc),
                 kind: UnitKind::BuildScript,
                 for_host: true,
+                feature_side: blaze_unit_graph::HostFeatureSide::Target,
                 edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
                 crate_name: Text::from_str_in("build_script_build", alloc),
                 root: Text::from_str_in("build.rs", alloc),
@@ -1524,6 +1529,7 @@ mod tests {
                 version: Text::from_str_in("0.1.0", alloc),
                 kind: UnitKind::Lib,
                 for_host: true,
+                feature_side: blaze_unit_graph::HostFeatureSide::Host,
                 edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
                 crate_name: Text::from_str_in("wasi_only", alloc),
                 root: Text::from_str_in("src/lib.rs", alloc),
@@ -1577,6 +1583,7 @@ mod tests {
                 version: Text::from_str_in("0.1.0", alloc),
                 kind: UnitKind::BuildScript,
                 for_host: true,
+                feature_side: blaze_unit_graph::HostFeatureSide::Target,
                 edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
                 crate_name: Text::from_str_in("build_script_build", alloc),
                 root: Text::from_str_in("build.rs", alloc),
@@ -1592,6 +1599,7 @@ mod tests {
                 version: Text::from_str_in("0.1.0", alloc),
                 kind: UnitKind::Lib,
                 for_host: true,
+                feature_side: blaze_unit_graph::HostFeatureSide::Host,
                 edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
                 crate_name: Text::from_str_in("dup", alloc),
                 root: Text::from_str_in("src/lib.rs", alloc),
@@ -1607,6 +1615,7 @@ mod tests {
                 version: Text::from_str_in("0.1.0", alloc),
                 kind: UnitKind::Lib,
                 for_host: true,
+                feature_side: blaze_unit_graph::HostFeatureSide::Host,
                 edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
                 crate_name: Text::from_str_in("dup", alloc),
                 root: Text::from_str_in("src/lib.rs", alloc),
@@ -1627,6 +1636,7 @@ mod tests {
                 version: Text::from_str_in("0.1.0", alloc),
                 kind: UnitKind::BuildScript,
                 for_host: true,
+                feature_side: blaze_unit_graph::HostFeatureSide::Target,
                 edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
                 crate_name: Text::from_str_in("build_script_build", alloc),
                 root: Text::from_str_in("build.rs", alloc),
@@ -1689,6 +1699,7 @@ mod tests {
                 version: Text::from_str_in("0.1.0", alloc),
                 kind,
                 for_host: true,
+                feature_side: blaze_unit_graph::HostFeatureSide::Target,
                 edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
                 crate_name: Text::from_str_in(name, alloc),
                 root: Text::from_str_in(root, alloc),
@@ -1835,7 +1846,7 @@ mod tests {
         let lock_a = Lock::read(lock_a_txt.as_bytes(), alloc).expect("lock_a");
         let lock_b = Lock::read(lock_b_txt.as_bytes(), alloc).expect("lock_b");
 
-        let mk_unit = |pkg: u32, name: &str, kind: UnitKind<'static>, for_host: bool, feats: &[&str], deps: &[(&str, u32)], bs: Option<u32>| {
+        let mk_unit = |pkg: u32, name: &str, kind: UnitKind<'static>, for_host: bool, feature_side: blaze_unit_graph::HostFeatureSide, feats: &[&str], deps: &[(&str, u32)], bs: Option<u32>| {
             let mut d = OwnVec::new_in(alloc);
             for &(dn, du) in deps {
                 d.push(UnitDep { name: Text::from_str_in(dn, alloc), unit: UnitId(du) });
@@ -1851,6 +1862,7 @@ mod tests {
                 version: Text::from_str_in("0.1.0", alloc),
                 kind,
                 for_host,
+                feature_side,
                 edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
                 crate_name: Text::from_str_in(name, alloc),
                 root: Text::from_str_in(root, alloc),
@@ -1862,23 +1874,24 @@ mod tests {
             }
         };
 
+        use blaze_unit_graph::HostFeatureSide;
         // Host graph: target-side `app` BuildScript (features=["want"]) -> `host_dep` (path).
         let mut host_units = OwnVec::new_in(alloc);
-        host_units.push(mk_unit(0, "app", UnitKind::BuildScript, true, &["want"], &[("host_dep", 1)], None));
-        host_units.push(mk_unit(1, "host_dep", UnitKind::Lib, true, &[], &[], None));
-        host_units.push(mk_unit(0, "app", UnitKind::Lib, false, &["want"], &[], Some(0)));
+        host_units.push(mk_unit(0, "app", UnitKind::BuildScript, true, HostFeatureSide::Target, &["want"], &[("host_dep", 1)], None));
+        host_units.push(mk_unit(1, "host_dep", UnitKind::Lib, true, HostFeatureSide::Host, &[], &[], None));
+        host_units.push(mk_unit(0, "app", UnitKind::Lib, false, HostFeatureSide::Target, &["want"], &[], Some(0)));
         let host_graph = UnitGraph { units: host_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
 
         // Case 1: wasm_graph only has `app` BuildScript with WRONG features (`["other"]`) and empty deps.
         let mut wg_feats_units = OwnVec::new_in(alloc);
-        wg_feats_units.push(mk_unit(0, "app", UnitKind::BuildScript, true, &["other"], &[], None));
-        wg_feats_units.push(mk_unit(0, "app", UnitKind::Lib, false, &["other"], &[], Some(0)));
+        wg_feats_units.push(mk_unit(0, "app", UnitKind::BuildScript, true, HostFeatureSide::Target, &["other"], &[], None));
+        wg_feats_units.push(mk_unit(0, "app", UnitKind::Lib, false, HostFeatureSide::Target, &["other"], &[], Some(0)));
         let wg_wrong_feats = UnitGraph { units: wg_feats_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
 
-        // Case 2: wasm_graph only has `app` BuildScript with WRONG HostFeatureSide (host-side, for_host=true) and empty deps.
+        // Case 2: wasm_graph only has `app` BuildScript with WRONG HostFeatureSide (host-side) and empty deps.
         let mut wg_side_units = OwnVec::new_in(alloc);
-        wg_side_units.push(mk_unit(0, "app", UnitKind::BuildScript, true, &["want"], &[], None));
-        wg_side_units.push(mk_unit(0, "app", UnitKind::Lib, true, &["want"], &[], Some(0)));
+        wg_side_units.push(mk_unit(0, "app", UnitKind::BuildScript, true, HostFeatureSide::Host, &["want"], &[], None));
+        wg_side_units.push(mk_unit(0, "app", UnitKind::Lib, true, HostFeatureSide::Host, &["want"], &[], Some(0)));
         let wg_wrong_side = UnitGraph { units: wg_side_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
 
         let fallback_v1 = super::script_deps_digest(&host_graph, None, &lock_a, UnitId(0), |id| (id == LockId(1)).then(|| "h-v1".to_owned()))
@@ -1907,5 +1920,24 @@ mod tests {
             assert_ne!(d1, d_wasi_path_edit, "{label}: must pin WASI-only lock path build-dep by its actual contents");
             assert_ne!(d1, d_lock_b, "{label}: must still cover lock-pinned dep in fallback mode");
         }
+
+        // Case 3 (Wave 14 PR 3 positive control): host-side `app` BuildScript in host_graph matches
+        // an orphan (`saw_server == false`) host-side `app` BuildScript in wasm_graph with zero
+        // deps, returning `Ok(None)` instead of falling back to the lock walk.
+        let mut host_side_units = OwnVec::new_in(alloc);
+        host_side_units.push(mk_unit(0, "app", UnitKind::BuildScript, true, HostFeatureSide::Host, &["want"], &[("host_dep", 1)], None));
+        host_side_units.push(mk_unit(1, "host_dep", UnitKind::Lib, true, HostFeatureSide::Host, &[], &[], None));
+        host_side_units.push(mk_unit(0, "app", UnitKind::Lib, true, HostFeatureSide::Host, &["want"], &[], Some(0)));
+        let host_side_graph = UnitGraph { units: host_side_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        let mut wg_orphan_host_units = OwnVec::new_in(alloc);
+        wg_orphan_host_units.push(mk_unit(0, "app", UnitKind::BuildScript, true, HostFeatureSide::Host, &["want"], &[], None));
+        let wg_orphan_host = UnitGraph { units: wg_orphan_host_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        assert_eq!(
+            super::script_deps_digest(&host_side_graph, Some(&wg_orphan_host), &lock_a, UnitId(0), |_| None).expect("ok"),
+            None,
+            "orphan Host-side BuildScript in wasm_graph must match Host-side root instead of falling back"
+        );
     }
 }

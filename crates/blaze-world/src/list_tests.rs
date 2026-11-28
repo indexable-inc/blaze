@@ -119,6 +119,7 @@ fn unit(lock: &Lock<'static>, name: &str, kind: UnitKind<'static>, for_host: boo
         version: t(if lock.package(package).source_text.is_empty() { "0.1.0" } else { "1.0.0" }),
         kind,
         for_host,
+        feature_side: if for_host { blaze_unit_graph::HostFeatureSide::Host } else { blaze_unit_graph::HostFeatureSide::Target },
         edition: RUST21,
         crate_name: t(name),
         root: t("src/lib.rs"),

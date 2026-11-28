@@ -2439,6 +2439,7 @@ mod unresolved_tests {
                 version: Text::from_str_in("0.1.0", alloc),
                 kind,
                 for_host: true,
+                feature_side: blaze_unit_graph::HostFeatureSide::Target,
                 edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
                 crate_name: Text::from_str_in(name, alloc),
                 root: Text::from_str_in(root, alloc),

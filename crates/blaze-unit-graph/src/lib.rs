@@ -227,6 +227,11 @@ pub struct Unit<'a> {
     pub kind: UnitKind<'a>,
     /// Built for the host (a build script, a proc macro, or what they depend on).
     pub for_host: bool,
+    /// Which feature namespace side (`Target` vs `Host`) this unit's features were resolved in:
+    /// `Target` for target-side units, build scripts serving target-side units, and resolver 1
+    /// unified units; `Host` for host-side units (proc macros, build-deps, and build scripts
+    /// serving them) under resolver 2/3 and `Host`-side roots of [`Resolution::for_host_units`].
+    pub feature_side: HostFeatureSide,
     pub edition: PackageEdition,
     /// The crate's name.
     pub crate_name: Text<'a>,
@@ -326,20 +331,7 @@ impl<'a> UnitGraph<'a> {
         if u.kind != UnitKind::BuildScript {
             return HostFeatureSide::Host;
         }
-        let mut saw_server = false;
-        for server in self.units.iter() {
-            if server.build_script == Some(unit) {
-                saw_server = true;
-                if !server.for_host {
-                    return HostFeatureSide::Target;
-                }
-            }
-        }
-        if saw_server {
-            HostFeatureSide::Host
-        } else {
-            HostFeatureSide::Target
-        }
+        u.feature_side
     }
 }
 
