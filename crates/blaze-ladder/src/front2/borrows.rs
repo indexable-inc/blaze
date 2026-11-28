@@ -1621,7 +1621,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 }
             }
             if read_owner_clauses {
-                g.reads.push(clauses_read(owner.0, &owner_regions, r.store.tys.view()));
+                g.reads.push(clauses_read(owner.0, &owner_regions, r.store.tys.view(), alloc));
             }
         }
         if !param_traits.is_empty() {
@@ -1691,7 +1691,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                         let t_views = if !direct.is_empty() && t_len > 0 {
                             if clauses_recorded.scan_for(&t).is_none() {
                                 clauses_recorded.push(t);
-                                g.reads.push(clauses_read(t.0, &t_regions, r.store.tys.view()));
+                                g.reads.push(clauses_read(t.0, &t_regions, r.store.tys.view(), alloc));
                             }
                             t_regions.clauses(t).ok()
                         } else {
@@ -2832,13 +2832,13 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         }
         let stys = r.store.tys.view();
         for &k in traits.iter() {
-            g.reads.push(clauses_read(k, &regions, stys));
+            g.reads.push(clauses_read(k, &regions, stys, alloc));
         }
         for &k in opaques.iter() {
-            g.reads.push(clauses_read(k, &regions, stys));
+            g.reads.push(clauses_read(k, &regions, stys, alloc));
         }
         for &(_, _, a_item) in g.assoc_items.iter() {
-            g.reads.push(clauses_read(a_item.0, &regions, stys));
+            g.reads.push(clauses_read(a_item.0, &regions, stys, alloc));
         }
         // The generic shape of each head whose signature regions are filed: where its type
         // parameters stand among its positions (blaze-flow-lower generic_call.rs), counted by

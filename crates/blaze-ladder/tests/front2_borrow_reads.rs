@@ -288,3 +288,57 @@ where
     );
     assert_ne!(a.digest, b.digest, "body read digest must change when TypeOutlives subject type changes");
 }
+
+#[test]
+fn fn_ptr_abi_and_wide_tuple_clause_subjects_move_clauses_read_digest() {
+    let run = |text: String| -> Seen {
+        let heap = blaze_own::testing::heap();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let shelf = format!("{home}/.blaze/v2/toolchain");
+        let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+        let files = [("/clause-hash/src/main.rs".to_string(), text.clone())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("a known edition");
+        let user = UserCrate { name: "clause_hash", dir: "/clause-hash/", root: "/clause-hash/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let sources = [SourceFile { path: "src/main.rs", text: text.as_str() }];
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
+        let mut world = ProjectWorld::new(&names, &frame, &sources, heap.alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+        let bodies = world.bodies(heap.alloc());
+        let target = bodies
+            .iter()
+            .find(|(b, _)| match b {
+                BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name) == Some("target"),
+                BodyRef::Member { name, .. } => *name == "target",
+            })
+            .map(|(b, _)| *b)
+            .expect("`target` listed");
+        let (types, borrows) = world.check_borrows(target, heap.alloc());
+        assert!(borrows.is_clean(), "`target` is borrow checked clean: {borrows:?}");
+        seen("target", &types)
+    };
+    const CLAUSES_DETAIL: u64 = 11;
+
+    // 1. Function-pointer ABI change (`fn(&'a ())` vs `extern "C" fn(&'a ())`) must move clauses_read.
+    let rust_abi = run("fn main() {}\nfn target<'a, 'k>(x: &'a ()) where fn(&'a ()): 'k { let _ = x; }\n".to_string());
+    let c_abi = run("fn main() {}\nfn target<'a, 'k>(x: &'a ()) where extern \"C\" fn(&'a ()): 'k { let _ = x; }\n".to_string());
+    let r11: Vec<Read> = of_kind(&rust_abi.rows, FactKind::BorrowHead).into_iter().filter(|r| r.fact.detail == CLAUSES_DETAIL).collect();
+    let c11: Vec<Read> = of_kind(&c_abi.rows, FactKind::BorrowHead).into_iter().filter(|r| r.fact.detail == CLAUSES_DETAIL).collect();
+    assert_eq!(keys_of(&r11), keys_of(&c11), "same detail-11 keys for fn ptr ABI test");
+    let moved_abi: Vec<_> = r11.iter().zip(c11.iter()).filter(|(x, y)| x != y).collect();
+    assert_eq!(moved_abi.len(), 1, "changing fn ptr ABI must move `target`'s clauses_read digest: {r11:?} then {c11:?}");
+
+    // 2. Wide 130-element tuple differing only in element #129 (`u8` vs `u16`) must move clauses_read.
+    let mut prefix = String::from("&'a ()");
+    for _ in 1..129 {
+        prefix.push_str(", u8");
+    }
+    let wide_a = run(format!("fn main() {{}}\nfn target<'a, 'k>(x: &'a ()) where ({prefix}, u8): 'k {{ let _ = x; }}\n"));
+    let wide_b = run(format!("fn main() {{}}\nfn target<'a, 'k>(x: &'a ()) where ({prefix}, u16): 'k {{ let _ = x; }}\n"));
+    let wa11: Vec<Read> = of_kind(&wide_a.rows, FactKind::BorrowHead).into_iter().filter(|r| r.fact.detail == CLAUSES_DETAIL).collect();
+    let wb11: Vec<Read> = of_kind(&wide_b.rows, FactKind::BorrowHead).into_iter().filter(|r| r.fact.detail == CLAUSES_DETAIL).collect();
+    assert_eq!(keys_of(&wa11), keys_of(&wb11), "same detail-11 keys for wide tuple test");
+    let moved_wide: Vec<_> = wa11.iter().zip(wb11.iter()).filter(|(x, y)| x != y).collect();
+    assert_eq!(moved_wide.len(), 1, "changing element #129 of a 130-element tuple must move `target`'s clauses_read digest: {wa11:?} then {wb11:?}");
+}
