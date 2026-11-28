@@ -34,11 +34,13 @@ use crate::handle::{
 use crate::{DirName, FileName, Listing, LockMode, Meta};
 
 pub use direct::{
-    DirectFsBackend, DirectFsHandler, DirectFsHandlerError, InMemoryDirectFs, PlannedSqe, SqeFlags,
-    SqeOpcode, SqePlanPlant, UringSqePlan, plan_batch_stat, plan_batch_stat_with,
-    plan_chain_write_flush, plan_chain_write_flush_with, plan_flush, plan_flush_with,
-    plan_read_into, plan_read_into_with, plan_stat, plan_stat_with, plan_write_from,
-    plan_write_from_with,
+    DirectFsBackend, DirectFsHandler, DirectFsHandlerError, InMemoryDirectFs, NativeDirectFs,
+    PlannedSqe, SqeFlags, SqeOpcode, SqePlanPlant, UringSqePlan, plan_batch_stat,
+    plan_batch_stat_with, plan_chain_flush_sync_dir, plan_chain_flush_sync_dir_with,
+    plan_chain_rename_sync_dir, plan_chain_rename_sync_dir_with, plan_chain_write_flush,
+    plan_chain_write_flush_with, plan_flush, plan_flush_with, plan_read_into, plan_read_into_with,
+    plan_rename_flushed, plan_rename_flushed_with, plan_stat, plan_stat_with, plan_sync_dir,
+    plan_sync_dir_with, plan_write_from, plan_write_from_with,
 };
 pub use handler::{DriverHandler, DriverHandlerError, SimHandler, SimHandlerError};
 pub use net::{

@@ -122,7 +122,7 @@ pub struct PlannedSqe {
 pub enum SqePlanPlant {
     #[default]
     None,
-    /// Planted bug: omit `IOSQE_IO_LINK` on the first SQE of a chained write+flush.
+    /// Planted bug: omit `IOSQE_IO_LINK` on the first SQE of a chained submission.
     SkipIoLinkOnChain,
     /// Planted bug: lower registered buffers as plain `Read`/`Write` instead of
     /// `ReadFixed`/`WriteFixed`.
@@ -185,6 +185,60 @@ impl UringSqePlan {
         plant: P,
     ) -> [PlannedSqe; 2] {
         plan_chain_write_flush_with(req, plant)
+    }
+
+    #[inline]
+    pub fn plan_sync_dir(req: &SyncDir<'_>) -> PlannedSqe {
+        plan_sync_dir(req)
+    }
+
+    #[inline]
+    pub fn plan_sync_dir_with<P: Planted<SqePlanPlant>>(
+        req: &SyncDir<'_>,
+        plant: P,
+    ) -> PlannedSqe {
+        plan_sync_dir_with(req, plant)
+    }
+
+    #[inline]
+    pub fn plan_rename_flushed(req: &RenameFlushed<'_>) -> PlannedSqe {
+        plan_rename_flushed(req)
+    }
+
+    #[inline]
+    pub fn plan_rename_flushed_with<P: Planted<SqePlanPlant>>(
+        req: &RenameFlushed<'_>,
+        plant: P,
+    ) -> PlannedSqe {
+        plan_rename_flushed_with(req, plant)
+    }
+
+    #[inline]
+    pub fn plan_chain_flush_sync_dir(req: &Chain<Flush<'_>, SyncDir<'_>>) -> [PlannedSqe; 2] {
+        plan_chain_flush_sync_dir(req)
+    }
+
+    #[inline]
+    pub fn plan_chain_flush_sync_dir_with<P: Planted<SqePlanPlant>>(
+        req: &Chain<Flush<'_>, SyncDir<'_>>,
+        plant: P,
+    ) -> [PlannedSqe; 2] {
+        plan_chain_flush_sync_dir_with(req, plant)
+    }
+
+    #[inline]
+    pub fn plan_chain_rename_sync_dir(
+        req: &Chain<RenameFlushed<'_>, SyncDir<'_>>,
+    ) -> [PlannedSqe; 2] {
+        plan_chain_rename_sync_dir(req)
+    }
+
+    #[inline]
+    pub fn plan_chain_rename_sync_dir_with<P: Planted<SqePlanPlant>>(
+        req: &Chain<RenameFlushed<'_>, SyncDir<'_>>,
+        plant: P,
+    ) -> [PlannedSqe; 2] {
+        plan_chain_rename_sync_dir_with(req, plant)
     }
 
     #[inline]
@@ -317,6 +371,95 @@ pub fn plan_chain_write_flush_with<P: Planted<SqePlanPlant>>(
         first.flags = first.flags.with(SqeFlags::IO_LINK);
     }
     let second = plan_flush_with(&req.second, plant);
+    [first, second]
+}
+
+/// Lowers [`SyncDir`] into an `Fsync` [`PlannedSqe`] targeting the directory's registered
+/// fixed-file slot.
+#[inline]
+pub fn plan_sync_dir(req: &SyncDir<'_>) -> PlannedSqe {
+    plan_sync_dir_with(req, NoPlant)
+}
+
+/// Plant-parameterized version of [`plan_sync_dir`].
+#[inline]
+pub fn plan_sync_dir_with<P: Planted<SqePlanPlant>>(req: &SyncDir<'_>, plant: P) -> PlannedSqe {
+    let flags =
+        if plant.has(SqePlanPlant::SkipFixedFileFlag) { SqeFlags::NONE } else { SqeFlags::FIXED_FILE };
+    PlannedSqe {
+        opcode: SqeOpcode::Fsync,
+        flags,
+        fd_slot: Some(req.dir.id().fixed_file_slot()),
+        buf_index: None,
+        offset: 0,
+        len: 0,
+    }
+}
+
+/// Lowers [`RenameFlushed`] into a `RenameAt` [`PlannedSqe`] anchored at the directory's
+/// registered fixed-file slot.
+#[inline]
+pub fn plan_rename_flushed(req: &RenameFlushed<'_>) -> PlannedSqe {
+    plan_rename_flushed_with(req, NoPlant)
+}
+
+/// Plant-parameterized version of [`plan_rename_flushed`].
+#[inline]
+pub fn plan_rename_flushed_with<P: Planted<SqePlanPlant>>(
+    req: &RenameFlushed<'_>,
+    plant: P,
+) -> PlannedSqe {
+    let flags =
+        if plant.has(SqePlanPlant::SkipFixedFileFlag) { SqeFlags::NONE } else { SqeFlags::FIXED_FILE };
+    PlannedSqe {
+        opcode: SqeOpcode::RenameAt,
+        flags,
+        fd_slot: Some(req.dir.id().fixed_file_slot()),
+        buf_index: None,
+        offset: 0,
+        len: 0,
+    }
+}
+
+/// Lowers `Chain<Flush, SyncDir>` into a linked 2-SQE submission with `IOSQE_IO_LINK` set on the
+/// leading file `Fsync` SQE.
+#[inline]
+pub fn plan_chain_flush_sync_dir(req: &Chain<Flush<'_>, SyncDir<'_>>) -> [PlannedSqe; 2] {
+    plan_chain_flush_sync_dir_with(req, NoPlant)
+}
+
+/// Plant-parameterized version of [`plan_chain_flush_sync_dir`].
+#[inline]
+pub fn plan_chain_flush_sync_dir_with<P: Planted<SqePlanPlant>>(
+    req: &Chain<Flush<'_>, SyncDir<'_>>,
+    plant: P,
+) -> [PlannedSqe; 2] {
+    let mut first = plan_flush_with(&req.first, plant);
+    if !plant.has(SqePlanPlant::SkipIoLinkOnChain) {
+        first.flags = first.flags.with(SqeFlags::IO_LINK);
+    }
+    let second = plan_sync_dir_with(&req.second, plant);
+    [first, second]
+}
+
+/// Lowers `Chain<RenameFlushed, SyncDir>` into a linked 2-SQE submission with `IOSQE_IO_LINK` set
+/// on the leading `RenameAt` SQE.
+#[inline]
+pub fn plan_chain_rename_sync_dir(req: &Chain<RenameFlushed<'_>, SyncDir<'_>>) -> [PlannedSqe; 2] {
+    plan_chain_rename_sync_dir_with(req, NoPlant)
+}
+
+/// Plant-parameterized version of [`plan_chain_rename_sync_dir`].
+#[inline]
+pub fn plan_chain_rename_sync_dir_with<P: Planted<SqePlanPlant>>(
+    req: &Chain<RenameFlushed<'_>, SyncDir<'_>>,
+    plant: P,
+) -> [PlannedSqe; 2] {
+    let mut first = plan_rename_flushed_with(&req.first, plant);
+    if !plant.has(SqePlanPlant::SkipIoLinkOnChain) {
+        first.flags = first.flags.with(SqeFlags::IO_LINK);
+    }
+    let second = plan_sync_dir_with(&req.second, plant);
     [first, second]
 }
 
@@ -668,6 +811,140 @@ impl DirectFsBackend for Sim {
     }
 }
 
+/// Zero-`Effect`/`Done`-bridge [`DirectFsBackend`] backed directly by the host OS filesystem
+/// under an explicit `root` directory (`crate::fs` + `std::fs::OpenOptions`).
+#[derive(Debug)]
+pub struct NativeDirectFs {
+    root: std::path::PathBuf,
+}
+
+impl NativeDirectFs {
+    /// Creates a native direct filesystem backend scoped beneath `root`.
+    #[inline]
+    pub fn new(root: std::path::PathBuf) -> Self {
+        Self { root }
+    }
+
+    /// Returns the root directory path this backend is scoped beneath.
+    #[inline]
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
+    fn map_io_err(path: &FileName, error: std::io::Error) -> FsError {
+        match error.kind() {
+            std::io::ErrorKind::NotFound => FsError::NotFound { path: path.clone() },
+            std::io::ErrorKind::StorageFull => FsError::NoSpace { path: path.clone() },
+            _ => FsError::Io {
+                path: Some(path.clone()),
+                // alloc: an error path.
+                message: format!("{error}"),
+            },
+        }
+    }
+
+    fn map_dir_io_err(dir: &DirName, error: std::io::Error) -> FsError {
+        match dir {
+            DirName::Named(path) => Self::map_io_err(path, error),
+            DirName::Root => FsError::Io {
+                path: None,
+                // alloc: an error path.
+                message: format!("{error}"),
+            },
+        }
+    }
+}
+
+impl DirectFsBackend for NativeDirectFs {
+    #[inline(never)]
+    fn open_write(&mut self, path: &FileName, create: bool, truncate: bool) -> Result<(), FsError> {
+        let open = |p: &std::path::Path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(create)
+                .truncate(truncate)
+                .open(p)
+        };
+        crate::threads::at(&self.root, path, |p| {
+            if create {
+                crate::fs::making_parent(p, || open(p))
+            } else {
+                open(p)
+            }
+        })
+        .map(|_| ())
+        .map_err(|e| Self::map_io_err(path, e))
+    }
+
+    #[inline(never)]
+    fn open_read(&mut self, path: &FileName) -> Result<(), FsError> {
+        crate::threads::at(&self.root, path, |p| {
+            let file = crate::fs::open_positional(p, false, crate::Cache::Kept)?;
+            if file.metadata()?.is_dir() {
+                // alloc: an error path.
+                return Err(std::io::Error::other(format!("{path}: is a directory")));
+            }
+            Ok(())
+        })
+        .map_err(|e| Self::map_io_err(path, e))
+    }
+
+    #[inline(never)]
+    fn read_at(&mut self, path: &FileName, at: u64, dst: &mut [u8]) -> Result<usize, FsError> {
+        crate::threads::at(&self.root, path, |p| {
+            let file = crate::fs::open_positional(p, false, crate::Cache::Kept)?;
+            crate::fs::read_into(&file, dst, at, crate::Cache::Kept)
+        })
+        .map_err(|e| Self::map_io_err(path, e))
+    }
+
+    #[inline(never)]
+    fn write_at(&mut self, path: &FileName, at: u64, src: &[u8]) -> Result<(), FsError> {
+        crate::threads::at(&self.root, path, |p| {
+            let file = crate::fs::open_positional(p, true, crate::Cache::Kept)?;
+            crate::fs::write_from(&file, src, at)
+        })
+        .map_err(|e| Self::map_io_err(path, e))
+    }
+
+    #[inline(never)]
+    fn flush(&mut self, path: &FileName) -> Result<(), FsError> {
+        crate::threads::at(&self.root, path, |p| {
+            if crate::fs::stat(p, true)?.is_none() {
+                return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+            }
+            crate::fs::sync(p)
+        })
+        .map_err(|e| Self::map_io_err(path, e))
+    }
+
+    #[inline(never)]
+    fn rename(&mut self, from: &FileName, to: &FileName) -> Result<(), FsError> {
+        crate::threads::at(&self.root, from, |from_path| {
+            crate::threads::at(&self.root, to, |to_path| {
+                crate::fs::rename_unsynced(from_path, to_path)
+            })
+        })
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => FsError::NotFound { path: from.clone() },
+            _ => Self::map_io_err(to, e),
+        })
+    }
+
+    #[inline(never)]
+    fn sync_dir(&mut self, dir: &DirName) -> Result<(), FsError> {
+        crate::threads::at_dir(&self.root, dir, crate::fs::sync_dir)
+            .map_err(|e| Self::map_dir_io_err(dir, e))
+    }
+
+    #[inline(never)]
+    fn stat(&mut self, path: &FileName) -> Result<Option<Meta>, FsError> {
+        crate::threads::at(&self.root, path, |p| crate::fs::stat(p, true))
+            .map_err(|e| Self::map_io_err(path, e))
+    }
+}
+
 /// Handler-level error for [`DirectFsHandler`] (handle leak on normal exit or table capacity hit).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DirectFsHandlerError {
@@ -744,6 +1021,12 @@ impl<'io, 'b, B: DirectFsBackend> DirectFsHandler<'io, 'b, B> {
                 count,
             })),
         }
+    }
+
+    /// Asserts normal task completion with zero leaked handles (`finish_task(ExitKind::Normal)`).
+    #[inline]
+    pub fn finish_checked(&mut self) -> Result<(), DirectFsHandlerError> {
+        self.finish_task(ExitKind::Normal).map(|_| ())
     }
 
     fn resolve_path(base: &DirName, path: &FileName) -> FileName {
@@ -950,6 +1233,48 @@ impl<'io, 'b, B: DirectFsBackend> DirectFsHandler<'io, 'b, B> {
     }
 
     #[inline(never)]
+    fn exec_chain_flush_sync_dir(
+        &mut self,
+        req: Chain<Flush<'io>, SyncDir<'io>>,
+    ) -> Result<
+        ChainOutcome<
+            Result<(File<'io, Flushed>, FlushedProof), (File<'io, Unflushed>, FsError)>,
+            Result<(), FsError>,
+        >,
+        DirectFsHandlerError,
+    > {
+        let (first, second) = req.split();
+        match self.exec_flush(first)? {
+            Ok((flushed, proof)) => {
+                let synced = self.exec_sync_dir(second)?;
+                Ok(ChainOutcome::Both(Ok((flushed, proof)), synced))
+            }
+            Err(err) => {
+                let SyncDir { dir: _ } = second;
+                Ok(ChainOutcome::FirstOnly(Err(err)))
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn exec_chain_rename_sync_dir(
+        &mut self,
+        req: Chain<RenameFlushed<'io>, SyncDir<'io>>,
+    ) -> Result<ChainOutcome<Result<(), FsError>, Result<(), FsError>>, DirectFsHandlerError> {
+        let (first, second) = req.split();
+        match self.exec_rename_flushed(first)? {
+            Ok(()) => {
+                let synced = self.exec_sync_dir(second)?;
+                Ok(ChainOutcome::Both(Ok(()), synced))
+            }
+            Err(err) => {
+                let SyncDir { dir: _ } = second;
+                Ok(ChainOutcome::FirstOnly(Err(err)))
+            }
+        }
+    }
+
+    #[inline(never)]
     fn exec_batch_stat<const CAP: usize>(
         &mut self,
         batch: Batch<Stat<'io>, CAP>,
@@ -1016,6 +1341,21 @@ impl_direct_fs_handler!(
         Result<(File<'io, Flushed>, FlushedProof), (File<'io, Unflushed>, FsError)>,
     >,
     exec_chain_write_flush
+);
+impl_direct_fs_handler!(
+    [],
+    Chain<Flush<'io>, SyncDir<'io>>,
+    ChainOutcome<
+        Result<(File<'io, Flushed>, FlushedProof), (File<'io, Unflushed>, FsError)>,
+        Result<(), FsError>,
+    >,
+    exec_chain_flush_sync_dir
+);
+impl_direct_fs_handler!(
+    [],
+    Chain<RenameFlushed<'io>, SyncDir<'io>>,
+    ChainOutcome<Result<(), FsError>, Result<(), FsError>>,
+    exec_chain_rename_sync_dir
 );
 
 impl<'io, 'b, B: DirectFsBackend, const CAP: usize> Handler<Batch<Stat<'io>, CAP>>

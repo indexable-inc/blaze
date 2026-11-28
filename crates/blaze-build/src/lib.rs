@@ -244,7 +244,8 @@ pub use instance::{
 pub use walk::arith_checks::PanicConst;
 pub use walk::coroutine::{
     CoroutineFacts, CoroutineOf, DO_STATUS_ASK, DO_STATUS_DONE, DoMachineError, StateShape, build_do_machine_body,
-    coroutine_facts, coroutine_of, coroutines_in, identity as coroutine_identity, split_do_machine_body,
+    coroutine_facts, coroutine_of, coroutines_in, has_do_exprs, identity as coroutine_identity,
+    split_do_machine_body, split_do_machine_body_bounded,
 };
 pub use coroutine_niche::{NicheRefused, StateNiche, niche_of, row_niche};
 

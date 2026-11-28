@@ -1119,7 +1119,7 @@ fn work(shared: &Shared, effect: Effect) -> bool {
 }
 
 /// `f` of `file` under `root`, joined in the thread's path buffer.
-fn at<R>(
+pub(crate) fn at<R>(
     root: &Path,
     file: &crate::FileName,
     f: impl FnOnce(&Path) -> io::Result<R>,
@@ -1133,7 +1133,7 @@ fn at<R>(
 
 /// `f` of the directory `dir` under `root` ([`crate::DirName::Root`] is `root` itself), joined
 /// in the thread's path buffer.
-fn at_dir<R>(
+pub(crate) fn at_dir<R>(
     root: &Path,
     dir: &crate::DirName,
     f: impl FnOnce(&Path) -> io::Result<R>,
@@ -1304,6 +1304,85 @@ fn part_error(part: &crate::ReadPart, error: &io::Error) -> IoError {
 
 fn run_kept(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done> {
     match effect {
+        Effect::ReadAll { .. }
+        | Effect::ReadLink { .. }
+        | Effect::Read { .. }
+        | Effect::ReadInto { .. }
+        | Effect::ReadMany { .. } => run_kept_read(root, kept, effect),
+
+        Effect::WriteFrom { .. }
+        | Effect::Append { .. }
+        | Effect::Sync { .. }
+        | Effect::SyncDir { .. }
+        | Effect::Barrier { .. }
+        | Effect::WriteBack { .. }
+        | Effect::Truncate { .. }
+        | Effect::Write { .. }
+        | Effect::WriteUnsynced { .. }
+        | Effect::WriteAt { .. } => run_kept_write(root, effect),
+
+        Effect::Rename { .. }
+        | Effect::RenameUnsynced { .. }
+        | Effect::Mode { .. }
+        | Effect::Seal { .. }
+        | Effect::Private { .. }
+        | Effect::Times { .. }
+        | Effect::Clone { .. }
+        | Effect::CopyData { .. }
+        | Effect::Prewarm { .. }
+        | Effect::Link { .. }
+        | Effect::Stat { .. }
+        | Effect::Lstat { .. } => run_kept_meta(root, effect),
+
+        Effect::Stamp { .. }
+        | Effect::Entries { .. }
+        | Effect::List { .. }
+        | Effect::Remove { .. }
+        | Effect::MakeDir { .. }
+        | Effect::RemoveDir { .. }
+        | Effect::Ancestors { .. }
+        | Effect::Above { .. }
+        | Effect::Map { .. }
+        | Effect::MapWrite { .. } => run_kept_dir_map(root, effect),
+
+        Effect::Lock { .. } | Effect::Unlock { .. } => {
+            unreachable!("file locks are kept by the driver, which takes each as it is asked for")
+        }
+        Effect::Timer { .. }
+        | Effect::Watch { .. }
+        | Effect::Journal { .. }
+        | Effect::Unwatch { .. }
+        | Effect::Flush { .. }
+        | Effect::Spawn { .. }
+        | Effect::Kill { .. }
+        | Effect::Listen { .. }
+        | Effect::Unlisten { .. }
+        | Effect::Connect { .. }
+        | Effect::Recv { .. }
+        | Effect::Send { .. }
+        | Effect::Hangup { .. }
+        | Effect::Pressure { .. }
+        | Effect::Bind { .. }
+        | Effect::SendTo { .. }
+        | Effect::RecvFrom { .. }
+        | Effect::Unbind { .. }
+        | Effect::Resolve { .. }
+        | Effect::ReadStdin { .. }
+        | Effect::WriteOut { .. }
+        | Effect::Now { .. }
+        | Effect::Random { .. }
+        | Effect::Roots { .. } => {
+            unreachable!(
+                "timers, watches, processes, sockets, the standard streams, the clock and \
+                 randomness are kept by the driver"
+            )
+        }
+    }
+}
+
+#[inline(never)]
+fn run_kept_read(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done> {
+    match effect {
         Effect::ReadAll { file, .. } => match at(root, &file, |path| std::fs::read(path)) {
             Ok(bytes) => Ok(Done::Read(bytes)),
             // alloc: none, an empty read.
@@ -1333,6 +1412,13 @@ fn run_kept(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done>
             })?;
             Ok(Done::ReadMany(parts))
         }
+        _ => unreachable!("dispatched by run_kept"),
+    }
+}
+
+#[inline(never)]
+fn run_kept_write(root: &Path, effect: Effect) -> io::Result<Done> {
+    match effect {
         Effect::WriteFrom { file, at: offset, from, cache, .. } => {
             let span = crate::spans::resolve(&from, &file, offset, cache, "a write from memory to")
                 // alloc: an error path.
@@ -1383,6 +1469,13 @@ fn run_kept(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done>
             fs::write_at(path, offset, &bytes)?;
             Ok(Done::Written)
         }),
+        _ => unreachable!("dispatched by run_kept"),
+    }
+}
+
+#[inline(never)]
+fn run_kept_meta(root: &Path, effect: Effect) -> io::Result<Done> {
+    match effect {
         Effect::Rename { from, to, .. } => at(root, &from, |from| {
             at(root, &to, |to| fs::rename(from, to))?;
             Ok(Done::Renamed)
@@ -1426,6 +1519,13 @@ fn run_kept(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done>
         Effect::Lstat { file, .. } => {
             Ok(Done::Stat(at(root, &file, |path| fs::stat(path, false))?))
         }
+        _ => unreachable!("dispatched by run_kept"),
+    }
+}
+
+#[inline(never)]
+fn run_kept_dir_map(root: &Path, effect: Effect) -> io::Result<Done> {
+    match effect {
         #[cfg(any(unix, target_os = "wasi"))]
         Effect::Stamp { files, .. } => {
             crate::journal::stamp_rows(&files)?;
@@ -1465,38 +1565,7 @@ fn run_kept(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done>
         Effect::MapWrite { file, len, .. } => Ok(Done::MappedWrite(
             at(root, &file, |path| fs::map_write(path, len)).map_err(|error| named(&file, &error))?,
         )),
-        Effect::Lock { .. } | Effect::Unlock { .. } => {
-            unreachable!("file locks are kept by the driver, which takes each as it is asked for")
-        }
-        Effect::Timer { .. }
-        | Effect::Watch { .. }
-        | Effect::Journal { .. }
-        | Effect::Unwatch { .. }
-        | Effect::Flush { .. }
-        | Effect::Spawn { .. }
-        | Effect::Kill { .. }
-        | Effect::Listen { .. }
-        | Effect::Unlisten { .. }
-        | Effect::Connect { .. }
-        | Effect::Recv { .. }
-        | Effect::Send { .. }
-        | Effect::Hangup { .. }
-        | Effect::Pressure { .. }
-        | Effect::Bind { .. }
-        | Effect::SendTo { .. }
-        | Effect::RecvFrom { .. }
-        | Effect::Unbind { .. }
-        | Effect::Resolve { .. }
-        | Effect::ReadStdin { .. }
-        | Effect::WriteOut { .. }
-        | Effect::Now { .. }
-        | Effect::Random { .. }
-        | Effect::Roots { .. } => {
-            unreachable!(
-                "timers, watches, processes, sockets, the standard streams, the clock and \
-                 randomness are kept by the driver"
-            )
-        }
+        _ => unreachable!("dispatched by run_kept"),
     }
 }
 

@@ -399,6 +399,8 @@ pub mod user;
 /// RFC 9562 UUIDs (v4 random, v7 Unix-millisecond time-ordered, deterministic v8 via BLAKE3)
 /// with zero ambient RNG or clock access.
 pub mod uuid;
+/// Typed filesystem watch request facade (`WatchDirReq`, `NextChangeReq`, `UnwatchReq`, `WatchHandle`).
+pub mod watch;
 /// The program's windows: `Window`, a surface's size and its events.
 pub mod window;
 /// Sans-IO RFC 6455 WebSocket handshake (`accept_key`) and frame encoder/decoder.
