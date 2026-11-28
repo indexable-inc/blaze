@@ -240,6 +240,7 @@ mod tests {
             version: t("1.0.0"),
             kind,
             for_host: false,
+            feature_side: blaze_unit_graph::HostFeatureSide::Target,
             edition: edition::PackageEdition::of_manifest("2021").expect("an edition"),
             crate_name: t(name),
             root: t("src/lib.rs"),

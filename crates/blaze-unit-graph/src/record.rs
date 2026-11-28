@@ -26,13 +26,14 @@ use blaze_own::{AVec, Alloc, String, Vec};
 use edition::{Edition, PackageEdition};
 
 use crate::resolve::unit_cfg;
-use crate::{Ask, CfgAtom, ExtraUnit, LeftOut, LeftOutKind, PackageMeta, Resolver, TargetDesc, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
+use crate::{Ask, CfgAtom, ExtraUnit, HostFeatureSide, LeftOut, LeftOutKind, PackageMeta, Resolver, TargetDesc, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
 
 /// The record's form. A change to it is a new magic; an older one is refused by it.
 /// `BUG2`: each package's `CARGO_PKG_*` metadata after the unavailable ids. `BUG3`: no
 /// unavailable ids and no `incomplete` flag: a graph is whole or not made (states.md 35).
 /// `BUG4`: the targets left out by `required-features` after the metadata.
-pub const MAGIC: &[u8; 4] = b"BUG4";
+/// `BUG5`: bit 1 of each unit's flags byte stores `feature_side == HostFeatureSide::Host`.
+pub const MAGIC: &[u8; 4] = b"BUG5";
 /// The domain of [`Source`]'s digest.
 pub const SOURCE_DOMAIN: &str = "blaze-unit-graph: what a request's unit graph read, v1";
 
@@ -107,7 +108,7 @@ pub fn encode<'g, 'r>(graph: &UnitGraph<'g>, target: &TargetDesc<'g>, host: &Tar
                 }
             }
         }
-        w.u8(u8::from(unit.for_host));
+        w.u8(u8::from(unit.for_host) | (u8::from(unit.feature_side == HostFeatureSide::Host) << 1));
         match unit.edition.blaze {
             Some(blaze) => {
                 w.u8(1);
@@ -311,7 +312,7 @@ pub fn decode<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Decoded<'a>, RecordR
             _ => return r.refuse("no such unit kind"),
         };
         let flags = r.u8()?;
-        if flags > 1 {
+        if flags > 3 {
             return r.refuse("unknown unit flags");
         }
         let edition = r.edition()?;
@@ -323,6 +324,7 @@ pub fn decode<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Decoded<'a>, RecordR
             features.push(r.text()?);
         }
         let for_host = flags & 1 != 0;
+        let feature_side = if flags & 2 != 0 { HostFeatureSide::Host } else { HostFeatureSide::Target };
         let desc = if for_host { &host } else { &target };
         let cfg = unit_cfg(desc, &features, is_test(&kind), crate::resolve::ignores_profile_panic(&kind), kind == UnitKind::ProcMacro, alloc);
         let nd = r.count()?;
@@ -348,6 +350,7 @@ pub fn decode<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Decoded<'a>, RecordR
             version,
             kind,
             for_host,
+            feature_side,
             edition,
             crate_name,
             root,
@@ -444,7 +447,7 @@ pub struct ScannedUnit<'b> {
     pub has_build_script: bool,
 }
 
-/// Zero-copy, zero-excess-alloc scan of a `BUG4` unit-graph record: validates the entire record
+/// Zero-copy, zero-excess-alloc scan of a `BUG5` unit-graph record: validates the entire record
 /// (magic, version, platforms, unit indices, UTF-8, metadata order, left-out order, trailing
 /// bytes) identically to [`decode`], while borrowing every string directly from `bytes` and
 /// skipping `unit_cfg`, `deps`, `meta`, and `left_out` allocations.
@@ -494,7 +497,7 @@ pub fn scan_units<'b, 'a>(bytes: &'b [u8], alloc: Alloc<'a>) -> Result<AVec<'a, 
             _ => return r.refuse("no such unit kind"),
         };
         let flags = r.u8()?;
-        if flags > 1 {
+        if flags > 3 {
             return r.refuse("unknown unit flags");
         }
         let for_host = flags & 1 != 0;
@@ -881,9 +884,9 @@ mod scan_tests {
     use blaze_own::{String, Vec};
     use edition::{Edition, PackageEdition};
 
-    use super::{ScannedKind, decode, encode, scan_units};
+    use super::{RecordRefused, ScannedKind, decode, encode, scan_units};
     use crate::resolve::unit_cfg;
-    use crate::{CfgAtom, ExtraUnit, Resolver, TargetDesc, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
+    use crate::{CfgAtom, ExtraUnit, HostFeatureSide, Resolver, TargetDesc, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
 
     #[test]
     fn scan_units_matches_decode_and_refuses_corrupt_records() {
@@ -901,7 +904,7 @@ mod scan_tests {
         let host = TargetDesc { triple: s("aarch64-apple-darwin"), cfg: Vec::new_in(alloc) };
         let ed = PackageEdition { syntax: Edition::Edition2024, blaze: None };
 
-        let make_unit = |kind, name: &str, crate_name: &str, root: &str, for_host: bool, feats: &[&str], build_script: Option<UnitId>| {
+        let make_unit = |kind, name: &str, crate_name: &str, root: &str, for_host: bool, feature_side: HostFeatureSide, feats: &[&str], build_script: Option<UnitId>| {
             let mut features = Vec::new_in(alloc);
             for &f in feats {
                 features.push(s(f));
@@ -921,6 +924,7 @@ mod scan_tests {
                 version: s("0.1.0"),
                 kind,
                 for_host,
+                feature_side,
                 edition: ed,
                 crate_name: s(crate_name),
                 root: s(root),
@@ -933,10 +937,10 @@ mod scan_tests {
         };
 
         let mut units = Vec::new_in(alloc);
-        units.push(make_unit(UnitKind::BuildScript, "app", "build_script_build", "build.rs", true, &[], None));
-        units.push(make_unit(UnitKind::Lib, "app", "app", "src/lib.rs", false, &["alpha"], Some(UnitId(0))));
-        units.push(make_unit(UnitKind::Bin(s("cli")), "app", "cli", "src/main.rs", false, &["alpha"], Some(UnitId(0))));
-        units.push(make_unit(UnitKind::Test { bin: None }, "app", "app", "src/lib.rs", false, &["alpha"], Some(UnitId(0))));
+        units.push(make_unit(UnitKind::BuildScript, "app", "build_script_build", "build.rs", true, HostFeatureSide::Target, &[], None));
+        units.push(make_unit(UnitKind::Lib, "app", "app", "src/lib.rs", false, HostFeatureSide::Target, &["alpha"], Some(UnitId(0))));
+        units.push(make_unit(UnitKind::Bin(s("cli")), "app", "cli", "src/main.rs", false, HostFeatureSide::Target, &["alpha"], Some(UnitId(0))));
+        units.push(make_unit(UnitKind::Test { bin: None }, "app", "app", "src/lib.rs", false, HostFeatureSide::Target, &["alpha"], Some(UnitId(0))));
         units.push(make_unit(
             UnitKind::IntegrationTest(ExtraUnit {
                 name: s("it_ok"),
@@ -952,6 +956,7 @@ mod scan_tests {
             "it_ok",
             "tests/it_ok.rs",
             false,
+            HostFeatureSide::Target,
             &["alpha", "beta"],
             None,
         ));
@@ -970,9 +975,12 @@ mod scan_tests {
             "it_missing",
             "tests/it_missing.rs",
             false,
+            HostFeatureSide::Target,
             &["alpha"],
             None,
         ));
+        // Host-side orphan BuildScript (no server unit) exercises bit 1 (`HostFeatureSide::Host`) round-trip.
+        units.push(make_unit(UnitKind::BuildScript, "libc", "build_script_build", "build.rs", true, HostFeatureSide::Host, &["std"], None));
         // Add a dependency edge on unit 1 -> unit 0 to exercise dep skipping.
         units[1].deps.push(UnitDep { name: s("bs"), unit: UnitId(0) });
 
@@ -982,6 +990,10 @@ mod scan_tests {
         let scanned = scan_units(encoded.as_slice(), alloc).expect("scan_units");
 
         assert_eq!(scanned.len(), full.graph.units.len());
+        assert_eq!(full.graph.units[0].feature_side, HostFeatureSide::Target);
+        assert_eq!(full.graph.host_unit_side(UnitId(0)), HostFeatureSide::Target);
+        assert_eq!(full.graph.units[6].feature_side, HostFeatureSide::Host);
+        assert_eq!(full.graph.host_unit_side(UnitId(6)), HostFeatureSide::Host);
         for (sc, u) in scanned.iter().zip(full.graph.units.iter()) {
             assert_eq!(sc.name, u.name.as_str());
             assert_eq!(sc.version, u.version.as_str());
@@ -1007,5 +1019,18 @@ mod scan_tests {
         bad_magic[0] = b'X';
         assert!(scan_units(bad_magic.as_slice(), alloc).is_err());
         assert!(scan_units(&encoded[..encoded.len() - 1], alloc).is_err());
+    }
+
+    #[test]
+    fn previous_magic_bug4_is_refused() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let s = |v: &str| String::from_str_in(v, alloc);
+        let desc = TargetDesc { triple: s("aarch64-apple-darwin"), cfg: Vec::new_in(alloc) };
+        let graph = UnitGraph { units: Vec::new_in(alloc), resolver: Resolver::V3, meta: Vec::new_in(alloc), left_out: Vec::new_in(alloc) };
+        let mut bytes = encode(&graph, &desc, &desc, alloc).expect("encode empty graph");
+        assert_eq!(&bytes[..4], b"BUG5");
+        bytes[..4].copy_from_slice(b"BUG4");
+        assert_eq!(decode(bytes.as_slice(), alloc).err(), Some(RecordRefused { at: 0, why: "another magic (an older form, or not a record)" }));
+        assert_eq!(scan_units(bytes.as_slice(), alloc).err(), Some(RecordRefused { at: 0, why: "another magic (an older form, or not a record)" }));
     }
 }

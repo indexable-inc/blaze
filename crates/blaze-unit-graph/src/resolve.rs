@@ -1013,6 +1013,10 @@ impl<'l, 'a> Resolution<'l, 'a> {
             },
             kind,
             for_host: key.platform == Side::Host,
+            feature_side: match key.fside {
+                Side::Target => HostFeatureSide::Target,
+                Side::Host => HostFeatureSide::Host,
+            },
             edition: package.edition,
             crate_name,
             root,

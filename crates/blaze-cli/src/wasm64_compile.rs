@@ -4041,12 +4041,17 @@ mod tests {
                 unit: UnitId(target),
             });
         }
+        let feature_side = match kind {
+            UnitKind::BuildScript => blaze_unit_graph::HostFeatureSide::Target,
+            _ => blaze_unit_graph::HostFeatureSide::Host,
+        };
         Unit {
             package: LockId(pkg),
             name: Text::from_str_in(name, alloc),
             version: Text::from_str_in("0.1.0", alloc),
             kind,
             for_host: true,
+            feature_side,
             edition: edition::PackageEdition::of_manifest(edition_str).expect("valid edition"),
             crate_name: Text::from_str_in(crate_name, alloc),
             root: Text::from_str_in("build.rs", alloc),
@@ -4516,12 +4521,16 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
 ";
         let lock = Lock::read(lock_text.as_bytes(), a).expect("parse lock");
 
-        let make_bs = |pkg: u32, deps: &[(&str, u32)]| -> Unit<'_> {
-            make_unit(pkg, "demo", "build_script_build", UnitKind::BuildScript, "2024", deps, a)
+        use blaze_unit_graph::HostFeatureSide;
+        let make_bs = |pkg: u32, side: HostFeatureSide, deps: &[(&str, u32)]| -> Unit<'_> {
+            let mut u = make_unit(pkg, "demo", "build_script_build", UnitKind::BuildScript, "2024", deps, a);
+            u.feature_side = side;
+            u
         };
         let make_lib = |pkg: u32, name: &str, for_host: bool, bs: Option<u32>| -> Unit<'_> {
             let mut u = make_unit(pkg, name, name, UnitKind::Lib, "2024", &[], a);
             u.for_host = for_host;
+            u.feature_side = if for_host { HostFeatureSide::Host } else { HostFeatureSide::Target };
             u.build_script = bs.map(UnitId);
             u
         };
@@ -4533,9 +4542,9 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         //   3: demo Lib (for_host = true, build_script = 2)
         let host_graph = make_graph(
             std::vec![
-                make_bs(0, &[]),
+                make_bs(0, HostFeatureSide::Target, &[]),
                 make_lib(0, "demo", false, Some(0)),
-                make_bs(0, &[]),
+                make_bs(0, HostFeatureSide::Host, &[]),
                 make_lib(0, "demo", true, Some(2)),
             ],
             a,
@@ -4555,10 +4564,10 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         let wasm_graph = make_graph(
             std::vec![
                 wasm_dep_b,
-                make_bs(0, &[("dep_b", 0)]),
+                make_bs(0, HostFeatureSide::Host, &[("dep_b", 0)]),
                 make_lib(0, "demo", true, Some(1)),
                 wasm_dep_a,
-                make_bs(0, &[("dep_a", 3)]),
+                make_bs(0, HostFeatureSide::Target, &[("dep_a", 3)]),
                 make_lib(0, "demo", false, Some(4)),
             ],
             a,
@@ -5676,15 +5685,18 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         let erased = Erased::new(&frame);
         let a = erased.handle();
 
+        use blaze_unit_graph::HostFeatureSide;
         let make_u = |pkg: u32,
                       name: &str,
                       kind: UnitKind<'static>,
                       for_host: bool,
+                      feature_side: HostFeatureSide,
                       build_script: Option<u32>,
                       feats: &[&str]|
          -> Unit<'_> {
             let mut u = make_unit(pkg, name, name, kind, "2024", &[], a);
             u.for_host = for_host;
+            u.feature_side = feature_side;
             u.build_script = build_script.map(UnitId);
             for &f in feats {
                 u.features.push(Text::from_str_in(f, a));
@@ -5693,14 +5705,18 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         };
 
         // Host graph:
-        // 0: foo BuildScript (features=["std"], served by target Lib -> HostFeatureSide::Target)
+        // 0: foo BuildScript (features=["std"], Target side)
         // 1: foo Lib (for_host=false, build_script=Some(0))
         // 2: my-macro ProcMacro (features=["macros"])
+        // 3: libc BuildScript (features=["default", "std"], Host side)
+        // 4: libc Lib (for_host=true, build_script=Some(3))
         let host_graph = make_graph(
             [
-                make_u(1, "foo", UnitKind::BuildScript, true, None, &["std"]),
-                make_u(1, "foo", UnitKind::Lib, false, Some(0), &["std"]),
-                make_u(2, "my-macro", UnitKind::ProcMacro, true, None, &["macros"]),
+                make_u(1, "foo", UnitKind::BuildScript, true, HostFeatureSide::Target, None, &["std"]),
+                make_u(1, "foo", UnitKind::Lib, false, HostFeatureSide::Target, Some(0), &["std"]),
+                make_u(2, "my-macro", UnitKind::ProcMacro, true, HostFeatureSide::Host, None, &["macros"]),
+                make_u(3, "libc", UnitKind::BuildScript, true, HostFeatureSide::Host, None, &["default", "std"]),
+                make_u(3, "libc", UnitKind::Lib, true, HostFeatureSide::Host, Some(3), &["default", "std"]),
             ]
             .into(),
             a,
@@ -5709,9 +5725,9 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         // Wasm graph 1: same package & kind, WRONG features (missing "std" / wrong feature "other").
         let wg_wrong_feats = make_graph(
             [
-                make_u(1, "foo", UnitKind::BuildScript, true, None, &["other"]),
-                make_u(1, "foo", UnitKind::Lib, false, Some(0), &["other"]),
-                make_u(2, "my-macro", UnitKind::ProcMacro, true, None, &[]),
+                make_u(1, "foo", UnitKind::BuildScript, true, HostFeatureSide::Target, None, &["other"]),
+                make_u(1, "foo", UnitKind::Lib, false, HostFeatureSide::Target, Some(0), &["other"]),
+                make_u(2, "my-macro", UnitKind::ProcMacro, true, HostFeatureSide::Host, None, &[]),
             ]
             .into(),
             a,
@@ -5730,11 +5746,11 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         );
 
         // Wasm graph 2: same package & kind & exact features, WRONG HostFeatureSide
-        // (served only by a for_host=true server -> HostFeatureSide::Host instead of Target).
+        // (Host instead of Target).
         let wg_wrong_side = make_graph(
             [
-                make_u(1, "foo", UnitKind::BuildScript, true, None, &["std"]),
-                make_u(1, "foo", UnitKind::Lib, true, Some(0), &["std"]),
+                make_u(1, "foo", UnitKind::BuildScript, true, HostFeatureSide::Host, None, &["std"]),
+                make_u(1, "foo", UnitKind::Lib, true, HostFeatureSide::Host, Some(0), &["std"]),
             ]
             .into(),
             a,
@@ -5744,6 +5760,29 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         assert!(
             bstd::mem::format_in!(&frame, "{bs_side_err}").as_str().contains("no exact"),
             "unexpected error: {bs_side_err}"
+        );
+
+        // Wasm graph 3 (Wave 14 PR 3 regression): orphan `libc` BuildScript with NO server unit
+        // (`saw_server == false`) and explicit `feature_side = HostFeatureSide::Host` MUST match
+        // host_graph's Host-side `libc` BuildScript, and MUST NOT match a Target-side root.
+        let wg_orphan_host = make_graph(
+            [
+                make_u(3, "libc", UnitKind::BuildScript, true, HostFeatureSide::Host, None, &["default", "std"]),
+                make_u(1, "foo", UnitKind::BuildScript, true, HostFeatureSide::Host, None, &["std"]),
+            ]
+            .into(),
+            a,
+        );
+        assert_eq!(
+            locate_root_in_wasm_graph(&host_graph, &wg_orphan_host, UnitId(3), CompileMode::BuildScript, a)
+                .expect("orphan Host-side libc BuildScript in wasm_graph must match"),
+            UnitId(0)
+        );
+        let orphan_wrong_side_err = locate_root_in_wasm_graph(&host_graph, &wg_orphan_host, UnitId(0), CompileMode::BuildScript, a)
+            .expect_err("orphan Host-side foo BuildScript must be refused for Target-side root");
+        assert!(
+            bstd::mem::format_in!(&frame, "{orphan_wrong_side_err}").as_str().contains("no exact"),
+            "unexpected error: {orphan_wrong_side_err}"
         );
 
         // Exact match on package + kind + side + features succeeds.

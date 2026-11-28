@@ -95,6 +95,7 @@ fn hello() -> (World<'static>, ToolchainId) {
         version: s("0.1.0"),
         kind: UnitKind::Lib,
         for_host: false,
+        feature_side: blaze_unit_graph::HostFeatureSide::Target,
         edition: PackageEdition { syntax: Syntax::Edition2021, blaze: None },
         crate_name: s("hello"),
         root: s("src/lib.rs"),

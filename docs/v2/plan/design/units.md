@@ -68,7 +68,7 @@ the workspace's root (the checkout `Dir` is the root's folder today), so a works
 
 ## The record
 
-`record::encode(graph, target, host)` writes the graph's bytes (magic `BUG4`): the resolver,
+`record::encode(graph, target, host)` writes the graph's bytes (magic `BUG5`): the resolver,
 both platforms once, then the units in order. A unit's cfg is not stored: `decode` remakes it
 with `unit_cfg`, the one function that makes it, and `encode` refuses a unit whose cfg is
 anything else (`NotItsCfg`). The bytes are a function of the graph alone.
@@ -108,7 +108,7 @@ footprint of 24 to 35 MiB and a record of 258,968 bytes.
 - `package` (a `LockId`), `name` and `version`;
 - `kind`: `Lib`, `ProcMacro`, `Bin(name)`, `BuildScript`, `Test{bin}`, `IntegrationTest`,
   `Example` or `Bench`;
-- `for_host` and `edition` (a `PackageEdition`, so blaze editions are kept);
+- `for_host`, `feature_side` (`Target` vs `Host` feature namespace) and `edition` (a `PackageEdition`, so blaze editions are kept);
 - `crate_name` and `root` (the root file, relative to the package's directory);
 - `features`, sorted;
 - `cfg`, sorted: the platform's atoms, `feature="f"` for each feature, `debug_assertions`, `test`

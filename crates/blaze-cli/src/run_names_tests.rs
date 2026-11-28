@@ -286,6 +286,7 @@ fn member_unit_index_resolves_unique_targets_and_refuses_ambiguous_or_host() {
             version: txt("0.1.0"),
             kind,
             for_host,
+            feature_side: if for_host { blaze_unit_graph::HostFeatureSide::Host } else { blaze_unit_graph::HostFeatureSide::Target },
             edition: edition::PackageEdition::of_manifest("2024").expect("2024 edition"),
             crate_name: txt(crate_name),
             root: txt(root),
