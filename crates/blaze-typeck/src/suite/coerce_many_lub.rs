@@ -263,3 +263,59 @@ fn incompatible_elements_in_generic_slice_still_fail() {
     let codes: Vec<DiagCode> = c.diags.iter().map(|d| d.code).collect();
     assert!(codes.contains(&DiagCode::IncompatibleArms), "expected E0308 IncompatibleArms, got {codes:?}");
 }
+
+/// Positive 5: a defining RPIT body whose only return paths diverge (`fn f() -> impl Sized { diverge() }`
+/// and `if true { diverge() } else { return diverge(); }`) queues its hidden-type variable for
+/// diverging fallback, resolving the hidden type to `!` with zero diagnostics.
+#[test]
+fn diverging_rpit_body_resolves_hidden_type_to_never() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let never = fx.never();
+    fx.func("diverge", 0, &[], never, Vec::new());
+
+    let o1 = fx.opaque_key("div_direct::{opaque#0}");
+    let none1 = fx.list(&[]);
+    let opaque1 = fx.ty(PNode::Opaque(o1, none1));
+    let is_sized1 = fx.bound(sized, &[opaque1]);
+    fx.set_opaque_bounds(o1, std::vec![is_sized1]);
+    let f_direct = fx.func("div_direct", 0, &[], opaque1, Vec::new());
+
+    let o2 = fx.opaque_key("div_if::{opaque#0}");
+    let none2 = fx.list(&[]);
+    let opaque2 = fx.ty(PNode::Opaque(o2, none2));
+    let is_sized2 = fx.bound(sized, &[opaque2]);
+    fx.set_opaque_bounds(o2, std::vec![is_sized2]);
+    let f_if = fx.func("div_if", 0, &[], opaque2, Vec::new());
+    fx.finish();
+
+    // 1. `fn div_direct() -> impl Sized { diverge() }`
+    {
+        let mut b = Bb::new();
+        let d = b.path(&["diverge"]);
+        let call = b.call(d, &[]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, f_direct, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "div_direct: {:?}", c.diags);
+        assert_eq!(c.hidden.len(), 1, "div_direct hidden: {:?}", c.hidden);
+        assert_eq!(crate::fixture::show(&fx, c.types.view(), c.hidden[0].1), "!");
+    }
+
+    // 2. `fn div_if() -> impl Sized { if true { diverge() } else { return diverge(); } }`
+    {
+        let mut b = Bb::new();
+        let cond = b.bool();
+        let d1 = b.path(&["diverge"]);
+        let c1 = b.call(d1, &[]);
+        let d2 = b.path(&["diverge"]);
+        let c2 = b.call(d2, &[]);
+        let r2 = b.ret(Some(c2));
+        let iff = b.e(Expr::If { cond, then: c1, else_: Some(r2) });
+        let root = b.block(&[], Some(iff));
+        let c = check_body(&fx, &b, f_if, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "div_if: {:?}", c.diags);
+        assert_eq!(c.hidden.len(), 1, "div_if hidden: {:?}", c.hidden);
+        assert_eq!(crate::fixture::show(&fx, c.types.view(), c.hidden[0].1), "!");
+    }
+}

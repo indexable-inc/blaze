@@ -48,6 +48,18 @@ fn pos_concrete_dyn() {
     take_dyn(&[&C1, &C2]);
 }
 
+fn pos_diverging_rpit() -> impl Sized {
+    panic!()
+}
+
+fn pos_diverging_rpit_if(c: bool) -> impl Sized {
+    if c {
+        panic!()
+    } else {
+        return todo!();
+    }
+}
+
 fn neg_concrete_string_slice(s: String) {
     take_strings(&[&s, "lit"]);
 }
@@ -97,6 +109,8 @@ fn coerce_many_unconstrained_expected_positive_and_negative_controls() {
         ("pos_array_diverging_mid", none),
         ("pos_array_diverging_first", none),
         ("pos_concrete_dyn", none),
+        ("pos_diverging_rpit", none),
+        ("pos_diverging_rpit_if", none),
         ("neg_concrete_string_slice", &["E0308"][..]),
         ("neg_incompatible_elements", &["E0308"][..]),
     ] {

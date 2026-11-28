@@ -1184,11 +1184,15 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 let expected = self.ty.shallow_resolve(cm.expected);
                 if self.is_err(expected) {
                     expected
-                } else if self.is_ty_var(expected)
-                    && self.active_inferred_err_var() != Some(expected)
-                    && !self.is_defining_var(expected)
-                {
-                    let v = self.fresh()?;
+                } else if self.is_ty_var(expected) && self.active_inferred_err_var() != Some(expected) {
+                    // Queue a defining opaque hidden-type var itself for diverging fallback so
+                    // `fn f() -> impl Sized { panic!() }` resolves its hidden type to `!`; for
+                    // an unconstrained outer var, use a fresh diverging var instead of binding it.
+                    let v = if self.is_defining_var(expected) {
+                        expected
+                    } else {
+                        self.fresh()?
+                    };
                     self.diverging.push(v);
                     v
                 } else {
