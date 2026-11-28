@@ -427,9 +427,9 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                         && !self.store.maps.inherents.borrow().has(c);
                     if cacheable
                         && let Some(ref shared) = shared
-                        && let Some(bits) = shared.get_const_bit(c)
+                        && let Some((bits, ty)) = shared.get_const_bit(c)
                     {
-                        self.store.maps.file_bits(c, bits);
+                        self.store.maps.file_bits_with_ty(c, bits, ty);
                         continue;
                     }
                     let mut r = self.records(true);
@@ -442,7 +442,8 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                         && let Some(ref shared) = shared
                         && let Some(&bits) = self.store.maps.const_bits.get(&c)
                     {
-                        shared.put_const_bit(c, bits);
+                        let ty = self.store.maps.const_tys.get(&c).copied();
+                        shared.put_const_bit(c, bits, ty);
                     }
                 }
                 Err(e) => {

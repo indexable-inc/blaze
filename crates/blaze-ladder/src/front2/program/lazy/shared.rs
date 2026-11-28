@@ -418,7 +418,7 @@ pub struct SharedPolyUsage {
 pub struct SharedLazyFront {
     alloc: SharedAlloc<'static>,
     heads: ShardedMap<[u8; WANT_BYTES], SharedBytes>,
-    const_bits: ShardedMap<LibKey, u128>,
+    const_bits: ShardedMap<LibKey, (u128, Option<blaze_typeck::PNode>)>,
     pure_consts: ShardedMap<ItemKey, Arc<SharedDataRecord, SharedAlloc<'static>>>,
     pure_statics: ShardedMap<ItemKey, (Arc<SharedDataRecord, SharedAlloc<'static>>, StaticItem)>,
     typed: ShardedMap<ItemKey, SharedBytes>,
@@ -541,7 +541,7 @@ impl SharedLazyFront {
 
     // ---- Evaluated const-generic / array-length bit patterns ----
 
-    pub fn get_const_bit(&self, key: LibKey) -> Option<u128> {
+    pub fn get_const_bit(&self, key: LibKey) -> Option<(u128, Option<blaze_typeck::PNode>)> {
         let found = self.const_bits.get_cloned(shard_of_lib_key(key), &key);
         if found.is_some() {
             self.counters.const_bit_hits.0.fetch_add(1, Ordering::Relaxed);
@@ -551,8 +551,8 @@ impl SharedLazyFront {
         found
     }
 
-    pub fn put_const_bit(&self, key: LibKey, bits: u128) -> bool {
-        self.const_bits.insert_if_absent(shard_of_lib_key(key), key, || bits)
+    pub fn put_const_bit(&self, key: LibKey, bits: u128, ty: Option<blaze_typeck::PNode>) -> bool {
+        self.const_bits.insert_if_absent(shard_of_lib_key(key), key, || (bits, ty))
     }
 
     // ---- Pure evaluated constant `DataRecord`s ----
@@ -819,7 +819,7 @@ mod tests {
             key[9] = i;
             let _ = shared.put_head(key, &[i; 8]);
             let lib = LibKey(ContentId([i; 32]));
-            let _ = shared.put_const_bit(lib, u128::from(i));
+            let _ = shared.put_const_bit(lib, u128::from(i), None);
             let ik = ItemKey(u128::from(i) + 1);
             let _ = shared.put_pure_const(ik, &make_pure_record(i));
             let _ = shared.put_typed_bytes(ik, &[i; 4]);

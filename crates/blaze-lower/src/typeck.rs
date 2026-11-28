@@ -141,8 +141,8 @@ pub trait Types {
     /// index: [`to_typeck`] writes them as that segment's arguments, and the caller's world
     /// answers the segment with the aliased type's definition. `None` (the default: a caller
     /// that resolves no name): the path is converted as written.
-    fn alias_args(&mut self, view: &View<'_>, path: PathIdx, written: &[&[PTy]], tys: &mut PortableTys<'_>, out: &mut dyn FnMut(PTy)) -> Result<Option<u32>, Refused> {
-        let _ = (view, path, written, tys, out);
+    fn alias_args(&mut self, view: &View<'_>, path: PathIdx, ns: PathNs, written: &[&[PTy]], tys: &mut PortableTys<'_>, out: &mut dyn FnMut(PTy)) -> Result<Option<u32>, Refused> {
+        let _ = (view, path, ns, written, tys, out);
         Ok(None)
     }
 
@@ -1200,7 +1200,10 @@ impl Conv<'_, '_, '_, '_, '_> {
     fn const_arg(&mut self, c: ConstIdx, place: ArgList, index: u32) -> Result<PTy, Refused> {
         let r = self.v.const_range(c)?;
         let text = self.v.text_at(r)?.trim();
-        let Some(value) = const_literal(text) else {
+        let unbraced = text.strip_prefix('{').and_then(|t| t.strip_suffix('}')).map(str::trim);
+        let value = const_literal(text)
+            .or_else(|| unbraced.and_then(const_literal).filter(|v| !matches!(v.ty, ConstLitTy::Int(None))));
+        let Some(value) = value else {
             let term = match place {
                 ArgList::Path { path, segment } => self.types.const_term_at(self.v, c, ArgAt { path, segment, index }, self.tys)?,
                 ArgList::Method(scope) => self.types.method_const_term(self.v, c, scope, self.tys)?,
@@ -1288,7 +1291,7 @@ impl Conv<'_, '_, '_, '_, '_> {
                     let Some(args) = self.out.type_lists.get(from..to) else { return self.refuse("a segment's arguments past the body's lists", r) };
                     written.push(args);
                 }
-                self.types.alias_args(self.v, p, &written, self.tys, &mut |t| expanded.push(t))?
+                self.types.alias_args(self.v, p, ns, &written, self.tys, &mut |t| expanded.push(t))?
             };
             if let Some(i) = named {
                 let Some(seg) = segs.get_mut(lead + i as usize) else { return self.refuse("a type alias's segment past its path", r) };

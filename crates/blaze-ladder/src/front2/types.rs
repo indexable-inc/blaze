@@ -269,6 +269,11 @@ pub trait Heads {
     fn const_bits(&self, key: LibKey) -> Option<u128> {
         self.const_len(key).map(u128::from)
     }
+    /// The evaluated primitive type (`bool`, `char`, `Int`, `Uint`) of the evaluated constant
+    /// `key`, when known.
+    fn const_ty(&self, _key: LibKey) -> Option<PNode> {
+        None
+    }
     /// Takes the anonymous constant `ask` to be made a head and evaluated
     /// ([`super::anon`]); `false` where these heads have no evaluator behind them (the
     /// default), and the expression stays the head's refusal.
@@ -1120,11 +1125,11 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// ([`Why::ConstPath`] naming the text).
     fn const_value_bits(&self, env: &Env<'_>, text: &str, r: Range, ty: Option<PNode>) -> Result<u128, Why> {
         let text = text.trim();
-        self.const_value_bits_owned(env, text, text, r, ty, None, None)
+        self.const_value_bits_owned_typed(env, text, text, r, ty, None, None).map(|(bits, _)| bits)
     }
 
     #[expect(clippy::too_many_arguments, reason = "const value evaluation carrying original text, head owner, and substitution edits")]
-    fn const_value_bits_owned(
+    fn const_value_bits_owned_typed(
         &self,
         env: &Env<'_>,
         orig_source: &str,
@@ -1133,7 +1138,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         ty: Option<PNode>,
         carried_owner: Option<(super::anon::HeadOwner, Option<&str>, Option<super::anon::HeadSite<'n>>)>,
         carried_edits: Option<blaze_own::AVec<'static, super::anon::TextEdit>>,
-    ) -> Result<u128, Why> {
+    ) -> Result<(u128, Option<PNode>), Why> {
         let text = text.trim();
         let orig_source = orig_source.trim();
         let other = || Why::ConstPath(Box::from(text), r);
@@ -1197,7 +1202,8 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 if let (None, Some(why)) = (self.heads.const_bits(found.key), self.heads.anon_failed(found.key)) {
                     return Err(Why::ConstPath(format!("{text}: {why}").into_boxed_str(), r));
                 }
-                return self.heads.const_bits(found.key).ok_or(Why::NeedConst(found.key, r));
+                let bits = self.heads.const_bits(found.key).ok_or(Why::NeedConst(found.key, r))?;
+                return Ok((bits, self.heads.const_ty(found.key)));
             }
         }
         let Some(mut ask) = ty.and_then(|ty| super::anon::Ask::of(env.module, ty, text)) else { return Err(other()) };
@@ -1242,7 +1248,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             }
         }
         if let Some(bits) = self.heads.const_bits(ask.need) {
-            return Ok(bits);
+            return Ok((bits, self.heads.const_ty(ask.need)));
         }
         // Tried and refused by the evaluator (`size_of::<u8>()` where a call it needs does not
         // check): the head is refused by the expression's name with the evaluator's reason, as
@@ -1346,9 +1352,17 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // (`[u8; size_of::<Self>()]` in `impl u16`: front2/const_open.rs, state one): its
         // anonymous constant is filed with that `Self` in scope. Every other expression is
         // read as before; one over a generic parameter is refused there by name.
-        let bits = match super::const_open::ground_self(tys.view(), env, text) {
-            Some((self_ty, self_node)) => super::anon::self_value(self.heads, env.module, node, orig_text, text, self_ty, self_node, active_marks, orig_owner, inherent_edits, r)?,
-            None => self.const_value_bits_owned(env, orig_text, text, r, node, orig_owner, inherent_edits)?,
+        let (bits, eval_ty) = match super::const_open::ground_self(tys.view(), env, text) {
+            Some((self_ty, self_node)) => super::anon::self_value_typed(self.heads, env.module, node, orig_text, text, self_ty, self_node, active_marks, orig_owner, inherent_edits, r)?,
+            None => self.const_value_bits_owned_typed(env, orig_text, text, r, node, orig_owner, inherent_edits)?,
+        };
+        let ty = if node == Some(PNode::Infer) {
+            match eval_ty {
+                Some(prim) => intern(tys, prim)?,
+                None => ty,
+            }
+        } else {
+            ty
         };
         intern(tys, PNode::ConstValue { ty, bits })
     }
@@ -1553,7 +1567,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                             let is_type = local_type || (!is_const && (param.is_some() || names_a_type()));
                             if is_type {
                                 self.path_ty(tys, env, v, tp, &[])?
-                            } else if let Ok(Some(super::const_open::LocalArg::Const(bits))) = local {
+                            } else if let Ok(Some(super::const_open::LocalArg::Const(bits, _))) = local {
                                 // The constant's bits in the parameter's type, as a module
                                 // constant's are (`const_term`). A scalar parameter only: a
                                 // fieldless enum's value is its variant under the enum's key

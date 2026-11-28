@@ -235,15 +235,16 @@ pub(super) fn value_prefix<'n, 'l: 'a, 'a, S: super::source::NamesSource<'n>>(
     alloc: Alloc<'a>,
 ) -> Result<(Option<super::locals::Row<'l>>, Option<super::glob_uses::Hit<'a>>), super::locals::LocalGap> {
     use super::locals::{LocalKind, LocalNs};
-    let ns = if single { LocalNs::Value } else { LocalNs::Type };
-    let mut row = if single && path_ns == crate::resolve::Ns::Value {
+    let in_value = single && path_ns == crate::resolve::Ns::Value;
+    let ns = if in_value { LocalNs::Value } else { LocalNs::Type };
+    let mut row = if in_value {
         locals.find_matching(owner, scope, first, ns, |r| {
             r.kind != LocalKind::Use || !use_is_type_only(paths, locals, owner, module, r)
         })
     } else {
         locals.find(owner, scope, first, ns)
     };
-    if row.is_none() && single {
+    if row.is_none() && in_value {
         row = locals.find(owner, scope, first, LocalNs::Type)
             .filter(|r| r.kind.in_block_module() && !matches!(r.kind, LocalKind::Mod | LocalKind::ExternCrate));
     }
@@ -255,7 +256,7 @@ pub(super) fn value_prefix<'n, 'l: 'a, 'a, S: super::source::NamesSource<'n>>(
         return Ok((row, None));
     }
     let Some(scope) = scope else { return Ok((row, None)) };
-    let ns = if single { crate::resolve::Ns::Value } else { crate::resolve::Ns::Type };
+    let ns = if in_value { crate::resolve::Ns::Value } else { crate::resolve::Ns::Type };
     let hit = super::glob_uses::before(locals, paths, module, owner, scope, first, ns, row.as_ref(), alloc)?;
     Ok((if hit.is_none() { row } else { None }, hit))
 }

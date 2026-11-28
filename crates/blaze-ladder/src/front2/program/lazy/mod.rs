@@ -268,8 +268,9 @@ struct LazyConsts<'n, S> {
     /// every crate's unfiled impl rows are filed at most once per lazy program instead of
     /// once per constant evaluation.
     bucket_index: RefCell<Option<crate::front2::buckets::BucketIndex>>,
-    /// Evaluated constant bit patterns reused across frozen heads in this program.
-    cached_bits: RefCell<blaze_hash::HashMap<blaze_id::ItemKey, u128, Alloc<'static>>>,
+    /// Evaluated constant bit patterns (and primitive types when known) reused across frozen heads
+    /// in this program.
+    cached_bits: RefCell<blaze_hash::HashMap<blaze_id::ItemKey, (u128, Option<blaze_typeck::PNode>), Alloc<'static>>>,
     /// Optional shared front-end cache attached to the owning [`LazyProgram`].
     shared: &'n SharedFrontSlot,
 }
@@ -292,18 +293,18 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::head::ConstValues<'n> for Sh
             && !store.maps.qpaths.borrow().is_leaf(c)
             && !store.maps.inherents.borrow().has(c);
         if cacheable
-            && let Some(&bits) = consts.cached_bits.borrow().get(&c)
+            && let Some(&(bits, ty)) = consts.cached_bits.borrow().get(&c)
         {
-            store.maps.file_bits(c, bits);
+            store.maps.file_bits_with_ty(c, bits, ty);
             return Ok(());
         }
         let shared = consts.shared.borrow().clone();
         if cacheable
             && let Some(ref shared) = shared
-            && let Some(bits) = shared.get_const_bit(c)
+            && let Some((bits, ty)) = shared.get_const_bit(c)
         {
-            consts.cached_bits.borrow_mut().insert(c, bits);
-            store.maps.file_bits(c, bits);
+            consts.cached_bits.borrow_mut().insert(c, (bits, ty));
+            store.maps.file_bits_with_ty(c, bits, ty);
             return Ok(());
         }
         if consts.index.borrow().is_none() {
@@ -346,9 +347,10 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::head::ConstValues<'n> for Sh
             && cacheable
             && let Some(&bits) = store.maps.const_bits.get(&c)
         {
-            consts.cached_bits.borrow_mut().insert(c, bits);
+            let ty = store.maps.const_tys.get(&c).copied();
+            consts.cached_bits.borrow_mut().insert(c, (bits, ty));
             if let Some(ref shared) = shared {
-                shared.put_const_bit(c, bits);
+                shared.put_const_bit(c, bits, ty);
             }
         }
         result

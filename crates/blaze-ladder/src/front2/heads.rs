@@ -452,6 +452,10 @@ pub struct Maps {
     /// ([`super::anon::need_key`]); filled by `check::eval_len` beside `const_lens`, which
     /// holds only those that fit 64 bits.
     pub const_bits: HashMap<LibKey, u128, Alloc<'static>>,
+    /// The evaluated primitive type (`bool`, `char`, `Int`, `Uint`) of each constant in
+    /// `const_bits`, when known; used to stamp the concrete type onto inferred anonymous
+    /// constants (`const _: _ = ...`) rather than leaving `PNode::Infer`.
+    pub const_tys: HashMap<LibKey, PNode, Alloc<'static>>,
     /// The current body's defining-text reads. A store shared across body tasks
     /// also keeps the source reads of values it can hand to a subsequent task.
     pub(super) const_text_reads: Option<Recorder<'static>>,
@@ -531,6 +535,7 @@ impl Maps {
             trait_aliases: Rows::new_in(alloc),
             const_lens: HashMap::new_in(alloc),
             const_bits: HashMap::new_in(alloc),
+            const_tys: HashMap::new_in(alloc),
             const_text_reads: None,
             const_proofs: None,
             anon_asked: core::cell::RefCell::new(blaze_own::Vec::new_in(alloc)),
@@ -570,6 +575,7 @@ impl Maps {
             trait_aliases,
             const_lens,
             const_bits,
+            const_tys,
             const_text_reads,
             const_proofs,
             anon_asked,
@@ -603,6 +609,7 @@ impl Maps {
         trait_aliases.clear();
         const_lens.clear();
         const_bits.clear();
+        const_tys.clear();
         *const_text_reads = None;
         *const_proofs = None;
         anon_asked.get_mut().clear();
@@ -625,6 +632,7 @@ impl Maps {
     fn begin_body_reuse(&mut self, work: Alloc<'static>) {
         self.const_lens = HashMap::new_in(work);
         self.const_bits = HashMap::new_in(work);
+        self.const_tys = HashMap::new_in(work);
         self.const_text_reads = None;
         self.const_proofs = None;
         *self.anon_asked.get_mut() = blaze_own::Vec::new_in(work);
@@ -641,12 +649,14 @@ impl Maps {
     fn end_body_reuse(&mut self, heads_alloc: Alloc<'static>) -> bool {
         let tainted = !self.anon_asked.get_mut().is_empty()
             || !self.const_bits.is_empty()
+            || !self.const_tys.is_empty()
             || !self.const_lens.is_empty()
             || !self.anon_failed.is_empty()
             || !self.qpaths.get_mut().is_empty()
             || !self.inherents.get_mut().is_empty();
         self.const_lens = HashMap::new_in(heads_alloc);
         self.const_bits = HashMap::new_in(heads_alloc);
+        self.const_tys = HashMap::new_in(heads_alloc);
         self.const_text_reads = None;
         self.const_proofs = None;
         *self.anon_asked.get_mut() = blaze_own::Vec::new_in(heads_alloc);
@@ -717,6 +727,13 @@ impl Maps {
         self.const_bits.insert(key, value);
     }
 
+    pub(super) fn file_bits_with_ty(&mut self, key: LibKey, value: u128, ty: Option<PNode>) {
+        self.file_bits(key, value);
+        if let Some(ty) = ty {
+            self.const_tys.insert(key, ty);
+        }
+    }
+
     fn replay_const(&self, key: LibKey) {
         if let (Some(reads), Some(proofs)) = (&self.const_text_reads, &self.const_proofs)
             && let Some(&at) = proofs.by_key.get(&key)
@@ -759,6 +776,10 @@ impl Heads for Maps {
     fn const_bits(&self, key: LibKey) -> Option<u128> {
         self.replay_const(key);
         self.const_bits.get(&key).copied().or_else(|| self.const_lens.get(&key).map(|&v| u128::from(v)))
+    }
+    fn const_ty(&self, key: LibKey) -> Option<PNode> {
+        self.replay_const(key);
+        self.const_tys.get(&key).copied()
     }
     fn anon_failed(&self, key: LibKey) -> Option<&str> {
         let why = self.anon_failed.get(&key)?;
