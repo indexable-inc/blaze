@@ -2013,6 +2013,21 @@ pub(crate) fn tell_public(store: &mut dyn Store<'_>, names: &Names<'_>) {
     store.toolchain_crates(&toolchain);
 }
 
+/// The `CrateScope` task source for crate `key`: mixes a proc-macro tag byte under `SOURCE_DOMAIN`
+/// so proc-macro crates automatically inherit every future `SOURCE_DOMAIN` bump while invalidating
+/// pre-fix cached proc-macro `CrateScope` records computed before `JobTexts::proc_exports` was wired
+/// (without churning non-proc-macro crates).
+pub(crate) fn crate_scope_source(key: blaze_id::CrateItemKey, proc_macro: bool) -> ContentId {
+    if proc_macro {
+        let mut tagged = [0u8; 33];
+        tagged[..32].copy_from_slice(&key.0.0);
+        tagged[32] = 1;
+        ContentId::of(SOURCE_DOMAIN, &tagged)
+    } else {
+        ContentId::of(SOURCE_DOMAIN, &key.0.0)
+    }
+}
+
 /// The `CrateScope` parts the graph's record names: one per crate of the world, by subject,
 /// its source the same key's digest. Owed (drive.md): every part runs, so a
 /// `#![no_core]` workspace still resolves all 15 toolchain crates cold; a `Need` locates its
@@ -2023,7 +2038,8 @@ pub(crate) fn parts(names: &Names<'_>) -> std::vec::Vec<(Name, ContentId), Globa
     let mut parts = std::vec::Vec::with_capacity(list.len());
     for r in 0..list.len() {
         let key = list.key(r);
-        parts.push((blaze_drive::key::crate_scope_name(&key), ContentId::of(SOURCE_DOMAIN, &key.0.0)));
+        let source = crate_scope_source(key, CrateGraph::proc_macro(list, r));
+        parts.push((blaze_drive::key::crate_scope_name(&key), source));
     }
     parts.sort_unstable_by_key(|(name, _)| name.subject);
     parts.dedup_by_key(|(name, _)| name.subject);

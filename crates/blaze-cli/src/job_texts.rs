@@ -527,6 +527,19 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
         self.runner().ok().flatten()?.key_of(krate)
     }
 
+    /// The macros the built module of the names job's proc-macro crate declares to the host
+    /// (`proc_runner.rs` `exports_of`): used in place of source `#[proc_macro*]` attributes so
+    /// macro-generated proc-macro exports (e.g. `askama_derive::make_derive_template!`,
+    /// `synstructure::decl_derive!`) resolve even when the proc-macro crate's dependencies are
+    /// stripped on the target side. `None` when no module is loaded, falling back to source text.
+    fn proc_exports(&self, krate: usize) -> Option<&'n [blaze_scope::resolve::ProcExport<'n>]> {
+        if self.own != Some(krate) {
+            return None;
+        }
+        let exports = self.runner().ok().flatten()?.exports_of(krate)?;
+        Some(proc_exports_in(exports, self.frame))
+    }
+
     /// A proc-macro call written in the crate `krate`: through the runner's one path
     /// (`ProcMacros::run`), shown the crate's own package at its edition. No runner, or a crate
     /// this job was not given as a caller, is refused with the expander's typed `HostError`.
@@ -589,6 +602,45 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
         };
         Some(ProcUnusable::Module(held_str(&words, self.frame)))
     }
+}
+
+/// Converts a loaded proc-macro module's `Exported` entries into `blaze-scope`'s borrowed
+/// `ProcExport` slice in `frame` (zero global allocations, zero copies for names and 0/1 helpers).
+pub(crate) fn proc_exports_in<'n>(
+    exports: &'n [blaze_proc_macro::module::Exported],
+    frame: &'n Frame,
+) -> &'n [blaze_scope::resolve::ProcExport<'n>] {
+    if exports.is_empty() {
+        return &[];
+    }
+    let mut out = blaze_own::Vec::with_capacity_in(exports.len(), frame);
+    for export in exports {
+        let helpers: &'n str = match export.helpers.as_slice() {
+            [] => "",
+            [one] => one.as_str(),
+            many => {
+                let len: usize = many
+                    .iter()
+                    .map(std::string::String::len)
+                    .sum::<usize>()
+                    .saturating_add(many.len().saturating_sub(1));
+                let mut joined = blaze_own::String::with_capacity_in(len, frame);
+                for (idx, helper) in many.iter().enumerate() {
+                    if idx > 0 {
+                        joined.push(',');
+                    }
+                    joined.push_str(helper.as_str());
+                }
+                joined.into_bump_str()
+            }
+        };
+        out.push(blaze_scope::resolve::ProcExport {
+            kind: export.kind,
+            name: export.name.as_str(),
+            helpers,
+        });
+    }
+    out.into_bump_slice()
 }
 
 #[cfg(test)]
@@ -655,6 +707,287 @@ mod tests {
         let none = texts(&cx, &root, Procs::None);
         assert!(matches!(none.runner(), Ok(None)), "control: a job given no runner has none");
         assert!(none.proc_macro_key(0).is_none(), "control: no runner, no key");
+        assert!(none.proc_exports(0).is_none(), "control: no runner, no exports");
         assert_eq!(asked.get(), 1, "control: a job given no runner asks no maker");
+    }
+
+    #[cfg(feature = "sandbox")]
+    fn fake_module(name: &str, macros: std::vec::Vec<blaze_proc_macro::module::Exported>) -> blaze_proc_macro::module::ModuleRecord {
+        blaze_proc_macro::module::ModuleRecord {
+            key: std::string::String::from("deadbeef"),
+            name: std::string::String::from(name),
+            version: std::string::String::from("0.1.0"),
+            wasm_sha256: std::string::String::from("00"),
+            macros,
+            decls: std::string::String::from("_DECLS"),
+            dir: std::path::PathBuf::new(),
+            compiled: std::path::PathBuf::new(),
+            native_dylib: None,
+        }
+    }
+
+    /// Positive + negative unit test for `JobTexts::proc_exports`:
+    /// - Loaded module with derive (0, 1, and multiple helpers), attr, and fn-like macros maps
+    ///   cleanly into `ProcExport` slices in the job frame.
+    /// - Loaded module with 0 exports returns `Some(&[])`, distinct from an unloaded module.
+    /// - Negative controls: non-`own` crate index, missing module, and `Procs::None` return `None`.
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn proc_exports_maps_loaded_module_exports_and_distinguishes_empty_from_missing() {
+        use blaze_expand::ProcKind;
+        use blaze_id::{ContentId, CrateItemKey};
+        use blaze_proc_macro::module::{Exported, ModuleError};
+        use blaze_scope::resolve::ProcExport;
+
+        let io = Io::simulated(SimWorld::new(92, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
+        let heap = blaze_own::testing::heap();
+
+        let key_loaded = CrateItemKey(ContentId([1; 32]));
+        let key_empty = CrateItemKey(ContentId([2; 32]));
+        let key_missing = CrateItemKey(ContentId([3; 32]));
+        let runner = crate::proc_runner::ProcRunner::for_test(
+            std::vec![
+                (
+                    0,
+                    key_loaded,
+                    "askama_macros",
+                    Ok(fake_module(
+                        "askama_macros",
+                        std::vec![
+                            Exported { index: 0, kind: ProcKind::Derive, name: "Template".into(), helpers: std::vec!["template".into()] },
+                            Exported { index: 1, kind: ProcKind::Derive, name: "Multi".into(), helpers: std::vec!["alpha".into(), "beta".into()] },
+                            Exported { index: 2, kind: ProcKind::Derive, name: "Bare".into(), helpers: std::vec::Vec::new() },
+                            Exported { index: 3, kind: ProcKind::Attr, name: "route".into(), helpers: std::vec::Vec::new() },
+                            Exported { index: 4, kind: ProcKind::FnLike, name: "sql".into(), helpers: std::vec::Vec::new() },
+                        ],
+                    )),
+                ),
+                (1, key_empty, "empty_macros", Ok(fake_module("empty_macros", std::vec::Vec::new()))),
+                (
+                    2,
+                    key_missing,
+                    "missing_macros",
+                    Err(ModuleError::Missing { name: "missing_macros".into(), version: "0.1.0".into(), key: "missing".into() }),
+                ),
+            ],
+            heap,
+        );
+
+        let loaded_job = texts(&cx, &root, Procs::Made(runner));
+        let exports = loaded_job.proc_exports(0).expect("loaded proc-macro crate must return Some(exports)");
+        assert_eq!(
+            exports,
+            &[
+                ProcExport { kind: ProcKind::Derive, name: "Template", helpers: "template" },
+                ProcExport { kind: ProcKind::Derive, name: "Multi", helpers: "alpha,beta" },
+                ProcExport { kind: ProcKind::Derive, name: "Bare", helpers: "" },
+                ProcExport { kind: ProcKind::Attr, name: "route", helpers: "" },
+                ProcExport { kind: ProcKind::FnLike, name: "sql", helpers: "" },
+            ]
+        );
+        assert!(loaded_job.proc_exports(1).is_none(), "non-own crate index must return None");
+
+        let mut empty_job = texts(&cx, &root, Procs::Made(runner));
+        empty_job.own = Some(1);
+        assert_eq!(empty_job.proc_exports(1), Some(&[][..]), "loaded module with 0 exports must return Some(&[])");
+
+        let mut missing_job = texts(&cx, &root, Procs::Made(runner));
+        missing_job.own = Some(2);
+        assert!(missing_job.proc_exports(2).is_none(), "missing module must return None to allow text fallback");
+
+        let none_job = texts(&cx, &root, Procs::None);
+        assert!(none_job.proc_exports(0).is_none(), "Procs::None must return None");
+    }
+
+    /// End-to-end `blaze-scope` regression test (Wave 15, `askama_macros` / `cloudinit`):
+    /// A registry proc-macro crate whose `#[proc_macro_derive(Template, attributes(template))]`
+    /// is generated by a helper macro (with no literal `#[proc_macro_derive]` in `lib.rs` and
+    /// stripped dependencies) resolves `Template` (and its helper attribute `template`) when
+    /// `JobTexts::proc_exports` supplies the compiled module's exports — allowing a downstream
+    /// crate's `pub use askama_macros::Template;` to resolve cleanly — AND falls back to
+    /// `ProcDecls::Text` (resolving literal `#[proc_macro]` items while not inventing `Template`)
+    /// when no module is loaded.
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn macro_generated_proc_macro_resolves_through_job_texts_proc_exports() {
+        use blaze_expand::ProcKind;
+        use blaze_id::{ContentId, CrateItemKey};
+        use blaze_own::Erased;
+        use blaze_proc_macro::module::{Exported, ModuleError};
+        use blaze_scope::crate_scope::resolve_crate;
+        use blaze_scope::graph::Sysroot;
+        use blaze_scope::prepares::Prepares;
+        use blaze_scope::resolve::CrateInput;
+        use blaze_scope::task::{MacroBody, Serial};
+        use blaze_surface::Edition;
+        use blaze_unit_graph::{Implicit, Prelude, StdIs};
+
+        const ASKAMA_MACROS_SRC: &str = "#![no_core]
+askama_derive::make_derive_template! {
+    #[proc_macro_derive(Template, attributes(template))]
+    pub fn derive_template(input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }
+}
+#[proc_macro]
+pub fn only_in_text(input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }
+";
+        const ASKAMA_SRC: &str = "#![no_core]
+pub use askama_macros::Template;
+";
+
+        let io = Io::simulated(SimWorld::new(93, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
+        let heap = blaze_own::testing::heap();
+
+        let pm_key = CrateItemKey(ContentId([0x41; 32]));
+        let consumer_key = CrateItemKey(ContentId([0x43; 32]));
+        let runner_key = CrateItemKey(ContentId([0x42; 32]));
+        let runner_loaded = crate::proc_runner::ProcRunner::for_test(
+            std::vec![(
+                0,
+                runner_key,
+                "askama_macros",
+                Ok(fake_module(
+                    "askama_macros",
+                    std::vec![Exported {
+                        index: 0,
+                        kind: ProcKind::Derive,
+                        name: "Template".into(),
+                        helpers: std::vec!["template".into()],
+                    }],
+                )),
+            )],
+            heap,
+        );
+        let runner_missing = crate::proc_runner::ProcRunner::for_test(
+            std::vec![(
+                0,
+                runner_key,
+                "askama_macros",
+                Err(ModuleError::Missing { name: "askama_macros".into(), version: "0.15.6".into(), key: "missing".into() }),
+            )],
+            heap,
+        );
+
+        let pm_input = CrateInput {
+            key: pm_key,
+            name: "askama_macros",
+            root: "/1/src/lib.rs",
+            shown_from: "/1/",
+            edition: Edition::E2021,
+            features: &[],
+            cfg: &[],
+            script: None,
+            deps: &[],
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: true, entry: false },
+        };
+        let consumer_input = CrateInput {
+            key: consumer_key,
+            name: "askama",
+            root: "/2/src/lib.rs",
+            shown_from: "/2/",
+            edition: Edition::E2021,
+            features: &[],
+            cfg: &[],
+            script: None,
+            deps: &[("askama_macros", 0)],
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false },
+        };
+        let corrected: [(u32, &str, &str); 2] = [
+            (1, "src/lib.rs", ASKAMA_MACROS_SRC),
+            (2, "src/lib.rs", ASKAMA_SRC),
+        ];
+        let sysroot = Sysroot { core: None, alloc: None, std: None, proc_macro: None, bstd: None };
+
+        // Positive case: loaded module provides `Template` (with helper `template`) via `ProcDecls::Module`.
+        {
+            let frame_pm = Frame::with_reserve(16 << 20, bstd::mem::Tag::Nameres).expect("test frame");
+            let erased_pm = Erased::new(&frame_pm);
+            let bump_pm = erased_pm.bump();
+            let prepares_pm = Prepares::new_in(bump_pm);
+            let mut loaded_texts = texts(&cx, &root, Procs::Made(runner_loaded));
+            loaded_texts.frame = &frame_pm;
+            loaded_texts.corrected = &corrected;
+            let done_ok = resolve_crate(&pm_input, &[], sysroot, &loaded_texts, 0, &Serial, prepares_pm, bump_pm).expect("resolve loaded");
+            let template_macro = done_ok
+                .names
+                .tables
+                .macros
+                .values()
+                .find(|src| src.name == "Template")
+                .expect("macro-generated `Template` derive must be declared from module exports");
+            assert!(
+                matches!(template_macro.body, MacroBody::Proc { kind: ProcKind::Derive, helpers: "template" }),
+                "expected derive helper `template`, got {:?}",
+                template_macro.body
+            );
+            assert!(
+                !done_ok.names.tables.macros.values().any(|src| src.name == "only_in_text"),
+                "when module exports are loaded, only module exports are declared (not unlisted text attrs)"
+            );
+
+            // Downstream `pub use askama_macros::Template;` resolves with zero errors against `done_ok.record`.
+            let frame_c = Frame::with_reserve(16 << 20, bstd::mem::Tag::Nameres).expect("consumer frame");
+            let erased_c = Erased::new(&frame_c);
+            let bump_c = erased_c.bump();
+            let prepares_c = Prepares::new_in(bump_c);
+            let mut consumer_texts = texts(&cx, &root, Procs::None);
+            consumer_texts.frame = &frame_c;
+            consumer_texts.corrected = &corrected;
+            consumer_texts.own = Some(1);
+            let dep_ok = blaze_scope::resolve::aligned(&done_ok.record, bump_c);
+            let consumer_ok = resolve_crate(&consumer_input, &[dep_ok], sysroot, &consumer_texts, 1, &Serial, prepares_c, bump_c)
+                .expect("resolve consumer against loaded proc-macro");
+            let consumer_root = consumer_ok.names.done.get(&consumer_ok.names.root).expect("consumer root");
+            assert!(
+                consumer_root.scope.errors.is_empty(),
+                "pub use askama_macros::Template must resolve with zero errors, got {:?}",
+                consumer_root.scope.errors
+            );
+        }
+
+        // Negative control: missing module returns `None` from `proc_exports` and falls back to `ProcDecls::Text`.
+        {
+            let frame_pm = Frame::with_reserve(16 << 20, bstd::mem::Tag::Nameres).expect("test frame");
+            let erased_pm = Erased::new(&frame_pm);
+            let bump_pm = erased_pm.bump();
+            let prepares_pm = Prepares::new_in(bump_pm);
+            let mut missing_texts = texts(&cx, &root, Procs::Made(runner_missing));
+            missing_texts.frame = &frame_pm;
+            missing_texts.corrected = &corrected;
+            let done_miss = resolve_crate(&pm_input, &[], sysroot, &missing_texts, 0, &Serial, prepares_pm, bump_pm).expect("resolve missing");
+            assert!(
+                !done_miss.names.tables.macros.values().any(|src| src.name == "Template"),
+                "control: without loaded module exports, macro-generated `Template` cannot be parsed from text"
+            );
+            let lit_macro = done_miss
+                .names
+                .tables
+                .macros
+                .values()
+                .find(|src| src.name == "only_in_text")
+                .expect("control: without loaded module exports, literal `#[proc_macro]` falls back to text");
+            assert!(matches!(lit_macro.body, MacroBody::Proc { kind: ProcKind::FnLike, helpers: "" }));
+
+            // Downstream `pub use askama_macros::Template;` fails to resolve against `done_miss.record`.
+            let frame_c = Frame::with_reserve(16 << 20, bstd::mem::Tag::Nameres).expect("consumer frame");
+            let erased_c = Erased::new(&frame_c);
+            let bump_c = erased_c.bump();
+            let prepares_c = Prepares::new_in(bump_c);
+            let mut consumer_texts = texts(&cx, &root, Procs::None);
+            consumer_texts.frame = &frame_c;
+            consumer_texts.corrected = &corrected;
+            consumer_texts.own = Some(1);
+            let dep_miss = blaze_scope::resolve::aligned(&done_miss.record, bump_c);
+            let consumer_miss = resolve_crate(&consumer_input, &[dep_miss], sysroot, &consumer_texts, 1, &Serial, prepares_c, bump_c)
+                .expect("resolve consumer against missing proc-macro");
+            let consumer_miss_root = consumer_miss.names.done.get(&consumer_miss.names.root).expect("consumer miss root");
+            assert!(
+                !consumer_miss_root.scope.errors.is_empty(),
+                "control: without loaded module exports, `pub use askama_macros::Template` must report an unresolved import"
+            );
+        }
     }
 }

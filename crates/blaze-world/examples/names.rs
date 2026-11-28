@@ -1199,13 +1199,12 @@ fn procs_of<P: blaze_world::Packages<'static>>(store: &FsPath, out: &FsPath, roo
     // What each macro crate's module declares to the host: its exports, in place of its text's
     // attributes (a derive declared through `synstructure::decl_derive!` has none written).
     // Copied out once (the hook owns the records) and leaked with the rest of `--procs`.
-    let with: std::collections::BTreeSet<blaze_id::CrateItemKey> = procs.crates().filter(|c| c.2).map(|c| c.0).collect();
     let exports = keys
         .iter()
         .map(|key| {
-            let key = (*key).filter(|k| with.contains(k))?;
+            let key = (*key)?;
             let list: Vec<blaze_scope::task::ProcExport<'static>> = procs
-                .exports(key)
+                .exports(key)?
                 .iter()
                 .map(|e| blaze_scope::task::ProcExport { kind: e.kind, name: String::leak(e.name.clone()), helpers: String::leak(e.helpers.join(", ")) })
                 .collect();
