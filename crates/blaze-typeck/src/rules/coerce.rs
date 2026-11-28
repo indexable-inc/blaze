@@ -19,7 +19,7 @@
 use crate::columns::AdjustKind;
 use crate::diag::{At, DiagCode, PendingDiag, PendingGoal};
 use crate::error::{CheckError, Malformed, Stop};
-use crate::ids::{ExprId, FnPtrHeader, ItemKey, LangItem, Mutbl, RecordSchema, Safety};
+use crate::ids::{ExprId, FnPtrHeader, ItemKey, LangItem, Mutbl, Name, RecordSchema, Safety};
 use crate::machine::Machine;
 use crate::ty::{Cause, Goal, Ty, TyList, TyView, TypeCtx};
 use crate::world::World;
@@ -285,7 +285,11 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         if equal_is_no_unsize && self.probe(|m| m.unify_some(a, b))?.is_some() {
             return Ok(None);
         }
-        self.unsize_goal(LangItem::Unsize, a, b, cause)
+        let unsizing = self.unsize_goal(LangItem::Unsize, a, b, cause)?;
+        if !equal_is_no_unsize && matches!(unsizing, Some(Unsizing::Adjust)) {
+            self.deferred_dyn_unsizes.push((a, b));
+        }
+        Ok(unsizing)
     }
 
     /// `coerce_unsized` for one ADT's two instances (`Box<T>` to `Box<dyn Tr>`, and nested:
@@ -302,14 +306,118 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         if !self.ty.ty_flags(a).is_empty() {
             a = self.try_structurally_resolve(a)?;
         }
-        if !self.has_unresolved_to_dyn(a, b) && self.probe(|m| m.unify_some(a, b))?.is_some() {
+        let unresolved_to_dyn = self.has_unresolved_to_dyn(a, b);
+        if !unresolved_to_dyn && self.probe(|m| m.unify_some(a, b))?.is_some() {
             return Ok(None);
         }
         let unsizing = self.unsize_goal(LangItem::CoerceUnsized, a, b, cause)?;
         if matches!(unsizing, Some(Unsizing::Adjust)) {
+            if unresolved_to_dyn {
+                self.deferred_dyn_unsizes.push((a, b));
+            }
             self.adj_scratch.push((AdjustKind::Unsize, b));
         }
         Ok(unsizing)
+    }
+
+    /// Resolves any type variable `?V` constrained by BOTH:
+    /// 1. a deferred unsizing where `?V` directly faces a trait object `dyn U` (`?V: Unsize<dyn U>`,
+    ///    `Box<?V>: CoerceUnsized<Box<dyn U>>`, `NonNull<?V>`, `Pin<Box<?V>>`, ...), AND
+    /// 2. a pending `< ?V as Pointee >::Metadata == DynMetadata<dyn T>` projection (as from
+    ///    `ptr::from_raw_parts(data, meta)` / `ptr::from_raw_parts_mut` / `NonNull::from_raw_parts`).
+    ///
+    /// In Rust's type system, `dyn T` is the unique type satisfying both constraints:
+    /// - `<X as Pointee>::Metadata == DynMetadata<dyn T>` rules out all `Sized` types (`()`),
+    ///   `str`/`[E]` (`usize`), and any other `dyn Other`, leaving only `dyn T` or an unsized
+    ///   struct/tuple whose tail is `dyn T`;
+    /// - `X: Unsize<dyn U>` (or equality at a non-tail parameter) rules out unsized structs/tuples
+    ///   (`UnsizeToDyn` requires `Self: Sized`).
+    ///
+    /// Unifying `?V = dyn T` (not `dyn U`) also preserves trait upcasting (`DynMetadata<dyn Sub>`
+    /// coerced to `&dyn Super` resolves `?V = dyn Sub` and proves `dyn Sub: Unsize<dyn Super>`)
+    /// and diagnoses incompatible traits (`DynMetadata<dyn Other>` coerced to `&dyn Display`) with
+    /// E0277 instead of ambiguity.
+    pub(crate) fn resolve_dyn_metadata_unsized(&mut self) -> Result<bool, Stop> {
+        const MAX_PAIRS: u32 = 256;
+        let mut facing_dyn = blaze_hash::HashSet::new_in(self.alloc);
+        let mut work = blaze_own::Vec::new_in(self.alloc);
+        let mut visited = blaze_hash::HashSet::new_in(self.alloc);
+        for i in 0..self.deferred_dyn_unsizes.len() {
+            let Some(&(a, b)) = self.deferred_dyn_unsizes.get(i) else { break };
+            work.clear();
+            visited.clear();
+            work.push((a, b));
+            let mut head = 0usize;
+            let mut seen = 0u32;
+            while let Some(&(rx, ry)) = work.get(head) {
+                head += 1;
+                let (x, y) = (self.ty.shallow_resolve(rx), self.ty.shallow_resolve(ry));
+                if x == y || !visited.insert((x, y)) {
+                    continue;
+                }
+                seen += 1;
+                if seen > MAX_PAIRS {
+                    break;
+                }
+                match (self.view(x), self.view(y)) {
+                    (TyView::Infer(crate::ty::Var { kind: crate::ty::VarKind::Ty, .. }), TyView::Dynamic(_)) => {
+                        facing_dyn.insert(x);
+                    }
+                    (TyView::Adt(kx, lx), TyView::Adt(ky, ly)) if kx == ky => {
+                        let n = self.ty.list_len(lx).min(self.ty.list_len(ly));
+                        for j in 0..n {
+                            work.push((self.ty.list_get(lx, j), self.ty.list_get(ly, j)));
+                        }
+                    }
+                    (TyView::Tuple(lx), TyView::Tuple(ly)) => {
+                        let n = self.ty.list_len(lx).min(self.ty.list_len(ly));
+                        for j in 0..n {
+                            work.push((self.ty.list_get(lx, j), self.ty.list_get(ly, j)));
+                        }
+                    }
+                    (TyView::Ref(_, px) | TyView::Ptr(_, px), TyView::Ref(_, py) | TyView::Ptr(_, py)) => {
+                        work.push((px, py));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if facing_dyn.is_empty() {
+            return Ok(false);
+        }
+        let Some(pointee) = self.lang(LangItem::Pointee)? else {
+            return Ok(false);
+        };
+        let Some(dyn_metadata) = self.lang(LangItem::DynMetadata)? else {
+            return Ok(false);
+        };
+        let metadata_name = Name::of("Metadata");
+        let mut goals = blaze_own::Vec::new_in(self.alloc);
+        self.ty.pending_goals(&mut goals);
+        let mut any = false;
+        for &goal in goals.iter() {
+            let Goal::Projection { trait_, args, name, term } = goal else { continue };
+            if trait_ != pointee || name != metadata_name || self.ty.list_len(args) != 1 {
+                continue;
+            }
+            let self_ty = self.ty.shallow_resolve(self.ty.list_get(args, 0));
+            if !facing_dyn.contains(&self_ty) {
+                continue;
+            }
+            let term_ty = self.ty.shallow_resolve(term);
+            let TyView::Adt(k, largs) = self.view(term_ty) else { continue };
+            if k != dyn_metadata || self.ty.list_len(largs) != 1 {
+                continue;
+            }
+            let dyn_ty = self.ty.shallow_resolve(self.ty.list_get(largs, 0));
+            if !matches!(self.view(dyn_ty), TyView::Dynamic(_)) {
+                continue;
+            }
+            if self.unify(self_ty, dyn_ty)? {
+                any = true;
+            }
+        }
+        Ok(any)
     }
 
     /// Whether `t` reaches a `dyn ..` trait object through ADT arguments, references, and raw
