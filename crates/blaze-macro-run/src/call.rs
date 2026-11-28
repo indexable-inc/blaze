@@ -381,6 +381,11 @@ pub(crate) fn lit_write(w: &mut Writer<'_, '_>, kind: LitKind) {
             w.u8(n);
         }
         LitKind::Err => w.u8(10),
+        LitKind::DocStrRaw(n) => {
+            w.u8(11);
+            w.u8(n);
+        }
+        LitKind::DocStr => w.u8(12),
     }
 }
 
@@ -397,6 +402,8 @@ pub(crate) fn lit_read(r: &mut Reader<'_>) -> Result<LitKind, Malformed> {
         8 => LitKind::CStr,
         9 => LitKind::CStrRaw(r.u8()?),
         10 => LitKind::Err,
+        11 => LitKind::DocStrRaw(r.u8()?),
+        12 => LitKind::DocStr,
         other => return Err(Malformed::Tag(Field::LitKind, other)),
     })
 }

@@ -4624,8 +4624,8 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
                 let split = text.len().saturating_sub(suffix_len as usize);
                 let (body, suffix) = text.split_at(split);
                 match kind {
-                    LitKind::Str => quoted(&mut out, "", 0, '"', body, suffix),
-                    LitKind::StrRaw(n) => quoted(&mut out, "r", n, '"', body, suffix),
+                    LitKind::Str | LitKind::DocStr => quoted(&mut out, "", 0, '"', body, suffix),
+                    LitKind::StrRaw(n) | LitKind::DocStrRaw(n) => quoted(&mut out, "r", n, '"', body, suffix),
                     LitKind::ByteStr => quoted(&mut out, "b", 0, '"', body, suffix),
                     LitKind::ByteStrRaw(n) => quoted(&mut out, "br", n, '"', body, suffix),
                     LitKind::CStr => quoted(&mut out, "c", 0, '"', body, suffix),

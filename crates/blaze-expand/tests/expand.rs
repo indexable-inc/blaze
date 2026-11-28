@@ -2909,6 +2909,11 @@ fn recursive_macro_rules_text_mark_preserves_distinct_local_hygiene() {
 
 #[test]
 fn doc_comment_desugars_to_str_raw_with_minimal_hashes() {
+    // Doc-comment provenance on `LitKind` must add 0 bytes to `LitKind`, `TokenKind`, and `Token`.
+    assert_eq!(core::mem::size_of::<LitKind>(), 2);
+    assert_eq!(core::mem::size_of::<TokenKind>(), 8);
+    assert_eq!(core::mem::size_of::<blaze_expand::Token>(), 20);
+
     let alloc = blaze_own::testing::heap().alloc();
     let assert_doc_lit = |src: &str, inner: bool, want_kind: LitKind, want_body: Option<&str>| {
         let stream = lex(src, Edition::E2021, alloc).expect("doc comment lexes");
@@ -2922,7 +2927,7 @@ fn doc_comment_desugars_to_str_raw_with_minimal_hashes() {
             assert_eq!(stream.text_at(idx), body, "literal body for `{src:?}`");
         }
         // Every desugared doc comment must round-trip through source rendering back to the exact
-        // same literal kind and body text.
+        // same raw/cooked literal kind (without doc provenance) and body text.
         let mut rendered = blaze_own::AString::new_in(alloc);
         blaze_expand::write_tokens(&stream, &mut rendered);
         let relexed = lex(rendered.as_str(), Edition::E2021, alloc).expect("rendered doc comment re-lexes");
@@ -2930,25 +2935,25 @@ fn doc_comment_desugars_to_str_raw_with_minimal_hashes() {
         let TokenKind::Literal { kind: rk, suffix_len: rsl, .. } = relexed.tokens()[idx].kind else {
             panic!("expected literal after round-trip for `{src:?}`");
         };
-        assert_eq!((rk, rsl), (kind, 0), "round-trip literal kind for `{src:?}`");
+        assert_eq!((rk, rsl), (kind.without_doc_provenance(), 0), "round-trip literal kind for `{src:?}`");
         assert_eq!(relexed.text_at(idx), stream.text_at(idx), "round-trip literal body for `{src:?}`");
     };
 
-    assert_doc_lit("/// attr\n", false, LitKind::StrRaw(0), Some(" attr"));
-    assert_doc_lit("///\n", false, LitKind::StrRaw(0), Some(""));
-    assert_doc_lit("//! inner\n", true, LitKind::StrRaw(0), Some(" inner"));
-    assert_doc_lit("/** block */", false, LitKind::StrRaw(0), Some(" block "));
-    assert_doc_lit("/*! inner block */", true, LitKind::StrRaw(0), Some(" inner block "));
-    assert_doc_lit("/// has \"quote\"\n", false, LitKind::StrRaw(1), Some(" has \"quote\""));
-    assert_doc_lit("/// trailing \"\n", false, LitKind::StrRaw(1), Some(" trailing \""));
-    assert_doc_lit("/// has \"#\n", false, LitKind::StrRaw(2), Some(" has \"#"));
-    assert_doc_lit("/// a\"###b\n", false, LitKind::StrRaw(4), Some(" a\"###b"));
-    assert_doc_lit("/// \"\"#\n", false, LitKind::StrRaw(2), Some(" \"\"#"));
-    assert_doc_lit("/// has \\n backslash\n", false, LitKind::StrRaw(0), Some(" has \\n backslash"));
-    assert_doc_lit("/** a\r\nb */", false, LitKind::StrRaw(0), Some(" a\nb "));
+    assert_doc_lit("/// attr\n", false, LitKind::DocStrRaw(0), Some(" attr"));
+    assert_doc_lit("///\n", false, LitKind::DocStrRaw(0), Some(""));
+    assert_doc_lit("//! inner\n", true, LitKind::DocStrRaw(0), Some(" inner"));
+    assert_doc_lit("/** block */", false, LitKind::DocStrRaw(0), Some(" block "));
+    assert_doc_lit("/*! inner block */", true, LitKind::DocStrRaw(0), Some(" inner block "));
+    assert_doc_lit("/// has \"quote\"\n", false, LitKind::DocStrRaw(1), Some(" has \"quote\""));
+    assert_doc_lit("/// trailing \"\n", false, LitKind::DocStrRaw(1), Some(" trailing \""));
+    assert_doc_lit("/// has \"#\n", false, LitKind::DocStrRaw(2), Some(" has \"#"));
+    assert_doc_lit("/// a\"###b\n", false, LitKind::DocStrRaw(4), Some(" a\"###b"));
+    assert_doc_lit("/// \"\"#\n", false, LitKind::DocStrRaw(2), Some(" \"\"#"));
+    assert_doc_lit("/// has \\n backslash\n", false, LitKind::DocStrRaw(0), Some(" has \\n backslash"));
+    assert_doc_lit("/** a\r\nb */", false, LitKind::DocStrRaw(0), Some(" a\nb "));
 
     // 254 hashes after `"` needs 255 hashes (the u8 maximum for raw strings); 255 hashes after `"`
-    // cannot be represented as `StrRaw(u8)` and falls back to cooked `LitKind::Str`.
+    // cannot be represented as `StrRaw(u8)` and falls back to cooked `LitKind::DocStr`.
     let mut hashes_254 = blaze_own::AString::new_in(alloc);
     hashes_254.push_str("/// \"");
     for _ in 0..254 {
@@ -2960,7 +2965,7 @@ fn doc_comment_desugars_to_str_raw_with_minimal_hashes() {
     for _ in 0..254 {
         want_254.push('#');
     }
-    assert_doc_lit(hashes_254.as_str(), false, LitKind::StrRaw(255), Some(want_254.as_str()));
+    assert_doc_lit(hashes_254.as_str(), false, LitKind::DocStrRaw(255), Some(want_254.as_str()));
 
     let mut hashes_255 = blaze_own::AString::new_in(alloc);
     hashes_255.push_str("/// \"");
@@ -2968,7 +2973,7 @@ fn doc_comment_desugars_to_str_raw_with_minimal_hashes() {
         hashes_255.push('#');
     }
     hashes_255.push('\n');
-    assert_doc_lit(hashes_255.as_str(), false, LitKind::Str, None);
+    assert_doc_lit(hashes_255.as_str(), false, LitKind::DocStr, None);
 
     // Bare `\r` (not followed by `\n`) in a doc comment is refused by the lexer, matching rustc.
     assert!(lex("/** bare\rcr */", Edition::E2021, alloc).is_err());
@@ -3058,4 +3063,38 @@ fn doc_comment_in_matcher_still_ignored_for_all_doc_forms() {
     assert_eq!(show(&ok.tokens), "fn hello ( ) { }", "{:?}", ok.diagnostics);
     let with_doc = call_fn(&def, "/// line doc in matcher\nhello", &cx);
     assert_eq!(with_doc.arm, None, "a doc comment written in a matcher must not match a doc comment in the call");
+
+    // Explicitly spaced `# [ doc = r" attr" ]`, `# [ doc = " attr" ]`, and `# ! [ doc = r" attr" ]`
+    // in a matcher are NOT doc comments: they stay real matcher tokens (Codex P2 regression test).
+    let spaced_raw = rules("(# [ doc = r\" attr\" ] $x:ident) => { fn $x() {} };", 1);
+    assert_eq!(call_fn(&spaced_raw, "/// attr\nfoo", &cx).arm, Some(0));
+    assert_eq!(call_fn(&spaced_raw, "#[doc = r\" attr\"] foo", &cx).arm, Some(0));
+    assert_eq!(call_fn(&spaced_raw, "foo", &cx).arm, None, "explicit spaced #[doc = r\" attr\"] must not be skipped");
+
+    let spaced_cooked = rules("(# [ doc = \" attr\" ] $x:ident) => { fn $x() {} };", 1);
+    assert_eq!(call_fn(&spaced_cooked, "#[doc = \" attr\"] foo", &cx).arm, Some(0));
+    assert_eq!(call_fn(&spaced_cooked, "/// attr\nfoo", &cx).arm, None);
+    assert_eq!(call_fn(&spaced_cooked, "foo", &cx).arm, None, "explicit spaced #[doc = \" attr\"] must not be skipped");
+
+    let spaced_inner = rules("(# ! [ doc = r\" inner\" ] $x:ident) => { fn $x() {} };", 1);
+    assert_eq!(call_fn(&spaced_inner, "//! inner\nfoo", &cx).arm, Some(0));
+    assert_eq!(call_fn(&spaced_inner, "foo", &cx).arm, None, "explicit spaced #![doc = r\" inner\"] must not be skipped");
+
+    // Forwarding a doc comment through `macro_rules!` strips doc provenance at the declarative
+    // input boundary (`LitKind::StrRaw`), whereas a `///` written directly in a template keeps
+    // `LitKind::DocStrRaw` (matching rustc).
+    let forward = rules("($($t:tt)*) => { $($t)* };", 1);
+    let forwarded = call_fn(&forward, "/// forwarded\n", &cx);
+    assert!(
+        matches!(forwarded.tokens.tokens()[4].kind, TokenKind::Literal { kind: LitKind::StrRaw(0), .. }),
+        "forwarded doc comment should become plain StrRaw(0), got {:?}",
+        forwarded.tokens.tokens()[4].kind
+    );
+    let from_template = rules("() => { /// templated\n };", 1);
+    let templated = call_fn(&from_template, "", &cx);
+    assert!(
+        matches!(templated.tokens.tokens()[4].kind, TokenKind::Literal { kind: LitKind::DocStrRaw(0), .. }),
+        "template doc comment should keep DocStrRaw(0), got {:?}",
+        templated.tokens.tokens()[4].kind
+    );
 }

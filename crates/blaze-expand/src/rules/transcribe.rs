@@ -8,7 +8,7 @@ use parser::SyntaxKind;
 use super::{
     Arm, Bound, CallError, ConcatElem, DEPTH_BOUND, DefTok, Engine, Frag, Msg, NONE, Op, RepKind,
     SITE, Sep,
-    copy::{self, Copying, set_last_alone, written},
+    copy::{self, Copying, set_last_alone, written, written_input},
     input::View,
     linear::{NodeKind, Values},
     matcher::{Fragment, Origin, Toks},
@@ -169,7 +169,7 @@ fn push_view(
         });
     }
     for at in toks.at..toks.end {
-        push(scratch, out, written(view.kind(at)), view.whole(at), view.origin(at))?;
+        push(scratch, out, written_input(view.kind(at)), view.whole(at), view.origin(at))?;
     }
     if alone && !toks.is_empty() {
         set_last_alone(out);

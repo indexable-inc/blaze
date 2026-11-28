@@ -2155,8 +2155,8 @@ fn render(stream: &TokenStream<'_>) -> String {
                 let (body, suffix) = text.split_at(split);
                 let hashes = |n: u8| "#".repeat(usize::from(n));
                 match kind {
-                    LitKind::Str => format!("\"{body}\"{suffix}"),
-                    LitKind::StrRaw(n) => format!("r{0}\"{body}\"{0}{suffix}", hashes(n)),
+                    LitKind::Str | LitKind::DocStr => format!("\"{body}\"{suffix}"),
+                    LitKind::StrRaw(n) | LitKind::DocStrRaw(n) => format!("r{0}\"{body}\"{0}{suffix}", hashes(n)),
                     LitKind::ByteStr => format!("b\"{body}\"{suffix}"),
                     LitKind::ByteStrRaw(n) => format!("br{0}\"{body}\"{0}{suffix}", hashes(n)),
                     LitKind::CStr => format!("c\"{body}\"{suffix}"),

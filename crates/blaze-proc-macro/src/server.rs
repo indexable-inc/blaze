@@ -261,8 +261,8 @@ fn lit_write(w: &mut Writer<'_>, kind: LitKind) {
         LitKind::Char => w.u8(1),
         LitKind::Integer => w.u8(2),
         LitKind::Float => w.u8(3),
-        LitKind::Str => w.u8(4),
-        LitKind::StrRaw(n) => {
+        LitKind::Str | LitKind::DocStr => w.u8(4),
+        LitKind::StrRaw(n) | LitKind::DocStrRaw(n) => {
             w.u8(5);
             w.u8(n);
         }
@@ -320,8 +320,23 @@ fn write_literal(out: &mut String, kind: LitKind, sym: &str, suffix: &str) {
         LitKind::Byte => out.push_str(&format!("b'{sym}'")),
         LitKind::Char => out.push_str(&format!("'{sym}'")),
         LitKind::Integer | LitKind::Float | LitKind::Err => out.push_str(sym),
-        LitKind::Str => out.push_str(&format!("\"{sym}\"")),
-        LitKind::StrRaw(n) => out.push_str(&format!("r{0}\"{sym}\"{0}", hashes(n))),
+        LitKind::Str | LitKind::DocStr => {
+            out.push('"');
+            out.push_str(sym);
+            out.push('"');
+        }
+        LitKind::StrRaw(n) | LitKind::DocStrRaw(n) => {
+            out.push('r');
+            for _ in 0..n {
+                out.push('#');
+            }
+            out.push('"');
+            out.push_str(sym);
+            out.push('"');
+            for _ in 0..n {
+                out.push('#');
+            }
+        }
         LitKind::ByteStr => out.push_str(&format!("b\"{sym}\"")),
         LitKind::ByteStrRaw(n) => out.push_str(&format!("br{0}\"{sym}\"{0}", hashes(n))),
         LitKind::CStr => out.push_str(&format!("c\"{sym}\"")),
@@ -489,7 +504,19 @@ impl Server {
                 TokenKind::Literal { kind, suffix_len, .. } => {
                     let split = text.len().saturating_sub(suffix_len as usize);
                     let (body, suffix) = text.split_at(split);
-                    let sym = self.sym(body)?;
+                    // Match `rustc_expand/src/proc_macro_server.rs`: doc comments arrive at
+                    // proc macros as cooked `LitKind::Str` literals (`escape_debug()`).
+                    let (kind, sym) = match kind {
+                        LitKind::DocStrRaw(_) => {
+                            let mut escaped = blaze_own::AString::new_in(self.scratch);
+                            for ch in body.escape_debug() {
+                                escaped.push(ch);
+                            }
+                            (LitKind::Str, self.sym(escaped.as_str())?)
+                        }
+                        LitKind::DocStr => (LitKind::Str, self.sym(body)?),
+                        other => (other, self.sym(body)?),
+                    };
                     let suffix = if suffix.is_empty() { None } else { Some(self.sym(suffix)?) };
                     Tok::Literal { kind, sym, suffix, span: self.span(span_of(i))? }
                 }
@@ -1108,12 +1135,17 @@ mod tests {
 
     use super::{Server, ServerLimits, SpanId, Tok};
 
-    fn produce_literal(kind: LitKind, text: &str) -> blaze_expand::TokenStream<'static> {
+    fn start_server(src: &str, kind: ProcKind) -> (Server, Alloc<'static>) {
         let alloc = Alloc::global();
-        let input = lex("input", Edition::E2021, alloc).expect("the test input lexes");
-        let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok("src/lib.rs") };
+        let input = lex(src, Edition::E2021, alloc).expect("the test input lexes");
+        let call = ProcCall { kind, input: &input, attr_args: None, file: Ok("src/lib.rs") };
         let mut run_input = Vec::new();
-        let mut server = Server::new(Edition::E2021, ServerLimits::STANDARD, &call, alloc, &mut run_input).expect("the server starts");
+        let server = Server::new(Edition::E2021, ServerLimits::STANDARD, &call, alloc, &mut run_input).expect("the server starts");
+        (server, alloc)
+    }
+
+    fn produce_literal(kind: LitKind, text: &str) -> blaze_expand::TokenStream<'static> {
+        let (mut server, alloc) = start_server("input", ProcKind::FnLike);
         let sym = server.sym(text).expect("the literal text fits");
         let span = server.spans.len() as SpanId;
         let handle = server.hold(vec![Tok::Literal { kind, sym, suffix: None, span }]).expect("the output stream is held");
@@ -1199,6 +1231,31 @@ mod tests {
         assert!(matches!(integer.tokens()[0].kind, TokenKind::Punct { char: '-', .. }));
         assert!(matches!(integer.tokens()[1].kind, TokenKind::Literal { kind: LitKind::Integer, .. }));
         assert_eq!(integer.text_at(1), "1");
+    }
+
+    #[test]
+    fn doc_comments_import_as_cooked_str_while_explicit_raw_doc_stays_raw() {
+        let src = "/// hello \"world\"\n/// it's a \\n backslash\n/** multi\nline */\n#[doc = r\" explicit raw\"]\nstruct S;";
+        let (server, alloc) = start_server(src, ProcKind::Derive);
+
+        // Collect (LitKind, body) for every literal imported into the proc-macro server stream.
+        let mut lits = blaze_own::AVec::new_in(alloc);
+        for tok in &server.input {
+            if let Tok::Literal { kind, sym, suffix, .. } = *tok {
+                assert!(suffix.is_none());
+                lits.push((kind, server.sym_text(sym)));
+            }
+        }
+        assert_eq!(
+            lits.as_slice(),
+            &[
+                (LitKind::Str, " hello \\\"world\\\""),
+                (LitKind::Str, " it\\'s a \\\\n backslash"),
+                (LitKind::Str, " multi\\nline "),
+                (LitKind::StrRaw(0), " explicit raw"),
+            ],
+            "doc comments must arrive at proc macros as cooked Str (escape_debug), while explicit #[doc = r\"...\"] stays StrRaw"
+        );
     }
 }
 

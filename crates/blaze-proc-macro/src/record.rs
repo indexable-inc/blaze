@@ -692,6 +692,8 @@ fn lit_bytes(kind: LitKind) -> [u8; 2] {
         LitKind::CStr => [8, 0],
         LitKind::CStrRaw(n) => [9, n],
         LitKind::Err => [10, 0],
+        LitKind::DocStrRaw(n) => [11, n],
+        LitKind::DocStr => [12, 0],
     }
 }
 
@@ -708,6 +710,8 @@ fn lit_of(tag: u8, n: u8) -> Option<LitKind> {
         8 => LitKind::CStr,
         9 => LitKind::CStrRaw(n),
         10 => LitKind::Err,
+        11 => LitKind::DocStrRaw(n),
+        12 => LitKind::DocStr,
         _ => return None,
     })
 }

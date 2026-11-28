@@ -297,8 +297,8 @@ pub fn write_token(stream: &TokenStream<'_>, token: &Token, out: &mut AString<'_
                 }
                 LitKind::Byte => ("b", '\'', 0),
                 LitKind::Char => ("", '\'', 0),
-                LitKind::Str => ("", '"', 0),
-                LitKind::StrRaw(n) => ("r", '"', n),
+                LitKind::Str | LitKind::DocStr => ("", '"', 0),
+                LitKind::StrRaw(n) | LitKind::DocStrRaw(n) => ("r", '"', n),
                 LitKind::ByteStr => ("b", '"', 0),
                 LitKind::ByteStrRaw(n) => ("br", '"', n),
                 LitKind::CStr => ("c", '"', 0),

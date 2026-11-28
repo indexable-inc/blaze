@@ -195,6 +195,8 @@ fn lit_bits(kind: LitKind) -> (u32, u8) {
         LitKind::CStr => (8, 0),
         LitKind::CStrRaw(hashes) => (9, hashes),
         LitKind::Err => (10, 0),
+        LitKind::DocStrRaw(hashes) => (11, hashes),
+        LitKind::DocStr => (12, 0),
     }
 }
 
@@ -706,6 +708,8 @@ fn lit_of(tag: u32, hashes: u8) -> Option<LitKind> {
         8 => LitKind::CStr,
         9 => LitKind::CStrRaw(hashes),
         10 => LitKind::Err,
+        11 => LitKind::DocStrRaw(hashes),
+        12 => LitKind::DocStr,
         _ => return None,
     })
 }

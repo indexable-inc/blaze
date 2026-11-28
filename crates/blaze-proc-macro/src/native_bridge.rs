@@ -389,7 +389,16 @@ pub fn encode_flat_tree_json(stream: &TokenStream<'_>, span_offset: u32) -> Stri
                 let full = stream.text_of(tok);
                 let slen = (suffix_len as usize).min(full.len());
                 let (body, suffix) = full.split_at(full.len() - slen);
-                let body_id = intern(body);
+                let body_id = match kind {
+                    LitKind::DocStrRaw(_) => {
+                        let mut escaped = blaze_own::AString::new_in(stream.allocator());
+                        for ch in body.escape_debug() {
+                            escaped.push(ch);
+                        }
+                        intern(escaped.as_str())
+                    }
+                    _ => intern(body),
+                };
                 let suffix_id = if suffix.is_empty() { u32::MAX } else { intern(suffix) };
                 let kind_u32: u32 = match kind {
                     LitKind::Err => 0,
@@ -397,7 +406,7 @@ pub fn encode_flat_tree_json(stream: &TokenStream<'_>, span_offset: u32) -> Stri
                     LitKind::Char => 2,
                     LitKind::Integer => 3,
                     LitKind::Float => 4,
-                    LitKind::Str => 5,
+                    LitKind::Str | LitKind::DocStr | LitKind::DocStrRaw(_) => 5,
                     LitKind::StrRaw(h) => 6 | ((h as u32) << 8),
                     LitKind::ByteStr => 7,
                     LitKind::ByteStrRaw(h) => 8 | ((h as u32) << 8),

@@ -86,9 +86,29 @@ pub enum LitKind {
     CStrRaw(u8),
     /// A literal the lexer refused, kept so its error is reported where it is used.
     Err,
+    /// A doc comment (`///`, `//!`, `/** */`, `/*! */`) desugared to `#[doc = r"..."]` with
+    /// minimal `#` count: matches `LitKind::StrRaw(n)` in declarative `macro_rules!`, skips as a
+    /// comment when written directly in a `macro_rules!` matcher, and escapes to cooked
+    /// `LitKind::Str` at the proc-macro server boundary (matching `rustc_expand`'s
+    /// `proc_macro_server.rs`).
+    DocStrRaw(u8),
+    /// A doc comment whose body cannot be represented as a raw string literal (bare `\r` or `"`
+    /// followed by ≥255 `#`s), already escaped like `LitKind::Str`, carrying doc-comment
+    /// provenance for matchers and proc-macro import.
+    DocStr,
 }
 
 impl LitKind {
+    /// The literal kind as declarative macros and source rendering see it:
+    /// `DocStrRaw(n)` is `StrRaw(n)` and `DocStr` is `Str`.
+    pub const fn without_doc_provenance(self) -> LitKind {
+        match self {
+            LitKind::DocStrRaw(hashes) => LitKind::StrRaw(hashes),
+            LitKind::DocStr => LitKind::Str,
+            other => other,
+        }
+    }
+
     fn bytes(self) -> [u8; 2] {
         match self {
             LitKind::Byte => [0, 0],
@@ -102,6 +122,8 @@ impl LitKind {
             LitKind::CStr => [8, 0],
             LitKind::CStrRaw(hashes) => [9, hashes],
             LitKind::Err => [10, 0],
+            LitKind::DocStrRaw(hashes) => [11, hashes],
+            LitKind::DocStr => [12, 0],
         }
     }
 }
@@ -1167,7 +1189,7 @@ fn doc_comment(
         body
     };
     let (lit_kind, lit_text) = match raw_str_hashes(normalized) {
-        Some(hashes) => (LitKind::StrRaw(hashes), normalized),
+        Some(hashes) => (LitKind::DocStrRaw(hashes), normalized),
         None => {
             scratch.clear();
             for piece in parser::line_break::without_break_crs(body) {
@@ -1175,7 +1197,7 @@ fn doc_comment(
                     scratch.push(char);
                 }
             }
-            (LitKind::Str, scratch.as_str())
+            (LitKind::DocStr, scratch.as_str())
         }
     };
     let write = |out: &mut TokenStream<'_>| -> Result<(), StreamError> {
