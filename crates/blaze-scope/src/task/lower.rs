@@ -574,11 +574,7 @@ impl<'s, 'a> Cfg<'s, 'a> {
                     let after_head = skip_attr_trivia(content.get(head(content).len()..).unwrap_or(""));
                     if after_head.starts_with('(') {
                         for part in SplitTop::new(args(content)) {
-                            let s = skip_attr_trivia(part);
-                            let rest = s.strip_prefix("r#").unwrap_or(s);
-                            let end = rest.bytes().take_while(|&b| b.is_ascii_alphanumeric() || b == b'_').count();
-                            let ident = rest.get(..end).unwrap_or("");
-                            if !ident.is_empty() {
+                            if let Some(ident) = blaze_expand::meta_list_ident(part) {
                                 attrs.macro_use_names.push(ident);
                             }
                         }

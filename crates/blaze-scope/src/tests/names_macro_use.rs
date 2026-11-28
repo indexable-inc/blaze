@@ -904,3 +904,93 @@ dep_macro!(FromEditedSub);
     assert!(view.get(Namespace::Types, "FromSub").is_some(), "`FromSub` must resolve in one-group solve");
     assert!(view.get(Namespace::Types, "FromEditedSub").is_some(), "`FromEditedSub` must resolve in one-group solve");
 }
+
+/// Full Unicode Rust identifiers (and raw identifiers) in `#[macro_use(π, café)] extern crate dep;`:
+/// `π!()` and `café!()` resolve in crate root and child modules (fresh `Names` and encoded
+/// `RecordNames`), while excluded Unicode/ASCII macros fail with `Unresolved::NotFound`.
+#[test]
+fn macro_use_allowlist_supports_unicode_identifiers() {
+    static DEP: &str = "#![no_core]
+#[macro_export]
+macro_rules! π {
+    ($name:ident) => { pub struct $name; };
+}
+#[macro_export]
+macro_rules! café {
+    ($name:ident) => { pub struct $name; };
+}
+#[macro_export]
+macro_rules! ω {
+    ($name:ident) => { pub struct $name; };
+}
+";
+    static USER_OK: &str = "#![no_core]
+macro_rules! if_hyper {
+    ($($item:item)*) => { $($item)* };
+}
+if_hyper! {
+    #[macro_use(π, /* comment */ r#café,)]
+    extern crate dep;
+    π!(FromPi);
+    café!(FromCafe);
+}
+pub mod sub {
+    π!(FromSubPi);
+    café!(FromSubCafe);
+}
+";
+    static USER_EXCLUDED: &str = "#![no_core]
+macro_rules! if_hyper {
+    ($($item:item)*) => { $($item)* };
+}
+if_hyper! {
+    #[macro_use(π, café)]
+    extern crate dep;
+    ω!(Nope);
+}
+";
+    static FILES_OK: Texts = Texts(&[&[("/dep/lib.rs", DEP)], &[("/user/lib.rs", USER_OK)]]);
+    static FILES_EXCLUDED: Texts = Texts(&[&[("/dep/lib.rs", DEP)], &[("/user/lib.rs", USER_EXCLUDED)]]);
+
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
+    let inputs = [input("dep", "/dep/lib.rs", &[]), input("user", "/user/lib.rs", &[("dep", 0)])];
+
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), &FILES_OK, &Serial, &Ready::serial(WAIT), bump)
+        .unwrap_or_else(|e| panic!("unicode solve: {e:?}"));
+    let all: Vec<&'static CrateNames<'static>> = solved.iter().map(|s| s.names).collect();
+    for (i, c) in all.iter().enumerate() {
+        assert!(c.notes.is_empty(), "crate {i}: notes {:?}", c.notes);
+        for (m, done) in c.done.iter() {
+            assert!(done.scope.errors.is_empty(), "crate {i} module {m:x} errors: {:?}", done.scope.errors);
+        }
+    }
+    let fresh = Names::of_crates(&inputs, Sysroot::default(), &all, g).unwrap_or_else(|e| panic!("names: {e:?}"));
+    let records: Vec<&'static [u8]> = all.iter().map(|n| aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), bump)).collect();
+    let keys: Vec<CrateItemKey> = all.iter().map(|n| n.key).collect();
+    let read = RecordNames::new(&keys, Loaded(records), g);
+    let user_root = fresh.root(1);
+    for segments in [&["FromPi"][..], &["FromCafe"][..], &["sub", "FromSubPi"][..], &["sub", "FromSubCafe"][..]] {
+        let w = Written { kind: PathKind::Plain, segments };
+        let a = path(&fresh, user_root, Namespace::Types, w, g);
+        let b = path(&read, user_root, Namespace::Types, w, g);
+        assert!(a.is_ok() && a == b, "unicode {segments:?}: fresh {a:?}, records {b:?}");
+    }
+    for name in ["π", "café"] {
+        for (side, got) in ["fresh", "records"].into_iter().zip(macro_at(&fresh, &read, user_root, name)) {
+            assert!(got.is_ok(), "`{name}` must be in #[macro_use] prelude ({side}): {got:?}");
+        }
+    }
+    for (side, got) in ["fresh", "records"].into_iter().zip(macro_at(&fresh, &read, user_root, "ω")) {
+        assert!(not_found(&got), "`ω` must NOT be in #[macro_use] prelude ({side}): {got:?}");
+    }
+
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), &FILES_EXCLUDED, &Serial, &Ready::serial(WAIT), bump)
+        .unwrap_or_else(|e| panic!("excluded unicode solve: {e:?}"));
+    let has_unresolved = solved[1].names.done.values().any(|done| {
+        done.scope.errors.iter().any(|err| {
+            matches!(err, blaze_surface::ScopeError::Macro { why: blaze_surface::Unresolved::NotFound, .. })
+        })
+    });
+    assert!(has_unresolved, "excluded Unicode macro `ω!` must fail with Unresolved::NotFound");
+}

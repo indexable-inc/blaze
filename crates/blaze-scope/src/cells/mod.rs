@@ -763,6 +763,9 @@ enum Taken<N> {
     /// The module's `Globs` cell of the name, read again when the run ends: the definition
     /// taken, and whether the globs brought it (else an outer scope did, and the globs had none).
     Globs(CellId, Def, bool),
+    /// An outer-macro selection made while crate-root expansions may still add a
+    /// `#[macro_use] extern crate ...`: revalidated against the final `#[macro_use]` prelude.
+    MacroUseWatch(N, Def, Option<CallShape>),
     /// The error is known already (a definition an expansion wrote beside another candidate).
     Error(EarlyAmbiguity<N>),
 }
@@ -947,6 +950,9 @@ pub(crate) struct Cells<'a, N> {
     /// R6's watches for the extern prelude: a use whose first segment took a later outer scope's
     /// binding while the root's calls could still add an extern-prelude name, by name.
     extern_watches: ABTreeMap<'a, N, AVec<'a, (ItemId, Def)>>,
+    /// Speculative outer-macro selections made while crate-root calls could still add a
+    /// `#[macro_use] extern crate ...`: revalidated once expansion settles ([`Cells::validate_macro_use`]).
+    macro_use_watches: AVec<'a, (ItemId, N, Def, Option<CallShape>)>,
     /// Every macro call by its key: a block's body written by an expansion is found by it.
     call_ids: ABTreeMap<'a, ItemKey, ItemId>,
     /// What stalled calls took while their module's globs were weakly undecided
@@ -1432,6 +1438,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             r8: AVec::new_in(alloc),
             unread: AVec::new_in(alloc),
             extern_watches: ABTreeMap::new_in(alloc),
+            macro_use_watches: AVec::new_in(alloc),
             call_ids: ABTreeMap::new_in(alloc),
             speculated: AVec::new_in(alloc),
             taken: AVec::new_in(alloc),
@@ -3478,6 +3485,72 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         self.modules[m as usize].calls.iter().copied().find(|&j| j != me && !self.items[j as usize].grown && !guess.is_some_and(|g| g.items.contains_key(&j)))
     }
 
+    /// Expansion depth of fragment `f` (0 for a module's own text).
+    fn frag_depth(&self, mut f: FragId) -> u32 {
+        let mut d = 0u32;
+        while let Some((up, _)) = usize::try_from(f).ok().and_then(|i| self.frags.get(i)).and_then(|fr| fr.up) {
+            d = d.saturating_add(1);
+            f = up;
+        }
+        d
+    }
+
+    /// Compares two `(frag, pos)` locations within one module in canonical expanded source order
+    /// without allocating.
+    fn cmp_frag_pos(&self, mut a: (FragId, u32), mut b: (FragId, u32)) -> core::cmp::Ordering {
+        if a.0 == b.0 {
+            return a.1.cmp(&b.1);
+        }
+        let da = self.frag_depth(a.0);
+        let db = self.frag_depth(b.0);
+        let mut ca = da;
+        let mut cb = db;
+        while ca > cb {
+            let Some(up) = usize::try_from(a.0).ok().and_then(|i| self.frags.get(i)).and_then(|fr| fr.up) else { break };
+            a = up;
+            ca -= 1;
+        }
+        while cb > ca {
+            let Some(up) = usize::try_from(b.0).ok().and_then(|i| self.frags.get(i)).and_then(|fr| fr.up) else { break };
+            b = up;
+            cb -= 1;
+        }
+        while a.0 != b.0 {
+            let (Some(ua), Some(ub)) = (
+                usize::try_from(a.0).ok().and_then(|i| self.frags.get(i)).and_then(|fr| fr.up),
+                usize::try_from(b.0).ok().and_then(|i| self.frags.get(i)).and_then(|fr| fr.up),
+            ) else {
+                break;
+            };
+            a = ua;
+            b = ub;
+        }
+        a.1.cmp(&b.1).then_with(|| da.cmp(&db))
+    }
+
+    /// A growing crate-root call that must expand before `me` takes an outer macro candidate:
+    /// - Outside the crate root (`m != self.root`): any growing crate-root call.
+    /// - Inside the crate root (`m == self.root`): any growing crate-root call strictly earlier
+    ///   in canonical expanded source order than `me`, so two root calls resolving via outer
+    ///   macros expand in deterministic source order instead of mutually deadlocking in a weak
+    ///   stall.
+    fn growing_root_for(&self, m: ModId, me: ItemId, guess: Option<&Guess<'a>>) -> Option<ItemId> {
+        if m != self.root {
+            return self.growing(self.root, me, guess);
+        }
+        let me_pos = usize::try_from(me).ok().and_then(|i| self.items.get(i)).map(|it| (it.at, it.pos))?;
+        let root_mod = usize::try_from(self.root).ok().and_then(|i| self.modules.get(i))?;
+        root_mod.calls.iter().copied().find(|&j| {
+            if j == me || guess.is_some_and(|g| g.items.contains_key(&j)) {
+                return false;
+            }
+            let Some(it) = usize::try_from(j).ok().and_then(|ix| self.items.get(ix)) else {
+                return false;
+            };
+            !it.grown && self.cmp_frag_pos((it.at, it.pos), me_pos) == core::cmp::Ordering::Less
+        })
+    }
+
     /// The outer candidate of `name` in `ns` (R6, R8): the extern prelude (types), the
     /// `#[macro_use]` prelude (macros), the standard prelude. `Some(Value::Outside)` when a scope
     /// of another crate this run cannot see may hold it. Built-in types are a type position's
@@ -3833,6 +3906,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         let g = self.cell(m, ns, name, Layer::Globs);
                         self.taken.push(Taken::Watch(m, ns, name, od, AmbiguityKind::MoreExpandedVsOuter));
                         self.taken.push(Taken::Globs(g, od, false));
+                        if ns == Namespace::Macros {
+                            self.taken.push(Taken::MacroUseWatch(name, od, sub));
+                        }
                     }
                     Step::Done(o)
                 }
@@ -3843,11 +3919,11 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         return Step::Wait(Node::Item(j));
                     }
                     // A macro lookup taking an outer candidate (from an earlier `#[macro_use]`
-                    // crate, built-in attributes, or the standard prelude) waits while a
-                    // crate-root call may still emit `#[macro_use] extern crate ...` that shadows
-                    // it, keeping resolution independent of expansion order.
+                    // crate, built-in attributes, or the standard prelude) waits while an
+                    // earlier crate-root call (or any crate-root call for non-root modules) may
+                    // still emit `#[macro_use] extern crate ...` that shadows it.
                     if ns == Namespace::Macros
-                        && let Some(j) = self.growing(self.root, me, guess)
+                        && let Some(j) = self.growing_root_for(m, me, guess)
                     {
                         return Step::Wait(Node::Item(j));
                     }
@@ -3857,6 +3933,14 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                             && self.growing(m, me, None).is_some()
                         {
                             self.watches.entry((m, ns, name)).or_insert_with(|| AVec::new_in(self.alloc)).push((me, od, AmbiguityKind::MoreExpandedVsOuter));
+                        }
+                        // If a later crate-root call still remains when an outer macro candidate
+                        // is taken, revalidate it once crate-root expansion settles.
+                        if let Some(od) = outer_def
+                            && ns == Namespace::Macros
+                            && self.growing(self.root, me, None).is_some()
+                        {
+                            self.macro_use_watches.push((me, name, od, sub));
                         }
                         // The binding of a scope after the extern prelude, while a root call
                         // may still write `extern crate .. as name;` (R6 for the extern prelude).
@@ -4667,6 +4751,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             }
             if !self.quiet_point()? {
                 self.validate_speculated();
+                self.validate_macro_use();
                 self.validate_expanded();
                 return Ok(());
             }
@@ -5330,6 +5415,31 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
     }
 
+    /// Revalidates speculative outer-macro selections (from a weak stall or an earlier crate-root
+    /// call) once crate-root macro expansion has settled: if a macro-expanded `#[macro_use] extern
+    /// crate` now resolves `name` to a different outer macro definition, records an R6 ambiguity
+    /// rather than silently keeping the stale candidate.
+    fn validate_macro_use(&mut self) {
+        if !self.outer.macro_use_changed || self.macro_use_watches.is_empty() {
+            return;
+        }
+        for k in 0..self.macro_use_watches.len() {
+            let Some(&(u, name, od, sub)) = self.macro_use_watches.get(k) else { continue };
+            if let Step::Done(Some(Value::Found(new_def, _) | Value::Ambiguous(new_def, _))) =
+                self.outer_of(Namespace::Macros, name, sub, None)
+                && new_def != od
+            {
+                self.r6_error(u, EarlyAmbiguity {
+                    ns: Namespace::Macros,
+                    name,
+                    kind: AmbiguityKind::MoreExpandedVsOuter,
+                    first: od,
+                    second: Some(new_def),
+                });
+            }
+        }
+    }
+
     /// GlobVsExpanded, when the run ends: each use whose plain first segment took a name an
     /// expansion wrote into its module ([`Cells::first_segment`] records it) is the error where
     /// the module's globs, decided now, bring a different definition of the name (the Reference
@@ -5423,6 +5533,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 match t {
                     Taken::Watch(m, ns, name, def, kind) => self.watches.entry((m, ns, name)).or_insert_with(|| AVec::new_in(alloc)).push((i, def, kind)),
                     Taken::Globs(g, def, globbed) => self.speculated.push((i, g, def, globbed)),
+                    Taken::MacroUseWatch(name, def, sub) => self.macro_use_watches.push((i, name, def, sub)),
                     Taken::Error(e) => self.r6_error(i, e),
                 }
             }
