@@ -606,6 +606,47 @@ fn outcome_rejects_doc_provenance_literal_tag_even_matching_input_origin() {
 }
 
 #[test]
+fn respanned_saturated_raw_doc_literal_is_accepted_while_forged_one_is_refused() {
+    let mut body = blaze_own::AString::new_in(alloc());
+    body.push_str(" \"");
+    for _ in 0..255 {
+        body.push('#');
+    }
+    let sat_kind = TokenKind::Literal { kind: LitKind::StrRaw(u8::MAX), suffix_len: 0, spacing: Spacing::Alone };
+
+    // Positive: a 255-hash doc comment forwarded through `macro_rules!` arrives as `StrRaw(255)`;
+    // if the proc macro changes its span to `Span::call_site()` (`MADE`) and returns it, outcome
+    // validation accepts it and preserves `StrRaw(255)`.
+    let mut input = TokenStream::new_in(alloc());
+    input.push(sat_kind, body.as_str(), blaze_expand::Ctx::root(Edition::E2021)).unwrap();
+    let call = derive(&input);
+    let call_bytes = encoded(&call);
+    let respanned = outcome_of(&[(sat_kind, MADE, body.as_str())], None);
+    with_grants(&call_bytes, |grants| {
+        let mut host = MacroHost::new(MacroHostOpts { program: &PROGRAM, call, file: Some(FILE), grants, alloc: alloc(), scratch: alloc(), .. }).unwrap();
+        let mut guest = Guest::new(GuestOpts { alloc: alloc(), .. });
+        guest.call(&SysCall::Hello { protocol: PROTOCOL }).unwrap();
+        let Some(GuestEffect::Send { frame }) = guest.next_effect() else { panic!("no hello") };
+        let answer = to_host(&mut host, 0, frame).unwrap();
+        guest.step(Nanos(0), GuestEvent::Frame(&answer)).unwrap();
+        guest.call(&SysCall::Return { output: &respanned }).unwrap();
+        let Some(GuestEffect::Send { frame }) = guest.next_effect() else { panic!("no return") };
+        assert!(to_host(&mut host, 0, frame).is_none());
+        let done = host.finish().expect("respanned saturated raw literal from input must be accepted");
+        assert_eq!(done.produced.tokens.tokens()[0].kind, sat_kind);
+        assert_eq!(done.produced.tokens.text_at(0), body.as_str());
+    });
+
+    // Negative control: forging an unlexable saturated `StrRaw(255)` that was NOT in the call's
+    // input is still rejected as `NotAToken`.
+    let plain = item("struct S;");
+    let plain_call = derive(&plain);
+    let plain_bytes = encoded(&plain_call);
+    let why = hostile(plain_call, &plain_bytes, &respanned);
+    assert!(matches!(why, Why::Outcome(OutcomeError::NotAToken { at: 0 })), "{why:?}");
+}
+
+#[test]
 fn a_garbage_frame_crashes_the_run() {
     let input = item("struct S ;");
     let call = derive(&input);

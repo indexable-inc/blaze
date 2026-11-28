@@ -4548,6 +4548,61 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
         }
         out.push_str(suffix);
     }
+    /// Whether `tokens[at..]` is a desugared doc comment (`# [ doc = DocStrRaw ]` or
+    /// `# ! [ doc = DocStrRaw ]`): returns `(inner, token_count, body)`.
+    fn doc_comment_at<'s>(stream: &'s TokenStream<'_>, at: usize) -> Option<(bool, usize, &'s str)> {
+        let tokens = stream.tokens();
+        if !matches!(tokens.get(at).map(|t| t.kind), Some(TokenKind::Punct { char: '#', .. })) {
+            return None;
+        }
+        let inner = matches!(tokens.get(at + 1).map(|t| t.kind), Some(TokenKind::Punct { char: '!', .. }));
+        let open = at + 1 + usize::from(inner);
+        if tokens.get(open).map(|t| t.kind) != Some(TokenKind::Open(Delim::Bracket)) {
+            return None;
+        }
+        let doc = tokens.get(open + 1)?;
+        if !matches!(doc.kind, TokenKind::Ident { raw: Raw::No, .. }) || stream.text_of(doc) != "doc" {
+            return None;
+        }
+        if !matches!(tokens.get(open + 2).map(|t| t.kind), Some(TokenKind::Punct { char: '=', .. })) {
+            return None;
+        }
+        let lit = tokens.get(open + 3)?;
+        if !matches!(lit.kind, TokenKind::Literal { kind: LitKind::DocStrRaw(_), suffix_len: 0, .. }) {
+            return None;
+        }
+        if tokens.get(open + 4).map(|t| t.kind) != Some(TokenKind::Close(Delim::Bracket)) {
+            return None;
+        }
+        Some((inner, open + 5 - at, stream.text_of(lit)))
+    }
+    /// Whether `body` can be written directly inside `/**body*/` (or `/*!body*/` when `inner`).
+    fn valid_block_doc_body(body: &str, inner: bool) -> bool {
+        if body.is_empty() || body.contains('\r') {
+            return false;
+        }
+        if !inner && (body.starts_with('*') || body.starts_with('/')) {
+            return false;
+        }
+        let bytes = body.as_bytes();
+        let mut i = 0usize;
+        let mut nesting = 0u32;
+        while let Some(&b) = bytes.get(i) {
+            if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                nesting += 1;
+                i += 2;
+            } else if b == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                let Some(next) = nesting.checked_sub(1) else {
+                    return false;
+                };
+                nesting = next;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        nesting == 0
+    }
     while at < tokens.len() {
         let token = &tokens[at];
         let text = stream.text_of(token);
@@ -4555,6 +4610,43 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
             note_word(&mut words, None);
             at += 1;
             continue;
+        }
+        // Inside a generated `macro_rules!` / `macro` definition, render desugared doc comments
+        // back as doc-comment syntax (`///...\n` / `/**...*/`) so re-lexing `MacroBody::Rules`
+        // preserves `LitKind::DocStrRaw` provenance (so `Compiler::doc_attr_end` still ignores doc
+        // comments in generated matchers while keeping explicit `#[doc = r"..."]`).
+        if in_def.is_some()
+            && let Some((inner, len, body)) = doc_comment_at(stream, at)
+        {
+            let as_line = !body.contains('\n') && !body.contains('\r') && (inner || !body.starts_with('/'));
+            let as_block = !as_line && valid_block_doc_body(body, inner);
+            if as_line || as_block {
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push(' ');
+                }
+                let start = out.len();
+                if as_line {
+                    out.push_str(if inner { "//!" } else { "///" });
+                    out.push_str(body);
+                    let comment_end = out.len();
+                    out.push('\n');
+                    placed(at, start, comment_end, None);
+                    prev = None;
+                } else {
+                    out.push_str(if inner { "/*!" } else { "/**" });
+                    out.push_str(body);
+                    out.push_str("*/");
+                    placed(at, start, out.len(), None);
+                    prev = Some(TokenKind::Close(Delim::Bracket));
+                }
+                for k in 0..len {
+                    let w = word + u32::try_from(k).unwrap_or(0);
+                    note_word(&mut words, Some(w));
+                }
+                word += u32::try_from(len).unwrap_or(0);
+                at += len;
+                continue;
+            }
         }
         if prev.is_some_and(|p| !blaze_expand::glued_in_text(p, token.kind)) {
             out.push(' ');

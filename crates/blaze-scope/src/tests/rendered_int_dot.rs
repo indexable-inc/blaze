@@ -24,6 +24,28 @@ pass_item! {
     /// \"###############################################################################################################################################################################################################################################################
     pub fn g() {}
 }
+macro_rules! gen_mac {
+    () => {
+        macro_rules! with_doc_comment {
+            (
+                /// line doc inside generated matcher
+                /** multi
+                line block doc inside generated matcher */
+                $name:ident
+            ) => { pub fn $name() {} };
+        }
+        macro_rules! with_explicit_doc_attr {
+            (#[doc = r\" attr\"] $name:ident) => { pub fn $name() {} };
+        }
+    };
+}
+gen_mac!();
+with_doc_comment!(from_doc_comment);
+with_explicit_doc_attr!(
+    /// attr
+    from_explicit_attr
+);
+with_explicit_doc_attr!(missing_attr);
 ";
 
 static TEXTS: Texts = Texts(&[&[("/m/lib.rs", LIB)]]);
@@ -83,4 +105,23 @@ fn a_saturated_255_hash_doc_comment_renders_as_lexable_string() {
         want.push('#');
     }
     assert_eq!(decoded.as_str(), want.as_str());
+}
+
+#[test]
+fn generated_macro_rules_preserves_doc_comment_provenance_in_matcher() {
+    let (_, stream) = item_stream("from_doc_comment");
+    let (_, _) = item_stream("from_explicit_attr");
+    let crates = [input("m", "/m/lib.rs", &[])];
+    let names = resolved(&crates, &TEXTS);
+    assert!(
+        names
+            .item_at(
+                names.root(0),
+                Namespace::Values,
+                Written { kind: PathKind::Plain, segments: &["missing_attr"] },
+                stream.allocator(),
+            )
+            .is_err(),
+        "explicit #[doc = r\" attr\"] inside generated macro_rules! must still require matching doc input"
+    );
 }
