@@ -2442,6 +2442,7 @@ pub(crate) fn open_pinned_standing<R>(
         Ok(stood_root) => stood_root,
         Err(why) => return Err(EngineCheckError::StartNoAnswer { why: Some(why) }.into()),
     };
+    crate::store::Store::map_all(&mut store, cx)?;
     let snapshot = store.snapshot_in(alloc)?;
     let headers = blaze_engine::pages::Headers::Absent { since: blaze_engine::Gen(0) };
     let stored = crate::engine_answer::Stored::new(&stood_root, &snapshot, &headers, blaze_engine::pages::Check::Store, alloc);
@@ -2915,7 +2916,12 @@ fn check_and_open<R>(
             },
             None => None,
         };
-        let snapshot = if stood_root.is_some() { Some(store.snapshot_in(alloc)?) } else { None };
+        let snapshot = if stood_root.is_some() {
+            crate::store::Store::map_all(&mut store, cx)?;
+            Some(store.snapshot_in(alloc)?)
+        } else {
+            None
+        };
         let stored = match (&pointer, &stood_root, &snapshot) {
             (Some(pointer), Some(stood_root), Some(snapshot)) => {
                 Some(crate::engine_answer::Stored::new(stood_root, snapshot, &pointer.headers, blaze_engine::pages::Check::Store, alloc))
@@ -3210,6 +3216,9 @@ pub(crate) struct Checked {
     /// many units it has (engine_lints.rs, sparse rows). 0 on a certified replay (no audit).
     #[cfg(test)]
     pub(crate) lint_rows: u32,
+    /// `(mapped, named)` segments on the command's store before post-answer commit/teardown.
+    #[cfg(test)]
+    pub(crate) store_segments: (u32, u32),
     /// The `Signature` head tasks entered this request (lane RH4's edit rows count them).
     pub(crate) signatures_entered: u32,
     /// The `Lint` tasks entered this request and their findings (engine_lints.rs `seen`).
@@ -4038,10 +4047,17 @@ fn checking<'f, 's: 'f>(
                 drop(cert_view_slot);
                 drop(view_slot);
                 drop(store);
+                #[cfg(test)]
+                let store_segments = opened.lent.mapped_of_named();
                 let cleanup = finish_store_for_check(cx, opened, reuse_store, teardown, phases.clock(), err)?;
                 phases.mark_cx(cx, "store committed", frame);
                 let ignore = if adopted.is_some() { CheckoutIgnore::Ensure } else { CheckoutIgnore::AlreadyPresent };
-                return certificate_checked(cx, root, stood, sweep_counts, &journal_counts, &cleanup, phases, heap, frame, own_whole, ignore);
+                let mut checked = certificate_checked(cx, root, stood, sweep_counts, &journal_counts, &cleanup, phases, heap, frame, own_whole, ignore)?;
+                #[cfg(test)]
+                {
+                    checked.store_segments = store_segments;
+                }
+                return Ok(checked);
             }
         }
     }
@@ -4128,9 +4144,16 @@ fn checking<'f, 's: 'f>(
                 drop(whole_view_slot);
                 drop(view_slot);
                 drop(store);
+                #[cfg(test)]
+                let store_segments = opened.lent.mapped_of_named();
                 let cleanup = finish_store_for_check(cx, opened, reuse_store, teardown, phases.clock(), err)?;
                 phases.mark_cx(cx, "store committed", frame);
-                return certificate_checked(cx, root, stood, whole_sweep_counts, &whole_journal_counts, &cleanup, phases, heap, frame, true, CheckoutIgnore::AlreadyPresent);
+                let mut checked = certificate_checked(cx, root, stood, whole_sweep_counts, &whole_journal_counts, &cleanup, phases, heap, frame, true, CheckoutIgnore::AlreadyPresent)?;
+                #[cfg(test)]
+                {
+                    checked.store_segments = store_segments;
+                }
+                return Ok(checked);
             }
             pointer = Some(whole_ptr);
             last_lines = Some(whole_lines);
@@ -4144,6 +4167,19 @@ fn checking<'f, 's: 'f>(
             journal_counts = whole_journal_counts;
             journal = whole_journal;
         }
+    }
+    // Past both certificate fast paths: map every segment named by the opened generation now
+    // (within `GRACE_NS`), before `open_fallback_base`, `layout`, `plan`, or any pool task can
+    // run past the grace window and trip `LATE_MAP` on a cold check's first `put` (when
+    // `last.is_none()` and `store.snapshot_in` is skipped). Uses parallel `CxPar` verification
+    // and marks the store whole so `store.snapshot_in` below is a no-op; both certificate fast
+    // paths above return before here and preserve lazy per-probe mapping.
+    #[cfg(test)]
+    let skip_map_all = SKIP_MAP_ALL_BEFORE_PLAN.with(core::cell::Cell::get);
+    #[cfg(not(test))]
+    let skip_map_all = false;
+    if !skip_map_all {
+        crate::store::Store::map_all(&mut store, cx)?;
     }
     // Past both certificate fast paths: materialize the request arena, phase ledger, and status
     // board once when deferred.
@@ -4520,6 +4556,10 @@ fn checking<'f, 's: 'f>(
             }
             let mut planned: SVec<'_, Planned> = SVec::new_in(alloc);
             let mut rows = Rows::new_in(frame);
+            #[cfg(test)]
+            if let Some(delay) = PLAN_DELAY_BEFORE_LAYOUT.with(core::cell::Cell::get) {
+                let _ = phases.clock().sleep(cx, delay);
+            }
             // PHASE-MEM-DEBT(Units): the layout's manifests on the process heap (units.rs `lay`, `heap:
             // &'static Heap`): the request's, read by every stage's plan.
             let mut laid_here = crate::units::lay(cx, root, &stamps, &mut rows, toolchain, heap, frame, erased.handle())?;
@@ -5361,6 +5401,8 @@ fn checking<'f, 's: 'f>(
         Ok(blaze_own::Box::new_in((finished.causes, report, saved, stored_keys, (task_pages_read, header_pages_read, pages_read), (tally, status, oracle), accounts, macro_modules, (heap_engine, heap_lines_made, heap_printed, heap_stored), driver_line, signatures_entered, audited, leaf_set_changed), heap.alloc()))
     })?;
     // The whole cleanup line: this profile is written after the commit (store.rs).
+    #[cfg(test)]
+    let store_segments = opened.lent.mapped_of_named();
     let cleanup = finish_store_for_check(cx, opened, reuse_store, teardown, phases.clock(), err)?;
     phases.mark_cx(cx, "store committed", frame);
     own_frame(|| -> Result<BoxedChecked, CliError> {
@@ -5477,6 +5519,8 @@ fn checking<'f, 's: 'f>(
             heads: (head_rows, u32::try_from(heads.refused.len()).unwrap_or(u32::MAX), heads.read_back),
             #[cfg(test)]
             lint_rows,
+            #[cfg(test)]
+            store_segments,
             signatures_entered,
             lints: lints.seen(&outlined),
             ownerless: (bodies.ownerless, bodies.ownerless_paths(&outlined)),
@@ -6091,6 +6135,8 @@ fn certificate_checked(
         heads: (0, 0, 0),
         #[cfg(test)]
         lint_rows: 0,
+        #[cfg(test)]
+        store_segments: (0, 0),
         signatures_entered: 0,
         lints: crate::engine_lints::LintsSeen::default(),
         ownerless: (0, std::vec::Vec::new_in(std::alloc::Global)),
@@ -9040,6 +9086,36 @@ pub(crate) fn with_text_only_outlines<R>(run: impl FnOnce() -> R) -> R {
 std::thread_local! {
     static WITHOUT_FOUND_SERVE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     static FOUND_CAP_PLANT: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
+    static SKIP_MAP_ALL_BEFORE_PLAN: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static PLAN_DELAY_BEFORE_LAYOUT: core::cell::Cell<Option<core::time::Duration>> = const { core::cell::Cell::new(None) };
+}
+
+/// Plant the pre-fix bug where `checking` skips `Store::map_all` past the certificate fast paths
+/// (so a cold check with `last.is_none()` never maps segments before `layout`/`plan`).
+#[cfg(test)]
+pub(crate) fn with_skip_map_all_before_plan<R>(run: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SKIP_MAP_ALL_BEFORE_PLAN.set(self.0);
+        }
+    }
+    let _restore = Restore(SKIP_MAP_ALL_BEFORE_PLAN.replace(true));
+    run()
+}
+
+/// Advance the check's clock by `delay` right before `units::lay` in phase setup to simulate a
+/// large workspace whose `layout` + `plan` exceeds `blaze_cas::plain::GRACE_NS`.
+#[cfg(test)]
+pub(crate) fn with_plan_delay_before_layout<R>(delay: core::time::Duration, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<core::time::Duration>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PLAN_DELAY_BEFORE_LAYOUT.set(self.0);
+        }
+    }
+    let _restore = Restore(PLAN_DELAY_BEFORE_LAYOUT.replace(Some(delay)));
+    run()
 }
 
 /// The most files one crate's names may find in one request (rule 18), each outlined on its

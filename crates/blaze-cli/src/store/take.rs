@@ -445,6 +445,15 @@ fn take_counted<D: Driver, O: Origin + ?Sized>(
     }
 
     let rows = prefixed.rows.as_slice();
+    if !rows.is_empty() {
+        // Map any existing local segments within `GRACE_NS` before potentially slow origin
+        // segment fetches run and put records into the store (rule 54: guard `LATE_MAP`).
+        match cx {
+            Some(cx) => place.map_all_par(&super::CxPar::new(cx)),
+            None => place.map_all(),
+        }
+        .map_err(TakeError::Place)?;
+    }
     let mut wave_start = 0usize;
     while wave_start < rows.len() {
         let wave_end = (wave_start + SEGMENT_IN_FLIGHT).min(rows.len());

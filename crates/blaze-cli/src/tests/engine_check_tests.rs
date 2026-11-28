@@ -2764,3 +2764,216 @@ fn scoped_check_after_whole_reuses_heads_and_bodies() {
     assert!(s5.certified, "0-edit scoped check with in-scope dep error must certify directly with filtered VIEW");
     assert_eq!(s5.entered, 0, "0 tasks entered when certifying filtered VIEW error");
 }
+
+/// Cold `blaze check` (`last.is_none()`, e.g. `--fresh` or a new checkout sharing an existing
+/// home store with committed segments) MUST call `Store::map_all` past the certificate fast paths
+/// BEFORE `layout`/`plan`/pool tasks run:
+/// - Positive: even when `layout`/`plan` takes longer than `blaze_cas::plain::GRACE_NS` (60s),
+///   every segment of the opened generation was already mapped inside the grace window so `phase
+///   Units wave 0` and the full cold check succeed cleanly (`mapped == named > 0`).
+/// - Negative control (`with_skip_map_all_before_plan`): reproducing the pre-fix path where
+///   `Store::map_all` is skipped when `last.is_none()` trips the exact `LATE_MAP` refusal on the
+///   first cold `put` in `phase Units wave 0`.
+#[test]
+fn cold_check_maps_all_segments_before_slow_plan_past_grace() {
+    use core::time::Duration;
+
+    const SEED_OTHER: Checkout = Checkout { dir: "ws_seed", shown: "/ws_seed" };
+    let past_grace = Duration::from_nanos(blaze_cas::plain::GRACE_NS + 5_000_000_000);
+
+    let io = Io::simulated(SimWorld::new(53, Limits::USUAL));
+    two_crates(&io);
+    write_in(&io, SEED_OTHER, "Cargo.toml", "[package]\nname = \"seed_other\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write_in(&io, SEED_OTHER, "src/lib.rs", "pub fn prior_segment() -> u32 {\n    99\n}\n");
+
+    let run_check_result = |checkout: Checkout, fresh: bool| {
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+        let frame = cx.frame();
+        let fs = io.need_fs().expect("fs");
+        let host = io.need_host().expect("host");
+        let mut rng = io.need_rng().expect("rng");
+        let root = fs.open_dir(&cx, &Path::new(checkout.dir).expect("path")).expect("open checkout");
+        let out = io.need_out().expect("out");
+        let err = io.need_err().expect("err");
+        let mut phases = boxed(|| Phases::new(io.need_clock().expect("clock")));
+        let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, checkout.shown, frame);
+        let args = io.args();
+        let net = io.net();
+        let mut check_opts = opts(&io, 2, fresh);
+        check_opts.place.checkout = checkout.dir;
+        let res = engine_check::check(
+            &cx,
+            &fs,
+            &host,
+            &mut rng,
+            args.as_ref(),
+            net.as_ref(),
+            &root,
+            check_opts,
+            &mut shown,
+            &mut phases,
+            &out,
+            &err,
+        );
+        let ids: std::vec::Vec<(std::string::String, std::string::String)> =
+            shown.listed.iter().map(|l| (l.code().to_owned(), l.id.as_str().to_owned())).collect();
+        res.map(|checked| (ids, checked))
+    };
+
+    // Seed the shared home store with two distinct committed segments (`ws_seed`, then `ws`) so
+    // an older segment remains unmapped after `open_for_command` and root-hinted metadata reads.
+    let (_, seed_other) = run_check_result(SEED_OTHER, false).expect("ws_seed check");
+    assert!(seed_other.entered > 0, "ws_seed check must commit a segment");
+    let (seed_ids, seed) = engine_from(&io, 2, false);
+    assert!(seed.entered > 0, "initial ws seed check must enter tasks");
+
+    // Case 1 (cold via `--fresh`, `last.is_none()`):
+    // Negative control first: skipping `Store::map_all` reproduces the live `LATE_MAP` crash.
+    let planted_fresh = engine_check::with_plan_delay_before_layout(past_grace, || {
+        engine_check::with_skip_map_all_before_plan(|| run_check_result(WS, true))
+    });
+    let err_msg = planted_fresh
+        .err()
+        .expect("planted control without Store::map_all must fail with LATE_MAP past GRACE_NS")
+        .to_string();
+    assert!(
+        err_msg.contains("more than the grace period after the open"),
+        "expected LATE_MAP grace-period error, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Driven::map_all"),
+        "expected LATE_MAP to name Driven::map_all, got: {err_msg}"
+    );
+
+    // Positive (fix enabled): `Store::map_all` runs past the certificate fast paths before
+    // `layout`/`plan`, so a slow plan past `GRACE_NS` succeeds cleanly.
+    let (fresh_ids, fresh_checked) = engine_check::with_plan_delay_before_layout(past_grace, || {
+        run_check_result(WS, true).expect("cold --fresh check must succeed past GRACE_NS after Store::map_all")
+    });
+    assert!(!fresh_checked.certified, "cold --fresh check is not certified");
+    assert!(!fresh_checked.from_last, "cold --fresh check starts with last.is_none()");
+    assert!(fresh_checked.entered > 0, "cold --fresh check enters tasks");
+    assert_eq!(fresh_ids, seed_ids, "cold --fresh check matches findings");
+    assert!(fresh_checked.store_segments.1 > 0, "store has committed segments");
+    assert_eq!(
+        fresh_checked.store_segments.0, fresh_checked.store_segments.1,
+        "cold check must map every named segment before planning"
+    );
+
+    // Case 2 (non-fresh cold check with `last.is_none()` — e.g. invalidated/cleaned checkout root
+    // and absent fallback bases, while prior records still live in unmapped store segments):
+    // Unroot `ws`'s answer roots and shared fallback bases (`engine.bases*` / `tool-base.*`) while
+    // keeping `ws_seed`'s and `ws`'s committed segments in the home store.
+    {
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+        let fs = io.need_fs().expect("fs");
+        let host = io.need_host().expect("host");
+        let store_home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
+        let boot = host.boot().ok().map(|b| crate::store::boot_fact(&b));
+        let facts = crate::store::Facts { boot, nonce: 54 };
+        let lent = store_home
+            .open_store(&blaze_cas::plain::Settings::default(), facts, blaze_own::testing::heap().alloc())
+            .expect("open store");
+        let ws_root = crate::engine_answer::root_name(WS.dir, cx.frame());
+        for (name, _) in lent.roots() {
+            if name.starts_with(ws_root.as_str())
+                || name.starts_with(crate::engine_answer::BASES_ROOT)
+                || name.starts_with("tool-base.")
+            {
+                lent.unroot(name.as_str());
+            }
+        }
+        lent.commit().expect("commit unroot of checkout and fallback bases");
+    }
+
+    // Negative control: skipping `Store::map_all` on a non-fresh cold check (`last.is_none()`)
+    // trips `LATE_MAP` when `layout`/`plan` exceeds `GRACE_NS` and `phase Units wave 0` puts
+    // a record that hits an unmapped segment's Bloom filter.
+    let planted_cold_non_fresh = engine_check::with_plan_delay_before_layout(past_grace, || {
+        engine_check::with_skip_map_all_before_plan(|| run_check_result(WS, false))
+    });
+    let cold_err_msg = match planted_cold_non_fresh {
+        Err(err) => err.to_string(),
+        Ok((_, checked)) => panic!(
+            "planted control on non-fresh cold check must fail with LATE_MAP past GRACE_NS (got Ok: certified={}, from_last={}, entered={}, store_segments={:?})",
+            checked.certified, checked.from_last, checked.entered, checked.store_segments,
+        ),
+    };
+    assert!(
+        cold_err_msg.contains("more than the grace period after the open"),
+        "expected LATE_MAP grace-period error on non-fresh cold check, got: {cold_err_msg}"
+    );
+    assert!(
+        cold_err_msg.contains("Driven::map_all"),
+        "expected LATE_MAP to name Driven::map_all, got: {cold_err_msg}"
+    );
+
+    // Positive (fix enabled): non-fresh cold check (`last.is_none()`) succeeds cleanly past `GRACE_NS`.
+    let (cold_ids, cold_checked) = engine_check::with_plan_delay_before_layout(past_grace, || {
+        run_check_result(WS, false).expect("non-fresh cold check must succeed past GRACE_NS after Store::map_all")
+    });
+    assert_eq!(cold_ids, seed_ids, "non-fresh cold check matches findings");
+    assert!(!cold_checked.certified);
+    assert!(!cold_checked.from_last, "non-fresh cold check started with last.is_none()");
+    assert!(cold_checked.entered > 0);
+    assert!(cold_checked.store_segments.1 > 0);
+    assert_eq!(cold_checked.store_segments.0, cold_checked.store_segments.1);
+}
+
+/// A warm unchanged `blaze check` hitting the certificate fast path MUST NOT eagerly call
+/// `Store::map_all`: unrelated segments from other checkouts remain unmapped (`mapped < named`),
+/// preserving the fast warm certificate latency.
+#[test]
+fn warm_certificate_fast_path_does_not_eagerly_map_unrelated_segments() {
+    const OTHER: Checkout = Checkout { dir: "ws_other", shown: "/ws_other" };
+
+    let io = Io::simulated(SimWorld::new(59, Limits::USUAL));
+    write_in(&io, OTHER, "Cargo.toml", "[package]\nname = \"unrelated_pkg\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write_in(&io, OTHER, "src/lib.rs", "pub fn unrelated() -> u32 {\n    7\n}\n");
+    // Give `ws` a distinct finding so its content-addressed `lines` record is written into `ws`'s
+    // own newest segment rather than deduplicating onto `ws_other`'s empty `lines` record.
+    write(&io, "Cargo.toml", "[package]\nname = \"target_pkg\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(&io, "src/lib.rs", "pub fn target() -> u32 {\n    true\n}\n");
+
+    // 1. Check `ws_other` first so it writes committed segment(s) into the shared home store.
+    {
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+        let frame = cx.frame();
+        let fs = io.need_fs().expect("fs");
+        let host = io.need_host().expect("host");
+        let mut rng = io.need_rng().expect("rng");
+        let root = fs.open_dir(&cx, &Path::new(OTHER.dir).expect("path")).expect("open ws_other");
+        let out = io.need_out().expect("out");
+        let err = io.need_err().expect("err");
+        let mut phases = boxed(|| Phases::new(io.need_clock().expect("clock")));
+        let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, OTHER.shown, frame);
+        let args = io.args();
+        let net = io.net();
+        let mut other_opts = opts(&io, 2, false);
+        other_opts.place.checkout = OTHER.dir;
+        let checked = engine_check::check(&cx, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, other_opts, &mut shown, &mut phases, &out, &err)
+            .expect("ws_other cold check");
+        assert!(checked.entered > 0);
+    }
+
+    // 2. Check `ws` cold so `ws` writes its own newer committed segment(s) beside `ws_other`'s.
+    let (cold_ids, cold) = engine_from(&io, 2, false);
+    assert!(!cold_ids.is_empty(), "ws cold check reports its type error: {cold_ids:?}");
+    assert!(!cold.certified);
+
+    // 3. Re-run `ws` unchanged: must hit the certificate fast path WITHOUT eagerly mapping
+    //    `ws_other`'s older segment(s).
+    let (warm_ids, warm) = engine_from(&io, 2, false);
+    assert_eq!(warm_ids, cold_ids, "ws warm check replays the same finding");
+    assert!(warm.certified, "warm unchanged check must hit the certificate fast path");
+    assert_eq!(warm.entered, 0, "warm certified check enters 0 tasks");
+    let (mapped, named) = warm.store_segments;
+    assert!(
+        named >= 2,
+        "test setup must hold at least 2 committed segments across ws_other and ws (got mapped={mapped}, named={named})"
+    );
+    assert!(
+        mapped < named,
+        "warm certificate fast path must NOT eagerly map every segment (got mapped={mapped}, named={named})"
+    );
+}
