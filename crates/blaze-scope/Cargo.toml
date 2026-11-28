@@ -58,6 +58,8 @@ blaze-manifest = { workspace = true, default-features = false }
 blaze-toolchain.workspace = true
 # units.rs: `PackageEdition`, a unit's edition, for `implicit`.
 edition.workspace = true
+# task/lower.rs: `cfg_version_holds` for RFC 2523 `#[cfg(version("..."))]`.
+blaze-pins.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true

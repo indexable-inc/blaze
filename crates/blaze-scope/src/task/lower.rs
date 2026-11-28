@@ -389,23 +389,34 @@ impl<'s, 'a> Cfg<'s, 'a> {
             let mut value = match lex.peek() {
                 Some(CTok::Open) => {
                     lex.next();
-                    let op = match name {
-                        "all" | "target" => Op::All,
-                        "any" => Op::Any,
-                        "not" => Op::Not,
-                        _ => return None,
-                    };
-                    if depth == MOST_CFG_DEPTH {
-                        return None;
+                    if name == "version" && !target {
+                        let Some(CTok::Str(spec)) = lex.next() else { return None };
+                        if lex.peek() == Some(CTok::Comma) {
+                            lex.next();
+                        }
+                        if lex.next() != Some(CTok::Close) {
+                            return None;
+                        }
+                        blaze_pins::cfg_version_holds(spec)
+                    } else {
+                        let op = match name {
+                            "all" | "target" => Op::All,
+                            "any" => Op::Any,
+                            "not" => Op::Not,
+                            _ => return None,
+                        };
+                        if depth == MOST_CFG_DEPTH {
+                            return None;
+                        }
+                        frames[depth] = Frame { op, target: target || name == "target", value: matches!(op, Op::All), count: 0 };
+                        depth += 1;
+                        if lex.peek() != Some(CTok::Close) {
+                            continue 'pred;
+                        }
+                        lex.next();
+                        depth -= 1;
+                        finish(frames[depth])?
                     }
-                    frames[depth] = Frame { op, target: target || name == "target", value: matches!(op, Op::All), count: 0 };
-                    depth += 1;
-                    if lex.peek() != Some(CTok::Close) {
-                        continue 'pred;
-                    }
-                    lex.next();
-                    depth -= 1;
-                    finish(frames[depth])?
                 }
                 Some(CTok::Eq) => {
                     lex.next();

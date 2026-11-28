@@ -69,3 +69,23 @@ fn a_comment_inside_a_cfg_predicate_is_whitespace() {
     assert_eq!(cfg.eval("not(feature = \"fs\") // off"), Some(false));
     assert_eq!(cfg.eval("all(feature = \"fs\" /* open"), None);
 }
+
+#[test]
+fn cfg_version_predicate_evaluates_against_pinned_release() {
+    let g = blaze_own::Alloc::global();
+    let cfg = crate::task::Cfg::from_atoms(&[("rust_nightly", None)], g);
+    assert_eq!(cfg.eval("version(\"1.76\")"), Some(true));
+    assert_eq!(cfg.eval("version(\"1.76.0\")"), Some(true));
+    assert_eq!(cfg.eval("version(\"1.76\",)"), Some(true));
+    assert_eq!(cfg.eval("version(\"99.0\")"), Some(false));
+    assert_eq!(cfg.eval("not(version(\"99.0\"))"), Some(true));
+    assert_eq!(cfg.eval("not(version(\"1.76\"))"), Some(false));
+    assert_eq!(cfg.eval("version(\"..\")"), Some(false));
+    assert_eq!(cfg.eval("all(rust_nightly, version(\"1.76\"))"), Some(true));
+    // Negative controls: malformed `version(..)` and unknown calls remain unread (`None`).
+    assert_eq!(cfg.eval("version()"), None);
+    assert_eq!(cfg.eval("version(123)"), None);
+    assert_eq!(cfg.eval("version(\"1.76\", \"1.77\")"), None);
+    assert_eq!(cfg.eval("version(rust_nightly)"), None);
+    assert_eq!(cfg.eval("unknown_call(\"foo\")"), None);
+}

@@ -1187,6 +1187,13 @@ fn a_cfg_predicate_is_read_from_its_tokens() {
         ("any()", false),
         ("all()", true),
         ("not(any(windows, feature = \"off\"))", true),
+        ("version(\"1.76\")", true),
+        ("version(\"1.76.0\")", true),
+        ("version(\"1.76\",)", true),
+        ("version(\"99.0\")", false),
+        ("not(version(\"99.0\"))", true),
+        ("version(\"..\")", false),
+        ("all(unix, version(\"1.76\"), not(version(\"99.0\")))", true),
     ];
     for (text, want) in cases {
         assert_eq!(eval(text).0, Ok(want), "{text}");
@@ -1199,6 +1206,11 @@ fn a_cfg_predicate_is_read_from_its_tokens() {
     assert!(matches!(eval("all(unix,,)").0, Err(CfgPredicateError::Malformed { .. })));
     assert!(matches!(eval("unix test").0, Err(CfgPredicateError::Malformed { .. })));
     assert!(matches!(eval("feature = 3").0, Err(CfgPredicateError::Malformed { .. })));
+    assert!(matches!(eval("version()").0, Err(CfgPredicateError::Malformed { .. })));
+    assert!(matches!(eval("version(123)").0, Err(CfgPredicateError::Malformed { .. })));
+    assert!(matches!(eval("version(\"1.76\", \"1.77\")").0, Err(CfgPredicateError::Malformed { .. })));
+    assert!(matches!(eval("version(unix)").0, Err(CfgPredicateError::Malformed { .. })));
+    assert!(matches!(eval("unknown_call(\"foo\")").0, Err(CfgPredicateError::Malformed { .. })));
     assert_eq!(eval("any(unix, unknown)").0, Err(CfgPredicateError::Atom(())));
 }
 

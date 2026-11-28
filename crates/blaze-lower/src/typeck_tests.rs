@@ -2166,3 +2166,54 @@ fn format_args_zero_padded_captured_width_and_precision() {
     let count_uses = converted.fmt_uses.iter().filter(|u| u.trait_ == blaze_typeck::FmtTrait::Count).count();
     assert_eq!(count_uses, 4, "expected 4 Count uses (full, full, prec, full); got {:?}", converted.fmt_uses);
 }
+
+/// Verifies `starlark_map::vec_map::simd::find_hash_in_array`'s `#[cfg(version("1.76"))]` /
+/// `#[cfg(not(version("1.76")))]` body lowers AND converts to typeck cleanly with zero syntax
+/// diagnostics and zero leaked string literals.
+#[test]
+fn cfg_version_starlark_map_simd_converts_to_typeck() {
+    struct Nightly(bool);
+    impl crate::Cfg for Nightly {
+        fn atom(&mut self, name: &str, value: Option<&str>) -> crate::CfgAnswer {
+            if name == "rust_nightly" && value.is_none() {
+                if self.0 {
+                    crate::CfgAnswer::Yes
+                } else {
+                    crate::CfgAnswer::No
+                }
+            } else {
+                crate::CfgAnswer::No
+            }
+        }
+    }
+
+    let heap = blaze_own::testing::heap();
+    let alloc = heap.alloc();
+    let src = r#"pub(crate) fn find_hash_in_array(array: &[u32], hash: u32) -> usize {
+        #[cfg(rust_nightly)]
+        unsafe {
+            #[cfg(version("1.76"))]
+            const LANES: usize = 4;
+            #[cfg(not(version("1.76")))]
+            const LANES: usize = 8;
+            let _ = (array, hash);
+            LANES
+        }
+        #[cfg(not(rust_nightly))]
+        {
+            let _ = (array, hash);
+            0
+        }
+    }"#;
+
+    for nightly in [true, false] {
+        let body = lower_body(src, Edition::E2021, &mut Nightly(nightly), &mut crate::NoModule, alloc)
+            .expect("lower");
+        let view = body.view();
+        assert!(view.diags.is_empty(), "nightly={nightly}: unexpected diags: {:?}", view.diags);
+        let mut tys = PortableTys::new_in(alloc);
+        let mut types = PrimTypes;
+        let _converted = to_typeck(&view, ItemKey(0), &mut tys, &mut types, alloc)
+            .unwrap_or_else(|e| panic!("nightly={nightly}: to_typeck refused: {e:?}"));
+    }
+}

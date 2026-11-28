@@ -214,6 +214,20 @@ fn predicate_in<V: Truth, E>(
                     continue;
                 }
             }
+            (None, Some(TokenKind::Open(Delim::Paren))) if name == "version" => {
+                let lit = tok(pos + 2).ok_or(malformed(pos + 2))?;
+                let TokenKind::Literal { kind, suffix_len: 0, .. } = lit.kind else { return Err(malformed(pos + 2)) };
+                value_buf.0.clear();
+                string_value(kind, tokens.text_of(lit), 0, &mut value_buf).map_err(|_| malformed(pos + 2))?;
+                pos += 3;
+                if matches!(tok(pos).map(|t| t.kind), Some(TokenKind::Punct { char: ',', .. })) {
+                    pos += 1;
+                }
+                let Some(TokenKind::Close(Delim::Paren)) = tok(pos).map(|t| t.kind) else { return Err(malformed(pos)) };
+                pos += 1;
+                Some(V::of(blaze_pins::cfg_version_holds(value_buf.as_str())))
+            }
+            (None, Some(TokenKind::Open(Delim::Paren))) => return Err(malformed(pos)),
             (_, Some(TokenKind::Punct { char: '=', .. })) => {
                 let lit = tok(pos + 2).ok_or(malformed(pos + 2))?;
                 let TokenKind::Literal { kind, suffix_len, .. } = lit.kind else { return Err(malformed(pos + 2)) };
