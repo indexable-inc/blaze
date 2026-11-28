@@ -1956,7 +1956,14 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     // item bounds, and nested alias traits so `regions.clauses` and `assoc_items` are loaded for
     // supertrait elaboration in `blaze-borrow`.
     {
-        fn push_clause_traits(stys: tc::PTys<'_>, cl: &tc::PClause, traits: &mut AVec<'_, u128>, opaques: &mut AVec<'_, u128>) {
+        fn push_clause_traits<'a>(
+            stys: tc::PTys<'_>,
+            cl: &tc::PClause,
+            st: &mut AVec<'a, tc::PTy>,
+            seen: &mut blaze_hash::Map<u32, (), blaze_hash::FixedState, Alloc<'a>>,
+            traits: &mut AVec<'a, u128>,
+            opaques: &mut AVec<'a, u128>,
+        ) {
             let (args, extra_ty) = match *cl {
                 tc::PClause::Trait { trait_: sup, args } => {
                     if traits.scan_for(&sup.0).is_none() {
@@ -1973,103 +1980,59 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 tc::PClause::TypeOutlives { ty, .. } => (None, Some(ty)),
                 _ => (None, None),
             };
-            let mut st = [tc::PTy(0); 32];
-            let mut len = 0usize;
+            st.clear();
             if let Some(args) = args
                 && let Ok(list) = stys.list(args)
             {
                 for &t in list {
-                    if let Some(slot) = st.get_mut(len) {
-                        *slot = t;
-                        len += 1;
+                    if seen.insert(t.0, ()).is_none() {
+                        st.push(t);
                     }
                 }
             }
             if let Some(t) = extra_ty
-                && let Some(slot) = st.get_mut(len)
+                && seen.insert(t.0, ()).is_none()
             {
-                *slot = t;
-                len += 1;
+                st.push(t);
             }
             let mut steps = 0u32;
-            while len > 0 && steps < 64 {
-                len -= 1;
+            while let Some(cur) = st.pop() {
+                if steps >= super::adt_variance::MOST_LAID_NODES {
+                    break;
+                }
                 steps += 1;
-                let Some(&cur) = st.get(len) else { break };
                 let Ok(node) = stys.node(cur) else { continue };
                 match node {
-                    tc::PNode::Alias { trait_: at, args: al, .. } | tc::PNode::ExTrait(at, al) => {
+                    tc::PNode::Alias { trait_: at, .. } | tc::PNode::ExTrait(at, _) | tc::PNode::ExProj { trait_: at, .. } => {
                         if traits.scan_for(&at.0).is_none() {
                             traits.push(at.0);
                         }
-                        if let Ok(xs) = stys.list(al) {
-                            for &x in xs {
-                                if let Some(slot) = st.get_mut(len) {
-                                    *slot = x;
-                                    len += 1;
-                                }
-                            }
-                        }
                     }
-                    tc::PNode::ExProj { trait_: at, args: al, term, .. } => {
-                        if traits.scan_for(&at.0).is_none() {
-                            traits.push(at.0);
-                        }
-                        if let Some(slot) = st.get_mut(len) {
-                            *slot = term;
-                            len += 1;
-                        }
-                        if let Ok(xs) = stys.list(al) {
-                            for &x in xs {
-                                if let Some(slot) = st.get_mut(len) {
-                                    *slot = x;
-                                    len += 1;
-                                }
-                            }
-                        }
-                    }
-                    tc::PNode::Opaque(ok, al) => {
+                    tc::PNode::Opaque(ok, _) => {
                         if opaques.scan_for(&ok.0).is_none() {
                             opaques.push(ok.0);
-                        }
-                        if let Ok(xs) = stys.list(al) {
-                            for &x in xs {
-                                if let Some(slot) = st.get_mut(len) {
-                                    *slot = x;
-                                    len += 1;
-                                }
-                            }
-                        }
-                    }
-                    tc::PNode::Adt(_, al)
-                    | tc::PNode::Tuple(al)
-                    | tc::PNode::Dynamic(al)
-                    | tc::PNode::FnPtr(al, _)
-                    | tc::PNode::Record(_, al)
-                    | tc::PNode::Union(al) => {
-                        if let Ok(xs) = stys.list(al) {
-                            for &x in xs {
-                                if let Some(slot) = st.get_mut(len) {
-                                    *slot = x;
-                                    len += 1;
-                                }
-                            }
-                        }
-                    }
-                    tc::PNode::Ref(_, x)
-                    | tc::PNode::Ptr(_, x)
-                    | tc::PNode::Slice(x)
-                    | tc::PNode::Array(x, _)
-                    | tc::PNode::Pat(x, _) => {
-                        if let Some(slot) = st.get_mut(len) {
-                            *slot = x;
-                            len += 1;
                         }
                     }
                     _ => {}
                 }
+                if let Ok((list, last)) = super::adt_variance::children(stys, cur, node) {
+                    for &ch in list {
+                        if seen.insert(ch.0, ()).is_none() {
+                            st.push(ch);
+                        }
+                    }
+                    if let Some(ch) = last
+                        && seen.insert(ch.0, ()).is_none()
+                    {
+                        st.push(ch);
+                    }
+                }
             }
         }
+
+        let mut clause_st: AVec<'a, tc::PTy> = AVec::new_in(alloc);
+        let mut clause_seen: blaze_hash::Map<u32, (), blaze_hash::FixedState, Alloc<'a>> =
+            blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc, capacity: None });
 
         // Gather nested traits and opaques inside `owner`'s `TypeOutlives` subjects (e.g.
         // `where (<() as UnusedProj<'a>>::Assoc, &'b U): 'k`) so their heads, RPITIT rows,
@@ -2078,7 +2041,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             let stys = r.store.tys.view();
             for cl in p.clauses.iter() {
                 if matches!(cl, tc::PClause::TypeOutlives { .. }) {
-                    push_clause_traits(stys, cl, &mut traits, &mut opaques);
+                    push_clause_traits(stys, cl, &mut clause_st, &mut clause_seen, &mut traits, &mut opaques);
                 }
             }
         }
@@ -2098,18 +2061,18 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             let stys = r.store.tys.view();
             if let Some(p) = r.store.preds.get(&tk) {
                 for cl in p.clauses.iter() {
-                    push_clause_traits(stys, cl, &mut traits, &mut opaques);
+                    push_clause_traits(stys, cl, &mut clause_st, &mut clause_seen, &mut traits, &mut opaques);
                 }
             }
             if let Some(def) = r.store.trait_defs.get(&tk) {
                 for sc in def.supertraits.iter() {
-                    push_clause_traits(stys, sc, &mut traits, &mut opaques);
+                    push_clause_traits(stys, sc, &mut clause_st, &mut clause_seen, &mut traits, &mut opaques);
                 }
                 for a in def.assoc.iter() {
                     g.assoc_items.push((tk.0, a.name, a.item));
                     if let Some(ap) = r.store.preds.get(&a.item) {
                         for ac in ap.clauses.iter() {
-                            push_clause_traits(stys, ac, &mut traits, &mut opaques);
+                            push_clause_traits(stys, ac, &mut clause_st, &mut clause_seen, &mut traits, &mut opaques);
                         }
                     }
                 }

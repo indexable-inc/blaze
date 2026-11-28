@@ -325,6 +325,50 @@ where
 {
     x
 }
+
+trait LateWideProj<'a> {
+    type Assoc;
+}
+
+impl<'a> LateWideProj<'a> for () {
+    type Assoc = u8;
+}
+
+fn wide_tuple_late_proj_yields_ref<'a, 'b, 'k, U>(x: &'b U) -> &'k U
+where
+    (
+        &'b U, u8, u8, u8, u8, u8, u8, u8, u8, u8,
+        u8, u8, u8, u8, u8, u8, u8, u8, u8, u8,
+        u8, u8, u8, u8, u8, u8, u8, u8, u8, u8,
+        u8, u8, u8, u8, u8, u8, u8, u8, u8, <() as LateWideProj<'a>>::Assoc,
+    ): 'k,
+{
+    x
+}
+
+fn wide_tuple_late_proj_yields_param<'a, 'b, 'k, U>(u: U, r: &'k u8) -> &'k u8
+where
+    (
+        &'b U, u8, u8, u8, u8, u8, u8, u8, u8, u8,
+        u8, u8, u8, u8, u8, u8, u8, u8, u8, u8,
+        u8, u8, u8, u8, u8, u8, u8, u8, u8, u8,
+        u8, u8, u8, u8, u8, u8, u8, u8, u8, <() as LateWideProj<'a>>::Assoc,
+    ): 'k,
+{
+    hold(u, r)
+}
+
+fn wide_tuple_late_proj_does_not_yield_proj_region<'a, 'b, 'k, U>(x: &'a str, _u: &'b U) -> &'k str
+where
+    (
+        &'b U, u8, u8, u8, u8, u8, u8, u8, u8, u8,
+        u8, u8, u8, u8, u8, u8, u8, u8, u8, u8,
+        u8, u8, u8, u8, u8, u8, u8, u8, u8, u8,
+        u8, u8, u8, u8, u8, u8, u8, u8, u8, <() as LateWideProj<'a>>::Assoc,
+    ): 'k,
+{
+    x
+}
 ";
 
 #[test]
@@ -374,6 +418,8 @@ fn async_implied_bounds_and_concrete_type_outlives() {
         "proj_sibling_yields_param",
         "dyn_sibling_yields_ref",
         "dyn_object_lifetime_yields_bound",
+        "wide_tuple_late_proj_yields_ref",
+        "wide_tuple_late_proj_yields_param",
     ] {
         let b = find(name);
         let (types, v) = world.check_borrows(b, heap.alloc());
@@ -403,6 +449,7 @@ fn async_implied_bounds_and_concrete_type_outlives() {
         "hr_fn_ptr_no_region",
         "proj_sibling_does_not_yield_proj_region",
         "dyn_predicate_lifetime_does_not_yield_bound",
+        "wide_tuple_late_proj_does_not_yield_proj_region",
     ] {
         let b = find(name);
         let (types, v) = world.check_borrows(b, heap.alloc());
