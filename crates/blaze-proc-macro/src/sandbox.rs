@@ -600,6 +600,88 @@ impl Sandbox {
         }
     }
 
+    /// Records every directory listing (`dir:<rel>`), regular file (`file:<rel>`), and symlink
+    /// (`lstat:<rel>` + target) beneath `rel_root` (relative to the package's served tree root)
+    /// into [`Self::reads`], using the exact same digests that [`answer_now`] recomputes on cache
+    /// validation. Used by Tier-2 confined `native.bin` workers whose OS sandbox permits direct
+    /// read-only `std::fs` access inside the granted tree so adding, deleting, or editing ANY
+    /// readable file invalidates cached expansions (rule 21).
+    ///
+    /// Returns `Ok(true)` when the entire subtree fit within `max_entries` and is safe to cache,
+    /// `Ok(false)` when `max_entries` was exceeded (caller must NOT cache an incomplete snapshot),
+    /// or `Err(())` if a symlink escaped the served tree.
+    pub(crate) fn record_granted_tree(&mut self, rel_root: &Path, max_entries: usize) -> Result<bool, ()> {
+        let mut stack = blaze_own::Vec::new_in(blaze_own::SharedAlloc::global());
+        let mut visited: usize = 0;
+
+        match self.package.files.find(rel_root, true) {
+            Ok(Some(Found::Folder)) => {
+                stack.push(rel_root.to_path_buf());
+            }
+            Ok(Some(Found::File(_))) => {
+                let bytes = self.package.files.bytes(rel_root).map_err(|_| ())?;
+                self.record(Self::subject("file", rel_root), bytes.as_deref().map(digest));
+                return Ok(true);
+            }
+            Ok(Some(Found::Link(_) | Found::Loop)) => {
+                return Ok(false);
+            }
+            Ok(None) => {
+                self.record(Self::subject("stat", rel_root), None);
+                return Ok(true);
+            }
+            Err(_) => return Err(()),
+        }
+
+        while let Some(dir_rel) = stack.pop() {
+            let (canon, entries) = self.package.files.listing(&dir_rel).map_err(|_| ())?;
+            let list_digest = listing_digest(&canon, &entries);
+            self.record(Self::subject("dir", &dir_rel), Some(list_digest));
+            for (name_bytes, filetype) in entries {
+                visited = visited.saturating_add(1);
+                if visited > max_entries {
+                    return Ok(false);
+                }
+                let child_rel = if dir_rel.as_os_str().is_empty() {
+                    PathBuf::from(OsStr::from_bytes(&name_bytes))
+                } else {
+                    dir_rel.join(OsStr::from_bytes(&name_bytes))
+                };
+                match filetype {
+                    Filetype::Directory => stack.push(child_rel),
+                    Filetype::RegularFile => {
+                        let bytes = self.package.files.bytes(&child_rel).map_err(|_| ())?;
+                        self.record(Self::subject("file", &child_rel), bytes.as_deref().map(digest));
+                    }
+                    Filetype::SymbolicLink => {
+                        let lstat = self.package.files.find(&child_rel, false).map_err(|_| ())?;
+                        let lstat_dig = match lstat {
+                            Some(Found::Link(size)) => Some(stat_digest(Filetype::SymbolicLink, size)),
+                            Some(Found::File(size)) => Some(stat_digest(Filetype::RegularFile, size)),
+                            Some(Found::Folder) => Some(stat_digest(Filetype::Directory, 0)),
+                            Some(Found::Loop) => Some(stat_digest(Filetype::Unknown, 0)),
+                            None => None,
+                        };
+                        self.record(Self::subject("lstat", &child_rel), lstat_dig);
+                        match self.package.files.find(&child_rel, true) {
+                            Ok(Some(Found::File(_))) => {
+                                let bytes = self.package.files.bytes(&child_rel).map_err(|_| ())?;
+                                self.record(Self::subject("file", &child_rel), bytes.as_deref().map(digest));
+                            }
+                            Ok(Some(Found::Folder)) => return Ok(false),
+                            Ok(_) => {}
+                            Err(_) => return Err(()),
+                        }
+                    }
+                    _ => {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// Formats a path read subject (`kind:rel`, or `kind-hex:<hex>` when `rel` is not UTF-8).
     fn subject(kind: &str, rel: &Path) -> String {
         match rel.to_str() {

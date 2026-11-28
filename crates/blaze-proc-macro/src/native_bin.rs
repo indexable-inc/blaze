@@ -26,7 +26,7 @@ use bstd::{
     mem::TASK_FRAME,
     procs::{
         Input, Output, ParentDeath, RunChild as _, RunError, RunSpec, Served, Streams,
-        hermetic::{Budget, start_served_read_only},
+        hermetic::{Budget, Fault, Over, Stop, check_served_budget, start_served_read_only},
     },
     sync::PublishOnce,
 };
@@ -60,6 +60,17 @@ pub const DEFAULT_WORKER_CPU_BUDGET: Duration = Duration::from_secs(3600);
 /// Default process-lifetime virtual address space limit (`RLIMIT_AS`, 8 GiB) for multi-threaded
 /// workers (e.g. `tokio`/`mio` running local offline tasks).
 pub const DEFAULT_WORKER_MEMORY_BUDGET: u64 = 8 << 30;
+
+/// Maximum filesystem entries snapshotted into [`Reads`] per expansion across granted read-only
+/// roots before marking the expansion uncacheable (rule 18 & rule 21).
+pub const MAX_GRANTED_SNAPSHOT_ENTRIES: usize = 16_384;
+
+/// Output of one Tier-2 `native.bin` expansion, together with whether its granted-tree read
+/// snapshot completed within bounds and is therefore safe to persist in the expansion cache.
+pub struct NativeBinExpand<'a> {
+    pub produced: Produced<'a>,
+    pub cacheable: bool,
+}
 
 /// Configuration bounds for [`NativeBinServer`] and [`NativeBinPool`].
 #[derive(Clone, Copy, Debug)]
@@ -111,6 +122,7 @@ pub enum RecvFrame {
 pub enum TransportError {
     Channel(ChannelError),
     Run(RunError),
+    Budget(ProcLimit, OwnString<SharedAlloc<'static>>),
 }
 
 impl fmt::Display for TransportError {
@@ -118,6 +130,7 @@ impl fmt::Display for TransportError {
         match self {
             TransportError::Channel(err) => write!(f, "{err}"),
             TransportError::Run(err) => write!(f, "{err}"),
+            TransportError::Budget(_, why) => f.write_str(why.as_str()),
         }
     }
 }
@@ -141,11 +154,42 @@ pub trait NativeBinTransport {
 /// Production transport backed by a confined [`bstd::procs::Served`] child process.
 pub struct ServedTransport {
     served: Served,
+    budget: Budget,
 }
 
 impl ServedTransport {
-    pub fn new(served: Served) -> Self {
-        Self { served }
+    pub fn new(served: Served, budget: Budget) -> Self {
+        Self { served, budget }
+    }
+
+    fn check_budget(&self) -> Result<(), TransportError> {
+        match check_served_budget(self.served.id(), self.budget) {
+            Ok(_) => Ok(()),
+            Err(Fault::Stopped(Stop::Budget(Over::Cpu { used, most }))) => {
+                let mut msg = OwnString::new_in(SharedAlloc::global());
+                let _ = fmt::Write::write_fmt(
+                    &mut msg,
+                    format_args!("native proc-macro exceeded CPU budget ({used:?} > {most:?})"),
+                );
+                Err(TransportError::Budget(ProcLimit::Fuel, msg))
+            }
+            Err(Fault::Stopped(Stop::Budget(Over::Memory { used, most }))) => {
+                let mut msg = OwnString::new_in(SharedAlloc::global());
+                let _ = fmt::Write::write_fmt(
+                    &mut msg,
+                    format_args!("native proc-macro exceeded memory budget ({used} > {most} bytes)"),
+                );
+                Err(TransportError::Budget(ProcLimit::Memory, msg))
+            }
+            Err(other) => {
+                let mut msg = OwnString::new_in(SharedAlloc::global());
+                let _ = fmt::Write::write_fmt(
+                    &mut msg,
+                    format_args!("native proc-macro budget check failed: {other:?}"),
+                );
+                Err(TransportError::Budget(ProcLimit::Fuel, msg))
+            }
+        }
     }
 }
 
@@ -155,6 +199,7 @@ impl NativeBinTransport for ServedTransport {
     }
 
     fn send_frame(&mut self, framed: &[u8], deadline: Deadline) -> Result<(), TransportError> {
+        self.check_budget()?;
         self.served.send(framed, deadline).map_err(TransportError::Run)
     }
 
@@ -164,11 +209,40 @@ impl NativeBinTransport for ServedTransport {
         max_frame: u32,
         deadline: Deadline,
     ) -> Result<RecvFrame, TransportError> {
-        match self.served.recv_message(into, max_frame, deadline) {
-            Ok(ChanMessage::Whole { len }) => Ok(RecvFrame::Whole { len }),
-            Ok(ChanMessage::Closed) => Ok(RecvFrame::Closed),
-            Ok(ChanMessage::Deadline) => Ok(RecvFrame::Deadline),
-            Err(err) => Err(TransportError::Run(err)),
+        #[cfg(target_os = "macos")]
+        {
+            const METER_SLICE: Duration = Duration::from_millis(100);
+            loop {
+                self.check_budget()?;
+                let now = self.served.now();
+                if deadline.passed(now) {
+                    return Ok(RecvFrame::Deadline);
+                }
+                let slice_end = Deadline::after(now, METER_SLICE).min(deadline);
+                match self.served.recv_message(into, max_frame, slice_end) {
+                    Ok(ChanMessage::Whole { len }) => {
+                        self.check_budget()?;
+                        return Ok(RecvFrame::Whole { len });
+                    }
+                    Ok(ChanMessage::Closed) => return Ok(RecvFrame::Closed),
+                    Ok(ChanMessage::Deadline) => {
+                        if deadline.passed(self.served.now()) {
+                            return Ok(RecvFrame::Deadline);
+                        }
+                    }
+                    Err(err) => return Err(TransportError::Run(err)),
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.check_budget()?;
+            match self.served.recv_message(into, max_frame, deadline) {
+                Ok(ChanMessage::Whole { len }) => Ok(RecvFrame::Whole { len }),
+                Ok(ChanMessage::Closed) => Ok(RecvFrame::Closed),
+                Ok(ChanMessage::Deadline) => Ok(RecvFrame::Deadline),
+                Err(err) => Err(TransportError::Run(err)),
+            }
         }
     }
 
@@ -308,14 +382,42 @@ fn remap_tracked_path<'a>(
     if !path.starts_with('/') {
         let cwd = package.cwd();
         out.push_str(&cwd);
-        if !path.is_empty() {
+        let rel = path.strip_prefix("./").unwrap_or(path);
+        if !rel.is_empty() && rel != "." {
             out.push('/');
-            out.push_str(path);
+            out.push_str(rel);
         }
         return out;
     }
     out.push_str(path);
     out
+}
+
+/// Returns `true` if any produced token or diagnostic text leaks one of the host checkout paths
+/// in `paths` (rule 25: machine paths must never enter cached macro outputs).
+fn contains_host_path(produced: &Produced<'_>, paths: NativePaths<'_>) -> bool {
+    let needles = [paths.manifest_dir, paths.workspace_root];
+    for host_dir in needles.into_iter().flatten() {
+        let trimmed = host_dir.trim_end_matches('/');
+        if trimmed.len() <= 1 {
+            continue;
+        }
+        let needle_bytes = trimmed.as_bytes();
+        if produced
+            .text
+            .as_slice()
+            .windows(needle_bytes.len())
+            .any(|w| w == needle_bytes)
+        {
+            return true;
+        }
+        for idx in 0..produced.tokens.tokens().len() {
+            if produced.tokens.text_at(idx).contains(trimmed) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Host driver for a single persistent confined Tier-2 native proc-macro worker over a
@@ -361,11 +463,12 @@ impl<T: NativeBinTransport> NativeBinServer<T> {
             .map_err(proto_to_call_error)?;
         self.transport
             .send_frame(self.outbox.as_slice(), deadline)
-            .map_err(|err| {
-                err_text(format_args!(
-                    "failed sending frame to native proc-macro worker: {err}"
+            .map_err(|err| match err {
+                TransportError::Budget(limit, why) => CallError::Limit { limit, why: why.as_str().into() },
+                other => err_text(format_args!(
+                    "failed sending frame to native proc-macro worker: {other}"
                 ))
-                .into()
+                .into(),
             })
     }
 
@@ -392,6 +495,9 @@ impl<T: NativeBinTransport> NativeBinServer<T> {
                         .as_str()
                         .into(),
                 });
+            }
+            Err(TransportError::Budget(limit, why)) => {
+                return Err(CallError::Limit { limit, why: why.as_str().into() });
             }
             Err(TransportError::Channel(ChannelError::TooLong { len, most })) => {
                 return Err(CallError::Limit {
@@ -446,9 +552,9 @@ impl<T: NativeBinTransport> NativeBinServer<T> {
     }
 
     /// Runs one proc-macro expansion against this worker, driving [`Server`] and [`Sandbox`]
-    /// identically to `host.rs` and returning [`Produced`] with full `TokenOrigin` hygiene,
-    /// `ProcDiagnostic`, and read tracking.
-    #[expect(clippy::too_many_arguments, reason = "explicit host inputs, sandbox, limits, paths, and allocators (rule 75)")]
+    /// identically to `host.rs` and returning [`NativeBinExpand`] with full `TokenOrigin` hygiene,
+    /// `ProcDiagnostic`, complete granted-tree filesystem read tracking, and host-path leak checks.
+    #[expect(clippy::too_many_arguments, reason = "explicit host inputs, sandbox, limits, paths, granted roots, and allocators (rule 75)")]
     pub fn expand<'a>(
         &mut self,
         export: &Exported,
@@ -457,9 +563,10 @@ impl<T: NativeBinTransport> NativeBinServer<T> {
         mut sandbox: Sandbox,
         limits: Limits,
         paths: NativePaths<'_>,
+        granted_rel_roots: &[&Path],
         scratch: Alloc<'static>,
         alloc: Alloc<'a>,
-    ) -> Result<Produced<'a>, CallError> {
+    ) -> Result<NativeBinExpand<'a>, CallError> {
         if !self.handshook {
             self.handshake(alloc)?;
         }
@@ -503,14 +610,12 @@ impl<T: NativeBinTransport> NativeBinServer<T> {
                 }
                 ChildMsg::EnvVar { name } => {
                     let recorded = sandbox.var(name).map_err(CallError::EnvUnknown)?;
-                    let mut mapped_buf = AString::new_in(alloc);
+                    // Never leak machine checkout paths into the worker environment (rule 25):
+                    // the worker's OS cwd IS `manifest_dir`, so `"."` and `"./Cargo.toml"` resolve
+                    // every relative file read inside the sandbox identically across machines.
                     let answer: Option<&str> = match (name, paths.manifest_dir) {
-                        ("CARGO_MANIFEST_DIR", Some(mdir)) => Some(mdir),
-                        ("CARGO_MANIFEST_PATH", Some(mdir)) => {
-                            mapped_buf.push_str(mdir.trim_end_matches('/'));
-                            mapped_buf.push_str("/Cargo.toml");
-                            Some(mapped_buf.as_str())
-                        }
+                        ("CARGO_MANIFEST_DIR", Some(_)) => Some("."),
+                        ("CARGO_MANIFEST_PATH", Some(_)) => Some("./Cargo.toml"),
                         _ => recorded.as_deref(),
                     };
                     self.send_msg(&HostMsg::EnvVal { value: answer }, deadline)?;
@@ -518,7 +623,7 @@ impl<T: NativeBinTransport> NativeBinServer<T> {
                 ChildMsg::CurrentDir => {
                     let virtual_cwd;
                     let dir = match paths.manifest_dir {
-                        Some(mdir) => mdir,
+                        Some(_) => ".",
                         None => {
                             virtual_cwd = sandbox.package().cwd();
                             virtual_cwd.as_str()
@@ -572,6 +677,27 @@ impl<T: NativeBinTransport> NativeBinServer<T> {
             }
         }
 
+        // Record every file, directory listing, and symlink inside every Landlock/Seatbelt-granted
+        // read-only root so direct `std::fs` reads made by the worker never produce stale cache
+        // entries when any permitted file is edited, added, or deleted (rule 21).
+        let mut cacheable = true;
+        for &rel_root in granted_rel_roots {
+            match sandbox.record_granted_tree(rel_root, MAX_GRANTED_SNAPSHOT_ENTRIES) {
+                Ok(true) => {}
+                Ok(false) => cacheable = false,
+                Err(()) => {
+                    return Err(CallError::Limit {
+                        limit: ProcLimit::Paths,
+                        why: fmt_err(format_args!(
+                            "granted read-only root contains a symlink escaping the served package tree"
+                        ))
+                        .as_str()
+                        .into(),
+                    });
+                }
+            }
+        }
+
         let mut reads = Reads::new_in(alloc);
         for read in &sandbox.reads {
             let answer = read.digest.map_or(ReadAnswer::Absent, ReadAnswer::Digest);
@@ -590,13 +716,23 @@ impl<T: NativeBinTransport> NativeBinServer<T> {
             Outcome::Tokens(handle) => (*handle, None),
             Outcome::Panicked(message) => (None, Some(message.as_str())),
         };
-        server.produce(handle, panicked, reads, alloc).map_err(|err| match err {
+        let produced = server.produce(handle, panicked, reads, alloc).map_err(|err| match err {
             ProduceError::Server(ServerError::Limit(limit)) => CallError::Limit {
                 limit,
                 why: fmt_err(format_args!("{err:?}")).as_str().into(),
             },
             other => err_text(format_args!("its output does not make tokens: {other:?}")).into(),
-        })
+        })?;
+        if contains_host_path(&produced, paths) {
+            return Err(CallError::Refused(
+                fmt_err(format_args!(
+                    "native proc-macro output leaked host checkout path (rule 25)"
+                ))
+                .as_str()
+                .into(),
+            ));
+        }
+        Ok(NativeBinExpand { produced, cacheable })
     }
 }
 
@@ -694,15 +830,17 @@ pub fn confined_roots_digest(sorted_unique_roots: &[&str]) -> [u8; 32] {
 struct WorkerKey {
     bin_path: OwnString<SharedAlloc<'static>>,
     bin_sha256: OwnString<SharedAlloc<'static>>,
+    cwd: OwnString<SharedAlloc<'static>>,
     roots_digest: [u8; 32],
 }
 
 impl WorkerKey {
-    fn new(bin_path: &str, bin_sha256: &str, roots_digest: [u8; 32]) -> Self {
+    fn new(bin_path: &str, bin_sha256: &str, cwd: &str, roots_digest: [u8; 32]) -> Self {
         let shared = SharedAlloc::global();
         Self {
             bin_path: OwnString::from_str_in(bin_path, shared),
             bin_sha256: OwnString::from_str_in(bin_sha256, shared),
+            cwd: OwnString::from_str_in(cwd, shared),
             roots_digest,
         }
     }
@@ -813,7 +951,10 @@ impl NativeBinPool {
             ))
             .into()
         })?;
-        let mut server = NativeBinServer::new(ServedTransport::new(started.child), self.config);
+        let mut server = NativeBinServer::new(
+            ServedTransport::new(started.child, self.config.worker_budget),
+            self.config,
+        );
         if let Err(err) = server.handshake(alloc) {
             server.shutdown();
             return Err(err);
@@ -821,14 +962,15 @@ impl NativeBinPool {
         Ok(server)
     }
 
-    /// Expands `export` using a warm confined worker matching `(bin_path, bin_sha256, read_roots)`,
+    /// Expands `export` using a warm confined worker matching `(bin_path, bin_sha256, cwd, read_roots)`,
     /// spawning one lazily on cache miss and evicting/reaping it cleanly on error.
-    #[expect(clippy::too_many_arguments, reason = "explicit binary, roots, call, sandbox, limits, paths, and allocators")]
+    #[expect(clippy::too_many_arguments, reason = "explicit binary, roots, call, sandbox, limits, paths, granted roots, and allocators")]
     pub fn expand<'a>(
         &self,
         bin_path: &Path,
         bin_sha256: &str,
         read_roots: &[&str],
+        granted_rel_roots: &[&Path],
         export: &Exported,
         call: &ProcCall<'_>,
         edition: Edition,
@@ -837,7 +979,7 @@ impl NativeBinPool {
         paths: NativePaths<'_>,
         scratch: Alloc<'static>,
         alloc: Alloc<'a>,
-    ) -> Result<Produced<'a>, CallError> {
+    ) -> Result<NativeBinExpand<'a>, CallError> {
         let Some(bin_str) = bin_path.to_str() else {
             return Err(err_text(format_args!(
                 "native proc-macro binary path is not valid UTF-8"
@@ -852,23 +994,31 @@ impl NativeBinPool {
         }
         sorted_roots.sort_unstable();
         sorted_roots.dedup();
+        let cwd = paths
+            .manifest_dir
+            .or(paths.workspace_root)
+            .or_else(|| sorted_roots.first().copied())
+            .unwrap_or("/");
         let roots_digest = confined_roots_digest(sorted_roots.as_slice());
-        let key = WorkerKey::new(bin_str, bin_sha256, roots_digest);
+        let key = WorkerKey::new(bin_str, bin_sha256, cwd, roots_digest);
 
         let maybe_worker = crate::host::lock(&self.core).acquire(&key);
         let mut worker = match maybe_worker {
             Some(w) => w,
-            None => {
-                let cwd = paths
-                    .manifest_dir
-                    .or(paths.workspace_root)
-                    .or_else(|| sorted_roots.first().copied())
-                    .unwrap_or("/");
-                self.spawn_worker(bin_str, sorted_roots.as_slice(), cwd, alloc)?
-            }
+            None => self.spawn_worker(bin_str, sorted_roots.as_slice(), cwd, alloc)?,
         };
 
-        let result = worker.expand(export, call, edition, sandbox, limits, paths, scratch, alloc);
+        let result = worker.expand(
+            export,
+            call,
+            edition,
+            sandbox,
+            limits,
+            paths,
+            granted_rel_roots,
+            scratch,
+            alloc,
+        );
         match result {
             Ok(produced) => {
                 let evicted = crate::host::lock(&self.core).release(key, worker, true);
@@ -1009,12 +1159,20 @@ mod tests {
                 assert_eq!(kind, ProcKind::FnLike);
                 assert!(input.len() >= 16);
 
-                // Query CARGO_MANIFEST_DIR -> receives mapped real host dir
+                // Query CARGO_MANIFEST_DIR -> receives relative "." (zero host path leak!)
                 write_child_msg(&mut fd, &ChildMsg::EnvVar { name: "CARGO_MANIFEST_DIR" });
                 let b = read_host_frame(&mut fd, &mut buf).expect("env val");
                 assert_eq!(
                     decode_host_body(&b),
-                    Ok(HostMsg::EnvVal { value: Some("/real/host/pkg") })
+                    Ok(HostMsg::EnvVal { value: Some(".") })
+                );
+
+                // Query CARGO_MANIFEST_PATH -> receives relative "./Cargo.toml" (zero host path leak!)
+                write_child_msg(&mut fd, &ChildMsg::EnvVar { name: "CARGO_MANIFEST_PATH" });
+                let b = read_host_frame(&mut fd, &mut buf).expect("env manifest path");
+                assert_eq!(
+                    decode_host_body(&b),
+                    Ok(HostMsg::EnvVal { value: Some("./Cargo.toml") })
                 );
 
                 // Query SQLX_OFFLINE -> receives Some("true")
@@ -1022,17 +1180,17 @@ mod tests {
                 let b = read_host_frame(&mut fd, &mut buf).expect("env val 2");
                 assert_eq!(decode_host_body(&b), Ok(HostMsg::EnvVal { value: Some("true") }));
 
-                // Query CurrentDir -> receives mapped real host dir
+                // Query CurrentDir -> receives relative "." (zero host path leak!)
                 write_child_msg(&mut fd, &ChildMsg::CurrentDir);
                 let b = read_host_frame(&mut fd, &mut buf).expect("cwd val");
                 assert_eq!(
                     decode_host_body(&b),
-                    Ok(HostMsg::CurrentDirVal { dir: "/real/host/pkg" })
+                    Ok(HostMsg::CurrentDirVal { dir: "." })
                 );
 
-                // Bridge RPC: TrackPath using real host path -> host remaps back to virtual `/package/.sqlx/q.json`
+                // Bridge RPC: TrackPath using relative "./.sqlx/q.json" -> remaps to virtual `/package/.sqlx/q.json`
                 let mut track_req = vec![Method::TrackPath as u8];
-                WireWriter { out: &mut track_req }.str("/real/host/pkg/.sqlx/q.json");
+                WireWriter { out: &mut track_req }.str("./.sqlx/q.json");
                 write_child_msg(&mut fd, &ChildMsg::Dispatch { bytes: &track_req });
                 let _ = read_host_frame(&mut fd, &mut buf).expect("track_path reply");
 
@@ -1093,9 +1251,12 @@ mod tests {
         let paths = NativePaths { manifest_dir: Some("/real/host/pkg"), workspace_root: None };
 
         // Expansion 1: verifies tokens + tracked reads (with virtual machine-independent paths!)
-        let prod1 = server
-            .expand(&export, &call, Edition::E2021, Sandbox::new(Arc::clone(&pkg)), Limits::STANDARD, paths, heap.alloc(), alloc)
+        let root_slice = [Path::new("")];
+        let exp1 = server
+            .expand(&export, &call, Edition::E2021, Sandbox::new(Arc::clone(&pkg)), Limits::STANDARD, paths, &root_slice, heap.alloc(), alloc)
             .expect("expand 1");
+        assert!(exp1.cacheable);
+        let prod1 = exp1.produced;
         assert!(prod1.diagnostics.is_empty());
         assert_eq!(prod1.tokens.tokens().len(), 7); // const ANSWER : u32 = 42 ;
         let mut saw_env_sqlx = false;
@@ -1118,8 +1279,9 @@ mod tests {
 
         // Expansion 2: macro panic becomes ProcDiagnostic, worker stays alive!
         let prod2 = server
-            .expand(&export, &call, Edition::E2021, Sandbox::new(Arc::clone(&pkg)), Limits::STANDARD, paths, heap.alloc(), alloc)
-            .expect("expand 2 panic");
+            .expand(&export, &call, Edition::E2021, Sandbox::new(Arc::clone(&pkg)), Limits::STANDARD, paths, &root_slice, heap.alloc(), alloc)
+            .expect("expand 2 panic")
+            .produced;
         assert_eq!(prod2.diagnostics.len(), 1);
         assert!(matches!(prod2.diagnostics[0], ProcDiagnostic::Panicked { .. }));
         assert!(
@@ -1130,8 +1292,9 @@ mod tests {
 
         // Expansion 3: worker reused cleanly after panic!
         let prod3 = server
-            .expand(&export, &call, Edition::E2021, Sandbox::new(pkg), Limits::STANDARD, paths, heap.alloc(), alloc)
-            .expect("expand 3 after panic");
+            .expand(&export, &call, Edition::E2021, Sandbox::new(pkg), Limits::STANDARD, paths, &root_slice, heap.alloc(), alloc)
+            .expect("expand 3 after panic")
+            .produced;
         assert!(prod3.diagnostics.is_empty());
         assert!(prod3.tokens.tokens().is_empty());
 
@@ -1180,6 +1343,7 @@ mod tests {
             Sandbox::new(Arc::clone(&pkg)),
             Limits::STANDARD,
             NativePaths::default(),
+            &[],
             heap.alloc(),
             alloc,
         ) {
@@ -1216,6 +1380,7 @@ mod tests {
             Sandbox::new(unknown_pkg),
             Limits::STANDARD,
             NativePaths::default(),
+            &[],
             heap.alloc(),
             alloc,
         ) {
@@ -1255,6 +1420,7 @@ mod tests {
             Sandbox::new(Arc::clone(&pkg)),
             Limits::STANDARD,
             NativePaths::default(),
+            &[],
             heap.alloc(),
             alloc,
         ) {
@@ -1400,5 +1566,150 @@ mod tests {
         // Control 2: KeepErroredWorker must fail the poisoned-worker oracle.
         let poison_caught = (1..=16u64).any(|seed| run_pool_dst(seed, PoolPlant::KeepErroredWorker).is_err());
         assert!(poison_caught, "DST oracle must catch PoolPlant::KeepErroredWorker");
+    }
+
+    #[test]
+    fn loopback_tracks_untracked_fs_reads_and_invalidates_on_edit_add_delete() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let dir = std::env::temp_dir().join(format!("blaze-native-bin-reads-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".sqlx")).expect("mkdir");
+        std::fs::write(dir.join("Cargo.toml"), b"[package]\nname=\"demo\"\n").expect("cargo toml");
+        std::fs::write(dir.join(".sqlx/q1.json"), b"{\"sql\":\"SELECT 1\"}").expect("q1");
+
+        let pkg = Arc::new(
+            Package::new(Files::Folder(dir.clone()), PackageEnv::set_only(Vec::new()).expect("env"))
+                .expect("Package"),
+        );
+        let export = Exported { index: 0, kind: ProcKind::FnLike, name: "q".to_owned(), helpers: Vec::new() };
+        let input = lex("", Edition::E2021, alloc).expect("lex");
+        let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok("src/lib.rs") };
+
+        // Peer produces output WITHOUT ever calling `TrackPath` (simulating direct `std::fs::read`).
+        let (mut srv, h) = run_loopback_peer(
+            |mut fd| {
+                let mut buf = Vec::new();
+                let _ = read_host_frame(&mut fd, &mut buf);
+                write_child_msg(&mut fd, &ChildMsg::HelloAck { magic: MAGIC, version: PROTO_VERSION });
+                let _ = read_host_frame(&mut fd, &mut buf);
+                let mut out_bytes = Vec::new();
+                let mut ww = WireWriter { out: &mut out_bytes };
+                ww.ok(true);
+                ww.some(false);
+                write_child_msg(&mut fd, &ChildMsg::Output { bytes: &out_bytes });
+                let _ = read_host_frame(&mut fd, &mut buf);
+            },
+            NativeBinConfig::STANDARD,
+        );
+        let dir_str = dir.to_str().expect("utf8");
+        let paths = NativePaths { manifest_dir: Some(dir_str), workspace_root: None };
+        let exp = srv
+            .expand(
+                &export,
+                &call,
+                Edition::E2021,
+                Sandbox::new(Arc::clone(&pkg)),
+                Limits::STANDARD,
+                paths,
+                &[Path::new("")],
+                heap.alloc(),
+                alloc,
+            )
+            .expect("expand");
+        assert!(exp.cacheable);
+        srv.shutdown();
+        h.join().expect("join");
+
+        let all_reads_hold = |pkg: &Package, reads: &Reads<'_>| -> bool {
+            reads.list().iter().all(|entry| {
+                let subj = reads.subject(entry);
+                let Ok(now) = crate::hook::read_now(pkg, subj) else { return false };
+                now == entry.answer
+            })
+        };
+
+        // 1. Unchanged directory -> every recorded read holds (cache HIT!).
+        assert!(all_reads_hold(&pkg, &exp.produced.reads), "unchanged tree must validate");
+
+        // 2. Modifying an UNTRACKED file inside the granted root invalidates cache!
+        std::fs::write(dir.join(".sqlx/q1.json"), b"{\"sql\":\"SELECT 2\"}").expect("edit q1");
+        assert!(!all_reads_hold(&pkg, &exp.produced.reads), "editing untracked file must invalidate reads");
+        std::fs::write(dir.join(".sqlx/q1.json"), b"{\"sql\":\"SELECT 1\"}").expect("restore q1");
+        assert!(all_reads_hold(&pkg, &exp.produced.reads), "restored file must validate again");
+
+        // 3. Adding a new file inside the granted root invalidates cache via dir listing!
+        std::fs::write(dir.join(".sqlx/q2.json"), b"{}").expect("add q2");
+        assert!(!all_reads_hold(&pkg, &exp.produced.reads), "adding file must invalidate reads");
+        std::fs::remove_file(dir.join(".sqlx/q2.json")).expect("rm q2");
+        assert!(all_reads_hold(&pkg, &exp.produced.reads), "removing added file must validate again");
+
+        // 4. Deleting an existing file invalidates cache!
+        std::fs::remove_file(dir.join(".sqlx/q1.json")).expect("rm q1");
+        assert!(!all_reads_hold(&pkg, &exp.produced.reads), "deleting file must invalidate reads");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loopback_refuses_host_checkout_path_leak_in_tokens() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let pkg = make_test_package(&[], &[]);
+        let export = Exported { index: 0, kind: ProcKind::FnLike, name: "leak".to_owned(), helpers: Vec::new() };
+        let input = lex("", Edition::E2021, alloc).expect("lex");
+        let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok("src/lib.rs") };
+
+        let (mut srv, h) = run_loopback_peer(
+            |mut fd| {
+                let mut buf = Vec::new();
+                let _ = read_host_frame(&mut fd, &mut buf);
+                write_child_msg(&mut fd, &ChildMsg::HelloAck { magic: MAGIC, version: PROTO_VERSION });
+                let _ = read_host_frame(&mut fd, &mut buf);
+
+                // Emit a string literal containing the host checkout path.
+                let mut ts_req = vec![Method::TsFromStr as u8];
+                WireWriter { out: &mut ts_req }.str("const P: &str = \"/home/ix/secret-checkout/pkg/data\";");
+                write_child_msg(&mut fd, &ChildMsg::Dispatch { bytes: &ts_req });
+                let rep = read_host_frame(&mut fd, &mut buf).expect("reply");
+                let HostMsg::Reply { bytes: rep_bytes } = decode_host_body(&rep).expect("reply") else {
+                    panic!("expected Reply");
+                };
+                let mut wr = WireReader::new(rep_bytes);
+                assert_eq!(wr.u8().expect("ok"), 0);
+                assert!(wr.some().expect("some"));
+                let out_handle = wr.handle().expect("handle");
+
+                let mut out_bytes = Vec::new();
+                let mut ww = WireWriter { out: &mut out_bytes };
+                ww.ok(true);
+                ww.some(true);
+                ww.handle(out_handle);
+                write_child_msg(&mut fd, &ChildMsg::Output { bytes: &out_bytes });
+                let _ = read_host_frame(&mut fd, &mut buf);
+            },
+            NativeBinConfig::STANDARD,
+        );
+        let paths = NativePaths {
+            manifest_dir: Some("/home/ix/secret-checkout/pkg"),
+            workspace_root: Some("/home/ix/secret-checkout"),
+        };
+        let err = match srv.expand(
+            &export,
+            &call,
+            Edition::E2021,
+            Sandbox::new(pkg),
+            Limits::STANDARD,
+            paths,
+            &[],
+            heap.alloc(),
+            alloc,
+        ) {
+            Ok(_) => panic!("host path leak in tokens must be refused"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, CallError::Refused(ref msg) if msg.contains("leaked host checkout path")));
+        srv.shutdown();
+        h.join().expect("join");
     }
 }

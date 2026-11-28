@@ -78,7 +78,16 @@ pub(super) fn run<'a>(
 
 /// The SBPL profile of `plan` (module docs), NUL-ended text in `alloc`.
 pub fn profile<'a>(plan: &Plan<'_>, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, Fault> {
-    use blaze_roots::seatbelt::{SbplAccess, SbplError, SbplRule, render_sbpl};
+    profile_with_fork(plan, true, alloc)
+}
+
+/// The SBPL profile of `plan` denying `process-fork` (threads still run), NUL-ended text in `alloc`.
+pub fn profile_no_fork<'a>(plan: &Plan<'_>, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, Fault> {
+    profile_with_fork(plan, false, alloc)
+}
+
+fn profile_with_fork<'a>(plan: &Plan<'_>, allow_fork: bool, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, Fault> {
+    use blaze_roots::seatbelt::{SbplAccess, SbplError, SbplRule, render_sbpl_with_fork};
     let rules = plan.rules().map(|rule| SbplRule {
         path: rule.path,
         subtree: rule.subtree,
@@ -88,10 +97,76 @@ pub fn profile<'a>(plan: &Plan<'_>, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, Fa
             Access::Exec => SbplAccess::Exec,
         },
     });
-    render_sbpl(rules, alloc).map_err(|err| match err {
+    render_sbpl_with_fork(rules, allow_fork, alloc).map_err(|err| match err {
         SbplError::OutOfMemory => Fault::OutOfMemory,
         SbplError::BadPath { at } => Fault::PathRefused { at },
     })
+}
+
+/// Samples current CPU time and physical memory footprint of process group `pid` on macOS.
+pub(super) fn sample_group_usage(pid: i32, timebase: (u32, u32)) -> Result<Usage, Fault> {
+    let mut pids = [0i32; GROUP_PID_CAP];
+    let count = match blaze_sys::seatbelt::group_pids(pid, &mut pids) {
+        Ok(count) => count,
+        // Benign exit race: the process group disappeared before metering ran.
+        Err(blaze_sys::Errno::Srch) => 0,
+        Err(errno) => return Err(Fault::Host { call: "proc_listpgrppids", code: errno.raw() }),
+    };
+    let listed = pids.get(..count).unwrap_or(&[]);
+    let mut total_ticks: u64 = 0;
+    let mut total_memory: u64 = 0;
+    let mut leader_seen = false;
+
+    for &member in listed {
+        if member == pid {
+            leader_seen = true;
+        }
+        match blaze_sys::seatbelt::child_usage(member) {
+            Ok(info) => {
+                total_ticks = total_ticks.saturating_add(info.total_cpu_ticks());
+                total_memory = total_memory.saturating_add(info.footprint());
+            }
+            // Benign exit race: a process exited between enumeration and rusage query.
+            Err(blaze_sys::Errno::Srch) => continue,
+            Err(errno) => return Err(Fault::Host { call: "proc_pid_rusage", code: errno.raw() }),
+        }
+    }
+    if !leader_seen {
+        match blaze_sys::seatbelt::child_usage(pid) {
+            Ok(info) => {
+                total_ticks = total_ticks.saturating_add(info.total_cpu_ticks());
+                total_memory = total_memory.saturating_add(info.footprint());
+            }
+            Err(blaze_sys::Errno::Srch) => {}
+            Err(errno) => return Err(Fault::Host { call: "proc_pid_rusage", code: errno.raw() }),
+        }
+    }
+
+    let (numer, denom) = timebase;
+    let nanos = u128::from(total_ticks) * u128::from(numer) / u128::from(denom.max(1));
+    // Saturated: a CPU time past u64 nanoseconds (584 years) is past every budget.
+    let cpu = Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
+    Ok(Usage { cpu, memory: total_memory, steps: None })
+}
+
+/// Samples current CPU time and physical memory footprint of process group `pid` on macOS and
+/// enforces `budget.cpu` and `budget.memory`, returning `Fault::Stopped(Stop::Budget(..))` when
+/// either cap is exceeded.
+pub(super) fn check_group_budget(pid: i32, budget: super::Budget) -> Result<Usage, Fault> {
+    let usage = sample_group_usage(pid, blaze_sys::macos::timebase())?;
+    if usage.cpu > budget.cpu {
+        return Err(Fault::Stopped(super::Stop::Budget(super::Over::Cpu {
+            used: usage.cpu,
+            most: budget.cpu,
+        })));
+    }
+    if usage.memory > budget.memory {
+        return Err(Fault::Stopped(super::Stop::Budget(super::Over::Memory {
+            used: usage.memory,
+            most: budget.memory,
+        })));
+    }
+    Ok(usage)
 }
 
 /// The macOS confiner: `sandbox-exec` with the plan's profile, and the process-group rusage meter.
@@ -127,48 +202,8 @@ impl Confiner for Seatbelt {
     }
 
     fn meter(&mut self, pid: i32) -> Result<Option<Usage>, Fault> {
-        let mut pids = [0i32; GROUP_PID_CAP];
-        let count = match blaze_sys::seatbelt::group_pids(pid, &mut pids) {
-            Ok(count) => count,
-            // Benign exit race: the process group disappeared before metering ran.
-            Err(blaze_sys::Errno::Srch) => 0,
-            Err(errno) => return Err(Fault::Host { call: "proc_listpgrppids", code: errno.raw() }),
-        };
-        let listed = &pids[..count];
-        let mut total_ticks: u64 = 0;
-        let mut total_memory: u64 = 0;
-        let mut leader_seen = false;
-
-        for &member in listed {
-            if member == pid {
-                leader_seen = true;
-            }
-            match blaze_sys::seatbelt::child_usage(member) {
-                Ok(info) => {
-                    total_ticks = total_ticks.saturating_add(info.total_cpu_ticks());
-                    total_memory = total_memory.saturating_add(info.footprint());
-                }
-                // Benign exit race: a process exited between enumeration and rusage query.
-                Err(blaze_sys::Errno::Srch) => continue,
-                Err(errno) => return Err(Fault::Host { call: "proc_pid_rusage", code: errno.raw() }),
-            }
-        }
-        if !leader_seen {
-            match blaze_sys::seatbelt::child_usage(pid) {
-                Ok(info) => {
-                    total_ticks = total_ticks.saturating_add(info.total_cpu_ticks());
-                    total_memory = total_memory.saturating_add(info.footprint());
-                }
-                Err(blaze_sys::Errno::Srch) => {}
-                Err(errno) => return Err(Fault::Host { call: "proc_pid_rusage", code: errno.raw() }),
-            }
-        }
-
-        let (numer, denom) = self.timebase;
-        let nanos = u128::from(total_ticks) * u128::from(numer) / u128::from(denom.max(1));
-        // Saturated: a CPU time past u64 nanoseconds (584 years) is past every budget.
-        let cpu = Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
-        self.peak_cpu = self.peak_cpu.max(cpu);
-        Ok(Some(Usage { cpu: self.peak_cpu, memory: total_memory, steps: None }))
+        let sampled = sample_group_usage(pid, self.timebase)?;
+        self.peak_cpu = self.peak_cpu.max(sampled.cpu);
+        Ok(Some(Usage { cpu: self.peak_cpu, memory: sampled.memory, steps: None }))
     }
 }

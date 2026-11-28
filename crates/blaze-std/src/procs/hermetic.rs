@@ -1818,10 +1818,12 @@ pub fn prepare_read_only(
 /// Starts `spec` as a confined served child speaking bidirectional framed IPC over
 /// [`super::CHILD_FD`] with strictly read-only access to `read_roots` (zero writable directories,
 /// zero network, zero subprocess spawning):
-/// - Linux: prepares Landlock + seccomp via [`prepare_read_only`] and starts via
-///   [`Spawner::start_served_confined`].
-/// - macOS: renders a read-only Seatbelt SBPL profile and starts via `/usr/bin/sandbox-exec` +
-///   [`Spawner::start_served`].
+/// - Linux: prepares Landlock + seccomp (`Filter { processes: false }`, `RLIMIT_CPU`, `RLIMIT_AS`,
+///   `RLIMIT_CORE=0`) via [`prepare_read_only`] and starts via [`Spawner::start_served_confined`].
+/// - macOS: renders a read-only Seatbelt SBPL profile denying `process-fork`, starts the worker in
+///   its own process group (`own_group: true`) via `/usr/bin/sandbox-exec` +
+///   [`Spawner::start_served`], and callers enforce `budget` continuously via
+///   [`check_served_budget`].
 pub fn start_served_read_only(
     spawner: &Spawner,
     cx: &Cx,
@@ -1830,6 +1832,9 @@ pub fn start_served_read_only(
     budget: Budget,
     alloc: Alloc<'_>,
 ) -> Result<super::Started<super::Served>, Fault> {
+    if budget.cpu.is_zero() || budget.memory == 0 {
+        return Err(Fault::Host { call: "start_served_read_only (zero budget)", code: 22 });
+    }
     #[cfg(target_os = "linux")]
     {
         let prepared = prepare_read_only(spec.program, read_roots, budget, alloc)?;
@@ -1837,9 +1842,8 @@ pub fn start_served_read_only(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = budget;
         let plan = Plan::read_only(spec.program, read_roots, &seatbelt::SYSTEM, alloc)?;
-        let profile = seatbelt::profile(&plan, alloc)?;
+        let profile = seatbelt::profile_no_fork(&plan, alloc)?;
         let text = profile
             .get(..profile.len().saturating_sub(1))
             .and_then(|bytes| core::str::from_utf8(bytes).ok())
@@ -1858,7 +1862,7 @@ pub fn start_served_read_only(
             env: spec.env,
             dir: spec.dir,
             streams: spec.streams,
-            own_group: spec.own_group,
+            own_group: true,
             parent_death: spec.parent_death,
         };
         spawner.start_served(cx, &wrapped).map_err(Fault::Run)
@@ -1867,6 +1871,32 @@ pub fn start_served_read_only(
     {
         let _ = (spawner, cx, spec, read_roots, budget, alloc);
         Err(Fault::NoBackend { os: "neither Linux nor macOS" })
+    }
+}
+
+/// Checks the live CPU and memory budget of a confined served worker started by
+/// [`start_served_read_only`]:
+/// - On macOS: meters the worker's process group (`proc_listpgrppids` + `proc_pid_rusage`) and
+///   returns `Err(Fault::Stopped(Stop::Budget(..)))` when `budget.cpu` or `budget.memory` is
+///   exceeded so the caller kills the worker immediately.
+/// - On Linux: returns `Ok(None)` because the kernel enforces `RLIMIT_CPU` and `RLIMIT_AS`
+///   directly via `prlimit64` in `ChildConfine`.
+pub fn check_served_budget(
+    proc_id: crate::procs::ProcId,
+    budget: Budget,
+) -> Result<Option<Usage>, Fault> {
+    #[cfg(target_os = "macos")]
+    {
+        let pid = i32::try_from(proc_id.0).map_err(|_| Fault::Host {
+            call: "check_served_budget (pid out of range)",
+            code: 22,
+        })?;
+        seatbelt::check_group_budget(pid, budget).map(Some)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (proc_id, budget);
+        Ok(None)
     }
 }
 

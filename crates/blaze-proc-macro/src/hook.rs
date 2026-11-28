@@ -581,13 +581,15 @@ impl<'r> ProcMacros<'r> {
             }
         };
         // Tier-2 confined standalone native executable (`native.bin`): runs under Landlock + seccomp
-        // (Linux) or Seatbelt (macOS) with strictly read-only workspace/manifest roots, speaking
-        // Blaze's own binary `Server` bridge RPC over `CHILD_FD` (zero rustc, zero dlopen).
+        // (Linux) or Seatbelt (macOS) with strictly read-only scoped roots, speaking Blaze's own
+        // binary `Server` bridge RPC over `CHILD_FD` (zero rustc, zero dlopen). Every file/dir
+        // readable under the granted roots is snapshotted into `Produced.reads` before caching.
         if let Some(ref native_bin) = module.native_bin {
             let listed_dir: Option<blaze_own::AString<'_>>;
             let member_joined;
-            let (raw_manifest_dir, raw_workspace_root): (Option<&Path>, Option<&Path>) = match &package.files {
-                crate::sandbox::Files::Folder(dir) => (Some(dir.as_path()), None),
+            let member_rel_buf: Option<blaze_own::AString<'_>>;
+            let (raw_manifest_dir, raw_workspace_root, manifest_rel): (Option<&Path>, Option<&Path>, &Path) = match &package.files {
+                crate::sandbox::Files::Folder(dir) => (Some(dir.as_path()), None, Path::new("")),
                 crate::sandbox::Files::Member { workspace, root } => {
                     let seen = root.seen().to_string();
                     let rel = seen.strip_prefix("/workspace").unwrap_or("").trim_start_matches('/');
@@ -597,10 +599,12 @@ impl<'r> ProcMacros<'r> {
                         workspace.as_path()
                     };
                     if rel.is_empty() {
-                        (Some(base), Some(base))
+                        (Some(base), Some(base), Path::new(""))
                     } else {
                         member_joined = base.join(rel);
-                        (Some(member_joined.as_path()), Some(base))
+                        member_rel_buf = Some(blaze_own::AString::from_str_in(rel, alloc));
+                        let rel_path = member_rel_buf.as_deref().map_or(Path::new(""), Path::new);
+                        (Some(member_joined.as_path()), Some(base), rel_path)
                     }
                 }
                 crate::sandbox::Files::Listed(listed) => {
@@ -634,7 +638,7 @@ impl<'r> ProcMacros<'r> {
                     let base_dir = native_manifest_stage_root();
                     let seq = self.stage_seq.fetch_add(1, Ordering::Relaxed);
                     listed_dir = materialize_listed_in(&base_dir, &package.files, seq, alloc);
-                    (listed_dir.as_deref().map(Path::new), None)
+                    (listed_dir.as_deref().map(Path::new), None, Path::new(""))
                 }
             };
             let canon_str = |p: &Path| -> Option<blaze_own::AString<'_>> {
@@ -645,12 +649,34 @@ impl<'r> ProcMacros<'r> {
             let canon_bin = fs::canonicalize(native_bin).unwrap_or_else(|_| native_bin.to_path_buf());
             let canon_manifest = raw_manifest_dir.and_then(&canon_str);
             let canon_workspace = raw_workspace_root.and_then(&canon_str);
+            // Grant ONLY the exact scoped roots that we also snapshot 1:1 into `Produced.reads`:
+            // - the crate's own `manifest_dir`,
+            // - for workspace sub-members, `<workspace>/.sqlx` (if present) and `<workspace>/Cargo.toml`
+            //   (if present), never exposing `.git/`, `target/`, or unrelated workspace crates.
+            let ws_sqlx = raw_workspace_root
+                .filter(|_| !manifest_rel.as_os_str().is_empty())
+                .map(|w| w.join(".sqlx"))
+                .filter(|p| p.is_dir())
+                .and_then(|p| canon_str(&p));
+            let ws_manifest = raw_workspace_root
+                .filter(|_| !manifest_rel.as_os_str().is_empty())
+                .map(|w| w.join("Cargo.toml"))
+                .filter(|p| p.is_file())
+                .and_then(|p| canon_str(&p));
+
             let mut read_roots: blaze_own::AVec<'_, &str> = blaze_own::AVec::new_in(alloc);
+            let mut granted_rel_roots: blaze_own::AVec<'_, &Path> = blaze_own::AVec::new_in(alloc);
             if let Some(ref m) = canon_manifest {
                 read_roots.push(m.as_str());
+                granted_rel_roots.push(manifest_rel);
             }
-            if let Some(ref w) = canon_workspace {
-                read_roots.push(w.as_str());
+            if let Some(ref s) = ws_sqlx {
+                read_roots.push(s.as_str());
+                granted_rel_roots.push(Path::new(".sqlx"));
+            }
+            if let Some(ref wm) = ws_manifest {
+                read_roots.push(wm.as_str());
+                granted_rel_roots.push(Path::new("Cargo.toml"));
             }
             let paths = crate::native_bin::NativePaths {
                 manifest_dir: canon_manifest.as_deref(),
@@ -661,6 +687,7 @@ impl<'r> ProcMacros<'r> {
                 &canon_bin,
                 &module.wasm_sha256,
                 read_roots.as_slice(),
+                granted_rel_roots.as_slice(),
                 export,
                 call,
                 edition,
@@ -670,12 +697,14 @@ impl<'r> ProcMacros<'r> {
                 self.runtime.heap().alloc(),
                 alloc,
             ) {
-                Ok(produced) => {
-                    let mut mark = parts.start();
-                    let kept = slot.results.insert(self.store, base, &produced);
-                    mark.lap(Part::Keep);
-                    if let Err(error) = kept {
-                        self.report(Finding::Record { base, error });
+                Ok(crate::native_bin::NativeBinExpand { produced, cacheable }) => {
+                    if cacheable {
+                        let mut mark = parts.start();
+                        let kept = slot.results.insert(self.store, base, &produced);
+                        mark.lap(Part::Keep);
+                        if let Err(error) = kept {
+                            self.report(Finding::Record { base, error });
+                        }
                     }
                     return Ok(produced);
                 }
