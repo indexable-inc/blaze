@@ -282,8 +282,8 @@ struct Opened {
     /// Its whole bytes, read when opened.
     bytes: Vec<u8>,
     pos: u64,
-    /// A folder's entries, sorted.
-    entries: Option<Vec<(Vec<u8>, Filetype)>>,
+    /// A folder's normalized path from the served tree's root (`""` for the root) and its sorted entries.
+    dir: Option<(String, Vec<(Vec<u8>, Filetype)>)>,
 }
 
 /// One run's sandbox.
@@ -427,7 +427,9 @@ impl Sandbox {
 
     /// A `track_path` of the macro: the file's digest, recorded like an open.
     pub fn track_path(&mut self, path: &str) -> Result<(), Stop> {
-        let rel = self.resolve(path.trim_start_matches('/').as_bytes())?;
+        let Ok(rel) = self.resolve_at(ROOT_FD, path.trim_start_matches('/').as_bytes())? else {
+            return Ok(());
+        };
         let bytes = self.package.files.bytes(&rel).map_err(|why| self.refuse(why))?;
         self.record(format!("file:{rel}"), bytes.as_deref().map(digest));
         Ok(())
@@ -439,11 +441,37 @@ impl Sandbox {
         stop
     }
 
-    /// `path`, relative to the root `/`, as a path from the package's folder: `..` and `.`
-    /// taken out; one outside [`PACKAGE`] is refused, naming it.
-    fn resolve(&mut self, path: &[u8]) -> Result<String, Stop> {
+    /// `path`, named from the directory descriptor `at` (`ROOT_FD` for `/`, or an open folder's
+    /// descriptor), as a path from the served tree's root: `..` and `.` taken out; a path that
+    /// leaves the tree, climbs above `/`, or passes an absolute path to a non-root descriptor is
+    /// refused, naming it.
+    fn resolve_at(&mut self, at: u32, path: &[u8]) -> Answer<String> {
+        let mount = self.package.files.seen().mount();
+        let dir = if at == ROOT_FD {
+            None
+        } else {
+            let slot = at.checked_sub(ROOT_FD + 1).and_then(|i| usize::try_from(i).ok());
+            match slot.and_then(|i| self.files.get(i)).and_then(Option::as_ref) {
+                Some(Opened { dir: Some((folder, _)), .. }) => Some(folder.as_str()),
+                Some(_) => return Ok(Err(Errno::NOTDIR)),
+                None => return Ok(Err(Errno::BADF)),
+            }
+        };
         let Ok(text) = std::str::from_utf8(path) else {
             return Err(self.refuse(format!("named the path {:?}, which is not UTF-8", String::from_utf8_lossy(path))));
+        };
+        let joined;
+        let text = if let Some(folder) = dir {
+            if text.starts_with('/') {
+                return Err(self.refuse(format!("named absolute path {text} from a directory descriptor, outside {mount}, the tree the macro is served")));
+            }
+            if text.is_empty() {
+                return Ok(Err(Errno::NOENT));
+            }
+            joined = if folder.is_empty() { format!("{mount}/{text}") } else { format!("{mount}/{folder}/{text}") };
+            joined.as_str()
+        } else {
+            text
         };
         let mut parts: Vec<&str> = Vec::new();
         for part in text.split('/') {
@@ -460,11 +488,9 @@ impl Sandbox {
         // The one home of the mount points: `SeenRoot::in_tree` (a member's path is from its
         // workspace's folder, a dependency's from its package's).
         let full = format!("/{}", parts.join("/"));
-        let seen = self.package.files.seen();
-        let mount = seen.mount();
-        let rel = seen.in_tree(&full).map(str::to_owned);
+        let rel = self.package.files.seen().in_tree(&full).map(str::to_owned);
         match rel {
-            Some(rel) => Ok(rel),
+            Some(rel) => Ok(Ok(rel)),
             // From the root `/`: a relative path the module asked (wasi-libc's, from its cwd) is
             // shown absolute, one written absolute as it was.
             None => {
@@ -522,7 +548,7 @@ impl System for Sandbox {
 
     fn read(&mut self, fd: u32, into: &mut [u8]) -> Answer<usize> {
         let Some(file) = self.opened(fd) else { return Ok(Err(Errno::BADF)) };
-        if file.entries.is_some() {
+        if file.dir.is_some() {
             return Ok(Err(Errno::ISDIR));
         }
         let at = (file.pos as usize).min(file.bytes.len());
@@ -537,7 +563,7 @@ impl System for Sandbox {
             0..=2 => Ok(Filetype::CharacterDevice),
             ROOT_FD => Ok(Filetype::Directory),
             _ => match self.opened(fd) {
-                Some(file) if file.entries.is_some() => Ok(Filetype::Directory),
+                Some(file) if file.dir.is_some() => Ok(Filetype::Directory),
                 Some(_) => Ok(Filetype::RegularFile),
                 None => Err(Errno::BADF),
             },
@@ -574,7 +600,7 @@ impl System for Sandbox {
             0..=2 => Ok(filestat(Filetype::CharacterDevice, 0)),
             ROOT_FD => Ok(filestat(Filetype::Directory, 0)),
             _ => match self.opened(fd) {
-                Some(file) if file.entries.is_some() => Ok(filestat(Filetype::Directory, 0)),
+                Some(file) if file.dir.is_some() => Ok(filestat(Filetype::Directory, 0)),
                 Some(file) => Ok(filestat(Filetype::RegularFile, file.bytes.len() as u64)),
                 None => Err(Errno::BADF),
             },
@@ -582,13 +608,13 @@ impl System for Sandbox {
     }
 
     fn open(&mut self, at: u32, path: &[u8], how: Open) -> Answer<u32> {
-        if at != ROOT_FD {
-            return Ok(Err(Errno::NOTCAPABLE));
-        }
+        let rel = match self.resolve_at(at, path)? {
+            Ok(rel) => rel,
+            Err(errno) => return Ok(Err(errno)),
+        };
         if how.create() || how.truncate() || how.write() || how.append() {
             return Ok(Err(Errno::ROFS));
         }
-        let rel = self.resolve(path)?;
         let Some(found) = self.found(&rel)? else {
             self.record(format!("file:{rel}"), None);
             return Ok(Err(Errno::NOENT));
@@ -596,7 +622,7 @@ impl System for Sandbox {
         let opened = if let Found::Folder = found {
             let entries = self.package.files.listing(&rel).map_err(|why| self.refuse(why))?;
             self.record(format!("dir:{rel}"), Some(listing_digest(&entries)));
-            Opened { bytes: Vec::new(), pos: 0, entries: Some(entries) }
+            Opened { bytes: Vec::new(), pos: 0, dir: Some((rel, entries)) }
         } else {
             if how.directory() {
                 return Ok(Err(Errno::NOTDIR));
@@ -606,7 +632,7 @@ impl System for Sandbox {
                 return Ok(Err(Errno::IO));
             };
             self.record(format!("file:{rel}"), Some(digest(&bytes)));
-            Opened { bytes, pos: 0, entries: None }
+            Opened { bytes, pos: 0, dir: None }
         };
         let slot = match self.files.iter().position(Option::is_none) {
             Some(slot) => slot,
@@ -620,10 +646,10 @@ impl System for Sandbox {
     }
 
     fn path_stat(&mut self, at: u32, path: &[u8], _follow: bool) -> Answer<Filestat> {
-        if at != ROOT_FD {
-            return Ok(Err(Errno::NOTCAPABLE));
-        }
-        let rel = self.resolve(path)?;
+        let rel = match self.resolve_at(at, path)? {
+            Ok(rel) => rel,
+            Err(errno) => return Ok(Err(errno)),
+        };
         if rel.is_empty() {
             return Ok(Ok(filestat(Filetype::Directory, 0)));
         }
@@ -646,7 +672,7 @@ impl System for Sandbox {
 
     fn dir_entry(&mut self, fd: u32, cookie: u64) -> Answer<Option<Dirent<'_>>> {
         let Some(file) = self.opened(fd) else { return Ok(Err(Errno::BADF)) };
-        let Some(entries) = &file.entries else { return Ok(Err(Errno::NOTDIR)) };
+        let Some((_, entries)) = &file.dir else { return Ok(Err(Errno::NOTDIR)) };
         Ok(Ok(entries.get(cookie as usize).map(|(name, filetype)| Dirent { ino: 0, filetype: *filetype, name })))
     }
 
@@ -681,12 +707,12 @@ mod seen_tests {
         let dependency = Package::new(Files::Listed(Arc::from(Vec::new())), PackageEnv::default()).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(dependency.cwd(), "/package");
         let mut sandbox = Sandbox::new(Arc::new(member));
-        assert_eq!(sandbox.resolve(b"/workspace/crates/m/Cargo.toml").ok().as_deref(), Some("crates/m/Cargo.toml"));
-        assert_eq!(sandbox.resolve(b"workspace/Cargo.toml").ok().as_deref(), Some("Cargo.toml"));
-        assert!(sandbox.resolve(b"/package/Cargo.toml").is_err(), "a member's macro is not served /package");
+        assert_eq!(sandbox.resolve_at(blaze_wasi::ROOT_FD, b"/workspace/crates/m/Cargo.toml").ok().and_then(Result::ok).as_deref(), Some("crates/m/Cargo.toml"));
+        assert_eq!(sandbox.resolve_at(blaze_wasi::ROOT_FD, b"workspace/Cargo.toml").ok().and_then(Result::ok).as_deref(), Some("Cargo.toml"));
+        assert!(sandbox.resolve_at(blaze_wasi::ROOT_FD, b"/package/Cargo.toml").is_err(), "a member's macro is not served /package");
         let mut dep = Sandbox::new(Arc::new(dependency));
-        assert_eq!(dep.resolve(b"/package/src/lib.rs").ok().as_deref(), Some("src/lib.rs"));
-        assert!(dep.resolve(b"/workspace/x").is_err());
+        assert_eq!(dep.resolve_at(blaze_wasi::ROOT_FD, b"/package/src/lib.rs").ok().and_then(Result::ok).as_deref(), Some("src/lib.rs"));
+        assert!(dep.resolve_at(blaze_wasi::ROOT_FD, b"/workspace/x").is_err());
 
         // Package-local submodules in `Files::Listed` appear as directories in parent listings
         // and fail closed on find/bytes/listing.
@@ -756,5 +782,343 @@ mod seen_tests {
         let Err(stop) = above else { panic!("a path above the workspace was answered") };
         assert!(stop.0.contains("/workspace/../etc/passwd") && stop.0.contains("outside /workspace"), "{}", stop.0);
         assert!(!stop.0.contains(env!("CARGO_MANIFEST_DIR")), "the words hold no path of this machine: {}", stop.0);
+    }
+}
+
+#[cfg(test)]
+mod dir_fd_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use blaze_expand::ProcLimit;
+    use blaze_wasi::{Errno, Filetype, Open, ROOT_FD, System};
+
+    use super::{Files, ListedBytes, Package, Sandbox, answer_now};
+    use crate::package_env::PackageEnv;
+    use crate::script_sandbox::ScriptRoot;
+
+    const READ_ONLY: Open = Open { dirflags: 1, oflags: 0, rights_base: 1 << 1, rights_inheriting: 0, fdflags: 0 };
+    const WRITE_ONLY: Open = Open { dirflags: 1, oflags: 1, rights_base: 1 << 6, rights_inheriting: 0, fdflags: 0 };
+
+    fn read_all(sandbox: &mut Sandbox, fd: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 64];
+        loop {
+            match sandbox.read(fd, &mut buf) {
+                Ok(Ok(0)) => return out,
+                Ok(Ok(n)) => out.extend_from_slice(&buf[..n]),
+                other => panic!("unexpected read result: {other:?}"),
+            }
+        }
+    }
+
+    fn collect_dir_entries(sandbox: &mut Sandbox, fd: u32) -> Vec<(Vec<u8>, Filetype)> {
+        let mut out = Vec::new();
+        let mut cookie = 0u64;
+        loop {
+            match sandbox.dir_entry(fd, cookie) {
+                Ok(Ok(Some(ent))) => {
+                    out.push((ent.name.to_vec(), ent.filetype));
+                    cookie += 1;
+                }
+                Ok(Ok(None)) => return out,
+                Ok(Err(errno)) => panic!("unexpected dir_entry errno: {errno:?}"),
+                Err(stop) => panic!("unexpected dir_entry stop: {stop}"),
+            }
+        }
+    }
+
+    struct TempTree {
+        base: PathBuf,
+        ws: PathBuf,
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn make_workspace(tag: &str) -> TempTree {
+        static COUNT: AtomicU32 = AtomicU32::new(0);
+        let n = COUNT.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("blaze-sandbox-dirfd-{}-{tag}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ws = base.join("ws");
+        std::fs::create_dir_all(base.join("outside")).expect("outside dir");
+        std::fs::write(base.join("outside/secret.txt"), b"top-secret").expect("outside file");
+        for (rel, content) in [
+            ("Cargo.toml", b"[workspace]\nmembers = [\"crates/m\"]\n".as_slice()),
+            ("crates/m/Cargo.toml", b"[package]\nname = \"m\"\n".as_slice()),
+            ("crates/m/parts/a.rs", b"pub fn a() {}\n".as_slice()),
+            ("crates/m/parts/sub/b.rs", b"pub fn b() {}\n".as_slice()),
+            ("crates/m/parts/sub/deep/c.rs", b"pub fn c() {}\n".as_slice()),
+        ] {
+            let at = ws.join(rel);
+            std::fs::create_dir_all(at.parent().expect("parent")).expect("dir");
+            std::fs::write(&at, content).expect("file");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink("sub/b.rs", ws.join("crates/m/parts/inside_link")).expect("inside symlink");
+            symlink("../../../../outside/secret.txt", ws.join("crates/m/parts/escape")).expect("escape symlink");
+        }
+        TempTree { base, ws }
+    }
+
+    fn member_sandbox(tree: &TempTree) -> (Arc<Package>, Sandbox) {
+        let root = ScriptRoot::member("crates/m").unwrap_or_else(|e| panic!("{e}"));
+        let pkg = Arc::new(
+            Package::new(Files::Member { workspace: tree.ws.clone(), root }, PackageEnv::default())
+                .unwrap_or_else(|e| panic!("{e}")),
+        );
+        let sandbox = Sandbox::new(Arc::clone(&pkg));
+        (pkg, sandbox)
+    }
+
+    /// Positive: open a directory via `ROOT_FD`, iterate `fd_readdir`, then call `path_stat` and
+    /// `open` relative to the opened dir fd on a child file and nested subdirectories
+    /// (`dir_fd -> sub_fd -> deep_fd -> c.rs`), verifying bytes AND Rule 21 recorded read parity.
+    #[test]
+    fn dir_fd_readdir_stat_and_nested_open_record_normalized_reads() {
+        let tree = make_workspace("pos");
+        let (pkg, mut sandbox) = member_sandbox(&tree);
+
+        let dir_fd = sandbox
+            .open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY)
+            .expect("not stopped")
+            .expect("parts dir opens");
+        let entries = collect_dir_entries(&mut sandbox, dir_fd);
+        assert!(entries.iter().any(|(name, ft)| name.as_slice() == b"a.rs" && *ft == Filetype::RegularFile));
+        assert!(entries.iter().any(|(name, ft)| name.as_slice() == b"sub" && *ft == Filetype::Directory));
+
+        // Child file: path_stat + open relative to dir_fd
+        let a_stat = sandbox.path_stat(dir_fd, b"a.rs", false).expect("not stopped").expect("a.rs stat");
+        assert_eq!(a_stat.filetype, Filetype::RegularFile);
+        assert_eq!(a_stat.size, b"pub fn a() {}\n".len() as u64);
+        let a_fd = sandbox.open(dir_fd, b"a.rs", READ_ONLY).expect("not stopped").expect("a.rs open");
+        assert_eq!(read_all(&mut sandbox, a_fd), b"pub fn a() {}\n");
+
+        // Nested subdir: dir_fd -> sub_fd -> b.rs AND sub_fd -> deep_fd -> c.rs
+        let sub_stat = sandbox.path_stat(dir_fd, b"sub", false).expect("not stopped").expect("sub stat");
+        assert_eq!(sub_stat.filetype, Filetype::Directory);
+        let sub_fd = sandbox.open(dir_fd, b"sub", READ_ONLY).expect("not stopped").expect("sub open");
+        let sub_entries = collect_dir_entries(&mut sandbox, sub_fd);
+        assert_eq!(sub_entries, vec![(b"b.rs".to_vec(), Filetype::RegularFile), (b"deep".to_vec(), Filetype::Directory)]);
+
+        let b_fd = sandbox.open(sub_fd, b"b.rs", READ_ONLY).expect("not stopped").expect("b.rs open");
+        assert_eq!(read_all(&mut sandbox, b_fd), b"pub fn b() {}\n");
+
+        let deep_fd = sandbox.open(sub_fd, b"deep", READ_ONLY).expect("not stopped").expect("deep open");
+        let c_stat = sandbox.path_stat(deep_fd, b"c.rs", true).expect("not stopped").expect("c.rs stat");
+        assert_eq!(c_stat.filetype, Filetype::RegularFile);
+        assert_eq!(c_stat.size, b"pub fn c() {}\n".len() as u64);
+        let c_fd = sandbox.open(deep_fd, b"c.rs", READ_ONLY).expect("not stopped").expect("c.rs open");
+        assert_eq!(read_all(&mut sandbox, c_fd), b"pub fn c() {}\n");
+
+        // Inside-workspace symlink relative to dir_fd succeeds and records normalized path.
+        #[cfg(unix)]
+        {
+            let link_fd = sandbox.open(dir_fd, b"inside_link", READ_ONLY).expect("not stopped").expect("inside symlink");
+            assert_eq!(read_all(&mut sandbox, link_fd), b"pub fn b() {}\n");
+        }
+
+        // Absent child file/stat relative to dir_fd returns ENOENT and records absence.
+        assert_eq!(sandbox.open(dir_fd, b"missing.rs", READ_ONLY).expect("not stopped"), Err(Errno::NOENT));
+        assert_eq!(sandbox.path_stat(dir_fd, b"missing_stat.rs", true).expect("not stopped"), Err(Errno::NOENT));
+
+        // Normalized read tracking and Rule 21 `answer_now` parity.
+        let subjects: Vec<&str> = sandbox.reads.iter().map(|r| r.subject.as_str()).collect();
+        for expected in [
+            "dir:crates/m/parts",
+            "stat:crates/m/parts/a.rs",
+            "file:crates/m/parts/a.rs",
+            "stat:crates/m/parts/sub",
+            "dir:crates/m/parts/sub",
+            "file:crates/m/parts/sub/b.rs",
+            "dir:crates/m/parts/sub/deep",
+            "stat:crates/m/parts/sub/deep/c.rs",
+            "file:crates/m/parts/sub/deep/c.rs",
+            "file:crates/m/parts/missing.rs",
+            "stat:crates/m/parts/missing_stat.rs",
+        ] {
+            assert!(subjects.contains(&expected), "missing recorded read {expected:?} in {subjects:?}");
+        }
+        for read in &sandbox.reads {
+            assert_eq!(
+                answer_now(&pkg, &read.subject),
+                Ok(read.digest),
+                "answer_now parity mismatch for {}",
+                read.subject
+            );
+        }
+        assert!(sandbox.refused.is_none(), "{:?}", sandbox.refused);
+    }
+
+    /// Positive: opening `"."` at the mount root (via `ROOT_FD` and via an open root dir fd where
+    /// `folder` is empty) and relative to a subdirectory fd works cleanly on `Files::Listed`,
+    /// while `open(ROOT_FD, b".")` stays refused (outside `/package`).
+    #[test]
+    fn dot_open_and_stat_work_at_mount_root_and_subdir_fd() {
+        let listed = Files::Listed(Arc::from([
+            (String::from("Cargo.toml"), ListedBytes::Static(b"[package]\nname = \"dep\"\n")),
+            (String::from("src/lib.rs"), ListedBytes::Static(b"pub mod sub;\n")),
+            (String::from("src/sub/mod.rs"), ListedBytes::Static(b"pub const X: u32 = 1;\n")),
+        ]));
+        let pkg = Arc::new(Package::new(listed, PackageEnv::default()).unwrap_or_else(|e| panic!("{e}")));
+        let mut sandbox = Sandbox::new(Arc::clone(&pkg));
+
+        // Opening `/package/.` via ROOT_FD opens the package root (folder == "").
+        let root_fd = sandbox.open(ROOT_FD, b"/package/.", READ_ONLY).expect("not stopped").expect("package/. opens");
+        let root_entries = collect_dir_entries(&mut sandbox, root_fd);
+        assert_eq!(
+            root_entries,
+            vec![(b"Cargo.toml".to_vec(), Filetype::RegularFile), (b"src".to_vec(), Filetype::Directory)]
+        );
+
+        // Opening and statting "." relative to the root dir fd (empty folder).
+        let dot_root_fd = sandbox.open(root_fd, b".", READ_ONLY).expect("not stopped").expect("root_fd . opens");
+        assert_eq!(collect_dir_entries(&mut sandbox, dot_root_fd), root_entries);
+        let dot_root_stat = sandbox.path_stat(root_fd, b".", true).expect("not stopped").expect("root_fd . stat");
+        assert_eq!(dot_root_stat.filetype, Filetype::Directory);
+
+        let manifest_fd = sandbox.open(root_fd, b"Cargo.toml", READ_ONLY).expect("not stopped").expect("Cargo.toml");
+        assert_eq!(read_all(&mut sandbox, manifest_fd), b"[package]\nname = \"dep\"\n");
+
+        // Opening and statting "." relative to a subdirectory fd, plus nested traversal.
+        let src_fd = sandbox.open(root_fd, b"src", READ_ONLY).expect("not stopped").expect("src opens");
+        let dot_src_fd = sandbox.open(src_fd, b".", READ_ONLY).expect("not stopped").expect("src_fd . opens");
+        assert_eq!(
+            collect_dir_entries(&mut sandbox, dot_src_fd),
+            vec![(b"lib.rs".to_vec(), Filetype::RegularFile), (b"sub".to_vec(), Filetype::Directory)]
+        );
+        let dot_src_stat = sandbox.path_stat(src_fd, b".", true).expect("not stopped").expect("src_fd . stat");
+        assert_eq!(dot_src_stat.filetype, Filetype::Directory);
+
+        let sub_fd = sandbox.open(src_fd, b"sub", READ_ONLY).expect("not stopped").expect("sub opens");
+        let mod_fd = sandbox.open(sub_fd, b"mod.rs", READ_ONLY).expect("not stopped").expect("mod.rs opens");
+        assert_eq!(read_all(&mut sandbox, mod_fd), b"pub const X: u32 = 1;\n");
+
+        // `answer_now` parity for all recorded reads.
+        for read in &sandbox.reads {
+            assert_eq!(answer_now(&pkg, &read.subject), Ok(read.digest), "parity for {}", read.subject);
+        }
+
+        // Control: `ROOT_FD` itself is `/`, outside `/package`, so `open(ROOT_FD, b".")` stays refused.
+        let Err(stop) = sandbox.open(ROOT_FD, b".", READ_ONLY) else {
+            panic!("opening `/` via ROOT_FD `.` must be refused");
+        };
+        assert!(stop.0.contains("outside /package"), "{}", stop.0);
+        assert!(matches!(sandbox.refused, Some((ProcLimit::Paths, _))));
+    }
+
+    /// Negative security controls: invalid/closed fd (`BADF`), regular file fd (`NOTDIR`),
+    /// empty path (`NOENT`), write flags (`ROFS`), `..` traversal outside workspace, absolute
+    /// path via subdir fd, and symlink inside subdir pointing outside workspace are all blocked.
+    #[test]
+    fn dir_fd_negative_security_controls() {
+        let tree = make_workspace("neg");
+        let ws_str = tree.ws.to_string_lossy().into_owned();
+
+        // 1. Invalid, stdio, and closed fds -> Errno::BADF; regular file fd -> Errno::NOTDIR;
+        //    empty path -> Errno::NOENT; write flags -> Errno::ROFS.
+        {
+            let (_pkg, mut sandbox) = member_sandbox(&tree);
+            for bad_fd in [0, 1, 2, 99] {
+                assert_eq!(sandbox.open(bad_fd, b"a.rs", READ_ONLY).expect("not stopped"), Err(Errno::BADF));
+                assert_eq!(sandbox.path_stat(bad_fd, b"a.rs", true).expect("not stopped"), Err(Errno::BADF));
+            }
+            let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
+            let file_fd = sandbox.open(dir_fd, b"a.rs", READ_ONLY).expect("not stopped").expect("file");
+
+            // Regular file fd used as dir fd -> NOTDIR.
+            assert_eq!(sandbox.open(file_fd, b"b.rs", READ_ONLY).expect("not stopped"), Err(Errno::NOTDIR));
+            assert_eq!(sandbox.path_stat(file_fd, b"b.rs", true).expect("not stopped"), Err(Errno::NOTDIR));
+
+            // Empty path on dir fd -> NOENT; write flags on dir fd -> ROFS.
+            assert_eq!(sandbox.open(dir_fd, b"", READ_ONLY).expect("not stopped"), Err(Errno::NOENT));
+            assert_eq!(sandbox.path_stat(dir_fd, b"", true).expect("not stopped"), Err(Errno::NOENT));
+            assert_eq!(sandbox.open(dir_fd, b"a.rs", WRITE_ONLY).expect("not stopped"), Err(Errno::ROFS));
+
+            // Closed dir fd -> BADF.
+            assert_eq!(sandbox.close(dir_fd).expect("not stopped"), Ok(()));
+            assert_eq!(sandbox.open(dir_fd, b"a.rs", READ_ONLY).expect("not stopped"), Err(Errno::BADF));
+            assert_eq!(sandbox.path_stat(dir_fd, b"a.rs", true).expect("not stopped"), Err(Errno::BADF));
+            assert!(sandbox.refused.is_none());
+        }
+
+        // 2. Path traversal (`..`) escaping `/workspace` via subdir fd -> refused with ProcLimit::Paths.
+        for escape_path in [b"../../../../outside/secret.txt".as_slice(), b"../../../../../../../etc/passwd".as_slice()] {
+            let (_pkg, mut sandbox) = member_sandbox(&tree);
+            let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
+            let Err(open_stop) = sandbox.open(dir_fd, escape_path, READ_ONLY) else {
+                panic!("traversal open {:?} must be refused", std::str::from_utf8(escape_path));
+            };
+            assert!(!open_stop.0.contains(&ws_str), "must not leak host path: {}", open_stop.0);
+            assert!(matches!(sandbox.refused, Some((ProcLimit::Paths, _))));
+
+            let (_pkg, mut sandbox) = member_sandbox(&tree);
+            let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
+            let Err(stat_stop) = sandbox.path_stat(dir_fd, escape_path, true) else {
+                panic!("traversal stat {:?} must be refused", std::str::from_utf8(escape_path));
+            };
+            assert!(!stat_stop.0.contains(&ws_str), "must not leak host path: {}", stat_stop.0);
+            assert!(matches!(sandbox.refused, Some((ProcLimit::Paths, _))));
+        }
+
+        // 3. Traversal escaping `/workspace` from root dir fd (`folder == ""`) -> refused.
+        {
+            let (_pkg, mut sandbox) = member_sandbox(&tree);
+            let root_dir_fd = sandbox.open(ROOT_FD, b"/workspace", READ_ONLY).expect("not stopped").expect("ws root");
+            let Err(stop) = sandbox.open(root_dir_fd, b"../outside/secret.txt", READ_ONLY) else {
+                panic!("root dir fd `..` escape must be refused");
+            };
+            assert!(stop.0.contains("outside /workspace"), "{}", stop.0);
+            assert!(matches!(sandbox.refused, Some((ProcLimit::Paths, _))));
+        }
+
+        // 4. Absolute paths via subdir fd -> refused (even if pointing under `/workspace`).
+        for abs_path in [b"/etc/passwd".as_slice(), b"/workspace/crates/m/parts/a.rs".as_slice()] {
+            let (_pkg, mut sandbox) = member_sandbox(&tree);
+            let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
+            let Err(open_stop) = sandbox.open(dir_fd, abs_path, READ_ONLY) else {
+                panic!("absolute open {:?} via dir_fd must be refused", std::str::from_utf8(abs_path));
+            };
+            assert!(open_stop.0.contains("absolute path"), "{}", open_stop.0);
+            assert!(matches!(sandbox.refused, Some((ProcLimit::Paths, _))));
+
+            let (_pkg, mut sandbox) = member_sandbox(&tree);
+            let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
+            let Err(stat_stop) = sandbox.path_stat(dir_fd, abs_path, true) else {
+                panic!("absolute stat {:?} via dir_fd must be refused", std::str::from_utf8(abs_path));
+            };
+            assert!(stat_stop.0.contains("absolute path"), "{}", stat_stop.0);
+            assert!(matches!(sandbox.refused, Some((ProcLimit::Paths, _))));
+        }
+
+        // 5. Symlink inside subdir pointing outside workspace accessed via subdir fd -> refused.
+        #[cfg(unix)]
+        {
+            for follow in [true, false] {
+                let (_pkg, mut sandbox) = member_sandbox(&tree);
+                let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
+                let Err(stat_stop) = sandbox.path_stat(dir_fd, b"escape", follow) else {
+                    panic!("symlink escape stat (follow={follow}) must be refused");
+                };
+                assert!(stat_stop.0.contains("a link out of /workspace"), "{}", stat_stop.0);
+                assert!(!stat_stop.0.contains(&ws_str), "must not leak host path: {}", stat_stop.0);
+                assert!(matches!(sandbox.refused, Some((ProcLimit::Paths, _))));
+            }
+            let (_pkg, mut sandbox) = member_sandbox(&tree);
+            let dir_fd = sandbox.open(ROOT_FD, b"/workspace/crates/m/parts", READ_ONLY).expect("not stopped").expect("dir");
+            let Err(open_stop) = sandbox.open(dir_fd, b"escape", READ_ONLY) else {
+                panic!("symlink escape open must be refused");
+            };
+            assert!(open_stop.0.contains("a link out of /workspace"), "{}", open_stop.0);
+            assert!(!open_stop.0.contains(&ws_str), "must not leak host path: {}", open_stop.0);
+            assert!(matches!(sandbox.refused, Some((ProcLimit::Paths, _))));
+        }
     }
 }
