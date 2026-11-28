@@ -292,24 +292,164 @@ fn the_oracle_catches_a_take_that_checks_no_digest() {
     blaze_sim::control(Config::cases(48), false, true, "a record taken with other bytes than the set's", flipped);
 }
 
-/// A take stopped after a drawn number of records, its home's syncs failing or not, then a
-/// crash; then the next command. The oracle: before the crash (a reader of the same boot) and
-/// after it the root is absent or names the set whole; after the next command the set is
-/// whole, and a take counts every record once.
-fn interrupted(tape: &Tape, root_each_segment: bool) -> Result<(), Broke> {
+/// A take stopped after a drawn number of records, its home's syncs failing or not, optionally
+/// interleaved with a concurrent writer that flips the generation, compacts/retires an unrooted
+/// segment, advances past `GRACE_NS`, and unlinks the retired file during `Object::Prefix`; then
+/// a crash; then the next command.
+///
+/// The oracle:
+/// 1. When no mid-take stop or sync failure is injected, the take MUST succeed even across the
+///    interleaved concurrent generation flip, compaction, grace expiry, and segment unlink
+///    (catches `map_after_prefix == true` failing with `LATE_MAP`).
+/// 2. Before the crash (same boot) and after the crash (new boot), the toolchain root is either
+///    absent or names the set whole — never half a root (catches `root_each_segment == true`).
+/// 3. After the crash, the next command finishes the take cleanly (`N` records verified, exact
+///    `records + already == N` count when `How::Took`), and the live unrelated local record
+///    survives intact.
+fn interrupted(tape: &Tape, root_each_segment: bool, map_after_prefix: bool) -> Result<(), Broke> {
+    use blaze_cas::plain::GRACE_NS;
+    use blaze_drive::Key;
+    use blaze_remote::read::{Object, Origin, OriginError};
+    use super::super::plain_place::PlainPlace;
+
+    struct InterleavedOrigin<'a> {
+        inner: FolderOrigin<'a>,
+        io: &'a Io,
+        cx: &'a Cx,
+        interleave_compact: bool,
+        interleaved: bool,
+        fail_sync_dir: Option<blaze_core::FileName>,
+        fault_err: Option<std::string::String>,
+    }
+
+    impl Origin for InterleavedOrigin<'_> {
+        fn read(&mut self, object: &Object, at: u64, into: &mut [u8], deadline_ns: u64) -> Result<usize, OriginError> {
+            let is_prefix = matches!(object, Object::Prefix);
+            let got = self.inner.read(object, at, into, deadline_ns)?;
+            if is_prefix && !self.interleaved {
+                self.interleaved = true;
+                if self.interleave_compact {
+                    // Concurrent Process 2 opens `/b`, flips the generation, compacts/retires the
+                    // unrooted victim segment, advances past `GRACE_NS`, and unlinks the retired
+                    // segment file while Process 1's take is still in flight.
+                    let (_h2, lent2) = developer_home(self.io, self.cx, "/b", 20);
+                    lent2.set_commit_durability(blaze_cas::plain::CommitDurability::Full);
+                    let mut p2 = PlainPlace::new(&lent2, false);
+                    let conc_key = Key(ContentId([0xC2; 32]));
+                    if let Err(e) = p2.put(conc_key, false, b"concurrent writer record") {
+                        self.fault_err = Some(format!("concurrent put: {e}"));
+                    } else if let Err(e) = p2.pin("test.concurrent.live", &[conc_key]) {
+                        self.fault_err = Some(format!("concurrent pin: {e}"));
+                    } else {
+                        lent2.release_lease();
+                        if let Err(e) = p2.commit() {
+                            self.fault_err = Some(format!("concurrent commit: {e}"));
+                        } else if let Err(e) = lent2.compact_foreground(8) {
+                            self.fault_err = Some(format!("concurrent compact 1: {e}"));
+                        } else {
+                            let _ = self.io.with_sim(|sim| sim.advance(Duration::from_nanos(GRACE_NS + 5_000_000_000)));
+                            if let Err(e) = lent2.compact_foreground(8) {
+                                self.fault_err = Some(format!("concurrent compact 2: {e}"));
+                            }
+                        }
+                    }
+                    drop(p2);
+                    drop(lent2);
+                }
+                if let Some(name) = self.fail_sync_dir.take() {
+                    let _ = self.io.with_sim(|sim| sim.fail_syncs(name));
+                }
+            }
+            Ok(got)
+        }
+    }
+
     let world = world(tape.below(1 << 32, "sim seed"));
-    let stop = tape.below(u64::from(N) + 1, "records put before the crash") as u32;
+    let interleave_compact = tape.one_in(2, "interleave concurrent generation flip and compaction");
+    let stop = if tape.one_in(3, "no mid-take stop") {
+        None
+    } else {
+        Some(tape.below(u64::from(N) + 1, "records put before the crash") as u32)
+    };
     let fail_syncs = tape.one_in(3, "the home's syncs fail");
+
+    let keep_key = ContentId([0xA5; 32]);
+    let victim_key = ContentId([0xD1; 32]);
+    // Seed `/b` durably with two committed segments: an unrooted victim segment (eligible for
+    // concurrent compaction + unlink) and a live unrelated pinned record that must survive crash +
+    // recovery. Durable settings ensure the pre-existing seeded segments are already synced on
+    // disk before the unsynced take and simulated power cut begin.
+    {
+        let cx = world.cx();
+        let fs = world.io.need_fs().map_err(|e| harness("files", e))?;
+        let home = super::super::Home::of(&cx, &fs, Some("/b")).map_err(|e| harness("the home", e))?;
+        let boot = super::super::boot_fact(&world.io.boot().map_err(|e| harness("the simulation's boot", e))?);
+        let durable = blaze_cas::plain::Settings { durable: true, ..blaze_cas::plain::Settings::default() };
+
+        let lent0 = home
+            .open_store(&durable, super::super::Facts { boot: Some(boot), nonce: 4 }, blaze_own::testing::heap().alloc())
+            .map_err(|e| harness("seed store 0", e))?;
+        lent0.set_commit_durability(blaze_cas::plain::CommitDurability::Full);
+        let mut p0 = PlainPlace::new(&lent0, false);
+        p0.put(Key(victim_key), false, b"victim record to retire and unlink")
+            .map_err(|e| harness("seed victim put", e))?;
+        lent0.release_lease();
+        p0.commit().map_err(|e| harness("seed victim commit", e))?;
+        drop(p0);
+        drop(lent0);
+
+        let lent1 = home
+            .open_store(&durable, super::super::Facts { boot: Some(boot), nonce: 5 }, blaze_own::testing::heap().alloc())
+            .map_err(|e| harness("seed store 1", e))?;
+        lent1.set_commit_durability(blaze_cas::plain::CommitDurability::Full);
+        let mut p1 = PlainPlace::new(&lent1, false);
+        p1.put(Key(keep_key), false, b"live unrelated local record")
+            .map_err(|e| harness("seed keep put", e))?;
+        p1.pin("test.existing.keep", &[Key(keep_key)])
+            .map_err(|e| harness("seed keep pin", e))?;
+        lent1.release_lease();
+        p1.commit().map_err(|e| harness("seed keep commit", e))?;
+    }
+
     {
         let cx = world.cx();
         let (home, lent) = developer_home(&world.io, &cx, "/b", 6);
-        if fail_syncs {
+        let fail_sync_dir = if fail_syncs {
             // clone: the directory's name, a refcount.
-            let name = home.dir().name().name().expect("the home is named").clone();
-            world.io.with_sim(|sim| sim.fail_syncs(name));
+            Some(home.dir().name().name().ok_or_else(|| Broke::Harness("the home is named".into()))?.clone())
+        } else {
+            None
+        };
+        let clock = world.io.need_clock().map_err(|e| harness("a clock", e))?;
+        let dir = world.dir(&cx);
+        let pub_key = Signer::from_seed(&SEED).public();
+        let mut origin = InterleavedOrigin {
+            inner: FolderOrigin { cx: &cx, folder: &dir },
+            io: &world.io,
+            cx: &cx,
+            interleave_compact,
+            interleaved: false,
+            fail_sync_dir,
+            fault_err: None,
+        };
+        // A failed sync or drawn stop halts the take where it is, as a crash does.
+        let outcome = take_from(
+            &mut origin,
+            &[pub_key],
+            set_id(),
+            &lent,
+            TOOLCHAIN,
+            &clock,
+            TakePlant { root_each_segment, stop_after: stop, map_after_prefix, ..TakePlant::NONE },
+        );
+        if let Some(fault) = origin.fault_err {
+            return Err(Broke::Harness(fault));
         }
-        // A failed sync stops the take where it is, as the crash does.
-        let _stopped = world.take(&cx, &lent, TakePlant { root_each_segment, stop_after: Some(stop), ..TakePlant::NONE });
+        if !fail_syncs && stop.is_none() {
+            if let Err(why) = outcome {
+                return Err(Broke::Oracle(format!("interleaved take failed without crash or sync fault: {why}")));
+            }
+        }
         // Before the crash, as a reader of this boot sees the store: what the next boot's open
         // drops (blaze-cas D200: a root reaching a record the power cut took) cannot hide a half
         // root here, where nothing was lost.
@@ -334,16 +474,34 @@ fn interrupted(tape: &Tape, root_each_segment: bool) -> Result<(), Broke> {
     if taken.how == How::Took && taken.records + taken.already != N {
         return Err(Broke::Oracle(format!("the next command counted {} taken and {} already of {N}", taken.records, taken.already)));
     }
+    match lent.get(&CasKey(keep_key)).map_err(|e| harness("get keep after crash", e))? {
+        Some(got) if got.bytes == b"live unrelated local record" => {}
+        other => return Err(Broke::Oracle(format!("unrelated live record lost or corrupted across interleaved take + crash: {:?}", other.map(|g| g.bytes.len())))),
+    }
     Ok(())
 }
 
-/// The invariant: taking a published set verifies every record digest, never names the root before the set is whole, and leaves either no root or the whole set after any interruption.
+/// The invariant: taking a published set verifies every record digest, maps existing segments
+/// before fetching the prefix (surviving interleaved concurrent generation flips, compaction,
+/// grace-window expiry, and unlinks), never names the root before the set is whole, and leaves
+/// either no root or the whole set after any interruption or sync failure.
 #[test]
 fn a_take_stopped_anywhere_leaves_no_root_or_the_whole_set_and_the_next_command_finishes_it() {
-    blaze_sim::check(Config::cases(48), |tape| interrupted(tape, false));
+    blaze_sim::check(Config::cases(48), |tape| interrupted(tape, false, false));
 }
 
 #[test]
 fn the_oracle_catches_a_take_that_names_the_root_before_the_set_is_whole() {
-    blaze_sim::control(Config::cases(96), false, true, "half a root", interrupted);
+    blaze_sim::control(Config::cases(96), false, true, "half a root", |tape, root_each| interrupted(tape, root_each, false));
+}
+
+#[test]
+fn the_oracle_catches_a_take_that_maps_after_prefix() {
+    blaze_sim::control(
+        Config::cases(64),
+        false,
+        true,
+        "more than the grace period after the open",
+        |tape, map_after| interrupted(tape, false, map_after),
+    );
 }

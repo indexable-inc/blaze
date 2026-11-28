@@ -1310,6 +1310,12 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
         self.place.kept_arenas()
     }
 
+    /// Whether `Store::map_all` was invoked on this command store.
+    #[cfg(test)]
+    pub(crate) fn did_map_all(&self) -> bool {
+        self.mapped_all
+    }
+
     /// Fetches `key` from `self.remote` (if configured), writes it into `self.place`, and
     /// optionally copies the fetched bytes into `into` without lending from the arena.
     fn fetch_remote(&mut self, cx: &Cx, key: Key, into: Option<&mut Bytes>) -> Result<bool, CliError> {
