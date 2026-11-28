@@ -2573,7 +2573,7 @@ impl<F: blaze_flow_lower::Facts> blaze_flow_lower::Facts for KeepFacts<'_, F> {
     fn copy_args(&self, adt: blaze_typeck::ItemKey) -> Option<&[bool]> {
         self.flow.copy_args(adt)
     }
-    fn inst_is_copy(&self, ty: blaze_typeck::PTy) -> Option<bool> {
+    fn inst_is_copy(&self, ty: blaze_typeck::PTy) -> Option<blaze_flow_lower::InstCopy<'_>> {
         self.flow.inst_is_copy(ty)
     }
 }

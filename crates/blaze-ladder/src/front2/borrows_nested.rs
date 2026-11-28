@@ -319,7 +319,7 @@ impl Facts for NestedFacts<'_, '_> {
     fn copy_args(&self, adt: tc::ItemKey) -> Option<&[bool]> {
         self.facts.copy_args(adt)
     }
-    fn inst_is_copy(&self, ty: tc::PTy) -> Option<bool> {
+    fn inst_is_copy(&self, ty: tc::PTy) -> Option<blaze_flow_lower::InstCopy<'_>> {
         self.facts.inst_is_copy(ty)
     }
     fn drop_args(&self, adt: tc::ItemKey) -> Option<&[bool]> {

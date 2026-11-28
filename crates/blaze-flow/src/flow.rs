@@ -690,6 +690,11 @@ impl<A: Allocator + Copy> FlowBuilder<A> {
         self.flow.known.push((from, into));
     }
 
+    /// Known outlives relations `(long, short)` recorded so far in this flow.
+    pub fn known_edges(&self) -> &[(Origin, Origin)] {
+        &self.flow.known
+    }
+
     pub fn block(&mut self) -> Block {
         self.flow.blocks.push(Ops { start: 0, end: 0 });
         self.filled.push(false);

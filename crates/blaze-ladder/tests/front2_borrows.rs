@@ -212,8 +212,36 @@ fn dyn_expect_param_vec_tuple(v: &mut Vec<(u32, Reader)>) {
     v.push((3u32, Box::new(move |link| link.downcast())));
 }
 
+fn dyn_expect_owner_return_ok() -> (u32, Reader) {
+    (5u32, Box::new(move |link| link.downcast()))
+}
+
 fn dyn_expect_negative_elided(v: &mut Vec<(u32, Box<dyn Fn(&(dyn MyErr + '_)) -> bool>)>) {
     v.push((4u32, Box::new(move |link| link.downcast())));
+}
+
+fn dyn_expect_negative_unrelated_owner_param(_other: &Vec<Reader>) {
+    let _f: Box<dyn Fn(&(dyn MyErr + '_)) -> bool> = Box::new(move |link| link.downcast());
+}
+
+struct Carrier<A, C>(PhantomData<(A, C)>);
+fn pick<A, B, C>(p: (A, B), _c: &Carrier<A, C>) -> (A, B) {
+    p
+}
+
+fn dyn_expect_negative_sibling_other_param() {
+    let c: Carrier<u32, Reader> = Carrier(PhantomData);
+    let _pair: (u32, Box<dyn Fn(&(dyn MyErr + '_)) -> bool>) =
+        pick((0u32, Box::new(move |link| link.downcast())), &c);
+}
+
+struct Wrap<T>(T);
+fn unrelated_wrap<F>(_f: F) -> Wrap<Reader> {
+    loop {}
+}
+
+fn dyn_expect_negative_unrelated_wrapper_call() -> Wrap<Reader> {
+    unrelated_wrap::<Box<dyn Fn(&(dyn MyErr + '_)) -> bool>>(Box::new(move |link| link.downcast()))
 }
 
 fn first_arg<A, B>(a: A, _b: B) -> A {
@@ -258,10 +286,61 @@ fn copy_outlives_static_scalar_ok() {
     let _ = (a, b);
 }
 
+fn copy_outlives_static_ref_ok(t: OutlivesToken<'static, &'static u8>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+fn copy_outlives_free_fn_bound_ok<'a, 'b: 'a>(t: OutlivesToken<'a, &'b u8>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+fn copy_outlives_generic_bound_ok<'a, T: 'a>(t: OutlivesToken<'a, T>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
 fn copy_outlives_unproven_err<'short>(_x: &'short u8) {
     let t: OutlivesToken<'static, &'short u8> = OutlivesToken(PhantomData, PhantomData);
     let a = t;
     let b = t;
+    let _ = (a, b);
+}
+
+fn copy_outlives_unproven_param_err<'short>(t: OutlivesToken<'static, &'short u8>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+fn copy_outlives_free_fn_missing_bound_err<'a, 'b>(t: OutlivesToken<'a, &'b u8>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+trait Marker<'a> {}
+struct Marked<T>(PhantomData<T>);
+impl<T: Marker<'static>> Copy for Marked<T> {}
+impl<T: Marker<'static>> Clone for Marked<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_trait_region_static_ok<T: Marker<'static>>(m: Marked<T>) {
+    let a = m;
+    let b = m;
+    let _ = (a, b);
+}
+
+fn copy_trait_region_short_err<'short, T: Marker<'short>>(m: Marked<T>) {
+    let a = m;
+    let b = m;
     let _ = (a, b);
 }
 
@@ -382,9 +461,14 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         "dyn_expect_static_local_guard",
         "dyn_expect_static_chained_unwrap",
         "dyn_expect_param_vec_tuple",
+        "dyn_expect_owner_return_ok",
         "copy_proj_shared_ok",
         "copy_proj_generic_tuple_shared_ok",
         "copy_outlives_static_scalar_ok",
+        "copy_outlives_static_ref_ok",
+        "copy_outlives_free_fn_bound_ok",
+        "copy_outlives_generic_bound_ok",
+        "copy_trait_region_static_ok",
     ] {
         let body = find(ok_fn);
         let (types, v) = world.check_borrows(body, heap.alloc());
@@ -393,9 +477,13 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
     }
 
     // Negative controls: non-`'static` `dyn Fn(&(dyn MyErr + '_))` MUST still fail with E0521
-    // (including beside an unrelated `&READERS` sibling arg or through an unrelated unary call).
+    // (including beside an unrelated `&READERS` sibling arg, unrelated owner param, sibling arg
+    // using a different generic parameter, or through an unrelated unary wrapper call).
     for err_fn in [
         "dyn_expect_negative_elided",
+        "dyn_expect_negative_unrelated_owner_param",
+        "dyn_expect_negative_sibling_other_param",
+        "dyn_expect_negative_unrelated_wrapper_call",
         "dyn_expect_negative_unrelated_sibling",
         "dyn_expect_negative_unrelated_unary_call",
     ] {
@@ -411,13 +499,16 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
     }
 
     // Negative controls: `Ptr` with `Aliasing = Exclusive` (including Copy markers and generic
-    // tuples) and `OutlivesToken<'static, &'short u8>` with an unproven `T: 'a` `Copy` bound
-    // MUST still fail with E0382.
+    // tuples), `OutlivesToken` with unproven `T: 'a` `Copy` bounds, and `Marked<T>` with weaker
+    // `T: Marker<'short>` owner bounds MUST still fail with E0382.
     for err_fn in [
         "copy_proj_exclusive_err",
         "copy_proj_exclusive_copy_arg_err",
         "copy_proj_generic_tuple_exclusive_err",
         "copy_outlives_unproven_err",
+        "copy_outlives_unproven_param_err",
+        "copy_outlives_free_fn_missing_bound_err",
+        "copy_trait_region_short_err",
     ] {
         let body = find(err_fn);
         let (types, v) = world.check_borrows(body, heap.alloc());

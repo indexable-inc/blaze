@@ -377,7 +377,7 @@ fn inst_is_copy_resolves_conditional_copy_when_copy_args_none() {
         ptr: ItemKey,
         marker: ItemKey,
         marker_copy: bool,
-        inst: Option<bool>,
+        inst: Option<crate::InstCopy<'static>>,
     }
 
     impl Facts for InstCopyWorld {
@@ -415,11 +415,11 @@ fn inst_is_copy_resolves_conditional_copy_when_copy_args_none() {
         fn field_regions(&self, _: ItemKey, _: u32, _: u32) -> Option<&[crate::FieldRegion]> { None }
         fn field_count(&self, _: ItemKey, _: u32) -> Option<u32> { None }
         fn copy_args(&self, _: ItemKey) -> Option<&[bool]> { None }
-        fn inst_is_copy(&self, _: blaze_typeck::PTy) -> Option<bool> { self.inst }
+        fn inst_is_copy(&self, _: blaze_typeck::PTy) -> Option<crate::InstCopy<'_>> { self.inst }
         fn param_copy(&self, _: u32) -> bool { false }
     }
 
-    let run_case = |marker_copy: bool, inst: Option<bool>| {
+    let run_case = |marker_copy: bool, inst: Option<crate::InstCopy<'static>>| {
         let mut fx = Fx::new();
         let u8_t = fx.u8();
         let marker = fx.strukt("Marker", 0, &[]);
@@ -453,8 +453,8 @@ fn inst_is_copy_resolves_conditional_copy_when_copy_args_none() {
         findings(&fx, &b, f, root, &InstCopyWorld { ptr, marker, marker_copy, inst }, &decls, Plant::None)
     };
 
-    assert_eq!(run_case(false, Some(true)), Ok(Default::default()), "inst_is_copy=Some(true) makes Ptr Copy even with non-Copy Marker");
-    assert!(!run_case(true, Some(false)).expect("checks").is_empty(), "inst_is_copy=Some(false) rejects copy even when Marker is Copy");
+    assert_eq!(run_case(false, Some(crate::InstCopy::Yes)), Ok(Default::default()), "inst_is_copy=Yes makes Ptr Copy even with non-Copy Marker");
+    assert!(!run_case(true, Some(crate::InstCopy::No)).expect("checks").is_empty(), "inst_is_copy=No rejects copy even when Marker is Copy");
     assert!(!run_case(false, None).expect("checks").is_empty(), "inst_is_copy=None falls back to checking args (non-Copy Marker rejects)");
     assert_eq!(run_case(true, None), Ok(Default::default()), "inst_is_copy=None falls back to checking args (Copy Marker accepts)");
 }

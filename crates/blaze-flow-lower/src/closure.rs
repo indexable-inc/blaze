@@ -709,6 +709,18 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
     }
 }
 
+/// One structural step in an outer-to-inner path from an aggregate/container root down to an
+/// expected `PNode::Dynamic` trait object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DynPathStep {
+    RefInner,
+    PtrInner,
+    SliceElem,
+    ArrayElem,
+    TupleElem(u32),
+    AdtArg(u32),
+}
+
 /// Whether a slot of a clause's column is one its `for<..>` binds.
 fn is_late(r: &Region) -> bool {
     matches!(r, Region::Late { .. })
@@ -1113,11 +1125,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
 
     /// Resolves the expecting `dyn Fn*(Args) -> Output` trait object type and its region column
     /// for a closure coerced to a trait object (`SigFrom::Object`, e.g. `Box::new(move |data: &[u8]| ...)`
-    /// coerced to `Box<dyn for<'a> Fn(&'a [u8]) -> Option<Decoded<'a>>>`).
+    /// coerced to `Box<dyn for<'a> Fn(&'a [u8]) -> Option<Decoded<'a>>>`) by tracking the exact
+    /// structural projection path from the closure up through enclosing aggregates/calls and down
+    /// through any mutated generic container back to its declared `HeadRegions`.
     ///
     /// Returns `(input_slots, declared_args_tuple, output_part, dyn_binder)` in the heads' table
-    /// when a unique matching `PNode::Dynamic` with `Fn*` predicates is found in the expecting
-    /// site or enclosing owner's signature.
+    /// when the exact path lands on a matching `PNode::Dynamic` with `Fn*` predicates.
     #[allow(clippy::type_complexity)]
     fn object_expectation<'h>(
         &self,
@@ -1130,18 +1143,20 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         use blaze_typeck::Def;
 
         let facts: &'b F = self.facts;
-        // Walk up from `ce` through transparent wrappers (`Paren`, `&`, `Box::new`/smart-ptr
-        // `new`, `Cast`) to find the coerced erased `PNode::Dynamic` target type.
+        // 0. Walk up from `ce` through transparent wrappers (`Paren`, `&`, `Cast`, `Def::Ctor`,
+        //    or unary smart-pointer `new` whose declared signature maps input `Param(p)` uniquely
+        //    into its zero-lifetime ADT return type) to find the coerced `PNode::Dynamic` target
+        //    type and its exact outer-to-inner path from `target_expr`.
         let mut cur = ce;
         let mut want_dyn: Option<PTy> = None;
+        let mut path: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
         for _ in 0..8 {
             if let Ok(adj) = self.adjusted_ty(cur)
-                && let Ok(Some(d)) = self.peel_body_dyn(adj, e)
+                && let Ok(Some(d)) = self.peel_body_dyn_path(adj, &mut path, e)
             {
                 want_dyn = Some(d);
                 break;
             }
-            // Find the parent expression that wraps `cur`.
             let mut next = None;
             for (ix, expr) in self.body.exprs.iter().enumerate() {
                 let pe = ExprId(to_u32(ix));
@@ -1150,18 +1165,38 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         next = Some(pe);
                         break;
                     }
-                    Expr::Call { args, .. } => {
+                    Expr::Call { callee, args } => {
                         if let Some(es) = self.body.expr_lists.get(args.range())
                             && es.len() == 1
                             && es[0] == cur
-                            && let Ok(pty) = self.expr_ty(pe)
-                            && let Ok(PNode::Adt(k, _)) = self.node(pty, e)
-                            && (facts.adt(k).is_some_and(|a| a.is_box)
-                                || (facts.adt(k).is_some_and(|a| a.lifetimes == 0)
-                                    && self.adjusted_ty(pe).ok().and_then(|t| self.peel_body_dyn(t, e).ok().flatten()).is_some()))
                         {
-                            next = Some(pe);
-                            break;
+                            let ok = match self.expr_def(callee) {
+                                Some(Def::Ctor { .. }) => true,
+                                _ => {
+                                    let callee_item = self.callee_of(pe).map(|(k, _)| k).or_else(|| match self.expr_def(callee) {
+                                        Some(Def::Fn(k)) => Some(k),
+                                        _ => None,
+                                    });
+                                    callee_item.is_some_and(|item| {
+                                        if let Ok(sig) = facts.sig(item)
+                                            && let Ok(in_ty) = self.sig_declared(sig, 0, e)
+                                            && let Ok(PNode::Param(p)) = self.head_node(in_ty, e)
+                                            && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                                            && let Ok(PNode::Adt(k, _)) = self.head_node(out_ty, e)
+                                            && facts.adt(k).is_some_and(|a| a.is_box || a.lifetimes == 0)
+                                        {
+                                            let mut psteps: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
+                                            self.find_unique_param_path(out_ty, p, heads, &mut psteps, e)
+                                        } else {
+                                            false
+                                        }
+                                    })
+                                }
+                            };
+                            if ok {
+                                next = Some(pe);
+                                break;
+                            }
                         }
                     }
                     _ => {}
@@ -1175,17 +1210,44 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
 
         let mut found: Option<(PTy, &'b [Region], u32)> = None;
 
-        // 1. Walk up from `target_expr` through enclosing aggregates/wrappers (`Tuple`, `Array`,
-        //    `Repeat`, `Struct`, `Call`, `MethodCall`, `Block`, `If`, `Match`, `Paren`, `Ref`,
-        //    `Cast`, `Assign`) to the expecting site's declared head (field, callee signature,
-        //    or generic container receiver/lhs traced back to a static/const/field/param/call).
+        // 1. Walk up from `target_expr` along the exact structural path (`path` is outer-to-inner
+        //    from `walk_cur`'s adjusted type when `walk_cur == target_expr`, or `walk_cur`'s type
+        //    otherwise, down to `want_dyn`).
         let mut walk_cur = target_expr;
         for _ in 0..16 {
+            if walk_cur != target_expr && !self.forward_expr_adjusts(walk_cur, &mut path, e) {
+                break;
+            }
+            if walk_cur == self.body.root {
+                if let Ok(own_sig) = facts.sig(self.body.owner)
+                    && let Some(out_slots) = own_sig.output()
+                    && let Ok(out_ty) = self.sig_declared(own_sig, own_sig.inputs(), e)
+                {
+                    let base = self.fn_sig_param_binder(own_sig, own_sig.inputs(), heads);
+                    if let Ok(Some(m)) = self.project_head_path(out_ty, out_slots, base, &path, heads, want_dyn, e) {
+                        found = Some(m);
+                    }
+                }
+                break;
+            }
             let mut next_parent: Option<ExprId> = None;
             let mut stop = false;
             for (ix, expr) in self.body.exprs.iter().enumerate() {
                 let pe = ExprId(to_u32(ix));
                 match *expr {
+                    Expr::Return { value: Some(inner) } if inner == walk_cur => {
+                        if let Ok(own_sig) = facts.sig(self.body.owner)
+                            && let Some(out_slots) = own_sig.output()
+                            && let Ok(out_ty) = self.sig_declared(own_sig, own_sig.inputs(), e)
+                        {
+                            let base = self.fn_sig_param_binder(own_sig, own_sig.inputs(), heads);
+                            if let Ok(Some(m)) = self.project_head_path(out_ty, out_slots, base, &path, heads, want_dyn, e) {
+                                found = Some(m);
+                            }
+                        }
+                        stop = true;
+                        break;
+                    }
                     Expr::Struct { fields, .. } => {
                         let Some(fs) = self.body.field_inits.get(fields.range()) else { continue };
                         let Some(f) = fs.iter().find(|f| f.expr == walk_cur) else { continue };
@@ -1195,177 +1257,181 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                             _ => None,
                         } && let Some(fi) = facts.field(adt, variant, f.name)
                             && let Ok(col) = facts.regions().field(adt, variant, fi)
-                            && let Ok(Some(m)) = self.find_unique_dyn_with_binder(col.ty(), col.as_slice(), 0, heads, want_dyn, e)
                         {
-                            found = Some(m);
-                            stop = true;
+                            if let Ok(Some(m)) = self.project_head_path(col.ty(), col.as_slice(), 0, &path, heads, want_dyn, e) {
+                                found = Some(m);
+                                stop = true;
+                            } else if let Some((param_p, rem_start)) = self.match_head_path_to_param(col.ty(), &path, heads, e) {
+                                Self::replace_path_prefix(&mut path, &[DynPathStep::AdtArg(param_p)], rem_start);
+                                next_parent = Some(pe);
+                            } else {
+                                stop = true;
+                            }
                         } else {
-                            next_parent = Some(pe);
+                            stop = true;
                         }
                         break;
                     }
                     Expr::Call { callee, args } => {
                         let Some(es) = self.body.expr_lists.get(args.range()) else { continue };
                         let Some(arg_i) = es.iter().position(|&a| a == walk_cur) else { continue };
-                        let mut sig_for_call: Option<crate::SigLife<'_>> = None;
-                        let mut is_ctor = false;
-                        match self.expr_def(callee) {
-                            Some(Def::Ctor { adt, variant, .. }) => {
-                                is_ctor = true;
-                                if let Ok(col) = facts.regions().field(adt, variant, to_u32(arg_i))
-                                    && let Ok(Some(m)) = self.find_unique_dyn_with_binder(col.ty(), col.as_slice(), 0, heads, want_dyn, e)
-                                {
+                        if let Some(Def::Ctor { adt, variant, .. }) = self.expr_def(callee) {
+                            if let Ok(col) = facts.regions().field(adt, variant, to_u32(arg_i)) {
+                                if let Ok(Some(m)) = self.project_head_path(col.ty(), col.as_slice(), 0, &path, heads, want_dyn, e) {
                                     found = Some(m);
                                     stop = true;
-                                    break;
+                                } else if let Some((param_p, rem_start)) = self.match_head_path_to_param(col.ty(), &path, heads, e) {
+                                    Self::replace_path_prefix(&mut path, &[DynPathStep::AdtArg(param_p)], rem_start);
+                                    next_parent = Some(pe);
+                                } else {
+                                    stop = true;
                                 }
+                            } else {
+                                stop = true;
                             }
-                            Some(Def::Fn(item)) => {
-                                if let Ok(sig) = facts.sig(item) {
-                                    sig_for_call = Some(sig);
-                                    if let Some(in_slots) = sig.input(to_u32(arg_i))
-                                        && let Ok(in_ty) = self.sig_declared(sig, to_u32(arg_i), e)
-                                    {
-                                        let base = self.fn_sig_param_binder(sig, to_u32(arg_i), heads);
-                                        if let Ok(Some(m)) = self.find_unique_dyn_with_binder(in_ty, in_slots, base, heads, want_dyn, e) {
-                                            found = Some(m);
-                                            stop = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {
-                                if let Some((item, _)) = self.callee_of(pe)
-                                    && let Ok(sig) = facts.sig(item)
-                                {
-                                    sig_for_call = Some(sig);
-                                    if let Some(in_slots) = sig.input(to_u32(arg_i))
-                                        && let Ok(in_ty) = self.sig_declared(sig, to_u32(arg_i), e)
-                                    {
-                                        let base = self.fn_sig_param_binder(sig, to_u32(arg_i), heads);
-                                        if let Ok(Some(m)) = self.find_unique_dyn_with_binder(in_ty, in_slots, base, heads, want_dyn, e) {
-                                            found = Some(m);
-                                            stop = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
+                            break;
                         }
-                        // Generic UFCS container mutation (e.g. `Vec::push(&mut readers, (id, Box::new(...)))`):
-                        // ONLY trace a sibling argument whose declared parameter type in `callee`'s
-                        // signature shares a generic type parameter with `arg_i`'s parameter type.
-                        if let Some(sig) = sig_for_call
-                            && let Ok(arg_ty) = self.sig_declared(sig, to_u32(arg_i), e)
+                        let callee_item = self.callee_of(pe).map(|(k, _)| k).or_else(|| match self.expr_def(callee) {
+                            Some(Def::Fn(k)) => Some(k),
+                            _ => None,
+                        });
+                        if let Some(item) = callee_item
+                            && let Ok(sig) = facts.sig(item)
+                            && let Some(in_slots) = sig.input(to_u32(arg_i))
+                            && let Ok(in_ty) = self.sig_declared(sig, to_u32(arg_i), e)
                         {
-                            let mut arg_match: Option<(PTy, &'b [Region], u32)> = None;
-                            let mut ambiguous = false;
-                            for (j, &other) in es.iter().enumerate() {
-                                if j == arg_i {
-                                    continue;
-                                }
-                                let Ok(other_ty) = self.sig_declared(sig, to_u32(j), e) else { continue };
-                                if !self.head_shares_type_param(arg_ty, other_ty, heads, e) {
-                                    continue;
-                                }
-                                if let Ok(Some(m)) = self.trace_dyn_root(other, want_dyn, heads, e) {
-                                    match arg_match {
-                                        None => arg_match = Some(m),
-                                        Some((_, prev_s, prev_b)) if prev_b == m.2 && prev_s == m.1 => {}
-                                        Some(_) => {
-                                            ambiguous = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            if !ambiguous && let Some(m) = arg_match {
+                            let base = self.fn_sig_param_binder(sig, to_u32(arg_i), heads);
+                            if let Ok(Some(m)) = self.project_head_path(in_ty, in_slots, base, &path, heads, want_dyn, e) {
                                 found = Some(m);
                                 stop = true;
                                 break;
                             }
-                            if let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
-                                && self.head_shares_type_param(arg_ty, out_ty, heads, e)
-                            {
-                                next_parent = Some(pe);
-                            } else {
-                                stop = true;
+                            if let Some((param_p, rem_start)) = self.match_head_path_to_param(in_ty, &path, heads, e) {
+                                // Only trace a sibling argument whose declared parameter type carries
+                                // this exact `param_p` at a unique structural path (e.g. `Vec::push(&mut v, x)`).
+                                let mut arg_match: Option<(PTy, &'b [Region], u32)> = None;
+                                let mut ambiguous = false;
+                                let mut prefix: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
+                                for (j, &other) in es.iter().enumerate() {
+                                    if j == arg_i {
+                                        continue;
+                                    }
+                                    let Ok(other_ty) = self.sig_declared(sig, to_u32(j), e) else { continue };
+                                    if !self.find_unique_param_path(other_ty, param_p, heads, &mut prefix, e) {
+                                        continue;
+                                    }
+                                    let mut sib_path: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
+                                    sib_path.extend_from_slice(&prefix);
+                                    if let Some(tail) = path.get(rem_start..) {
+                                        sib_path.extend_from_slice(tail);
+                                    }
+                                    if let Ok(Some(m)) = self.trace_dyn_path(other, sib_path, heads, want_dyn, e) {
+                                        match arg_match {
+                                            None => arg_match = Some(m),
+                                            Some((_, prev_s, prev_b)) if prev_b == m.2 && prev_s == m.1 => {}
+                                            Some(_) => {
+                                                ambiguous = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if !ambiguous && let Some(m) = arg_match {
+                                    found = Some(m);
+                                    stop = true;
+                                    break;
+                                }
+                                if let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                                    && self.find_unique_param_path(out_ty, param_p, heads, &mut prefix, e)
+                                {
+                                    Self::replace_path_prefix(&mut path, &prefix, rem_start);
+                                    next_parent = Some(pe);
+                                    break;
+                                }
                             }
-                        } else if is_ctor {
-                            next_parent = Some(pe);
-                        } else {
-                            stop = true;
                         }
+                        stop = true;
                         break;
                     }
                     Expr::MethodCall { receiver, args, .. } => {
                         let Some(es) = self.body.expr_lists.get(args.range()) else { continue };
                         let Some(arg_i) = es.iter().position(|&a| a == walk_cur) else { continue };
                         let param_i = to_u32(arg_i + 1);
-                        let mut sig_for_call: Option<crate::SigLife<'_>> = None;
-                        if let Some(pos) = self.ck.callees.column::<0>().iter().position(|&x| x == pe)
-                            && let Some(&item) = self.ck.callees.column::<1>().get(pos)
+                        if let Some((item, _)) = self.callee_of(pe)
                             && let Ok(sig) = facts.sig(item)
+                            && let Some(in_slots) = sig.input(param_i)
+                            && let Ok(in_ty) = self.sig_declared(sig, param_i, e)
                         {
-                            sig_for_call = Some(sig);
-                            if let Some(in_slots) = sig.input(param_i)
-                                && let Ok(in_ty) = self.sig_declared(sig, param_i, e)
-                            {
-                                let base = self.fn_sig_param_binder(sig, param_i, heads);
-                                if let Ok(Some(m)) = self.find_unique_dyn_with_binder(in_ty, in_slots, base, heads, want_dyn, e) {
-                                    found = Some(m);
-                                    stop = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some(sig) = sig_for_call
-                            && let Ok(arg_ty) = self.sig_declared(sig, param_i, e)
-                        {
-                            if let Ok(self_ty) = self.sig_declared(sig, 0, e)
-                                && self.head_shares_type_param(arg_ty, self_ty, heads, e)
-                                && let Ok(Some(m)) = self.trace_dyn_root(receiver, want_dyn, heads, e)
-                            {
+                            let base = self.fn_sig_param_binder(sig, param_i, heads);
+                            if let Ok(Some(m)) = self.project_head_path(in_ty, in_slots, base, &path, heads, want_dyn, e) {
                                 found = Some(m);
                                 stop = true;
                                 break;
                             }
-                            if let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
-                                && self.head_shares_type_param(arg_ty, out_ty, heads, e)
-                            {
-                                next_parent = Some(pe);
-                            } else {
-                                stop = true;
+                            if let Some((param_p, rem_start)) = self.match_head_path_to_param(in_ty, &path, heads, e) {
+                                let mut prefix: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
+                                if let Ok(self_ty) = self.sig_declared(sig, 0, e)
+                                    && self.find_unique_param_path(self_ty, param_p, heads, &mut prefix, e)
+                                {
+                                    let mut recv_path: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
+                                    recv_path.extend_from_slice(&prefix);
+                                    if let Some(tail) = path.get(rem_start..) {
+                                        recv_path.extend_from_slice(tail);
+                                    }
+                                    if let Ok(Some(m)) = self.trace_dyn_path(receiver, recv_path, heads, want_dyn, e) {
+                                        found = Some(m);
+                                        stop = true;
+                                        break;
+                                    }
+                                }
+                                if let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                                    && self.find_unique_param_path(out_ty, param_p, heads, &mut prefix, e)
+                                {
+                                    Self::replace_path_prefix(&mut path, &prefix, rem_start);
+                                    next_parent = Some(pe);
+                                    break;
+                                }
                             }
-                        } else {
-                            stop = true;
                         }
+                        stop = true;
                         break;
                     }
                     Expr::Assign { lhs, rhs } if rhs == walk_cur => {
-                        if let Ok(Some(m)) = self.trace_dyn_root(lhs, want_dyn, heads, e) {
+                        let mut lhs_path: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
+                        lhs_path.extend_from_slice(&path);
+                        if let Ok(Some(m)) = self.trace_dyn_path(lhs, lhs_path, heads, want_dyn, e) {
                             found = Some(m);
                         }
                         stop = true;
                         break;
                     }
-                    Expr::Tuple { elems } | Expr::Array { elems } => {
+                    Expr::Tuple { elems } => {
+                        if let Some(es) = self.body.expr_lists.get(elems.range())
+                            && let Some(ti) = es.iter().position(|&x| x == walk_cur)
+                        {
+                            Self::prepend_path_step(&mut path, DynPathStep::TupleElem(to_u32(ti)));
+                            next_parent = Some(pe);
+                            break;
+                        }
+                    }
+                    Expr::Array { elems } => {
                         if self.body.expr_lists.get(elems.range()).is_some_and(|es| es.contains(&walk_cur)) {
+                            Self::prepend_path_step(&mut path, DynPathStep::ArrayElem);
                             next_parent = Some(pe);
                             break;
                         }
                     }
                     Expr::Repeat { elem, .. } if elem == walk_cur => {
+                        Self::prepend_path_step(&mut path, DynPathStep::ArrayElem);
                         next_parent = Some(pe);
                         break;
                     }
-                    Expr::Paren(inner)
-                    | Expr::Ref { operand: inner, .. }
-                    | Expr::Cast { operand: inner, .. }
-                    | Expr::Block { tail: Some(inner), .. }
-                        if inner == walk_cur =>
-                    {
+                    Expr::Ref { operand: inner, .. } if inner == walk_cur => {
+                        Self::prepend_path_step(&mut path, DynPathStep::RefInner);
+                        next_parent = Some(pe);
+                        break;
+                    }
+                    Expr::Paren(inner) | Expr::Block { tail: Some(inner), .. } if inner == walk_cur => {
                         next_parent = Some(pe);
                         break;
                     }
@@ -1387,37 +1453,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             }
             let Some(parent) = next_parent else { break };
             walk_cur = parent;
-        }
-
-        // 2. When the immediate call is generic (e.g. `HashMap::insert(k, Box::new(closure))` into
-        //    a parameter `registry: &mut HashMap<K, Box<dyn for<'a> Fn(&'a [u8]) -> ...>>`),
-        //    search the enclosing fn's own declared signature for a unique matching `PNode::Dynamic`.
-        if found.is_none()
-            && let Ok(own_sig) = facts.sig(self.body.owner)
-            && let Ok(blaze_borrow::Kids::List(sig_kids)) = heads.kids(own_sig.regions().col.ty())
-        {
-            let mut ambiguous = false;
-            for (ki, &kty) in sig_kids.iter().enumerate() {
-                let Some(kslots) = own_sig.regions().col.child(to_u32(ki)) else { continue };
-                let base = self.fn_sig_param_binder(own_sig, to_u32(ki), heads);
-                let Ok(cand) = self.find_unique_dyn_with_binder(kty, kslots, base, heads, want_dyn, e) else {
-                    ambiguous = true;
-                    break;
-                };
-                if let Some((dt, ds, db)) = cand {
-                    match found {
-                        None => found = Some((dt, ds, db)),
-                        Some((_, prev_s, prev_b)) if prev_b == db && prev_s == ds => {}
-                        Some(_) => {
-                            ambiguous = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if ambiguous {
-                found = None;
-            }
         }
 
         let (dyn_ty, dyn_slots, dyn_binder) = found?;
@@ -1464,16 +1499,197 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         Some((args_slots, args_tup, out_match, dyn_binder))
     }
 
-    /// Traces a container expression `start` (e.g. `readers` bound from `READERS.write()`,
-    /// `READERS.write().unwrap()`, `self.readers`, or a fn parameter) back to a declared head
-    /// (static, const, struct field, callee output, or owner parameter) carrying a unique
-    /// `PNode::Dynamic` matching `want_dyn`, returning `(dyn_ty, dyn_slots, dyn_binder)`.
+    fn prepend_path_step(path: &mut Vec<DynPathStep, A>, step: DynPathStep) {
+        let mut next: Vec<DynPathStep, A> = Vec::with_capacity_in(path.len() + 1, *path.allocator());
+        next.push(step);
+        next.extend_from_slice(path);
+        *path = next;
+    }
+
+    fn replace_path_prefix(path: &mut Vec<DynPathStep, A>, prefix: &[DynPathStep], rem_start: usize) {
+        let tail = path.get(rem_start..).unwrap_or(&[]);
+        let mut next: Vec<DynPathStep, A> = Vec::with_capacity_in(prefix.len() + tail.len(), *path.allocator());
+        next.extend_from_slice(prefix);
+        next.extend_from_slice(tail);
+        *path = next;
+    }
+
+    /// Peels `&`/`&mut` and zero-lifetime smart-pointer wrappers (`Box`, `Arc`, `Rc`) off `t` to
+    /// find `PNode::Dynamic`, recording the outer-to-inner [`DynPathStep`]s into `out`.
+    fn peel_body_dyn_path(&self, mut t: PTy, out: &mut Vec<DynPathStep, A>, e: ExprId) -> Result<Option<PTy>, Refusal> {
+        let facts: &'b F = self.facts;
+        out.clear();
+        for _ in 0..16u32 {
+            match self.node(t, e)? {
+                PNode::Ref(_, inner) => {
+                    out.push(DynPathStep::RefInner);
+                    t = inner;
+                }
+                PNode::Adt(k, l) if facts.adt(k).is_some_and(|a| a.lifetimes == 0) => {
+                    let list = self.list(l, e)?;
+                    let Some(&inner) = list.first() else { return Ok(None) };
+                    if list.len() > 2 {
+                        return Ok(None);
+                    }
+                    out.push(DynPathStep::AdtArg(0));
+                    t = inner;
+                }
+                PNode::Dynamic(_) => return Ok(Some(t)),
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Applies `expr`'s adjustments forward (from unadjusted `expr_ty(expr)` to `adjusted_ty(expr)`)
+    /// onto an outer-to-inner `path` starting at `expr_ty(expr)`.
+    fn forward_expr_adjusts(&self, expr: ExprId, path: &mut Vec<DynPathStep, A>, e: ExprId) -> bool {
+        use blaze_typeck::AdjustKind;
+        let (lo, hi) = self.adjust_rows(expr);
+        if lo == hi {
+            return true;
+        }
+        let Ok(mut cur_ty) = self.expr_ty(expr) else { return false };
+        for idx in lo..hi {
+            let (Some(&kind), Some(&after_ty)) = (self.ck.adjusts.column::<1>().get(idx), self.ck.adjusts.column::<2>().get(idx)) else {
+                return false;
+            };
+            match kind {
+                AdjustKind::Borrow { raw: false, .. } => Self::prepend_path_step(path, DynPathStep::RefInner),
+                AdjustKind::Borrow { raw: true, .. } => Self::prepend_path_step(path, DynPathStep::PtrInner),
+                AdjustKind::Deref { overloaded: None } => match self.node(cur_ty, e) {
+                    Ok(PNode::Ref(..)) if path.first() == Some(&DynPathStep::RefInner) => {
+                        Self::replace_path_prefix(path, &[], 1);
+                    }
+                    Ok(PNode::Ptr(..)) if path.first() == Some(&DynPathStep::PtrInner) => {
+                        Self::replace_path_prefix(path, &[], 1);
+                    }
+                    Ok(PNode::Adt(k, _)) if self.facts.adt(k).is_some_and(|a| a.is_box) && path.first() == Some(&DynPathStep::AdtArg(0)) => {
+                        Self::replace_path_prefix(path, &[], 1);
+                    }
+                    _ => return false,
+                },
+                AdjustKind::MutToConstPointer => {}
+                AdjustKind::Unsize => {
+                    if let (Ok(PNode::Ref(_, bi)), Ok(PNode::Ref(_, ai))) = (self.node(cur_ty, e), self.node(after_ty, e))
+                        && matches!(self.node(bi, e), Ok(PNode::Array(..)))
+                        && matches!(self.node(ai, e), Ok(PNode::Slice(_)))
+                        && path.first() == Some(&DynPathStep::RefInner)
+                        && path.get(1) == Some(&DynPathStep::ArrayElem)
+                        && let Some(slot) = path.get_mut(1)
+                    {
+                        *slot = DynPathStep::SliceElem;
+                    } else {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+            cur_ty = after_ty;
+        }
+        true
+    }
+
+    /// Reverses `expr`'s adjustments (from `adjusted_ty(expr)` back to unadjusted `expr_ty(expr)`)
+    /// on an outer-to-inner `path`.
+    fn reverse_expr_adjusts(&self, expr: ExprId, path: &mut Vec<DynPathStep, A>, heads: &blaze_borrow::Columns<'_>, e: ExprId) -> bool {
+        use blaze_typeck::AdjustKind;
+        let (lo, hi) = self.adjust_rows(expr);
+        if lo == hi {
+            return true;
+        }
+        let Ok(unadj_ty) = self.expr_ty(expr) else { return false };
+        for idx in (lo..hi).rev() {
+            let (Some(&kind), Some(&after_ty)) = (self.ck.adjusts.column::<1>().get(idx), self.ck.adjusts.column::<2>().get(idx)) else {
+                return false;
+            };
+            let before_ty = if idx == lo {
+                unadj_ty
+            } else {
+                let Some(&prev) = self.ck.adjusts.column::<2>().get(idx - 1) else { return false };
+                prev
+            };
+            match kind {
+                AdjustKind::Borrow { raw: false, .. } => {
+                    if path.first() != Some(&DynPathStep::RefInner) {
+                        return false;
+                    }
+                    Self::replace_path_prefix(path, &[], 1);
+                }
+                AdjustKind::Borrow { raw: true, .. } => {
+                    if path.first() != Some(&DynPathStep::PtrInner) {
+                        return false;
+                    }
+                    Self::replace_path_prefix(path, &[], 1);
+                }
+                AdjustKind::Deref { overloaded: None } => match self.node(before_ty, e) {
+                    Ok(PNode::Ref(..)) => Self::prepend_path_step(path, DynPathStep::RefInner),
+                    Ok(PNode::Ptr(..)) => Self::prepend_path_step(path, DynPathStep::PtrInner),
+                    Ok(PNode::Adt(k, _)) if self.facts.adt(k).is_some_and(|a| a.is_box) => {
+                        Self::prepend_path_step(path, DynPathStep::AdtArg(0));
+                    }
+                    _ => return false,
+                },
+                AdjustKind::Deref { overloaded: Some(_) } => {
+                    if !self.reverse_overloaded_deref(before_ty, path, heads, e) {
+                        return false;
+                    }
+                }
+                AdjustKind::MutToConstPointer => {}
+                AdjustKind::Unsize => {
+                    if let (Ok(PNode::Ref(_, bi)), Ok(PNode::Ref(_, ai))) = (self.node(before_ty, e), self.node(after_ty, e))
+                        && matches!(self.node(bi, e), Ok(PNode::Array(..)))
+                        && matches!(self.node(ai, e), Ok(PNode::Slice(_)))
+                        && path.first() == Some(&DynPathStep::RefInner)
+                        && path.get(1) == Some(&DynPathStep::SliceElem)
+                        && let Some(slot) = path.get_mut(1)
+                    {
+                        *slot = DynPathStep::ArrayElem;
+                    } else {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Reverses an overloaded `Deref` step (`Adt` -> `<Adt as Deref>::Target`) on `path` using the
+    /// ADT's filed `Deref` impl header and `Target` associated type.
+    fn reverse_overloaded_deref(
+        &self,
+        adt_ty: PTy,
+        path: &mut Vec<DynPathStep, A>,
+        heads: &blaze_borrow::Columns<'_>,
+        e: ExprId,
+    ) -> bool {
+        let Ok(PNode::Adt(k, _)) = self.node(adt_ty, e) else { return false };
+        let Some(imp) = self.facts.deref_impl(k) else { return false };
+        let Ok((self_col, _)) = self.facts.regions().impl_header(imp) else { return false };
+        let Ok(target_col) = self.facts.regions().impl_assoc(imp, blaze_typeck::Name::of("Target")) else { return false };
+        let Some((param_p, rem_start)) = self.match_head_path_to_param(target_col.ty(), path, heads, e) else {
+            return false;
+        };
+        let mut prefix: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
+        if !self.find_unique_param_path(self_col.ty(), param_p, heads, &mut prefix, e) {
+            return false;
+        }
+        Self::replace_path_prefix(path, &prefix, rem_start);
+        true
+    }
+
+    /// Traces a container expression `start` (whose adjusted type is the root of `path`) back to a
+    /// declared head (`static`, `const`, struct field, callee output, or owner parameter),
+    /// transforming `path` step-by-step along every resolved call, deref, field, and local binding,
+    /// and projecting the root head's `HeadRegions` along the exact final path.
     #[allow(clippy::type_complexity)]
-    fn trace_dyn_root(
+    fn trace_dyn_path(
         &self,
         start: ExprId,
-        want_dyn: PTy,
+        mut path: Vec<DynPathStep, A>,
         heads: &blaze_borrow::Columns<'_>,
+        want_dyn: PTy,
         e: ExprId,
     ) -> Result<Option<(PTy, &'b [Region], u32)>, Refusal> {
         use blaze_typeck::{Def, Stmt, UnOp};
@@ -1481,13 +1697,44 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         let facts: &'b F = self.facts;
         let mut cur = start;
         for _ in 0..24 {
+            if !self.reverse_expr_adjusts(cur, &mut path, heads, e) {
+                return Ok(None);
+            }
             match self.expr(cur)? {
-                Expr::Paren(i)
-                | Expr::Unary { op: UnOp::Deref, operand: i }
-                | Expr::Ref { operand: i, .. }
-                | Expr::Cast { operand: i, .. }
-                | Expr::Block { tail: Some(i), .. } => cur = i,
-                Expr::Index { base, .. } => cur = base,
+                Expr::Paren(i) | Expr::Block { tail: Some(i), .. } => cur = i,
+                Expr::Ref { operand: i, .. } => {
+                    if path.first() != Some(&DynPathStep::RefInner) {
+                        return Ok(None);
+                    }
+                    Self::replace_path_prefix(&mut path, &[], 1);
+                    cur = i;
+                }
+                Expr::Unary { op: UnOp::Deref, operand: i } => {
+                    let Ok(op_ty) = self.adjusted_ty(i) else { return Ok(None) };
+                    match self.node(op_ty, e)? {
+                        PNode::Ref(..) => Self::prepend_path_step(&mut path, DynPathStep::RefInner),
+                        PNode::Ptr(..) => Self::prepend_path_step(&mut path, DynPathStep::PtrInner),
+                        PNode::Adt(k, _) if facts.adt(k).is_some_and(|a| a.is_box) => {
+                            Self::prepend_path_step(&mut path, DynPathStep::AdtArg(0));
+                        }
+                        PNode::Adt(..) => {
+                            if !self.reverse_overloaded_deref(op_ty, &mut path, heads, e) {
+                                return Ok(None);
+                            }
+                        }
+                        _ => return Ok(None),
+                    }
+                    cur = i;
+                }
+                Expr::Index { base, .. } => {
+                    let Ok(base_ty) = self.adjusted_ty(base) else { return Ok(None) };
+                    match self.node(base_ty, e)? {
+                        PNode::Array(..) => Self::prepend_path_step(&mut path, DynPathStep::ArrayElem),
+                        PNode::Slice(_) => Self::prepend_path_step(&mut path, DynPathStep::SliceElem),
+                        _ => return Ok(None),
+                    }
+                    cur = base;
+                }
                 Expr::Path(_) => match self.expr_def(cur) {
                     Some(Def::Static(item, _) | Def::Const(item)) => {
                         if let Ok(sig) = facts.sig(item)
@@ -1495,31 +1742,58 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                             && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
                         {
                             let base = self.fn_sig_param_binder(sig, sig.inputs(), heads);
-                            return self.find_unique_dyn_with_binder(out_ty, out_slots, base, heads, want_dyn, e);
+                            return self.project_head_path(out_ty, out_slots, base, &path, heads, want_dyn, e);
                         }
                         return Ok(None);
                     }
                     _ => return Ok(None),
                 },
-                Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
-                    let field_idx = match self.expr(cur)? {
-                        Expr::Field { .. } => self.field_of(cur),
-                        Expr::TupleField { index, .. } => Some(index),
-                        _ => None,
-                    };
-                    if let Some(fi) = field_idx
-                        && let Some(adt) = self.peel_field_adt(base, e)?
-                        && let Ok(col) = facts.regions().field(adt, 0, fi)
-                        && let Some(m) = self.find_unique_dyn_with_binder(col.ty(), col.as_slice(), 0, heads, want_dyn, e)?
-                    {
+                Expr::TupleField { base, index } => {
+                    Self::prepend_path_step(&mut path, DynPathStep::TupleElem(index));
+                    cur = base;
+                }
+                Expr::Field { base, .. } => {
+                    let Some(fi) = self.field_of(cur) else { return Ok(None) };
+                    let Some(adt) = self.peel_field_adt(base, e)? else { return Ok(None) };
+                    let Ok(col) = facts.regions().field(adt, 0, fi) else { return Ok(None) };
+                    if let Some(m) = self.project_head_path(col.ty(), col.as_slice(), 0, &path, heads, want_dyn, e)? {
                         return Ok(Some(m));
+                    }
+                    let Some((param_p, rem_start)) = self.match_head_path_to_param(col.ty(), &path, heads, e) else {
+                        return Ok(None);
+                    };
+                    Self::replace_path_prefix(&mut path, &[DynPathStep::AdtArg(param_p)], rem_start);
+                    // Account for any auto-deref on `base` to reach `adt`.
+                    let Ok(mut bt) = self.adjusted_ty(base) else { return Ok(None) };
+                    let mut derefs: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
+                    for _ in 0..8 {
+                        match self.node(bt, e)? {
+                            PNode::Adt(k, _) if k == adt => break,
+                            PNode::Ref(_, inner) => {
+                                derefs.push(DynPathStep::RefInner);
+                                bt = inner;
+                            }
+                            PNode::Adt(k, l) if facts.adt(k).is_some_and(|a| a.is_box) => {
+                                let Some(&inner) = self.list(l, e)?.first() else { return Ok(None) };
+                                derefs.push(DynPathStep::AdtArg(0));
+                                bt = inner;
+                            }
+                            _ => return Ok(None),
+                        }
+                    }
+                    if !derefs.is_empty() {
+                        Self::replace_path_prefix(&mut path, &derefs, 0);
                     }
                     cur = base;
                 }
                 Expr::Call { callee, args } => {
-                    if matches!(self.expr_def(callee), Some(Def::Ctor { .. }))
+                    if let Some(Def::Ctor { adt, variant, .. }) = self.expr_def(callee)
                         && let Some(&[only]) = self.body.expr_lists.get(args.range())
+                        && let Ok(col) = facts.regions().field(adt, variant, 0)
+                        && let Some((param_p, rem_start)) = self.match_head_path_to_param(col.ty(), &path, heads, e)
                     {
+                        let _ = param_p;
+                        Self::replace_path_prefix(&mut path, &[], rem_start);
                         cur = only;
                         continue;
                     }
@@ -1533,18 +1807,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
                     {
                         let base = self.fn_sig_param_binder(sig, sig.inputs(), heads);
-                        if let Some(m) = self.find_unique_dyn_with_binder(out_ty, out_slots, base, heads, want_dyn, e)? {
+                        if let Some(m) = self.project_head_path(out_ty, out_slots, base, &path, heads, want_dyn, e)? {
                             return Ok(Some(m));
                         }
-                        // Only unwrap a unary call when its resolved signature ties its input's
-                        // generic type parameter into its return type (e.g. `RwLock::write(&x)`
-                        // or `Result::unwrap(x)`), never arbitrary `fn token<T>(_: T) -> Token`.
                         if let Some(&[only]) = self.body.expr_lists.get(args.range())
+                            && let Some((param_p, rem_start)) = self.match_head_path_to_param(out_ty, &path, heads, e)
                             && let Ok(in_ty) = self.sig_declared(sig, 0, e)
-                            && self.head_shares_type_param(in_ty, out_ty, heads, e)
                         {
-                            cur = only;
-                            continue;
+                            let mut prefix: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
+                            if self.find_unique_param_path(in_ty, param_p, heads, &mut prefix, e) {
+                                Self::replace_path_prefix(&mut path, &prefix, rem_start);
+                                cur = only;
+                                continue;
+                            }
                         }
                     }
                     return Ok(None);
@@ -1556,14 +1831,18 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
                     {
                         let base = self.fn_sig_param_binder(sig, sig.inputs(), heads);
-                        if let Some(m) = self.find_unique_dyn_with_binder(out_ty, out_slots, base, heads, want_dyn, e)? {
+                        if let Some(m) = self.project_head_path(out_ty, out_slots, base, &path, heads, want_dyn, e)? {
                             return Ok(Some(m));
                         }
-                        if let Ok(self_ty) = self.sig_declared(sig, 0, e)
-                            && self.head_shares_type_param(self_ty, out_ty, heads, e)
+                        if let Some((param_p, rem_start)) = self.match_head_path_to_param(out_ty, &path, heads, e)
+                            && let Ok(self_ty) = self.sig_declared(sig, 0, e)
                         {
-                            cur = receiver;
-                            continue;
+                            let mut prefix: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
+                            if self.find_unique_param_path(self_ty, param_p, heads, &mut prefix, e) {
+                                Self::replace_path_prefix(&mut path, &prefix, rem_start);
+                                cur = receiver;
+                                continue;
+                            }
                         }
                     }
                     return Ok(None);
@@ -1588,32 +1867,23 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         && let Expr::Call { args, .. } = self.expr(scrutinee)?
                         && let Some(&[only]) = self.body.expr_lists.get(args.range())
                     {
-                        if let Some((item, _)) = self.callee_of(scrutinee)
-                            && let Ok(sig) = facts.sig(item)
-                            && let Some(out_slots) = sig.output()
-                            && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
-                        {
-                            let base = self.fn_sig_param_binder(sig, sig.inputs(), heads);
-                            if let Some(m) = self.find_unique_dyn_with_binder(out_ty, out_slots, base, heads, want_dyn, e)? {
-                                return Ok(Some(m));
-                            }
-                        }
                         if let (Ok(only_ty), Ok(arm_ty)) = (self.adjusted_ty(only), self.expr_ty(arm.body))
                             && let Ok(PNode::Adt(_, adt_args)) = self.node(only_ty, e)
-                            && self.list(adt_args, e)?.contains(&arm_ty)
+                            && let Some(pos) = self.list(adt_args, e)?.iter().position(|&a| a == arm_ty)
                         {
+                            Self::prepend_path_step(&mut path, DynPathStep::AdtArg(to_u32(pos)));
                             cur = only;
                             continue;
                         }
+                        return Ok(None);
                     }
                     cur = arm.body;
                 }
                 Expr::Local(p) => {
                     if let Some((adt, variant, field)) = self.pat_field_source(p)?
                         && let Ok(col) = facts.regions().field(adt, variant, field)
-                        && let Some(m) = self.find_unique_dyn_with_binder(col.ty(), col.as_slice(), 0, heads, want_dyn, e)?
                     {
-                        return Ok(Some(m));
+                        return self.project_head_path(col.ty(), col.as_slice(), 0, &path, heads, want_dyn, e);
                     }
                     if let Some(param) = self.body.params.iter().position(|x| *x == p)
                         && let Ok(param32) = u32::try_from(param)
@@ -1622,13 +1892,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         && let Ok(in_ty) = self.sig_declared(own_sig, param32, e)
                     {
                         let base = self.fn_sig_param_binder(own_sig, param32, heads);
-                        if let Some(m) = self.find_unique_dyn_with_binder(in_ty, in_slots, base, heads, want_dyn, e)? {
-                            return Ok(Some(m));
-                        }
+                        return self.project_head_path(in_ty, in_slots, base, &path, heads, want_dyn, e);
                     }
-                    // Allow tracing through `let mut readers = READERS.write();` (mutably
-                    // borrowing a container for `push`/`insert` does not change its declared type,
-                    // whereas an explicit `let` type annotation or direct reassignment might).
+                    // Trace through an unannotated, unreassigned `let p = init;` (exact binding
+                    // `pat == p`, so no destructuring offset is dropped).
                     let reassigned = self.body.exprs.iter().any(|ex| {
                         matches!(
                             *ex,
@@ -1642,33 +1909,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     let mut init_expr: Option<ExprId> = None;
                     for stmt in self.body.stmts.iter() {
                         if let Stmt::Let { pat, ty, init: Some(i), .. } = *stmt
-                            && self.pat_contains(pat, p)?
+                            && pat == p
                         {
                             if ty.is_some() || init_expr.is_some() {
                                 return Ok(None);
                             }
                             init_expr = Some(i);
-                        }
-                    }
-                    for expr in self.body.exprs.iter() {
-                        match *expr {
-                            Expr::Let { pat, init } if self.pat_contains(pat, p)? => {
-                                if init_expr.is_some() {
-                                    return Ok(None);
-                                }
-                                init_expr = Some(init);
-                            }
-                            Expr::Match { scrutinee, arms } => {
-                                for arm in self.body.arms.get(arms.range()).unwrap_or(&[]) {
-                                    if self.pat_contains(arm.pat, p)? {
-                                        if init_expr.is_some() {
-                                            return Ok(None);
-                                        }
-                                        init_expr = Some(scrutinee);
-                                    }
-                                }
-                            }
-                            _ => {}
                         }
                     }
                     let Some(init) = init_expr else { return Ok(None) };
@@ -1680,108 +1926,206 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         Ok(None)
     }
 
-    /// Collects every `PNode::Param(p)` appearing inside head-table type `root`.
-    fn collect_head_type_params(&self, root: PTy, heads: &blaze_borrow::Columns<'_>, out: &mut Vec<u32, A>, e: ExprId) {
+    /// Counts pre-order binder nodes (`PNode::FnPtr` and `PNode::Dynamic`) inside head-table `root`.
+    fn count_head_binders(&self, root: PTy, heads: &blaze_borrow::Columns<'_>) -> u32 {
         use blaze_borrow::RegionTypes;
+        let mut binders = 0u32;
         let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
         stack.push(root);
         let mut steps = 0u32;
-        while let Some(cur) = stack.pop() {
+        while let Some(t) = stack.pop() {
             steps += 1;
             if steps > MOST_POSITIONS {
                 break;
             }
-            match self.head_node(cur, e) {
-                Ok(PNode::Param(p)) => {
-                    if out.scan_for(&p).is_none() {
-                        out.push(p);
+            let Ok(n) = heads.node(t) else { break };
+            if matches!(n, PNode::FnPtr(..) | PNode::Dynamic(_)) {
+                binders = binders.saturating_add(1);
+            }
+            if let Ok(ks) = heads.kids(t) {
+                for ci in (0..ks.len()).rev() {
+                    if let Some(child) = ks.get(ci) {
+                        stack.push(child);
                     }
                 }
-                Ok(_) => {
-                    if let Ok(kids) = heads.kids(cur) {
-                        for ci in 0..kids.len() {
-                            if let Some(child) = kids.get(ci) {
-                                stack.push(child);
-                            }
-                        }
-                    }
-                }
-                Err(_) => {}
             }
         }
+        binders
     }
 
-    /// Whether head-table types `a` and `b` share at least one generic type parameter `Param(p)`.
-    fn head_shares_type_param(&self, a: PTy, b: PTy, heads: &blaze_borrow::Columns<'_>, e: ExprId) -> bool {
-        let mut pa: Vec<u32, A> = Vec::new_in(self.alloc);
-        self.collect_head_type_params(a, heads, &mut pa, e);
-        if pa.is_empty() {
-            return false;
-        }
-        let mut pb: Vec<u32, A> = Vec::new_in(self.alloc);
-        self.collect_head_type_params(b, heads, &mut pb, e);
-        pa.iter().any(|p| pb.scan_for(p).is_some())
-    }
-
-    /// Searches a head-table type `(root, slots)` in exact pre-order (tracking binder indices
-    /// from `base_binder`) for a unique `PNode::Dynamic` matching `want_dyn`.
+    /// Projects head-table `(root, slots, base_binder)` along the exact outer-to-inner `path` and
+    /// returns `Some((dyn_ty, dyn_slots, dyn_binder))` iff the target node is a `PNode::Dynamic`
+    /// whose predicates match `want_dyn`.
     #[allow(clippy::type_complexity)]
-    fn find_unique_dyn_with_binder(
+    fn project_head_path(
         &self,
         root: PTy,
         slots: &'b [Region],
         base_binder: u32,
+        path: &[DynPathStep],
         heads: &blaze_borrow::Columns<'_>,
         want_dyn: PTy,
         e: ExprId,
     ) -> Result<Option<(PTy, &'b [Region], u32)>, Refusal> {
         use blaze_borrow::RegionTypes;
-
         let PNode::Dynamic(want_preds) = self.node(want_dyn, e)? else { return Ok(None) };
         let want_list = self.list(want_preds, e)?;
-        let mut stack: Vec<(PTy, &'b [Region], bool), A> = Vec::new_in(self.alloc);
-        stack.push((root, slots, false));
-        let mut found: Option<(PTy, &'b [Region], u32)> = None;
-        let mut next_binder = base_binder;
-        let mut steps = 0u32;
-        while let Some((cur, cur_slots, under_fn_ptr)) = stack.pop() {
-            steps += 1;
-            if steps > MOST_POSITIONS {
-                return Ok(None);
-            }
-            let cur_node = self.head_node(cur, e).ok();
-            let mut child_under_fn_ptr = under_fn_ptr;
-            if let Some(PNode::Dynamic(h_preds)) = cur_node {
-                let my_binder = next_binder;
-                next_binder += 1;
-                if !under_fn_ptr && self.dyn_preds_match(h_preds, want_list, e)? {
-                    match found {
-                        None => found = Some((cur, cur_slots, my_binder)),
-                        Some((_, prev_slots, prev_b)) if prev_b == my_binder && prev_slots == cur_slots => {}
-                        Some(_) => return Ok(None),
+
+        let mut cur = root;
+        let mut cur_slots = slots;
+        let mut cur_binder = base_binder;
+        for &step in path {
+            let Ok(node) = self.head_node(cur, e) else { return Ok(None) };
+            match (step, node) {
+                (DynPathStep::RefInner, PNode::Ref(_, inner)) => {
+                    let Some(rest) = cur_slots.get(1..) else { return Ok(None) };
+                    cur = inner;
+                    cur_slots = rest;
+                }
+                (DynPathStep::PtrInner, PNode::Ptr(_, inner))
+                | (DynPathStep::SliceElem, PNode::Slice(inner))
+                | (DynPathStep::ArrayElem, PNode::Array(inner, _)) => {
+                    cur = inner;
+                }
+                (DynPathStep::TupleElem(idx), PNode::Tuple(_)) | (DynPathStep::AdtArg(idx), PNode::Adt(..)) => {
+                    let Ok(own) = heads.own(cur) else { return Ok(None) };
+                    let Ok(kids) = heads.kids(cur) else { return Ok(None) };
+                    if idx >= kids.len() {
+                        return Ok(None);
+                    }
+                    let Some((_, mut rest)) = cur_slots.split_at_checked(own.len()) else { return Ok(None) };
+                    for k in 0..=idx {
+                        let Some(kid) = kids.get(k) else { return Ok(None) };
+                        let Ok(kc) = heads.count(kid) else { return Ok(None) };
+                        let Some((kslots, next_rest)) = rest.split_at_checked(kc.len()) else { return Ok(None) };
+                        rest = next_rest;
+                        if k == idx {
+                            cur = kid;
+                            cur_slots = kslots;
+                        } else {
+                            cur_binder = cur_binder.saturating_add(self.count_head_binders(kid, heads));
+                        }
                     }
                 }
-            } else if matches!(cur_node, Some(PNode::FnPtr(..))) {
-                next_binder += 1;
-                child_under_fn_ptr = true;
-            }
-            let Ok(own) = heads.own(cur) else { continue };
-            let Ok(kids) = heads.kids(cur) else { continue };
-            let Some((_, mut rest)) = cur_slots.split_at_checked(own.len()) else { continue };
-            // Collect children first, then push in reverse so stack pop visits in exact pre-order.
-            let mut kslices: Vec<(PTy, &'b [Region]), A> = Vec::new_in(self.alloc);
-            for k in 0..kids.len() {
-                let Some(kid) = kids.get(k) else { break };
-                let Ok(kc) = heads.count(kid) else { break };
-                let Some((kslots, next_rest)) = rest.split_at_checked(kc.len()) else { break };
-                rest = next_rest;
-                kslices.push((kid, kslots));
-            }
-            for &(kid, kslots) in kslices.iter().rev() {
-                stack.push((kid, kslots, child_under_fn_ptr));
+                _ => return Ok(None),
             }
         }
-        Ok(found)
+        if let Ok(PNode::Dynamic(h_preds)) = self.head_node(cur, e)
+            && self.dyn_preds_match(h_preds, want_list, e)?
+        {
+            Ok(Some((cur, cur_slots, cur_binder)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Walks head-table `head_ty` along outer-to-inner `path`. If a prefix `0..k` lands on
+    /// `PNode::Param(p)`, returns `Some((p, k))` so the remaining tail is `path[k..]`.
+    fn match_head_path_to_param(
+        &self,
+        mut head_ty: PTy,
+        path: &[DynPathStep],
+        heads: &blaze_borrow::Columns<'_>,
+        e: ExprId,
+    ) -> Option<(u32, usize)> {
+        use blaze_borrow::RegionTypes;
+        for (k, &step) in path.iter().enumerate() {
+            let Ok(node) = self.head_node(head_ty, e) else { return None };
+            if let PNode::Param(p) = node {
+                return Some((p, k));
+            }
+            head_ty = match (step, node) {
+                (DynPathStep::RefInner, PNode::Ref(_, inner))
+                | (DynPathStep::PtrInner, PNode::Ptr(_, inner))
+                | (DynPathStep::SliceElem, PNode::Slice(inner))
+                | (DynPathStep::ArrayElem, PNode::Array(inner, _)) => inner,
+                (DynPathStep::TupleElem(idx), PNode::Tuple(_)) | (DynPathStep::AdtArg(idx), PNode::Adt(..)) => {
+                    heads.kids(head_ty).ok()?.get(idx)?
+                }
+                _ => return None,
+            };
+        }
+        match self.head_node(head_ty, e) {
+            Ok(PNode::Param(p)) => Some((p, path.len())),
+            _ => None,
+        }
+    }
+
+    /// Finds the unique structural path from `head_ty` down to `PNode::Param(want_param)`, writing
+    /// the outer-to-inner steps into `out`. Returns `false` if `want_param` occurs 0 times or more
+    /// than once (or only inside a non-structural node like `FnPtr`/`Dynamic`/`Alias`/`Opaque`).
+    fn find_unique_param_path(
+        &self,
+        head_ty: PTy,
+        want_param: u32,
+        heads: &blaze_borrow::Columns<'_>,
+        out: &mut Vec<DynPathStep, A>,
+        e: ExprId,
+    ) -> bool {
+        use blaze_borrow::RegionTypes;
+        enum Work {
+            Enter(PTy, Option<DynPathStep>),
+            Leave,
+        }
+        out.clear();
+        let mut found = false;
+        let mut cur_path: Vec<DynPathStep, A> = Vec::new_in(self.alloc);
+        let mut stack: Vec<Work, A> = Vec::new_in(self.alloc);
+        stack.push(Work::Enter(head_ty, None));
+        let mut steps = 0u32;
+        while let Some(item) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                out.clear();
+                return false;
+            }
+            match item {
+                Work::Leave => {
+                    cur_path.pop();
+                }
+                Work::Enter(ty, step) => {
+                    if let Some(s) = step {
+                        cur_path.push(s);
+                        stack.push(Work::Leave);
+                    }
+                    let Ok(node) = self.head_node(ty, e) else { continue };
+                    match node {
+                        PNode::Param(p) if p == want_param => {
+                            if found {
+                                out.clear();
+                                return false;
+                            }
+                            out.extend_from_slice(&cur_path);
+                            found = true;
+                        }
+                        PNode::Ref(_, inner) => stack.push(Work::Enter(inner, Some(DynPathStep::RefInner))),
+                        PNode::Ptr(_, inner) => stack.push(Work::Enter(inner, Some(DynPathStep::PtrInner))),
+                        PNode::Slice(inner) => stack.push(Work::Enter(inner, Some(DynPathStep::SliceElem))),
+                        PNode::Array(inner, _) => stack.push(Work::Enter(inner, Some(DynPathStep::ArrayElem))),
+                        PNode::Tuple(_) => {
+                            if let Ok(kids) = heads.kids(ty) {
+                                for k in (0..kids.len()).rev() {
+                                    if let Some(kid) = kids.get(k) {
+                                        stack.push(Work::Enter(kid, Some(DynPathStep::TupleElem(k))));
+                                    }
+                                }
+                            }
+                        }
+                        PNode::Adt(..) => {
+                            if let Ok(kids) = heads.kids(ty) {
+                                for k in (0..kids.len()).rev() {
+                                    if let Some(kid) = kids.get(k) {
+                                        stack.push(Work::Enter(kid, Some(DynPathStep::AdtArg(k))));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        found
     }
 
     /// Pre-order binder index of parameter `param_i`'s root node in `sig` (`sig`'s own root

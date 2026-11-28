@@ -158,6 +158,9 @@ impl<A: Allocator + Copy> Builder<A> {
     pub(crate) fn known(&mut self, from: Origin, into: Origin) {
         self.inner.known(from, into)
     }
+    pub(crate) fn known_edges(&self) -> &[(Origin, Origin)] {
+        self.inner.known_edges()
+    }
     pub(crate) fn block(&mut self) -> Block {
         self.inner.block()
     }
