@@ -413,8 +413,8 @@ fn record_union_tuple_distinct_unification_and_shapes() {
     let elems = tys.mk_list(&[i32_ty, u8_ty]).expect("mk list");
 
     let tup = tys.mk(TyKind::Tuple(elems)).expect("mk tuple");
-    let rec_a = tys.mk(TyKind::Record(0x1111_2222_3333_4444, elems)).expect("mk record a");
-    let rec_b = tys.mk(TyKind::Record(0x5555_6666_7777_8888, elems)).expect("mk record b");
+    let rec_a = tys.mk(TyKind::Record(0x1111_2222_3333_4444, 0, elems)).expect("mk record a");
+    let rec_b = tys.mk(TyKind::Record(0x5555_6666_7777_8888, 0, elems)).expect("mk record b");
     let uni = tys.mk(TyKind::Union(elems)).expect("mk union");
 
     // Distinct Shape buckets.
@@ -436,7 +436,7 @@ fn record_union_tuple_distinct_unification_and_shapes() {
     // Same-schema Record unifies element-wise and binds variables.
     let v1 = tys.fresh(VarKind::Ty).expect("fresh v1");
     let rec_a_var_list = tys.mk_list(&[v1, u8_ty]).expect("mk list");
-    let rec_a_var = tys.mk(TyKind::Record(0x1111_2222_3333_4444, rec_a_var_list)).expect("mk rec var");
+    let rec_a_var = tys.mk(TyKind::Record(0x1111_2222_3333_4444, 0, rec_a_var_list)).expect("mk rec var");
     assert!(tys.unify(rec_a, rec_a_var, Relate::Lazy, &mut deferred).expect("unify same schema"));
     assert_eq!(tys.shallow_resolve(v1), i32_ty);
 
@@ -453,7 +453,7 @@ fn record_union_tuple_distinct_unification_and_shapes() {
     let mut dec = Decode::new_in(alloc);
     canon.term(&tys, &mut words, rec_a).expect("canon rec");
     dec.run(&mut tys, &words).expect("decode rec");
-    assert_eq!(tys.kind(rec_a), TyKind::Record(0x1111_2222_3333_4444, elems));
+    assert_eq!(tys.kind(rec_a), TyKind::Record(0x1111_2222_3333_4444, 0, elems));
     words.clear();
     canon.clear();
     canon.term(&tys, &mut words, uni).expect("canon uni");

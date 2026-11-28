@@ -62,7 +62,7 @@ pub struct ScopedBy<'d, 'n: 'd, S> {
 pub struct BodyBlocks<'a> {
     krate: blaze_id::CrateItemKey,
     nested: blaze_file_items::nested::Nested<'a>,
-    hand: AVec<'a, Option<ItemKey>>,
+    hand: super::scope_table::OwnedHandBlocks<'a>,
     read: core::cell::RefCell<ReadExpansions<'a>>,
     alloc: Alloc<'a>,
 }
@@ -91,9 +91,22 @@ pub fn body_blocks<'a>(krate: blaze_id::CrateItemKey, body: ItemKey, text: &str,
     if nested.end != blaze_file_items::nested::NestedEnd::Whole {
         return None;
     }
-    let hand = blaze_scope::blocks::block_modules(krate, body, &nested, alloc);
+    let modules = blaze_scope::blocks::block_modules(krate, body, &nested, alloc);
+    let head_module = (!nested.head_calls.is_empty()).then(|| blaze_scope::blocks::head_call_module(krate, body));
+    let hand = super::scope_table::OwnedHandBlocks { modules, head_module, call_keys: AVec::new_in(alloc) };
+    Some(body_blocks_from(krate, nested, hand, alloc))
+}
+
+/// [`body_blocks`] from an already-scanned `nested` and mapped `hand` block modules (used for both
+/// direct library bodies and head-level anonymous constants mapped onto their enclosing item).
+pub fn body_blocks_from<'a>(
+    krate: blaze_id::CrateItemKey,
+    nested: blaze_file_items::nested::Nested<'a>,
+    hand: super::scope_table::OwnedHandBlocks<'a>,
+    alloc: Alloc<'a>,
+) -> BodyBlocks<'a> {
     let read = ReadExpansions { made: Vec::new_in(alloc), at: Vec::new_in(alloc) };
-    Some(BodyBlocks { krate, nested, hand, read: core::cell::RefCell::new(read), alloc })
+    BodyBlocks { krate, nested, hand, read: core::cell::RefCell::new(read), alloc }
 }
 
 /// The two questions [`ScopedBy`] asks of a body's blocks ([`BodyBlocks`]). It holds them
@@ -117,7 +130,7 @@ impl BlockModules for BodyBlocks<'_> {
     /// those that hold it, since a block inside another opens after it. `None` when no block
     /// holds the call.
     fn hand_module(&self, call: blaze_surface::Range) -> Option<ItemKey> {
-        self.nested.blocks.iter().zip(self.hand.iter()).filter(|(b, m)| m.is_some() && b.open < call.start && call.end <= b.close).last().and_then(|(_, m)| *m)
+        self.nested.blocks.iter().zip(self.hand.modules.iter()).filter(|(b, m)| m.is_some() && b.open < call.start && call.end <= b.close).last().and_then(|(_, m)| *m)
     }
 
     /// The module of the innermost block an expansion wrote that holds the body call at `call`
@@ -208,7 +221,7 @@ impl<'a> BodyBlocks<'a> {
             }
         }
         for &j in chain.iter().rev() {
-            let one = super::scope_table::expanded(self.krate, &self.nested, Some(self.hand.as_slice()), &expansions, j, &read.made, self.alloc).map_err(|r| r.form())?;
+            let one = super::scope_table::expanded(self.krate, &self.nested, Some(self.hand.as_ref()), &expansions, j, &read.made, self.alloc).map_err(|r| r.form())?;
             read.made[j as usize] = Some(one);
             read.at[j as usize] = place(j);
         }
@@ -463,21 +476,44 @@ mod tests {
         assert_eq!(blocks.expansion_module(expansions, calls[1]), Ok(Some(first_block)), "the inner call itself stands in the outer expansion's block");
     }
 
-    /// A block an expansion wrote that declares an item, where the expansion's call is no
-    /// statement call of a block the names library filed (a call outside every block of the
-    /// item, a `const`'s initializer): refused by name, never read at an outer block, where
-    /// the block's `__d` is not bound.
+    /// A block an expansion wrote that declares an item, where the expansion's call is not
+    /// filed by the names library (e.g. a nested argument call `outer!(check!(x))` that is
+    /// neither a block call nor a top-level head call): refused by name, never read at an
+    /// outer block, where the block's `__d` is not bound. Meanwhile a direct top-level `const`
+    /// initializer call (`const C: () = check!(x);`) IS filed as a head call and resolves its
+    /// block module.
     #[test]
     fn an_unfiled_expansion_block_that_binds_is_refused() {
-        let item = "const C: () = check!(x);";
+        let alloc = blaze_own::testing::heap().alloc();
+        let krate = CrateItemKey(key(b"app"));
+        let body = ItemKey(key(b"body"));
+        let item = "fn f(x: bool) { outer!(check!(x)); }";
         let expansion = "if x { extern crate dep as __d ; let _m = __d :: unit ! ( ) ; }";
         let mut text = std::string::String::from(item);
         text.push_str(expansion);
-        let alloc = blaze_own::testing::heap().alloc();
-        let blocks = body_blocks(CrateItemKey(key(b"app")), ItemKey(key(b"body")), item, alloc).unwrap_or_else(|| panic!("the item scans whole"));
+        let blocks = body_blocks(krate, body, item, alloc).unwrap_or_else(|| panic!("the item scans whole"));
         let calls = [nth(item, "check!(x)", 0)];
         let expansions = blaze_lower::Expansions { text: &text, item_len: u32::try_from(item.len()).unwrap_or(u32::MAX), starts: &[0], calls: &calls };
         assert_eq!(blocks.expansion_module(expansions, nth(&text, "__d :: unit ! ( )", 0)), Err(UNFILED_BLOCK));
+
+        let const_item = "const C: () = check!(x);";
+        let mut const_text = std::string::String::from(const_item);
+        const_text.push_str(expansion);
+        let const_blocks = body_blocks(krate, body, const_item, alloc).unwrap_or_else(|| panic!("the const scans whole"));
+        let const_calls = [nth(const_item, "check!(x)", 0)];
+        let const_expansions = blaze_lower::Expansions {
+            text: &const_text,
+            item_len: u32::try_from(const_item.len()).unwrap_or(u32::MAX),
+            starts: &[0],
+            calls: &const_calls,
+        };
+        let head_mod = const_blocks.hand.head_module.expect("top-level const call must have a head module");
+        let call_key = key_of(krate, head_mod, "MacroCall", "", 0);
+        assert_eq!(
+            const_blocks.expansion_module(const_expansions, nth(&const_text, "__d :: unit ! ( )", 0)),
+            Ok(Some(expansion_block(krate, call_key, 0))),
+            "a top-level const initializer macro call is filed under the head calls module",
+        );
     }
 
     /// `cfg_if!` (nybbles 0.4.8 `Nibbles::as_array`) expands through an attributed statement call

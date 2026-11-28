@@ -94,6 +94,21 @@ impl RecordSchema {
         hi.u64(self.0);
         ItemKey(u128::from(lo.finish()) | (u128::from(hi.finish()) << 64))
     }
+
+    /// Deterministic owner-scoped `World::field_defaults` key for a structural record type
+    /// carrying a non-zero 64-bit `defaults_tag` (falls back to [`Self::defaults_key`] when 0).
+    pub fn scoped_defaults_key(self, defaults_tag: u64) -> ItemKey {
+        if defaults_tag == 0 {
+            return self.defaults_key();
+        }
+        let mut lo = StableHasher::new("blaze-typeck record defaults lo");
+        lo.u64(self.0);
+        lo.u64(defaults_tag);
+        let mut hi = StableHasher::new("blaze-typeck record defaults hi");
+        hi.u64(self.0);
+        hi.u64(defaults_tag);
+        ItemKey(u128::from(lo.finish()) | (u128::from(hi.finish()) << 64))
+    }
 }
 
 impl ContentHash for RecordSchema {

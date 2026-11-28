@@ -722,6 +722,36 @@ impl<'b> View<'b> {
         Ok(out)
     }
 
+    /// The concatenated UTF-8 text of all expansions appended to this view (`expansion_text(0..)`),
+    /// paired with every mark row inside that buffer (offsets relative to the start of the
+    /// expanded buffer). Returns `Ok(None)` when the view recorded no marked expansion tokens.
+    pub fn expanded_marks<'x>(&self, alloc: Alloc<'x>) -> Result<Option<(&'b str, AVec<'x, (u32, crate::mark_site::TextMark)>)>, TextAt> {
+        use blaze_expand::origin_column::MARK;
+        if self.mark_starts.is_empty() {
+            return Ok(None);
+        }
+        let bad = TextAt::Row(BadRow { column: "mark_bytes", tag: u16::MAX });
+        let exp_str = core::str::from_utf8(self.expanded).map_err(|_| bad)?;
+        let item_len = self.lens.item_len;
+        let mut out = AVec::with_capacity_in(self.mark_starts.len(), alloc);
+        for (i, &start) in self.mark_starts.iter().enumerate() {
+            let Some(rel) = start.checked_sub(item_len) else { continue };
+            let bytes = self.mark_bytes.get(i * MARK..(i + 1) * MARK).ok_or(bad)?;
+            let mark = crate::mark_site::TextMark::from_bytes(bytes).ok_or(bad)?;
+            out.push((rel, mark));
+        }
+        if out.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some((exp_str, out)))
+        }
+    }
+
+    /// The concatenated UTF-8 text of all expansions appended to this view.
+    pub fn expanded_text(&self) -> Result<&'b str, TextAt> {
+        core::str::from_utf8(self.expanded).map_err(|_| TextAt::Row(BadRow { column: "expanded", tag: u16::MAX }))
+    }
+
     /// The range of the row at `i` of the `rows` column (a list's `start + k`).
     pub fn row_range(&self, i: u32) -> Result<BodyRange, BadRow> {
         self.ranged("row_ranges", self.row_ranges, i)

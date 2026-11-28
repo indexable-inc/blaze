@@ -1012,8 +1012,28 @@ impl<'a> Tys<'a> {
 
     /// A structural record of canonical schema hash `schema` and sorted field types `fields`.
     pub fn record(&mut self, schema: u64, fields: List) -> Ty {
-        let s = self.scalar(u128::from(schema));
+        self.record_with_defaults(schema, 0, fields)
+    }
+
+    /// A structural record of canonical schema hash `schema`, optional owner-scoped defaults tag
+    /// `defaults` (0 = anonymous / no owner-scoped defaults), and sorted field types `fields`.
+    /// Structural equality and unification compare only `schema` and `fields`; `defaults` is
+    /// carried through type inference so record literals inherit their expected alias's defaults.
+    pub fn record_with_defaults(&mut self, schema: u64, defaults: u64, fields: List) -> Ty {
+        let packed = u128::from(schema) | (u128::from(defaults) << 64);
+        let s = self.scalar(packed);
         self.intern_ty(ty::RECORD, fields.node().bits(), s)
+    }
+
+    /// The owner-scoped defaults tag of a `ty::RECORD` (0 for non-records or untagged records).
+    pub fn record_defaults_tag(&self, t: Ty) -> u64 {
+        let i = ix(t.0);
+        let Row { kind: k, b, .. } = self.ty.at(i);
+        if k != ty::RECORD {
+            return 0;
+        }
+        let [_, _, _, _, _, _, _, _, b8, b9, b10, b11, b12, b13, b14, b15] = self.scalar_value(b).to_le_bytes();
+        u64::from_le_bytes([b8, b9, b10, b11, b12, b13, b14, b15])
     }
 
     /// A structural tagged union of canonical member types `members`.

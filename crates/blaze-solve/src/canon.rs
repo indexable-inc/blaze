@@ -323,11 +323,14 @@ fn emit<T: Tys>(tys: &T, out: &mut Vec<u32, Alloc<'_>>, k: TyKind) {
         TyKind::Str => out.push(header(T_STR, 0)),
         TyKind::Never => out.push(header(T_NEVER, 0)),
         TyKind::Tuple(l) => out.push(header(T_TUPLE, l.len)),
-        TyKind::Record(s, l) => {
+        TyKind::Record(s, d, l) => {
             out.push(header(T_RECORD, l.len));
             let [b0, b1, b2, b3, b4, b5, b6, b7] = s.to_le_bytes();
             out.push(u32::from_le_bytes([b0, b1, b2, b3]));
             out.push(u32::from_le_bytes([b4, b5, b6, b7]));
+            let [d0, d1, d2, d3, d4, d5, d6, d7] = d.to_le_bytes();
+            out.push(u32::from_le_bytes([d0, d1, d2, d3]));
+            out.push(u32::from_le_bytes([d4, d5, d6, d7]));
         }
         TyKind::Union(l) => out.push(header(T_UNION, l.len)),
         TyKind::Ref(_, _, m) => {
@@ -545,13 +548,16 @@ impl<'a> Decode<'a> {
                     TyKind::Tuple(tys.mk_list(&self.kids)?)
                 }
                 T_RECORD => {
-                    need(2)?;
-                    i += 2;
+                    need(4)?;
+                    i += 4;
                     let lo = *w.get(at + 1).ok_or(bad(at))?;
                     let hi = *w.get(at + 2).ok_or(bad(at))?;
                     let s = u64::from(lo) | (u64::from(hi) << 32);
+                    let dlo = *w.get(at + 3).ok_or(bad(at))?;
+                    let dhi = *w.get(at + 4).ok_or(bad(at))?;
+                    let d = u64::from(dlo) | (u64::from(dhi) << 32);
                     self.pop_kids(n, at)?;
-                    TyKind::Record(s, tys.mk_list(&self.kids)?)
+                    TyKind::Record(s, d, tys.mk_list(&self.kids)?)
                 }
                 T_UNION => {
                     self.pop_kids(n, at)?;

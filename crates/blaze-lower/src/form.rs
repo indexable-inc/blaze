@@ -1342,7 +1342,7 @@ impl Arm {
         Node { a: self.pat.0, b: opt(self.guard.map(|e| e.0)), c: self.body.0, ..Node::of(ROW_ARM) }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<Arm, BadRow> {
+    pub fn decode(n: Node) -> Result<Arm, BadRow> {
         check_tag!(n, ROW_ARM, "arms");
         Ok(Arm { pat: PatId(n.a), guard: opt_expr(n.b), body: ExprId(n.c) })
     }
@@ -1410,7 +1410,7 @@ impl MethodCall {
         }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<MethodCall, BadRow> {
+    pub fn decode(n: Node) -> Result<MethodCall, BadRow> {
         check_tag!(n, ROW_METHOD, "method calls");
         Ok(MethodCall {
             receiver: ExprId(n.a),
@@ -1483,7 +1483,7 @@ impl Closure {
         }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<Closure, BadRow> {
+    pub fn decode(n: Node) -> Result<Closure, BadRow> {
         check_tag!(n, ROW_CLOSURE, "closures");
         Ok(Closure {
             params: list(n.a, n.b),

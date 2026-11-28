@@ -748,7 +748,7 @@ fn sizedness<T: Tys, F: Facts>(
             }
             true
         }
-        TyKind::Record(_, l) | TyKind::Union(l) => {
+        TyKind::Record(_, _, l) | TyKind::Union(l) => {
             for i in 0..l.len {
                 w.cons.push(tys.list_get(l, i));
             }
@@ -767,7 +767,7 @@ fn sizedness<T: Tys, F: Facts>(
 fn copy_clone<T: Tys>(tys: &T, k: TyKind, out: &mut Vec<Ty, Alloc<'_>>) -> bool {
     match k {
         TyKind::FnDef(..) | TyKind::FnPtr(..) | TyKind::Error => true,
-        TyKind::Tuple(l) | TyKind::Record(_, l) | TyKind::Union(l) => {
+        TyKind::Tuple(l) | TyKind::Record(_, _, l) | TyKind::Union(l) => {
             for i in 0..l.len {
                 out.push(tys.list_get(l, i));
             }
@@ -816,7 +816,7 @@ fn auto_constituents<T: Tys, F: Facts>(
             w.cons.push(e);
             true
         }
-        TyKind::Tuple(l) | TyKind::Record(_, l) | TyKind::Union(l) => {
+        TyKind::Tuple(l) | TyKind::Record(_, _, l) | TyKind::Union(l) => {
             for i in 0..l.len {
                 w.cons.push(tys.list_get(l, i));
             }
@@ -917,7 +917,7 @@ fn bare(k: TyKind) -> TyKind {
     let l0 = |l: List| List { start: 0, len: l.len };
     match k {
         TyKind::Tuple(l) => TyKind::Tuple(l0(l)),
-        TyKind::Record(s, l) => TyKind::Record(s, l0(l)),
+        TyKind::Record(s, _, l) => TyKind::Record(s, 0, l0(l)),
         TyKind::Union(l) => TyKind::Union(l0(l)),
         TyKind::Ref(_, _, m) => TyKind::Ref(Z, Z, m),
         TyKind::RawPtr(_, m) => TyKind::RawPtr(Z, m),

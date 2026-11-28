@@ -52,6 +52,165 @@ use super::keys::{KeyClash, Keys, MemberKind, anon_const_key, checker_of};
 use super::preds::Preds;
 use super::types::{PRIMS, SelfTy, Why, intern};
 
+/// One leaf replacement applied while preparing a head anonymous constant's text
+/// (`const_inherent::substitute_mapped` / `const_qpath::substitute_mapped`): maps byte offsets
+/// in the substituted text back to byte offsets in the original enclosing item's text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextEdit {
+    pub sub_start: u32,
+    pub sub_end: u32,
+    pub orig_start: u32,
+    pub orig_end: u32,
+}
+
+/// Maps byte offset `pos` in a leaf-substituted expression back to its byte offset in the
+/// original unmodified expression slice (rounding into an edit's `orig_start` if `pos` lies
+/// inside a replaced range).
+pub(super) fn orig_offset(edits: &[TextEdit], pos: u32) -> Option<u32> {
+    let mut sub_cur = 0u32;
+    let mut orig_cur = 0u32;
+    for &e in edits {
+        if pos < e.sub_start {
+            return orig_cur.checked_add(pos.checked_sub(sub_cur)?);
+        }
+        if pos < e.sub_end {
+            return Some(e.orig_start);
+        }
+        sub_cur = e.sub_end;
+        orig_cur = e.orig_end;
+    }
+    orig_cur.checked_add(pos.checked_sub(sub_cur)?)
+}
+
+/// Exclusive end-bound counterpart to [`orig_offset`]: if `pos` equals `e.sub_start` it maps
+/// strictly before `e` (`e.orig_start`); if `e.sub_start < pos <= e.sub_end` it rounds up to
+/// `e.orig_end`.
+fn orig_offset_end(edits: &[TextEdit], pos: u32) -> Option<u32> {
+    let mut sub_cur = 0u32;
+    let mut orig_cur = 0u32;
+    for &e in edits {
+        if pos <= e.sub_start {
+            return orig_cur.checked_add(pos.checked_sub(sub_cur)?);
+        }
+        if pos <= e.sub_end {
+            return Some(e.orig_end);
+        }
+        sub_cur = e.sub_end;
+        orig_cur = e.orig_end;
+    }
+    orig_cur.checked_add(pos.checked_sub(sub_cur)?)
+}
+
+/// Composes two substitution passes (`first`: `mid -> orig`, `second`: `final -> mid`) into a
+/// single sorted, non-overlapping edit list (`final -> orig`). When a `second` edit spans over
+/// one or more `first` edits (e.g. an inherent constant `A::N` substituted inside a qualified
+/// associated constant `<[u8; A::N] as Tr>::C`), the outer `second` edit supersedes the
+/// contained `first` edits while non-overlapping `first` edits stay intact.
+pub(super) fn compose_edits(first: &[TextEdit], second: &[TextEdit], out: &mut AVec<'static, TextEdit>) -> Option<()> {
+    let (mut i, mut j) = (0usize, 0usize);
+    let (mut mid_cur, mut final_cur) = (0u32, 0u32);
+    while let (Some(&e1), Some(&e2)) = (first.get(i), second.get(j)) {
+        if e2.orig_end <= e1.sub_start {
+            let orig_start = orig_offset(first, e2.orig_start)?;
+            let orig_end = orig_offset_end(first, e2.orig_end)?;
+            out.push(TextEdit { sub_start: e2.sub_start, sub_end: e2.sub_end, orig_start, orig_end });
+            mid_cur = e2.orig_end;
+            final_cur = e2.sub_end;
+            j += 1;
+        } else if e1.sub_end <= e2.orig_start {
+            let gap = e1.sub_start.checked_sub(mid_cur)?;
+            let sub_start = final_cur.checked_add(gap)?;
+            let sub_len = e1.sub_end.checked_sub(e1.sub_start)?;
+            let sub_end = sub_start.checked_add(sub_len)?;
+            out.push(TextEdit { sub_start, sub_end, orig_start: e1.orig_start, orig_end: e1.orig_end });
+            i += 1;
+        } else {
+            // `e2` overlaps `e1`: require every overlapping `first` edit to be fully contained
+            // inside `e2`'s `[orig_start, orig_end)` so bytes outside composed edits still match
+            // the original source verbatim.
+            while let Some(&inner) = first.get(i) {
+                if inner.sub_start >= e2.orig_end {
+                    break;
+                }
+                if inner.sub_start < e2.orig_start || inner.sub_end > e2.orig_end {
+                    return None;
+                }
+                i += 1;
+            }
+            let orig_start = orig_offset(first, e2.orig_start)?;
+            let orig_end = orig_offset_end(first, e2.orig_end)?;
+            out.push(TextEdit { sub_start: e2.sub_start, sub_end: e2.sub_end, orig_start, orig_end });
+            mid_cur = e2.orig_end;
+            final_cur = e2.sub_end;
+            j += 1;
+        }
+    }
+    while let Some(&e2) = second.get(j) {
+        let orig_start = orig_offset(first, e2.orig_start)?;
+        let orig_end = orig_offset_end(first, e2.orig_end)?;
+        out.push(TextEdit { sub_start: e2.sub_start, sub_end: e2.sub_end, orig_start, orig_end });
+        mid_cur = e2.orig_end;
+        final_cur = e2.sub_end;
+        j += 1;
+    }
+    while let Some(&e1) = first.get(i) {
+        let gap = e1.sub_start.checked_sub(mid_cur)?;
+        let sub_start = final_cur.checked_add(gap)?;
+        let sub_len = e1.sub_end.checked_sub(e1.sub_start)?;
+        let sub_end = sub_start.checked_add(sub_len)?;
+        out.push(TextEdit { sub_start, sub_end, orig_start: e1.orig_start, orig_end: e1.orig_end });
+        i += 1;
+    }
+    Some(())
+}
+
+/// Observable source position of a macro-bearing head anonymous constant (`line!()`, `column!()`,
+/// `file!()`, or a macro expanding to them), hashed into the anonymous constant key so inserting a
+/// blank line or moving a module between `#[path]` files invalidates cached values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadSite<'a> {
+    pub line: u32,
+    pub col: u32,
+    pub file: Option<&'a str>,
+}
+
+/// Expansion-call provenance when a head-level anonymous constant came from expanding a type
+/// macro in the enclosing item's head (e.g. `type A = ty!();` where `ty!()` expands to
+/// `[u8; { enum E {} core::mem::size_of::<E>() }]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadExpansion {
+    /// The `blaze-scope` `MacroCall` key whose `statements_as_items` fragment holds this
+    /// expansion's block modules (`__blaze_block_x<tag(call)>_<ord>`).
+    pub call: LibKey,
+    /// Byte offset in the enclosing item's scanned owner text of the outermost macro call
+    /// (where `line!()`/`column!()`/`file!()` report their call-site position).
+    pub root_call_offset: u32,
+}
+
+/// The enclosing library item whose scanned text (`blaze_scope::blocks`) owns the block modules
+/// of a head-level anonymous constant expression (`where (): Trait<{ pub enum Tag .. }>`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadOwner {
+    pub item: LibKey,
+    /// Byte offset of the original unmodified expression inside `item`'s scanned text
+    /// (`impl_header` for an impl, `trait_head` for a trait, whole text for other items/members),
+    /// or inside the expansion text when [`Self::expansion`] is `Some`.
+    pub offset: u32,
+    /// Byte length of the original unmodified expression inside that scanned text.
+    pub len: u32,
+    /// `Some` when the expression came from expanding a type macro in `item`'s head rather than
+    /// standing verbatim in `item`'s scanned text.
+    pub expansion: Option<HeadExpansion>,
+}
+
+#[derive(Clone, Debug)]
+struct HeadOwned {
+    owner: HeadOwner,
+    exp_text: Option<AString<'static>>,
+    edits: AVec<'static, TextEdit>,
+    member: AString<'static>,
+}
+
 /// One anonymous constant a head asked for: filed as a head by [`file_asked`] before the
 /// evaluator is asked its value.
 #[derive(Clone, Debug)]
@@ -74,6 +233,9 @@ pub struct Ask {
     /// an item declared in the body ([`Ask::in_body`]): its names are read there first, then
     /// at the module. `None`: a constant of the module.
     pub body: Option<(ItemKey, u32)>,
+    /// The enclosing library item whose `blaze-scope` block modules hold items declared inside
+    /// this head-level anonymous constant expression ([`Ask::in_head_item`]).
+    head_owner: Option<HeadOwned>,
     /// Marks are relative to the expression, independent of its position in the enclosing text.
     marked: Option<Marked>,
 }
@@ -235,7 +397,7 @@ impl Ask {
         }
         let name = format!("{prim}: {text}").into_boxed_str();
         let need = need_key(anon_const_key(checker_of(module), &name));
-        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: None, body: None, marked: None })
+        Some(Ask { need, module, ty, name, text: text.into(), self_ty: None, body: None, head_owner: None, marked: None })
     }
 
     /// The anonymous constant `text` of type `ty` written in block `scope` of the body `owner`
@@ -266,7 +428,7 @@ impl Ask {
         }
         .into_boxed_str();
         let need = body_need_key(anon_const_key(checker_of(module), &name));
-        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: self_.map(|(t, _)| t), body: Some((owner, scope)), marked: None })
+        Some(Ask { need, module, ty, name, text: text.into(), self_ty: self_.map(|(t, _)| t), body: Some((owner, scope)), head_owner: None, marked: None })
     }
 
     /// The anonymous constant `text` of type `ty` written in `module` where `Self` is the
@@ -291,13 +453,83 @@ impl Ask {
         }
         .into_boxed_str();
         let need = need_key(anon_const_key(checker_of(module), &name));
-        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: Some(self_ty), body: None, marked: None })
+        Some(Ask { need, module, ty, name, text: text.into(), self_ty: Some(self_ty), body: None, head_owner: None, marked: None })
+    }
+
+    pub(super) fn in_head_item(
+        mut self,
+        owner: HeadOwner,
+        exp_text: Option<&str>,
+        site: Option<HeadSite<'_>>,
+        edits: AVec<'static, TextEdit>,
+        alloc: Alloc<'static>,
+    ) -> Self {
+        let mut hash = blaze_ids::Hasher::new("blaze-ladder head item anonymous constant 1");
+        hash.part(self.member_name().as_bytes());
+        hash.update(&owner.item.0.0);
+        hash.update(&owner.offset.to_le_bytes());
+        hash.update(&owner.len.to_le_bytes());
+        match owner.expansion {
+            Some(exp) => {
+                hash.update(&[1]);
+                hash.update(&exp.call.0.0);
+                hash.update(&exp.root_call_offset.to_le_bytes());
+            }
+            None => {
+                hash.update(&[0]);
+            }
+        }
+        // Include the full substitution mapping: `BodyHost::place_of_call` remaps call columns
+        // through `edits`, so replacing a long qualified constant with its literal value changes
+        // later `column!()` positions even when the substituted text, owner, offset, and start
+        // site are identical.
+        for e in edits.iter() {
+            hash.update(&[1]);
+            hash.update(&e.sub_start.to_le_bytes());
+            hash.update(&e.sub_end.to_le_bytes());
+            hash.update(&e.orig_start.to_le_bytes());
+            hash.update(&e.orig_end.to_le_bytes());
+        }
+        hash.update(&[0]);
+        match site {
+            Some(s) => {
+                hash.update(&[1]);
+                hash.update(&s.line.to_le_bytes());
+                hash.update(&s.col.to_le_bytes());
+                match s.file {
+                    Some(f) => {
+                        hash.update(&[1]);
+                        hash.part(f.as_bytes());
+                    }
+                    None => {
+                        hash.update(&[0]);
+                    }
+                }
+            }
+            None => {
+                hash.update(&[0]);
+            }
+        }
+        let member = blaze_own::format_in!(alloc, "head {:x}", hash.finish());
+        let key = anon_const_key(checker_of(self.module), &member);
+        self.need = if self.body.is_some() { body_need_key(key) } else { need_key(key) };
+        let exp_text = exp_text.map(|t| {
+            let mut s = AString::new_in(alloc);
+            s.push_str(t);
+            s
+        });
+        self.head_owner = Some(HeadOwned { owner, exp_text, edits, member });
+        self
+    }
+
+    pub(super) fn head_owner(&self) -> Option<(HeadOwner, Option<&str>, &[TextEdit])> {
+        self.head_owner.as_ref().map(|h| (h.owner, h.exp_text.as_deref(), h.edits.as_slice()))
     }
 
     pub(super) fn carry_marks(mut self, rows: AVec<'static, (u32, TextMark)>) -> Self {
         if !rows.is_empty() {
             let mut hash = blaze_ids::Hasher::new("blaze-ladder marked anonymous constant 1");
-            hash.part(self.name.as_bytes());
+            hash.part(self.member_name().as_bytes());
             for &(offset, mark) in &rows {
                 hash.update(&offset.to_le_bytes()).update(&mark.to_bytes());
             }
@@ -310,8 +542,76 @@ impl Ask {
     }
 
     fn member_name(&self) -> &str {
-        self.marked.as_ref().map_or(&self.name, |m| m.member.as_str())
+        if let Some(m) = &self.marked {
+            m.member.as_str()
+        } else if let Some(h) = &self.head_owner {
+            h.member.as_str()
+        } else {
+            &self.name
+        }
     }
+}
+
+/// If `text` contains a macro call (`!`), resolves its observable `(line, col)` and shown file
+/// path relative to `item`'s scanned owner text (`offset` is the byte offset of `text` inside
+/// `item`'s scanned owner text: `it.impl_header` for `Impl`, `it.text` otherwise).
+pub(super) fn head_site_of<'n, S: super::source::NamesSource<'n>>(
+    names: S,
+    item: LibKey,
+    offset: u32,
+    text: &str,
+) -> Option<HeadSite<'n>> {
+    if !text.contains('!') {
+        return None;
+    }
+    let header_off = names
+        .seeded_text_of(item)
+        .and_then(|it| it.impl_header.and_then(|hdr| blaze_scope::expansion_origins::offset_in(it.text, hdr)))
+        .unwrap_or(0);
+    blaze_mem::frame::task(blaze_mem::Tag::Parse, |frame| {
+        let scratch = blaze_own::Erased::new(frame);
+        let (krate, file_text, start, by_call) = crate::front2::program::lazy::body_place(names, item, scratch.handle()).ok()?;
+        let at = if by_call { start } else { start.checked_add(header_off)?.checked_add(offset)? };
+        let at = usize::try_from(at).ok()?;
+        let line = blaze_expand::PlaceOf::Line.counted(file_text, at)?;
+        let col = blaze_expand::PlaceOf::Column.counted(file_text, at)?;
+        let file = super::body_host::body_file(names, krate, item).map(|f| f.shown);
+        Some(HeadSite { line, col, file })
+    })
+}
+
+/// Extracts token marks for each `(prefix_in_decl, slice_in_marks)` segment of a synthetic
+/// declaration `decl` (such as `"const _: {ty_text} = {value_text};"` or
+/// `"const _: bool = {body_expr};"`) and files the combined `TextMarks` into `columns` under
+/// `item`. No-op when `marks` is `None` or no segment carries any marks.
+pub(super) fn file_parts_marks<'n>(
+    columns: &mut Columns<'n>,
+    item: ItemKey,
+    decl: &'n str,
+    marks: Option<TextMarks<'_>>,
+    parts: &[(usize, &str)],
+    alloc: Alloc<'_>,
+) -> Result<(), blaze_expand::origin_column::ColumnError> {
+    use blaze_expand::origin_column::{ColumnError, OriginsRef};
+    let Some(marks) = marks else { return Ok(()) };
+    let mut rows: AVec<'_, (u32, TextMark)> = AVec::new_in(alloc);
+    for &(prefix, part) in parts {
+        let prefix_u32 = u32::try_from(prefix).map_err(|_| ColumnError::TooLarge { at: prefix })?;
+        let Ok(slice_marks) = blaze_lower::mark_site::ItemMarks::of(part, marks) else { continue };
+        for (offset, mark) in slice_marks.marked() {
+            let at = prefix_u32.checked_add(offset).ok_or(ColumnError::TooLarge { at: usize::MAX })?;
+            rows.push((at, mark));
+        }
+    }
+    if rows.is_empty() {
+        return Ok(());
+    }
+    rows.sort_unstable_by_key(|&(at, _)| at);
+    let bytes = blaze_lower::mark_site::column_of_copy(decl, &rows, alloc)?;
+    let frame = *columns.allocator();
+    let (column, _) = OriginsRef::open(frame.alloc_slice_copy(&bytes))?;
+    columns.insert(item, TextMarks { text: decl, column });
+    Ok(())
 }
 
 /// Move the expression's marks past the synthetic declaration prefix before passing the
@@ -344,59 +644,93 @@ fn file_marks<'n>(
 /// [`Why::NeedConst`] naming it until the driver's `eval_len` has filed and evaluated it.
 /// An expression whose type is unknown or is not `bool`, `char` or an integer is
 /// [`Why::ConstPath`] naming its text.
-pub fn self_value<H: super::types::Heads + ?Sized>(heads: &H, module: LibKey, ty: Option<PNode>, text: &str, self_ty: tc::PTy, self_node: PNode, r: blaze_surface::Range) -> Result<u128, Why> {
-    let text = text.trim();
-    let Some(ask) = ty.and_then(|ty| Ask::of_self(module, ty, text, self_ty, self_node)) else { return Err(Why::ConstPath(Box::from(text), r)) };
+#[expect(clippy::too_many_arguments, reason = "self-typed anonymous constant lookup with head owner, substitution edits, and token marks")]
+pub fn self_value<H: super::types::Heads + ?Sized>(
+    heads: &H,
+    module: LibKey,
+    ty: Option<PNode>,
+    orig_source: &str,
+    text: &str,
+    self_ty: tc::PTy,
+    self_node: PNode,
+    marks: Option<TextMarks<'_>>,
+    head_owner: Option<(HeadOwner, Option<&str>, Option<HeadSite<'_>>)>,
+    edits: Option<AVec<'static, TextEdit>>,
+    r: blaze_surface::Range,
+) -> Result<u128, Why> {
+    let source = text.trim();
+    let Some(mut ask) = ty.and_then(|ty| Ask::of_self(module, ty, source, self_ty, self_node)) else { return Err(Why::ConstPath(source.into(), r)) };
+    if let Some(alloc) = heads.mark_alloc() {
+        let carried_marks = if let Some(marks) = marks {
+            let mark_edits = edits.as_deref().unwrap_or(&[]);
+            match head_marks_with_edits(marks, orig_source.trim(), source, mark_edits, alloc, r)? {
+                Some(rows) => Some(rows),
+                None if names_crate(source) => {
+                    return Err(Why::Unsupported(
+                        "a `crate` path in a constant expression of a macro-written head whose text is not the item's (its tokens' marks are not read: anon.rs `self_value`)",
+                        r,
+                    ));
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        if let Some((owner, exp_text, site)) = head_owner {
+            let edits = edits.unwrap_or_else(|| AVec::new_in(alloc));
+            ask = ask.in_head_item(owner, exp_text, site, edits, alloc);
+        }
+        if let Some(rows) = carried_marks {
+            ask = ask.carry_marks(rows);
+        }
+    }
     if let Some(bits) = heads.const_bits(ask.need) {
         return Ok(bits);
     }
     if let Some(why) = heads.anon_failed(ask.need) {
-        return Err(Why::ConstPath(format!("{text}: {why}").into_boxed_str(), r));
+        return Err(Why::ConstPath(format!("{source}: {why}").into_boxed_str(), r));
     }
     let need = ask.need;
-    if heads.ask_anon(ask) { Err(Why::NeedConst(need, r)) } else { Err(Why::ConstPath(Box::from(text), r)) }
+    if heads.ask_anon(ask) { Err(Why::NeedConst(need, r)) } else { Err(Why::ConstPath(source.into(), r)) }
 }
 
-/// The token marks of a HEAD's constant expression `source` (a slice of the text `marks` are
-/// of: a head a macro wrote), each at its place in `asked`, the text the constant is asked
-/// with: `source` itself, or `source` with every qualified constant leaf replaced by its
-/// value ([`super::const_qpath::substitute`]; a leaf's own marks go with it, its value being a
-/// literal). Rust's rule: a path in the expression resolves where ITS tokens' hygiene says
-/// (the Reference, "Macros By Example", "Hygiene": `$crate` "refers to the crate defining the
-/// macro"), so the constant made of it is lowered with them as a body's is
-/// ([`Ask::carry_marks`]). zerocopy's `cryptocorrosion_derive_traits!` writes `(): PaddingFree<
-/// Self, { $crate::cryptocorrosion_derive_traits!(@struct_padding_check ..) }>` into an impl
-/// it expands in ppv-lite86; without them `crate` named ppv-lite86 (tempo t1500, rand_chacha
-/// `refill_wide_impl`: "segment 0: not found"). `Ok(None)`: `source` is no slice of the marks'
-/// text (a type macro's expansion lowered inside the head's view, or a text the inherent
-/// leaves rewrote: `Builder::const_term`), whose marks this does not hold; the caller decides.
-/// An `asked` that does not follow from `source` leaf by leaf is refused by name.
-pub(super) fn head_marks(
+/// The token marks of a HEAD's constant expression `orig` (a slice of the text `marks` are
+/// of: a head a macro wrote), remapped to their positions in `asked` through the sorted,
+/// non-overlapping substitution `edits` (from inherent associated-constant substitution,
+/// qualified associated-constant substitution, or their composition via [`compose_edits`];
+/// marks inside a replaced leaf are dropped with the leaf since its replacement is a literal).
+/// `Ok(None)`: `orig` is not a slice of `marks`'s text (e.g. a type macro's expansion lowered
+/// inside the head's view), or `edits` is empty while `orig != asked`; the caller decides.
+pub(super) fn head_marks_with_edits(
     marks: blaze_scope::crate_roots::TextMarks<'_>,
-    source: &str,
-    asked: Option<&str>,
+    orig: &str,
+    asked: &str,
+    edits: &[TextEdit],
     alloc: Alloc<'static>,
     r: blaze_surface::Range,
 ) -> Result<Option<AVec<'static, (u32, TextMark)>>, Why> {
-    let Ok(item) = blaze_lower::mark_site::ItemMarks::of(source, marks) else { return Ok(None) };
+    let Ok(item) = blaze_lower::mark_site::ItemMarks::of(orig, marks) else { return Ok(None) };
     let mut rows = AVec::new_in(alloc);
-    let Some(asked) = asked else {
+    if edits.is_empty() {
+        if orig != asked {
+            return Ok(None);
+        }
         for row in item.marked() {
             rows.push(row);
         }
         return Ok(Some(rows));
-    };
-    let off = |why: &'static str| Why::Program(format!("a marked constant expression `{source}` asked as `{asked}`: {why}").into_boxed_str(), r);
+    }
+    let off = |why: &'static str| Why::Program(format!("a marked constant expression `{orig}` asked as `{asked}`: {why}").into_boxed_str(), r);
     let at = |i: usize| u32::try_from(i).map_err(|_| off("past 4 GiB"));
     let mut marked = item.marked().peekable();
-    // Copies `source[from..to]`, found at `asked[out..]`, with its marks.
+    // Copies `orig[from..to]`, found at `asked[out..]`, with its marks.
     let mut copy = |from: usize, to: usize, out: usize, rows: &mut AVec<'static, (u32, TextMark)>| -> Result<usize, Why> {
-        let seg = source.get(from..to).ok_or_else(|| off("a leaf off a char boundary"))?;
+        let seg = orig.get(from..to).ok_or_else(|| off("a leaf off a char boundary"))?;
         if !asked.get(out..).is_some_and(|rest| rest.starts_with(seg)) {
             return Err(off("the text between two leaves is not copied"));
         }
         while let Some(&(start, mark)) = marked.peek() {
-            let s = start as usize;
+            let s = usize::try_from(start).map_err(|_| off("past 4 GiB"))?;
             if s >= to {
                 break;
             }
@@ -407,14 +741,24 @@ pub(super) fn head_marks(
         }
         Ok(out + seg.len())
     };
-    let (mut from, mut out) = (0usize, 0usize);
-    for leaf in super::const_qpath::Leaves::of(source) {
-        out = copy(from, leaf.start, out, &mut rows)?;
-        out += literal_len(asked.get(out..).unwrap_or("")).ok_or_else(|| off("a leaf's value is no literal"))?;
-        from = leaf.end;
+    let (mut orig_at, mut sub_at) = (0usize, 0usize);
+    for edit in edits {
+        let o_s = usize::try_from(edit.orig_start).map_err(|_| off("past 4 GiB"))?;
+        let o_e = usize::try_from(edit.orig_end).map_err(|_| off("past 4 GiB"))?;
+        let s_s = usize::try_from(edit.sub_start).map_err(|_| off("past 4 GiB"))?;
+        let s_e = usize::try_from(edit.sub_end).map_err(|_| off("past 4 GiB"))?;
+        if o_s < orig_at || o_e < o_s || s_s < sub_at || s_e < s_s {
+            return Err(off("substitution edits are out of order"));
+        }
+        sub_at = copy(orig_at, o_s, sub_at, &mut rows)?;
+        if sub_at != s_s {
+            return Err(off("substitution edit start disagrees with copied text"));
+        }
+        orig_at = o_e;
+        sub_at = s_e;
     }
-    out = copy(from, source.len(), out, &mut rows)?;
-    if out != asked.len() {
+    sub_at = copy(orig_at, orig.len(), sub_at, &mut rows)?;
+    if sub_at != asked.len() {
         return Err(off("text past the last leaf"));
     }
     Ok(Some(rows))
@@ -434,21 +778,6 @@ pub(super) fn names_crate(text: &str) -> bool {
         from = e;
     }
     false
-}
-
-/// The length of the literal `text` starts with, as [`super::const_qpath::push_literal`]
-/// writes one: `true`/`false` or digits with a suffix (one word), `'\u{..}'`, or a negative
-/// integer `(-N - 1T)`.
-fn literal_len(text: &str) -> Option<usize> {
-    let b = text.as_bytes();
-    match *b.first()? {
-        b'(' => text.find(')').map(|i| i + 1),
-        b'\'' => text.find("}'").map(|i| i + 2),
-        _ => {
-            let n = b.iter().take_while(|c| c.is_ascii_alphanumeric() || **c == b'_').count();
-            (n > 0).then_some(n)
-        }
-    }
 }
 
 /// A body's anonymous constant is required. Return its bits or ask the driver
@@ -481,10 +810,16 @@ pub fn file_asked<'n>(store: &mut Store<'n>, keys: &mut Keys) -> Result<Vec<LibK
         if let Some((owner, scope)) = a.body {
             store.locals.file_anon(key, owner, scope);
         }
+        let prim = written_ty(a.ty, &a.text).ok_or(FileFail::NoName(a.ty))?;
+        if let Some((owner, exp_text, edits)) = a.head_owner() {
+            let prefix = "const _: ".len() + prim.len() + " = { ".len();
+            if let Ok(prefix) = u32::try_from(prefix) {
+                store.locals.file_head_anon(key, owner, exp_text, edits, prefix);
+            }
+        }
         if store.fns.contains_key(&key) {
             continue;
         }
-        let prim = written_ty(a.ty, &a.text).ok_or(FileFail::NoName(a.ty))?;
         let alloc = store.tys.alloc();
         let mut declaration = blaze_own::format_in!(alloc, "const _: {prim} = {{ ");
         let prefix = declaration.len();
@@ -568,5 +903,73 @@ mod tests {
         assert_ne!(left, ask.need, "the unmarked root selects the calling crate");
         assert_ne!(left, key(0, 5), "the left root selects a different defining crate");
         assert_ne!(left, key(expr.rfind("crate").expect("second root") as u32, 4), "the foreign root now qualifies B");
+    }
+
+    #[test]
+    fn anonymous_const_key_distinguishes_head_owner_and_offset() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let module = LibKey(ContentId([1; 32]));
+        let expr = "pub enum Tag { A } core::mem::size_of::<Tag>()";
+        let base = Ask::of(module, PNode::Uint(tc::UintTy::Usize), expr).expect("usize anon const");
+        let item_a = LibKey(ContentId([2; 32]));
+        let item_b = LibKey(ContentId([3; 32]));
+        let owner = |item, offset| HeadOwner { item, offset, len: expr.len() as u32, expansion: None };
+        let empty = || blaze_own::AVec::new_in(alloc);
+        let a_at_10 = base.clone().in_head_item(owner(item_a, 10), None, None, empty(), alloc);
+        let a_at_10_again = base.clone().in_head_item(owner(item_a, 10), None, None, empty(), alloc);
+        let a_at_20 = base.clone().in_head_item(owner(item_a, 20), None, None, empty(), alloc);
+        let b_at_10 = base.clone().in_head_item(owner(item_b, 10), None, None, empty(), alloc);
+        let a_line_3 = base.clone().in_head_item(owner(item_a, 10), None, Some(HeadSite { line: 3, col: 5, file: Some("src/a.rs") }), empty(), alloc);
+        let a_line_4 = base.clone().in_head_item(owner(item_a, 10), None, Some(HeadSite { line: 4, col: 5, file: Some("src/a.rs") }), empty(), alloc);
+        let a_file_b = base.clone().in_head_item(owner(item_a, 10), None, Some(HeadSite { line: 3, col: 5, file: Some("src/b.rs") }), empty(), alloc);
+        assert_eq!(a_at_10.need, a_at_10_again.need, "identical head owner and offset share one key");
+        assert_ne!(a_at_10.need, base.need, "head-owned anon const differs from unowned");
+        assert_ne!(a_at_10.need, a_at_20.need, "different offsets in the same item get distinct keys");
+        assert_ne!(a_at_10.need, b_at_10.need, "different enclosing items get distinct keys");
+        assert_ne!(a_line_3.need, a_line_4.need, "shifting an enclosing item's line invalidates the cached key");
+        assert_ne!(a_line_3.need, a_file_b.need, "changing the enclosing item's shown file invalidates the cached key");
+        assert_ne!(a_line_3.need, a_at_10.need, "positioned key differs from unpositioned key");
+        // Marks compose with head owner without dropping owner identity.
+        let mark = TextMark {
+            site: DefSite { krate: CrateItemKey(ContentId([4; 32])), module: None },
+            transparency: Transparency::Opaque,
+            edition: Edition::E2021,
+            local_inner: false,
+            hygiene: 0,
+        };
+        let mut marks_a = blaze_own::AVec::new_in(alloc);
+        marks_a.push((0, mark));
+        let mut marks_b = blaze_own::AVec::new_in(alloc);
+        marks_b.push((0, mark));
+        assert_ne!(a_at_10.carry_marks(marks_a).need, b_at_10.carry_marks(marks_b).need, "marks preserve head owner distinction");
+        // Composed substitution edits map final offsets back to original offsets in either order.
+        let first = [TextEdit { sub_start: 15, sub_end: 21, orig_start: 15, orig_end: 19 }];
+        let second = [TextEdit { sub_start: 0, sub_end: 6, orig_start: 0, orig_end: 12 }];
+        let mut merged = blaze_own::AVec::new_in(alloc);
+        compose_edits(&first, &second, &mut merged).expect("disjoint passes compose");
+        assert_eq!(orig_offset(&merged, 18), Some(22));
+        // Contained nested edits (e.g. `A::N` -> `2usize` inside `<[u8; 2usize] as Tr>::C` -> `7usize`)
+        // supersede the inner `first` edits while preserving non-overlapping sibling edits.
+        let nested_first = [
+            TextEdit { sub_start: 6, sub_end: 12, orig_start: 6, orig_end: 10 },
+            TextEdit { sub_start: 26, sub_end: 32, orig_start: 24, orig_end: 28 },
+        ];
+        let nested_second = [TextEdit { sub_start: 0, sub_end: 6, orig_start: 0, orig_end: 23 }];
+        let mut nested_merged = blaze_own::AVec::new_in(alloc);
+        compose_edits(&nested_first, &nested_second, &mut nested_merged).expect("contained nested edits compose");
+        assert_eq!(
+            nested_merged.as_slice(),
+            &[
+                TextEdit { sub_start: 0, sub_end: 6, orig_start: 0, orig_end: 21 },
+                TextEdit { sub_start: 9, sub_end: 15, orig_start: 24, orig_end: 28 },
+            ]
+        );
+        assert_eq!(orig_offset(&nested_merged, 16), Some(29));
+        // Distinct substitution edit lists at identical (text, owner, offset, site) get distinct keys.
+        let site = Some(HeadSite { line: 3, col: 5, file: Some("src/a.rs") });
+        let mut sub_edits = blaze_own::AVec::new_in(alloc);
+        sub_edits.push(TextEdit { sub_start: 0, sub_end: 7, orig_start: 0, orig_end: 15 });
+        let with_edits = base.clone().in_head_item(owner(item_a, 10), None, site, sub_edits, alloc);
+        assert_ne!(with_edits.need, a_line_3.need, "changing substitution edits must change the head anon const key");
     }
 }

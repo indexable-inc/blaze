@@ -1136,6 +1136,13 @@ impl<'x, 'a, 'f> Exporter<'x, 'a, 'f> {
         self.seen().view(t)
     }
 
+    /// Owner-scoped defaults tag of a `TyView::Record` (`0` for untagged records or other types).
+    pub(crate) fn record_defaults_tag(&self, t: Ty) -> u64 {
+        let Some(b) = self.seen().node(t.0).as_ty() else { return 0 };
+        let b = self.terms.cx.probe(b);
+        self.terms.cx.tys.record_defaults_tag(b)
+    }
+
     pub(crate) fn list_len(&self, l: TyList) -> u32 {
         self.seen().list_len(l)
     }
@@ -2691,6 +2698,17 @@ impl<'a, 'f> TypeCtx for InferCtxIn<'a, 'f> {
             }
         }
         saw_once && !saw_ref
+    }
+
+    fn mk_record_with_defaults(&mut self, schema: RecordSchema, defaults: u64, fields: TyList) -> Result<Ty, CheckError> {
+        let l = self.blist(fields);
+        let t = self.terms.cx.tys.record_with_defaults(schema.0, defaults, l);
+        Ok(Ty(t.node().bits()))
+    }
+
+    fn record_defaults_tag(&self, t: Ty) -> u64 {
+        let resolved = self.terms.cx.probe(self.bty(t));
+        self.terms.cx.tys.record_defaults_tag(resolved)
     }
 }
 

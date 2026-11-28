@@ -946,7 +946,7 @@ fn step_sizedness<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand, meta
             }
         }
         // impl {Meta,}Sized for Record / Union where every field/member: {Meta,}Sized.
-        TyKind::Record(_, l) | TyKind::Union(l) => {
+        TyKind::Record(_, _, l) | TyKind::Union(l) => {
             let elems = cx.list_small(l);
             add_constituent_goals(cx, cand.d, &elems)?;
             return Ok(Step::Done(Certainty::Yes));
@@ -1019,7 +1019,7 @@ fn step_copy_clone<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> 
         }
         // An async coroutine is immovable: never `Copy` or `Clone`.
         TyKind::Coroutine(..) => return Ok(Step::No),
-        TyKind::Tuple(l) | TyKind::Record(_, l) | TyKind::Union(l) => tys.extend_from_slice(&cx.list_small(l)),
+        TyKind::Tuple(l) | TyKind::Record(_, _, l) | TyKind::Union(l) => tys.extend_from_slice(&cx.list_small(l)),
         // A pattern type is `Copy`/`Clone` as its base (core's `niche_types` derives both over
         // one; no impl in core).
         TyKind::Pat(base, _) => tys.push(base),

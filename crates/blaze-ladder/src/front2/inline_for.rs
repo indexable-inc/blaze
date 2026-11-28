@@ -355,6 +355,15 @@ pub fn copy_ty_into(
                 if let Some(names) = from.record_names(s) {
                     into.register_record_schema(s, names).ok()?;
                 }
+                let tag = from.record_defaults_tag(PTy(idx));
+                if tag != 0 {
+                    let nl = l(a, &mapped, into)?;
+                    let id = into.intern_record_with_defaults(s, nl, tag).ok()?;
+                    if let Some(slot) = mapped.get_mut(i) {
+                        *slot = Some(id);
+                    }
+                    continue;
+                }
                 PNode::Record(s, l(a, &mapped, into)?)
             }
             PNode::Union(a) => PNode::Union(l(a, &mapped, into)?),

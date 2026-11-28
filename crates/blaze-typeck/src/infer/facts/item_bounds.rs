@@ -279,7 +279,7 @@ impl<'a> FactCache<'a> {
                 }
                 continue;
             }
-            let k = self.convert(c, node)?;
+            let k = self.convert(c, PTy(n), node)?;
             let s = STy(self.nodes.len() as u32);
             self.nodes.push(k);
             self.memo.insert((c.tab, n), s);

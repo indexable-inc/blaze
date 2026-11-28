@@ -208,8 +208,36 @@ pub(crate) fn source_read<'n>(records: &'n Records<'n>, subjects: &Subjects, rea
     match read {
         TableRead::Text { key } => text_cell(records, subjects, key),
         TableRead::Signature { key } => signature_text_cell(records, subjects, key),
+        TableRead::File { krate, file } => file_cell(records, subjects, krate, file),
         _ => Ok(None),
     }
+}
+
+/// The whole physical file (`Kind::FileItems`, `WHOLE`) for a crate/file whose raw text was read
+/// (e.g. to compute `line!()`/`column!()` coordinates in a head or body). Moving a line in that
+/// file moves its `FileItems` `WHOLE` cell and invalidates every cached head or body that observed
+/// its line/column positions, even when the file's surface digest (`Section::Items`) is unchanged.
+fn file_cell<'n>(records: &'n Records<'n>, subjects: &Subjects, prefix: [u8; 8], file: u32) -> Result<Option<CellId>, Unplaced> {
+    if prefix == blaze_scope::BUILTIN_PREFIX {
+        return Ok(None);
+    }
+    let first = subjects.partition_point(|row| row.prefix < prefix);
+    if subjects.get(first).is_some_and(|row| row.prefix == prefix) {
+        let row = subjects
+            .binary_search_by(|row| (row.prefix, row.file).cmp(&(prefix, file)))
+            .map_err(|_| {
+                let mut bytes = [0u8; 32];
+                bytes[..8].copy_from_slice(&prefix);
+                Unplaced { key: LibKey(blaze_ids::ContentId(bytes)), why: UnplacedWhy::NoOutline { file } }
+            })?;
+        return Ok(subjects.get(row).map(|subject| CellId { of: subject.slot, cell: WHOLE }));
+    }
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(&prefix);
+    let key = LibKey(blaze_ids::ContentId(bytes));
+    let k = NamesSource::crate_of(records, key).ok_or(Unplaced { key, why: UnplacedWhy::NoCrate })?;
+    let krate = NamesSource::crate_key(records, k).ok_or(Unplaced { key, why: UnplacedWhy::NoCrateKey { at: k } })?;
+    Ok(Some(CellId { of: crate_scope_name(&krate), cell: WHOLE }))
 }
 
 /// The item's full definition, including an initializer or const fn body.

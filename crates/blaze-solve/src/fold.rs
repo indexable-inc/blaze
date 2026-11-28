@@ -263,7 +263,7 @@ pub fn rebuild<T: Tys>(tys: &mut T, k: TyKind, kids: &[Ty]) -> Result<Ty, SolveE
     let n = kids.len();
     let k2 = match k {
         TyKind::Tuple(_) => TyKind::Tuple(tys.mk_list(kids)?),
-        TyKind::Record(s, _) => TyKind::Record(s, tys.mk_list(kids)?),
+        TyKind::Record(s, d, _) => TyKind::Record(s, d, tys.mk_list(kids)?),
         TyKind::Union(_) => TyKind::Union(tys.mk_list(kids)?),
         TyKind::Adt(d, _) => TyKind::Adt(d, tys.mk_list(kids)?),
         TyKind::FnDef(d, _) => TyKind::FnDef(d, tys.mk_list(kids)?),

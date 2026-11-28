@@ -1145,9 +1145,9 @@ pub(crate) fn transfer_cell_in_process<'n, N: NamesSource<'n>>(
     }
     let needs_members = heads.iter().any(|(_, h)| matches!(&**h, Head::Trait { .. } | Head::Impl { .. }));
     if needs_members {
-        cache.0.with_members(names, cell, |members| file_keys(cell, members, &heads, dst_keys, scratch))?;
+        cache.0.with_members(names, cell, |members| file_keys(names, cell, members, &heads, dst_keys, scratch))?;
     } else {
-        file_keys(cell, &[], &heads, dst_keys, scratch)?;
+        file_keys(names, cell, &[], &heads, dst_keys, scratch)?;
     }
     file_named_items(names, cell, dst, dst_keys, &heads, tys_before)?;
     dst.file_heads(cell, heads.into_iter().map(|(at, h)| (at, blaze_own::Box::into_inner(h))))
@@ -1294,7 +1294,7 @@ fn file_frozen_finish<'n, N: NamesSource<'n>>(
     tys_before: usize,
     scratch: Alloc<'static>,
 ) -> Result<(), FreezeError> {
-    file_keys(cell, members, &heads, keys, scratch)?;
+    file_keys(names, cell, members, &heads, keys, scratch)?;
     file_named_items(names, cell, store, keys, &heads, tys_before)?;
     // Each head's recorded regions (form 11) against its record: laid exactly when the record
     // holds the section, and none only for a kind that holds none.
@@ -1550,7 +1550,7 @@ fn file_named_items<'n, N: NamesSource<'n>>(
     Ok(())
 }
 
-fn file_keys(cell: Want, members: &[MemberText<'_>], heads: &[(HeadAt, blaze_own::Box<Head<'_>, Alloc<'static>>)], keys: &Keys, scratch: Alloc<'static>) -> Result<(), FreezeError> {
+fn file_keys<'n, N: NamesSource<'n>>(names: N, cell: Want, members: &[MemberText<'_>], heads: &[(HeadAt, blaze_own::Box<Head<'_>, Alloc<'static>>)], keys: &Keys, scratch: Alloc<'static>) -> Result<(), FreezeError> {
     let container = checker_of(cell.key());
     let clash = |error| FreezeError::Head { want: cell, error: HeadError::Key(error) };
     // The cell's own library key (e.g. an impl or trait container whose members are filed
@@ -1589,7 +1589,7 @@ fn file_keys(cell: Want, members: &[MemberText<'_>], heads: &[(HeadAt, blaze_own
                                     error: HeadRecordError::Shape { what: "an ADT field default has no inline fn head in its frozen cell" },
                                 });
                             };
-                            let Some(label) = crate::front2::heads::field_default_label_from_decl(vi, j, decl, scratch) else {
+                            let Some(label) = crate::front2::heads::field_default_label_for_frozen(names, cell.key(), container, vi, j, decl, *dk, scratch) else {
                                 return Err(FreezeError::Record {
                                     want: cell,
                                     at: HeadAt::Fn(*dk),

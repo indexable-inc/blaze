@@ -639,7 +639,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         let mut missing: Option<Name> = None;
                         let mut unwritten: blaze_own::Vec<(u32, ItemKey), Alloc<'a>> = blaze_own::Vec::new_in(self.alloc);
                         {
-                            let defaults = self.reads.field_defaults(schema.defaults_key())?;
+                            let defaults_tag = self.ty.record_defaults_tag(f.t);
+                            let defaults_key = schema.scoped_defaults_key(defaults_tag);
+                            let defaults = self.reads.field_defaults(defaults_key)?;
                             if let Some(names) = self.record_names(schema) {
                                 for (i, &nm) in names.iter().enumerate() {
                                     if init_set.contains(nm) {

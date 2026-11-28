@@ -436,7 +436,8 @@ pub fn copy_ground(from: PTys<'_>, args: &[PTy], into: &mut PortableTys<'_>, scr
             if !reached[at] {
                 continue;
             }
-            let raw_node = from.node(PTy(u32::try_from(at).map_err(|_| CopyFail::Malformed)?)).map_err(|_| CopyFail::Malformed)?;
+            let at_pty = PTy(u32::try_from(at).map_err(|_| CopyFail::Malformed)?);
+            let raw_node = from.node(at_pty).map_err(|_| CopyFail::Malformed)?;
             if let PNode::Record(s, _) = raw_node
                 && let Some(names) = from.record_names(s)
             {
@@ -450,6 +451,15 @@ pub fn copy_ground(from: PTys<'_>, args: &[PTy], into: &mut PortableTys<'_>, scr
                 into.intern_list(list).map_err(|_| CopyFail::Full)
             };
             let m = |t: PTy| mapped.get(t.0 as usize).copied().ok_or(CopyFail::Malformed);
+            if let PNode::Record(s, l) = raw_node {
+                let tag = from.record_defaults_tag(at_pty);
+                if tag != 0 {
+                    let nl = map_list(l, &mut list)?;
+                    let id = into.intern_record_with_defaults(s, nl, tag).map_err(|_| CopyFail::Full)?;
+                    *mapped.get_mut(at).ok_or(CopyFail::Malformed)? = id;
+                    continue;
+                }
+            }
             let node = match raw_node {
                 PNode::Param(_) | PNode::ConstParam(_) => return Err(CopyFail::NotGround { what: "a generic parameter" }),
                 PNode::Alias { .. } => return Err(CopyFail::NotGround { what: "a projection" }),

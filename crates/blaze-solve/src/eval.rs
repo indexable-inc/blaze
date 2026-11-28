@@ -3012,7 +3012,7 @@ fn step_for_fields_structural<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, conta
             add_for_fields_goals(cx, trait_, args_after_self, &fields, true)?;
             Ok(Step::Done(Certainty::Yes))
         }
-        TyKind::Record(_, fields_list) => {
+        TyKind::Record(_, _, fields_list) => {
             let fields = cx.list_small(fields_list);
             add_for_fields_goals(cx, trait_, args_after_self, &fields, false)?;
             Ok(Step::Done(Certainty::Yes))

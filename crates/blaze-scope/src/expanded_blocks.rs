@@ -148,6 +148,30 @@ pub(crate) fn written<'a>(nested: &Nested<'_>, alloc: Alloc<'a>) -> AVec<'a, boo
 ///
 /// `copied` is told each slice of `text` written into the result (token-mark-2: the origin
 /// column moves with them, crate::crate_roots::remap).
+pub(crate) fn emit_cfg_attrs(
+    text: &str,
+    range: blaze_surface::Range,
+    out: &mut AString<'_>,
+    copied: &mut dyn FnMut(crate::crate_roots::Copied),
+    alloc: Alloc<'_>,
+) {
+    blaze_file_items::nested::for_each_cfg_attr(text, range, alloc, |piece| match piece {
+        blaze_file_items::nested::CfgEmit::Lit(s) => out.push_str(s),
+        blaze_file_items::nested::CfgEmit::Src(r) => {
+            if let (Ok(start), Ok(end)) = (usize::try_from(r.start), usize::try_from(r.end))
+                && let Some(part) = text.get(start..end)
+            {
+                copied(crate::crate_roots::Copied {
+                    from: r.start,
+                    to: u32::try_from(out.len()).unwrap_or(u32::MAX),
+                    len: r.end.saturating_sub(r.start),
+                });
+                out.push_str(part);
+            }
+        }
+    });
+}
+
 pub(crate) fn render<'a>(
     text: &str,
     nested: &Nested<'_>,
@@ -157,9 +181,6 @@ pub(crate) fn render<'a>(
     synthetic_blocks: &mut AVec<'_, u32>,
     alloc: Alloc<'a>,
 ) -> AString<'a> {
-    let mut copy = |out: &AString<'_>, from: u32, len: u32| {
-        copied(crate::crate_roots::Copied { from, to: u32::try_from(out.len()).unwrap_or(u32::MAX), len });
-    };
     let mut out = AString::new_in(alloc);
     let is_written = |b: u32| written.get(b as usize).copied().unwrap_or(false);
     let mut events: AVec<'a, (u32, Event)> = AVec::new_in(alloc);
@@ -192,20 +213,13 @@ pub(crate) fn render<'a>(
     for (_, event) in events.iter() {
         match *event {
             Event::Open(b) => {
-                // The block's outer attributes go on its module: a false `cfg` removes the
-                // block and so the module, its items and its calls with it (hyper's `trace!`:
-                // `#[cfg(feature = "tracing")] { tracing::trace!(..); }`). The Reference,
-                // "Conditional compilation": a false `cfg` removes the thing it is on.
+                // The block's outer `#[cfg(..)]` attributes go on its module: a false `cfg`
+                // removes the block and so the module, its items and its calls with it (hyper's
+                // `trace!`: `#[cfg(feature = "tracing")] { tracing::trace!(..); }`). The
+                // Reference, "Conditional compilation": a false `cfg` removes the thing it is on.
                 let block = nested.blocks[b as usize];
-                let attrs = &text[block.attrs.start as usize..block.attrs.end as usize];
-                // Outer ones only (`#[..]`, `# [..]` in an expansion's printed tokens): an
-                // inner `#![..]` at the start of the block around is that block's own.
-                let outer_attr = attrs.strip_prefix('#').is_some_and(|rest| rest.trim_start().starts_with('['));
-                if outer_attr {
-                    copy(&out, block.attrs.start, block.attrs.end - block.attrs.start);
-                    out.push_str(attrs);
-                    out.push_str("\n");
-                }
+                emit_cfg_attrs(text, block.attrs, &mut out, copied, alloc);
+                emit_cfg_attrs(text, block.elem_attrs, &mut out, copied, alloc);
                 // Record the exact byte offset of the synthetic block module's name in `out`,
                 // so `resolve::make_modules` identifies synthetic blocks structurally rather than
                 // by name prefix (a user or macro module legitimately named `__blaze_block_*` is
@@ -222,25 +236,21 @@ pub(crate) fn render<'a>(
             Event::Close => out.push_str("}\n"),
             Event::Item(i) => {
                 let r = nested.items[i as usize].range;
-                copy(&out, r.start, r.end - r.start);
+                copied(crate::crate_roots::Copied { from: r.start, to: u32::try_from(out.len()).unwrap_or(u32::MAX), len: r.end - r.start });
                 out.push_str(&text[r.start as usize..r.end as usize]);
                 out.push_str("\n");
             }
             Event::Call(i) => {
                 let c = nested.calls[i as usize];
-                // An expression call goes under its statement's outer attributes: a false
-                // `cfg` removes it as it removes the statement (the Reference, "Conditional
-                // compilation"; tempo actor.rs:325, `#[cfg(feature = "fuzz")] let details =
-                // serde_json::json!(..);`, whose crate is no name without the feature). A
-                // statement call's path holds its own.
-                if c.attrs.end > c.attrs.start {
-                    copy(&out, c.attrs.start, c.attrs.end - c.attrs.start);
-                    out.push_str(&text[c.attrs.start as usize..c.attrs.end as usize]);
-                    out.push_str("\n");
-                }
+                // An expression call goes under its statement's/field's/param's outer `#[cfg(..)]`
+                // attributes: a false `cfg` removes it as it removes the element (the Reference,
+                // "Conditional compilation"; tempo actor.rs:325, `#[cfg(feature = "fuzz")] let
+                // details = serde_json::json!(..);`). A statement call's path holds its own.
+                emit_cfg_attrs(text, c.attrs, &mut out, copied, alloc);
+                emit_cfg_attrs(text, c.elem_attrs, &mut out, copied, alloc);
                 let r = c.range;
                 let call = &text[r.start as usize..r.end as usize];
-                copy(&out, r.start, r.end - r.start);
+                copied(crate::crate_roots::Copied { from: r.start, to: u32::try_from(out.len()).unwrap_or(u32::MAX), len: r.end - r.start });
                 out.push_str(call);
                 // The Reference, "Macro invocation": an item-position call with `(..)` or
                 // `[..]` ends with `;`; one with `{..}` takes none.

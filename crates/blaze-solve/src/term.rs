@@ -408,8 +408,10 @@ pub enum TyKind {
     Str,
     Never,
     Tuple(List),
-    /// A structural record: canonical schema hash of sorted field names, and sorted field types.
-    Record(u64, List),
+    /// A structural record: canonical schema hash of sorted field names, optional owner-scoped
+    /// defaults tag (0 = untagged; ignored by structural equality/shapes, preserved by folding),
+    /// and sorted field types.
+    Record(u64, u64, List),
     /// A structural tagged union: canonical member types.
     Union(List),
     /// Region, pointee.
@@ -802,7 +804,7 @@ pub fn shape_of_kind(k: TyKind) -> Option<Shape> {
         TyKind::Str => Shape::Str,
         TyKind::Never => Shape::Never,
         TyKind::Tuple(l) => Shape::Tuple(l.len),
-        TyKind::Record(s, l) => Shape::Record(s, l.len),
+        TyKind::Record(s, _, l) => Shape::Record(s, l.len),
         TyKind::Union(l) => Shape::Union(l.len),
         TyKind::Ref(_, _, m) => Shape::Ref(m),
         TyKind::RawPtr(_, m) => Shape::Ptr(m),
@@ -871,7 +873,7 @@ pub enum Children {
 pub fn children(k: TyKind) -> Children {
     match k {
         TyKind::Tuple(l)
-        | TyKind::Record(_, l)
+        | TyKind::Record(_, _, l)
         | TyKind::Union(l)
         | TyKind::Adt(_, l)
         | TyKind::FnDef(_, l)

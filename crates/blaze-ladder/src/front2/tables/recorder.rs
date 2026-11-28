@@ -33,6 +33,11 @@ pub enum TableRead {
     Signature { key: ItemKey },
     /// Tokens consumed while lowering or evaluating the definition, including its body.
     Text { key: ItemKey },
+    /// Raw bytes of a source file (e.g. to compute `line!()` / `column!()` coordinates in a head
+    /// or body): placed on the file's `FileItems` `WHOLE` cell so shifting a line invalidates any
+    /// cached head or body that observed line/column positions, even when the file's surface
+    /// digest (`Section::Items`) did not change.
+    File { krate: [u8; 8], file: u32 },
     /// A head read whole: the item by its checker key's 16 bytes (front2 reads.rs `Fact::key`,
     /// big-endian) and which part (the `FactKind` byte: signature, predicates, ADT, ..).
     Head { item: [u8; 16], part: u8 },
@@ -64,6 +69,8 @@ pub enum ReadOf {
     Names { krate: [u8; 8] },
     /// The input text of an item. Its physical source is placed by the plan.
     Source { key: ItemKey },
+    /// The whole raw text of a crate's source file (`Kind::FileItems`, `WHOLE`).
+    File { krate: [u8; 8], file: u32 },
     /// The head record of the item (its checker key's 16 bytes).
     Head { item: [u8; 16] },
     /// The impl table of the crate (its key's first 16 bytes; zero: the whole graph's fact).
@@ -91,6 +98,7 @@ impl TableRead {
         match self {
             TableRead::Names(cell) => ReadOf::Names { krate: cell.crate_prefix() },
             TableRead::Signature { key } | TableRead::Text { key } => ReadOf::Source { key },
+            TableRead::File { krate, file } => ReadOf::File { krate, file },
             TableRead::Head { item, .. } => ReadOf::Head { item },
             TableRead::Impls { krate, .. } => ReadOf::Impls { krate },
         }
@@ -103,6 +111,11 @@ impl TableRead {
             TableRead::Names(cell) => cell.key(),
             TableRead::Signature { .. } => *b"signature tokens",
             TableRead::Text { .. } => *b"definition text\0",
+            TableRead::File { file, .. } => {
+                let mut cell = *b"file bytes\0\0\0\0\0\0";
+                cell[12..16].copy_from_slice(&file.to_le_bytes());
+                cell
+            }
             TableRead::Head { part, .. } => {
                 let mut cell = [0u8; 16];
                 cell[0] = part;
@@ -115,7 +128,7 @@ impl TableRead {
     /// A workspace places this question on its physical outline or expansion producer.
     /// A standalone check asks its `Make` for the item input directly.
     pub fn is_source(self) -> bool {
-        matches!(self, Self::Signature { .. } | Self::Text { .. })
+        matches!(self, Self::Signature { .. } | Self::Text { .. } | Self::File { .. })
     }
 }
 
@@ -807,6 +820,7 @@ fn slot_of(key: ReadKey) -> usize {
         },
         ReadKey::Raw(TableRead::Signature { key }) => item(key) ^ 0x0e,
         ReadKey::Raw(TableRead::Text { key }) => item(key) ^ 0x1e,
+        ReadKey::Raw(TableRead::File { krate, file }) => krate[7] ^ file.to_le_bytes()[0] ^ 0x3e,
         ReadKey::Raw(TableRead::Head { item: k, part }) => k[15] ^ part.rotate_left(4),
         ReadKey::Raw(TableRead::Impls { krate, bucket }) => krate[15] ^ bucket[0] ^ 0x2e,
     };

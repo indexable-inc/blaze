@@ -27,6 +27,7 @@ use blaze_lower::scoped::Prepares;
 use blaze_lower::typeck::{ArgAt, ConstGapWhy, ConstTerm, Refused, TypeckBody, Types, to_typeck};
 use blaze_lower::{Lowered, View};
 use blaze_own::Alloc;
+use blaze_scope::crate_roots::TextMarks;
 use blaze_surface::Range;
 use blaze_typeck::{ExprId, ItemKey, Name, OwnTys, PTy, PortableTys};
 
@@ -1512,40 +1513,53 @@ fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, 
     if !store.fns.contains_key(&key) && !store.fn_gaps.contains_key(&key) {
         if let Some(want) = super::heads::member_head_want(names, keys, key) {
             store.ensure(names, keys, want).map_err(|error| BodyError::Head { item: want.key(), error })?;
+        } else if let Some(&want) = store.where_const_owners.get(&key) {
+            store.ensure_where_const_head(names, keys, key).map_err(|error| BodyError::Head { item: want.key(), error })?;
         }
     }
-    let head: &FnHead<'n> = match store.fns.get(&key) {
-        Some(head) => head,
+    let (head_lib, head_text, head_text_inline, head_has_body) = match store.fns.get(&key) {
+        Some(head) => (head.lib, head.text, head.text_inline, head.has_body),
         // A head refused is its `fn_gaps` row (`Store::member_fn_head` files it and lets the
         // container's head go on): that reason, never "no head" (census r16: 455 fns of tempo
         // were `NoHead` whose head had been refused for a reason of its own).
         None => return Err(refused_head(names, keys, store, key)),
     };
-    if !head.has_body {
+    if !head_has_body {
         return Err(BodyError::NoBody(key));
     }
+    if head_text_inline {
+        store.ensure_field_default_site(names, head_lib, key, head_text).map_err(|why| BodyError::Record { item: head_lib, owner: key, why })?;
+    }
+    let head: &FnHead<'n> = match store.fns.get(&key) {
+        Some(head) => head,
+        None => return Err(refused_head(names, keys, store, key)),
+    };
     let krate = names.crate_of(head.lib).ok_or(BodyError::NoText(head.lib))?;
     // The marks of the member's text, as its head read them (heads/member_fn.rs, heads.rs
     // `trait_members`): the expansion of the call in the container's body that wrote it, or
     // else the container's own (front2 item_site.rs `head_marks`). A derived impl's `default`
     // writes `crate::default::Default::default()`, its `crate` core's only by its mark.
-    let marks = match keys.origin(key) {
-        Some(Origin::Member { kind: MemberKind::Anon, .. }) => store.anon_marks.get(&key).copied(),
-        Some(Origin::Member { kind, name, .. }) => {
-            let item_kind = match kind {
-                MemberKind::Fn => blaze_surface::ItemKind::Function,
-                MemberKind::Const => blaze_surface::ItemKind::Const,
-                MemberKind::Type => blaze_surface::ItemKind::TypeAlias,
-                // A constructor has no text of its own and no body.
-                MemberKind::Ctor | MemberKind::Anon => return Err(BodyError::NoBody(key)),
-            };
-            super::item_site::head_marks(names, head.lib, name, item_kind, head.text).map_err(|lost| BodyError::Record { item: head.lib, owner: key, why: lost.why() })?
-        }
-        // A head in `store.fns` under a key front2 never filed as a member: lowered here only
-        // by a caller's mistake (a free fn is `lower_fn`'s).
-        Some(Origin::Item(_)) | None => {
-            let why = Why::Program(format!("{key:?} has a head but is filed as no member of a trait, an impl or a module (a free fn is lowered by `lower_fn`)").into_boxed_str(), Range::new(0, 0));
-            return Err(BodyError::Record { item: head.lib, owner: key, why });
+    let marks = if head.text_inline {
+        store.anon_marks.get(&key).copied()
+    } else {
+        match keys.origin(key) {
+            Some(Origin::Member { kind: MemberKind::Anon, .. }) => store.anon_marks.get(&key).copied(),
+            Some(Origin::Member { kind, name, .. }) => {
+                let item_kind = match kind {
+                    MemberKind::Fn => blaze_surface::ItemKind::Function,
+                    MemberKind::Const => blaze_surface::ItemKind::Const,
+                    MemberKind::Type => blaze_surface::ItemKind::TypeAlias,
+                    // A constructor has no text of its own and no body.
+                    MemberKind::Ctor | MemberKind::Anon => return Err(BodyError::NoBody(key)),
+                };
+                super::item_site::head_marks(names, head.lib, name, item_kind, head.text).map_err(|lost| BodyError::Record { item: head.lib, owner: key, why: lost.why() })?
+            }
+            // A head in `store.fns` under a key front2 never filed as a member: lowered here only
+            // by a caller's mistake (a free fn is `lower_fn`'s).
+            Some(Origin::Item(_)) | None => {
+                let why = Why::Program(format!("{key:?} has a head but is filed as no member of a trait, an impl or a module (a free fn is lowered by `lower_fn`)").into_boxed_str(), Range::new(0, 0));
+                return Err(BodyError::Record { item: head.lib, owner: key, why });
+            }
         }
     };
     let alloc = store.work_alloc();
@@ -1653,12 +1667,33 @@ const MOST_LOCAL_LEVELS: usize = 64;
 /// in its copy is (core `line!`: "the first macro invocation leading up to the expansion"), so
 /// the offsets inside it are dropped. `None`: no library body (an anonymous constant's
 /// rendering, a chain past [`MOST_LOCAL_LEVELS`]).
-fn body_at<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, item: LibKey, owner: ItemKey, text: &str) -> Option<super::body_host::BodyAt> {
+fn body_at<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, item: LibKey, owner: ItemKey, text: &str) -> Option<super::body_host::BodyAt<'n>> {
     let mut key = owner;
     let mut off = 0u32;
     let mut fixed = false;
     for _ in 0..MOST_LOCAL_LEVELS {
         let Some(h) = store.locals.head(key) else {
+            if let Some(ha) = store.locals.head_anon(key) {
+                let header_off = names
+                    .seeded_text_of(ha.owner_item)
+                    .and_then(|it| it.impl_header.and_then(|hdr| blaze_scope::expansion_origins::offset_in(it.text, hdr)))
+                    .unwrap_or(0);
+                if let Some((_, _, root_call_offset)) = ha.expansion {
+                    let base = header_off.checked_add(root_call_offset)?;
+                    return Some(super::body_host::BodyAt { lib: ha.owner_item, off: base, sub: 0, fixed: true, edits: &[] });
+                }
+                let base = header_off.checked_add(ha.expr_offset)?;
+                if fixed {
+                    let rel = super::anon::orig_offset(ha.edits, off.checked_sub(ha.prefix)?)?;
+                    return Some(super::body_host::BodyAt { lib: ha.owner_item, off: base.checked_add(rel)?, sub: 0, fixed: true, edits: &[] });
+                }
+                if let Some(rel) = off.checked_sub(ha.prefix) {
+                    let rel = super::anon::orig_offset(ha.edits, rel)?;
+                    return Some(super::body_host::BodyAt { lib: ha.owner_item, off: base.checked_add(rel)?, sub: 0, fixed: false, edits: &[] });
+                }
+                let sub = ha.prefix.checked_sub(off)?;
+                return Some(super::body_host::BodyAt { lib: ha.owner_item, off: base, sub, fixed: false, edits: ha.edits });
+            }
             // A library body: the lowered body itself (a free fn: its item; a member: the member
             // whose text it is, never its container, whose first byte is not the member's), or
             // the enclosing body a local was declared in, lowered from its own item's or
@@ -1682,7 +1717,7 @@ fn body_at<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, ite
                     }
                 }
             };
-            return Some(super::body_host::BodyAt { lib, off, fixed });
+            return Some(super::body_host::BodyAt { lib, off, sub: 0, fixed, edits: &[] });
         };
         if h.copied {
             off = h.range.start;
@@ -1713,14 +1748,15 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     let atoms = names.cfg_atoms(krate).ok_or(BodyError::NoText(item))?;
 
     // The body's blocks the names library made modules: a call in one, written by hand or by
-    // an expansion, reads its path there (scoped.rs `body_blocks`). Uses `store.locals.library_body`
-    // so both top-level items/members AND local fns/consts/statics whose blocks the names library
-    // wrote (`Locals::library_twin`, e.g. `std::sys::process::unix::<impl Command>::posix_spawn::get_posix_spawn_addchdir`)
-    // resolve block-local macro imports like `use crate::sys::weak::weak; weak!(...);`.
-    let blocks = match (store.locals.library_body(names, keys, item, owner, text), names.crate_key(krate)) {
-        (Some(body), Some(crate_key)) => super::scoped::body_blocks(crate_key, body, text, alloc),
-        _ => None,
-    };
+    // an expansion, reads its path there (scoped.rs `body_blocks`). Uses `store.locals.body_block_modules`
+    // so top-level items/members, local fns/consts/statics whose blocks the names library wrote
+    // (`Locals::library_twin`), AND head-level anonymous constants mapped onto their enclosing item
+    // all resolve block-local items and macro imports.
+    let blocks = names.crate_key(krate).and_then(|crate_key| {
+        let nested = blaze_file_items::nested::scan(text, alloc);
+        let (hand, _) = store.locals.body_block_modules(names, keys, crate_key, item, owner, text, &nested, alloc);
+        hand.map(|hand| super::scoped::body_blocks_from(crate_key, nested, hand, alloc))
+    });
     let scoped = ScopedBy { names, module, prepared: Some(prepared), blocks: blocks.as_ref().map(super::scoped::BodyBlocks::modules) };
     // The crate's host, the one item-level expansion answers from (census 13, brief 13): env,
     // includes, proc macros; `NoHost` refused them all.
@@ -1928,7 +1964,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             // Every word's mark is in the lowered record (`View::mark_of_path`): an expansion's
             // lowered into the body, and the item's own when a macro wrote it
             // (`lower_body_expanding_marked`), so the builder needs no second copy of them.
-            builder: Builder { resolver: Paths { names }, heads: &store.maps, marks: None },
+            builder: Builder { resolver: Paths { names }, heads: &store.maps, marks: None, owner: None, owner_key: Some(owner), expanded: None },
             // A written type's first segment is asked of the blocks' named imports first
             // (super::block_type_uses): a block holding only `use`s is no module to read at.
             env: Env {
@@ -2088,11 +2124,6 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     }
     let Some((typeck, tys, type_misses)) = typeck else { return Err(BodyError::Rounds { item, last }) };
     defaults_gate(names, krate, &typeck).map_err(|why| BodyError::Record { item, owner, why })?;
-    if Store::view_has_record_type(&view) {
-        let body_env = Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts, body: None };
-        store.register_record_defaults(names, keys, item, &body_env, None, &view).map_err(|why| BodyError::Record { item, owner, why })?;
-    }
-
     let in_scope = names.traits_in_scope(module, alloc).map_err(|error| BodyError::Traits { item, error })?;
     let mut traits = blaze_own::Vec::with_capacity_in(in_scope.len(), alloc);
     for &k in in_scope.iter() {
@@ -2104,6 +2135,17 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     // The traits a block's `use` brings into scope there (tracing's `use
     // $crate::__macro_support::Callsite as _;` in the block its macros expand to).
     let blocks = super::block_traits::of(names, &store.locals, owner, module, krate, &traits, alloc);
+
+    if Store::view_has_record_type(&view) {
+        let rec_owner = store
+            .locals
+            .local_head_owner(names, owner, text)
+            .or_else(|| store.locals.library_body(names, keys, item, owner, text).map(|body_lib| (body_lib, text)));
+        let rec_lib = rec_owner.map_or(item, |(k, _)| k);
+        let body_env = Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts, body: None };
+        store.register_record_defaults(names, keys, rec_lib, owner, rec_owner, &body_env, text_marks, &view).map_err(|why| BodyError::Record { item, owner, why })?;
+    }
+
     drop(view);
     Ok(Body { item, owner, module, lowered, typeck, tys, params, self_, traits, blocks, type_misses, expanded_text: None, param_subst: None })
 }

@@ -897,3 +897,451 @@ fn format_args_nested_user_macro_rules_in_block() {
     assert_eq!(named_in(&names, by_chain, &["LocalFromChain"]), 0);
     assert_eq!(named_in(&names, by_comma, &["LocalAfterCommaInLiteral"]), 0);
 }
+
+const IMPL_WHERE_CONST_BLOCK: &str = r#"#![no_core]
+pub trait Immutable {}
+pub trait PaddingFree<T, const N: usize> {}
+pub trait IntoBytes {}
+pub enum AddressSpace { SystemMemory = 0, SystemIo = 1 }
+
+const _: () = {
+    unsafe impl IntoBytes for AddressSpace
+    where
+        (): PaddingFree<
+            Self,
+            {
+                pub enum ___ZerocopyTag {
+                    SystemMemory = 0,
+                    SystemIo = 1,
+                }
+                unsafe impl Immutable for ___ZerocopyTag {
+                    fn only_derive() {}
+                }
+                0
+            },
+        >,
+    {
+        fn only_derive() {
+            struct BodyOnly;
+            impl Immutable for BodyOnly {}
+        }
+    }
+};
+"#;
+
+static IMPL_WHERE_CONST_BLOCK_TEXTS: Texts = Texts(&[&[("/user/lib.rs", IMPL_WHERE_CONST_BLOCK)]]);
+
+/// An `impl` header's `where`-clause const block (`zerocopy::IntoBytes` shape) creates a block
+/// module under the `impl` key holding `___ZerocopyTag` and registering `impl Immutable for
+/// ___ZerocopyTag`, while the `impl`'s own assoc-item body `{ fn only_derive() { ... } }` is NOT
+/// scanned under the `impl` key (its method's body is scanned separately under the method member).
+#[test]
+fn impl_header_where_const_block_creates_block_module_without_scanning_impl_body() {
+    let crates = [input("user", "/user/lib.rs", &[])];
+    let names = resolved(&crates, &IMPL_WHERE_CONST_BLOCK_TEXTS);
+    let tag_impl = impl_ending(&names, 0, "Immutablefor___ZerocopyTag");
+    assert_eq!(named_in(&names, tag_impl, &["___ZerocopyTag"]), 0);
+    // The `impl` itself lives in `const _`'s `__blaze_block_0`, and `___ZerocopyTag`'s impl lives
+    // in the `impl` header's own block module (distinct from `const _`'s block module).
+    let outer_impl = impl_ending(&names, 0, "0},>,");
+    assert_ne!(tag_impl.module, outer_impl.module);
+    // Verify `block_modules` over `outer_impl.header` derives `tag_impl.module` deterministically.
+    let alloc = blaze_own::testing::heap().alloc();
+    let nested = blaze_file_items::nested::scan(outer_impl.header, alloc);
+    let mods = crate::blocks::block_modules(names.krate(0).key, outer_impl.key, &nested, alloc);
+    let first_mod = mods.iter().copied().flatten().next().expect("header const block module");
+    assert_eq!(first_mod, tag_impl.module);
+    // The method body's `BodyOnly` impl lives under the method's own block module, NOT under `tag_impl.module`.
+    let body_impl = impl_ending(&names, 0, "ImmutableforBodyOnly");
+    assert_ne!(body_impl.module, tag_impl.module);
+    assert_ne!(body_impl.module, outer_impl.module);
+}
+
+const BODY_FREE_FN_WHERE_CONST_BLOCK: &str = r#"#![no_core]
+pub trait Tr<const N: usize> {}
+
+pub fn f()
+where
+    (): Tr<{
+        enum E { A = 0 }
+        0
+    }>,
+{}
+"#;
+
+static BODY_FREE_FN_WHERE_CONST_BLOCK_TEXTS: Texts = Texts(&[&[("/user/lib.rs", BODY_FREE_FN_WHERE_CONST_BLOCK)]]);
+
+/// A body-free `fn` (`{}` so `body_holds_items == false`) declaring an item inside a `where`-clause
+/// const block still emits a `BodySrc` in `blaze-scope` and creates a block module holding `E`.
+#[test]
+fn body_free_fn_where_const_block_creates_block_module() {
+    use blaze_surface::DefKind;
+    let alloc = blaze_own::testing::heap().alloc();
+    let crates = [input("user", "/user/lib.rs", &[])];
+    let names = resolved(&crates, &BODY_FREE_FN_WHERE_CONST_BLOCK_TEXTS);
+    let root = names.root(0);
+    let f_item = names
+        .item_at(root, Namespace::Values, Written { kind: PathKind::Plain, segments: &["f"] }, alloc)
+        .unwrap_or_else(|e| panic!("`f`: {e}"));
+    let at = BODY_FREE_FN_WHERE_CONST_BLOCK.find("pub fn f").expect("`pub fn f` in fixture");
+    let nested = blaze_file_items::nested::scan(&BODY_FREE_FN_WHERE_CONST_BLOCK[at..], alloc);
+    let mods = crate::blocks::block_modules(names.krate(0).key, f_item.def.key, &nested, alloc);
+    let block_mod = mods.iter().copied().flatten().next().expect("where-clause const block module");
+    let e = names
+        .item_at(block_mod, Namespace::Types, Written { kind: PathKind::Plain, segments: &["E"] }, alloc)
+        .unwrap_or_else(|e| panic!("`E` in `f`'s where-clause block module: {e}"));
+    assert_eq!(e.def.kind, DefKind::Enum);
+}
+
+const ALL_ITEM_HEADS_CONST_BLOCKS: &str = r#"#![no_core]
+pub trait Tr<const N: usize> {}
+
+pub type AliasWithBlock = [u8; {
+    enum AliasEnum { A = 0 }
+    1
+}];
+
+pub struct TupleWithBlock([u8; {
+    enum TupleEnum { A = 0 }
+    1
+}]);
+
+pub struct RecordWithBlock {
+    pub x: [u8; {
+        enum RecordEnum { A = 0 }
+        1
+    }],
+}
+
+pub enum EnumWithBlock {
+    V = {
+        enum DiscEnum { A = 0 }
+        1
+    },
+}
+
+pub trait TraitWithBlock
+where
+    (): Tr<{
+        enum TraitHeadEnum { A = 0 }
+        1
+    }>,
+{
+    fn body_method() {
+        struct InMethodBody;
+    }
+}
+"#;
+
+static ALL_ITEM_HEADS_CONST_BLOCKS_TEXTS: Texts = Texts(&[&[("/user/lib.rs", ALL_ITEM_HEADS_CONST_BLOCKS)]]);
+
+/// Every item form (`type`, tuple/record `struct`, `enum`, `trait` header) with an item-declaring
+/// const block creates its `blaze-scope` block module cleanly, and `trait` scans only its header
+/// before `{ ... }` so assoc-item bodies are not treated as code blocks of the trait key.
+#[test]
+fn all_item_heads_with_const_blocks_create_block_modules() {
+    use blaze_surface::DefKind;
+    let alloc = blaze_own::testing::heap().alloc();
+    let crates = [input("user", "/user/lib.rs", &[])];
+    let names = resolved(&crates, &ALL_ITEM_HEADS_CONST_BLOCKS_TEXTS);
+    let root = names.root(0);
+    let check = |item_name: &str, needle: &str, enum_name: &str, is_trait: bool| {
+        let item = names
+            .item_at(root, Namespace::Types, Written { kind: PathKind::Plain, segments: &[item_name] }, alloc)
+            .unwrap_or_else(|e| panic!("`{item_name}`: {e}"));
+        let at = ALL_ITEM_HEADS_CONST_BLOCKS.find(needle).unwrap_or_else(|| panic!("missing `{needle}`"));
+        let rest = &ALL_ITEM_HEADS_CONST_BLOCKS[at..];
+        let end = rest.find("\n\n").unwrap_or(rest.len());
+        let slice = &rest[..end];
+        let scan_text = if is_trait { blaze_file_items::nested::trait_head(slice) } else { slice };
+        let nested = blaze_file_items::nested::scan(scan_text, alloc);
+        let mods = crate::blocks::block_modules(names.krate(0).key, item.def.key, &nested, alloc);
+        let found = mods
+            .iter()
+            .copied()
+            .flatten()
+            .any(|m| {
+                names
+                    .item_at(m, Namespace::Types, Written { kind: PathKind::Plain, segments: &[enum_name] }, alloc)
+                    .is_ok_and(|res| res.def.kind == DefKind::Enum)
+            });
+        assert!(found, "`{enum_name}` must resolve in a block module of `{item_name}`");
+    };
+    check("AliasWithBlock", "pub type AliasWithBlock", "AliasEnum", false);
+    check("TupleWithBlock", "pub struct TupleWithBlock", "TupleEnum", false);
+    check("RecordWithBlock", "pub struct RecordWithBlock", "RecordEnum", false);
+    check("EnumWithBlock", "pub enum EnumWithBlock", "DiscEnum", false);
+    check("TraitWithBlock", "pub trait TraitWithBlock", "TraitHeadEnum", true);
+}
+
+#[test]
+fn trait_head_and_adt_skip_where_const_blocks_when_finding_body_braces() {
+    let trait_src = "pub trait T where const { enum E { A = 0 } true } { fn f(); }";
+    assert_eq!(
+        blaze_file_items::nested::trait_head(trait_src),
+        "pub trait T where const { enum E { A = 0 } true }"
+    );
+    assert!(blaze_file_items::nested::has_writing_block(blaze_file_items::nested::trait_head(trait_src)));
+    let struct_src = "pub struct S where const { enum E { A = 0 } true } { pub x: u8 }";
+    assert!(blaze_file_items::nested::adt_has_writing_block(struct_src));
+    let plain_struct = "pub struct Plain { pub x: u8 }";
+    assert!(!blaze_file_items::nested::adt_has_writing_block(plain_struct));
+}
+
+const DIRECT_HEAD_MACRO_CALL: &str = r#"#![no_core]
+macro_rules! make_len {
+    () => {
+        {
+            pub enum HeadMacroEnum { A = 0, B = 1 }
+            pub trait Mark {}
+            impl Mark for HeadMacroEnum {}
+            2
+        }
+    };
+}
+pub type A = [u8; make_len!()];
+"#;
+
+static DIRECT_HEAD_MACRO_CALL_TEXTS: Texts = Texts(&[&[("/user/lib.rs", DIRECT_HEAD_MACRO_CALL)]]);
+
+/// Round 8 P1: a direct unbraced macro call in an item head (`type A = [u8; make_len!()];`)
+/// emits a `__blaze_block_head` module under `A`, expands `make_len!()` in statement/expression
+/// position, and creates the expansion's block module holding `HeadMacroEnum` and its `impl`.
+#[test]
+fn direct_macro_call_in_type_alias_head_creates_expansion_block_module() {
+    use blaze_surface::DefKind;
+    let alloc = blaze_own::testing::heap().alloc();
+    let crates = [input("user", "/user/lib.rs", &[])];
+    let names = resolved(&crates, &DIRECT_HEAD_MACRO_CALL_TEXTS);
+    let mark_impl = impl_ending(&names, 0, "MarkforHeadMacroEnum");
+    let root = names.root(0);
+    let alias = names
+        .item_at(root, Namespace::Types, Written { kind: PathKind::Plain, segments: &["A"] }, alloc)
+        .unwrap_or_else(|e| panic!("`A`: {e}"));
+    let head_mod = crate::blocks::head_call_module(names.krate(0).key, alias.def.key);
+    let call_key = crate::task::key_of(names.krate(0).key, head_mod, "MacroCall", "", 0);
+    let exp_name = crate::expanded_blocks::expansion_block_name(call_key, 0, alloc);
+    let exp_mod = crate::task::key_of(names.krate(0).key, call_key, "mod", exp_name.as_str(), 0);
+    assert_eq!(mark_impl.module, exp_mod);
+    let e = names
+        .item_at(exp_mod, Namespace::Types, Written { kind: PathKind::Plain, segments: &["HeadMacroEnum"] }, alloc)
+        .unwrap_or_else(|e| panic!("`HeadMacroEnum` in expansion block module: {e}"));
+    assert_eq!(e.def.kind, DefKind::Enum);
+}
+
+const CFG_GATED_HEAD_MACRO_CALLS: &str = r#"#![no_core]
+macro_rules! make_len {
+    () => {
+        {
+            pub enum HeadCfgEnum { A = 0, B = 1 }
+            pub trait Mark {}
+            impl Mark for HeadCfgEnum {}
+            2
+        }
+    };
+}
+pub fn f(#[cfg(any())] _: [u8; missing!()], #[cfg(all())] _ok: [u8; make_len!()]) {}
+pub struct S {
+    #[cfg(any())]
+    pub a: [u8; missing!()],
+    #[cfg(all())]
+    pub b: [u8; make_len!()],
+}
+pub struct T(#[cfg(any())] pub [u8; missing!()], #[cfg(all())] pub [u8; make_len!()]);
+pub enum E {
+    #[cfg_attr(all(), non_exhaustive)]
+    V([u8; make_len!()]),
+}
+pub fn g(
+    #[cfg_attr(all(), cfg(any()))] _disabled: [u8; missing!()],
+    #[cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), cfg(any())))))))))))))))))))))] _deep_disabled: [u8; missing!()],
+    #[cfg_attr(any(), cfg(any()))] _kept: [u8; make_len!()],
+    #[cfg_attr(all(), cfg(all()))] _enabled: [u8; make_len!()],
+) {}
+pub fn h(
+    #[xtool::cfg_attr(all(), cfg(any()))] _tool_cfg_attr: [u8; make_len!()],
+    #[xtool::cfg(any())] _tool_cfg: [u8; make_len!()],
+) {}
+pub fn r(
+    #[r#cfg(any())] _raw_cfg: [u8; missing!()],
+    #[r#cfg_attr(all(), r#cfg(any()))] _raw_cfg_attr: [u8; missing!()],
+    #[r#cfg(all())] _raw_enabled: [u8; make_len!()],
+) {}
+"#;
+
+static CFG_GATED_HEAD_MACRO_CALLS_TEXTS: Texts = Texts(&[&[("/user/lib.rs", CFG_GATED_HEAD_MACRO_CALLS)]]);
+
+/// Round 9 P1: `#[cfg(any())]` on a fn parameter, struct field, or tuple field containing a
+/// direct macro call prevents `blaze-scope` from expanding the disabled `missing!()` call,
+/// while a sibling `#[cfg(all())]` call is still expanded at its preserved ordinal.
+#[test]
+fn cfg_disabled_head_macro_calls_are_not_expanded_while_enabled_ones_are() {
+    use blaze_surface::DefKind;
+    let alloc = blaze_own::testing::heap().alloc();
+    let crates = [input("user", "/user/lib.rs", &[])];
+    let names = resolved(&crates, &CFG_GATED_HEAD_MACRO_CALLS_TEXTS);
+    assert!(
+        !names.notes(0).iter().any(|n| matches!(n, crate::resolve::NamesNote::Expand { .. })),
+        "cfg-disabled `missing!()` must NOT be expanded: {:?}",
+        names.notes(0)
+    );
+
+    let root = names.root(0);
+    // For `fn f`, `missing!()` was ordinal 0 (cfg-removed, still counted) so `make_len!()` is ordinal 1.
+    let f_item = names
+        .item_at(root, Namespace::Values, Written { kind: PathKind::Plain, segments: &["f"] }, alloc)
+        .unwrap_or_else(|e| panic!("`f`: {e}"));
+    let head_mod = crate::blocks::head_call_module(names.krate(0).key, f_item.def.key);
+    let call_key = crate::task::key_of(names.krate(0).key, head_mod, "MacroCall", "", 1);
+    let exp_name = crate::expanded_blocks::expansion_block_name(call_key, 0, alloc);
+    let exp_mod = crate::task::key_of(names.krate(0).key, call_key, "mod", exp_name.as_str(), 0);
+    let e = names
+        .item_at(exp_mod, Namespace::Types, Written { kind: PathKind::Plain, segments: &["HeadCfgEnum"] }, alloc)
+        .unwrap_or_else(|e| panic!("`HeadCfgEnum` in fn `f` enabled head call: {e}"));
+    assert_eq!(e.def.kind, DefKind::Enum);
+
+    // Round 12 P1 #2: tool-qualified `#[xtool::cfg_attr(all(), cfg(any()))]` and
+    // `#[xtool::cfg(any())]` are inert tool attributes and MUST leave `make_len!()` enabled.
+    let h_item = names
+        .item_at(root, Namespace::Values, Written { kind: PathKind::Plain, segments: &["h"] }, alloc)
+        .unwrap_or_else(|e| panic!("`h`: {e}"));
+    let h_head_mod = crate::blocks::head_call_module(names.krate(0).key, h_item.def.key);
+    for ordinal in 0..2 {
+        let ck = crate::task::key_of(names.krate(0).key, h_head_mod, "MacroCall", "", ordinal);
+        let en = crate::expanded_blocks::expansion_block_name(ck, 0, alloc);
+        let em = crate::task::key_of(names.krate(0).key, ck, "mod", en.as_str(), 0);
+        let he = names
+            .item_at(em, Namespace::Types, Written { kind: PathKind::Plain, segments: &["HeadCfgEnum"] }, alloc)
+            .unwrap_or_else(|e| panic!("`HeadCfgEnum` in fn `h` tool-qualified attr call {ordinal}: {e}"));
+        assert_eq!(he.def.kind, DefKind::Enum);
+    }
+
+    // Round 14 P1 #2: raw `#[r#cfg(any())]` and `#[r#cfg_attr(all(), r#cfg(any()))]` MUST
+    // disable `missing!()`, while sibling `#[r#cfg(all())]` at ordinal 2 stays enabled.
+    let r_item = names
+        .item_at(root, Namespace::Values, Written { kind: PathKind::Plain, segments: &["r"] }, alloc)
+        .unwrap_or_else(|e| panic!("`r`: {e}"));
+    let r_head_mod = crate::blocks::head_call_module(names.krate(0).key, r_item.def.key);
+    let r_ck = crate::task::key_of(names.krate(0).key, r_head_mod, "MacroCall", "", 2);
+    let r_en = crate::expanded_blocks::expansion_block_name(r_ck, 0, alloc);
+    let r_em = crate::task::key_of(names.krate(0).key, r_ck, "mod", r_en.as_str(), 0);
+    let re = names
+        .item_at(r_em, Namespace::Types, Written { kind: PathKind::Plain, segments: &["HeadCfgEnum"] }, alloc)
+        .unwrap_or_else(|e| panic!("`HeadCfgEnum` in fn `r` raw-cfg enabled call: {e}"));
+    assert_eq!(re.def.kind, DefKind::Enum);
+}
+
+const SUPER_HEAD_MACRO_CALL: &str = r#"#![no_core]
+pub mod outer {
+    macro_rules! deep_len {
+        () => {
+            {
+                pub enum DeepOuterEnum { A = 0 }
+                1
+            }
+        };
+    }
+    pub(crate) use deep_len;
+
+    pub mod parent {
+        macro_rules! make_len {
+            () => {
+                {
+                    pub enum ParentMacroEnum { A = 0, B = 1 }
+                    pub trait Mark {}
+                    impl Mark for ParentMacroEnum {}
+                    2
+                }
+            };
+        }
+        pub(crate) use make_len;
+
+        pub mod inner {
+            macro_rules! make_len {
+                () => {
+                    {
+                        pub enum WrongInnerEnum { X = 0 }
+                        99
+                    }
+                };
+            }
+            pub(crate) use make_len;
+
+            macro_rules! local_len {
+                () => {
+                    {
+                        pub enum LocalSelfEnum { L = 0 }
+                        3
+                    }
+                };
+            }
+            pub(crate) use local_len;
+
+            pub type FromParent = [u8; super::make_len!()];
+            pub type FromOuter = [u8; super::super::deep_len!()];
+            pub type FromSelf = [u8; self::local_len!()];
+        }
+
+        pub mod inner_no_shadow {
+            pub type FromParent = [u8; super::make_len!()];
+        }
+    }
+}
+"#;
+
+static SUPER_HEAD_MACRO_CALL_TEXTS: Texts = Texts(&[&[("/user/lib.rs", SUPER_HEAD_MACRO_CALL)]]);
+
+#[test]
+fn super_and_self_head_macro_calls_resolve_in_enclosing_module_context() {
+    use blaze_surface::DefKind;
+    let alloc = blaze_own::testing::heap().alloc();
+    let crates = [input("user", "/user/lib.rs", &[])];
+    let names = resolved(&crates, &SUPER_HEAD_MACRO_CALL_TEXTS);
+    assert!(
+        !names.notes(0).iter().any(|n| matches!(n, crate::resolve::NamesNote::Expand { .. })),
+        "super/self head macro calls must expand cleanly: {:?}",
+        names.notes(0)
+    );
+    let root = names.root(0);
+    let check_alias = |segs: &[&str], expected_enum: &str| {
+        let alias = names
+            .item_at(root, Namespace::Types, Written { kind: PathKind::Plain, segments: segs }, alloc)
+            .unwrap_or_else(|e| panic!("{segs:?}: {e}"));
+        let head_mod = crate::blocks::head_call_module(names.krate(0).key, alias.def.key);
+        let call_key = crate::task::key_of(names.krate(0).key, head_mod, "MacroCall", "", 0);
+        let exp_name = crate::expanded_blocks::expansion_block_name(call_key, 0, alloc);
+        let exp_mod = crate::task::key_of(names.krate(0).key, call_key, "mod", exp_name.as_str(), 0);
+        let e = names
+            .item_at(exp_mod, Namespace::Types, Written { kind: PathKind::Plain, segments: &[expected_enum] }, alloc)
+            .unwrap_or_else(|e| panic!("`{expected_enum}` in {segs:?} expansion block module: {e}"));
+        assert_eq!(e.def.kind, DefKind::Enum);
+    };
+    check_alias(&["outer", "parent", "inner", "FromParent"], "ParentMacroEnum");
+    check_alias(&["outer", "parent", "inner", "FromOuter"], "DeepOuterEnum");
+    check_alias(&["outer", "parent", "inner", "FromSelf"], "LocalSelfEnum");
+    check_alias(&["outer", "parent", "inner_no_shadow", "FromParent"], "ParentMacroEnum");
+    let expected_mods: std::vec::Vec<_> = [&["outer", "parent", "inner", "FromParent"][..], &["outer", "parent", "inner_no_shadow", "FromParent"][..]]
+        .into_iter()
+        .map(|segs| {
+            let alias = names
+                .item_at(root, Namespace::Types, Written { kind: PathKind::Plain, segments: segs }, alloc)
+                .unwrap_or_else(|e| panic!("{segs:?}: {e}"));
+            let head_mod = crate::blocks::head_call_module(names.krate(0).key, alias.def.key);
+            let call_key = crate::task::key_of(names.krate(0).key, head_mod, "MacroCall", "", 0);
+            let exp_name = crate::expanded_blocks::expansion_block_name(call_key, 0, alloc);
+            crate::task::key_of(names.krate(0).key, call_key, "mod", exp_name.as_str(), 0)
+        })
+        .collect();
+    let got_mods: std::vec::Vec<_> = names
+        .krate(0)
+        .tables
+        .impls
+        .iter()
+        .filter(|i| i.header.chars().filter(|c| !c.is_whitespace()).collect::<std::string::String>().trim_end_matches('{').ends_with("MarkforParentMacroEnum"))
+        .map(|i| i.module)
+        .collect();
+    assert_eq!(got_mods.len(), 2, "both inner::FromParent and inner_no_shadow::FromParent must expand parent::make_len");
+    for exp_mod in &expected_mods {
+        assert!(got_mods.contains(exp_mod), "missing Mark impl in {exp_mod:x}, got {got_mods:?}");
+    }
+}

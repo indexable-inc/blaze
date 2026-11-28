@@ -339,7 +339,9 @@ pub fn stable_tys(alloc: blaze_own::Alloc<'_>) -> Result<blaze_typeck::PortableT
         blaze_own::Box::new_in(StableColumn::new_in(alloc), alloc);
     let record_names: blaze_own::Box<dyn blaze_typeck::Stable<blaze_typeck::Name>, blaze_own::Alloc<'_>> =
         blaze_own::Box::new_in(StableColumn::new_in(alloc), alloc);
-    blaze_typeck::PortableTys::new_stable(alloc, nodes, lists, record_schemas, record_names)
+    let record_defaults: blaze_own::Box<dyn blaze_typeck::Stable<(blaze_typeck::PTy, u64)>, blaze_own::Alloc<'_>> =
+        blaze_own::Box::new_in(StableColumn::new_in(alloc), alloc);
+    blaze_typeck::PortableTys::new_stable(alloc, nodes, lists, record_schemas, record_names, record_defaults)
 }
 
 #[cfg(test)]

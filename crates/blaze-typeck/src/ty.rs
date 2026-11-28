@@ -384,6 +384,20 @@ pub trait TypeCtx {
         once_traits: [Option<ItemKey>; 2],
         ref_traits: [Option<ItemKey>; 4],
     ) -> bool;
+
+    /// Constructs a structural record type carrying an optional owner-scoped `defaults` tag
+    /// (0 = anonymous / untagged; ignored by structural equality and unification).
+    fn mk_record_with_defaults(&mut self, schema: RecordSchema, defaults: u64, fields: TyList) -> Result<Ty, CheckError> {
+        let _ = defaults;
+        self.mk(TyView::Record(schema, fields))
+    }
+
+    /// Returns the owner-scoped defaults tag of `t` when `t` is a structural record type (0 if
+    /// untagged or not a structural record).
+    fn record_defaults_tag(&self, t: Ty) -> u64 {
+        let _ = t;
+        0
+    }
 }
 
 /// A closure's kind (`rustc_type_ir::ClosureKind`), weakest trait first.

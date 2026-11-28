@@ -406,6 +406,47 @@ pub(super) fn library_item_or_member<'n, S: NamesSource<'n>>(names: S, keys: &Ke
     found
 }
 
+/// The exact text `blaze-scope::blocks` scanned for `owner_item` (top-level item or associated
+/// member): `impl_header` for `Impl`, `trait_head` for `Trait`, whole text for all other items
+/// and associated members (`NamesSource::member_owner`).
+pub(super) fn owner_scanned_text<'n, S: NamesSource<'n>>(names: S, owner_item: LibKey) -> Option<&'n str> {
+    if let Some(it) = names.seeded_text_of(owner_item) {
+        return Some(if let Some(header) = it.impl_header {
+            header
+        } else if matches!(names.detail_of(owner_item), Some(ItemDetail::Trait)) {
+            blaze_file_items::nested::trait_head(it.text)
+        } else {
+            it.text
+        });
+    }
+    let (container, _) = names.member_owner(owner_item)?;
+    let mut found = None;
+    names.each_member(container, &mut |m| {
+        if found.is_none() && m.key == owner_item {
+            found = Some(m.text);
+        }
+    });
+    found
+}
+
+/// Enclosing library item and byte alignment for a head-level anonymous constant
+/// (`"const _: TY = { <expr> };"`), used to map its blocks back to the enclosing item's
+/// `blaze-scope` block modules (or to a type-macro expansion's `statements_as_items` block
+/// modules when [`Self::expansion`] is `Some`).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct HeadAnon<'n> {
+    pub owner_item: LibKey,
+    pub expr_offset: u32,
+    pub expr_len: u32,
+    pub prefix: u32,
+    /// When `Some`, the expression came from expanding a type macro in `owner_item`'s head:
+    /// `(call_key, exp_text, root_call_offset)`.
+    pub expansion: Option<(LibKey, &'n str, u32)>,
+    /// Leaf substitutions applied to the expression text (`const_inherent`/`const_qpath`),
+    /// mapping byte offsets past `prefix` back to byte offsets in the original expression slice.
+    pub edits: &'n [super::anon::TextEdit],
+}
+
 /// The local items of every body lowered in this command, kept in the command's frame.
 pub struct Locals<'n> {
     frame: &'n Frame,
@@ -419,6 +460,9 @@ pub struct Locals<'n> {
     /// constant's own body continues there ([`Locals::find`]), as a local item's does; the
     /// constant is no item, so it is not in `heads`.
     anons: HashMap<ItemKey, (ItemKey, u32), &'n Frame>,
+    /// Head-level anonymous constants that may declare items or invoke macros inside a block,
+    /// mapped back to the enclosing library item whose `blaze-scope` block modules hold them.
+    head_anons: HashMap<ItemKey, HeadAnon<'n>, &'n Frame>,
     /// Each block module (`__blaze_block_*`) owned by a lowered body, mapping the block module's
     /// library key back to its enclosing body's checker key: what `type_name` prints items
     /// declared in that block (`struct LocalStruct;` in `fn outer`) under (`crate::outer::LocalStruct`).
@@ -445,6 +489,7 @@ impl<'n> Locals<'n> {
             heads: HashMap::new_in(frame),
             foreign: HashMap::new_in(frame),
             anons: HashMap::new_in(frame),
+            head_anons: HashMap::new_in(frame),
             block_owners: HashMap::new_in(frame),
             planted: super::scope_table::Planted::None,
             body_scopes: None,
@@ -452,11 +497,12 @@ impl<'n> Locals<'n> {
     }
 
     pub fn clear(&mut self) {
-        let Locals { frame: _, bodies, heads, foreign, anons, block_owners, planted, body_scopes } = self;
+        let Locals { frame: _, bodies, heads, foreign, anons, head_anons, block_owners, planted, body_scopes } = self;
         bodies.clear();
         heads.clear();
         foreign.clear();
         anons.clear();
+        head_anons.clear();
         block_owners.clear();
         *planted = super::scope_table::Planted::None;
         *body_scopes = None;
@@ -473,6 +519,22 @@ impl<'n> Locals<'n> {
     /// key is never filed at two places.
     pub(super) fn file_anon(&mut self, key: ItemKey, owner: ItemKey, scope: u32) {
         self.anons.insert(key, (owner, scope));
+    }
+
+    /// Files the head-level anonymous constant `key` as originating from `owner` in its enclosing
+    /// library item, wrapped with a `prefix`-byte synthetic `"const _: TY = { "` header.
+    pub(super) fn file_head_anon(&mut self, key: ItemKey, owner: super::anon::HeadOwner, exp_text: Option<&str>, edits: &[super::anon::TextEdit], prefix: u32) {
+        let edits: &'n [super::anon::TextEdit] = if edits.is_empty() { &[] } else { self.frame.alloc_slice_copy(edits) };
+        let expansion = match (owner.expansion, exp_text) {
+            (Some(exp), Some(t)) => Some((exp.call, &*self.frame.alloc_str(t), exp.root_call_offset)),
+            _ => None,
+        };
+        self.head_anons.insert(key, HeadAnon { owner_item: owner.item, expr_offset: owner.offset, expr_len: owner.len, prefix, expansion, edits });
+    }
+
+    /// The enclosing library item alignment of a head-level anonymous constant, if any.
+    pub(super) fn head_anon(&self, key: ItemKey) -> Option<HeadAnon<'n>> {
+        self.head_anons.get(&key).copied()
     }
 
     /// Plants the scope table's bug for every body kept after this (tests only:
@@ -565,18 +627,15 @@ impl<'n> Locals<'n> {
         // The body's blocks as the names library made them modules: the same scan of the same
         // text, so the same keys (`blaze_scope::blocks::block_modules`). A local fn's, const's
         // or static's own body is the library's item of its block's module when its blocks
-        // are written (`Self::library_twin`). None when the library has no such body.
+        // are written (`Self::library_twin`). A head-level anonymous constant maps its blocks
+        // back to its enclosing library item's block modules (`self.head_anons`).
         let nested = blaze_file_items::nested::scan(at.text, alloc);
-        let library_body = self.library_body(names, keys, at.item, at.owner, at.text);
-        let modules = match library_body {
-            Some(body) if nested.end == blaze_file_items::nested::NestedEnd::Whole => Some(blaze_scope::blocks::block_modules(crate_key, body, &nested, alloc)),
-            _ => None,
-        };
+        let (modules, scope_body) = self.body_block_modules(names, keys, crate_key, at.item, at.owner, at.text, &nested, alloc);
         // The module of each block scope of the body, by the scope (super::scope_table): built
         // once, here, and kept with the body. A refusal names the whole item: the table is the
         // body's.
         let whole = Range::new(0, at.text.len() as u32);
-        let table = super::scope_table::build(crate_key, at.module, view, &nested, modules.as_deref(), self.planted, alloc)
+        let table = super::scope_table::build(crate_key, at.module, view, &nested, modules.as_ref().map(super::scope_table::OwnedHandBlocks::as_ref), self.planted, alloc)
             .map_err(|r| bad(Why::Unsupported(r.form(), whole)))?;
         // The blocks whose module is known to exist: one that binds a kept item's name, and
         // the blocks around it.
@@ -769,7 +828,7 @@ impl<'n> Locals<'n> {
         let mut blocks: blaze_own::Vec<BlockModule, &'n Frame> = blaze_own::Vec::new_in(frame);
         if let Some(ms) = modules.as_ref() {
             for (b, block) in nested.blocks.iter().enumerate() {
-                if let (true, Some(module)) = (known[b], ms.get(b).copied().flatten()) {
+                if let (Some(true), Some(module)) = (known.get(b).copied(), ms.modules.get(b).copied().flatten()) {
                     blocks.push(BlockModule { open: block.open, close: block.close, module });
                 }
             }
@@ -786,13 +845,187 @@ impl<'n> Locals<'n> {
         }
         let names_of_blocks = match self.body_scopes {
             None => super::scope_table::BlockNames::Modules,
-            Some(s) => match library_body.ok_or(NoBodyScope::NoLibraryBody).and_then(|body| s.of(body)) {
+            Some(s) => match scope_body.ok_or(NoBodyScope::NoLibraryBody).and_then(|body| s.of(body)) {
                 Ok(view) => super::scope_table::BlockNames::Bodies(view),
                 Err(why) => return Err(bad(Why::Unsupported(why.form(), whole))),
             },
         };
         self.bodies.insert(at.owner, BodyLocals { parents, rows, blocks, scopes, names_of_blocks });
         Ok(())
+    }
+
+    /// The names-library block modules for `nested` (the scan of `text`, lowered as body `owner`
+    /// under `item`), returning `(modules, scope_body)` where `scope_body` is the library key
+    /// owning those block modules (for `--block-scopes=bodies`).
+    ///
+    /// For a library item/member body (or a local fn/const/static twin), derives modules directly
+    /// via `blaze_scope::blocks::block_modules`. For a synthetic head-level anonymous constant
+    /// (`"const _: TY = { <expr> };"`), maps each block back to the enclosing library item's
+    /// `blaze-scope` block modules (`self.head_anons`).
+    #[expect(clippy::too_many_arguments, reason = "one shared lookup of a body's block modules across keep, body_blocks, and PatternBlocks")]
+    pub(super) fn body_block_modules<'a, S: NamesSource<'n>>(
+        &self,
+        names: S,
+        keys: &Keys,
+        crate_key: blaze_id::CrateItemKey,
+        item: LibKey,
+        owner: ItemKey,
+        text: &str,
+        nested: &blaze_file_items::nested::Nested<'_>,
+        alloc: Alloc<'a>,
+    ) -> (Option<super::scope_table::OwnedHandBlocks<'a>>, Option<LibKey>) {
+        if nested.end != blaze_file_items::nested::NestedEnd::Whole {
+            return (None, None);
+        }
+        if let Some(body) = self.library_body(names, keys, item, owner, text) {
+            let modules = blaze_scope::blocks::block_modules(crate_key, body, nested, alloc);
+            let head_module = (!nested.head_calls.is_empty()).then(|| blaze_scope::blocks::head_call_module(crate_key, body));
+            return (
+                Some(super::scope_table::OwnedHandBlocks { modules, head_module, call_keys: blaze_own::AVec::new_in(alloc) }),
+                Some(body),
+            );
+        }
+        let Some(ha) = self.head_anons.get(&owner).copied() else {
+            return (None, None);
+        };
+        if let Some((call_key, exp_text, _)) = ha.expansion {
+            let Ok(exp_blocks) = blaze_scope::expanded_blocks::expansion_blocks(exp_text, alloc) else {
+                return (None, None);
+            };
+            let block_count = exp_blocks.nested.blocks.len();
+            let mut exp_modules: blaze_own::AVec<'a, Option<LibKey>> = blaze_own::AVec::with_capacity_in(block_count, alloc);
+            exp_modules.resize(block_count, None);
+            for (b, block) in exp_blocks.nested.blocks.iter().enumerate() {
+                let Some(ordinal) = exp_blocks.ordinals.get(b).copied().flatten() else { continue };
+                let outer = match block.parent {
+                    None | Some(0) => Some(call_key),
+                    Some(p) => usize::try_from(p).ok().and_then(|idx| exp_modules.get(idx)).copied().flatten(),
+                };
+                let name = blaze_scope::expanded_blocks::expansion_block_name(call_key, ordinal, alloc);
+                if let Some(slot) = exp_modules.get_mut(b) {
+                    *slot = outer.map(|o| blaze_scope::task::key_of(crate_key, o, "mod", name.as_str(), 0));
+                }
+            }
+            let wrap = blaze_scope::expanded_blocks::WRAP_OPEN;
+            let wrapped_offset = wrap.saturating_add(ha.expr_offset);
+            let wrapped_end = wrapped_offset.saturating_add(ha.expr_len);
+            let enclosing_module = exp_blocks
+                .nested
+                .blocks
+                .iter()
+                .enumerate()
+                .skip(1)
+                .rev()
+                .find(|(_, b)| b.open < wrapped_offset && wrapped_end < b.close)
+                .and_then(|(idx, _)| exp_modules.get(idx).copied().flatten());
+            let mut mapped: blaze_own::AVec<'a, Option<LibKey>> = blaze_own::AVec::with_capacity_in(nested.blocks.len(), alloc);
+            let mut any = false;
+            for blk in nested.blocks.iter() {
+                let module = if blk.open >= ha.prefix {
+                    super::anon::orig_offset(ha.edits, blk.open - ha.prefix)
+                        .and_then(|rel| wrapped_offset.checked_add(rel))
+                        .and_then(|target_open| exp_blocks.nested.blocks.binary_search_by_key(&target_open, |b| b.open).ok())
+                        .and_then(|idx| exp_modules.get(idx).copied().flatten())
+                } else {
+                    enclosing_module
+                };
+                any |= module.is_some();
+                mapped.push(module);
+            }
+            let mut call_keys: blaze_own::AVec<'a, (u32, LibKey)> = blaze_own::AVec::new_in(alloc);
+            let lookup_exp_call = |start: u32| -> Option<LibKey> {
+                let rel = start.checked_sub(ha.prefix)?;
+                let owner_start = wrapped_offset.checked_add(super::anon::orig_offset(ha.edits, rel)?)?;
+                let (block, n) = super::scope_table::statement_call(&exp_blocks.nested, owner_start)?;
+                let owner_mod = if block == 0 {
+                    call_key
+                } else {
+                    usize::try_from(block).ok().and_then(|idx| exp_modules.get(idx)).copied().flatten()?
+                };
+                Some(blaze_scope::task::key_of(crate_key, owner_mod, "MacroCall", "", n))
+            };
+            for c in nested.calls.iter().chain(nested.head_calls.iter()) {
+                if let Some(ck) = lookup_exp_call(c.range.start).or_else(|| lookup_exp_call(c.path.start)) {
+                    call_keys.push((c.range.start, ck));
+                    if c.path.start != c.range.start {
+                        call_keys.push((c.path.start, ck));
+                    }
+                }
+            }
+            return if any || !call_keys.is_empty() {
+                (
+                    Some(super::scope_table::OwnedHandBlocks { modules: mapped, head_module: None, call_keys }),
+                    Some(ha.owner_item),
+                )
+            } else {
+                (None, None)
+            };
+        }
+        let Some(owner_text) = owner_scanned_text(names, ha.owner_item) else {
+            return (None, None);
+        };
+        let owner_nested = blaze_file_items::nested::scan(owner_text, alloc);
+        if owner_nested.end != blaze_file_items::nested::NestedEnd::Whole {
+            return (None, None);
+        }
+        let owner_modules = blaze_scope::blocks::block_modules(crate_key, ha.owner_item, &owner_nested, alloc);
+        let owner_head_mod = (!owner_nested.head_calls.is_empty()).then(|| blaze_scope::blocks::head_call_module(crate_key, ha.owner_item));
+        let expr_end = ha.expr_offset.saturating_add(ha.expr_len);
+        // When `const_term` stripped the outer `{ ... }` of a const generic argument, the
+        // synthetic outer wrapper `{` (`open < prefix`) stands for the innermost block of
+        // `owner_nested` strictly enclosing `[expr_offset, expr_end]`.
+        let enclosing_module = owner_nested
+            .blocks
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, b)| b.open < ha.expr_offset && expr_end < b.close)
+            .and_then(|(idx, _)| owner_modules.get(idx).copied().flatten());
+        let mut mapped: blaze_own::AVec<'a, Option<LibKey>> = blaze_own::AVec::with_capacity_in(nested.blocks.len(), alloc);
+        let mut any = false;
+        for blk in nested.blocks.iter() {
+            let module = if blk.open >= ha.prefix {
+                super::anon::orig_offset(ha.edits, blk.open - ha.prefix)
+                    .and_then(|rel| ha.expr_offset.checked_add(rel))
+                    .and_then(|target_open| owner_nested.blocks.binary_search_by_key(&target_open, |b| b.open).ok())
+                    .and_then(|idx| owner_modules.get(idx).copied().flatten())
+            } else {
+                enclosing_module
+            };
+            any |= module.is_some();
+            mapped.push(module);
+        }
+        // Map direct macro calls inside the synthetic head constant back to their `blaze-scope`
+        // `MacroCall` keys in `owner_nested` (covering both braced calls in `owner_nested.calls`
+        // and unbraced calls in `owner_nested.head_calls`, preserving exact owner-item ordinals).
+        let mut call_keys: blaze_own::AVec<'a, (u32, LibKey)> = blaze_own::AVec::new_in(alloc);
+        let lookup_owner_call = |start: u32| -> Option<LibKey> {
+            let rel = start.checked_sub(ha.prefix)?;
+            let owner_start = ha.expr_offset.checked_add(super::anon::orig_offset(ha.edits, rel)?)?;
+            if let Some((block, n)) = super::scope_table::statement_call(&owner_nested, owner_start) {
+                let owner_mod = usize::try_from(block).ok().and_then(|idx| owner_modules.get(idx)).copied().flatten()?;
+                return Some(blaze_scope::task::key_of(crate_key, owner_mod, "MacroCall", "", n));
+            }
+            let head_mod = owner_head_mod?;
+            let n = super::scope_table::head_call(&owner_nested, owner_start)?;
+            Some(blaze_scope::task::key_of(crate_key, head_mod, "MacroCall", "", n))
+        };
+        for c in nested.calls.iter().chain(nested.head_calls.iter()) {
+            if let Some(ck) = lookup_owner_call(c.range.start).or_else(|| lookup_owner_call(c.path.start)) {
+                call_keys.push((c.range.start, ck));
+                if c.path.start != c.range.start {
+                    call_keys.push((c.path.start, ck));
+                }
+            }
+        }
+        if any || !call_keys.is_empty() {
+            (
+                Some(super::scope_table::OwnedHandBlocks { modules: mapped, head_module: None, call_keys }),
+                Some(ha.owner_item),
+            )
+        } else {
+            (None, None)
+        }
     }
 
     /// The library's key of the body of `item` lowered from `text`, when the names library
@@ -811,6 +1044,24 @@ impl<'n> Locals<'n> {
             return self.library_twin(names, h, text);
         }
         library_item_or_member(names, keys, item, owner, text)
+    }
+
+    /// For a local `fn`, `const`, or `static` whose own text writes a block (making it an item of
+    /// its block's names-library module via `NestedItem::body_writes`), returns its names-library
+    /// twin key and the subslice of `text` aligned with that twin's scanned text (with leading
+    /// comments/whitespace adjusted to match `blaze-file-items::nested::scan`).
+    pub(super) fn local_head_owner<S: NamesSource<'n>>(&self, names: S, key: ItemKey, text: &'n str) -> Option<(LibKey, &'n str)> {
+        let h = self.heads.get(&key)?;
+        let twin = self.library_twin(names, h, text)?;
+        let stripped = strip_leading_trivia(text);
+        let aligned = if let Some(it) = names.seeded_text_of(twin) {
+            let it_lead = it.text.len().saturating_sub(strip_leading_trivia(it.text).len());
+            let text_lead = text.len().saturating_sub(stripped.len());
+            text_lead.checked_sub(it_lead).and_then(|start| text.get(start..)).unwrap_or(stripped)
+        } else {
+            stripped
+        };
+        Some((twin, aligned))
     }
 
     /// The names library's item for the local `fn`, `const` or `static` `h` whose text is

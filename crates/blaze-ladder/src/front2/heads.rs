@@ -898,6 +898,23 @@ pub(crate) fn field_default_label<'a>(variant: usize, field: usize, ty_text: &st
     blaze_own::format_in!(alloc, "field default {variant}.{field}: {ty_text} = {value_text}")
 }
 
+/// Synthetic anonymous-member name for ADT field default `(variant, field)`, including its
+/// observable source placement when the default expression invokes a macro (`line!()`, `column!()`,
+/// `file!()`, etc.).
+pub(crate) fn field_default_label_with_site<'a>(
+    variant: usize,
+    field: usize,
+    ty_text: &str,
+    value_text: &str,
+    site: Option<super::anon::HeadSite<'_>>,
+    alloc: Alloc<'a>,
+) -> blaze_own::String<Alloc<'a>> {
+    match site {
+        Some(s) => blaze_own::format_in!(alloc, "field default {variant}.{field}: {ty_text} = {value_text} @{}:{}:{}", s.line, s.col, s.file.unwrap_or("")),
+        None => field_default_label(variant, field, ty_text, value_text, alloc),
+    }
+}
+
 /// Synthetic inline `const` declaration stored in `FnHead::text` for an ADT field default.
 pub(crate) fn field_default_decl<'a>(ty_text: &str, value_text: &str, alloc: Alloc<'a>) -> blaze_own::String<Alloc<'a>> {
     blaze_own::format_in!(alloc, "const _: {ty_text} = {value_text};")
@@ -907,6 +924,51 @@ pub(crate) fn field_default_decl<'a>(ty_text: &str, value_text: &str, alloc: All
 pub(crate) fn field_default_label_from_decl<'a>(variant: usize, field: usize, decl: &str, alloc: Alloc<'a>) -> Option<blaze_own::String<Alloc<'a>>> {
     let body = decl.strip_prefix("const _: ")?.strip_suffix(';')?;
     Some(blaze_own::format_in!(alloc, "field default {variant}.{field}: {body}"))
+}
+
+/// Reconstructs the anonymous-member label for a frozen ADT field default, falling back to the
+/// enclosing ADT's source placement when the default calls a macro and its key includes `HeadSite`.
+pub(crate) fn field_default_label_for_frozen<'n, 'a, S: NamesSource<'n>>(
+    names: S,
+    adt: LibKey,
+    container: ItemKey,
+    variant: usize,
+    field: usize,
+    decl: &str,
+    expected: ItemKey,
+    alloc: Alloc<'a>,
+) -> Option<blaze_own::String<Alloc<'a>>> {
+    let plain = field_default_label_from_decl(variant, field, decl, alloc)?;
+    if !decl.contains('!') {
+        return Some(plain);
+    }
+    let owner_text = super::locals::owner_scanned_text(names, adt)?;
+    let is_enum = matches!(names.detail_of(adt), Some(ItemDetail::Enum));
+    let situated = with_lowered(names, adt, owner_text, |v| {
+        let field_row = if is_enum {
+            let vn = v.rows(v.list(head::FIELDS)).ok()?.get(variant).copied()?;
+            let var = lf::Variant::decode(vn).ok()?;
+            v.rows(var.fields).ok()?.get(field).copied()?
+        } else {
+            if variant != 0 {
+                return None;
+            }
+            v.rows(v.list(head::FIELDS)).ok()?.get(field).copied()?
+        };
+        let f = lf::Field::decode(field_row).ok()?;
+        let c = f.default?;
+        let ty_text = v.text_at(v.type_range(f.ty).ok()?).ok()?.trim();
+        let value_text = v.text_at(v.const_range(c).ok()?).ok()?.trim();
+        let offset = blaze_scope::expansion_origins::offset_in(owner_text, value_text)?;
+        let site = super::anon::head_site_of(names, adt, offset, value_text);
+        Some(field_default_label_with_site(variant, field, ty_text, value_text, site, alloc))
+    })
+    .ok()
+    .flatten();
+    if let Some(label) = situated {
+        return Some(label);
+    }
+    (super::keys::member_key_of(container, MemberKind::Anon, plain.as_str()) == expected).then_some(plain)
 }
 
 pub(crate) fn field_default_allowed<'n, S: NamesSource<'n>>(names: S, adt: LibKey, kind: tc::AdtKind, ctor: tc::CtorKind, r: Range) -> Result<(), Why> {
@@ -3852,18 +3914,69 @@ impl<'n> Store<'n> {
         }
     }
 
+    fn where_const_member_name(k: usize, site: Option<super::anon::HeadSite<'_>>, alloc: Alloc<'static>) -> blaze_own::String<Alloc<'static>> {
+        match site {
+            Some(s) => blaze_own::format_in!(alloc, "where const {k} @{}:{}:{}", s.line, s.col, s.file.unwrap_or("")),
+            None => blaze_own::format_in!(alloc, "where const {k}"),
+        }
+    }
+
+    fn field_default_member_name(
+        vi: usize,
+        j: usize,
+        ty_text: &str,
+        value_text: &str,
+        site: Option<super::anon::HeadSite<'_>>,
+        alloc: Alloc<'static>,
+    ) -> blaze_own::String<Alloc<'static>> {
+        field_default_label_with_site(vi, j, ty_text, value_text, site, alloc)
+    }
+
+    fn record_default_member_name(
+        owner: LibKey,
+        j: usize,
+        ty_text: &str,
+        value_text: &str,
+        site: Option<super::anon::HeadSite<'_>>,
+        alloc: Alloc<'static>,
+    ) -> blaze_own::String<Alloc<'static>> {
+        match site {
+            Some(s) => blaze_own::format_in!(alloc, "record default {owner:x} {j}: {ty_text} = {value_text} @{}:{}:{}", s.line, s.col, s.file.unwrap_or("")),
+            None => blaze_own::format_in!(alloc, "record default {owner:x} {j}: {ty_text} = {value_text}"),
+        }
+    }
+
+    fn owner_item_marks<S: NamesSource<'n>>(&self, names: S, item: LibKey, owner_text: &'n str) -> Option<TextMarks<'n>> {
+        if names.seeded_text_of(item).is_some() {
+            return self.marks(names, item, owner_text).ok().flatten();
+        }
+        let (container, _) = names.member_owner(item)?;
+        let mut found = None;
+        names.each_member(container, &mut |m| {
+            if found.is_none() && m.key == item {
+                found = m.name.map(|name| (name, m.kind, m.text));
+            }
+        });
+        let (name, kind, text) = found?;
+        super::item_site::head_marks(names, container, name, kind, text).ok().flatten()
+    }
+
     /// Lowers every `where const { COND }` collected in `preds.conds` into a `PClause::Const`
     /// clause + synthetic `bool`-returning constant `FnHead` in `fns` so `World::const_holds`
     /// can evaluate the condition at arbitrary ground generic arguments.
     /// Takes individual store fields so callers can invoke it while a `Builder` borrows `self.maps`.
     #[expect(clippy::too_many_arguments, reason = "owner item head context for synthetic const fn")]
-    fn file_where_consts(
+    fn file_where_consts<S: NamesSource<'n>>(
+        names: S,
         tys: &mut PortableTys<'static>,
         locals: &super::locals::Locals<'n>,
+        anon_marks: &mut super::anon::Columns<'n>,
         fns: &Rows<ItemKey, FnHead<'n>>,
         preds_table: &Rows<ItemKey, Preds>,
         owner_ck: ItemKey,
         lib: LibKey,
+        owner: Option<(LibKey, &'n str)>,
+        marks: Option<TextMarks<'_>>,
         module: LibKey,
         v: &View<'_>,
         env: &Env<'_>,
@@ -3871,15 +3984,19 @@ impl<'n> Store<'n> {
         total_generics: u32,
         keys: &Keys,
         preds: &mut Preds,
-    ) -> Result<(), Why> {
-        if preds.conds.is_empty() {
-            return Ok(());
-        }
+    ) -> Result<blaze_own::Vec<(ItemKey, super::anon::HeadOwner, u32), Alloc<'static>>, Why> {
         let alloc = tys.alloc();
+        if preds.conds.is_empty() {
+            return Ok(blaze_own::Vec::new_in(alloc));
+        }
         let bool_ty = intern(tys, PNode::Bool)?;
         let args = params(tys, 0, total_generics, env.consts)?;
         let conds = core::mem::replace(&mut preds.conds, blaze_own::Vec::new_in(alloc));
         let mut made: blaze_own::Vec<(ItemKey, &'n str), Alloc<'static>> = blaze_own::Vec::with_capacity_in(conds.len(), alloc);
+        let mut anons: blaze_own::Vec<(ItemKey, super::anon::HeadOwner, u32), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        let prefix_usize = "const _: bool = ".len();
+        let prefix = u32::try_from(prefix_usize).ok();
+        let owner_pair = owner.or_else(|| super::locals::owner_scanned_text(names, lib).map(|t| (lib, t)));
         for (k, &cond) in conds.iter().enumerate() {
             let at = v.const_range(cond)?;
             let r = v.site(at)?;
@@ -3888,12 +4005,24 @@ impl<'n> Store<'n> {
                 Some(rest) => rest.trim_start(),
                 None => written,
             };
-            let member_name = blaze_own::format_in!(alloc, "where const {k}");
+            let located = owner_pair.and_then(|(owner_item, owner_text)| {
+                blaze_scope::expansion_origins::offset_in(owner_text, body_expr).map(|offset| (owner_item, offset))
+            });
+            let site = located.and_then(|(owner_item, offset)| super::anon::head_site_of(names, owner_item, offset, body_expr));
+            let member_name = Self::where_const_member_name(k, site, alloc);
             let cond_key = keys
                 .member(owner_ck, MemberKind::Anon, member_name.as_str())
                 .map_err(|_| Why::Unsupported("duplicate `where const` condition key", r))?;
             let decl = blaze_own::format_in!(alloc, "const _: bool = {body_expr};");
             let text: &'n str = locals.keep_text(decl.as_str());
+            super::anon::file_parts_marks(anon_marks, cond_key, text, marks, &[(prefix_usize, body_expr)], alloc)
+                .map_err(|e| Why::Program(blaze_own::format_in!(alloc, "{e}").as_str().into(), r))?;
+            if let (Some((owner_item, offset)), Some(prefix)) = (located, prefix)
+                && blaze_file_items::nested::may_write_block(body_expr)
+                && let Ok(len) = u32::try_from(body_expr.len())
+            {
+                anons.push((cond_key, super::anon::HeadOwner { item: owner_item, offset, len, expansion: None }, prefix));
+            }
             preds.push(PClause::Const { cond: cond_key, args }, super::heads_regions::Src::Derived);
             made.push((cond_key, text));
         }
@@ -3932,7 +4061,7 @@ impl<'n> Store<'n> {
             };
             fns.insert(cond_key, row);
         }
-        Ok(())
+        Ok(anons)
     }
 
     /// Reconstructs the synthetic `FnHead` + `Preds` for a `where const` condition key whose
@@ -3951,7 +4080,7 @@ impl<'n> Store<'n> {
         let mut own_bounds: blaze_own::Vec<ParamBound, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         let mut own_assoc: blaze_own::Vec<(Name, PTy), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         let mut clauses: blaze_own::Vec<PClause, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
-        let (owner_ck, lib, module, text, total_generics, self_) = match owner_want {
+        let (owner_ck, lib, owner_lib, module, text, total_generics, self_) = match owner_want {
             Want::Impl(lib) => {
                 let ck = checker_of(lib);
                 let Some(it) = names.signature_text_of(lib) else { return Ok(false) };
@@ -3963,7 +4092,7 @@ impl<'n> Store<'n> {
                 own_bounds.extend_from_slice(&frame.bounds);
                 own_assoc.extend_from_slice(&imp.assoc);
                 clauses.extend_from_slice(&p.clauses);
-                (ck, lib, frame.module, it.text, frame.generics, frame.self_)
+                (ck, lib, Some(lib), frame.module, it.text, frame.generics, frame.self_)
             }
             Want::Fn(lib) => {
                 let ck = checker_of(lib);
@@ -3974,7 +4103,7 @@ impl<'n> Store<'n> {
                 own_bounds.extend_from_slice(&f.bounds);
                 own_assoc.extend_from_slice(&f.self_assoc);
                 clauses.extend_from_slice(&p.clauses);
-                (ck, lib, f.module, f.text, f.parent + f.own, f.self_)
+                (ck, lib, Some(lib), f.module, f.text, f.parent + f.own, f.self_)
             }
             Want::MemberFn(lib, fk) => {
                 let Some(f) = self.fns.get(&fk) else { return Ok(false) };
@@ -3984,7 +4113,8 @@ impl<'n> Store<'n> {
                 own_bounds.extend_from_slice(&f.bounds);
                 own_assoc.extend_from_slice(&f.self_assoc);
                 clauses.extend_from_slice(&p.clauses);
-                (fk, lib, f.module, f.text, f.parent + f.own, f.self_)
+                let member_lib = keys.source_member(names, fk, f.text).map(|(_, m)| m.key);
+                (fk, lib, member_lib, f.module, f.text, f.parent + f.own, f.self_)
             }
             Want::Adt(lib) => {
                 let ck = checker_of(lib);
@@ -4001,7 +4131,7 @@ impl<'n> Store<'n> {
                 param_names(&v, 0, &mut own_params, Consts::Keep).map_err(|w| HeadError::Item(lib, w))?;
                 let self_args = params(&mut self.tys, 0, adt.generics, &own_consts).map_err(|w| HeadError::Item(lib, w))?;
                 let self_ty = intern(&mut self.tys, PNode::Adt(ck, self_args)).map_err(|w| HeadError::Item(lib, w))?;
-                (ck, lib, module, it.text, adt.generics, SelfTy::Ty(self_ty, None))
+                (ck, lib, Some(lib), module, it.text, adt.generics, SelfTy::Ty(self_ty, None))
             }
             Want::Members(lib) => {
                 let ck = checker_of(lib);
@@ -4016,10 +4146,20 @@ impl<'n> Store<'n> {
                 let low = self.lower_alloc_here(names, lib, it.text, alloc).map_err(|_| HeadError::Item(lib, Why::Unsupported("lowering trait for `where const`", Range::new(0, 0))))?;
                 let v = low.view();
                 param_names(&v, 1, &mut own_params, Consts::Keep).map_err(|w| HeadError::Item(lib, w))?;
-                (ck, lib, module, it.text, tr.generics, SelfTy::Trait(lib))
+                (ck, lib, Some(lib), module, it.text, tr.generics, SelfTy::Trait(lib))
             }
             Want::Head(_) => return Ok(false),
         };
+        let header_off = match owner_want {
+            Want::Impl(impl_lib) => names
+                .seeded_text_of(impl_lib)
+                .and_then(|it| it.impl_header.and_then(|hdr| blaze_scope::expansion_origins::offset_in(it.text, hdr)))
+                .unwrap_or(0),
+            _ => 0,
+        };
+        let prefix_usize = "const _: bool = ".len();
+        let prefix = u32::try_from(prefix_usize).ok();
+        let owner_marks = owner_lib.and_then(|oi| self.owner_item_marks(names, oi, text));
         let low = self.lower_alloc_here(names, lib, text, alloc).map_err(|_| HeadError::Item(lib, Why::Unsupported("lowering owner for `where const`", Range::new(0, 0))))?;
         let v = low.view();
         let rows = v.rows(v.list(head::WHERE)).map_err(|b| HeadError::Item(lib, Why::from(b)))?;
@@ -4035,14 +4175,25 @@ impl<'n> Store<'n> {
                 Some(rest) => rest.trim_start(),
                 None => written,
             };
-            let member_name = blaze_own::format_in!(alloc, "where const {k}");
+            let offset = blaze_scope::expansion_origins::offset_in(text, body_expr).and_then(|raw_off| raw_off.checked_sub(header_off));
+            let site = owner_lib.and_then(|owner_item| offset.and_then(|off| super::anon::head_site_of(names, owner_item, off, body_expr)));
+            let member_name = Self::where_const_member_name(k, site, alloc);
             let cond_key = keys.member(owner_ck, MemberKind::Anon, member_name.as_str()).map_err(HeadError::Key)?;
             k += 1;
+            if let (Some(owner_item), Some(offset), Some(prefix)) = (owner_lib, offset, prefix)
+                && blaze_file_items::nested::may_write_block(body_expr)
+                && let Ok(len) = u32::try_from(body_expr.len())
+            {
+                self.locals.file_head_anon(cond_key, super::anon::HeadOwner { item: owner_item, offset, len, expansion: None }, None, &[], prefix);
+            }
             if self.fns.contains_key(&cond_key) {
                 continue;
             }
             let decl_buf = blaze_own::format_in!(alloc, "const _: bool = {body_expr};");
             let decl: &'n str = self.locals.keep_text(decl_buf.as_str());
+            if let Err(e) = super::anon::file_parts_marks(&mut self.anon_marks, cond_key, decl, owner_marks, &[(prefix_usize, body_expr)], alloc) {
+                return Err(HeadError::Item(lib, Why::Program(blaze_own::format_in!(alloc, "{e}").as_str().into(), Range::new(0, 0))));
+            }
             let mut cp = Preds::new_in(Scope::new_in(alloc));
             for &cl in &clauses {
                 if !matches!(cl, PClause::Const { cond: x, .. } if x == cond_key) {
@@ -4078,6 +4229,151 @@ impl<'n> Store<'n> {
             self.fns.insert(cond_key, row);
         }
         Ok(self.fns.contains_key(&cond))
+    }
+
+    /// Deterministic non-zero 64-bit owner-scoped defaults tag for structural record type `ti`
+    /// inside `owner_ck`, carried through `PortableTys`, `blaze-ty`, and `blaze-solve` so
+    /// distinct aliases/types with identical structural schemas keep isolated defaults in
+    /// `Store::field_defaults` (`RecordSchema::scoped_defaults_key`).
+    pub(super) fn scoped_record_defaults_tag(owner_ck: ItemKey, schema: tc::RecordSchema, ti: u32, alloc: Alloc<'_>) -> u64 {
+        let label = blaze_own::format_in!(alloc, "record defaults {:016x} #{ti}", schema.0);
+        let k = super::keys::member_key_of(owner_ck, MemberKind::Anon, label.as_str());
+        let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = k.0.to_le_bytes();
+        u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]) | 1
+    }
+
+    /// Registers `HeadAnon` alignment and remapped hygiene `anon_marks` for a frozen/seeded
+    /// inline field default (`text_inline: true`) — both nominal ADT field defaults (keyed under
+    /// `checker_of(item)`) and structural record field defaults (keyed under
+    /// `RecordSchema::defaults_key()`) — when lowered in a fresh store whose `locals.head_anons`
+    /// and `anon_marks` were not populated by `Store::adt` / `Store::register_record_defaults`.
+    ///
+    /// Returns `Err` if a frozen nominal field default's key disagrees with the current source's
+    /// observable placement (e.g. a `line!()` default shifted to another line), refusing to attach
+    /// moved coordinates to a stale key.
+    pub(super) fn ensure_field_default_site<S: NamesSource<'n>>(&mut self, names: S, item: LibKey, owner: ItemKey, text: &'n str) -> Result<(), Why> {
+        if self.locals.head_anon(owner).is_some() || self.locals.head(owner).is_some() || self.anon_marks.contains_key(&owner) {
+            return Ok(());
+        }
+        if !self.fns.get(&owner).is_some_and(|h| h.text_inline) {
+            return Ok(());
+        }
+        enum DefaultKind {
+            Nominal(usize),
+            Record(ItemKey, usize),
+        }
+        let item_ck = checker_of(item);
+        let kind = if let Some(field_idx) = self.field_defaults.get(&item_ck).and_then(|ds| ds.iter().position(|d| *d == Some(owner))) {
+            DefaultKind::Nominal(field_idx)
+        } else if let Some((rk, rec_idx)) = self
+            .field_defaults
+            .iter()
+            .find_map(|(&rk, ds)| (rk != item_ck).then(|| ds.iter().position(|d| *d == Some(owner)).map(|j| (rk, j))).flatten())
+        {
+            DefaultKind::Record(rk, rec_idx)
+        } else {
+            return Ok(());
+        };
+        let Some(owner_text) = super::locals::owner_scanned_text(names, item) else {
+            return Ok(());
+        };
+        let lower_key = if names.crate_of(item).is_some() { item } else { names.member_owner(item).map_or(item, |(c, _)| c) };
+        let alloc = self.tys.alloc();
+        let Ok(low) = self.lower_alloc_here(names, lower_key, owner_text, alloc) else {
+            return Ok(());
+        };
+        let v = low.view();
+        let mut found: Option<(&str, &str)> = None;
+        match kind {
+            DefaultKind::Nominal(field_idx) => {
+                let mut seen = 0usize;
+                let mut located_field: Option<(usize, usize, &str, &str)> = None;
+                let is_enum = matches!(names.detail_of(item), Some(ItemDetail::Enum));
+                if is_enum {
+                    if let Ok(variants) = v.rows(v.list(head::FIELDS)) {
+                        'outer: for (vi, &vn) in variants.iter().enumerate() {
+                            let Ok(var) = lf::Variant::decode(vn) else { continue };
+                            let Ok(rows) = v.rows(var.fields) else { continue };
+                            for (j, &fn_row) in rows.iter().enumerate() {
+                                if seen == field_idx {
+                                    if let Ok(f) = lf::Field::decode(fn_row)
+                                        && let Some(c) = f.default
+                                        && let Ok(ty_at) = v.type_range(f.ty)
+                                        && let Ok(ty_s) = v.text_at(ty_at)
+                                        && let Ok(at) = v.const_range(c)
+                                        && let Ok(val) = v.text_at(at)
+                                    {
+                                        located_field = Some((vi, j, ty_s.trim(), val.trim()));
+                                    }
+                                    break 'outer;
+                                }
+                                seen += 1;
+                            }
+                        }
+                    }
+                } else if let Ok(rows) = v.rows(v.list(head::FIELDS))
+                    && let Some(&fn_row) = rows.get(field_idx)
+                    && let Ok(f) = lf::Field::decode(fn_row)
+                    && let Some(c) = f.default
+                    && let Ok(ty_at) = v.type_range(f.ty)
+                    && let Ok(ty_s) = v.text_at(ty_at)
+                    && let Ok(at) = v.const_range(c)
+                    && let Ok(val) = v.text_at(at)
+                {
+                    located_field = Some((0, field_idx, ty_s.trim(), val.trim()));
+                }
+                if let Some((vi, j, ty_text, value_text)) = located_field {
+                    let site = blaze_scope::expansion_origins::offset_in(owner_text, value_text)
+                        .and_then(|off| super::anon::head_site_of(names, item, off, value_text));
+                    let label = Self::field_default_member_name(vi, j, ty_text, value_text, site, alloc);
+                    if super::keys::member_key_of(item_ck, MemberKind::Anon, label.as_str()) != owner {
+                        return Err(Why::Program(
+                            "a frozen field default's key disagrees with its current source placement".into(),
+                            Range::new(0, 0),
+                        ));
+                    }
+                    found = Some((ty_text, value_text));
+                }
+            }
+            DefaultKind::Record(_, rec_idx) => {
+                'records: for i in 0..v.types.len() {
+                    let Ok(ti) = u32::try_from(i) else { break };
+                    let Ok(lf::TypeRef::Record(fields)) = v.ty(lf::TypeId(ti)) else { continue };
+                    let Ok(rows) = v.rows(fields) else { continue };
+                    for &row in rows {
+                        let Ok(f) = lf::Field::decode(row) else { continue };
+                        let Some(c) = f.default else { continue };
+                        let (Ok(ty_at), Ok(val_at)) = (v.type_range(f.ty), v.const_range(c)) else { continue };
+                        let (Ok(ty_s), Ok(val_s)) = (v.text_at(ty_at), v.text_at(val_at)) else { continue };
+                        let (ty_text, value_text) = (ty_s.trim(), val_s.trim());
+                        let site = blaze_scope::expansion_origins::offset_in(owner_text, value_text)
+                            .and_then(|off| super::anon::head_site_of(names, item, off, value_text));
+                        let label = Self::record_default_member_name(item, rec_idx, ty_text, value_text, site, alloc);
+                        if self
+                            .field_defaults
+                            .iter()
+                            .any(|(&rk, ds)| rk != item_ck && ds.get(rec_idx) == Some(&Some(owner)) && super::keys::member_key_of(rk, MemberKind::Anon, label.as_str()) == owner)
+                        {
+                            found = Some((ty_text, value_text));
+                            break 'records;
+                        }
+                    }
+                }
+            }
+        }
+        let Some((ty_text, value_text)) = found else { return Ok(()) };
+        let ty_prefix = "const _: ".len();
+        let val_prefix = ty_prefix + ty_text.len() + " = ".len();
+        if blaze_file_items::nested::may_write_block(value_text)
+            && let Some(offset) = blaze_scope::expansion_origins::offset_in(owner_text, value_text)
+            && let (Ok(len), Ok(prefix)) = (u32::try_from(value_text.len()), u32::try_from(val_prefix))
+        {
+            self.locals.file_head_anon(owner, super::anon::HeadOwner { item, offset, len, expansion: None }, None, &[], prefix);
+        }
+        if let Some(marks) = self.owner_item_marks(names, item, owner_text) {
+            let _ = super::anon::file_parts_marks(&mut self.anon_marks, owner, text, Some(marks), &[(ty_prefix, ty_text), (val_prefix, value_text)], alloc);
+        }
+        Ok(())
     }
 
     /// Whether ADT `item` is eligible for Blaze-edition automatic `Copy`/`Clone`
@@ -4205,6 +4501,13 @@ impl<'n> Store<'n> {
                 PNode::Record(s, a) => {
                     if let Some(names) = from.record_names(s) {
                         self.tys.register_record_schema(s, names).ok()?;
+                    }
+                    let tag = from.record_defaults_tag(PTy(idx));
+                    if tag != 0 {
+                        let nl = l(a, &mapped, &mut self.tys)?;
+                        let id = self.tys.intern_record_with_defaults(s, nl, tag).ok()?;
+                        *mapped.get_mut(i)? = Some(id);
+                        continue;
                     }
                     PNode::Record(s, l(a, &mapped, &mut self.tys)?)
                 }
@@ -4510,14 +4813,14 @@ impl<'n> Store<'n> {
             (Want::Fn(_), ItemDetail::Fn { .. } | ItemDetail::Const { .. }) => {
                 let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
                 let marks = self.marks(names, key, text).map_err(|why| HeadError::Item(key, why))?;
-                self.fn_head(names, keys, key, ck, None, &env, 0, &[], &v, text, detail, marks, false)
+                self.fn_head(names, keys, key, key, ck, None, &env, 0, &[], &v, text, detail, marks, false)
             }
             // A static's head is its type, as a const's, and its mutability (the Reference,
             // "Static items": "Mutable statics", `static mut`).
             (Want::Fn(_), ItemDetail::Static { .. }) => {
                 let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
                 let marks = self.marks(names, key, text).map_err(|why| HeadError::Item(key, why))?;
-                let made = self.fn_head(names, keys, key, ck, None, &env, 0, &[], &v, text, detail, marks, false);
+                let made = self.fn_head(names, keys, key, key, ck, None, &env, 0, &[], &v, text, detail, marks, false);
                 if made.is_ok() {
                     let m = if v.head[head::FLAGS] & sig::MUT != 0 { tc::Mutbl::Mut } else { tc::Mutbl::Not };
                     self.statics.insert(ck, m);
@@ -5177,6 +5480,38 @@ impl<'n> Store<'n> {
         self.file_container(ck, &life_names, Some((None, self_ty))).map_err(|what| HeadError::Filed { want, at, what })
     }
 
+    /// The `(LibKey, scanned_text)` head owner for a top-level library item whose head or body
+    /// may hold item- or macro-bearing const blocks (`blaze_scope::task::lower::BodySrc::of`).
+    fn head_owner_item<S: NamesSource<'n>>(names: S, key: LibKey) -> Option<(LibKey, &'n str)> {
+        let it = names.seeded_text_of(key)?;
+        match names.detail_of(key)? {
+            ItemDetail::Impl => it.impl_header.filter(|h| blaze_file_items::nested::has_writing_block(h)).map(|h| (key, h)),
+            ItemDetail::Trait => {
+                let head = blaze_file_items::nested::trait_head(it.text);
+                blaze_file_items::nested::has_writing_block(head).then_some((key, head))
+            }
+            ItemDetail::TraitAlias | ItemDetail::TypeAlias => blaze_file_items::nested::has_writing_block(it.text).then_some((key, it.text)),
+            ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union => blaze_file_items::nested::adt_has_writing_block(it.text).then_some((key, it.text)),
+            ItemDetail::Fn { body_holds_items } | ItemDetail::Const { body_holds_items } | ItemDetail::Static { body_holds_items } => {
+                (body_holds_items || blaze_file_items::nested::has_writing_block(it.text)).then_some((key, it.text))
+            }
+            _ => None,
+        }
+    }
+
+    /// The `(member_lib, member_text)` head owner for an associated `fn`, `const`, or `type`
+    /// member (or free `fn`/`const`/`static`) whose head or body may hold item- or macro-bearing
+    /// const blocks.
+    fn head_owner_member(member_lib: LibKey, detail: ItemDetail, text: &'n str) -> Option<(LibKey, &'n str)> {
+        match detail {
+            ItemDetail::TypeAlias => blaze_file_items::nested::has_writing_block(text).then_some((member_lib, text)),
+            ItemDetail::Fn { body_holds_items } | ItemDetail::Const { body_holds_items } | ItemDetail::Static { body_holds_items } => {
+                (body_holds_items || blaze_file_items::nested::has_writing_block(text)).then_some((member_lib, text))
+            }
+            _ => None,
+        }
+    }
+
     /// A trait alias's head (`trait A<T> = B<T> + C where ..;`): its generics (`Self` first)
     /// and the clauses it stands for, read in its own module as a trait's supertraits and where
     /// clauses are, with `Self` = `Param(0)`. An alias named in them is made first
@@ -5188,7 +5523,8 @@ impl<'n> Store<'n> {
         let mut ps = blaze_own::Vec::new_in(alloc);
         let mut cs = blaze_own::Vec::new_in(alloc);
         let marks = self.marks(names, key, v.item())?;
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+        let owner = Self::head_owner_item(names, key);
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None };
         let own = own_generics(&b, &mut self.tys, module, v, 1, &mut ps, &mut cs)?;
         let me = intern(&mut self.tys, PNode::Param(0))?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Ty(me, None), self_assoc: &[], anon: &[], consts: &cs, body: None };
@@ -5224,7 +5560,8 @@ impl<'n> Store<'n> {
         let mut ps = blaze_own::Vec::new_in(a);
         let mut cs = blaze_own::Vec::new_in(a);
         let marks = self.marks(names, key, v.item())?;
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+        let owner = Self::head_owner_item(names, key);
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None };
         let generics = own_generics(&b, &mut self.tys, module, v, 0, &mut ps, &mut cs)?;
         // A free `type T;` with no type is an extern type (the Reference, "Type aliases": a
         // free alias without a type is an error, so the only accepted form is a foreign item:
@@ -5274,7 +5611,7 @@ impl<'n> Store<'n> {
             self.preds.insert(o.key, o.preds);
             self.opaques.insert(o.key, (alias_ck, o.index));
         }
-        self.register_record_defaults(names, keys, key, &env, marks, v)?;
+        self.register_record_defaults(names, keys, key, alias_ck, owner, &env, marks, v)?;
         self.maps.alias_defaults.insert(key, defaults);
         self.maps.aliases.insert(key, Some((generics, ty)));
         self.maps.const_params.insert(key, cs);
@@ -5288,7 +5625,8 @@ impl<'n> Store<'n> {
         let mut ps = blaze_own::Vec::new_in(alloc);
         let mut cs = blaze_own::Vec::new_in(alloc);
         let marks = self.marks(names, key, v.item())?;
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+        let owner = Self::head_owner_item(names, key);
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None };
         let g = own_generics(&b, &mut self.tys, module, v, 0, &mut ps, &mut cs)?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs, body: None };
         let mut defaults = blaze_own::Vec::new_in(alloc);
@@ -5393,7 +5731,8 @@ impl<'n> Store<'n> {
         let mut ps = blaze_own::Vec::new_in(alloc);
         let mut cs = blaze_own::Vec::new_in(alloc);
         let marks = self.marks(names, key, v.item())?;
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+        let owner = Self::head_owner_item(names, key);
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None };
         let own = own_generics(&b, &mut self.tys, module, v, 1, &mut ps, &mut cs)?;
         // The trait's bounds are lowered after its head (they may name the trait): a default
         // written with `T::X` is refused as not yet readable, never as not found.
@@ -5521,11 +5860,12 @@ impl<'n> Store<'n> {
             cs.extend_from_slice(existing);
         }
         let Ok(marks) = self.marks(names, key, v.item()) else { return };
+        let trait_owner = Self::head_owner_item(names, key);
         let mut bounds: blaze_own::Vec<super::types::ParamBound, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         for _ in 0..16u32 {
             bounds.clear();
             let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Trait(key), self_assoc: &[], anon: &[], consts: &cs, body: None };
-            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner: trait_owner, owner_key: Some(checker_of(key)), expanded: None };
             match b.param_bounds_in(&mut self.tys, &env, &v, 1, &mut bounds) {
                 Ok(()) => break,
                 Err(Why::Need(dep)) => {
@@ -5564,7 +5904,8 @@ impl<'n> Store<'n> {
                     let base = own + 1;
                     let mut idx = base;
                     let cenv = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
-                    let cb = Builder { resolver: Paths { names }, heads: &self.maps, marks: m_marks };
+                    let m_owner = Self::head_owner_member(m.lib, m.detail, m.text);
+                    let cb = Builder { resolver: Paths { names }, heads: &self.maps, marks: m_marks, owner: m_owner, owner_key: Some(checker_of(m.lib)), expanded: None };
                     for &n in rows {
                         match lf::GenericParam::decode(n) {
                             Ok(lf::GenericParam::Lifetime { .. }) => {}
@@ -5631,7 +5972,8 @@ impl<'n> Store<'n> {
                 let Ok(ap_scope) = Scope::item(&mv, Some(&scope), scope.params(), alloc) else { break };
                 let mut ap = Preds::new_in(ap_scope);
                 let own_env = Env { module, params: &own_ps, bounds: Bounds::Done(&bounds), self_: SelfTy::Trait(key), self_assoc: &[], anon: &[], consts: &own_cs, body: None };
-                let b = Builder { resolver: Paths { names }, heads: &self.maps, marks: m_marks };
+                let m_owner = Self::head_owner_member(m.lib, m.detail, m.text);
+                let b = Builder { resolver: Paths { names }, heads: &self.maps, marks: m_marks, owner: m_owner, owner_key: Some(checker_of(m.lib)), expanded: None };
                 match b.assoc_ty_bounds(&mut self.tys, &own_env, &mv, alias, self.sized, &mut ap) {
                     Ok(()) => {
                         let laid = match lay_listed(&b, &mut self.tys, &own_env, &mv, (&ap, &[]), SelfGiven::NONE, Captures::NONE, alloc) {
@@ -5685,7 +6027,8 @@ impl<'n> Store<'n> {
         cs.extend_from_slice(self.maps.const_params.get(&key).ok_or(Why::Need(key))?);
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Trait(key), self_assoc: &[], anon: &[], consts: &cs, body: None };
         let marks = self.marks(names, key, v.item())?;
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+        let owner = Self::head_owner_item(names, key);
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None };
         let mut bounds = blaze_own::Vec::new_in(alloc);
         b.param_bounds_in(&mut self.tys, &env, v, 1, &mut bounds)?;
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
@@ -5746,7 +6089,9 @@ impl<'n> Store<'n> {
         // (D148), never `RegionRefusal::NoContainer` for a header that is here. One the record
         // or `trait_head` filed stands.
         self.container_regions.insert_absent(ck, ContainerRegions::of_header(v, None, alloc)?);
-        Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, ck, key, module, v, &env, &bounds, own + 1, keys, &mut preds)?;
+        for (cond_key, head_owner, prefix) in Self::file_where_consts(names, &mut self.tys, &self.locals, &mut self.anon_marks, &self.fns, &self.preds, ck, key, owner, b.marks, module, v, &env, &bounds, own + 1, keys, &mut preds)? {
+            self.locals.file_head_anon(cond_key, head_owner, None, &[], prefix);
+        }
         let mut inherited = blaze_own::Vec::with_capacity_in(preds.clauses.len() + 1, alloc);
         inherited.push(PClause::Trait { trait_: ck, args: params(&mut self.tys, 0, own + 1, &cs)? });
         inherited.extend_from_slice(&preds.clauses);
@@ -5864,7 +6209,8 @@ impl<'n> Store<'n> {
                     ItemDetail::TypeAlias => {
                         let item = keys.member(ck, MemberKind::Type, m.name).map_err(&why_key)?;
                         let marks = super::item_site::member_marks(names, key, m.written_by, m.text).map_err(MarksLost::why)?;
-                        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+                        let owner = Self::head_owner_member(m.lib, m.detail, m.text);
+                        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(m.lib)), expanded: None };
                         let default = match mv.head_opt(head::TY) {
                             Some(t) => Some(b.ty(&mut self.tys, &env, mv, lf::TypeId(t))?),
                             None => None,
@@ -5920,6 +6266,9 @@ impl<'n> Store<'n> {
                                 self.regions.file_refused(item);
                             }
                         }
+                        if Self::view_has_record_type(mv) {
+                            self.register_record_defaults(names, keys, m.lib, checker_of(m.lib), owner, &own_env, marks, mv)?;
+                        }
                         assoc.push(tc::AssocTyDef { name: Name::of(m.name), item, default });
                     }
                     ItemDetail::Const { .. } => {
@@ -5928,7 +6277,8 @@ impl<'n> Store<'n> {
                         let t = mv.head_opt(head::TY).ok_or(Why::Unsupported("an associated constant with no type", at))?;
                         consts.push((Name::of(m.name), mk));
                         let marks = super::item_site::member_marks(names, key, m.written_by, m.text).map_err(MarksLost::why)?;
-                        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+                        let owner = Self::head_owner_member(m.lib, m.detail, m.text);
+                        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(m.lib)), expanded: None };
                         let mut cp = Preds::new_in(scope.clone_in(alloc));
                         cp.inherit(&inherited);
                         let ra = self.tys.alloc();
@@ -5946,6 +6296,9 @@ impl<'n> Store<'n> {
                             }
                         };
                         self.fn_gaps.remove(&mk);
+                        if Self::view_has_record_type(mv) {
+                            self.register_record_defaults(names, keys, m.lib, checker_of(m.lib), owner, &env, marks, mv)?;
+                        }
                         let head_alloc = self.tys.alloc();
                         self.preds.insert(mk, cp);
                         let header = tc::FnPtrHeader::RUST;
@@ -6002,7 +6355,8 @@ impl<'n> Store<'n> {
         let self_ty = intern(&mut self.tys, PNode::Adt(ck, pl))?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Ty(self_ty, None), self_assoc: &[], anon: &[], consts: &cs, body: None };
         let marks = self.marks(names, key, v.item())?;
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+        let owner = Self::head_owner_item(names, key);
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None };
         let mut bounds = blaze_own::Vec::new_in(alloc);
         b.param_bounds_in(&mut self.tys, &env, v, 0, &mut bounds)?;
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
@@ -6073,14 +6427,29 @@ impl<'n> Store<'n> {
                 field_default_allowed(names, key, kind, ctor, r)?;
                 let ty_text = v.text_at(v.type_range(f.ty)?)?.trim();
                 let value_text = v.text_at(at)?.trim();
-                // Keyed by the ADT, the field's place and the default's text (rule 21: the
-                // text is the value's input; the ADT's generics are its head's).
-                let label = field_default_label(vi, j, ty_text, value_text, alloc);
+                let owner_pair = owner.or_else(|| super::locals::owner_scanned_text(names, key).map(|t| (key, t)));
+                let located = owner_pair.and_then(|(owner_item, owner_text)| {
+                    blaze_scope::expansion_origins::offset_in(owner_text, value_text).map(|offset| (owner_item, offset))
+                });
+                let site = located.and_then(|(owner_item, offset)| super::anon::head_site_of(names, owner_item, offset, value_text));
+                // Keyed by the ADT, the field's place, the default's text, and (when it calls a
+                // macro) its observable source site (rule 21: the text and site are its inputs).
+                let label = Self::field_default_member_name(vi, j, ty_text, value_text, site, alloc);
                 let dk = keys
                     .member(ck, MemberKind::Anon, label.as_str())
                     .map_err(|c| Why::Program(format!("{c}").into_boxed_str(), r))?;
                 let src = field_default_decl(ty_text, value_text, alloc);
                 let text: &'n str = self.locals.keep_text(src.as_str());
+                let ty_prefix = "const _: ".len();
+                let val_prefix = ty_prefix + ty_text.len() + " = ".len();
+                super::anon::file_parts_marks(&mut self.anon_marks, dk, text, marks, &[(ty_prefix, ty_text), (val_prefix, value_text)], alloc)
+                    .map_err(|e| Why::Program(blaze_own::format_in!(alloc, "{e}").as_str().into(), r))?;
+                if let Some((owner_item, offset)) = located
+                    && blaze_file_items::nested::may_write_block(value_text)
+                    && let (Ok(len), Ok(prefix)) = (u32::try_from(value_text.len()), u32::try_from(val_prefix))
+                {
+                    self.locals.file_head_anon(dk, super::anon::HeadOwner { item: owner_item, offset, len, expansion: None }, None, &[], prefix);
+                }
                 defaults.push(Some(dk));
                 default_heads.push((dk, text, ty));
             }
@@ -6094,7 +6463,9 @@ impl<'n> Store<'n> {
         let scope = Scope::item(v, None, 0, alloc).map_err(Why::Regions)?;
         let mut preds = Preds::new_in(scope.clone_in(alloc));
         b.predicates(&mut self.tys, &env, v, 0, None, self.sized, &mut preds)?;
-        Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, ck, key, module, v, &env, &bounds, generics, keys, &mut preds)?;
+        for (cond_key, head_owner, prefix) in Self::file_where_consts(names, &mut self.tys, &self.locals, &mut self.anon_marks, &self.fns, &self.preds, ck, key, owner, b.marks, module, v, &env, &bounds, generics, keys, &mut preds)? {
+            self.locals.file_head_anon(cond_key, head_owner, None, &[], prefix);
+        }
         // D148: the ADT's regions (its own lifetimes, its clauses' columns, its fields'), filed
         // under its checker key ([`super::head_record::regions_key`]), plus a `HeadRegions::sig`
         // for each tuple struct / tuple variant constructor (`CtorSig`) so `FnDef` values like
@@ -6243,7 +6614,7 @@ impl<'n> Store<'n> {
         }
         sans_io |= names.in_sans_io_scope(key, module);
         let discrs = discriminants(&b, &mut self.tys, &env, v, repr, &written)?;
-        self.register_record_defaults(names, keys, key, &env, marks, v)?;
+        self.register_record_defaults(names, keys, key, ck, owner, &env, marks, v)?;
         let (lifetimes, field_region_at, field_region_list) = super::borrows::freeze_field_regions(names, keys, self, ck, v, kind, &fields, self.tys.alloc())?;
         let field_regions = super::borrows::FieldRegions::new(field_region_at, field_region_list, self.tys.alloc());
         let auto_copy = is_auto_copy_pub_view(names, key, module, kind, v)?;
@@ -6354,7 +6725,8 @@ impl<'n> Store<'n> {
         let mut ps = blaze_own::Vec::new_in(alloc);
         let mut cs = blaze_own::Vec::new_in(alloc);
         let marks = self.marks(names, key, v.item())?;
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+        let owner = Self::head_owner_item(names, key);
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(key)), expanded: None };
         let generics = own_generics(&b, &mut self.tys, module, v, 0, &mut ps, &mut cs)?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs, body: None };
         // The self type FIRST, then the bounds with `Self` known: the Reference, "Paths",
@@ -6465,7 +6837,7 @@ impl<'n> Store<'n> {
         // impl type parameter's lifetime-carrying bound (e.g. `impl<'de, A: ?Sized +
         // SeqAccess<'de>> SeqAccess<'de> for &mut A { type Error = A::Error; }`) receive
         // `impl_given.param_bounds` instead of `&[]`.
-        let mut assoc_to_lay: blaze_own::Vec<(Name, &'n str, Option<LibKey>, PTy), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        let mut assoc_to_lay: blaze_own::Vec<(Name, LibKey, &'n str, Option<LibKey>, PTy), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         // For a trait impl, `Self::X` in where-clauses and members lowers to `<SelfTy as Trait>::X`
         // (types.rs `self_assoc_path`), never reading `env.self_assoc`. When an associated type's
         // value needs a constant (`Why::NeedConst`), we still lower the impl's header, where-clauses
@@ -6495,14 +6867,16 @@ impl<'n> Store<'n> {
                     ItemDetail::TypeAlias => {
                         let t = mv.head_opt(head::TY).ok_or(Why::Unsupported("an associated type with no type", whole))?;
                         let marks = super::item_site::member_marks(names, key, m.written_by, m.text).map_err(MarksLost::why)?;
-                        let mb = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+                        let owner = Self::head_owner_member(m.lib, m.detail, m.text);
+                        let mb = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(m.lib)), expanded: None };
                         let written_t = lf::TypeId(t);
-                        let lowered_assoc = if mv.rows(mv.list(head::GENERICS))?.is_empty() {
+                        let mut own_ps = blaze_own::Vec::new_in(alloc);
+                        let mut own_cs = blaze_own::Vec::new_in(alloc);
+                        let has_own_generics = !mv.rows(mv.list(head::GENERICS))?.is_empty();
+                        let lowered_assoc = if !has_own_generics {
                             mb.ty(&mut self.tys, &env, mv, written_t)
                         } else {
-                            let mut own_ps = blaze_own::Vec::new_in(alloc);
                             own_ps.extend_from_slice(&ps);
-                            let mut own_cs = blaze_own::Vec::new_in(alloc);
                             own_cs.extend_from_slice(&cs);
                             own_generics(&mb, &mut self.tys, module, mv, generics, &mut own_ps, &mut own_cs).and_then(|_| {
                                 let own_env = Env { params: &own_ps, consts: &own_cs, ..env };
@@ -6520,14 +6894,22 @@ impl<'n> Store<'n> {
                             }
                             Err(why) => return Err(why),
                         };
+                        if Self::view_has_record_type(mv) {
+                            let assoc_env = if has_own_generics {
+                                Env { params: &own_ps, consts: &own_cs, ..env }
+                            } else {
+                                env
+                            };
+                            self.register_record_defaults(names, keys, m.lib, checker_of(m.lib), owner, &assoc_env, marks, mv)?;
+                        }
                         super::gat::member_where(mv, m.name)?;
                         let assoc_name = Name::of(m.name);
                         assoc.push((assoc_name, value));
-                        assoc_to_lay.push((assoc_name, m.text, m.written_by, value));
+                        assoc_to_lay.push((assoc_name, m.lib, m.text, m.written_by, value));
                     }
                     ItemDetail::Const { .. } => {
                         let mk = keys.member(ck, MemberKind::Const, m.name).map_err(|c| Why::Program(format!("{c}").into_boxed_str(), whole))?;
-                        const_texts.push((Name::of(m.name), mk, m.text, m.written_by));
+                        const_texts.push((Name::of(m.name), mk, m.lib, m.detail, m.text, m.written_by));
                     }
                     d => return Err(Why::Unsupported(crate::front::detail_name(d), whole)),
                 }
@@ -6538,15 +6920,18 @@ impl<'n> Store<'n> {
         self.put_parse_scratch(scratch);
         let env = Env { self_assoc: &assoc, ..env };
         let mut preds = Preds::new_in(scope.clone_in(alloc));
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(ck), expanded: None };
         b.predicates(&mut self.tys, &env, v, 0, None, self.sized, &mut preds)?;
-        Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, ck, key, module, v, &env, &bounds, generics, keys, &mut preds)?;
+        for (cond_key, head_owner, prefix) in Self::file_where_consts(names, &mut self.tys, &self.locals, &mut self.anon_marks, &self.fns, &self.preds, ck, key, owner, b.marks, module, v, &env, &bounds, generics, keys, &mut preds)? {
+            self.locals.file_head_anon(cond_key, head_owner, None, &[], prefix);
+        }
         let mut consts = blaze_own::Vec::with_capacity_in(const_texts.len(), alloc);
         let mut life_names = Vec::new_in(alloc);
         lifetime_names(v, &mut life_names)?;
         if let Some((waiting_const, need_const)) = first_assoc_const {
             self.container_scopes.insert(ck, Scope::container(&life_names, scope.params(), alloc).map_err(Why::Regions)?);
-            for &(name, mk, text, written_by) in &const_texts {
-                if self.impl_const(names, key, ck, mk, text, written_by, &env, (&preds.scope, preds.clauses.as_slice()), &bounds, generics).is_ok() {
+            for &(name, mk, m_lib, m_detail, text, written_by) in &const_texts {
+                if self.impl_const(names, keys, key, m_lib, m_detail, ck, mk, text, written_by, &env, (&preds.scope, preds.clauses.as_slice()), &bounds, generics).is_ok() {
                     self.fn_gaps.remove(&mk);
                     consts.push((name, mk));
                 }
@@ -6582,11 +6967,12 @@ impl<'n> Store<'n> {
             if !assoc_to_lay.is_empty() {
                 let mut scratch = self.take_parse_scratch();
                 let res: Result<(), Why> = (|| {
-                    for &(assoc_name, m_text, m_written_by, value) in &assoc_to_lay {
+                    for &(assoc_name, m_lib, m_text, m_written_by, value) in &assoc_to_lay {
                         with_lowered_in(&mut scratch, names, key, m_text, blaze_lower::ItemContext::TopLevel, |mv| -> Result<(), Why> {
                             let t = mv.head_opt(head::TY).ok_or(Why::Unsupported("an associated type with no type", whole))?;
                             let marks = super::item_site::member_marks(names, key, m_written_by, m_text).map_err(MarksLost::why)?;
-                            let mb = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+                            let owner = Self::head_owner_member(m_lib, ItemDetail::TypeAlias, m_text);
+                            let mb = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(m_lib)), expanded: None };
                             let written_t = lf::TypeId(t);
                             let mut own_lifetimes = false;
                             for &row in mv.rows(mv.list(head::GENERICS))? {
@@ -6669,8 +7055,8 @@ impl<'n> Store<'n> {
         // Every constant's name and key, for the waits below (`ConstWait`).
         let mut declared_consts = blaze_own::Vec::with_capacity_in(const_texts.len(), alloc);
         declared_consts.extend(const_texts.iter().map(|&(name, mk, ..)| (name, mk)));
-        for &(name, mk, text, written_by) in &const_texts {
-            match self.impl_const(names, key, ck, mk, text, written_by, &env, (&preds.scope, preds.clauses.as_slice()), &bounds, generics) {
+        for &(name, mk, m_lib, m_detail, text, written_by) in &const_texts {
+            match self.impl_const(names, keys, key, m_lib, m_detail, ck, mk, text, written_by, &env, (&preds.scope, preds.clauses.as_slice()), &bounds, generics) {
                 Ok(()) => {
                     self.fn_gaps.remove(&mk);
                 }
@@ -6711,14 +7097,15 @@ impl<'n> Store<'n> {
     /// with its impl's head ([`Store::impl_`]), or after it when it waited on a leaf
     /// ([`Store::remake_waiting`]): one maker, so both rows are the same.
     #[expect(clippy::too_many_arguments, reason = "one constant's text and its impl's frame")]
-    fn impl_const<S: NamesSource<'n>>(&mut self, names: S, key: LibKey, ck: ItemKey, mk: ItemKey, text: &'n str, written_by: Option<LibKey>, env: &Env<'_>, (scope, clauses): (&Scope, &[PClause]), bounds: &[ParamBound], generics: u32) -> Result<(), Why> {
+    fn impl_const<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, key: LibKey, member_lib: LibKey, member_detail: ItemDetail, ck: ItemKey, mk: ItemKey, text: &'n str, written_by: Option<LibKey>, env: &Env<'_>, (scope, clauses): (&Scope, &[PClause]), bounds: &[ParamBound], generics: u32) -> Result<(), Why> {
         let whole = Range::new(0, 0);
         let mut scratch = self.take_parse_scratch();
         let res = with_lowered_in(&mut scratch, names, key, text, blaze_lower::ItemContext::TopLevel, |cv| -> Result<(), Why> {
             let at = Range::new(0, text.len() as u32);
             let t = cv.head_opt(head::TY).ok_or(Why::Unsupported("an associated constant with no type", at))?;
             let marks = super::item_site::member_marks(names, key, written_by, text).map_err(MarksLost::why)?;
-            let cb = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+            let owner = Self::head_owner_member(member_lib, member_detail, text);
+            let cb = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(checker_of(member_lib)), expanded: None };
             // An associated constant has no generics of its own: the impl's lifetimes.
             let mut cp = Preds::new_in(scope.clone_in(scope.alloc()));
             cp.inherit(clauses);
@@ -6728,6 +7115,9 @@ impl<'n> Store<'n> {
             let ra = self.tys.alloc();
             let (output, filed) = const_regions(&cb, &mut self.tys, env, cv, lf::TypeId(t), (self.container_regions.get(&ck).ok_or(ck), member_scope, self.regions.made(ck).map(super::head_record::FiledRegions::arity)), (&cp, self.regions.made(ck).map(super::head_record::FiledRegions::regions)), ra)?;
             file_regions(self, mk, filed);
+            if Self::view_has_record_type(cv) {
+                self.register_record_defaults(names, keys, member_lib, checker_of(member_lib), owner, env, marks, cv)?;
+            }
             let head_alloc = self.tys.alloc();
             let header = tc::FnPtrHeader::RUST;
             self.preds.insert(mk, cp);
@@ -6775,7 +7165,7 @@ impl<'n> Store<'n> {
 
     /// One waiting constant's row (front2/const_inherent.rs `remake_waiting`), in the frame its
     /// impl's head kept, as [`Store::member_fn`] makes a fn's signature.
-    pub(super) fn remake_const<S: NamesSource<'n>>(&mut self, names: S, w: ConstWait, mk: ItemKey) -> Result<(), Why> {
+    pub(super) fn remake_const<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, w: ConstWait, mk: ItemKey) -> Result<(), Why> {
         let whole = Range::new(0, 0);
         let ck = checker_of(w.impl_);
         let alloc = self.tys.alloc();
@@ -6805,7 +7195,7 @@ impl<'n> Store<'n> {
             if low.view().cfg_out() {
                 continue;
             }
-            return self.impl_const(names, w.impl_, ck, mk, m.text, m.written_by, &env, (&scope, inherited.as_slice()), &bounds, generics);
+            return self.impl_const(names, keys, w.impl_, m.lib, m.detail, ck, mk, m.text, m.written_by, &env, (&scope, inherited.as_slice()), &bounds, generics);
         }
         Err(lost("its impl holds no constant of its name that its crate's cfg keeps"))
     }
@@ -6831,7 +7221,7 @@ impl<'n> Store<'n> {
     #[expect(clippy::too_many_arguments, reason = "the fn's parts and its container's")]
     fn member_fn_head<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, member: &Member<'n>, marks: Option<TextMarks<'n>>, container_const: bool) -> Result<(), Why> {
         names.read_member_signature(member.lib, member.written_by);
-        match self.fn_head(names, keys, lib, key, container, outer, parent, inherited, v, member.text, member.detail, marks, container_const) {
+        match self.fn_head(names, keys, lib, member.lib, key, container, outer, parent, inherited, v, member.text, member.detail, marks, container_const) {
             Err(why @ (Why::Need(_) | Why::NeedConst(..))) => Err(why),
             Err(why) => {
                 self.fn_gaps.insert(key, why);
@@ -6863,11 +7253,14 @@ impl<'n> Store<'n> {
     /// `self.field_defaults` so `Expr::Record { .. }` resolves them via `World::field_defaults`.
     #[cold]
     #[inline(never)]
+    #[expect(clippy::too_many_arguments, reason = "owner item head context for structural record defaults")]
     pub(super) fn register_record_defaults<S: NamesSource<'n>>(
         &mut self,
         names: S,
         keys: &Keys,
         lib: LibKey,
+        tag_owner: ItemKey,
+        owner: Option<(LibKey, &'n str)>,
         env: &Env<'_>,
         marks: Option<TextMarks<'n>>,
         v: &View<'_>,
@@ -6898,7 +7291,7 @@ impl<'n> Store<'n> {
             if !has_default && !has_spread {
                 continue;
             }
-            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(tag_owner), expanded: None };
             let mut merged: blaze_own::Vec<(&str, Name, DefaultEntry), Alloc<'_>> = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
             let mut inherited_any = false;
             let mut spread_ok = true;
@@ -6932,7 +7325,9 @@ impl<'n> Store<'n> {
                             spread_ok = false;
                             break;
                         }
-                        let base_defaults = self.field_defaults.get(&base_schema.defaults_key());
+                        let base_tag = self.tys.view().record_defaults_tag(base_ty);
+                        let base_rk = base_schema.scoped_defaults_key(base_tag);
+                        let base_defaults = self.field_defaults.get(&base_rk).map(|ds| &ds[..]);
                         for (idx, &bnm) in base_names.iter().enumerate() {
                             let Some(btext) = self.maps.record_field_name(bnm) else {
                                 spread_ok = false;
@@ -6966,7 +7361,8 @@ impl<'n> Store<'n> {
                 sorted_names.push(nm);
             }
             let schema = tc::RecordSchema::of_sorted_names(&sorted_names);
-            let rk = schema.defaults_key();
+            let defaults_tag = Self::scoped_record_defaults_tag(tag_owner, schema, ti, alloc);
+            let scoped_rk = schema.scoped_defaults_key(defaults_tag);
             let mut defaults = blaze_own::Vec::with_capacity_in(merged.len(), alloc);
             for (j, &(_, _, entry)) in merged.iter().enumerate() {
                 let (fty, c) = match entry {
@@ -6985,10 +7381,15 @@ impl<'n> Store<'n> {
                 let r = v.site(at)?;
                 let ty_text = v.text_at(v.type_range(fty)?)?.trim();
                 let value_text = v.text_at(at)?.trim();
-                let mut label = blaze_own::String::new_in(alloc);
-                let _ = core::fmt::Write::write_fmt(&mut label, format_args!("record default {j}: {ty_text} = {value_text}"));
+                let owner_pair = owner.or_else(|| super::locals::owner_scanned_text(names, lib).map(|t| (lib, t)));
+                let owner_lib = owner_pair.map_or(lib, |(owner_item, _)| owner_item);
+                let located = owner_pair.and_then(|(owner_item, owner_text)| {
+                    blaze_scope::expansion_origins::offset_in(owner_text, value_text).map(|offset| (owner_item, offset))
+                });
+                let site = located.and_then(|(owner_item, offset)| super::anon::head_site_of(names, owner_item, offset, value_text));
+                let label = Self::record_default_member_name(owner_lib, j, ty_text, value_text, site, alloc);
                 let dk = keys
-                    .member(rk, MemberKind::Anon, &label)
+                    .member(scoped_rk, MemberKind::Anon, &label)
                     .map_err(|e| {
                         let mut msg = blaze_own::String::new_in(alloc);
                         let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("{e}"));
@@ -6997,11 +7398,21 @@ impl<'n> Store<'n> {
                 let mut src = blaze_own::String::new_in(alloc);
                 let _ = core::fmt::Write::write_fmt(&mut src, format_args!("const _: {ty_text} = {value_text};"));
                 let text: &'n str = self.locals.keep_text(&src);
+                let ty_prefix = "const _: ".len();
+                let val_prefix = ty_prefix + ty_text.len() + " = ".len();
+                super::anon::file_parts_marks(&mut self.anon_marks, dk, text, marks, &[(ty_prefix, ty_text), (val_prefix, value_text)], alloc)
+                    .map_err(|e| Why::Program(blaze_own::format_in!(alloc, "{e}").as_str().into(), r))?;
+                if let Some((owner_item, offset)) = located
+                    && blaze_file_items::nested::may_write_block(value_text)
+                    && let (Ok(len), Ok(prefix)) = (u32::try_from(value_text.len()), u32::try_from(val_prefix))
+                {
+                    self.locals.file_head_anon(dk, super::anon::HeadOwner { item: owner_item, offset, len, expansion: None }, None, &[], prefix);
+                }
                 let scope = Scope::item(v, None, 0, alloc).map_err(Why::Regions)?;
                 self.preds.insert(dk, Preds::new_in(scope));
                 let head_alloc = self.tys.alloc();
                 let row = FnHead {
-                    lib,
+                    lib: owner_lib,
                     text,
                     qualifiers: FnQualifiers::CONST.note_lifetimes(text),
                     cost: tc::CostContract::NONE,
@@ -7028,7 +7439,7 @@ impl<'n> Store<'n> {
                 self.fns.insert(dk, row);
                 defaults.push(Some(dk));
             }
-            self.field_defaults.insert(rk, defaults);
+            self.field_defaults.insert(scoped_rk, defaults);
         }
         Ok(())
     }
@@ -7037,14 +7448,18 @@ impl<'n> Store<'n> {
     /// `inherited` its container's clauses, `v` its own text's, `marks` its text's tokens'
     /// (front2 item_site.rs).
     #[expect(clippy::too_many_arguments, reason = "the fn's parts and its container's")]
-    fn fn_head<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str, detail: ItemDetail, marks: Option<TextMarks<'n>>, container_const: bool) -> Result<(), Why> {
+    fn fn_head<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey, owner_lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str, detail: ItemDetail, marks: Option<TextMarks<'n>>, container_const: bool) -> Result<(), Why> {
         let alloc = self.tys.alloc();
         let mut ps = blaze_own::Vec::with_capacity_in(outer.params.len(), alloc);
         ps.extend_from_slice(outer.params);
         let mut cs = blaze_own::Vec::with_capacity_in(outer.consts.len(), alloc);
         cs.extend_from_slice(outer.consts);
+        let owner = match self.locals.head(key) {
+            Some(_) => self.locals.local_head_owner(names, key, text).and_then(|(twin, aligned)| Self::head_owner_member(twin, detail, aligned)),
+            None => Self::head_owner_member(owner_lib, detail, text),
+        };
         let declared = {
-            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(key), expanded: None };
             own_generics(&b, &mut self.tys, outer.module, v, parent, &mut ps, &mut cs)?
         };
         // Each `impl Trait` parameter type is one more own type parameter, after the declared
@@ -7094,7 +7509,7 @@ impl<'n> Store<'n> {
                 let mut macro_rets = Vec::new_in(Global);
                 x.impls(ret_text, r, &mut macro_rets)?;
                 rets.extend_from_slice(&macro_rets);
-                Some(x)
+                Some((ret_text, x))
             }
             _ => None,
         };
@@ -7102,7 +7517,7 @@ impl<'n> Store<'n> {
         // the item's own. The return opaques are in their own list (`opaques`), never in
         // `anon` with the parameters' `impl`s: two views' type ids are not comparable.
         let (rv, ret) = match &expanded {
-            Some(x) => (x.view(), Some(x.root)),
+            Some((_, x)) => (x.view(), Some(x.root)),
             None => (*v, written_ret),
         };
         let first = u32::from(is_async);
@@ -7115,10 +7530,26 @@ impl<'n> Store<'n> {
             return Err(Why::Program("a fn's container's bounds were not lowered before the fn".into(), Range::new(0, 0)));
         };
         let mut bounds = exact_in(outer_bounds, alloc);
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner, owner_key: Some(key), expanded: None };
         // The return type's builder: an expanded return type is a text of its own, read at the
-        // fn's module; the item's marks are not its tokens'.
-        let rb = Builder { resolver: Paths { names }, heads: &self.maps, marks: if expanded.is_some() { None } else { marks } };
+        // fn's module; the item's marks are not its tokens', while enclosing head ownership is
+        // carried through `ExpandedOwner` so item-declaring const blocks in the expansion resolve
+        // to the `blaze-scope` expansion block modules created under the direct head call.
+        let exp_marks = expanded.as_ref().and_then(|(_, x)| x.expansion_marks());
+        let ret_expanded = match (&expanded, owner) {
+            (Some((ret_text, x)), Some((item, owner_text))) => blaze_scope::expansion_origins::offset_in(owner_text, ret_text).map(|base_offset| {
+                super::types::ExpandedOwner { item, owner_text, base_offset, view: x.view(), marks: exp_marks }
+            }),
+            _ => None,
+        };
+        let rb = Builder {
+            resolver: Paths { names },
+            heads: &self.maps,
+            marks: if expanded.is_some() { exp_marks } else { marks },
+            owner,
+            owner_key: Some(key),
+            expanded: ret_expanded,
+        };
         // A LOCAL fn's, const's or static's signature stands in the block it is declared in
         // (the Reference, "Statements", "Item declarations": its scope is the block's), so a
         // written type's first segment is first asked of that block's `use` items: the body
@@ -7475,7 +7906,7 @@ impl<'n> Store<'n> {
         }
         b.predicates(&mut self.tys, &env, v, parent, None, self.sized, &mut preds)?;
         b.impl_bounds(&mut self.tys, &env, v, &anon[..params_end], self.sized, &mut preds)?;
-        Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, key, lib, env.module, v, &env, &bounds, parent + own, keys, &mut preds)?;
+        let where_anons = Self::file_where_consts(names, &mut self.tys, &self.locals, &mut self.anon_marks, &self.fns, &self.preds, key, lib, owner, b.marks, env.module, v, &env, &bounds, parent + own, keys, &mut preds)?;
         // The bounds' E0405s: one per bound path (the parameter-bound walk and the predicates
         // walk each meet it), in text order. One the words cannot be made for (a path not in
         // the fn's own text) stays the head's error, as before.
@@ -7653,10 +8084,15 @@ impl<'n> Store<'n> {
         {
             file_regions(self, op_k, op_filed);
         }
+        for (cond_key, head_owner, prefix) in where_anons {
+            self.locals.file_head_anon(cond_key, head_owner, None, &[], prefix);
+        }
         file_regions(self, key, filed);
-        if Self::view_has_record_type(v) {
+        let fn_owner_lib = owner.map_or(lib, |(k, _)| k);
+        let has_rec = Self::view_has_record_type(v);
+        if has_rec {
             let rec_env = Env { module, params: &ps, bounds: Bounds::Done(&bounds), self_, self_assoc: self_assoc_slice, anon: &anon, consts: &cs, body: None };
-            self.register_record_defaults(names, keys, lib, &rec_env, marks, v)?;
+            self.register_record_defaults(names, keys, fn_owner_lib, key, owner, &rec_env, marks, v)?;
         }
         self.fns.insert(
             key,
@@ -8418,7 +8854,7 @@ pub struct B;
             let row = v.rows(v.list(head::PARAMS)).expect("params")[0];
             let p = lf::Param::decode(row).expect("param");
             let ty_id = p.ty.expect("param type");
-            let b = Builder { resolver: Paths { names }, heads: &store.maps, marks: None };
+            let b = Builder { resolver: Paths { names }, heads: &store.maps, marks: None, owner: None, owner_key: None, expanded: None };
             b.ty(&mut store.tys, &env, &v, ty_id).unwrap_or_else(|e| panic!("Builder::ty `{sig_text}`: {e:?}"))
         };
 

@@ -54,6 +54,19 @@ use blaze_own::{AString, AVec, Alloc};
 /// The name of the module of a body's `ordinal`th written block.
 pub const BLOCK_MODULE: &str = "__blaze_block_";
 
+/// The name of the synthetic block module holding direct macro calls outside any `{ ... }`
+/// block in an item's head or body (e.g. `type A = [u8; make_len!()];`, `const C: usize =
+/// make_len!();`). Starts with [`BLOCK_MODULE`] so `is_block_module` is `true` and its calls
+/// expand in statement/expression position via `statements_as_items`, without ever colliding
+/// with numeric `__blaze_block_<N>` or expansion `__blaze_block_x<tag>_<N>` names.
+pub const HEAD_BLOCK_MODULE: &str = "__blaze_block_head";
+
+/// Key of the [`HEAD_BLOCK_MODULE`] created under `body` for its unbraced top-level macro calls.
+pub fn head_call_module(krate: CrateItemKey, body: ItemKey) -> ItemKey {
+    let fragment = crate::task::key_of(krate, body, "blocks", "", 0);
+    crate::task::key_of(krate, fragment, "mod", HEAD_BLOCK_MODULE, 0)
+}
+
 /// Whether a module named `name` is a block's module, written for a body's block
 /// ([`BLOCK_MODULE`]) or for a block an expansion writes
 /// ([`crate::expanded_blocks::EXPANSION_BLOCK`], which starts with it): an anonymous scope,
@@ -125,7 +138,35 @@ pub(crate) fn module_text_with_blocks<'a>(
     alloc: Alloc<'a>,
 ) -> AString<'a> {
     let written = written_blocks(nested, alloc);
-    crate::expanded_blocks::render(text, nested, &written, crate::expanded_blocks::Outer::Module, copied, synthetic_blocks, alloc)
+    let mut out = crate::expanded_blocks::render(text, nested, &written, crate::expanded_blocks::Outer::Module, copied, synthetic_blocks, alloc);
+    if !nested.head_calls.is_empty() {
+        let name_start = u32::try_from(out.len() + "mod ".len()).unwrap_or(u32::MAX);
+        synthetic_blocks.push(name_start);
+        // `HEAD_BLOCK_MODULE` begins with `BLOCK_MODULE` (`__blaze_block_`), so `is_block_module`
+        // is `true`: the cell core treats it as an anonymous scope (`Cells::anonymous`), skipping
+        // it for written `self::` / `super::` paths (`Cells::up`, `names::written_up`) while the
+        // leading `use super::*;` acts as the lexical glob (`Cells::lexical_glob`) inheriting the
+        // enclosing module's items.
+        let _ = writeln!(out, "mod {HEAD_BLOCK_MODULE} {{\nuse super::*;");
+        for c in nested.head_calls.iter() {
+            crate::expanded_blocks::emit_cfg_attrs(text, c.attrs, &mut out, copied, alloc);
+            crate::expanded_blocks::emit_cfg_attrs(text, c.elem_attrs, &mut out, copied, alloc);
+            let r = c.range;
+            if let (Ok(start), Ok(end)) = (usize::try_from(r.start), usize::try_from(r.end))
+                && let Some(call) = text.get(start..end)
+            {
+                copied(crate::crate_roots::Copied {
+                    from: r.start,
+                    to: u32::try_from(out.len()).unwrap_or(u32::MAX),
+                    len: r.end.saturating_sub(r.start),
+                });
+                out.push_str(call);
+                out.push_str(if call.ends_with('}') { "\n" } else { ";\n" });
+            }
+        }
+        out.push_str("}\n");
+    }
+    out
 }
 
 #[cfg(test)]

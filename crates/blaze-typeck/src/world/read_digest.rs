@@ -90,3 +90,52 @@ fn one_head_in_two_tables_has_one_digest() {
     let d = digest(&sig(one, &twice, PTy(3)));
     assert_ne!(a, d, "one input and two inputs gave one digest");
 }
+
+#[test]
+fn record_defaults_tag_changes_fn_sig_and_ptys_digests() {
+    use crate::hash::{ContentHash, StableHasher};
+    use crate::ids::{IntTy, Name, RecordSchema};
+    use crate::portable::PortableTys;
+
+    let schema = RecordSchema::of_sorted_names(&[Name::of("n")]);
+    let alloc = Alloc::global();
+    let ptys_hash = |v: PTys<'_>| {
+        let mut h = StableHasher::new("term shape");
+        v.hash_into(&mut h);
+        h.finish()
+    };
+
+    let build = |tag: u64, pad_first: bool| {
+        let mut t = PortableTys::new_in(alloc);
+        if pad_first {
+            let _ = t.intern(PNode::Bool).expect("pad");
+        }
+        let isize_t = t.intern(PNode::Int(IntTy::Isize)).expect("isize");
+        let list = t.intern_list(&[isize_t]).expect("fields");
+        let rec = t.intern_record_with_defaults(schema, list, tag).expect("record");
+        let ret = t.intern(PNode::Int(IntTy::Isize)).expect("ret");
+        (t, rec, ret)
+    };
+
+    let (t0, r0, out0) = build(0, false);
+    let (ta, ra, outa) = build(0x1111_2222_3333_4444, false);
+    let (tb, rb, outb) = build(0x5555_6666_7777_8888, false);
+    let (ta_reordered, ra_reordered, outa_reordered) = build(0x1111_2222_3333_4444, true);
+
+    let d0 = digest(&sig(t0.view(), &[r0], out0));
+    let da = digest(&sig(ta.view(), &[ra], outa));
+    let db = digest(&sig(tb.view(), &[rb], outb));
+    let da_reordered = digest(&sig(ta_reordered.view(), &[ra_reordered], outa_reordered));
+
+    assert_ne!(da, db, "same-schema records with distinct defaults tags must produce distinct FnSig digests");
+    assert_ne!(d0, da, "untagged and tagged same-schema records must produce distinct FnSig digests");
+    assert_ne!(d0, db, "untagged and tagged same-schema records must produce distinct FnSig digests");
+    assert_eq!(da, da_reordered, "tagged record FnSig digest must remain independent of table interning order");
+
+    let h0 = ptys_hash(t0.view());
+    let ha = ptys_hash(ta.view());
+    let hb = ptys_hash(tb.view());
+    assert_ne!(ha, hb, "PTys ContentHash must distinguish distinct record defaults tags");
+    assert_ne!(h0, ha, "PTys ContentHash must distinguish untagged vs tagged records");
+    assert_ne!(h0, hb, "PTys ContentHash must distinguish untagged vs tagged records");
+}

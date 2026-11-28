@@ -95,9 +95,10 @@ pub(crate) fn names_digests<C: Compress>(
     scratch.clear();
     let mut ends = [0usize; BATCH + 1];
     let mut count = 0;
+    let alloc = *scratch.allocator();
     for (at, item) in items.iter().enumerate() {
         let calls_macros = item.parent.is_none_or(|parent| lowered_one_by_one(items[parent.at()].detail));
-        message(scratch, text, edition, item, &attrs[item.attrs.to_usize()], calls_macros);
+        message(scratch, text, edition, item, &attrs[item.attrs.to_usize()], calls_macros, alloc);
         count += 1;
         ends[count] = scratch.len();
         if count == BATCH || scratch.len() >= BATCH_BYTES || at + 1 == items.len() {
@@ -149,13 +150,13 @@ const fn lowered_one_by_one(detail: ItemDetail) -> bool {
 #[cfg(test)]
 pub(crate) fn names_digest(text: &str, edition: u8, item: &Item, attrs: &[Attr], calls_macros: bool) -> ContentId {
     let mut hasher = blaze_ids::Hasher::of(&NAMES);
-    message(&mut hasher, text, edition, item, attrs, calls_macros);
+    message(&mut hasher, text, edition, item, attrs, calls_macros, blaze_own::testing::heap().alloc());
     hasher.finish()
 }
 
 /// The message a names digest is the digest of, into `sink`: one definition, whether the bytes
 /// are streamed through a hasher or copied to be hashed side by side with other entries'.
-fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[Attr], calls_macros: bool) {
+fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[Attr], calls_macros: bool, alloc: blaze_own::Alloc<'_>) {
     let own = |range: Range| item.text(text, range).as_bytes();
     sink.part(&[edition, item.kind() as u8]);
     match item.name {
@@ -186,26 +187,59 @@ fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[
         | ItemDetail::Const { body_holds_items }
         | ItemDetail::Static { body_holds_items } => {
             sink.part(&[u8::from(body_holds_items)]);
-            // `BodySrc::of`: a body that holds items is scanned for the modules its blocks make.
-            // When the body's only block-writing constructs are bare, unqualified std expression
-            // macros (`nested::STD_EXPR_MACROS`), digest only the written-block and call shape so
-            // edits inside `#[test]` / library bodies keep `Outline::surface()` stable; shadowed
-            // macro definitions are guarded in `engine_names.rs` (`has_shadowed_expr_macro`).
+            // `BodySrc::of`: a body that holds items, or a signature whose const generic
+            // arguments / `where` clause write a block with items or macros, is scanned for the
+            // modules its blocks make. When the only block-writing constructs are bare,
+            // unqualified std expression macros (`nested::STD_EXPR_MACROS`), digest only the
+            // written-block and call shape so edits inside `#[test]` / library bodies keep
+            // `Outline::surface()` stable; shadowed macro definitions are guarded in
+            // `engine_names.rs` (`has_shadowed_expr_macro`).
+            let sig = item.text(text, item.signature);
+            let sig_writes = crate::nested::has_writing_block(sig);
+            if sig_writes {
+                // Signature-level head blocks/macros are not covered by `engine_names.rs`'s
+                // `body_holds_items` shadow guard, so hash the signature itself whenever it
+                // writes a block or calls a macro (e.g. a shadowed `line!(A)` -> `line!(B)`).
+                sink.id(&item.signature_hash);
+            }
             if body_holds_items {
-                whole |= crate::nested::digest_body_blocks(item.range.of(text), &mut |bytes| {
+                whole |= crate::nested::digest_body_blocks(item.range.of(text), alloc, &mut |bytes| {
                     sink.part(bytes);
                 });
             }
         }
-        ItemDetail::Struct | ItemDetail::Variant { discriminant: _ } => {
+        ItemDetail::Struct => {
+            sink.part(&form(text, item));
+            let body = item.range.of(text);
+            // ADTs are not guarded by `engine_names.rs`'s `body_holds_items` shadow check, so
+            // any ADT with a writing block or direct macro call (which may shadow a name in
+            // `STD_EXPR_MACROS`) hashes whole.
+            if crate::nested::adt_has_writing_block(body) {
+                whole = true;
+            }
+        }
+        ItemDetail::Variant { discriminant: _ } => {
             sink.part(&form(text, item));
         }
-        ItemDetail::Enum
-        | ItemDetail::Union
-        | ItemDetail::Trait
-        | ItemDetail::TraitAlias
-        | ItemDetail::TypeAlias
-        | ItemDetail::Field { ty: _, default: _ } => {}
+        ItemDetail::Enum | ItemDetail::Union => {
+            let body = item.range.of(text);
+            if crate::nested::adt_has_writing_block(body) {
+                whole = true;
+            }
+        }
+        ItemDetail::Trait => {
+            let head = crate::nested::trait_head(item.range.of(text));
+            if crate::nested::has_writing_block(head) {
+                sink.part(head.as_bytes());
+            }
+        }
+        ItemDetail::TraitAlias | ItemDetail::TypeAlias => {
+            let body = item.range.of(text);
+            if crate::nested::has_writing_block(body) {
+                whole = true;
+            }
+        }
+        ItemDetail::Field { ty: _, default: _ } => {}
         ItemDetail::Impl => {
             // `Lower::impl_header`: the header, every byte of it, is read for the impl's trait,
             // self type and parameters.
@@ -449,5 +483,70 @@ mod tests {
             crate::outline(arg_item_after, Edition::E2024, alloc).surface(),
             "nested item inside std macro arg must hash whole into Outline::surface()"
         );
+    }
+
+    #[test]
+    fn head_block_and_call_cfg_gates_move_names_digest() {
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Changing `#[cfg(any())]` -> `#[cfg(all())]` on a fn param around a scanned head block
+        // (whose only macro is a bare std expr macro) MUST change `Outline::surface()`.
+        let fn_off = "fn f(#[cfg(any())] _: [u8; { matches!(0, 0) as usize }]) {}\n";
+        let fn_on = "fn f(#[cfg(all())] _: [u8; { matches!(0, 0) as usize }]) {}\n";
+        assert_ne!(
+            crate::outline(fn_off, Edition::E2024, alloc).surface(),
+            crate::outline(fn_on, Edition::E2024, alloc).surface(),
+            "changing #[cfg] on a fn param around a scanned head block must move Outline::surface()"
+        );
+
+        // Moving `#[cfg(any())]` across a parameter comma MUST also move `Outline::surface()`.
+        let fn_param0 = "fn f(#[cfg(any())] _: u8, _: [u8; { matches!(0, 0) as usize }]) {}\n";
+        let fn_param1 = "fn f(_: u8, #[cfg(any())] _: [u8; { matches!(0, 0) as usize }]) {}\n";
+        assert_ne!(
+            crate::outline(fn_param0, Edition::E2024, alloc).surface(),
+            crate::outline(fn_param1, Edition::E2024, alloc).surface(),
+            "moving #[cfg] from an unrelated param onto the scanned head block param must move Outline::surface()"
+        );
+
+        // Same for `#[cfg_attr(..., cfg(...))]` and tuple struct fields.
+        let tup_off = "struct T(#[cfg_attr(all(), cfg(any()))] [u8; { matches!(0, 0) as usize }]);\n";
+        let tup_on = "struct T(#[cfg_attr(all(), cfg(all()))] [u8; { matches!(0, 0) as usize }]);\n";
+        assert_ne!(
+            crate::outline(tup_off, Edition::E2024, alloc).surface(),
+            crate::outline(tup_on, Edition::E2024, alloc).surface(),
+            "changing #[cfg_attr(..., cfg(...))] on a tuple field around a scanned head block must move Outline::surface()"
+        );
+
+        // Direct head macro call gated by `#[cfg(...)]` or raw `#[r#cfg(...)]` MUST move `Outline::surface()`.
+        let call_off = "fn f(#[cfg(any())] _: [u8; make_len!()]) {}\n";
+        let call_on = "fn f(#[cfg(all())] _: [u8; make_len!()]) {}\n";
+        assert_ne!(
+            crate::outline(call_off, Edition::E2024, alloc).surface(),
+            crate::outline(call_on, Edition::E2024, alloc).surface(),
+            "changing #[cfg] on a direct head macro call must move Outline::surface()"
+        );
+        let raw_off = "fn f(#[r#cfg(any())] _: [u8; { matches!(0, 0) as usize }]) {}\n";
+        let raw_on = "fn f(#[r#cfg(all())] _: [u8; { matches!(0, 0) as usize }]) {}\n";
+        assert_ne!(
+            crate::outline(raw_off, Edition::E2024, alloc).surface(),
+            crate::outline(raw_on, Edition::E2024, alloc).surface(),
+            "changing #[r#cfg] on a scanned head block param must move Outline::surface()"
+        );
+
+        // Round 15 P1 #5: editing arguments of a potentially shadowed std expr macro (`line!(A)`
+        // -> `line!(B)`) inside ADT / alias / trait / fn signatures MUST move `Outline::surface()`.
+        for (what, before, after) in [
+            ("struct field", "struct S { x: [u8; line!(A)] }\n", "struct S { x: [u8; line!(B)] }\n"),
+            ("enum variant", "enum E { V([u8; line!(A)]) }\n", "enum E { V([u8; line!(B)]) }\n"),
+            ("type alias", "type A = [u8; line!(A)];\n", "type A = [u8; line!(B)];\n"),
+            ("trait where", "trait T where [(); line!(A)]: {}\n", "trait T where [(); line!(B)]: {}\n"),
+            ("fn signature", "fn f(_: [u8; line!(A)]) {}\n", "fn f(_: [u8; line!(B)]) {}\n"),
+        ] {
+            assert_ne!(
+                crate::outline(before, Edition::E2024, alloc).surface(),
+                crate::outline(after, Edition::E2024, alloc).surface(),
+                "changing shadowed `line!(A)` -> `line!(B)` in {what} must move Outline::surface()"
+            );
+        }
     }
 }

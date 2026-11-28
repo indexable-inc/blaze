@@ -2333,9 +2333,18 @@ pub struct BodySrc<'t> {
 }
 
 impl<'t> BodySrc<'t> {
-    /// The entry for an item of `detail` and `text`, if its body may write an impl.
+    /// The entry for an item of `detail` and `text`, if its body or head const blocks may
+    /// write an item or macro block.
+    ///
+    /// For `Impl`, `header` is the impl header without its `{ ... }` assoc-item body; for
+    /// `Trait`, `blaze_file_items::nested::trait_head(text)` strips its `{ ... }` assoc-item
+    /// body; for every other item form (`Fn`, `Const`, `Static`, `TypeAlias`, `TraitAlias`,
+    /// `Struct`, `Enum`, `Union`, and associated members), the whole item text is scanned.
+    #[expect(clippy::too_many_arguments, reason = "internal body source constructor forwarding lowering fields")]
     fn of(
         detail: ItemDetail,
+        sig: &'t str,
+        impl_header: Option<&'t str>,
         key: ItemKey,
         module: ItemKey,
         text: &'t str,
@@ -2346,22 +2355,54 @@ impl<'t> BodySrc<'t> {
         marks: Option<crate::crate_roots::TextMarks<'t>>,
         tokens: FragmentTokens<'_, 't>,
     ) -> Option<BodySrc<'t>> {
-        let holds = matches!(
-            detail,
-            ItemDetail::Fn { body_holds_items: true } | ItemDetail::Const { body_holds_items: true } | ItemDetail::Static { body_holds_items: true }
-        );
-        // The words of the items that make a block a module
-        // (`blaze_file_items::nested::NestedKind::makes_module`): a body without one costs
-        // eight substring searches and no scan. A trait declared in a block makes one too
-        // (core's `Write::write_fmt` declares `trait SpecWriteFmt` in its body), and a `mod`
-        // and an `extern crate` (whose first word is `extern`).
-        // A `!` too: a statement call may declare items (crate::expanded_blocks); the scan
-        // decides whether one is in statement position. The one test, shared with the names
-        // digest (`blaze_file_items::nested::may_write_block`, lane CX19).
-        (holds && blaze_file_items::nested::may_write_block(text)).then(|| BodySrc {
+        let scan_text: &'t str = match detail {
+            ItemDetail::Fn { body_holds_items }
+            | ItemDetail::Const { body_holds_items }
+            | ItemDetail::Static { body_holds_items } => {
+                if (body_holds_items && blaze_file_items::nested::may_write_block(text))
+                    || blaze_file_items::nested::has_writing_block(sig)
+                {
+                    text
+                } else {
+                    return None;
+                }
+            }
+            ItemDetail::TypeAlias | ItemDetail::TraitAlias => {
+                if blaze_file_items::nested::has_writing_block(text) {
+                    text
+                } else {
+                    return None;
+                }
+            }
+            ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union => {
+                if blaze_file_items::nested::adt_has_writing_block(text) {
+                    text
+                } else {
+                    return None;
+                }
+            }
+            ItemDetail::Trait => {
+                let head = blaze_file_items::nested::trait_head(text);
+                if blaze_file_items::nested::has_writing_block(head) {
+                    head
+                } else {
+                    return None;
+                }
+            }
+            ItemDetail::Impl => {
+                let header = impl_header?;
+                if blaze_file_items::nested::has_writing_block(header) {
+                    header
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        Some(BodySrc {
             key,
             module,
-            text,
+            text: scan_text,
             loc,
             written,
             included_dir: None,
@@ -3116,7 +3157,8 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
             let loc = self.loc(at);
             self.out.langs.push(LangSrc { name: lang, key, loc });
         }
-        if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(at), self.written, self.depth, (self.owner, self.pos), self.marks, self.tokens) {
+        let impl_header = matches!(item.detail, ItemDetail::Impl).then(|| self.impl_header(item));
+        if let Some(body) = BodySrc::of(item.detail, item.text(text, item.signature), impl_header, key, self.module, whole, self.loc(at), self.written, self.depth, (self.owner, self.pos), self.marks, self.tokens) {
             self.out.bodies.push(body);
         }
         match item.detail {
@@ -3196,7 +3238,7 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
                 self.assoc(Some(idx), key);
             }
             ItemDetail::Impl => {
-                let header = self.impl_header(item);
+                let header = impl_header.unwrap_or_else(|| self.impl_header(item));
                 let loc = self.loc(at);
                 self.out.impls.push(ImplSrc { module: self.module, key, header, loc, marks: self.marks });
                 self.assoc(Some(idx), key);
@@ -3484,7 +3526,7 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
             let key = self.key(key_owner, "assoc", name.unwrap_or(""));
             members.push(Member { key, name, item: idx, detail: item.detail, text: whole, written_by });
             self.attr_checks(idx, item.range.start, &attrs.checks);
-            if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(item.range.start), self.written, self.depth, (self.owner, self.pos), self.marks, self.tokens) {
+            if let Some(body) = BodySrc::of(item.detail, item.text(text, item.signature), None, key, self.module, whole, self.loc(item.range.start), self.written, self.depth, (self.owner, self.pos), self.marks, self.tokens) {
                 self.out.bodies.push(body);
             }
             if is_call {

@@ -847,6 +847,19 @@ fn int_literal(text: &str) -> Option<(u128, &str)> {
     Some((value, &text[end..]))
 }
 
+/// Expansion provenance for a type lowered by `type_expand::expand_type_text` (`pattern_ty.rs`
+/// `macro_ty` and `heads.rs` `fn_head` return-type expansion): lets [`Builder::head_owner_of`]
+/// connect item-declaring const blocks inside the expansion back to the enclosing item's
+/// `blaze-scope` expansion block modules (`__blaze_block_x<tag(call)>_<ord>`).
+#[derive(Clone, Copy)]
+pub(super) struct ExpandedOwner<'b> {
+    pub(super) item: LibKey,
+    pub(super) owner_text: &'b str,
+    pub(super) base_offset: u32,
+    pub(super) view: View<'b>,
+    pub(super) marks: Option<blaze_scope::crate_roots::TextMarks<'b>>,
+}
+
 /// The type builder of one item: its resolver, over the names source `S`
 /// ([`NamesSource`]: the solved names or each crate's records), and the heads lowered so far.
 pub struct Builder<'b, H: Heads, S> {
@@ -855,9 +868,148 @@ pub struct Builder<'b, H: Heads, S> {
     /// The marks of the tokens of the text this builder reads paths from (front2 item_site.rs,
     /// token-mark-F1): `None` for a text written in a file, or one that keeps no column.
     pub marks: Option<blaze_scope::crate_roots::TextMarks<'b>>,
+    /// The enclosing library item and the exact scanned text (`impl_header` for an `impl`, whole
+    /// text for a `fn`/`const`/`static` with `body_holds_items`) that `blaze-scope` built block
+    /// modules for: carried onto head-level anonymous constants (`anon::HeadOwner`) so blocks
+    /// declared inside them resolve to their `blaze-scope` block modules.
+    pub owner: Option<(LibKey, &'b str)>,
+    /// The checker key of the item/member/body whose written types this builder lowers, used to
+    /// scope structural-record field default tags independently of whether the item holds const
+    /// blocks (`owner`).
+    pub owner_key: Option<ItemKey>,
+    /// Present when this builder walks an expanded type's view (`pattern_ty.rs` / `heads.rs`):
+    /// maps const blocks inside macro expansions back to the enclosing head call's expansion
+    /// block modules.
+    pub(super) expanded: Option<ExpandedOwner<'b>>,
 }
 
 impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
+    /// Selects the token-mark column whose text holds `slice` (`self.marks` or `self.expanded`'s
+    /// expansion marks), falling back to `self.marks`.
+    fn marks_for(&self, slice: &str) -> Option<blaze_scope::crate_roots::TextMarks<'b>> {
+        if let Some(m) = self.marks
+            && blaze_scope::expansion_origins::offset_in(m.text, slice).is_some()
+        {
+            return Some(m);
+        }
+        if let Some(exp) = self.expanded
+            && let Some(em) = exp.marks
+            && blaze_scope::expansion_origins::offset_in(em.text, slice).is_some()
+        {
+            return Some(em);
+        }
+        self.marks
+    }
+
+    /// Resolves the `blaze-scope` `MacroCall` key and outermost owner-text call offset for
+    /// expansion `target_exp` inside `exp.view`.
+    fn resolve_expansion_call(&self, exp: ExpandedOwner<'_>, target_exp: u32) -> Option<super::anon::HeadExpansion> {
+        let names = self.resolver.names;
+        let krate = names
+            .crate_of(exp.item)
+            .or_else(|| names.member_owner(exp.item).and_then(|(c, _)| names.crate_of(c)))?;
+        let crate_key = names.crate_key(krate)?;
+        blaze_mem::frame::task(blaze_mem::Tag::Parse, |frame| {
+            let scratch = blaze_own::Erased::new(frame);
+            let alloc = scratch.handle();
+            let total = exp.view.expansion_keys.len();
+            let mut chain: blaze_own::AVec<'_, u32> = blaze_own::AVec::new_in(alloc);
+            let mut cur = target_exp;
+            for _ in 0..=total {
+                chain.push(cur);
+                match exp.view.expansion_call_at(cur).ok()? {
+                    blaze_lower::scope_origin::CallAt::Item { .. } => break,
+                    blaze_lower::scope_origin::CallAt::Expansion { expansion: writer, .. } => cur = writer,
+                }
+            }
+            chain.reverse();
+            let root_exp = *chain.first()?;
+            let blaze_lower::scope_origin::CallAt::Item { start: root_start } = exp.view.expansion_call_at(root_exp).ok()? else {
+                return None;
+            };
+            let root_call_offset = exp.base_offset.checked_add(root_start)?;
+            let owner_nested = blaze_file_items::nested::scan(exp.owner_text, alloc);
+            if owner_nested.end != blaze_file_items::nested::NestedEnd::Whole {
+                return None;
+            }
+            let owner_modules = blaze_scope::blocks::block_modules(crate_key, exp.item, &owner_nested, alloc);
+            let mut call_key = if let Some((block, n)) = super::scope_table::statement_call(&owner_nested, root_call_offset) {
+                let owner_mod = usize::try_from(block).ok().and_then(|idx| owner_modules.get(idx)).copied().flatten()?;
+                blaze_scope::task::key_of(crate_key, owner_mod, "MacroCall", "", n)
+            } else {
+                if owner_nested.head_calls.is_empty() {
+                    return None;
+                }
+                let head_mod = blaze_scope::blocks::head_call_module(crate_key, exp.item);
+                let n = super::scope_table::head_call(&owner_nested, root_call_offset)?;
+                blaze_scope::task::key_of(crate_key, head_mod, "MacroCall", "", n)
+            };
+            for &next_exp in chain.get(1..).unwrap_or(&[]) {
+                let blaze_lower::scope_origin::CallAt::Expansion { expansion: writer, start } = exp.view.expansion_call_at(next_exp).ok()? else {
+                    return None;
+                };
+                let writer_text = exp.view.expansion_text(writer).ok()?;
+                let writer_blocks = blaze_scope::expanded_blocks::expansion_blocks(writer_text, alloc).ok()?;
+                let block_count = writer_blocks.nested.blocks.len();
+                let mut writer_modules: blaze_own::AVec<'_, Option<LibKey>> = blaze_own::AVec::with_capacity_in(block_count, alloc);
+                writer_modules.resize(block_count, None);
+                for (b, block) in writer_blocks.nested.blocks.iter().enumerate() {
+                    let Some(ordinal) = writer_blocks.ordinals.get(b).copied().flatten() else { continue };
+                    let outer = match block.parent {
+                        None | Some(0) => Some(call_key),
+                        Some(p) => usize::try_from(p).ok().and_then(|idx| writer_modules.get(idx)).copied().flatten(),
+                    };
+                    let name = blaze_scope::expanded_blocks::expansion_block_name(call_key, ordinal, alloc);
+                    if let Some(slot) = writer_modules.get_mut(b) {
+                        *slot = outer.map(|o| blaze_scope::task::key_of(crate_key, o, "mod", name.as_str(), 0));
+                    }
+                }
+                let target_start = start.checked_add(blaze_scope::expanded_blocks::WRAP_OPEN)?;
+                let (block, n) = super::scope_table::statement_call(&writer_blocks.nested, target_start)?;
+                let owner_mod = if block == 0 {
+                    call_key
+                } else {
+                    usize::try_from(block).ok().and_then(|idx| writer_modules.get(idx)).copied().flatten()?
+                };
+                call_key = blaze_scope::task::key_of(crate_key, owner_mod, "MacroCall", "", n);
+            }
+            Some(super::anon::HeadExpansion { call: call_key, root_call_offset })
+        })
+    }
+
+    /// If `text` is an unmodified subslice of `self.owner`'s scanned text (or of a macro expansion
+    /// in `self.expanded`) and may declare items or invoke macros, returns its
+    /// [`super::anon::HeadOwner`] coordinates, optional expansion text, and—when `text` contains
+    /// a macro call (`!`)—its observable [`super::anon::HeadSite`] (`(line, col)` and shown file
+    /// path via `body_place`/`body_file`) so inserting a blank line or moving a module across
+    /// `#[path]` files invalidates cached head constants.
+    fn head_owner_of(&self, text: &str) -> Option<(super::anon::HeadOwner, Option<&'b str>, Option<super::anon::HeadSite<'n>>)> {
+        if !blaze_file_items::nested::may_write_block(text) {
+            return None;
+        }
+        let len = u32::try_from(text.len()).ok()?;
+        if let Some((item, owner_text)) = self.owner
+            && let Some(offset) = blaze_scope::expansion_origins::offset_in(owner_text, text)
+        {
+            let site = super::anon::head_site_of(self.resolver.names, item, offset, text);
+            return Some((super::anon::HeadOwner { item, offset, len, expansion: None }, None, site));
+        }
+        let exp = self.expanded?;
+        for j in 0..exp.view.expansion_keys.len() {
+            let Ok(j_u32) = u32::try_from(j) else { break };
+            let Ok(exp_text) = exp.view.expansion_text(j_u32) else { continue };
+            if let Some(offset) = blaze_scope::expansion_origins::offset_in(exp_text, text) {
+                let head_exp = self.resolve_expansion_call(exp, j_u32)?;
+                let site = super::anon::head_site_of(self.resolver.names, exp.item, head_exp.root_call_offset, text);
+                return Some((
+                    super::anon::HeadOwner { item: exp.item, offset, len, expansion: Some(head_exp) },
+                    Some(exp_text),
+                    site,
+                ));
+            }
+        }
+        None
+    }
     /// The portable type of `t`, by a work list (no recursion).
     pub fn ty(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId) -> Result<PTy, Why> {
         self.walk_ty(tys, env, v, t, None)
@@ -962,6 +1114,22 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// ([`Why::ConstPath`] naming the text).
     fn const_value_bits(&self, env: &Env<'_>, text: &str, r: Range, ty: Option<PNode>) -> Result<u128, Why> {
         let text = text.trim();
+        self.const_value_bits_owned(env, text, text, r, ty, None, None)
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "const value evaluation carrying original text, head owner, and substitution edits")]
+    fn const_value_bits_owned(
+        &self,
+        env: &Env<'_>,
+        orig_source: &str,
+        text: &str,
+        r: Range,
+        ty: Option<PNode>,
+        carried_owner: Option<(super::anon::HeadOwner, Option<&str>, Option<super::anon::HeadSite<'n>>)>,
+        carried_edits: Option<blaze_own::AVec<'static, super::anon::TextEdit>>,
+    ) -> Result<u128, Why> {
+        let text = text.trim();
+        let orig_source = orig_source.trim();
         let other = || Why::ConstPath(Box::from(text), r);
         let (abs, rest) = match text.strip_prefix("::") {
             Some(rest) => (true, rest),
@@ -986,9 +1154,13 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // place: a checked body's constant path holds no `Self` to select an impl by. A leaf
         // refused there refuses this head, naming the leaf and the reason.
         let resolve_ty = |abs: bool, segs: &[&str]| self.resolver.path(env.module, abs, segs, Ns::Type);
+        let owner_site = carried_owner.or_else(|| self.head_owner_of(orig_source));
+        let active_marks = self.marks_for(orig_source);
+        let need_edits = owner_site.is_some() || active_marks.is_some();
         blaze_mem::frame::task(blaze_mem::Tag::Parse, |frame| {
         let scratch = blaze_own::Erased::new(frame);
-        let with_values = match super::const_qpath::substitute(self.heads, &resolve_ty, text, scratch.handle()) {
+        let mut qpath_edits = need_edits.then(|| self.heads.mark_alloc()).flatten().map(blaze_own::AVec::new_in);
+        let with_values = match super::const_qpath::substitute_mapped(self.heads, &resolve_ty, text, scratch.handle(), qpath_edits.as_mut()) {
             Ok(done) => done,
             Err(super::const_qpath::Stop::Need(need)) => return Err(Why::NeedConst(need, r)),
             Err(super::const_qpath::Stop::Failed { start, end, why }) => {
@@ -1006,7 +1178,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             // written path of a macro-written head does (item_site.rs `written_site`): a
             // `$crate::N` another crate's macro wrote is that crate's `N`.
             let first = segs.first().copied().unwrap_or("");
-            let mark = match self.marks.map(|m| m.mark_of(first)) {
+            let mark = match active_marks.map(|m| m.mark_of(first)) {
                 Some(Ok(mark)) => mark,
                 Some(Err(miss)) if first == "crate" => return Err(program(format!("the constant path `{source}`: {miss}"), r)),
                 Some(Err(_)) | None => None,
@@ -1023,20 +1195,44 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             }
         }
         let Some(mut ask) = ty.and_then(|ty| super::anon::Ask::of(env.module, ty, text)) else { return Err(other()) };
-        // A macro-written head's expression is lowered with its tokens' marks (anon.rs
-        // `head_marks`), and keyed by them (`Ask::carry_marks`): zerocopy's
-        // `{ $crate::cryptocorrosion_derive_traits!(..) }` in an impl it writes in ppv-lite86.
-        // Heads with no evaluator (`mark_alloc` `None`) ask nothing, so carry nothing.
-        if let (Some(marks), Some(alloc)) = (self.marks, self.heads.mark_alloc()) {
-            match super::anon::head_marks(marks, source, with_values.as_deref(), alloc, r)? {
-                Some(rows) => ask = ask.carry_marks(rows),
-                // Not the item's text: its marks are not read here. Only a `crate` would be
-                // misread without them (a `macro_rules!` expansion's other paths resolve at the
-                // call site, which is the head's module): refused by name.
-                None if super::anon::names_crate(source) => {
-                    return Err(Why::Unsupported("a `crate` path in a constant expression of a macro-written head whose text is not the item's (its tokens' marks are not read: types.rs `const_value_bits`)", r));
+        if let Some(alloc) = self.heads.mark_alloc() {
+            let final_edits = match (carried_edits, qpath_edits) {
+                (Some(first_edits), Some(second_edits)) if with_values.is_some() && !second_edits.is_empty() => {
+                    if first_edits.is_empty() {
+                        Some(second_edits)
+                    } else {
+                        let mut merged = blaze_own::AVec::with_capacity_in(first_edits.len() + second_edits.len(), alloc);
+                        super::anon::compose_edits(&first_edits, &second_edits, &mut merged).map(|()| merged)
+                    }
                 }
-                None => {}
+                (None, Some(second_edits)) if with_values.is_some() => Some(second_edits),
+                (Some(first_edits), _) => Some(first_edits),
+                (None, _) => Some(blaze_own::AVec::new_in(alloc)),
+            };
+            // A macro-written head's expression is lowered with its tokens' marks (anon.rs
+            // `head_marks_with_edits`), and keyed by them (`Ask::carry_marks`): zerocopy's
+            // `{ $crate::cryptocorrosion_derive_traits!(..) }` in an impl it writes in ppv-lite86,
+            // including after inherent-constant and/or qualified-constant substitution.
+            let carried_marks = if let Some(marks) = active_marks {
+                let mark_edits = final_edits.as_deref().unwrap_or(&[]);
+                match super::anon::head_marks_with_edits(marks, orig_source, text, mark_edits, alloc, r)? {
+                    Some(rows) => Some(rows),
+                    // Not the item's text: its marks are not read here. Only a `crate` would be
+                    // misread without them (a `macro_rules!` expansion's other paths resolve at the
+                    // call site, which is the head's module): refused by name.
+                    None if super::anon::names_crate(text) => {
+                        return Err(Why::Unsupported("a `crate` path in a constant expression of a macro-written head whose text is not the item's (its tokens' marks are not read: types.rs `const_value_bits`)", r));
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            if let (Some((owner, exp_text, site)), Some(edits)) = (owner_site, final_edits) {
+                ask = ask.in_head_item(owner, exp_text, site, edits, alloc);
+            }
+            if let Some(rows) = carried_marks {
+                ask = ask.carry_marks(rows);
             }
         }
         if let Some(bits) = self.heads.const_bits(ask.need) {
@@ -1095,8 +1291,13 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // very length; the expression goes on with each leaf's value in its place.
         let inherent_resolve = |abs: bool, segs: &[&str]| self.resolver.path(env.module, abs, segs, Ns::Type);
         let self_adt = super::const_inherent::ground_self_adt(tys.view(), env);
+        let orig_text = text;
+        let orig_owner = self.head_owner_of(orig_text);
+        let active_marks = self.marks_for(orig_text);
+        let need_edits = orig_owner.is_some() || active_marks.is_some();
+        let mut inherent_edits = need_edits.then(|| self.heads.mark_alloc()).flatten().map(blaze_own::AVec::new_in);
         // The substituted text is kept in the allocator of the type table this call holds.
-        let substituted = match super::const_inherent::substitute(self.heads, &inherent_resolve, self_adt, text, tys.alloc()) {
+        let substituted = match super::const_inherent::substitute_mapped(self.heads, &inherent_resolve, self_adt, text, tys.alloc(), inherent_edits.as_mut()) {
             Ok(done) => done,
             Err(super::const_inherent::Stop::Need(need)) => return Err(Why::NeedConst(need, r)),
             Err(super::const_inherent::Stop::Failed { start, end, need }) => {
@@ -1140,8 +1341,8 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // anonymous constant is filed with that `Self` in scope. Every other expression is
         // read as before; one over a generic parameter is refused there by name.
         let bits = match super::const_open::ground_self(tys.view(), env, text) {
-            Some((self_ty, self_node)) => super::anon::self_value(self.heads, env.module, node, text, self_ty, self_node, r)?,
-            None => self.const_value_bits(env, text, r, node)?,
+            Some((self_ty, self_node)) => super::anon::self_value(self.heads, env.module, node, orig_text, text, self_ty, self_node, active_marks, orig_owner, inherent_edits, r)?,
+            None => self.const_value_bits_owned(env, orig_text, text, r, node, orig_owner, inherent_edits)?,
         };
         intern(tys, PNode::ConstValue { ty, bits })
     }
@@ -1490,8 +1691,13 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 // Merged fields `(field_text, Name, PTy)`. Spreads (`f.name.is_none()`) expand
                 // left-to-right, and later spreads or explicit fields override earlier ones.
                 let mut merged: blaze_own::Vec<(&str, Name, PTy), Alloc<'_>> = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
+                let mut has_default = false;
+                let mut spread_defaults_tag: u64 = 0;
                 for (i, &n) in rows.iter().enumerate() {
                     let f = lf::Field::decode(n)?;
+                    if f.default.is_some() {
+                        has_default = true;
+                    }
                     let Some(&kid_ty) = kids.get(i) else {
                         return Err(Why::Unsupported("record field count mismatch", r));
                     };
@@ -1512,6 +1718,10 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                                 let spread_r = place(v, v.type_range(f.ty)).unwrap_or(r);
                                 return Err(Why::Unsupported("record type spread (`..Base`) requires a structural record type", spread_r));
                             };
+                            let base_tag = tv.record_defaults_tag(kid_ty);
+                            if base_tag != 0 {
+                                spread_defaults_tag = base_tag;
+                            }
                             let base_names = tv
                                 .record_names(base_schema)
                                 .ok_or(Why::Unsupported("record type spread target has no registered schema", r))?;
@@ -1543,7 +1753,19 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 let schema = tc::RecordSchema::of_sorted_names(&sorted_names);
                 tys.register_record_schema(schema, &sorted_names).map_err(|_| table_full())?;
                 let l = intern_list(tys, &sorted_tys)?;
-                intern(tys, PNode::Record(schema, l))
+                let defaults_tag = if has_default || spread_defaults_tag != 0 {
+                    let owner_ck = self
+                        .owner_key
+                        .or_else(|| self.owner.map(|(k, _)| super::keys::checker_of(k)))
+                        .or_else(|| env.body.map(|bs| bs.owner));
+                    match owner_ck {
+                        Some(ock) => super::heads::Store::scoped_record_defaults_tag(ock, schema, t.0, alloc),
+                        None => spread_defaults_tag,
+                    }
+                } else {
+                    0
+                };
+                tys.intern_record_with_defaults(schema, l, defaults_tag).map_err(|_| table_full())
             }
             lf::TypeRef::Union(_) => {
                 let mut flat = blaze_own::Vec::with_capacity_in(kids.len(), tys.alloc());
@@ -2176,7 +2398,14 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 consts: cs,
                 body: None,
             };
-            let alias_builder = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks };
+            let alias_builder = Builder {
+                resolver: crate::resolve::Paths { names: self.resolver.names },
+                heads: self.heads,
+                marks,
+                owner: Some((alias, alias_text.text)),
+                owner_key: Some(super::keys::checker_of(alias)),
+                expanded: None,
+            };
             let mut full = blaze_own::Vec::with_capacity_in(want + 1, alloc);
             full.push(self_ty);
             full.extend_from_slice(given);
@@ -4387,7 +4616,21 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 consts: cs,
                 body: None,
             };
-            let def_builder = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks };
+            let def_owner_text = if let Some(hdr) = item_text.impl_header {
+                hdr
+            } else if matches!(self.resolver.names.detail_of(item_key), Some(blaze_surface::ItemDetail::Trait)) {
+                blaze_file_items::nested::trait_head(item_text.text)
+            } else {
+                item_text.text
+            };
+            let def_builder = Builder {
+                resolver: crate::resolve::Paths { names: self.resolver.names },
+                heads: self.heads,
+                marks,
+                owner: Some((item_key, def_owner_text)),
+                owner_key: Some(super::keys::checker_of(item_key)),
+                expanded: None,
+            };
             let mut def_sink = RegionSink::new_in(alloc);
             def_sink.default_depth = s.default_depth + 1;
             let raw_ty = match def_builder.ty_regions(tys, &def_env, dv, default_ty, &mut def_sink) {
@@ -5686,7 +5929,14 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 consts: cs,
                 body: None,
             };
-            let alias_builder = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks };
+            let alias_builder = Builder {
+                resolver: crate::resolve::Paths { names: self.resolver.names },
+                heads: self.heads,
+                marks,
+                owner: Some((alias_key, alias_text.text)),
+                owner_key: Some(super::keys::checker_of(alias_key)),
+                expanded: None,
+            };
             // Fill any omitted defaulted type/const arguments declared by the trait alias
             // (`trait Alias<T = &'static u8> = Gen<T>;`, `trait Alias<const N: usize = 3> = Gen<N>;`)
             // into `all_args`/`all_pool`/`all_index` with `Slot::quiet`.

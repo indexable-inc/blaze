@@ -299,6 +299,9 @@ pub fn body_scope_scratch<'a, S: SourceTexts<'a>>(
             n += 1;
         }
     }
+    if !nested.head_calls.is_empty() {
+        ordinals.push((crate::blocks::head_call_module(c.key, body.src.key), n));
+    }
     ordinals.sort_unstable();
 
     let scopes = core::mem::replace(&mut solved.scopes, AVec::new_in(alloc));

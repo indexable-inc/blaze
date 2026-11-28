@@ -429,7 +429,7 @@ where
 /// the body is no item or member of the library (a local item's own body).
 pub struct PatternBlocks<'a> {
     nested: Nested<'a>,
-    modules: Option<AVec<'a, Option<LibKey>>>,
+    modules: Option<super::scope_table::OwnedHandBlocks<'a>>,
 }
 
 impl<'a> PatternBlocks<'a> {
@@ -437,12 +437,8 @@ impl<'a> PatternBlocks<'a> {
     /// of crate `krate`.
     pub fn of<'n, S: NamesSource<'n>>(names: S, locals: &super::locals::Locals<'n>, keys: &super::keys::Keys, krate: usize, item: LibKey, owner: ItemKey, text: &str, alloc: Alloc<'a>) -> PatternBlocks<'a> {
         let nested = blaze_file_items::nested::scan(text, alloc);
-        // The library's key of the body, the one answer `Locals::keep` takes too.
-        let body = locals.library_body(names, keys, item, owner, text);
-        let modules = match (body, names.crate_key(krate)) {
-            (Some(body), Some(crate_key)) if nested.end == NestedEnd::Whole => Some(blaze_scope::blocks::block_modules(crate_key, body, &nested, alloc)),
-            _ => None,
-        };
+        // The library's block modules, the one answer `Locals::keep` and `body::lower_at` take too.
+        let modules = names.crate_key(krate).and_then(|crate_key| locals.body_block_modules(names, keys, crate_key, item, owner, text, &nested, alloc).0);
         PatternBlocks { nested, modules }
     }
 }
@@ -536,7 +532,7 @@ pub fn by_uses<'n, 'a, S: NamesSource<'n>>(
                 let Some(crate_key) = paths.names.crate_of(module).and_then(|k| paths.names.crate_key(k)) else {
                     return Err(LocalGap { item, form: THROUGH_LOCAL, range });
                 };
-                let built = super::scope_table::build(crate_key, module, view, &blocks.nested, blocks.modules.as_deref(), planted, alloc)
+                let built = super::scope_table::build(crate_key, module, view, &blocks.nested, blocks.modules.as_ref().map(super::scope_table::OwnedHandBlocks::as_ref), planted, alloc)
                     .map_err(|r| LocalGap { item, form: r.form(), range })?;
                 table = Some(built);
             }
