@@ -2326,6 +2326,18 @@ pub(crate) fn seed_pinned_dep_probes<D: blaze_core::Driver, S: crate::store::Sha
     Ok(None)
 }
 
+/// Publishes (or clears when `None`) the verified dependency-probe identity snapshot captured
+/// during a certificate sweep into `command_probes` right before returning a certificate hit.
+pub(crate) fn apply_cert_dep_probe_snapshot(
+    command_probes: &crate::scripts::SharedCommandProbes,
+    cert_hex: Option<crate::wasm64_compile::Hex64>,
+) {
+    match cert_hex {
+        Some(hex) => command_probes.publish_checked_dep_probe_hex(hex),
+        None => command_probes.clear_checked_dep_probe_hex(),
+    }
+}
+
 /// Opens a pinned engine answer `Standing` directly from `cert` (`standing.root`) in `store_home`
 /// for `blaze jit-exec` — ZERO workspace stat sweep, ZERO file hashing, and ZERO re-checking.
 /// Commits the store cleanly after `start` returns (including updated `start_list`, compiled
@@ -3998,11 +4010,7 @@ fn checking<'f, 's: 'f>(
                 }
             };
             if (own_certifies && (whole_clean_cert || scoped_filtered.is_some())) || adopted.is_some() {
-                if let Some(hex) = cert_dep_probe_hex.get() {
-                    command_probes.publish_checked_dep_probe_hex(hex);
-                } else {
-                    command_probes.clear_checked_dep_probe_hex();
-                }
+                apply_cert_dep_probe_snapshot(command_probes, cert_dep_probe_hex.get());
                 // The certificate's print and commit, then its profile, each in a call of its own
                 // (rule 54: no stage's temporaries in this frame).
                 let cert_root = if own_whole { whole_root.as_str() } else { answer_root.as_str() };
@@ -4071,6 +4079,7 @@ fn checking<'f, 's: 'f>(
             Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), wall_ns),
             None => Ok(blaze_build_script::facts::sdk_id_digest("")),
         };
+        cert_dep_probe_hex.set(None);
         let dep_probes_fn = || resolve_dep_probes(&env);
         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
         let follow_began = phases.clock().now();
@@ -4102,6 +4111,7 @@ fn checking<'f, 's: 'f>(
                 }
             };
             if whole_clean_cert || scoped_filtered.is_some() {
+                apply_cert_dep_probe_snapshot(command_probes, cert_dep_probe_hex.get());
                 let whole_view_slot = if scoped_filtered.is_some() {
                     None
                 } else {

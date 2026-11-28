@@ -1376,6 +1376,7 @@ pub(crate) fn job<'f: 'j, 'j>(
     names: &mut Option<crate::names::Names<'f>>,
     env: &FetchEnv<'_>,
     probes: CommandProbes<'_>,
+    planned_script_probes: &[(ContentId, crate::engine_scripts::PlannedProbe)],
     tool: blaze_drive::Tool,
     workers: u32,
     lock: Option<&'f Lock<'static>>,
@@ -1487,10 +1488,11 @@ pub(crate) fn job<'f: 'j, 'j>(
     let mut wants = std::vec::Vec::new_in(Global);
     // Its module, looked up by its own task (script_modules.rs, ruling D115 (c)): read, so a
     // rebuilt module reruns this run alone and an equal one moves nothing.
-    let Some(module) = names.as_ref().and_then(|n| n.script_readers(task.name).next().and_then(|at| n.script_module_of(at))) else {
+    let Some(module_row) = names.as_ref().and_then(|n| n.script_readers(task.name).next().and_then(|at| n.script_module_of(at))) else {
         return Ok(Prepared::Said { what: "a build script with no module lookup", words: "the build script read here has no unit in the graph to name its module by", hole: false });
     };
-    let module = crate::script_modules::name(module.subject);
+    let module_subject = module_row.subject;
+    let module = crate::script_modules::name(module_subject);
     if !task.inputs.iter().any(|input: &Input| input.name == module) {
         wants.push(Want { name: module, home: Name::unit_graph() });
     }
@@ -1547,7 +1549,18 @@ pub(crate) fn job<'f: 'j, 'j>(
             erased.handle(),
         ))
     };
-    let deps_digest = match fold_wasm_script_dep_probes(&cx, ran_as, graph, scripts.wasm_graph, script, deps_digest, probes, jobs) {
+    let deps_digest = match fold_wasm_script_dep_probes(
+        &cx,
+        ran_as,
+        graph,
+        scripts.wasm_graph,
+        script,
+        module_subject,
+        Some(planned_script_probes),
+        deps_digest,
+        probes,
+        jobs,
+    ) {
         Ok(folded) => folded,
         Err(error) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{error}")), hole: true }),
     };
@@ -1556,15 +1569,20 @@ pub(crate) fn job<'f: 'j, 'j>(
 
 /// Folds the dependency build-script probe identity digest into `deps_digest` ONLY for
 /// `RanAs::Wasm` build scripts (which execute wasm64 self-compiled modules and require
-/// `wasm_graph`). Native build scripts (`RanAs::Native`) skip wasm64 dependency scanning so
-/// minimal toolchains without `wasm64-blaze-wasip1` never fail native preparation.
-#[expect(clippy::too_many_arguments, reason = "build-script deps-digest folding over cx, placement, graphs, unit, digest, probes, and bump")]
+/// `wasm_graph`). When `planned_script_probes` is supplied by `ScriptsStage`, binds strictly to
+/// the planned `MacroModule` probe tag instead of rescanning live probe state so wave-1 `Script`
+/// runs always open the exact module keyed and compiled in wave 0 (Rule 21). Native build scripts
+/// (`RanAs::Native`) skip wasm64 dependency scanning so minimal toolchains without
+/// `wasm64-blaze-wasip1` never fail native preparation.
+#[expect(clippy::too_many_arguments, reason = "build-script deps-digest folding over cx, placement, graphs, unit, module_subject, planned, digest, probes, and bump")]
 fn fold_wasm_script_dep_probes<'j>(
     cx: &Cx,
     ran_as: RanAs,
     graph: &UnitGraph<'_>,
     wasm_graph: Option<&UnitGraph<'_>>,
     script: UnitId,
+    module_subject: ContentId,
+    planned_script_probes: Option<&[(ContentId, crate::engine_scripts::PlannedProbe)]>,
     deps_digest: Option<&'j str>,
     probes: CommandProbes<'_>,
     jobs: &'j Frame,
@@ -1572,12 +1590,26 @@ fn fold_wasm_script_dep_probes<'j>(
     if ran_as != RanAs::Wasm {
         return Ok(deps_digest);
     }
-    match crate::wasm64_compile::unit_has_dep_build_scripts(graph, wasm_graph, script, false)? {
-        true => {
-            let probes_hex = probes.dep_probe_identity_hex(cx)?;
-            Ok(Some(crate::wasm64_compile::fold_dep_probes_opt(deps_digest, probes_hex.as_str(), jobs)))
+    let planned_entry = planned_script_probes.and_then(|table| {
+        let at = table.binary_search_by_key(&module_subject, |(s, _)| *s).ok()?;
+        table.get(at).map(|(_, entry)| entry)
+    });
+    match planned_entry {
+        Some(crate::engine_scripts::PlannedProbe::Digest(planned_hex)) => {
+            Ok(Some(crate::wasm64_compile::fold_dep_probes_opt(deps_digest, planned_hex.as_str(), jobs)))
         }
-        false => Ok(deps_digest),
+        Some(crate::engine_scripts::PlannedProbe::Failed(err)) => Err(err.duplicate()),
+        None => match crate::wasm64_compile::unit_has_dep_build_scripts(graph, wasm_graph, script, false)? {
+            true if planned_script_probes.is_some() => Err(ProbeSetupError::from_str(
+                ProbeErrorKind::PlannedDrift,
+                "build script has dependency build scripts at job time without a planned module probe identity",
+            )),
+            true => {
+                let probes_hex = probes.dep_probe_identity_hex(cx)?;
+                Ok(Some(crate::wasm64_compile::fold_dep_probes_opt(deps_digest, probes_hex.as_str(), jobs)))
+            }
+            false => Ok(deps_digest),
+        },
     }
 }
 
@@ -2420,12 +2452,15 @@ mod shared_command_probes_dst {
 
         // Native build script with `wasm_graph = None` MUST succeed untouched without
         // requiring `wasm64-blaze-wasip1` or initializing `SharedCommandProbes`.
+        let mod_subj = blaze_ids::ContentId([0x33; 32]);
         let native_res = super::fold_wasm_script_dep_probes(
             &cx,
             super::RanAs::Native,
             &graph,
             None,
             blaze_unit_graph::UnitId(0),
+            mod_subj,
+            Some(&[]),
             Some("orig-deps"),
             probes,
             &frame,
@@ -2442,6 +2477,8 @@ mod shared_command_probes_dst {
             &graph,
             None,
             blaze_unit_graph::UnitId(0),
+            mod_subj,
+            Some(&[]),
             Some("orig-deps"),
             probes,
             &frame,
@@ -3252,5 +3289,178 @@ mod shared_command_probes_dst {
         )
         .expect("empty payload on non-probe MacroModule is valid");
         assert_eq!(res_empty, None);
+    }
+
+    #[test]
+    fn script_job_binds_deps_digest_to_planned_module_probe_tag_under_live_drift() {
+        use blaze_build_script::c_tasks_probe::{CanonicalProbe, ProbeAnswer, ProbeAnswerer};
+        use blaze_ids::ContentId;
+        use blaze_proc_macro::probe_clang::{CProbeStore, CScriptProbes, MemCProbeStore};
+
+        struct MutableAnswerer(std::sync::Arc<core::sync::atomic::AtomicU8>);
+        impl ProbeAnswerer for MutableAnswerer {
+            fn id<'a>(&self, _alloc: blaze_own::Alloc<'a>) -> Result<ContentId, blaze_own::AString<'a>> {
+                Ok(ContentId([self.0.load(Ordering::SeqCst); 32]))
+            }
+            fn answer<'a, 'b>(
+                &self,
+                _probe: &CanonicalProbe<'_, '_>,
+                _input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+                alloc: blaze_own::Alloc<'a>,
+            ) -> Result<ProbeAnswer<'a>, blaze_own::AString<'a>> {
+                Err(blaze_own::AString::from_str_in("unused", alloc))
+            }
+        }
+
+        let io = Io::simulated(SimWorld::new(80, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root sim cx");
+        let env = sim_env(&io);
+        let shared = SharedAlloc::global();
+        let frame = cx.frame();
+        let erased = blaze_own::Erased::new(frame);
+        let a = erased.handle();
+
+        // Build a minimal 3-unit graph:
+        // 0: dep_bs (BuildScript), 1: dep_lib (Lib with build_script=0), 2: app_bs (BuildScript depending on dep_lib).
+        let make_u = |pkg: u32, name: &str, kind: blaze_unit_graph::UnitKind<'static>, bs: Option<u32>, dep: Option<(&str, u32)>| {
+            let mut deps = blaze_own::Vec::new_in(a);
+            if let Some((dn, du)) = dep {
+                deps.push(blaze_unit_graph::UnitDep {
+                    name: blaze_own::String::from_str_in(dn, a),
+                    unit: blaze_unit_graph::UnitId(du),
+                });
+            }
+            blaze_unit_graph::Unit {
+                package: blaze_manifest::lock::LockId(pkg),
+                name: blaze_own::String::from_str_in(name, a),
+                version: blaze_own::String::from_str_in("0.1.0", a),
+                kind,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2024").expect("edition"),
+                crate_name: blaze_own::String::from_str_in(name, a),
+                root: blaze_own::String::from_str_in("build.rs", a),
+                features: blaze_own::Vec::new_in(a),
+                cfg: blaze_own::Vec::new_in(a),
+                deps,
+                build_script: bs.map(blaze_unit_graph::UnitId),
+                links: None,
+            }
+        };
+        let mut units = blaze_own::Vec::new_in(a);
+        units.push(make_u(0, "dep_bs", blaze_unit_graph::UnitKind::BuildScript, None, None));
+        units.push(make_u(0, "dep_lib", blaze_unit_graph::UnitKind::Lib, Some(0), None));
+        units.push(make_u(1, "app_bs", blaze_unit_graph::UnitKind::BuildScript, None, Some(("dep_lib", 1))));
+        let graph = blaze_unit_graph::UnitGraph {
+            resolver: blaze_unit_graph::Resolver::V3,
+            units,
+            meta: blaze_own::Vec::new_in(a),
+            left_out: blaze_own::Vec::new_in(a),
+        };
+
+        let state = std::sync::Arc::new(core::sync::atomic::AtomicU8::new(0xaa));
+        let holder = SharedCommandProbes::new();
+        let probes = holder.with_env(&env);
+        let _ = probes
+            .c_probes_with(&cx, |_| {
+                let answerer: blaze_own::Arc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> =
+                    blaze_own::Arc::new_in(MutableAnswerer(std::sync::Arc::clone(&state)), shared);
+                let records: blaze_own::Arc<dyn CProbeStore, SharedAlloc<'static>> =
+                    blaze_own::Arc::new_in(MemCProbeStore::default(), shared);
+                Some(CProbeSetting::Ready(CScriptProbes {
+                    answerer,
+                    #[cfg(target_os = "linux")]
+                    hermetic: None,
+                    records,
+                    sdk_dir: blaze_own::Arc::from_str_in("", shared),
+                    sdk_id: blaze_own::Arc::from_str_in("", shared),
+                    sdk_digest: [0; 32],
+                    clang_sha256: [0x99; 32],
+                }))
+            })
+            .expect("seed c_probes");
+        let _ = probes
+            .spawn_setting_with(&cx, |_| {
+                Ok(SpawnSetting::facts_only(FactPins {
+                    clang_version_text: std::string::String::from("clang version 23.0.0"),
+                    macos_product_version: std::string::String::new(),
+                    macos_build_version: std::string::String::new(),
+                }))
+            })
+            .expect("seed spawn");
+
+        // Wave-0 planning froze probe tag A for `mod_subj`.
+        let hex_a = probes.dep_probe_identity_hex(&cx).expect("hex A");
+        let mod_subj = ContentId([0x77; 32]);
+        let planned = [(mod_subj, crate::engine_scripts::PlannedProbe::Digest(hex_a))];
+
+        // Before wave-1 `scripts::job` runs, live answerer drifts to B!
+        state.store(0xbb, Ordering::SeqCst);
+        let hex_b = probes.dep_probe_identity_hex(&cx).expect("hex B");
+        assert_ne!(hex_a, hex_b);
+
+        // `fold_wasm_script_dep_probes` MUST bind strictly to planned tag A (never live B!).
+        let got = super::fold_wasm_script_dep_probes(
+            &cx,
+            super::RanAs::Wasm,
+            &graph,
+            Some(&graph),
+            blaze_unit_graph::UnitId(2),
+            mod_subj,
+            Some(&planned),
+            Some("base-deps"),
+            probes,
+            frame,
+        )
+        .expect("planned tag must bind cleanly");
+        let expected_a = crate::wasm64_compile::fold_dep_probes_opt(Some("base-deps"), hex_a.as_str(), frame);
+        let drifted_b = crate::wasm64_compile::fold_dep_probes_opt(Some("base-deps"), hex_b.as_str(), frame);
+        assert_eq!(got, Some(expected_a), "Script job deps_digest must stay bound to planned module tag A");
+        assert_ne!(got, Some(drifted_b));
+
+        // Contrast: if `planned` does NOT include `mod_subj` for a dep-script-using unit, refuse PlannedDrift.
+        let drift_err = super::fold_wasm_script_dep_probes(
+            &cx,
+            super::RanAs::Wasm,
+            &graph,
+            Some(&graph),
+            blaze_unit_graph::UnitId(2),
+            mod_subj,
+            Some(&[]),
+            Some("base-deps"),
+            probes,
+            frame,
+        )
+        .expect_err("unplanned dep-script unit must refuse PlannedDrift");
+        assert_eq!(drift_err.kind, ProbeErrorKind::PlannedDrift);
+    }
+
+    #[test]
+    fn whole_certificate_fallback_resets_and_publishes_whole_probe_snapshot() {
+        let io = Io::simulated(SimWorld::new(81, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root sim cx");
+        let env = sim_env(&io);
+
+        let hex_scoped_stale = crate::wasm64_compile::Hex64::from_bytes([0xa1; 32]);
+        let hex_whole_fresh = crate::wasm64_compile::Hex64::from_bytes([0xb2; 32]);
+        let holder = SharedCommandProbes::new();
+        let cert_cell: core::cell::Cell<Option<crate::wasm64_compile::Hex64>> = core::cell::Cell::new(None);
+
+        // 1. Stale scoped sweep observed `hex_scoped_stale`, then missed.
+        cert_cell.set(Some(hex_scoped_stale));
+        // 2. Own-whole fallback resets `cert_cell` before its sweep and validates `hex_whole_fresh`.
+        cert_cell.set(None);
+        cert_cell.set(Some(hex_whole_fresh));
+        crate::engine_check::apply_cert_dep_probe_snapshot(&holder, cert_cell.get());
+        let start_hex = holder
+            .with_env(&env)
+            .with_checked_snapshot()
+            .dep_probe_identity_hex(&cx)
+            .expect("whole fallback snapshot");
+        assert_eq!(start_hex, hex_whole_fresh, "own-whole certificate fallback must publish whole cert tag");
+
+        // 3. If the own-whole certificate has NO `DepProbes` leaf, reset + apply clears any prior tag.
+        cert_cell.set(None);
+        crate::engine_check::apply_cert_dep_probe_snapshot(&holder, cert_cell.get());
+        assert_eq!(holder.checked_dep_probe_hex.load(), None);
     }
 }

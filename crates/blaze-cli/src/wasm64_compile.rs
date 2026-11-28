@@ -1470,6 +1470,9 @@ fn ensure_proc_macro_unit(
                 let _ = write!(msg, "proc-macro dep probe identity of {}: {e}", unit.name.as_str());
                 SelfCompileError::Failed(msg.as_str().into())
             })?;
+            if let Some(expected) = dep_probes.expected_probes {
+                verify_dep_probe_unchanged(expected, probes_hex, unit.name.as_str(), heap.alloc())?;
+            }
             (identity.with_dep_probes(probes_hex.as_str()), Some(probes_hex))
         } else {
             (identity, None)
@@ -6032,5 +6035,117 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         assert_eq!(planned_whole.script_modules.len(), 1);
         assert_eq!(planned_whole.script_modules[0].0, bs_with_ring_subj);
         assert!(planned_whole.leaf_id().is_some());
+    }
+
+    #[test]
+    fn ensure_proc_macro_unit_rejects_drifted_probes_before_cache_hit() {
+        let tmp = std::env::temp_dir().join(std::format!(
+            "blaze-wasm64-nested-pm-drift-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+
+        let frame = Frame::with_reserve(8 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let a = erased.handle();
+        let make_u = |pkg: u32, name: &str, kind: UnitKind<'static>, build_script: Option<u32>, deps: &[(&str, u32)]| -> Unit<'_> {
+            let mut u = make_unit(pkg, name, name, kind, "2024", deps, a);
+            u.version = Text::from_str_in("0.1.0", a);
+            u.build_script = build_script.map(UnitId);
+            u
+        };
+        // Graph where nested proc-macro `pm-dep-ring` (Unit 2) depends on `ring` (Unit 1, build script Unit 0).
+        let graph = make_graph(
+            std::vec![
+                make_u(0, "ring", UnitKind::BuildScript, None, &[]),
+                make_u(0, "ring", UnitKind::Lib, Some(0), &[]),
+                make_u(1, "pm-dep-ring", UnitKind::ProcMacro, None, &[("ring", 1)]),
+            ],
+            a,
+        );
+        let lock_text = b"version = 4\n\n\
+[[package]]\nname = \"ring\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"2222222222222222222222222222222222222222222222222222222222222222\"\n\n\
+[[package]]\nname = \"pm-dep-ring\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"4444444444444444444444444444444444444444444444444444444444444444\"\n";
+        let heap = blaze_own::testing::heap();
+        let lock = crate::fetch::Lockfile::read(lock_text, heap, &frame).expect("lockfile");
+
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(82, bstd::io::Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("sim cx");
+        let fetch_env = crate::fetch::FetchEnv {
+            clock: io.need_clock().expect("clock"),
+            checkout: "",
+            served: crate::engine_script_reads::Served::Simulated,
+            cert_file: None,
+            cert_dir: None,
+            rustflags: blaze_manifest::rustflags::RustflagsEnv::default(),
+            home: None,
+            cargo_home: None,
+            start: None,
+            toolchain: blaze_toolchain::PINNED,
+            fs: io.need_fs().expect("fs"),
+            sdk: crate::sdk::NONE_IN_TESTS,
+            exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
+            lan_peer: crate::fetch::LanPeerConfig::DISABLED,
+            heap,
+        };
+        let shared_probes = crate::scripts::SharedCommandProbes::new();
+        let probes = shared_probes.with_env(&fetch_env);
+        let live_hex = probes.dep_probe_identity_hex(&cx).expect("live hex");
+
+        // Pre-populate a cached module record on disk for `live_hex` (tag B) so the cache-hit path
+        // would succeed if `ensure_proc_macro_unit` skipped planned-probe drift validation!
+        let locked = blaze_proc_macro::module::LockedPackages::of(lock.lock);
+        let folders = blaze_world::procs::git_folders(&tmp).expect("git folders");
+        let identity_b = blaze_world::procs::identify(
+            lock.lock,
+            &locked,
+            &folders,
+            &graph,
+            &graph.units[2],
+            |_| Ok(None::<&str>),
+            heap.alloc(),
+        )
+        .expect("identify")
+        .expect("identified")
+        .with_wasm_features(lock.lock, &graph, graph.units[2].package, |_| None::<&str>, heap.alloc())
+        .with_dep_probes(live_hex.as_str());
+        let (mod_key, id_text) = identity_b.with_id(|id| {
+            (
+                blaze_proc_macro::module::module_key(id),
+                blaze_proc_macro::module::identity(id),
+            )
+        });
+        let fake_wasm = b"\0asm\x01\0\0\0";
+        let fake_sha = sha256_hex(fake_wasm);
+        publish_proc_macro_module(&tmp, &mod_key, &id_text, fake_wasm, &fake_sha, &[], PROC_MACRO_DECLS_GLOBAL)
+            .expect("publish cached nested proc-macro module for live probe B");
+
+        // Now ask `ensure_proc_macro_unit` with a DIFFERENT planned probe tag A -> MUST refuse
+        // drift BEFORE loading/returning the cached B module!
+        let planned_a = Hex64::from_bytes([0xaa; 32]);
+        assert_ne!(planned_a, live_hex);
+        let producers = blaze_ids::producer::Producers::for_tests(b"nested-pm-drift");
+        let checkout = blaze_proc_macro::script_sandbox::RealRoot::resolve(&tmp).expect("real root");
+        let err = ensure_proc_macro_unit(
+            &cx,
+            &tmp,
+            &graph,
+            lock.lock,
+            &checkout,
+            &[],
+            &producers,
+            heap,
+            DepScriptProbes { shared: Some(probes), expected_probes: Some(planned_a) },
+            UnitId(2),
+            0,
+        )
+        .expect_err("ensure_proc_macro_unit must refuse drifted live probe before cache hit");
+        let msg = std::format!("{err}");
+        assert!(
+            msg.contains("changed") || msg.contains("planned"),
+            "error must report planned-vs-live probe drift, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

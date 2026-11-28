@@ -1509,7 +1509,8 @@ impl<'f> ScriptsStage<'f> {
         let tool = self.tools.ok_or(EngineCheckError::Unseen { task: name, read: Name::unit_graph() })?.of(name);
         let made = work::unwinding(|| {
             crate::scripts::job(
-                cx, handles.root, store, &mut self.scripts, &mut names.names, handles.env, handles.probes, tool,
+                cx, handles.root, store, &mut self.scripts, &mut names.names, handles.env, handles.probes,
+                self.planned_script_probes.as_slice(), tool,
                 handles.workers.get(), handles.lock, handles.members, &drive, frame, jobs,
             )
         });
