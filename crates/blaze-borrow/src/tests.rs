@@ -3175,3 +3175,130 @@ fn impl_header_alias_enforces_assoc_impl_where_clauses() {
         "CONTROL: missing AsContext::Data row must refuse Unanswered, never unsoundly skip",
     );
 }
+
+#[test]
+fn future_output_slices_trailing_slots_without_constraining_captures() {
+    let mut t = Tys::new();
+    let unit = t.unit();
+    let p0 = t.param(0);
+    let dyn_pred = t.extrait(T_TR, &[]);
+    let dyn_ty = t.dynamic(&[dyn_pred]);
+    let fut_ty = t.n(PNode::Future(blaze_typeck::ExprId(7), dyn_ty, unit));
+    let fut_out = t.alias(T_FUT, OUTPUT, &[p0]);
+    let fut_trait_clause = t.extrait(T_FUT, &[p0]);
+
+    let facts = Facts::default()
+        .trait_(T_TR, 0)
+        .trait_(T_FUT, 0)
+        .alias(T_FUT, OUTPUT, 0);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+
+    struct BodyCols<'a> {
+        cols: Columns<'a>,
+        fut: PTy,
+        fut_slots: SlotCount,
+    }
+    impl RegionTypes for BodyCols<'_> {
+        fn node(&self, ty: PTy) -> Result<PNode, Unknown> {
+            self.cols.node(ty)
+        }
+        fn own(&self, ty: PTy) -> Result<SlotCount, Unknown> {
+            if ty == self.fut { Ok(self.fut_slots) } else { self.cols.own(ty) }
+        }
+        fn kids(&self, ty: PTy) -> Result<Kids<'_>, Unknown> {
+            if ty == self.fut { Ok(Kids::None) } else { self.cols.kids(ty) }
+        }
+        fn adt_variances(&self, adt: ItemKey) -> Option<&[Variance]> {
+            self.cols.adt_variances(adt)
+        }
+    }
+
+    struct FutSel;
+    impl Selected for FutSel {
+        fn select(&self, _ask: Ask) -> Selection<'_> {
+            Selection::Not(NotSelected::Builtin)
+        }
+        fn is_future_trait(&self, trait_: ItemKey) -> bool {
+            trait_ == T_FUT
+        }
+    }
+
+    // 1. `fn block_on<F: Future>(f: F) -> F::Output`:
+    //    `fut_ty` lays `[cap_0, out_0]` (2 slots). Slicing the trailing output slot relates
+    //    `out_0 -> dest_0` without constraining capture slot `cap_0` to `out_0` or `dest_0`.
+    let p = params(0, &[]);
+    let inputs = [ty(p0, NONE)];
+    let clauses_basic = [ClauseIn::TraitOf { trait_ref: ty(fut_trait_clause, NONE), binders: 0 }];
+    let sig_basic = Sig { item: F, params: ParamsView::of(&p), inputs: &inputs, output: ty(fut_out, NONE), clauses: &clauses_basic };
+    let body_types = BodyCols { cols, fut: fut_ty, fut_slots: SlotCount::new(2) };
+    // Caller slots: 0 = capture borrow, 1 = future output slot, 2 = dest `dyn Tr + '2`,
+    // 3..5 = type argument `F` slots `[3, 4]`.
+    let (res, rec) = run(
+        &body_types,
+        &FutSel,
+        &Own::default(),
+        5,
+        Callee::Fn(sig_basic),
+        GenericArgs { lifetimes: SlotRange::EMPTY, types: &[arg(fut_ty, 3, 2)] },
+        &[arg(fut_ty, 0, 2)],
+        arg(dyn_ty, 2, 1),
+    );
+    assert_eq!(res, Ok(()), "block_on<PNode::Future> must succeed: {res:?}");
+    assert!(reach(&rec, 1).contains(&2), "future output slot 1 must flow to dest slot 2: {:?}", rec.subsets);
+    assert!(
+        !reach(&rec, 0).contains(&2) && !reach(&rec, 0).contains(&1),
+        "unrelated capture slot 0 must NOT be forced to outlive output/dest: {:?}",
+        rec.subsets,
+    );
+
+    // 2. `fn needs_static<F: Future>(f: F) -> F::Output where F::Output: 'static`:
+    //    `components_loop` slices the trailing output slot so `out_0: 'static` is enforced
+    //    without forcing unrelated capture slot `cap_0: 'static`.
+    let clauses_static = [
+        ClauseIn::TraitOf { trait_ref: ty(fut_trait_clause, NONE), binders: 0 },
+        ClauseIn::TypeOutlives { subject: ty(fut_out, NONE), region: Region::Static },
+    ];
+    let sig_static = Sig { item: F, params: ParamsView::of(&p), inputs: &inputs, output: ty(fut_out, NONE), clauses: &clauses_static };
+    let (res_static, rec_static) = run(
+        &body_types,
+        &FutSel,
+        &Own::default(),
+        5,
+        Callee::Fn(sig_static),
+        GenericArgs { lifetimes: SlotRange::EMPTY, types: &[arg(fut_ty, 3, 2)] },
+        &[arg(fut_ty, 0, 2)],
+        arg(dyn_ty, 2, 1),
+    );
+    assert_eq!(res_static, Ok(()), "needs_static<PNode::Future> must succeed: {res_static:?}");
+    assert!(
+        reach(&rec_static, 1).contains(&STATIC_NODE),
+        "F::Output: 'static must constrain future output slot 1 to 'static: subsets={:?}, statics={:?}",
+        rec_static.subsets,
+        rec_static.statics,
+    );
+    assert!(
+        !reach(&rec_static, 0).contains(&STATIC_NODE),
+        "F::Output: 'static must NOT constrain unrelated capture slot 0 to 'static: subsets={:?}, statics={:?}",
+        rec_static.subsets,
+        rec_static.statics,
+    );
+
+    // 3. Malformed control: a `PNode::Future` whose slot count is smaller than `count(output)`
+    //    must refuse with `Bad::ColumnLength`, never silently fall back or panic.
+    let bad_types = BodyCols { cols, fut: fut_ty, fut_slots: SlotCount::ZERO };
+    let (res_bad, _) = run(
+        &bad_types,
+        &FutSel,
+        &Own::default(),
+        1,
+        Callee::Fn(sig_basic),
+        GenericArgs { lifetimes: SlotRange::EMPTY, types: &[arg(fut_ty, 0, 0)] },
+        &[arg(fut_ty, 0, 0)],
+        arg(dyn_ty, 0, 1),
+    );
+    assert_eq!(
+        res_bad,
+        Err(Refused::Malformed { item: F, node: fut_out, what: Bad::ColumnLength { want: SlotCount::new(1), got: SlotCount::ZERO } }),
+        "CONTROL: PNode::Future shorter than count(output) must refuse Malformed::ColumnLength",
+    );
+}
