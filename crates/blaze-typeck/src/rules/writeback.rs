@@ -326,6 +326,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 let c = ctx.shallow_resolve(c);
                 Ok(ex.child(owner, x_res, c)?.0)
             };
+            if let TyView::Record(s, l) = v {
+                let list = self.export_list(ex, x_res, l)?;
+                let tag = self.ty.record_defaults_tag(x_res);
+                let p = ex.out.intern_record_with_defaults(s, list, tag)?;
+                ex.insert(x, p, false);
+                ex.insert(x_res, p, false);
+                continue;
+            }
             let node = match v {
                 TyView::Bool => PNode::Bool,
                 TyView::Char => PNode::Char,
@@ -547,7 +555,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
                 PNode::Record(s, l) => {
                     let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
-                    if !ch { cur } else { out.intern(PNode::Record(s, ml))? }
+                    if !ch {
+                        cur
+                    } else {
+                        let tag = out.view().record_defaults_tag(cur);
+                        out.intern_record_with_defaults(s, ml, tag)?
+                    }
                 }
                 PNode::Union(l) => {
                     let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;

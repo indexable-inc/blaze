@@ -258,7 +258,14 @@ impl<'a> TyCx<'a> {
         let (_, a2, b2) = self.tys.raw(b);
         let d = self.tys.desc(a);
         let same = |r: Role, x: u32, y: u32| r == Role::Child || x == y;
-        if !same(d.a, a1, a2) || !same(d.b, b1, b2) {
+        let same_b = if a.tag() == crate::ids::TAG_TY && k == ty::RECORD {
+            let [a0, a1_, a2_, a3, a4, a5, a6, a7, ..] = self.tys.scalar_value(b1).to_le_bytes();
+            let [c0, c1, c2, c3, c4, c5, c6, c7, ..] = self.tys.scalar_value(b2).to_le_bytes();
+            [a0, a1_, a2_, a3, a4, a5, a6, a7] == [c0, c1, c2, c3, c4, c5, c6, c7]
+        } else {
+            same(d.b, b1, b2)
+        };
+        if !same(d.a, a1, a2) || !same_b {
             return Err(TypeError::Mismatch { a, b });
         }
         let def = if d.a == Role::Def { a1 } else { 0 };

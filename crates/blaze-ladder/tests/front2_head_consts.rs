@@ -1410,12 +1410,15 @@ fn main() {}
         .key;
     let sized = front.index.lang("sized");
 
-    // Fresh store: registers structural record defaults under `schema.defaults_key()`.
+    // Fresh store: registers structural record defaults under `schema.scoped_defaults_key(tag)`.
     let mut maker = Store::new(sized, &frame, alloc);
     let mut maker_keys = Keys::new();
     maker.ensure(&names, &mut maker_keys, Want::Head(cfg)).unwrap_or_else(|e| panic!("ensure Config: {e}"));
     let schema = RecordSchema::of_sorted_names(&[Name::of("n")]);
-    let rk = schema.defaults_key();
+    let (_, cfg_ty) = maker.maps.aliases.get(&cfg).and_then(|x| *x).expect("Config alias");
+    let cfg_tag = maker.tys.view().record_defaults_tag(cfg_ty);
+    assert_ne!(cfg_tag, 0, "Config structural record must carry a non-zero defaults tag");
+    let rk = schema.scoped_defaults_key(cfg_tag);
     let dk = maker.field_defaults.get(&rk).expect("record field_defaults")[0].expect("first record default key");
     let encoded_dk = {
         let head_ref = head_record::from_store(&maker, HeadAt::Fn(dk)).unwrap_or_else(|e| panic!("from_store dk: {e}"));
@@ -2059,11 +2062,18 @@ fn main() {}
 
     // Also evaluate the registered default constants directly to confirm `size_of::<Enum>() == 2`
     // (not just type-checked without running the constant evaluator).
-    let schema = blaze_typeck::RecordSchema::of_sorted_names(&[blaze_typeck::Name::of("n")]);
-    let dk = store.field_defaults.get(&schema.defaults_key()).expect("record field_defaults")[0].expect("n default key");
+    let mut default_keys = blaze_own::AVec::new_in(alloc);
+    for (_, ds) in store.field_defaults.iter() {
+        if let Some(Some(dk)) = ds.first() {
+            default_keys.push(*dk);
+        }
+    }
+    assert!(default_keys.len() >= 2, "expected distinct scoped record field_defaults for impl and trait method bodies");
     let mut r = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: None };
-    let val = consts.value(&mut r, prepared, dk).unwrap_or_else(|e| panic!("eval method record default: {e}"));
-    assert_eq!(blaze_ladder::front2::consts::int_of(val), Some(2), "method structural record default must evaluate size_of::<Enum>() == 2");
+    for &dk in default_keys.iter() {
+        let val = consts.value(&mut r, prepared, dk).unwrap_or_else(|e| panic!("eval method record default: {e}"));
+        assert_eq!(blaze_ladder::front2::consts::int_of(val), Some(2), "method structural record default must evaluate size_of::<Enum>() == 2");
+    }
 }
 
 /// Round 8 P1: a direct unbraced macro call in an item head (`type A = [u8; make_len!()];`,
@@ -2375,6 +2385,7 @@ fn structural_record_defaults_with_identical_text_in_distinct_modules_do_not_col
     use blaze_typeck::{Name, RecordSchema};
 
     const TEXT: &str = "#![blaze::records]
+#![feature(unboxed_closures, fn_traits)]
 mod a {
     pub const N: isize = 1;
     pub type Rec = { n: isize = { enum E { V = N } E::V as isize } };
@@ -2432,6 +2443,28 @@ struct OuterWrap {
 struct Hooks {
     on_a: fn(a::Rec) -> isize,
     on_b: fn(b::Rec) -> isize,
+}
+struct WrapFnA<T>(T);
+struct WrapFnB<T>(T);
+impl FnOnce<(a::Rec,)> for WrapFnA<fn(b::Rec) -> isize> {
+    type Output = isize;
+    extern \"rust-call\" fn call_once(self, args: (a::Rec,)) -> isize {
+        args.0.n
+    }
+}
+impl FnOnce<(b::Rec,)> for WrapFnB<fn(a::Rec) -> isize> {
+    type Output = isize;
+    extern \"rust-call\" fn call_once(self, args: (b::Rec,)) -> isize {
+        args.0.n
+    }
+}
+fn structural_interchange() -> (a::Rec, b::Rec) {
+    let x: a::Rec = mk_b_root();
+    let y: b::Rec = mk_a_root();
+    (x, y)
+}
+fn plain_without_defaults() -> { n: isize } {
+    { .. }
 }
 struct WrapA(a::Rec);
 struct WrapB(b::Rec);
@@ -2546,6 +2579,42 @@ fn ret_b_with_closure_returning_a() -> b::Rec {
     let _ = g();
     { .. }
 }
+fn both_branch_valued_callables_in_one_fn(c: bool) -> isize {
+    let fa = if c { take_a } else { take_a };
+    let fb = if c { take_b } else { take_b };
+    fa({ .. }) + fb({ .. })
+}
+fn both_deep_parens_callee_in_one_fn() -> isize {
+    ((((((((((take_a))))))))))({ .. }) + ((((((((((take_b))))))))))({ .. })
+}
+fn both_wrapper_fn_impl_in_one_fn(wa: WrapFnA<fn(b::Rec) -> isize>, wb: WrapFnB<fn(a::Rec) -> isize>) -> isize {
+    wa({ .. }) + wb({ .. })
+}
+trait AssocRec {
+    type R;
+}
+struct AssocA;
+struct AssocB;
+impl AssocRec for AssocA {
+    type R = { n: isize = 1 };
+}
+impl AssocRec for AssocB {
+    type R = { n: isize = 2 };
+}
+fn both_assoc_rec_in_one_fn() -> isize {
+    let ra: <AssocA as AssocRec>::R = { .. };
+    let rb: <AssocB as AssocRec>::R = { .. };
+    ra.n + rb.n
+}
+fn mk_rpit_a() -> impl FnOnce(a::Rec) -> isize {
+    |r| r.n
+}
+fn mk_rpit_b() -> impl FnOnce(b::Rec) -> isize {
+    |r| r.n
+}
+fn both_rpit_fn_in_one_fn() -> isize {
+    mk_rpit_a()({ .. }) + mk_rpit_b()({ .. })
+}
 fn both_match_many_arms_in_one_fn(k: u32) -> isize {
     let ra: a::Rec = match k {
         0 => { .. }, 1 => { .. }, 2 => { .. }, 3 => { .. }, 4 => { .. }, 5 => { .. }, 6 => { .. }, 7 => { .. },
@@ -2589,15 +2658,52 @@ fn main() {}
     let mut store = Store::new(front.index.lang("sized"), &frame, alloc);
     let mut keys = Keys::new();
     let schema = RecordSchema::of_sorted_names(&[Name::of("n")]);
-    let rk = schema.defaults_key();
 
     store.ensure(&names, &mut keys, Want::Head(rec_a)).unwrap_or_else(|e| panic!("ensure a::Rec: {e}"));
-    let dk_a = store.record_defaults_by_owner.get(&(rec_a, rk)).expect("a::Rec record_defaults")[0].expect("a::Rec default key");
+    let (_, ty_a) = store.maps.aliases.get(&rec_a).copied().flatten().expect("a::Rec alias");
+    let tag_a = store.tys.view().record_defaults_tag(ty_a);
+    assert_ne!(tag_a, 0, "a::Rec must carry a non-zero owner-scoped defaults tag");
+    let dk_a = store.field_defaults.get(&schema.scoped_defaults_key(tag_a)).expect("a::Rec record_defaults")[0].expect("a::Rec default key");
 
     store.ensure(&names, &mut keys, Want::Head(rec_b)).unwrap_or_else(|e| panic!("ensure b::Rec: {e}"));
-    let dk_b = store.record_defaults_by_owner.get(&(rec_b, rk)).expect("b::Rec record_defaults")[0].expect("b::Rec default key");
+    let (_, ty_b) = store.maps.aliases.get(&rec_b).copied().flatten().expect("b::Rec alias");
+    let tag_b = store.tys.view().record_defaults_tag(ty_b);
+    assert_ne!(tag_b, 0, "b::Rec must carry a non-zero owner-scoped defaults tag");
+    assert_ne!(tag_a, tag_b, "a::Rec and b::Rec must carry distinct owner-scoped defaults tags");
+    let dk_b = store.field_defaults.get(&schema.scoped_defaults_key(tag_b)).expect("b::Rec record_defaults")[0].expect("b::Rec default key");
 
     assert_ne!(dk_a, dk_b, "identical structural-record default text in distinct modules must produce distinct keys");
+
+    // Verify structural interchangeability: `a::Rec` and `b::Rec` unify cleanly despite distinct
+    // owner-scoped defaults tags.
+    {
+        let prepared = Prepares::new_in(blaze_own::testing::bump());
+        let (mut buckets, mut consts) = (None, Consts::default());
+        let fn_key = lookup(Namespace::Values, &["structural_interchange"]);
+        let body = lower_fn(&names, prepared, &mut keys, &mut store, fn_key).unwrap_or_else(|e| panic!("lower structural_interchange: {e}"));
+        let view = body.lowered.view();
+        let spell = Spelling::of(&view).unwrap_or_else(|e| panic!("spell structural_interchange: {e:?}"));
+        let scope = body.scope(&spell);
+        let mut r = Records { names: &names, index: &front.index, store: &mut store, keys: &mut keys, buckets: &mut buckets, consts: Some((&mut consts, prepared)), order: BuildOrder::AsAsked };
+        let done = check_body(&mut r, &body, &scope).unwrap_or_else(|e| panic!("check structural_interchange: {e}"));
+        assert!(done.diags.is_empty(), "structural_interchange diags: {:?}", done.diags);
+
+        // A plain `{ n: isize }` written WITHOUT defaults must NOT borrow `a::Rec` or `b::Rec`
+        // defaults from the shared schema key.
+        let plain_key = lookup(Namespace::Values, &["plain_without_defaults"]);
+        let plain_body = lower_fn(&names, prepared, &mut keys, &mut store, plain_key).unwrap_or_else(|e| panic!("lower plain_without_defaults: {e}"));
+        let plain_view = plain_body.lowered.view();
+        let plain_spell = Spelling::of(&plain_view).unwrap_or_else(|e| panic!("spell plain_without_defaults: {e:?}"));
+        let plain_scope = plain_body.scope(&plain_spell);
+        let mut r_plain = Records { names: &names, index: &front.index, store: &mut store, keys: &mut keys, buckets: &mut buckets, consts: Some((&mut consts, prepared)), order: BuildOrder::AsAsked };
+        let plain_res = check_body(&mut r_plain, &plain_body, &plain_scope);
+        let has_diags = match &plain_res {
+            Ok(done) => !done.diags.is_empty(),
+            Err(CheckFail::Diags { diags, .. }) => !diags.is_empty(),
+            Err(e) => panic!("unexpected plain_without_defaults error: {e}"),
+        };
+        assert!(has_diags, "plain {{ n: isize }} without defaults must reject `{{ .. }}` rather than borrowing a::Rec/b::Rec defaults");
+    }
 
     // Check bodies for BOTH `a::Rec` and `b::Rec` AFTER `b::Rec` has been registered:
     // `World::field_defaults` must resolve `dk_a` for `a::mk` / `mk_a_root` and `dk_b` for
@@ -2659,6 +2765,11 @@ fn main() {}
         &["both_field_callables_in_one_fn"][..],
         &["both_ref_and_break_in_one_fn"][..],
         &["ret_b_with_closure_returning_a"][..],
+        &["both_branch_valued_callables_in_one_fn"][..],
+        &["both_deep_parens_callee_in_one_fn"][..],
+        &["both_wrapper_fn_impl_in_one_fn"][..],
+        &["both_assoc_rec_in_one_fn"][..],
+        &["both_rpit_fn_in_one_fn"][..],
     ] {
         let fn_key = lookup(Namespace::Values, segs);
         let body = lower_fn(&names, prepared, &mut keys, &mut store, fn_key).unwrap_or_else(|e| panic!("lower {segs:?}: {e}"));

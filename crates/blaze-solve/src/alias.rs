@@ -898,7 +898,7 @@ fn same_head(a: TyKind, b: TyKind) -> bool {
         (TyKind::Tuple(x), TyKind::Tuple(y)) | (TyKind::Union(x), TyKind::Union(y)) | (TyKind::Dynamic(x, _), TyKind::Dynamic(y, _)) | (TyKind::Pat(_, x), TyKind::Pat(_, y)) => {
             x.len == y.len
         }
-        (TyKind::Record(s1, x), TyKind::Record(s2, y)) => s1 == s2 && x.len == y.len,
+        (TyKind::Record(s1, _, x), TyKind::Record(s2, _, y)) => s1 == s2 && x.len == y.len,
         (TyKind::Ref(_, _, m), TyKind::Ref(_, _, n)) | (TyKind::RawPtr(_, m), TyKind::RawPtr(_, n)) => m == n,
         (TyKind::Array(..), TyKind::Array(..)) | (TyKind::Slice(_), TyKind::Slice(_)) => true,
         (TyKind::Adt(d, x), TyKind::Adt(e, y))

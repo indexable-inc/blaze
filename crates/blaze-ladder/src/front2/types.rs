@@ -873,6 +873,10 @@ pub struct Builder<'b, H: Heads, S> {
     /// modules for: carried onto head-level anonymous constants (`anon::HeadOwner`) so blocks
     /// declared inside them resolve to their `blaze-scope` block modules.
     pub owner: Option<(LibKey, &'b str)>,
+    /// The checker key of the item/member/body whose written types this builder lowers, used to
+    /// scope structural-record field default tags independently of whether the item holds const
+    /// blocks (`owner`).
+    pub owner_key: Option<ItemKey>,
     /// Present when this builder walks an expanded type's view (`pattern_ty.rs` / `heads.rs`):
     /// maps const blocks inside macro expansions back to the enclosing head call's expansion
     /// block modules.
@@ -1687,8 +1691,13 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 // Merged fields `(field_text, Name, PTy)`. Spreads (`f.name.is_none()`) expand
                 // left-to-right, and later spreads or explicit fields override earlier ones.
                 let mut merged: blaze_own::Vec<(&str, Name, PTy), Alloc<'_>> = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
+                let mut has_default = false;
+                let mut spread_defaults_tag: u64 = 0;
                 for (i, &n) in rows.iter().enumerate() {
                     let f = lf::Field::decode(n)?;
+                    if f.default.is_some() {
+                        has_default = true;
+                    }
                     let Some(&kid_ty) = kids.get(i) else {
                         return Err(Why::Unsupported("record field count mismatch", r));
                     };
@@ -1709,6 +1718,10 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                                 let spread_r = place(v, v.type_range(f.ty)).unwrap_or(r);
                                 return Err(Why::Unsupported("record type spread (`..Base`) requires a structural record type", spread_r));
                             };
+                            let base_tag = tv.record_defaults_tag(kid_ty);
+                            if base_tag != 0 {
+                                spread_defaults_tag = base_tag;
+                            }
                             let base_names = tv
                                 .record_names(base_schema)
                                 .ok_or(Why::Unsupported("record type spread target has no registered schema", r))?;
@@ -1740,7 +1753,19 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 let schema = tc::RecordSchema::of_sorted_names(&sorted_names);
                 tys.register_record_schema(schema, &sorted_names).map_err(|_| table_full())?;
                 let l = intern_list(tys, &sorted_tys)?;
-                intern(tys, PNode::Record(schema, l))
+                let defaults_tag = if has_default || spread_defaults_tag != 0 {
+                    let owner_ck = self
+                        .owner_key
+                        .or_else(|| self.owner.map(|(k, _)| super::keys::checker_of(k)))
+                        .or_else(|| env.body.map(|bs| bs.owner));
+                    match owner_ck {
+                        Some(ock) => super::heads::Store::scoped_record_defaults_tag(ock, schema, t.0, alloc),
+                        None => spread_defaults_tag,
+                    }
+                } else {
+                    0
+                };
+                tys.intern_record_with_defaults(schema, l, defaults_tag).map_err(|_| table_full())
             }
             lf::TypeRef::Union(_) => {
                 let mut flat = blaze_own::Vec::with_capacity_in(kids.len(), tys.alloc());
@@ -2373,7 +2398,14 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 consts: cs,
                 body: None,
             };
-            let alias_builder = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks, owner: Some((alias, alias_text.text)), expanded: None };
+            let alias_builder = Builder {
+                resolver: crate::resolve::Paths { names: self.resolver.names },
+                heads: self.heads,
+                marks,
+                owner: Some((alias, alias_text.text)),
+                owner_key: Some(super::keys::checker_of(alias)),
+                expanded: None,
+            };
             let mut full = blaze_own::Vec::with_capacity_in(want + 1, alloc);
             full.push(self_ty);
             full.extend_from_slice(given);
@@ -4596,6 +4628,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 heads: self.heads,
                 marks,
                 owner: Some((item_key, def_owner_text)),
+                owner_key: Some(super::keys::checker_of(item_key)),
                 expanded: None,
             };
             let mut def_sink = RegionSink::new_in(alloc);
@@ -5896,7 +5929,14 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 consts: cs,
                 body: None,
             };
-            let alias_builder = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks, owner: Some((alias_key, alias_text.text)), expanded: None };
+            let alias_builder = Builder {
+                resolver: crate::resolve::Paths { names: self.resolver.names },
+                heads: self.heads,
+                marks,
+                owner: Some((alias_key, alias_text.text)),
+                owner_key: Some(super::keys::checker_of(alias_key)),
+                expanded: None,
+            };
             // Fill any omitted defaulted type/const arguments declared by the trait alias
             // (`trait Alias<T = &'static u8> = Gen<T>;`, `trait Alias<const N: usize = 3> = Gen<N>;`)
             // into `all_args`/`all_pool`/`all_index` with `Slot::quiet`.

@@ -1618,7 +1618,6 @@ impl Bb {
             expr_editions: &self.expr_editions,
             pat_editions: &self.pat_editions,
             record_expr_schemas: &[],
-            record_expr_defaults: &[],
             closure_param_regions: &[],
             loop_marks: &self.loop_marks,
         }

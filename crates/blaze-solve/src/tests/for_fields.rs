@@ -554,9 +554,9 @@ fn for_fields_record_and_tuple() {
     let good_list = tys.mk_list(&[i32_ty, bool_ty]).expect("good list");
     let bad_list = tys.mk_list(&[i32_ty, f32_ty]).expect("bad list");
 
-    let rec_good = tys.mk(TyKind::Record(0x1234, good_list)).expect("rec good");
-    let rec_bad = tys.mk(TyKind::Record(0x1234, bad_list)).expect("rec bad");
-    let rec_empty = tys.mk(TyKind::Record(0x0, List::EMPTY)).expect("rec empty");
+    let rec_good = tys.mk(TyKind::Record(0x1234, 0, good_list)).expect("rec good");
+    let rec_bad = tys.mk(TyKind::Record(0x1234, 0, bad_list)).expect("rec bad");
+    let rec_empty = tys.mk(TyKind::Record(0x0, 0, List::EMPTY)).expect("rec empty");
 
     let tup_good = tys.mk(TyKind::Tuple(good_list)).expect("tup good");
     let tup_bad = tys.mk(TyKind::Tuple(bad_list)).expect("tup bad");
@@ -758,7 +758,7 @@ fn for_fields_recursive_blanket_impl_and_coherence() {
     let rec_nested = {
         let pos = tys.mk(TyKind::Adt(ADT_POS, List::EMPTY)).expect("Pos");
         let l = tys.mk_list(&[pos, bool_ty]).expect("l");
-        tys.mk(TyKind::Record(0x9999, l)).expect("{ pos: Pos, ok: bool }")
+        tys.mk(TyKind::Record(0x9999, 0, l)).expect("{ pos: Pos, ok: bool }")
     };
 
     let prove_codec = |tys: &mut TestTys, ty: Ty| {

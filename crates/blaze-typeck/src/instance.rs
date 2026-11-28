@@ -252,7 +252,7 @@ impl<W: World> ClosureSource for OwnFirst<'_, '_, '_, '_, '_, W> {
 pub(crate) fn import<S: ClosureSource>(cx: &mut InferCtxIn<'_, '_>, src: &mut S, types: PTys<'_>, t: PTy, subst: &[Ty], depth: u32) -> Result<Ty, S::Error> {
     enum Kind {
         Tuple,
-        Record(crate::ids::RecordSchema),
+        Record(crate::ids::RecordSchema, u64),
         Union,
         Ref(crate::ids::Mutbl),
         Ptr(crate::ids::Mutbl),
@@ -279,9 +279,13 @@ pub(crate) fn import<S: ClosureSource>(cx: &mut InferCtxIn<'_, '_>, src: &mut S,
         extra: Option<PTy>,
     }
     fn finish<S: ClosureSource>(cx: &mut InferCtxIn<'_, '_>, src: &mut S, kind: Kind, slice: &[Ty], depth: u32) -> Result<Ty, S::Error> {
+        if let Kind::Record(s, d) = kind {
+            let l = cx.mk_list(slice)?;
+            return Ok(cx.mk_record_with_defaults(s, d, l)?);
+        }
         let v = match kind {
             Kind::Tuple => TyView::Tuple(cx.mk_list(slice)?),
-            Kind::Record(s) => TyView::Record(s, cx.mk_list(slice)?),
+            Kind::Record(s, _) => TyView::Record(s, cx.mk_list(slice)?),
             Kind::Union => TyView::Union(cx.mk_list(slice)?),
             Kind::Ref(m) => {
                 let Some(&p) = slice.first() else { return Ok(cx.mk(TyView::Error)?) };
@@ -422,7 +426,7 @@ pub(crate) fn import<S: ClosureSource>(cx: &mut InferCtxIn<'_, '_>, src: &mut S,
             node => {
                 let (kind, l) = match node {
                     PNode::Tuple(l) => (Kind::Tuple, l),
-                    PNode::Record(s, l) => (Kind::Record(s), l),
+                    PNode::Record(s, l) => (Kind::Record(s, types.record_defaults_tag(cur_t)), l),
                     PNode::Union(l) => (Kind::Union, l),
                     PNode::Adt(k, l) => (Kind::Adt(k), l),
                     PNode::FnDef(k, l) => (Kind::FnDef(k), l),

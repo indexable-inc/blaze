@@ -2692,6 +2692,17 @@ impl<'a, 'f> TypeCtx for InferCtxIn<'a, 'f> {
         }
         saw_once && !saw_ref
     }
+
+    fn mk_record_with_defaults(&mut self, schema: RecordSchema, defaults: u64, fields: TyList) -> Result<Ty, CheckError> {
+        let l = self.blist(fields);
+        let t = self.terms.cx.tys.record_with_defaults(schema.0, defaults, l);
+        Ok(Ty(t.node().bits()))
+    }
+
+    fn record_defaults_tag(&self, t: Ty) -> u64 {
+        let resolved = self.terms.cx.probe(self.bty(t));
+        self.terms.cx.tys.record_defaults_tag(resolved)
+    }
 }
 
 fn mutability(m: crate::ids::Mutbl) -> blaze_ty::Mutability {

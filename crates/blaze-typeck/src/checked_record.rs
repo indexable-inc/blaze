@@ -463,7 +463,7 @@ fn bool_of(g: &Get<'_>, t: u8) -> Result<bool, E> {
 
 // ---- types ---------------------------------------------------------------------------------
 
-fn put_node(p: &mut Put, n: PNode) {
+fn put_node(p: &mut Put, n: PNode, record_defaults_tag: u64) {
     match n {
         PNode::Bool => p.u8(0),
         PNode::Char => p.u8(1),
@@ -593,9 +593,16 @@ fn put_node(p: &mut Put, n: PNode) {
             p.key(k);
         }
         PNode::Record(s, l) => {
-            p.u8(31);
-            p.u64(s.0);
-            p.list(l);
+            if record_defaults_tag != 0 {
+                p.u8(33);
+                p.u64(s.0);
+                p.list(l);
+                p.u64(record_defaults_tag);
+            } else {
+                p.u8(31);
+                p.u64(s.0);
+                p.list(l);
+            }
         }
         PNode::Union(l) => {
             p.u8(32);
@@ -638,10 +645,16 @@ impl Bounds {
     }
 }
 
-fn get_node(g: &mut Get<'_>, b: Bounds) -> Result<PNode, E> {
+fn get_node(g: &mut Get<'_>, b: Bounds) -> Result<(PNode, u64), E> {
     let me = g.n;
     let tag = g.u8()?;
-    Ok(match tag {
+    if tag == 33 {
+        let s = RecordSchema(g.u64()?);
+        let l = b.list(g)?;
+        let dtag = g.u64()?;
+        return Ok((PNode::Record(s, l), dtag));
+    }
+    Ok((match tag {
         0 => PNode::Bool,
         1 => PNode::Char,
         2 => {
@@ -693,7 +706,7 @@ fn get_node(g: &mut Get<'_>, b: Bounds) -> Result<PNode, E> {
         31 => PNode::Record(RecordSchema(g.u64()?), b.list(g)?),
         32 => PNode::Union(b.list(g)?),
         _ => return Err(g.bad(tag)),
-    })
+    }, 0))
 }
 
 // ---- rows of the sparse tables -------------------------------------------------------------
@@ -1187,7 +1200,10 @@ fn encode_rows<'b>(c: &Checked<'_>, stalled_proved: bool, alloc: Alloc<'b>) -> R
         out.extend_from_slice(&rows_u32(rows[col.at()], col.name())?.to_le_bytes());
     }
     let mut w = Writer { out: &mut out };
-    w.column(Col::TyNodes, view.nodes(), |p, &n| put_node(p, n))?;
+    w.column(Col::TyNodes, view.nodes().enumerate(), |p, (i, &n)| {
+        let tag = u32::try_from(i).map_or(0, |idx| view.record_defaults_tag(PTy(idx)));
+        put_node(p, n, tag);
+    })?;
     w.column(Col::TyLists, view.lists(), |p, &t| p.ty(t))?;
     w.column(Col::TyListRows, list_rows.iter(), |p, &l| p.list(l))?;
     w.column(Col::ExprTy, c.expr_ty.iter(), |p, &t| p.ty(t))?;
@@ -1464,8 +1480,11 @@ impl<'r> CheckedRecord<'r> {
         let b = Bounds { nodes: self.rows(Col::TyNodes), lists: self.rows(Col::TyLists) };
         let mut types = PortableTys::new_in(alloc);
         self.each(Col::TyNodes, |g| {
-            let n = get_node(g, b)?;
-            let t = types.intern(n).map_err(E::Types)?;
+            let (n, dtag) = get_node(g, b)?;
+            let t = match n {
+                PNode::Record(s, l) if dtag != 0 => types.intern_record_with_defaults(s, l, dtag).map_err(E::Types)?,
+                other => types.intern(other).map_err(E::Types)?,
+            };
             if t.0 != g.n {
                 return Err(E::NotCanonical { column: Col::TyNodes.name(), row: g.n });
             }

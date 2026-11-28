@@ -1125,7 +1125,7 @@ impl<'a> FactCache<'a> {
                 }
                 continue;
             }
-            let k = self.convert(c, node)?;
+            let k = self.convert(c, PTy(n), node)?;
             let s = STy(self.nodes.len() as u32);
             self.nodes.push(k);
             self.memo.insert((c.tab, n), s);
@@ -1147,8 +1147,8 @@ impl<'a> FactCache<'a> {
         Ok(SList { start, len: l.len })
     }
 
-    /// The solver node of `n`, whose children are converted already.
-    fn convert(&mut self, c: Conv<'_>, n: PNode) -> Result<K, Stop> {
+    /// The solver node of `n` (at `at`), whose children are converted already.
+    fn convert(&mut self, c: Conv<'_>, at: PTy, n: PNode) -> Result<K, Stop> {
         let (q, t, tab) = (c.q, c.t, c.tab);
         let erased = self.erased().0;
         let memo = &self.memo;
@@ -1174,7 +1174,7 @@ impl<'a> FactCache<'a> {
                 PNode::Str => K::Str,
                 PNode::Never => K::Never,
                 PNode::Tuple(l) => K::Tuple(list(l)?),
-                PNode::Record(schema, l) => K::Record(schema.0, list(l)?),
+                PNode::Record(schema, l) => K::Record(schema.0, t.record_defaults_tag(at), list(l)?),
                 PNode::Union(l) => K::Union(list(l)?),
                 PNode::Ref(m, p) => K::Ref(STy(erased), ty(p)?, mutbl(m)),
                 PNode::Ptr(m, p) => K::RawPtr(ty(p)?, mutbl(m)),
@@ -1335,7 +1335,7 @@ impl<'a> FactCache<'a> {
             Array(STy),
             Pat(SList),
             Tuple(u32),
-            Record(u64, u32),
+            Record(u64, u64, u32),
             Union(u32),
             Adt(SDef, u32),
             FnDef(SDef, u32),
@@ -1419,7 +1419,7 @@ impl<'a> FactCache<'a> {
                             push_list(&mut work, l, depth)?;
                         }
                         PNode::Record(schema, l) => {
-                            work.push(RegWork::Build(RegBuild::Record(schema.0, l.len)));
+                            work.push(RegWork::Build(RegBuild::Record(schema.0, c.t.record_defaults_tag(t), l.len)));
                             push_list(&mut work, l, depth)?;
                         }
                         PNode::Union(l) => {
@@ -1522,9 +1522,9 @@ impl<'a> FactCache<'a> {
                             let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
                             K::Tuple(l)
                         }
-                        RegBuild::Record(schema, len) => {
+                        RegBuild::Record(schema, defaults, len) => {
                             let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
-                            K::Record(schema, l)
+                            K::Record(schema, defaults, l)
                         }
                         RegBuild::Union(len) => {
                             let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };

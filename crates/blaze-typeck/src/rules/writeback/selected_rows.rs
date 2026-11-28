@@ -713,7 +713,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     descend = Some((next_kid, next_depth));
                     break;
                 }
-                let rebuilt = if frame.changed { rebuild_in(&mut ex.out, frame.node, &frame.kids)? } else { frame.orig };
+                let rebuilt = if frame.changed {
+                    let dtag = ex.out.view().record_defaults_tag(frame.orig);
+                    rebuild_in(&mut ex.out, frame.node, dtag, &frame.kids)?
+                } else {
+                    frame.orig
+                };
                 if let Some(sub) = self.normalize_portable_alias(ex, rows, inert, seen, out, nest, e, depth, rebuilt)? {
                     descend = Some((sub, frame.norm_depth + 1));
                     break;
@@ -1832,7 +1837,7 @@ fn subst_into(src: PTys<'_>, root: PTy, args: &[PTy], out: &mut PortableTys<'_>,
         for child in kids.iter_mut() {
             *child = *mapped.get(&*child).ok_or(order(at, *child))?;
         }
-        let made = rebuild_in(out, node, &kids)?;
+        let made = rebuild_in(out, node, src.record_defaults_tag(at), &kids)?;
         mapped.insert(at, made);
     }
     mapped.get(&root).copied().ok_or(order(root, root))
@@ -1840,7 +1845,13 @@ fn subst_into(src: PTys<'_>, root: PTy, args: &[PTy], out: &mut PortableTys<'_>,
 
 /// `node` of another table reassembled in `out` from its children there, given in
 /// `PTys::children_of`'s order.
-fn rebuild_in(out: &mut PortableTys<'_>, node: PNode, kids: &[PTy]) -> Result<PTy, CheckError> {
+fn rebuild_in(out: &mut PortableTys<'_>, node: PNode, record_defaults_tag: u64, kids: &[PTy]) -> Result<PTy, CheckError> {
+    if let PNode::Record(s, _) = node
+        && record_defaults_tag != 0
+    {
+        let list = out.intern_list(kids)?;
+        return out.intern_record_with_defaults(s, list, record_defaults_tag);
+    }
     let node = match node {
         PNode::ConstValue { bits, .. } => PNode::ConstValue { ty: kids[0], bits },
         PNode::Tuple(_) => PNode::Tuple(out.intern_list(kids)?),
@@ -1946,7 +1957,7 @@ fn copy_into(src: PTys<'_>, root: PTy, out: &mut PortableTys<'_>, alloc: Alloc<'
         for child in kids.iter_mut() {
             *child = *mapped.get(&*child).ok_or(order(at, *child))?;
         }
-        let made = rebuild_in(out, node, &kids)?;
+        let made = rebuild_in(out, node, src.record_defaults_tag(at), &kids)?;
         mapped.insert(at, made);
     }
     mapped.get(&root).copied().ok_or(order(root, root))

@@ -626,7 +626,7 @@ fn remake_waiting<'n, S: NamesSource<'n>>(
     for (mk, w) in due {
         let mut steps = 0u32;
         loop {
-            match r.store.remake_const(r.names, w, mk) {
+            match r.store.remake_const(r.names, r.keys, w, mk) {
                 Ok(()) => {
                     r.store.fn_gaps.remove(&mk);
                     break;

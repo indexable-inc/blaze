@@ -258,6 +258,7 @@ const T_EX_AUTO: u8 = 25;
 const T_FOREIGN: u8 = 26;
 const T_RECORD: u8 = 27;
 const T_UNION: u8 = 28;
+const T_RECORD_DEFAULTS: u8 = 29;
 
 /// Where to read an opaque's bounds even when an unrelated head first exposes its type.
 /// A trait method's checker key is `owner`; its bounds are in its trait's `Members` cell.
@@ -2252,7 +2253,7 @@ impl Out<'_, '_, '_, '_> {
             }
             let node = self.tys.node(t).map_err(|_| E::Outside { what: "a term of the head" })?;
             if open {
-                self.write_node(node)?;
+                self.write_node(t, node)?;
                 let at = self.count;
                 self.count = at.checked_add(1).filter(|&c| c <= MOST_TERMS).ok_or(E::TooBig { what: "a head's terms" })?;
                 self.seen.insert(t, at);
@@ -2355,7 +2356,7 @@ impl Out<'_, '_, '_, '_> {
         Ok(())
     }
 
-    fn write_node(&mut self, n: PNode) -> Result<(), E> {
+    fn write_node(&mut self, cur: PTy, n: PNode) -> Result<(), E> {
         match n {
             PNode::Bool => self.t8(T_BOOL),
             PNode::Char => self.t8(T_CHAR),
@@ -2378,8 +2379,15 @@ impl Out<'_, '_, '_, '_> {
                 self.tlist(l)?;
             }
             PNode::Record(s, l) => {
-                self.t8(T_RECORD);
-                self.terms.extend_from_slice(&s.0.to_le_bytes());
+                let dtag = self.tys.record_defaults_tag(cur);
+                if dtag != 0 {
+                    self.t8(T_RECORD_DEFAULTS);
+                    self.terms.extend_from_slice(&s.0.to_le_bytes());
+                    self.terms.extend_from_slice(&dtag.to_le_bytes());
+                } else {
+                    self.t8(T_RECORD);
+                    self.terms.extend_from_slice(&s.0.to_le_bytes());
+                }
                 let names = self.tys.record_names(s).unwrap_or(&[]);
                 let n = u32::try_from(names.len()).map_err(|_| E::TooBig { what: "a record's field names" })?;
                 self.t32(n);
@@ -3057,6 +3065,9 @@ impl<'r> In<'r, '_, '_, '_> {
         if tag == T_DYNAMIC {
             return self.node_dynamic();
         }
+        if tag == T_RECORD_DEFAULTS {
+            return self.node_record_defaults();
+        }
         let n = match tag {
             T_BOOL | T_CHAR | T_INT | T_UINT | T_FLOAT | T_STR | T_NEVER | T_ERROR | T_PARAM | T_CONST_PARAM => self.node_scalar(tag)?,
             T_TUPLE | T_REF | T_PTR | T_ARRAY | T_SLICE | T_PAT | T_ADT | T_FNDEF | T_FNPTR => self.node_compound(tag)?,
@@ -3072,6 +3083,24 @@ impl<'r> In<'r, '_, '_, '_> {
         // Through the table's own constructor, which keeps the one canonical form.
         self.tys_into_scratch("a trait object's predicates")?;
         let t = self.tys.dynamic_shared(self.scratch.as_slice()).map_err(E::Table)?;
+        self.locals.push(t, self.scratch_alloc);
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn node_record_defaults(&mut self) -> Result<(), E> {
+        let s = blaze_typeck::RecordSchema(self.u64("a record's schema")?);
+        let dtag = self.u64("a record's defaults tag")?;
+        let n = self.u32("a record's field name count")?;
+        let mut names = Vec::with_capacity_in(usize::try_from(n).unwrap_or(0).min(self.bytes.len()), self.scratch_alloc);
+        for _ in 0..n {
+            names.push(self.name("a record's field name")?);
+        }
+        if n > 0 || s == blaze_typeck::RecordSchema::EMPTY {
+            self.tys.register_record_schema_shared(s, &names).map_err(E::Table)?;
+        }
+        let l = self.list("a record's fields")?;
+        let t = self.tys.intern_record_with_defaults_shared(s, l, dtag).map_err(E::Table)?;
         self.locals.push(t, self.scratch_alloc);
         Ok(())
     }

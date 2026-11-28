@@ -68,7 +68,7 @@ impl<'n, H: Heads, S: NamesSource<'n>> Builder<'_, H, S> {
                 super::types::ExpandedOwner { item, owner_text, base_offset, view: x.view(), marks: exp_marks }
             })
         });
-        let own = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks: exp_marks, owner: self.owner, expanded };
+        let own = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks: exp_marks, owner: self.owner, owner_key: self.owner_key, expanded };
         let own_env = Env { anon: &[], ..*env };
         match sink {
             Some(s) => {

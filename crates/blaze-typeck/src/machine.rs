@@ -2382,7 +2382,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 holey.insert(at);
                 continue;
             }
-            let ty = self.lower_node(node, types, &mut low, mode, cause)?;
+            let ty = self.lower_node(PTy(at), node, types, &mut low, mode, cause)?;
             low.memo.insert(at, ty);
         }
         // The lowered nodes are exactly the type's subtree: checked in node order, so the
@@ -2431,7 +2431,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             }
             let node = types.node(PTy(at))?;
             if expanded {
-                let ty = self.lower_node(node, types, low, mode, cause)?;
+                let ty = self.lower_node(PTy(at), node, types, low, mode, cause)?;
                 low.pool.push((at, ty));
                 continue;
             }
@@ -2476,7 +2476,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.mk_list(&v)
     }
 
-    fn lower_node(&mut self, node: PNode, types: PTys<'_>, memo: &mut Lowered<'a>, mode: Lower, cause: Cause) -> Result<Ty, Stop> {
+    fn lower_node(&mut self, at: PTy, node: PNode, types: PTys<'_>, memo: &mut Lowered<'a>, mode: Lower, cause: Cause) -> Result<Ty, Stop> {
         // A trait fn's `impl Trait` at a concrete `Self` (rules/rpitit_use.rs): the projection
         // it is in Rust (RFC 3425; the Reference, "Impl trait"), which the impl's row
         // normalizes to the type the impl's fn returns.
@@ -2499,7 +2499,9 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 if let Some(names) = types.record_names(s) {
                     self.register_record_schema(s, names)?;
                 }
-                TyView::Record(s, self.lowered_list(memo, types, l)?)
+                let list = self.lowered_list(memo, types, l)?;
+                let tag = types.record_defaults_tag(at);
+                return self.ty.mk_record_with_defaults(s, tag, list).map_err(Stop::from);
             }
             PNode::Union(l) => TyView::Union(self.lowered_list(memo, types, l)?),
             PNode::Ref(m, t) => TyView::Ref(m, Self::lowered(memo, t)?),

@@ -242,7 +242,7 @@ fn step_auto_in<T: Tys, F: Facts>(
             tys.push(e);
             reach.push(Reach::Pointee);
         }
-        TyKind::Tuple(l) | TyKind::Record(_, l) | TyKind::Union(l) => {
+        TyKind::Tuple(l) | TyKind::Record(_, _, l) | TyKind::Union(l) => {
             for i in 0..l.len {
                 tys.push(cx.arg(l, i));
                 reach.push(Reach::Element(i));
@@ -418,7 +418,7 @@ fn step_wf_in<T: Tys, F: Facts>(
                 kids.push(e);
             }
         }
-        TyKind::Record(_, l) | TyKind::Union(l) => {
+        TyKind::Record(_, _, l) | TyKind::Union(l) => {
             for i in 0..l.len {
                 let e = cx.arg(l, i);
                 let sized = require_lang(cx, Lang::Sized)?;
