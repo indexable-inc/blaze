@@ -33,6 +33,7 @@
 //!   `*mut T`, `Box<T>`, and where `U` can be obtained from `T` by unsized coercion".
 
 use super::{adjusts, check_body};
+use crate::body::{Expr, UnOp};
 use crate::diag::DiagCode;
 use crate::fixture::{Bb, Fx};
 use crate::ids::{Abi, ExprId, FnPtrHeader, LangItem, List, Mutbl, Safety, UintTy};
@@ -46,6 +47,14 @@ fn world() -> Fx {
 
     let sized = fx.tr("Sized", 1, Default::default(), &[]);
     fx.lang(LangItem::Sized, sized);
+    let copy = fx.tr("Copy", 1, Default::default(), &[]);
+    fx.lang(LangItem::Copy, copy);
+    let pointee_sized = fx.tr("PointeeSized", 1, Default::default(), &[]);
+    fx.lang(LangItem::PointeeSized, pointee_sized);
+    let pointee = fx.tr("Pointee", 1, Default::default(), &["Metadata"]);
+    fx.lang(LangItem::Pointee, pointee);
+    let dyn_metadata_k = fx.strukt("DynMetadata", 1, &[]);
+    fx.lang(LangItem::DynMetadata, dyn_metadata_k);
     let unsize = fx.tr("Unsize", 2, Default::default(), &[]);
     fx.lang(LangItem::Unsize, unsize);
     let coerce = fx.tr("CoerceUnsized", 2, Default::default(), &[]);
@@ -148,8 +157,23 @@ fn world() -> Fx {
     fx.func("box_new", 1, &[p0], box_t, Default::default());
     fx.func("pin_new", 1, &[p0], pin_p, Default::default());
     fx.func("box_pin", 1, &[p0], pin_box_t, Default::default());
+    let ptr_const_unit = fx.ty(PNode::Ptr(Mutbl::Not, unit));
+    let ptr_mut_unit = fx.ty(PNode::Ptr(Mutbl::Mut, unit));
+    let ptr_const_p0 = fx.ty(PNode::Ptr(Mutbl::Not, p0));
     let ptr_mut_p0 = fx.ty(PNode::Ptr(Mutbl::Mut, p0));
     fx.func("as_raw_mut", 1, &[m_self], ptr_mut_p0, Default::default());
+
+    // ptr::from_raw_parts<T: PointeeSized>(data: *const (), metadata: <T as Pointee>::Metadata) -> *const T
+    // ptr::from_raw_parts_mut<T: PointeeSized>(data: *mut (), metadata: <T as Pointee>::Metadata) -> *mut T
+    // Box::from_raw<T: ?Sized>(raw: *mut T) -> Box<T>
+    let p0_meta = fx.alias(pointee, "Metadata", &[p0]);
+    let p0_pointee_sized = fx.bound(pointee_sized, &[p0]);
+    let frp = fx.func("from_raw_parts", 1, &[ptr_const_unit, p0_meta], ptr_const_p0, [p0_pointee_sized].into());
+    fx.unsized_fn_param(frp, 0);
+    let frpm = fx.func("from_raw_parts_mut", 1, &[ptr_mut_unit, p0_meta], ptr_mut_p0, [p0_pointee_sized].into());
+    fx.unsized_fn_param(frpm, 0);
+    let bfr = fx.func("box_from_raw", 1, &[ptr_mut_p0], box_t, Default::default());
+    fx.unsized_fn_param(bfr, 0);
 
     // Reflexive & nested-unresolved helpers:
     // fn make_ref_fn<T: ?Sized, F: FnOnce(&T) -> ()>(f: F) -> F
@@ -254,6 +278,18 @@ fn world() -> Fx {
     fx.func("id_wide_deep_slice", 0, &[wide_deep_slice], wide_deep_slice, Default::default());
     fx.func("unify_wide_dag_slice", 0, &[], wide_dag_u32_slice, Default::default());
     fx.func("unify_wide_chain_slice", 0, &[], wide_chain_u32_slice, Default::default());
+
+    let meta_display = fx.adt(dyn_metadata_k, &[dyn_display]);
+    let meta_error = fx.adt(dyn_metadata_k, &[dyn_error]);
+    let meta_my_trait = fx.adt(dyn_metadata_k, &[dyn_my_trait]);
+    fx.func("from_raw_parts_ref_dyn", 0, &[ptr_const_unit, meta_display], unit, Default::default());
+    fx.func("from_raw_parts_local_ref_dyn", 0, &[ptr_const_unit, meta_display], unit, Default::default());
+    fx.func("from_raw_parts_raw_ptr_dyn", 0, &[ptr_const_unit, meta_display], unit, Default::default());
+    fx.func("from_raw_parts_box_dyn", 0, &[ptr_mut_unit, meta_display], unit, Default::default());
+    fx.func("from_raw_parts_upcast_dyn", 0, &[ptr_const_unit, meta_error], unit, Default::default());
+    fx.func("from_raw_parts_closure_deferred_meta", 0, &[ptr_const_unit, meta_display], unit, Default::default());
+    fx.func("from_raw_parts_incompatible_dyn", 0, &[ptr_const_unit, meta_my_trait], unit, Default::default());
+    fx.func("from_raw_parts_unconstrained_ambiguous", 0, &[ptr_const_unit, meta_display], unit, Default::default());
 
     fx.finish();
     world
@@ -588,5 +624,180 @@ fn identity_and_slice_coercions_with_large_markers_succeed() {
         let c = check_body(&fx, &b, fx.key_of("unify_wide_chain_slice"), root, Plant::None, InferPlant::None);
         assert!(c.diags.is_empty(), "unify_wide_chain_slice: {:?}", c.diags);
         assert_eq!(adjusts(&fx, &c, call), "");
+    }
+}
+
+/// Regression tests for `ptr::from_raw_parts` / `from_raw_parts_mut` with `DynMetadata<dyn Tr>`
+/// coerced to `&dyn Tr`, `*const dyn Tr`, or `Box<dyn Tr>` (e.g. `blaze-text/src/debug.rs:179,312`):
+/// `<?0 as Pointee>::Metadata == DynMetadata<dyn T>` combined with a deferred `?0: Unsize<dyn U>`
+/// (or `Box<?0>: CoerceUnsized<Box<dyn U>>`) uniquely determines `?0 = dyn T`.
+#[test]
+fn from_raw_parts_dyn_metadata_coerced_to_dyn_resolves_uniquely() {
+    let fx = world();
+
+    // 1. Direct `&*from_raw_parts(data, meta)` passed to `takes_dyn_display`:
+    //    exact shape of `let value: &dyn DebugForm = &*ptr::from_raw_parts(at.cast::<()>(), own);`
+    {
+        let mut b = Bb::new();
+        let data = b.param("data");
+        let meta = b.param("meta");
+        let frp = b.path(&["from_raw_parts"]);
+        let d_use = b.local(data);
+        let m_use = b.local(meta);
+        let raw = b.call(frp, &[d_use, m_use]);
+        let deref = b.e(Expr::Unary { op: UnOp::Deref, operand: raw });
+        let reborrowed = b.borrow(Mutbl::Not, deref);
+        let takes = b.path(&["takes_dyn_display"]);
+        let call = b.call(takes, &[reborrowed]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, fx.key_of("from_raw_parts_ref_dyn"), root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "direct &*from_raw_parts -> &dyn Display: {:?}", c.diags);
+    }
+
+    // 2. Intermediate local: `let p = from_raw_parts(data, meta); takes_dyn_display(&*p)`
+    {
+        let mut b = Bb::new();
+        let data = b.param("data");
+        let meta = b.param("meta");
+        let frp = b.path(&["from_raw_parts"]);
+        let d_use = b.local(data);
+        let m_use = b.local(meta);
+        let raw = b.call(frp, &[d_use, m_use]);
+        let p_pat = b.bind("p");
+        let s1 = b.let_(p_pat, None, raw);
+        let p_use = b.local(p_pat);
+        let deref = b.e(Expr::Unary { op: UnOp::Deref, operand: p_use });
+        let reborrowed = b.borrow(Mutbl::Not, deref);
+        let takes = b.path(&["takes_dyn_display"]);
+        let call = b.call(takes, &[reborrowed]);
+        let root = b.block(&[s1], Some(call));
+        let c = check_body(&fx, &b, fx.key_of("from_raw_parts_local_ref_dyn"), root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "local p; &*p -> &dyn Display: {:?}", c.diags);
+    }
+
+    // 3. Direct raw pointer: `takes_ptr_const_dyn_display(from_raw_parts(data, meta))`
+    {
+        let mut b = Bb::new();
+        let data = b.param("data");
+        let meta = b.param("meta");
+        let frp = b.path(&["from_raw_parts"]);
+        let d_use = b.local(data);
+        let m_use = b.local(meta);
+        let raw = b.call(frp, &[d_use, m_use]);
+        let takes = b.path(&["takes_ptr_const_dyn_display"]);
+        let call = b.call(takes, &[raw]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, fx.key_of("from_raw_parts_raw_ptr_dyn"), root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "from_raw_parts -> *const dyn Display: {:?}", c.diags);
+    }
+
+    // 4. Smart pointer (`CoerceUnsized`): `takes_box_dyn_display(box_from_raw(from_raw_parts_mut(data, meta)))`
+    {
+        let mut b = Bb::new();
+        let data = b.param("data");
+        let meta = b.param("meta");
+        let frpm = b.path(&["from_raw_parts_mut"]);
+        let d_use = b.local(data);
+        let m_use = b.local(meta);
+        let raw = b.call(frpm, &[d_use, m_use]);
+        let bfr = b.path(&["box_from_raw"]);
+        let boxed = b.call(bfr, &[raw]);
+        let takes = b.path(&["takes_box_dyn_display"]);
+        let call = b.call(takes, &[boxed]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, fx.key_of("from_raw_parts_box_dyn"), root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "Box::from_raw(from_raw_parts_mut) -> Box<dyn Display>: {:?}", c.diags);
+    }
+
+    // 5. Trait upcasting: `meta: DynMetadata<dyn Error>` (`Error: Display`) coerced to `&dyn Display`
+    //    must bind `?0 = dyn Error` (NOT `dyn Display`) and prove `dyn Error: Unsize<dyn Display>`.
+    {
+        let mut b = Bb::new();
+        let data = b.param("data");
+        let meta = b.param("meta");
+        let frp = b.path(&["from_raw_parts"]);
+        let d_use = b.local(data);
+        let m_use = b.local(meta);
+        let raw = b.call(frp, &[d_use, m_use]);
+        let deref = b.e(Expr::Unary { op: UnOp::Deref, operand: raw });
+        let reborrowed = b.borrow(Mutbl::Not, deref);
+        let takes = b.path(&["takes_dyn_display"]);
+        let call = b.call(takes, &[reborrowed]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, fx.key_of("from_raw_parts_upcast_dyn"), root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "DynMetadata<dyn Error> upcast to &dyn Display: {:?}", c.diags);
+        let got = adjusts(&fx, &c, reborrowed);
+        assert!(got.ends_with("unsize -> &dyn Display"), "upcast adjustments `{got}`");
+    }
+
+    // 6. Closure-deferred metadata: `let f = |m| takes_dyn_display(&*from_raw_parts(data, m)); f(meta)`
+    //    `DynMetadata<dyn Display>` is only unified with `m` AFTER `coerce_unsized` runs.
+    {
+        let mut b = Bb::new();
+        let data = b.param("data");
+        let meta = b.param("meta");
+        let m_pat = b.bind("m");
+        let frp = b.path(&["from_raw_parts"]);
+        let d_use = b.local(data);
+        let m_use = b.local(m_pat);
+        let raw = b.call(frp, &[d_use, m_use]);
+        let deref = b.e(Expr::Unary { op: UnOp::Deref, operand: raw });
+        let reborrowed = b.borrow(Mutbl::Not, deref);
+        let takes = b.path(&["takes_dyn_display"]);
+        let body = b.call(takes, &[reborrowed]);
+        let clo = b.closure(&[m_pat], body);
+        let f_pat = b.bind("f");
+        let s1 = b.let_(f_pat, None, clo);
+        let f_use = b.local(f_pat);
+        let meta_use = b.local(meta);
+        let call = b.call(f_use, &[meta_use]);
+        let root = b.block(&[s1], Some(call));
+        let c = check_body(&fx, &b, fx.key_of("from_raw_parts_closure_deferred_meta"), root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "closure-deferred DynMetadata -> &dyn Display: {:?}", c.diags);
+    }
+
+    // 7. Negative control: `meta: DynMetadata<dyn MyTrait>` coerced to `&dyn Display` MUST fail
+    //    with E0277 (`Unsatisfied`), since `dyn MyTrait` does not unsize to `dyn Display`.
+    {
+        let mut b = Bb::new();
+        let data = b.param("data");
+        let meta = b.param("meta");
+        let frp = b.path(&["from_raw_parts"]);
+        let d_use = b.local(data);
+        let m_use = b.local(meta);
+        let raw = b.call(frp, &[d_use, m_use]);
+        let deref = b.e(Expr::Unary { op: UnOp::Deref, operand: raw });
+        let reborrowed = b.borrow(Mutbl::Not, deref);
+        let takes = b.path(&["takes_dyn_display"]);
+        let call = b.call(takes, &[reborrowed]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, fx.key_of("from_raw_parts_incompatible_dyn"), root, Plant::None, InferPlant::None);
+        assert!(
+            c.diags.iter().any(|d| d.code == DiagCode::Unsatisfied),
+            "CONTROL: DynMetadata<dyn MyTrait> -> &dyn Display must fail with E0277, got {:?}",
+            c.diags
+        );
+    }
+
+    // 8. Negative control: `let _p = from_raw_parts(data, meta);` with NO unsizing to `dyn ..`
+    //    must remain ambiguous (a struct with a `dyn Display` tail has the same metadata).
+    {
+        let mut b = Bb::new();
+        let data = b.param("data");
+        let meta = b.param("meta");
+        let frp = b.path(&["from_raw_parts"]);
+        let d_use = b.local(data);
+        let m_use = b.local(meta);
+        let raw = b.call(frp, &[d_use, m_use]);
+        let p_pat = b.bind("_p");
+        let s1 = b.let_(p_pat, None, raw);
+        let unit_val = b.tuple(&[]);
+        let root = b.block(&[s1], Some(unit_val));
+        let c = check_body(&fx, &b, fx.key_of("from_raw_parts_unconstrained_ambiguous"), root, Plant::None, InferPlant::None);
+        assert!(
+            c.diags.iter().any(|d| matches!(d.code, DiagCode::CannotSatisfy | DiagCode::AnnotationsNeeded)),
+            "CONTROL: unconstrained from_raw_parts must remain ambiguous, got {:?}",
+            c.diags
+        );
     }
 }

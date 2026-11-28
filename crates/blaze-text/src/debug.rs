@@ -176,7 +176,7 @@ unsafe fn walk(form: Form, at: *const u8, variant: u128, out: &mut dyn Put, plan
     unsafe {
         match form {
             Form::Own(own) => {
-                let value: &dyn DebugForm = &*ptr::from_raw_parts(at.cast::<()>(), own);
+                let value: &dyn DebugForm = &*ptr::from_raw_parts::<dyn DebugForm>(at.cast::<()>(), own);
                 value.debug_form(out);
             }
             Form::Bool =>_ = out.bool(at.cast::<bool>().read()),
@@ -309,7 +309,7 @@ fn field_name(name: &'static str, plant: TextPlant) -> &'static str {
 /// `at` points at a live, aligned value of the type `write` is for.
 unsafe fn field(at: *const u8, write: DynMetadata<dyn Reflect>, out: &mut dyn Put, plant: TextPlant) {
     // SAFETY: per the caller; `write` is that type's vtable for `Reflect`.
-    let value: &dyn Reflect = unsafe { &*ptr::from_raw_parts(at.cast::<()>(), write) };
+    let value: &dyn Reflect = unsafe { &*ptr::from_raw_parts::<dyn Reflect>(at.cast::<()>(), write) };
     value.reflect(out, plant);
 }
 
