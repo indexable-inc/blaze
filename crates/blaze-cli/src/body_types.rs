@@ -1050,9 +1050,9 @@ pub(crate) fn names_world<'f>(
     let members = crate::names::member_dirs(facts.laid.as_ref());
     let read = crate::work::payload(cx, store, graph, frame)?;
     let made = {
-        let _cx = cx.span("names: make the world");
+        let span_cx = cx.span("names: make the world");
         let sections = read.unit_graph(graph.name)?;
-        crate::names::world(cx, root, sections.graph, sections.wasm_graph, lock, members, &facts.fetch_env)
+        crate::names::world(&span_cx, root, sections.graph, sections.wasm_graph, lock, members, &facts.fetch_env)
     };
     match made {
         Ok(made) => {

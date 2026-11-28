@@ -1217,8 +1217,9 @@ fn path_pkg_files_digest(
     } else {
         checkout.path().join(dir)
     };
-    let mut files = blaze_proc_macro::module::package_files(&pkg_dir).ok()?;
-    Some(blaze_proc_macro::module::files_digest(&mut files))
+    let scratch = Frame::new(Tag::Other).ok()?;
+    let hex = blaze_proc_macro::module::package_files_digest_in(&pkg_dir, &scratch).ok()?;
+    Some(std::string::String::from(hex.as_str()))
 }
 
 /// Computes the build-script files digest (`Cargo.toml` + `build.rs` root) when `pkg_id` is a
@@ -1504,13 +1505,18 @@ fn ensure_proc_macro_unit(
         } else {
             checkout.path().join(dir)
         };
-        let mut files = blaze_proc_macro::module::package_files(&pkg_dir)
+        let digest = blaze_proc_macro::module::package_files_digest_in(&pkg_dir, heap.alloc())
             .map_err(|e| blaze_world::procs::ProcsError::Files { at: pkg_dir, error: e })?;
-        Ok(Some(blaze_proc_macro::module::files_digest(&mut files)))
+        Ok(Some(digest))
     }, heap.alloc())
     .map_err(|e| std::format!("identifying proc-macro dep {} {}: {e}", unit.name.as_str(), unit.version.as_str()))?
     .map_err(|e| std::format!("proc-macro dep {} {} not identified: {e}", unit.name.as_str(), unit.version.as_str()))?
-    .with_wasm_features(lock, graph, unit.package, |dep_id| path_pkg_files_digest(checkout, members, dep_id), heap.alloc());
+    .with_wasm_features(lock, graph, unit.package, |dep_id| path_pkg_files_digest(checkout, members, dep_id), heap.alloc())
+    .map_err(|e| {
+        let mut msg = blaze_own::String::new_in(heap.alloc());
+        let _ = write!(msg, "proc-macro dep {} {} wasm64 features not identified: {e}", unit.name.as_str(), unit.version.as_str());
+        SelfCompileError::Failed(msg.as_str().into())
+    })?;
     let (identity, frozen_probes) = if let Some(shared) = dep_probes.shared {
         let has_dep_scripts = unit_has_dep_build_scripts(graph, Some(graph), pm_id, true, shared.shared()).map_err(|e| {
             let mut msg = blaze_own::String::new_in(heap.alloc());
@@ -6230,6 +6236,7 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         .expect("identify")
         .expect("identified")
         .with_wasm_features(lock.lock, &graph, graph.units[2].package, |_| None::<&str>, heap.alloc())
+        .expect("wasm features")
         .with_dep_probes(live_hex.as_str());
         let (mod_key, id_text) = identity_b.with_id(|id| {
             (
@@ -6286,7 +6293,7 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         let Some(home) = host_env.get(&home_var).ok().flatten() else {
             return;
         };
-        let real_shelf = PathBuf::from(home.as_str()).join(".blaze/v2/toolchain");
+        let real_shelf = PathBuf::from(home).join(".blaze/v2/toolchain");
         let tc_id = blaze_toolchain::PINNED;
         if !real_shelf.join(bstd::mem::format_in!(&frame, "{tc_id}").as_str()).exists() {
             eprintln!("skipping wasm64_compile_proc_macro test: pinned toolchain {tc_id} not on shelf");
@@ -6476,5 +6483,57 @@ pub fn pkg_version(_input: TokenStream) -> TokenStream {\n\
                 .any(|r| ran.produced.reads.subject(r) == "env:CARGO_PKG_VERSION"),
             "expected tracked env:CARGO_PKG_VERSION read"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_pkg_files_digest_handles_non_utf8_paths_on_unix() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+        let tmp = std::env::temp_dir().join(std::format!("blaze-non-utf8-pkg-digest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let pkg_dir = tmp.join("dep");
+        let bad_dir = pkg_dir.join(OsStr::from_bytes(b"dir_\xfe"));
+        std::fs::create_dir_all(&bad_dir).expect("mkdir bad_dir");
+        // Two distinct non-UTF-8 filenames that collapse to the same `to_string_lossy()` label
+        // (`bad_\u{FFFD}.rs`), plus a nested non-UTF-8 directory/file.
+        let bad_fe = pkg_dir.join(OsStr::from_bytes(b"bad_\xfe.rs"));
+        let bad_ff = pkg_dir.join(OsStr::from_bytes(b"bad_\xff.rs"));
+        let nested_file = bad_dir.join(OsStr::from_bytes(b"inner_\xfd.rs"));
+        std::fs::write(pkg_dir.join("Cargo.toml"), b"[package]\nname = \"dep\"\n").expect("Cargo.toml");
+        std::fs::write(&bad_ff, b"v1-non-utf8-ff").expect("write bad_ff");
+        std::fs::write(&bad_fe, b"v1-non-utf8-fe").expect("write bad_fe");
+        std::fs::write(&nested_file, b"v1-non-utf8-nested").expect("write nested_file");
+
+        let checkout = blaze_proc_macro::script_sandbox::RealRoot::resolve(&tmp).expect("RealRoot");
+        let members = [(LockId(0), "dep", blaze_world::PathKind::Member)];
+
+        let got_v1 = path_pkg_files_digest(&checkout, &members, LockId(0))
+            .expect("non-UTF-8 file/dir must still hash cleanly instead of returning None");
+        let alloc = blaze_own::testing::heap().alloc();
+        let mod_v1 = blaze_proc_macro::module::package_files_digest_in(&pkg_dir, alloc)
+            .expect("package_files_digest_in");
+        assert_eq!(got_v1.as_str(), mod_v1.as_str(), "wasm64_compile must match blaze_proc_macro::module::package_files_digest_in");
+
+        // Exact raw relative-path wire oracle (sorted strictly by raw encoded bytes).
+        let mut wire = std::vec::Vec::new();
+        for (rel, bytes) in [
+            (&b"Cargo.toml"[..], &b"[package]\nname = \"dep\"\n"[..]),
+            (&b"bad_\xfe.rs"[..], &b"v1-non-utf8-fe"[..]),
+            (&b"bad_\xff.rs"[..], &b"v1-non-utf8-ff"[..]),
+            (&b"dir_\xfe/inner_\xfd.rs"[..], &b"v1-non-utf8-nested"[..]),
+        ] {
+            wire.extend_from_slice(rel);
+            wire.push(0);
+            wire.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            wire.extend_from_slice(bytes);
+        }
+        assert_eq!(got_v1, blaze_proc_macro::module::sha256_hex(&wire));
+
+        std::fs::write(&bad_ff, b"v2-non-utf8-ff").expect("update bad_ff");
+        let got_v2 = path_pkg_files_digest(&checkout, &members, LockId(0)).expect("digest v2");
+        assert_ne!(got_v1, got_v2, "editing either colliding non-UTF-8 file must invalidate path_pkg_files_digest");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

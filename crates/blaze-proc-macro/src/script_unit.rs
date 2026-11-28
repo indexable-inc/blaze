@@ -201,35 +201,52 @@ impl core::fmt::Display for DepsDigestError {
 impl core::error::Error for DepsDigestError {}
 
 /// Canonical SHA-256 digest of a build-script unit's transitive `UnitKind::Lib | UnitKind::ProcMacro`
-/// build-dependencies (resolved against `wasm_graph` when present, so every WASI-side unified
-/// dependency feature and WASI-only direct/transitive build-dep enters the module key without
-/// pulling in the package's normal or dev dependencies from `Cargo.lock`, rules 21 & 60).
+/// build-dependencies (resolved against `wasm_graph` when present and matching the script's exact
+/// host-feature side and feature set, so every WASI-side unified dependency feature and WASI-only
+/// direct/transitive build-dep enters the module key without pulling in the package's normal or
+/// dev dependencies from `Cargo.lock`, rules 21 & 60).
 ///
-/// When `wasm_graph` is absent (e.g. minimal toolchains without `wasm64-blaze-wasip1`), falls back
-/// to supplementing host `graph` build-deps with lock-pinned (non-path) `Cargo.lock` metadata so
-/// registry/git WASI-only deps still invalidate the digest while unkeyed normal/dev checkout path
-/// files are never read into `UnitGraph`'s sealed `CrateList` (Rule 21: prevents `TwoValues`).
-/// Returns `Ok(None)` when the build script has no build-dependencies (and, without `wasm_graph`,
-/// no lock dependencies).
+/// When `wasm_graph` is absent (e.g. native build scripts or minimal toolchains without
+/// `wasm64-blaze-wasip1`) or does not contain an exact side-and-feature match for `script`, falls
+/// back to supplementing host `graph` build-deps with lock-pinned (non-path) `Cargo.lock` metadata
+/// so registry/git WASI-only deps still invalidate the digest while unkeyed normal/dev checkout
+/// path files are never read into `UnitGraph`'s sealed `CrateList` (Rule 21: prevents `TwoValues`).
+/// Returns `Ok(None)` when the build script has no build-dependencies (and, in fallback mode, no
+/// lock dependencies).
 pub fn script_deps_digest(
     graph: &UnitGraph<'_>,
     wasm_graph: Option<&UnitGraph<'_>>,
     lock: &blaze_manifest::lock::Lock<'_>,
     script: UnitId,
-    mut path_files: impl FnMut(blaze_manifest::lock::LockId) -> Option<String>,) -> Result<Option<String>, DepsDigestError> {
+    path_files: impl FnMut(blaze_manifest::lock::LockId) -> Option<String>,) -> Result<Option<String>, DepsDigestError> {
+    let frame = bstd::mem::Frame::new(bstd::mem::Tag::Other).map_err(DepsDigestError)?;
+    Ok(script_deps_digest_with(graph, wasm_graph, lock, script, path_files, &frame)?.map(|s| s.as_str().to_owned()))
+}
+
+/// Like [`script_deps_digest`], accepting any `AsRef<str>` return from `path_files` (e.g. `&str`
+/// from a caller-side memoization cache) and allocating the returned hex digest in `alloc` so
+/// callers avoid global heap allocations on both cache hits and results.
+pub fn script_deps_digest_with<S: AsRef<str>, A: core::alloc::Allocator>(
+    graph: &UnitGraph<'_>,
+    wasm_graph: Option<&UnitGraph<'_>>,
+    lock: &blaze_manifest::lock::Lock<'_>,
+    script: UnitId,
+    mut path_files: impl FnMut(blaze_manifest::lock::LockId) -> Option<S>,
+    alloc: A,
+) -> Result<Option<blaze_own::String<A>>, DepsDigestError> {
     use blaze_manifest::lock::{Checksum, LockId, LockSource};
     use core::fmt::Write as _;
     let Some(root) = graph.units.get(script.index()) else { return Ok(None) };
     let frame = bstd::mem::Frame::new(bstd::mem::Tag::Other).map_err(DepsDigestError)?;
-    let erased = blaze_own::Erased::new(&frame);
-    let frame_alloc = erased.handle();
 
-    // When the resolved `wasm64-blaze-wasip1` host-unit graph is available, walk its exact
-    // build-dependency closure for `script` so every WASI-only dependency and workspace-unified
-    // WASI feature set enters the digest — and never touch `Cargo.lock` normal/dev dependencies
-    // (rule 21: `UnitGraph`'s key only covers build-deps, rule 60: normal `.rs` edits never
-    // invalidate `build.rs` modules).
-    let (active_graph, active_root, used_wasm_graph) = match wasm_graph {
+    // When the resolved `wasm64-blaze-wasip1` host-unit graph is available and contains an exact
+    // side-and-feature match for `script`, walk its exact build-dependency closure so every
+    // WASI-only dependency and workspace-unified WASI feature set enters the digest without
+    // touching `Cargo.lock` normal/dev dependencies (rule 21: `UnitGraph`'s key only covers
+    // build-deps, rule 60: normal `.rs` edits never invalidate `build.rs` modules). Any missing or
+    // mismatched side/feature falls back to the host graph + conservative lock walk instead of
+    // silently binding to another side's build-script unit.
+    let (active_graph, active_root, resolved_wasm) = match wasm_graph {
         Some(wg) => {
             let want_side = graph.host_unit_side(script);
             let mut want_feats = blaze_own::Vec::with_capacity_in(root.features.len(), &frame);
@@ -247,31 +264,15 @@ pub fn script_deps_digest(
                 got.dedup();
                 got.as_slice() == want_feats.as_slice()
             };
-            let found = wg
-                .units
-                .iter()
-                .enumerate()
-                .find_map(|(i, u)| {
-                    let uid = UnitId(u32::try_from(i).ok()?);
-                    (u.package == root.package
-                        && u.kind == UnitKind::BuildScript
-                        && wg.host_unit_side(uid) == want_side
-                        && feats_match(u))
-                    .then_some(uid)
-                })
-                .or_else(|| {
-                    wg.units.iter().enumerate().find_map(|(i, u)| {
-                        let uid = UnitId(u32::try_from(i).ok()?);
-                        (u.package == root.package && u.kind == UnitKind::BuildScript && feats_match(u)).then_some(uid)
-                    })
-                })
-                .or_else(|| {
-                    wg.units.iter().enumerate().find_map(|(i, u)| {
-                        let uid = UnitId(u32::try_from(i).ok()?);
-                        (u.package == root.package && u.kind == UnitKind::BuildScript).then_some(uid)
-                    })
-                });
-            match found {
+            let exact = wg.units.iter().enumerate().find_map(|(i, u)| {
+                let uid = UnitId(u32::try_from(i).ok()?);
+                (u.package == root.package
+                    && u.kind == UnitKind::BuildScript
+                    && wg.host_unit_side(uid) == want_side
+                    && feats_match(u))
+                .then_some(uid)
+            });
+            match exact {
                 Some(uid) => (wg, uid, true),
                 None => (graph, script, false),
             }
@@ -279,10 +280,15 @@ pub fn script_deps_digest(
         None => (graph, script, false),
     };
 
+    let active_root_unit = active_graph.units.get(active_root.index());
+    if resolved_wasm && active_root_unit.is_none_or(|u| u.deps.is_empty()) {
+        return Ok(None);
+    }
+
     let mut visited = blaze_own::Vec::with_capacity_in(active_graph.units.len(), &frame);
     visited.resize(active_graph.units.len(), false);
-    let mut stack = blaze_own::AVec::<UnitId>::new_in(frame_alloc);
-    let push_unit_deps = |u: &Unit<'_>, visited: &mut [bool], stack: &mut blaze_own::AVec<'_, UnitId>| {
+    let mut stack = blaze_own::Vec::<UnitId, _>::new_in(&frame);
+    let push_deps = |u: &Unit<'_>, visited: &mut blaze_own::Vec<bool, _>, stack: &mut blaze_own::Vec<UnitId, _>| {
         for dep in u.deps.iter() {
             let idx = dep.unit.index();
             if active_graph
@@ -300,15 +306,39 @@ pub fn script_deps_digest(
     if let Some(slot) = visited.get_mut(active_root.index()) {
         *slot = true;
     }
-    if let Some(active_root_unit) = active_graph.units.get(active_root.index()) {
-        push_unit_deps(active_root_unit, &mut visited, &mut stack);
+    if let Some(active_root_unit) = active_root_unit {
+        push_deps(active_root_unit, &mut visited, &mut stack);
     }
 
-    let mut lock_seen = blaze_own::Vec::with_capacity_in(if used_wasm_graph { 0 } else { lock.packages.len() }, &frame);
+    // Memoize `path_files(pkg_id)` inside this call so each `LockId` is hashed at most once even
+    // when multiple units in `active_graph` share a package.
+    let mut path_cache: blaze_own::Vec<Option<Option<blaze_own::String<&bstd::mem::Frame>>>, _> =
+        blaze_own::Vec::with_capacity_in(lock.packages.len(), &frame);
+    for _ in 0..lock.packages.len() {
+        path_cache.push(None);
+    }
+    let mut write_path_pin = |row: &mut blaze_own::String<&bstd::mem::Frame>, pkg_id: LockId| {
+        let cached = if let Some(slot) = path_cache.get_mut(pkg_id.index()) {
+            slot.get_or_insert_with(|| {
+                path_files(pkg_id).map(|hex| blaze_own::String::from_str_in(hex.as_ref(), &frame))
+            })
+            .as_deref()
+        } else {
+            None
+        };
+        match cached {
+            Some(hex) => {
+                let _ = write!(row, "files:{hex}");
+            }
+            None => row.push_str("path:unpinned"),
+        }
+    };
+
+    let mut lock_seen = blaze_own::Vec::with_capacity_in(if resolved_wasm { 0 } else { lock.packages.len() }, &frame);
     let mut lock_stack = blaze_own::Vec::<LockId, _>::new_in(&frame);
-    if !used_wasm_graph {
+    if !resolved_wasm {
         lock_seen.resize(lock.packages.len(), false);
-        // Without a resolved `wasm_graph`, seed the lock walk from `root.package` so WASI-only
+        // Without an exact `wasm_graph` match, seed the lock walk from `root.package` so WASI-only
         // registry/git build-deps (absent from the host `UnitGraph`) still enter the digest.
         // Path packages NOT in `active_graph` are NEVER hashed via `path_files` here because
         // `Cargo.lock` mixes normal/dev/build deps and `UnitGraph`'s key only sweeps build-deps
@@ -329,13 +359,17 @@ pub fn script_deps_digest(
     let mut lines = blaze_own::Vec::<blaze_own::String<&bstd::mem::Frame>, _>::new_in(&frame);
     while let Some(uid) = stack.pop() {
         let Some(u) = active_graph.units.get(uid.index()) else { continue };
-        push_unit_deps(u, &mut visited, &mut stack);
-        if let Some(bs_id) = u.build_script
-            && let Some(bs_unit) = active_graph.units.get(bs_id.index())
+        push_deps(u, &mut visited, &mut stack);
+        if let Some(dep_bs) = u.build_script
+            && let Some(slot) = visited.get_mut(dep_bs.index())
+            && !*slot
         {
-            push_unit_deps(bs_unit, &mut visited, &mut stack);
+            *slot = true;
+            if let Some(bs_unit) = active_graph.units.get(dep_bs.index()) {
+                push_deps(bs_unit, &mut visited, &mut stack);
+            }
         }
-        if !used_wasm_graph
+        if !resolved_wasm
             && let Some(slot) = lock_seen.get_mut(u.package.index())
             && !*slot
         {
@@ -366,12 +400,7 @@ pub fn script_deps_digest(
             (Checksum::Sha256(sum), _) => {
                 let _ = write!(row, "checksum:{} {}", sum.as_str(), pkg.source_text.as_str());
             }
-            (Checksum::Absent, LockSource::Path) => match path_files(u.package) {
-                Some(hex) => {
-                    let _ = write!(row, "files:{hex}");
-                }
-                None => row.push_str("path:unpinned"),
-            },
+            (Checksum::Absent, LockSource::Path) => write_path_pin(&mut row, u.package),
             (Checksum::Absent, LockSource::Git { commit, .. }) => {
                 let _ = write!(row, "git:{} {}", commit.as_str(), pkg.source_text.as_str());
             }
@@ -399,11 +428,18 @@ pub fn script_deps_digest(
             (Checksum::Sha256(sum), _) => {
                 let _ = write!(row, "checksum:{}", sum.as_str());
             }
-            // Never read checkout files for lock-only path entries (which include normal and dev
-            // dependencies outside `active_graph`): their files are not in `UnitGraph`'s key
-            // (rule 21). Actual build-dep path packages are already hashed in `lines` above.
+            // When `wasm_graph` was supplied for a wasm script but lacked an exact side-and-feature
+            // match, pin lock-reachable path dependencies by their actual file contents so WASI-only
+            // path build-dependencies absent from the host graph still invalidate the digest
+            // (rule 21). When `wasm_graph` is `None` (native build scripts or minimal toolchains),
+            // never read checkout files for lock-only path entries outside `active_graph` because
+            // `Cargo.lock` mixes normal/dev deps not in `UnitGraph`'s key (prevents `TwoValues`).
             (Checksum::Absent, LockSource::Path) => {
-                row.push_str("path:lock");
+                if wasm_graph.is_some() {
+                    write_path_pin(&mut row, pkg_id);
+                } else {
+                    row.push_str("path:lock");
+                }
             }
             (Checksum::Absent, LockSource::Git { commit, .. }) => {
                 let _ = write!(row, "git:{}", commit.as_str());
@@ -434,7 +470,12 @@ pub fn script_deps_digest(
         }
         joined.push_str(l.as_str());
     }
-    Ok(Some(crate::module::sha256_hex(joined.as_str().as_bytes())))
+    let digest = blaze_sha256::digest(joined.as_str().as_bytes());
+    let mut out = blaze_own::String::with_capacity_in(digest.len() * 2, alloc);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    Ok(Some(out))
 }
 
 /// Relative paths under a package directory that contribute to a workspace-member or path
@@ -444,22 +485,15 @@ pub fn script_deps_digest(
 /// binary sources do not recompile `build.rs` (rule 60) while edits to `build.rs`, its helper
 /// modules, or `Cargo.toml` immediately invalidate the build-script module key (rule 21).
 pub fn script_files_digest(pkg_dir: &Path, script_root: &str) -> Result<String, std::io::Error> {
-    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut push_file = |rel: &str| -> Result<(), std::io::Error> {
+    let mut add_path = |rel: &str| {
         let norm = rel.trim_start_matches("./");
-        if norm.is_empty() || !seen.insert(norm.to_owned()) {
-            return Ok(());
+        if !norm.is_empty() {
+            seen.insert(norm.to_owned());
         }
-        let full = pkg_dir.join(norm);
-        if full.is_file() {
-            let bytes = std::fs::read(&full)?;
-            files.push((norm.to_owned(), bytes));
-        }
-        Ok(())
     };
-    push_file("Cargo.toml")?;
-    push_file(script_root)?;
+    add_path("Cargo.toml");
+    add_path(script_root);
     if let Ok(entries) = std::fs::read_dir(pkg_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -467,7 +501,7 @@ pub fn script_files_digest(pkg_dir: &Path, script_root: &str) -> Result<String, 
                 && s.ends_with(".rs")
                 && entry.file_type().is_ok_and(|t| t.is_file())
             {
-                push_file(s)?;
+                add_path(s);
             }
         }
     }
@@ -488,12 +522,21 @@ pub fn script_files_digest(pkg_dir: &Path, script_root: &str) -> Result<String, 
                 if ft.is_dir() {
                     stack.push(child);
                 } else if ft.is_file() && name.ends_with(".rs") {
-                    push_file(&child)?;
+                    add_path(&child);
                 }
             }
         }
     }
-    Ok(crate::module::files_digest(&mut files))
+    // `BTreeSet<String>` iterates in ascending byte order of relative path.
+    let mut hasher = crate::module::FilesHasher::new();
+    for norm in seen.iter() {
+        let full = pkg_dir.join(norm);
+        if full.is_file() {
+            let bytes = std::fs::read(&full)?;
+            hasher.update_file(norm.as_str(), bytes.as_slice());
+        }
+    }
+    Ok(crate::module::hex(&hasher.finish()))
 }
 
 /// Why the module store could not answer a lookup: each names the path (rule 19), and none is
@@ -1607,5 +1650,262 @@ mod tests {
             d_ab, d_ba,
             "swapping features A and B between two same-name/version packages from different sources must change script_deps_digest"
         );
+    }
+
+    #[test]
+    fn script_deps_digest_scopes_to_build_deps_when_wasm_graph_present_and_memoizes_path_files() {
+        use blaze_manifest::lock::{Lock, LockId};
+        use blaze_own::Vec as OwnVec;
+        use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitKind};
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Lock packages:
+        //   0: app (depends on build_dep_direct, normal_or_dev_path in flat Cargo.lock deps)
+        //   1: build_dep_direct (path, depends on build_dep_trans)
+        //   2: build_dep_trans (path)
+        //   3: normal_or_dev_path (path — normal/dev dep of app, NOT a build-dependency!)
+        //   4: dep_bs_helper (path — build-dep of build_dep_direct's own build.rs)
+        let lock_txt = "version = 4\n\n\
+            [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"build_dep_direct\", \"normal_or_dev_path\"]\n\n\
+            [[package]]\nname = \"build_dep_direct\"\nversion = \"0.1.0\"\ndependencies = [\"build_dep_trans\", \"dep_bs_helper\"]\n\n\
+            [[package]]\nname = \"build_dep_trans\"\nversion = \"0.1.0\"\n\n\
+            [[package]]\nname = \"normal_or_dev_path\"\nversion = \"0.1.0\"\n\n\
+            [[package]]\nname = \"dep_bs_helper\"\nversion = \"0.1.0\"\n";
+        let lock = Lock::read(lock_txt.as_bytes(), alloc).expect("lock");
+
+        let mk_unit = |pkg: u32, name: &str, kind: UnitKind<'static>, feats: &[&str], deps: &[(&str, u32)], bs: Option<u32>| {
+            let mut d = OwnVec::new_in(alloc);
+            for &(dn, du) in deps {
+                d.push(UnitDep { name: Text::from_str_in(dn, alloc), unit: UnitId(du) });
+            }
+            let mut f = OwnVec::new_in(alloc);
+            for &feat in feats {
+                f.push(Text::from_str_in(feat, alloc));
+            }
+            let root = if kind == UnitKind::BuildScript { "build.rs" } else { "src/lib.rs" };
+            Unit {
+                package: LockId(pkg),
+                name: Text::from_str_in(name, alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in(name, alloc),
+                root: Text::from_str_in(root, alloc),
+                features: f,
+                cfg: OwnVec::new_in(alloc),
+                deps: d,
+                build_script: bs.map(UnitId),
+                links: None,
+            }
+        };
+
+        // Negative control 1: std-only build.rs with ZERO build-dependencies in wasm_graph,
+        // even though Cargo.lock lists path dependencies on `app`.
+        let mut units_zero = OwnVec::new_in(alloc);
+        units_zero.push(mk_unit(0, "app", UnitKind::BuildScript, &[], &[], None));
+        let graph_zero = UnitGraph { units: units_zero, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+        let mut zero_calls = Vec::new();
+        let zero_digest = super::script_deps_digest(&graph_zero, Some(&graph_zero), &lock, UnitId(0), |id| {
+            zero_calls.push(id);
+            Some(format!("digest-{}", id.0))
+        })
+        .expect("frame ok");
+        assert_eq!(zero_digest, None, "std-only build.rs with zero build-deps must return None when wasm_graph is present");
+        assert!(zero_calls.is_empty(), "zero build-deps must never hash normal/dev path deps in Cargo.lock");
+
+        // Positive + Negative control 2:
+        //   0: app BuildScript -> [1 (build_dep_direct), 5 (second unit of build_dep_direct with extra feature)]
+        //   1: build_dep_direct Lib -> [2 (build_dep_trans)], build_script = Some(3)
+        //   2: build_dep_trans Lib -> []
+        //   3: build_dep_direct BuildScript -> [4 (dep_bs_helper)]
+        //   4: dep_bs_helper Lib -> []
+        //   5: build_dep_direct Lib (feat "extra") -> [2 (build_dep_trans)]
+        // Note: LockId(3) (`normal_or_dev_path`) is in `app`'s Cargo.lock deps, NOT in the build-dep closure!
+        let mut units = OwnVec::new_in(alloc);
+        units.push(mk_unit(0, "app", UnitKind::BuildScript, &[], &[("build_dep_direct", 1), ("build_dep_direct_extra", 5)], None));
+        units.push(mk_unit(1, "build_dep_direct", UnitKind::Lib, &[], &[("build_dep_trans", 2)], Some(3)));
+        units.push(mk_unit(2, "build_dep_trans", UnitKind::Lib, &[], &[], None));
+        units.push(mk_unit(1, "build_dep_direct", UnitKind::BuildScript, &[], &[("dep_bs_helper", 4)], None));
+        units.push(mk_unit(4, "dep_bs_helper", UnitKind::Lib, &[], &[], None));
+        units.push(mk_unit(1, "build_dep_direct", UnitKind::Lib, &["extra"], &[("build_dep_trans", 2)], None));
+        let wg = UnitGraph { units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        let run = |d1: &str, d2: &str, d3_normal: &str, d4_bs: &str| {
+            let mut calls = Vec::new();
+            let digest = super::script_deps_digest(&wg, Some(&wg), &lock, UnitId(0), |id| {
+                calls.push(id);
+                match id {
+                    LockId(1) => Some(d1.to_owned()),
+                    LockId(2) => Some(d2.to_owned()),
+                    LockId(3) => Some(d3_normal.to_owned()),
+                    LockId(4) => Some(d4_bs.to_owned()),
+                    _ => None,
+                }
+            })
+            .expect("frame ok")
+            .expect("some digest");
+            (digest, calls)
+        };
+
+        let (base, calls) = run("dir-v1", "trans-v1", "normal-v1", "helper-v1");
+        // Each reachable build-dep LockId must be queried AT MOST ONCE (even though LockId(1) has 2 units!).
+        assert_eq!(calls.iter().filter(|&&id| id == LockId(1)).count(), 1, "LockId(1) must be memoized to 1 call");
+        assert_eq!(calls.iter().filter(|&&id| id == LockId(2)).count(), 1, "LockId(2) must be queried once");
+        assert_eq!(calls.iter().filter(|&&id| id == LockId(4)).count(), 1, "LockId(4) (dep build-script dep) must be queried once");
+        // Negative control: normal/dev path dep LockId(3) must NEVER be queried or hashed.
+        assert!(!calls.contains(&LockId(3)), "normal/dev path dep must NEVER trigger path_files when wasm_graph is present");
+        let (same_after_normal_edit, _) = run("dir-v1", "trans-v1", "normal-v2", "helper-v1");
+        assert_eq!(base, same_after_normal_edit, "editing a normal/dev path dep must NOT change script_deps_digest");
+
+        // Positive controls: direct, transitive, and dep-build-script path deps MUST change digest.
+        let (changed_direct, _) = run("dir-v2", "trans-v1", "normal-v1", "helper-v1");
+        assert_ne!(base, changed_direct, "editing direct path build-dep must change script_deps_digest");
+        let (changed_trans, _) = run("dir-v1", "trans-v2", "normal-v1", "helper-v1");
+        assert_ne!(base, changed_trans, "editing transitive path build-dep must change script_deps_digest");
+        let (changed_helper, _) = run("dir-v1", "trans-v1", "normal-v1", "helper-v2");
+        assert_ne!(base, changed_helper, "editing path build-dep of a build-dep's build.rs must change script_deps_digest");
+
+        // Fallback mode (`wasm_graph = None`) must ALSO memoize `path_files` to at most once per LockId
+        // even when a package appears in both `lines` and `lock_lines`.
+        let mut fallback_calls = Vec::new();
+        let _ = super::script_deps_digest(&wg, None, &lock, UnitId(0), |id| {
+            fallback_calls.push(id);
+            Some(format!("fb-{}", id.0))
+        })
+        .expect("frame ok");
+        for pkg_idx in 0..5u32 {
+            assert!(
+                fallback_calls.iter().filter(|&&id| id == LockId(pkg_idx)).count() <= 1,
+                "fallback mode must call path_files at most once for LockId({pkg_idx})"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_script_files_digest_matches_exact_wire_format() {
+        let dir = std::env::temp_dir().join(format!("blaze-script-files-streaming-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("build")).expect("mkdir build");
+        std::fs::create_dir_all(dir.join("src")).expect("mkdir src");
+        std::fs::write(dir.join("Cargo.toml"), b"[package]\nname = \"s\"\n").expect("Cargo.toml");
+        std::fs::write(dir.join("build/main.rs"), b"mod helper; fn main() {}\n").expect("build/main.rs");
+        std::fs::write(dir.join("build/helper.rs"), b"pub fn h() {}\n").expect("build/helper.rs");
+        std::fs::write(dir.join("top.rs"), b"// top\n").expect("top.rs");
+        std::fs::write(dir.join("src/lib.rs"), b"// ignored by script_files_digest\n").expect("src/lib.rs");
+
+        let mut entries = vec![
+            ("Cargo.toml", &b"[package]\nname = \"s\"\n"[..]),
+            ("build/helper.rs", &b"pub fn h() {}\n"[..]),
+            ("build/main.rs", &b"mod helper; fn main() {}\n"[..]),
+            ("top.rs", &b"// top\n"[..]),
+        ];
+        entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let mut wire = Vec::new();
+        for (p, b) in &entries {
+            wire.extend_from_slice(p.as_bytes());
+            wire.push(0);
+            wire.extend_from_slice(&(b.len() as u64).to_le_bytes());
+            wire.extend_from_slice(b);
+        }
+        let oracle = crate::module::sha256_hex(&wire);
+        assert_eq!(super::script_files_digest(&dir, "./build/main.rs").expect("digest"), oracle);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn script_deps_digest_rejects_mismatched_wasm_side_or_features_and_falls_back() {
+        use blaze_manifest::lock::{Lock, LockId};
+        use blaze_own::Vec as OwnVec;
+        use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitKind};
+        let alloc = blaze_own::testing::heap().alloc();
+
+        let mk_lock = |reg_sum: &str| {
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"host_dep\", \"reg_dep\", \"wasi_only_path\"]\n\n\
+                 [[package]]\nname = \"host_dep\"\nversion = \"0.1.0\"\n\n\
+                 [[package]]\nname = \"reg_dep\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{reg_sum}\"\n\n\
+                 [[package]]\nname = \"wasi_only_path\"\nversion = \"0.1.0\"\n"
+            )
+        };
+        let lock_a_txt = mk_lock("1111111111111111111111111111111111111111111111111111111111111111");
+        let lock_b_txt = mk_lock("2222222222222222222222222222222222222222222222222222222222222222");
+        let lock_a = Lock::read(lock_a_txt.as_bytes(), alloc).expect("lock_a");
+        let lock_b = Lock::read(lock_b_txt.as_bytes(), alloc).expect("lock_b");
+
+        let mk_unit = |pkg: u32, name: &str, kind: UnitKind<'static>, for_host: bool, feats: &[&str], deps: &[(&str, u32)], bs: Option<u32>| {
+            let mut d = OwnVec::new_in(alloc);
+            for &(dn, du) in deps {
+                d.push(UnitDep { name: Text::from_str_in(dn, alloc), unit: UnitId(du) });
+            }
+            let mut f = OwnVec::new_in(alloc);
+            for &feat in feats {
+                f.push(Text::from_str_in(feat, alloc));
+            }
+            let root = if kind == UnitKind::BuildScript { "build.rs" } else { "src/lib.rs" };
+            Unit {
+                package: LockId(pkg),
+                name: Text::from_str_in(name, alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind,
+                for_host,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in(name, alloc),
+                root: Text::from_str_in(root, alloc),
+                features: f,
+                cfg: OwnVec::new_in(alloc),
+                deps: d,
+                build_script: bs.map(UnitId),
+                links: None,
+            }
+        };
+
+        // Host graph: target-side `app` BuildScript (features=["want"]) -> `host_dep` (path).
+        let mut host_units = OwnVec::new_in(alloc);
+        host_units.push(mk_unit(0, "app", UnitKind::BuildScript, true, &["want"], &[("host_dep", 1)], None));
+        host_units.push(mk_unit(1, "host_dep", UnitKind::Lib, true, &[], &[], None));
+        host_units.push(mk_unit(0, "app", UnitKind::Lib, false, &["want"], &[], Some(0)));
+        let host_graph = UnitGraph { units: host_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        // Case 1: wasm_graph only has `app` BuildScript with WRONG features (`["other"]`) and empty deps.
+        let mut wg_feats_units = OwnVec::new_in(alloc);
+        wg_feats_units.push(mk_unit(0, "app", UnitKind::BuildScript, true, &["other"], &[], None));
+        wg_feats_units.push(mk_unit(0, "app", UnitKind::Lib, false, &["other"], &[], Some(0)));
+        let wg_wrong_feats = UnitGraph { units: wg_feats_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        // Case 2: wasm_graph only has `app` BuildScript with WRONG HostFeatureSide (host-side, for_host=true) and empty deps.
+        let mut wg_side_units = OwnVec::new_in(alloc);
+        wg_side_units.push(mk_unit(0, "app", UnitKind::BuildScript, true, &["want"], &[], None));
+        wg_side_units.push(mk_unit(0, "app", UnitKind::Lib, true, &["want"], &[], Some(0)));
+        let wg_wrong_side = UnitGraph { units: wg_side_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        let fallback_v1 = super::script_deps_digest(&host_graph, None, &lock_a, UnitId(0), |id| (id == LockId(1)).then(|| "h-v1".to_owned()))
+            .expect("ok")
+            .expect("fallback digest");
+        let fallback_v2 = super::script_deps_digest(&host_graph, None, &lock_a, UnitId(0), |id| (id == LockId(1)).then(|| "h-v2".to_owned()))
+            .expect("ok")
+            .expect("fallback digest v2");
+        assert_ne!(fallback_v1, fallback_v2);
+
+        for (label, wg) in [("wrong features", &wg_wrong_feats), ("wrong side", &wg_wrong_side)] {
+            let run_wg = |lock: &Lock<'_>, host_hex: &str, wasi_hex: &str| {
+                super::script_deps_digest(&host_graph, Some(wg), lock, UnitId(0), |id| match id {
+                    LockId(1) => Some(host_hex.to_owned()),
+                    LockId(3) => Some(wasi_hex.to_owned()),
+                    _ => None,
+                })
+                .expect("ok")
+                .expect("mismatched wasm root must not return None")
+            };
+            let d1 = run_wg(&lock_a, "h-v1", "w-v1");
+            let d_host_edit = run_wg(&lock_a, "h-v2", "w-v1");
+            let d_wasi_path_edit = run_wg(&lock_a, "h-v1", "w-v2");
+            let d_lock_b = run_wg(&lock_b, "h-v1", "w-v1");
+            assert_ne!(d1, d_host_edit, "{label}: must still cover host path build-dep");
+            assert_ne!(d1, d_wasi_path_edit, "{label}: must pin WASI-only lock path build-dep by its actual contents");
+            assert_ne!(d1, d_lock_b, "{label}: must still cover lock-pinned dep in fallback mode");
+        }
     }
 }

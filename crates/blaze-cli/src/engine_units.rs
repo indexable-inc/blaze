@@ -972,9 +972,9 @@ pub(crate) fn discover<'f>(
                 // The names world (work.rs's `UnitGraph` arm): every crate of the build.
                 // Reuses the already-mapped source packs and git package dirs from discovery.
                 let world = {
-                    let _cx = cx.span("names: make the world");
+                    let span_cx = cx.span("names: make the world");
                     crate::names::world_with_mapped(
-                        &cx,
+                        &span_cx,
                         root,
                         record.payload_bytes()?,
                         graph.wasm_record_bytes(),

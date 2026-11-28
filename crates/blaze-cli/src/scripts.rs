@@ -214,6 +214,20 @@ fn sdk_bytes(ran_as: RanAs, sdk: Option<blaze_apple_sdk::SdkId>) -> ([u8; 1 + bl
     }
 }
 
+/// Selects `wasm_graph` only for `RanAs::Wasm` build scripts; `RanAs::Native` build scripts run as
+/// host executables and must be keyed from the host `UnitGraph` dependency closure so host-only
+/// target-specific build-dependencies invalidate both the module subject and the script run's
+/// `deps_digest` (Rule 21).
+pub(crate) fn deps_wasm_graph<'g>(
+    ran_as: RanAs,
+    wasm_graph: Option<&'g UnitGraph<'g>>,
+) -> Option<&'g UnitGraph<'g>> {
+    match ran_as {
+        RanAs::Wasm => wasm_graph,
+        RanAs::Native => None,
+    }
+}
+
 /// The `Script` parts of a world whose crates read the runs `keys` (`Names::script_keys`: each
 /// run's subject and its reading crate's world key, named with the crates' `CrateScope` parts),
 /// for a command whose macOS SDK is `sdk` ([`sdk_identity`]): one a subject, sorted and without
@@ -315,6 +329,9 @@ pub(crate) struct Scripts<'f> {
     /// package's manifests are laid out once a command, not once for each job that runs its
     /// script or is served by it as a `links` producer (rule 77).
     files: std::vec::Vec<(LockId, Files<'f>), Global>,
+    /// Memoized checkout path-package `files_digest` hex strings (in `frame`), sorted by `LockId`,
+    /// so `script_deps_digest_with` hashes each path build-dependency at most once per command.
+    dep_files: blaze_own::Vec<(LockId, Option<&'f str>), &'f Frame>,
     /// The shared setups opened ([`Scripts::shared`]): 1 when a job was made ready, else 0.
     setups_opened: u32,
 }
@@ -546,7 +563,7 @@ impl<'f> Scripts<'f> {
         let folder = crate::fetch::sources_native(env, frame).ok_or(SetupError::NoHome)?;
         let dir = SourcesDir { folder: crate::work::held_str(folder.as_str(), frame), frame };
         let sources = StoreSources::new(lock, dir, blaze_fetch::pack::PackView::open_source_put, alloc).map_err(|error| SetupError::Sources(said(frame, format_args!("{error}"))))?;
-        Ok(Scripts { shared: None, graph_record, graph, wasm_graph, script_world, by_subject, sources, lock, members, files: std::vec::Vec::new_in(Global), setups_opened: 0 })
+        Ok(Scripts { shared: None, graph_record, graph, wasm_graph, script_world, by_subject, sources, lock, members, files: std::vec::Vec::new_in(Global), dep_files: blaze_own::Vec::new_in(frame), setups_opened: 0 })
     }
 
     /// The shared setups opened this command: 1 once a job was made ready to run, else 0.
@@ -1525,15 +1542,6 @@ pub(crate) fn job<'f: 'j, 'j>(
         Ok(shared) => shared,
         Err(words) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{words}")), hole: true }),
     };
-    let deps_digest = match blaze_proc_macro::script_unit::script_deps_digest(graph, scripts.wasm_graph, lock, script, |dep_pkg| {
-        members
-            .iter()
-            .find(|m| m.id == dep_pkg)
-            .and_then(|m| crate::macro_files::package_files_digest_in_dir(&cx, &root.read_only(), m.dir, frame))
-    }) {
-        Ok(opt) => opt.map(|hex| crate::work::held_str(&hex, jobs)),
-        Err(error) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{error}")), hole: true }),
-    };
     let ran_as = {
         let erased = blaze_own::Erased::new(frame);
         RanAs::of(&blaze_proc_macro::native_unit::placed_in_store(
@@ -1544,6 +1552,33 @@ pub(crate) fn job<'f: 'j, 'j>(
             crate::graph::TRIPLE,
             erased.handle(),
         ))
+    };
+    let mut io_scratch = match bstd::mem::Frame::new(bstd::mem::Tag::Other) {
+        Ok(scratch) => scratch,
+        Err(error) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{error}")), hole: true }),
+    };
+    let dep_files = &mut scripts.dep_files;
+    let deps_digest = match blaze_proc_macro::script_unit::script_deps_digest_with(
+        graph,
+        deps_wasm_graph(ran_as, scripts.wasm_graph),
+        lock,
+        script,
+        |dep_pkg| match dep_files.binary_search_by_key(&dep_pkg, |(id, _)| *id) {
+            Ok(at) => dep_files.get(at).and_then(|(_, hex)| *hex),
+            Err(at) => {
+                let held = members
+                    .iter()
+                    .find(|m| m.id == dep_pkg)
+                    .and_then(|m| crate::macro_files::package_files_digest_in_dir(&cx, &root.read_only(), m.dir, frame, &io_scratch));
+                io_scratch.reset();
+                dep_files.insert_shift(at, (dep_pkg, held));
+                held
+            }
+        },
+        frame,
+    ) {
+        Ok(opt) => opt.map(|hex| crate::work::held_str(hex.as_str(), jobs)),
+        Err(error) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{error}")), hole: true }),
     };
     let deps_digest = match fold_wasm_script_dep_probes(
         &cx,
