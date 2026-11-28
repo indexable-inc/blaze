@@ -896,8 +896,12 @@ impl TreeRunner for ShelfTree<'_> {
         }
         pairs.push((setting.shelf.guest, shelf));
         pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-        // What a file is checked against and an error shows: every host folder, `tmp` too.
+        // What a file is checked against and an error shows: every host folder, `tmp` and any
+        // split dynamic linker path too.
         let mut shown = pairs.clone();
+        if let Some(dyn_linker) = setting.sdk_dynamic_linker {
+            shown.push(("/sdk-dynamic-linker", dyn_linker));
+        }
         shown.push(("/tmp", tmp.as_str()));
 
         // 3. The grant: the shelf's compilers and archiver, the linker when a tool runs what
@@ -950,6 +954,7 @@ impl TreeRunner for ShelfTree<'_> {
                 dynamic_linker: setting.sdk_dynamic_linker,
                 rpaths: rpath_hosts.as_slice(),
                 ld_lld: ld_lld_path.as_deref(),
+                embed_runtime_paths: runs_out_dir,
             };
             let cfg_path = joined(&[folder.as_str(), "/clang.cfg"], alloc);
             if cfg_path.as_str().bytes().any(|b| b.is_ascii_whitespace()) {
@@ -1328,6 +1333,7 @@ mod tree_spelling_tests {
             dynamic_linker: Some("/nix/store/def-glibc/lib/ld-linux-aarch64.so.1"),
             rpaths: &extra_rpaths,
             ld_lld: Some("/h/work/trees/abc/ld.lld"),
+            embed_runtime_paths: true,
         };
 
         // 1. NixOS clang.cfg includes resource-dir, --sysroot, prefix maps, and Nix link flags.

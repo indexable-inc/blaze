@@ -153,6 +153,9 @@ pub enum NativeScriptError {
     /// The script left something in `OUT_DIR` that is not a plain file or a folder (a link, a
     /// socket): the record holds files only, and a link's target is not the script's output.
     NotAFile { folder: std::string::String, name: std::string::String, kind: bstd::fs::EntryKind },
+    /// A kept file in `OUT_DIR` embeds a host sysroot or linker path (e.g. a Nix store `RPATH` or
+    /// `PT_INTERP`), which would violate key/output path-independence (Rule 25).
+    HostPath { file: std::string::String, host: std::string::String },
 }
 
 impl std::fmt::Display for NativeScriptError {
@@ -200,6 +203,10 @@ impl std::fmt::Display for NativeScriptError {
             NativeScriptError::NotAFile { folder, name, kind } => write!(
                 f,
                 "{folder}/{name}: the build script left a {kind:?} in OUT_DIR, not a file or a folder; its outputs record holds files only (a link's target is not its output), so it is refused (rule 3)"
+            ),
+            NativeScriptError::HostPath { file, host } => write!(
+                f,
+                "kept output `{file}` in OUT_DIR embeds host path `{host}` (rule 25: equal inputs, equal bytes)"
             ),
         }
     }
@@ -404,7 +411,73 @@ fn hex64(digest: &[u8; 32]) -> std::string::String {
 /// the record can hold. No length is limited; the count of files is (`limits.files`).
 ///
 /// `out_dir` and `area` are canonical and `area` exists.
+fn slice_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+/// Scans a streamed chunk (plus the overlap tail from previous chunks) for any forbidden host path
+/// needle without buffering the whole file in memory.
+fn scan_stream_chunk<'a, 'n>(
+    data: &[u8],
+    forbidden_hosts: &[&'n str],
+    max_needle: usize,
+    tail: &mut AVec<'a, u8>,
+    bridge: &mut AVec<'a, u8>,
+) -> Option<&'n str> {
+    if max_needle == 0 || data.is_empty() {
+        return None;
+    }
+    for &host in forbidden_hosts {
+        if slice_contains(data, host.as_bytes()) {
+            return Some(host);
+        }
+    }
+    let keep = max_needle.saturating_sub(1);
+    if keep > 0 && !tail.is_empty() {
+        bridge.clear();
+        bridge.extend_from_slice(tail.as_slice());
+        let take = data.len().min(keep);
+        if let Some(prefix) = data.get(..take) {
+            bridge.extend_from_slice(prefix);
+        }
+        for &host in forbidden_hosts {
+            if slice_contains(bridge.as_slice(), host.as_bytes()) {
+                return Some(host);
+            }
+        }
+    }
+    if keep > 0 {
+        if data.len() >= keep {
+            tail.clear();
+            if let Some(suffix) = data.get(data.len() - keep..) {
+                tail.extend_from_slice(suffix);
+            }
+        } else {
+            tail.extend_from_slice(data);
+            if tail.len() > keep {
+                let drop = tail.len() - keep;
+                tail.as_mut_slice().copy_within(drop.., 0);
+                tail.truncate(keep);
+            }
+        }
+    }
+    None
+}
+
 pub fn store_out_dir<'a>(out_dir: &str, area: &str, listed: &[Listed], outputs: &mut Outputs<'a>, limits: FileLimits, alloc: Alloc<'a>) -> Result<StoredOutputs, NativeScriptError> {
+    store_out_dir_checked(out_dir, area, listed, outputs, limits, &[], alloc)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_out_dir_checked<'a>(
+    out_dir: &str,
+    area: &str,
+    listed: &[Listed],
+    outputs: &mut Outputs<'a>,
+    limits: FileLimits,
+    forbidden_hosts: &[&str],
+    alloc: Alloc<'a>,
+) -> Result<StoredOutputs, NativeScriptError> {
     let failed = |why: std::string::String| NativeScriptError::Files { folder: out_dir.to_owned(), why };
     let top = common_folder(out_dir, area);
     let under = |path: &str| path.get(top.len()..).unwrap_or("").trim_start_matches('/').to_owned();
@@ -413,6 +486,10 @@ pub fn store_out_dir<'a>(out_dir: &str, area: &str, listed: &[Listed], outputs: 
     let mem = io.mem().ok_or_else(|| failed("the world over it offers no memory to stream a digest through".to_owned()))?;
     let arena = mem.arena(DIGEST_ARENA_NAME, DIGEST_ARENA).map_err(|e| failed(format!("{e:?}")))?;
     let mut chunk = arena.bytes();
+    let max_needle = forbidden_hosts.iter().map(|h| h.len()).max().unwrap_or(0);
+    let keep = max_needle.saturating_sub(1);
+    let mut tail: AVec<'a, u8> = Vec::with_capacity_in(keep, alloc);
+    let mut bridge: AVec<'a, u8> = Vec::with_capacity_in(keep.saturating_mul(2), alloc);
     let mut stored = StoredOutputs { peak: 0, files: 0, bytes: 0, present: 0 };
     for file in listed {
         if file.kind != bstd::fs::EntryKind::File {
@@ -428,11 +505,15 @@ pub fn store_out_dir<'a>(out_dir: &str, area: &str, listed: &[Listed], outputs: 
         let opened = root.open_read(&cx, &from).map_err(|e| named(e.to_string()))?;
         let mut sha = blaze_sha256::Sha256::new();
         let mut at = 0u64;
+        tail.clear();
         loop {
             chunk.clear();
             let n = opened.read_at(&cx, at, CHUNK, &mut chunk).map_err(|e| named(e.to_string()))?;
             if n == 0 {
                 break;
+            }
+            if let Some(host) = scan_stream_chunk(chunk.as_slice(), forbidden_hosts, max_needle, &mut tail, &mut bridge) {
+                return Err(NativeScriptError::HostPath { file: file.name.as_str().into(), host: host.into() });
             }
             sha.update(chunk.as_slice());
             at += n as u64;
@@ -602,6 +683,55 @@ mod stored_tests {
         assert_eq!(common_folder("/a/bc/out", "/a/b/files"), "/a");
         assert_eq!(common_folder("/x/out", "/y/files"), "/");
         assert_eq!(common_folder("/a/b", "/a/b/files"), "/a/b");
+    }
+
+    /// Streaming host-path scan rejects any kept `OUT_DIR` file embedding a forbidden host
+    /// sysroot/linker path — including a path split across `CHUNK` boundaries — without buffering
+    /// the whole file, while clean files pass through unchanged.
+    #[test]
+    fn store_out_dir_checked_rejects_host_path_across_chunk_boundary() {
+        let (root, out, files) = folders("hostpath");
+        let needle = "/nix/store/0123456789abcdef-glibc-2.44/lib";
+        let split_at = super::CHUNK - 10;
+        let mut payload = vec![b'A'; super::CHUNK + 128];
+        payload[split_at..split_at + needle.len()].copy_from_slice(needle.as_bytes());
+        std::fs::write(format!("{out}/leaked.so"), &payload).expect("write leaked.so");
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let listed = listed_under(&out).expect("listed");
+        let mut outputs = Outputs::new_in("/target/debug/build/x-0/out", alloc);
+        let err = super::store_out_dir_checked(
+            &out,
+            &files,
+            &listed,
+            &mut outputs,
+            FileLimits::DEFAULT,
+            &[needle],
+            alloc,
+        )
+        .expect_err("leaked host path across chunk boundary must be rejected");
+        assert!(
+            matches!(&err, NativeScriptError::HostPath { file, host } if file == "leaked.so" && host == needle),
+            "expected HostPath(leaked.so, {needle}), got {err:?}"
+        );
+
+        // Control: removing the leaked file and writing a clean file passes.
+        std::fs::remove_file(format!("{out}/leaked.so")).expect("rm leaked.so");
+        std::fs::write(format!("{out}/clean.a"), b"!<arch>\nclean bytes\n").expect("write clean.a");
+        let listed_clean = listed_under(&out).expect("listed clean");
+        let mut clean_out = Outputs::new_in("/target/debug/build/x-0/out", alloc);
+        let stored = super::store_out_dir_checked(
+            &out,
+            &files,
+            &listed_clean,
+            &mut clean_out,
+            FileLimits::DEFAULT,
+            &[needle],
+            alloc,
+        )
+        .unwrap_or_else(|e| panic!("clean file must pass: {e}"));
+        _ = std::fs::remove_dir_all(&root);
+        assert_eq!(stored.files, 1);
     }
 }
 
@@ -1127,7 +1257,26 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         }
         remove(c.out_dir, name)?;
     }
-    store_out_dir(c.out_dir, script.files, &kept, &mut outputs, file_limits, alloc)?;
+    // On `Sysroot::LinuxHost`, reject any kept output file in `OUT_DIR` that embeds a host
+    // sysroot/linker path (e.g. Nix store `RPATH` or `PT_INTERP`), so path-independent
+    // `sdk_version` keys can never cache machine-specific output bytes (Rule 25).
+    let mut forbidden_hosts: AVec<'a, &str> = Vec::new_in(alloc);
+    if c.sysroot_kind == Sysroot::LinuxHost {
+        if c.sysroot != "/usr" && !c.sysroot.is_empty() {
+            forbidden_hosts.push(c.sysroot);
+        }
+        for extra in c.sysroot_extra_reads {
+            if *extra != "/usr" && !extra.is_empty() && !forbidden_hosts.contains(extra) {
+                forbidden_hosts.push(*extra);
+            }
+        }
+        if let Some(cfg_dir) = linux_cfg_dir
+            && !forbidden_hosts.contains(&cfg_dir)
+        {
+            forbidden_hosts.push(cfg_dir);
+        }
+    }
+    store_out_dir_checked(c.out_dir, script.files, &kept, &mut outputs, file_limits, forbidden_hosts.as_slice(), alloc)?;
     headers.sort();
     headers.dedup();
     for (under, digest) in headers.iter_mut() {

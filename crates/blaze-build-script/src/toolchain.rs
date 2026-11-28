@@ -505,10 +505,11 @@ pub const SHELF_MEMBERS: [&str; 9] =
     ["bin/clang", "bin/clang++", "bin/clang-23", "bin/ld64.lld", "bin/lld", "bin/llvm-ar", "bin/llvm-nm", "lib/clang", "lib/libclang.dylib"];
 
 /// What a Linux shelf holds of the pinned archive (`LLVM-23.1.4-Linux-ARM64/`), sorted: the
-/// compilers, `lld`, `llvm-ar`, `llvm-nm`, and clang's builtin headers (`lib/clang`). Linux
-/// shelves carry no macOS-only `bin/ld64.lld` or `lib/libclang.dylib`.
-pub const SHELF_MEMBERS_LINUX: [&str; 7] =
-    ["bin/clang", "bin/clang++", "bin/clang-23", "bin/lld", "bin/llvm-ar", "bin/llvm-nm", "lib/clang"];
+/// compilers, `lld`, `llvm-ar`, `llvm-nm`, clang's builtin headers (`lib/clang`), and
+/// `lib/libclang.so` (required by `bindgen` / `clang-sys` via `LIBCLANG_PATH`). Linux shelves
+/// carry no macOS-only `bin/ld64.lld` or `lib/libclang.dylib`.
+pub const SHELF_MEMBERS_LINUX: [&str; 8] =
+    ["bin/clang", "bin/clang++", "bin/clang-23", "bin/lld", "bin/llvm-ar", "bin/llvm-nm", "lib/clang", "lib/libclang.so"];
 
 /// The shelf members required for `sysroot`.
 pub const fn shelf_members_for(sysroot: Sysroot) -> &'static [&'static str] {
@@ -538,6 +539,13 @@ pub struct LinuxClangLink<'s> {
     pub dynamic_linker: Option<&'s str>,
     pub rpaths: &'s [&'s str],
     pub ld_lld: Option<&'s str>,
+    /// When `true` (e.g. a granted host tool with `runs_out_dir = true` executing temporary
+    /// `configure` probes under Landlock on NixOS), emits `-Wl,-rpath,...` and
+    /// `-Wl,--dynamic-linker=...` so temporary probe executables can execute against split Nix
+    /// glibc; callers MUST reject any kept output file containing those host paths (Rule 25).
+    /// When `false`, omits `-Wl,-rpath` and `-Wl,--dynamic-linker` so linked outputs keep the
+    /// path-independent ELF interpreter and embed zero host store paths.
+    pub embed_runtime_paths: bool,
 }
 
 /// The `--sysroot=` prefix for a `Sysroot::LinuxHost` header root: strips trailing `/usr` for
@@ -610,21 +618,23 @@ pub fn format_linux_clang_cfg<'a>(
         l_flag.push_str(lib_dir);
         push_cfg_quoted(&mut cfg, l_flag.as_str());
 
-        let mut rpath_flag = String::from_str_in("-Wl,-rpath,", alloc);
-        rpath_flag.push_str(lib_dir);
-        push_cfg_quoted(&mut cfg, rpath_flag.as_str());
+        if link.embed_runtime_paths {
+            let mut rpath_flag = String::from_str_in("-Wl,-rpath,", alloc);
+            rpath_flag.push_str(lib_dir);
+            push_cfg_quoted(&mut cfg, rpath_flag.as_str());
 
-        for extra_rpath in link.rpaths {
-            if *extra_rpath != lib_dir {
-                let mut extra_flag = String::from_str_in("-Wl,-rpath,", alloc);
-                extra_flag.push_str(extra_rpath);
-                push_cfg_quoted(&mut cfg, extra_flag.as_str());
+            for extra_rpath in link.rpaths {
+                if *extra_rpath != lib_dir {
+                    let mut extra_flag = String::from_str_in("-Wl,-rpath,", alloc);
+                    extra_flag.push_str(extra_rpath);
+                    push_cfg_quoted(&mut cfg, extra_flag.as_str());
+                }
             }
-        }
-        if let Some(dyn_linker) = link.dynamic_linker {
-            let mut dyn_flag = String::from_str_in("-Wl,--dynamic-linker=", alloc);
-            dyn_flag.push_str(dyn_linker);
-            push_cfg_quoted(&mut cfg, dyn_flag.as_str());
+            if let Some(dyn_linker) = link.dynamic_linker {
+                let mut dyn_flag = String::from_str_in("-Wl,--dynamic-linker=", alloc);
+                dyn_flag.push_str(dyn_linker);
+                push_cfg_quoted(&mut cfg, dyn_flag.as_str());
+            }
         }
         if let Some(ld_lld) = link.ld_lld {
             let mut ld_flag = String::from_str_in("-fuse-ld=", alloc);

@@ -932,16 +932,39 @@ pub(crate) struct LinuxHostSysroot<'f> {
     pub(crate) rpaths: &'f [&'f str],
 }
 
-/// Resolved Linux host sysroot together with its 32-byte content identity (`sdk_version` SHA-256)
-/// computed once at the command's edge for `Script` task keys (Rule 21, Rule 75).
+/// Resolved Linux host sysroot together with its canonical roots and 32-byte content identity
+/// (`sdk_version` SHA-256) computed once at the command's edge and reused by both `Script` task
+/// keying and native execution without re-hashing (Rule 21, Rule 75).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct ResolvedLinuxHost<'f> {
     pub(crate) sysroot: LinuxHostSysroot<'f>,
+    pub(crate) canonical_sdk: &'f str,
+    pub(crate) sdk_extra: Option<&'f str>,
+    pub(crate) sdk_lib: Option<&'f str>,
+    pub(crate) sdk_dynamic_linker: Option<&'f str>,
+    pub(crate) sdk_rpaths: &'f [&'f str],
+    pub(crate) sdk_version: &'f str,
     pub(crate) id: [u8; 32],
 }
 
-/// Computes the 32-byte content digest (`sdk_version` SHA-256) of a resolved [`LinuxHostSysroot`],
-/// returning `Err` naming the broken host path if validation or hashing fails.
+impl<'f> ResolvedLinuxHost<'f> {
+    /// Borrows this already-verified Linux host sysroot snapshot for
+    /// `native_setting::command_native_setting_from_resolved_linux`.
+    pub(crate) fn as_setting(&self) -> blaze_proc_macro::native_setting::ResolvedLinuxSetting<'f> {
+        blaze_proc_macro::native_setting::ResolvedLinuxSetting {
+            sdk: self.canonical_sdk,
+            sdk_extra: self.sdk_extra,
+            sdk_lib: self.sdk_lib,
+            sdk_dynamic_linker: self.sdk_dynamic_linker,
+            sdk_rpaths: self.sdk_rpaths,
+            sdk_version: self.sdk_version,
+        }
+    }
+}
+
+/// Computes the canonical roots and 32-byte content digest (`sdk_version` SHA-256) of a resolved
+/// [`LinuxHostSysroot`] once at the command's edge, retaining the complete snapshot in `frame` so
+/// execution never re-walks or re-hashes the sysroot.
 pub(crate) fn linux_host_with_id<'f>(
     resolved: Result<Option<LinuxHostSysroot<'f>>, LinuxSysrootError<'f>>,
     alloc: blaze_own::Alloc<'_>,
@@ -957,7 +980,26 @@ pub(crate) fn linux_host_with_id<'f>(
     };
     let keyed = blaze_proc_macro::native_setting::resolve_linux_sysroot(sysroot.dir, link, alloc)
         .map_err(|err| held(frame, format_args!("{err}")))?;
-    Ok(Some(ResolvedLinuxHost { sysroot, id: keyed.sdk_digest }))
+    let canonical_sdk = crate::work::held_str(keyed.sdk.as_str(), frame);
+    let sdk_extra = keyed.sdk_extra.as_ref().map(|s| crate::work::held_str(s.as_str(), frame));
+    let sdk_lib = keyed.sdk_lib.as_ref().map(|s| crate::work::held_str(s.as_str(), frame));
+    let sdk_dynamic_linker = keyed.sdk_dynamic_linker.as_ref().map(|s| crate::work::held_str(s.as_str(), frame));
+    let mut rpaths_vec = blaze_own::Vec::with_capacity_in(keyed.sdk_rpaths.len(), frame);
+    for rpath in keyed.sdk_rpaths.iter() {
+        rpaths_vec.push(crate::work::held_str(rpath.as_str(), frame));
+    }
+    let sdk_rpaths: &'f [&'f str] = rpaths_vec.into_bump_slice();
+    let sdk_version = crate::work::held_str(keyed.sdk_version.as_str(), frame);
+    Ok(Some(ResolvedLinuxHost {
+        sysroot,
+        canonical_sdk,
+        sdk_extra,
+        sdk_lib,
+        sdk_dynamic_linker,
+        sdk_rpaths,
+        sdk_version,
+        id: keyed.sdk_digest,
+    }))
 }
 
 /// Why Linux host sysroot discovery failed on a concrete host path (rule 3, rule 19):

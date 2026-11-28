@@ -236,6 +236,66 @@ fn linux_host_native_setting_accepts_linux_shelf_and_features_h() {
     assert_eq!(owned.shelf.as_str().rsplit('/').next(), Some(LINUX_PIN_HEX));
     assert_eq!(owned.sdk_version.len(), 64);
 
+    // FHS `/usr` sysroots MUST hash every granted header under `<sdk>/include`, not just
+    // `include/features.h`: adding or modifying another header moves `sdk_version`, while two
+    // content-identical FHS trees at different paths produce the same path-independent digest.
+    fs::create_dir_all(sdk.join("include/sys")).expect("include/sys");
+    fs::write(sdk.join("include/sys/types.h"), b"typedef long off_t;\n").expect("types.h v1");
+    let fhs_v1 = command_native_setting(home_s, sdk_s, "test", LINUX_HOST, alloc).unwrap_or_else(|e| panic!("{e}"));
+    assert_ne!(fhs_v1.sdk_version.as_str(), owned.sdk_version.as_str(), "adding FHS header outside features.h must move sdk_version");
+    fs::write(sdk.join("include/sys/types.h"), b"typedef long long off_t;\n").expect("types.h v2");
+    let fhs_v2 = command_native_setting(home_s, sdk_s, "test", LINUX_HOST, alloc).unwrap_or_else(|e| panic!("{e}"));
+    assert_ne!(fhs_v1.sdk_version.as_str(), fhs_v2.sdk_version.as_str(), "editing FHS header outside features.h must move sdk_version");
+
+    let fhs_mirror = home.join("mirror/usr");
+    fs::create_dir_all(fhs_mirror.join("include/sys")).expect("mirror sys");
+    fs::write(fhs_mirror.join(LINUX_HOST_SYSROOT_MARKER), b"#define __GLIBC__ 2\n").expect("mirror features.h");
+    fs::write(fhs_mirror.join("include/sys/types.h"), b"typedef long long off_t;\n").expect("mirror types.h");
+    let fhs_mirror_owned = command_native_setting(home_s, fhs_mirror.to_str().expect("utf8"), "test", LINUX_HOST, alloc)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(fhs_v2.sdk_version.as_str(), fhs_mirror_owned.sdk_version.as_str(), "identical FHS trees at different paths must share sdk_version");
+
+    // Reusing an already-resolved `ResolvedLinuxSysroot` via `command_native_setting_from_resolved_linux`
+    // avoids re-hashing and preserves the exact planned snapshot even if a mutable FHS header
+    // changes afterwards (eliminating double hashing and key-vs-execution TOCTOU drift).
+    let resolved_once = crate::native_setting::resolve_linux_sysroot(
+        fhs_mirror.to_str().expect("utf8"),
+        crate::native_setting::LinuxLinkInputs::default(),
+        alloc,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    fs::write(fhs_mirror.join("include/sys/types.h"), b"typedef int off_t;\n").expect("mutate mirror after resolve");
+    let reused = crate::native_setting::command_native_setting_from_resolved_linux(
+        home_s,
+        crate::native_setting::ResolvedLinuxSetting {
+            sdk: resolved_once.sdk.as_str(),
+            sdk_extra: resolved_once.sdk_extra.as_deref(),
+            sdk_lib: resolved_once.sdk_lib.as_deref(),
+            sdk_dynamic_linker: resolved_once.sdk_dynamic_linker.as_deref(),
+            sdk_rpaths: &[],
+            sdk_version: resolved_once.sdk_version.as_str(),
+        },
+        "test",
+        LINUX_HOST,
+        alloc,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(reused.sdk_version.as_str(), resolved_once.sdk_version.as_str());
+    assert_eq!(reused.sdk.as_str(), resolved_once.sdk.as_str());
+
+    // Restore `sdk/include` to `features.h` alone before the split-headers test below.
+    fs::remove_dir_all(sdk.join("include/sys")).expect("cleanup include/sys");
+
+    // Negative control: a Linux shelf missing `lib/libclang.so` is rejected up front as
+    // `ShelfIncomplete` naming `lib/libclang.so` (required for `bindgen`/`clang-sys`).
+    fs::remove_file(shelf.join("lib/libclang.so")).expect("rm libclang.so");
+    let no_libclang = command_native_setting(home_s, sdk_s, "test", LINUX_HOST, alloc).expect_err("missing libclang.so");
+    assert!(
+        matches!(no_libclang, NativeSettingError::ShelfIncomplete { member: "lib/libclang.so", .. }),
+        "expected ShelfIncomplete(lib/libclang.so), got {no_libclang}"
+    );
+    fs::write(shelf.join("lib/libclang.so"), b"").expect("restore libclang.so");
+
     // NixOS split kernel headers: `<sdk>/include/linux` symlinks to a separate store root.
     // `sdk_extra` records that root for Landlock, and `sdk_version` commits to every header file
     // byte under both `<sdk>/include` and `<sdk_extra>/include` (e.g. changing `asm/errno.h`

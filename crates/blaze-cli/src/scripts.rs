@@ -54,7 +54,7 @@ use blaze_drive::{Input, Kind, Name, Task, Want};
 use blaze_ids::ContentId;
 use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::{AVec, Alloc, Erased};
-use blaze_proc_macro::native_unit::{NativeSetting, placed};
+use blaze_proc_macro::native_unit::{NativeSetting, placed_for_host};
 use blaze_proc_macro::script::ScriptRuntime;
 use blaze_proc_macro::script_sandbox::{ScriptRoot, Tree, dir_tree, mem_tree_with_submodules};
 use blaze_proc_macro::script_unit::{self, Setting, links_closure};
@@ -117,7 +117,7 @@ pub(crate) fn placement(home: Option<&str>, graph: &UnitGraph<'_>, script: UnitI
             let store = Path::new(home).join(STORE_UNDER_HOME);
             RanAs::of(&blaze_proc_macro::native_unit::placed_in_store(&store, graph, script, MODE, crate::graph::TRIPLE, alloc))
         }
-        None => RanAs::of(&placed(graph, script, MODE, alloc)),
+        None => RanAs::of(&placed_for_host(graph, script, MODE, crate::graph::TRIPLE, alloc)),
     }
 }
 
@@ -653,22 +653,14 @@ impl<'f> Scripts<'f> {
             },
             Ok(blaze_build_script::toolchain::Sysroot::LinuxHost) => match env.linux_sysroot {
                 Err(why) => Err(said(frame, format_args!("{why}"))),
-                Ok(Some(resolved)) => {
-                    let link = blaze_proc_macro::native_setting::LinuxLinkInputs {
-                        lib_dir: resolved.sysroot.lib_dir,
-                        dynamic_linker: resolved.sysroot.dynamic_linker,
-                        rpaths: resolved.sysroot.rpaths,
-                    };
-                    blaze_proc_macro::native_setting::command_native_setting_with_link(
-                        home,
-                        resolved.sysroot.dir,
-                        link,
-                        NATIVE_WORK,
-                        host,
-                        alloc,
-                    )
-                    .map_err(|error| said(frame, format_args!("the native runner's setting (D112): {error}")))
-                }
+                Ok(Some(resolved)) => blaze_proc_macro::native_setting::command_native_setting_from_resolved_linux(
+                    home,
+                    resolved.as_setting(),
+                    NATIVE_WORK,
+                    host,
+                    alloc,
+                )
+                .map_err(|error| said(frame, format_args!("the native runner's setting (D112): {error}"))),
                 Ok(None) => blaze_proc_macro::native_setting::command_native_setting_with_link(
                     home,
                     blaze_build_script::toolchain::LINUX_HOST_SYSROOT_DIR,

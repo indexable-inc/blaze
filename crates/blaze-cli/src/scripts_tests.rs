@@ -250,6 +250,12 @@ fn scripts_linux_native_sysroot_id_moves_key_and_handles_missing_sysroot() {
             dynamic_linker: Some("/nix/store/def-glibc/lib/ld-linux-aarch64.so.1"),
             rpaths: &[],
         },
+        canonical_sdk: "/nix/store/abc-glibc-dev",
+        sdk_extra: None,
+        sdk_lib: Some("/nix/store/def-glibc/lib"),
+        sdk_dynamic_linker: Some("/nix/store/def-glibc/lib/ld-linux-aarch64.so.1"),
+        sdk_rpaths: &[],
+        sdk_version: "1111111111111111111111111111111111111111111111111111111111111111",
         id: [0x11; 32],
     }));
     assert_eq!(sdk_identity(&env), Some(linux_a), "resolved Linux host sysroot yields NativeSysrootId::LinuxHost");

@@ -42,13 +42,45 @@ fn linux_has_no_sysroot_pinned_yet() {
     assert!(refused.to_string().contains("no sysroot pinned for x86_64-unknown-linux-gnu"), "{refused}");
 }
 
-/// Linux shelves do not ship macOS-only `bin/ld64.lld` or `lib/libclang.dylib`.
+/// Linux shelves require `lib/libclang.so` (for `bindgen`/`clang-sys`) and do not require
+/// macOS-only `bin/ld64.lld` or `lib/libclang.dylib`.
 #[test]
 fn linux_shelf_members_do_not_require_macos_only_files() {
     assert!(SHELF_MEMBERS_LINUX.is_sorted());
     assert_eq!(shelf_missing_for(Sysroot::LinuxHost, |m| m != "lib/libclang.dylib" && m != "bin/ld64.lld"), None);
+    assert_eq!(shelf_missing_for(Sysroot::LinuxHost, |m| m != "lib/libclang.so"), Some("lib/libclang.so"));
     assert_eq!(shelf_missing_for(Sysroot::LinuxHost, |m| m != "bin/clang-23"), Some("bin/clang-23"));
     assert_eq!(shelf_missing_for(Sysroot::MacosSdk, |m| m != "lib/libclang.dylib"), Some("lib/libclang.dylib"));
+}
+
+#[test]
+fn format_linux_clang_cfg_gates_runtime_linker_paths() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let shelf = Shelf { dir: "/h/shelf", clang_major: "23" };
+    let rpaths = ["/nix/store/extra/lib"];
+    let base_link = super::LinuxClangLink {
+        lib_dir: Some("/nix/store/glibc/lib"),
+        dynamic_linker: Some("/nix/store/glibc/lib/ld-linux-aarch64.so.1"),
+        rpaths: &rpaths,
+        ld_lld: Some("/h/shelf/bin/ld.lld"),
+        embed_runtime_paths: false,
+    };
+    let clean = super::format_linux_clang_cfg("/nix/store/glibc-dev", base_link, &[], shelf, alloc);
+    assert!(clean.as_str().contains("\"-B/nix/store/glibc/lib\"\n"));
+    assert!(clean.as_str().contains("\"-L/nix/store/glibc/lib\"\n"));
+    assert!(!clean.as_str().contains("-Wl,-rpath,"), "default clang.cfg must not embed host rpath: {clean}");
+    assert!(!clean.as_str().contains("-Wl,--dynamic-linker="), "default clang.cfg must not embed host PT_INTERP: {clean}");
+
+    let probe = super::format_linux_clang_cfg(
+        "/nix/store/glibc-dev",
+        super::LinuxClangLink { embed_runtime_paths: true, ..base_link },
+        &[],
+        shelf,
+        alloc,
+    );
+    assert!(probe.as_str().contains("\"-Wl,-rpath,/nix/store/glibc/lib\"\n"));
+    assert!(probe.as_str().contains("\"-Wl,-rpath,/nix/store/extra/lib\"\n"));
+    assert!(probe.as_str().contains("\"-Wl,--dynamic-linker=/nix/store/glibc/lib/ld-linux-aarch64.so.1\"\n"));
 }
 
 #[test]

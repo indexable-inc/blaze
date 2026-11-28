@@ -430,7 +430,7 @@ pub fn resolve_linux_sysroot<'a>(
 ) -> Result<ResolvedLinuxSysroot<'a>, NativeSettingError<'a>> {
     let sdk = resolved(&String::from_str_in(sdk, alloc), |path, error| NativeSettingError::NoSdk { path, error }, alloc)?;
     let settings_path = text(&[sdk.as_str(), "/", toolchain::LINUX_HOST_SYSROOT_MARKER], alloc);
-    let settings = read_bounded(settings_path.as_str(), alloc)
+    let _settings = read_bounded(settings_path.as_str(), alloc)
         .map_err(|error| NativeSettingError::NoSdk { path: settings_path, error })?;
     // On NixOS, `<glibc-dev>/include/linux` (and `asm/`, `asm-generic/`) symlinks into a
     // separate `/nix/store/<hash>-linux-headers-<ver>/include/...` store path. Mount that
@@ -472,21 +472,12 @@ pub fn resolve_linux_sysroot<'a>(
             sdk_rpaths.push(real_rpath);
         }
     }
-    // Standard FHS `/usr` without split kernel headers or split libc runtime stays keyed by
-    // `include/features.h` so we never scan unrelated packages under `/usr/include`. Flat or
-    // split sysroots (e.g. NixOS `<glibc-dev>` + `<linux-headers>` + `<glibc-runtime>/lib`)
-    // hash every file byte and symlinked directory subtree under `<sdk>/include`,
-    // `<sdk_extra>/include`, `<sdk_lib>`, and any extra runtime rpaths / dynamic linker in
-    // sorted relative-path order so `sdk_version` is a complete, path-independent content
-    // identity (Rule 21, Rule 25).
-    let is_fhs_single = sdk.as_str().ends_with("/usr")
-        && sdk_extra.is_none()
-        && sdk_lib.is_none()
-        && sdk_dynamic_linker.is_none()
-        && sdk_rpaths.is_empty();
-    let sdk_digest = if is_fhs_single {
-        blaze_sha256::digest(&settings)
-    } else {
+    // Hash every file byte and symlinked directory subtree under `<sdk>/include` (on both FHS
+    // `/usr` and split NixOS roots), plus optional `<sdk_extra>/include`, `<sdk_lib>`, dynamic
+    // linker, and extra runtime rpaths in sorted relative-path order so `sdk_version` commits to
+    // every permitted system header/library that a native C or `bindgen` build script can read
+    // while remaining completely path-independent (Rule 21, Rule 25).
+    let sdk_digest = {
         let mut sha = blaze_sha256::Sha256::new();
         sha.update(b"blaze linux-host sysroot headers 1\0");
         let hash_dir = |sha: &mut blaze_sha256::Sha256,
@@ -531,12 +522,12 @@ pub fn resolve_linux_sysroot<'a>(
                             hash_regular(sha, full.as_str())
                                 .map_err(|error| NativeSettingError::NoSdk { path: full, error })?;
                         }
-                                bstd::fs::EntryKind::Link => {
-                                    sha.update(b"L");
-                                    sha.update(&u64::try_from(name.len()).unwrap_or(u64::MAX).to_le_bytes());
-                                    sha.update(name.as_bytes());
-                                    let meta = stat_meta(full.as_str())
-                                        .map_err(|error| NativeSettingError::NoSdk { path: String::from_str_in(full.as_str(), alloc), error })?;
+                        bstd::fs::EntryKind::Link => {
+                            sha.update(b"L");
+                            sha.update(&u64::try_from(name.len()).unwrap_or(u64::MAX).to_le_bytes());
+                            sha.update(name.as_bytes());
+                            let meta = stat_meta(full.as_str())
+                                .map_err(|error| NativeSettingError::NoSdk { path: String::from_str_in(full.as_str(), alloc), error })?;
                             if meta.is_file() {
                                 sha.update(b"f");
                                 hash_regular(sha, full.as_str())
@@ -620,16 +611,71 @@ pub fn resolve_linux_sysroot<'a>(
     Ok(ResolvedLinuxSysroot { sdk, sdk_extra, sdk_lib, sdk_dynamic_linker, sdk_rpaths, sdk_version, sdk_digest })
 }
 
-/// [`native_setting`] with optional Linux host runtime link inputs (`lib_dir`, `dynamic_linker`,
-/// `rpaths`).
-pub fn native_setting_with_link<'a>(
+/// Borrowed view of an already-resolved and content-keyed [`ResolvedLinuxSysroot`] so commands
+/// reuse the exact sysroot snapshot computed at planning time without walking or hashing the
+/// Linux sysroot twice (eliminating redundant I/O and TOCTOU drift between key and execution).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ResolvedLinuxSetting<'s> {
+    pub sdk: &'s str,
+    pub sdk_extra: Option<&'s str>,
+    pub sdk_lib: Option<&'s str>,
+    pub sdk_dynamic_linker: Option<&'s str>,
+    pub sdk_rpaths: &'s [&'s str],
+    pub sdk_version: &'s str,
+}
+
+/// [`command_native_setting_with_link`] reusing an already-verified [`ResolvedLinuxSetting`]
+/// instead of re-resolving or re-hashing the Linux host sysroot.
+pub fn command_native_setting_from_resolved_linux<'a>(
+    home: &str,
+    linux: ResolvedLinuxSetting<'_>,
+    command: &str,
+    host: &'a str,
+    alloc: Alloc<'a>,
+) -> Result<OwnedNativeSetting<'a>, NativeSettingError<'a>> {
+    let pin = toolchain::clang_pin(CLANG_JSON, host).map_err(NativeSettingError::Pin)?;
+    let digest = hex(&pin.sha256, alloc);
+    let shelf = text(&[home, "/", SHELF_DIR, "/", digest.as_str()], alloc);
+    let work = text(&[home, "/", NATIVE_WORK_DIR, "/", command], alloc);
+    native_setting_from_resolved_linux(shelf.as_str(), linux, work.as_str(), host, alloc)
+}
+
+/// [`native_setting_with_link`] reusing an already-verified [`ResolvedLinuxSetting`] (validates
+/// the pinned clang shelf and work folder without re-hashing the Linux sysroot).
+pub fn native_setting_from_resolved_linux<'a>(
     shelf: &str,
-    sdk: &str,
-    link: LinuxLinkInputs<'_>,
+    linux: ResolvedLinuxSetting<'_>,
     work: &str,
     host: &'a str,
     alloc: Alloc<'a>,
 ) -> Result<OwnedNativeSetting<'a>, NativeSettingError<'a>> {
+    let (shelf, sysroot) = validate_shelf(shelf, host, alloc)?;
+    if sysroot != Sysroot::LinuxHost {
+        return Err(NativeSettingError::PinnedSysroot { host });
+    }
+    let mut sdk_rpaths: AVec<'a, AString<'a>> = Vec::with_capacity_in(linux.sdk_rpaths.len(), alloc);
+    for rpath in linux.sdk_rpaths {
+        sdk_rpaths.push(String::from_str_in(rpath, alloc));
+    }
+    finish_native_setting(
+        shelf,
+        sysroot,
+        String::from_str_in(linux.sdk, alloc),
+        linux.sdk_extra.map(|s| String::from_str_in(s, alloc)),
+        linux.sdk_lib.map(|s| String::from_str_in(s, alloc)),
+        linux.sdk_dynamic_linker.map(|s| String::from_str_in(s, alloc)),
+        sdk_rpaths,
+        String::from_str_in(linux.sdk_version, alloc),
+        work,
+        alloc,
+    )
+}
+
+fn validate_shelf<'a>(
+    shelf: &str,
+    host: &'a str,
+    alloc: Alloc<'a>,
+) -> Result<(AString<'a>, Sysroot), NativeSettingError<'a>> {
     let pin = toolchain::clang_pin(CLANG_JSON, host).map_err(NativeSettingError::Pin)?;
     let sysroot = toolchain::sysroot(CLANG_JSON, host).map_err(NativeSettingError::Pin)?;
     if matches!(sysroot, Sysroot::Pinned { .. }) {
@@ -648,27 +694,22 @@ pub fn native_setting_with_link<'a>(
     if let Some(member) = toolchain::shelf_missing_for(sysroot, member_there) {
         return Err(NativeSettingError::ShelfIncomplete { shelf, member });
     }
+    Ok((shelf, sysroot))
+}
 
-    let (sdk, sdk_extra, sdk_lib, sdk_dynamic_linker, sdk_rpaths, sdk_version) = match sysroot {
-        Sysroot::MacosSdk => {
-            let sdk = resolved(&String::from_str_in(sdk, alloc), |path, error| NativeSettingError::NoSdk { path, error }, alloc)?;
-            let settings_path = text(&[sdk.as_str(), "/SDKSettings.json"], alloc);
-            let settings = match read_bounded(settings_path.as_str(), alloc) {
-                Ok(bytes) => bytes,
-                Err(error) => return Err(NativeSettingError::NoSdk { path: settings_path, error }),
-            };
-            let Some(version) = core::str::from_utf8(&settings).ok().and_then(sdk_version) else {
-                return Err(NativeSettingError::SdkVersion { path: settings_path });
-            };
-            (sdk, None, None, None, Vec::new_in(alloc), String::from_str_in(version, alloc))
-        }
-        Sysroot::LinuxHost => {
-            let linux = resolve_linux_sysroot(sdk, link, alloc)?;
-            (linux.sdk, linux.sdk_extra, linux.sdk_lib, linux.sdk_dynamic_linker, linux.sdk_rpaths, linux.sdk_version)
-        }
-        Sysroot::Pinned { .. } => return Err(NativeSettingError::PinnedSysroot { host }),
-    };
-
+#[allow(clippy::too_many_arguments)]
+fn finish_native_setting<'a>(
+    shelf: AString<'a>,
+    sysroot: Sysroot,
+    sdk: AString<'a>,
+    sdk_extra: Option<AString<'a>>,
+    sdk_lib: Option<AString<'a>>,
+    sdk_dynamic_linker: Option<AString<'a>>,
+    sdk_rpaths: AVec<'a, AString<'a>>,
+    sdk_version: AString<'a>,
+    work: &str,
+    alloc: Alloc<'a>,
+) -> Result<OwnedNativeSetting<'a>, NativeSettingError<'a>> {
     let mut sdk_rpaths_nul: AString<'a> = String::new_in(alloc);
     for (idx, rpath) in sdk_rpaths.iter().enumerate() {
         if idx > 0 {
@@ -694,4 +735,39 @@ pub fn native_setting_with_link<'a>(
         work,
         deadline: NATIVE_RUN_DEADLINE,
     })
+}
+
+/// [`native_setting`] with optional Linux host runtime link inputs (`lib_dir`, `dynamic_linker`,
+/// `rpaths`).
+pub fn native_setting_with_link<'a>(
+    shelf: &str,
+    sdk: &str,
+    link: LinuxLinkInputs<'_>,
+    work: &str,
+    host: &'a str,
+    alloc: Alloc<'a>,
+) -> Result<OwnedNativeSetting<'a>, NativeSettingError<'a>> {
+    let (shelf, sysroot) = validate_shelf(shelf, host, alloc)?;
+
+    let (sdk, sdk_extra, sdk_lib, sdk_dynamic_linker, sdk_rpaths, sdk_version) = match sysroot {
+        Sysroot::MacosSdk => {
+            let sdk = resolved(&String::from_str_in(sdk, alloc), |path, error| NativeSettingError::NoSdk { path, error }, alloc)?;
+            let settings_path = text(&[sdk.as_str(), "/SDKSettings.json"], alloc);
+            let settings = match read_bounded(settings_path.as_str(), alloc) {
+                Ok(bytes) => bytes,
+                Err(error) => return Err(NativeSettingError::NoSdk { path: settings_path, error }),
+            };
+            let Some(version) = core::str::from_utf8(&settings).ok().and_then(sdk_version) else {
+                return Err(NativeSettingError::SdkVersion { path: settings_path });
+            };
+            (sdk, None, None, None, Vec::new_in(alloc), String::from_str_in(version, alloc))
+        }
+        Sysroot::LinuxHost => {
+            let linux = resolve_linux_sysroot(sdk, link, alloc)?;
+            (linux.sdk, linux.sdk_extra, linux.sdk_lib, linux.sdk_dynamic_linker, linux.sdk_rpaths, linux.sdk_version)
+        }
+        Sysroot::Pinned { .. } => return Err(NativeSettingError::PinnedSysroot { host }),
+    };
+
+    finish_native_setting(shelf, sysroot, sdk, sdk_extra, sdk_lib, sdk_dynamic_linker, sdk_rpaths, sdk_version, work, alloc)
 }

@@ -58,10 +58,45 @@ pub fn placed(graph: &UnitGraph<'_>, script: UnitId, mode: Mode, alloc: Alloc<'_
     toolchain::placement(native::closure(graph, script, alloc), mode, graph.units[script.index()].name.as_str())
 }
 
-/// Like [`placed`], but honors the D175 zero-Wasm fast path: whenever `store` holds a native
-/// host binary record (`script.bin`, `target <host>`) for `script` and does not hold a legacy
-/// `module.wasm` record, places `script` on [`Runner::Native`] so it runs confined under
-/// `bstd::procs::hermetic` (macOS Seatbelt / Linux Landlock + seccomp) with zero Wasm.
+/// Returns the name of a host tool that `script` requires to run natively on `host` but that
+/// `pins/clang.json`'s `host_tools` row for `host` does not grant:
+/// - a script whose closure contains `cmake` requires a granted `cmake` tool;
+/// - a script in [`toolchain::NATIVE_EVERY_MODE`] (`sha3-asm`) requires its granted host tool
+///   (`perl`).
+pub fn missing_native_host_tool(graph: &UnitGraph<'_>, script: UnitId, host: &str, alloc: Alloc<'_>) -> Option<&'static str> {
+    let unit = graph.units.get(script.index())?;
+    let pkg = unit.name.as_str();
+    let table = host_tools::host_tools(CLANG_JSON, host, alloc).ok()?;
+    let tools = host_tools::granted(&table, pkg, alloc);
+    if native::closure_has_crate(graph, script, "cmake", alloc) && !tools.iter().any(|tool| tool.name == "cmake") {
+        return Some("cmake");
+    }
+    if toolchain::NATIVE_EVERY_MODE.binary_search(&pkg).is_ok() && tools.is_empty() {
+        return Some("perl");
+    }
+    None
+}
+
+/// Like [`placed`], but avoids selecting [`Runner::Native`] when `host`'s `pins/clang.json`
+/// `host_tools` row does not grant a required tool (such as `cmake` or `sha3-asm`'s `perl`) and
+/// the script's closure can still run on Wasm (`closure.no_wasm.is_none()`).
+pub fn placed_for_host(graph: &UnitGraph<'_>, script: UnitId, mode: Mode, host: &str, alloc: Alloc<'_>) -> Runner {
+    let Some(unit) = graph.units.get(script.index()) else {
+        return Runner::Wasm;
+    };
+    let cl = native::closure(graph, script, alloc);
+    let base = toolchain::placement(cl, mode, unit.name.as_str());
+    if matches!(base, Runner::Native { .. }) && cl.no_wasm.is_none() && missing_native_host_tool(graph, script, host, alloc).is_some() {
+        return Runner::Wasm;
+    }
+    base
+}
+
+/// Like [`placed_for_host`], and honors the D175 zero-Wasm fast path: whenever `store` holds a
+/// native host binary record (`script.bin`, `target <host>`) for `script`, does not hold a legacy
+/// `module.wasm` record, and all required host tools are granted on `host`, places `script` on
+/// [`Runner::Native`] so it runs confined under `bstd::procs::hermetic` (macOS Seatbelt / Linux
+/// Landlock + seccomp) with zero Wasm.
 pub fn placed_in_store(
     store: &Path,
     graph: &UnitGraph<'_>,
@@ -70,8 +105,11 @@ pub fn placed_in_store(
     host: &str,
     alloc: Alloc<'_>,
 ) -> Runner {
-    let base = placed(graph, script, mode, alloc);
+    let base = placed_for_host(graph, script, mode, host, alloc);
     if matches!(base, Runner::Native { .. }) {
+        return base;
+    }
+    if missing_native_host_tool(graph, script, host, alloc).is_some() {
         return base;
     }
     let Some(unit) = graph.units.get(script.index()) else { return base };
@@ -186,6 +224,9 @@ pub enum NativeUnitError {
     PinTable { package: String, why: String },
     /// A host tool's path in the pin table is not its resolved real path (D71).
     ToolNotReal { package: String, tool: String, path: String, real: String },
+    /// The script requires a host tool (e.g. `cmake` or `perl`) that `pins/clang.json`'s
+    /// `host_tools` table does not grant for this host (D71).
+    MissingHostTool { package: String, tool: &'static str },
     /// The shelf's folder is not named by a SHA-256.
     Shelf { shelf: String },
     /// The package's or the run's folder could not be made or read.
@@ -218,6 +259,11 @@ impl std::fmt::Display for NativeUnitError {
             NativeUnitError::ToolNotReal { package, tool, path, real } => write!(
                 f,
                 "{}: host tool `{tool}` of {package}'s build script is at {path}, whose real path is {real}: the grant takes only a resolved path (D71)",
+                CLANG_PATH
+            ),
+            NativeUnitError::MissingHostTool { package, tool } => write!(
+                f,
+                "{}: the native build script of {package} requires host tool `{tool}`, which is not granted in `host_tools` for this host (D71)",
                 CLANG_PATH
             ),
             NativeUnitError::Shelf { shelf } => write!(f, "{shelf}: the C toolchain's shelf folder is not named by its SHA-256 (D69)"),
@@ -440,6 +486,9 @@ pub fn native_outputs<'a>(
     let pin = |why: String| NativeUnitError::PinTable { package: pkg(), why };
     let table = host_tools::host_tools(CLANG_JSON, setting.host, alloc).map_err(|e| pin(e.to_string()))?;
     let tools: AVec<'a, HostTool<'_>> = host_tools::granted(&table, name, alloc);
+    if let Some(missing) = missing_native_host_tool(graph, script, setting.host, alloc) {
+        return Err(NativeUnitError::MissingHostTool { package: pkg(), tool: missing });
+    }
     // Every granted program is keyed at its real path: the tool under its name, then each
     // program it starts under `<tool>+<path>` (sorted after the tool's own name, in the table's
     // sorted order); a shelf row's program (nm-row: nm, the shelf's llvm-nm) under the shelf.
@@ -663,6 +712,7 @@ pub fn native_outputs<'a>(
                 dynamic_linker: native.sdk_dynamic_linker,
                 rpaths: rpath_strs.as_slice(),
                 ld_lld: ld_lld_path.as_deref(),
+                embed_runtime_paths: host_tools::runs_out_dir(&tools),
             };
             let cfg_text = toolchain::format_linux_clang_cfg(native.sdk, link, &shown_maps, shelf, alloc);
             let cfg_rel_file = blaze_own::format_in!(alloc, "cfg/{}/clang.cfg", run_key.as_str());
@@ -1257,5 +1307,43 @@ mod tests {
         assert_eq!(resolved("../../../outside.txt"), super::RerunTarget::Escape);
         assert_eq!(resolved("/etc/passwd"), super::RerunTarget::Escape);
         assert_eq!(resolved(""), super::RerunTarget::Escape);
+    }
+
+    #[test]
+    fn linux_avoids_native_placement_when_required_host_tools_are_ungranted() {
+        const LINUX: &str = "aarch64-unknown-linux-gnu";
+        const MACOS: &str = "aarch64-apple-darwin";
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut units = AVec::new_in(alloc);
+        units.push(unit("libz-ng-sys", UnitKind::BuildScript, &[1], None)); // 0: cmake
+        units.push(unit("cmake", UnitKind::Lib, &[], None)); // 1
+        units.push(unit("sha3-asm", UnitKind::BuildScript, &[3], None)); // 2: NATIVE_EVERY_MODE (perl)
+        units.push(unit("cc", UnitKind::Lib, &[], None)); // 3
+        units.push(unit("zstd-sys", UnitKind::BuildScript, &[3], None)); // 4: cc only
+        units.push(unit("bindgen-cmake", UnitKind::BuildScript, &[1, 6], None)); // 5: no_wasm + cmake
+        units.push(unit("bindgen", UnitKind::Lib, &[], None)); // 6
+        let graph = UnitGraph { units, resolver: Resolver::V3, meta: AVec::new_in(alloc), left_out: AVec::new_in(alloc) };
+
+        // On Linux, `pins/clang.json` grants neither `cmake` nor `perl`, so `cmake` scripts and
+        // `sha3-asm` stay on Wasm instead of selecting an unready native runner.
+        assert_eq!(super::missing_native_host_tool(&graph, UnitId(0), LINUX, alloc), Some("cmake"));
+        assert_eq!(super::placed_for_host(&graph, UnitId(0), Mode::Build, LINUX, alloc), Runner::Wasm);
+        assert_eq!(super::placed_for_host(&graph, UnitId(0), Mode::Check, LINUX, alloc), Runner::Wasm);
+        assert_eq!(super::missing_native_host_tool(&graph, UnitId(2), LINUX, alloc), Some("perl"));
+        assert_eq!(super::placed_for_host(&graph, UnitId(2), Mode::Check, LINUX, alloc), Runner::Wasm);
+        assert_eq!(super::placed_for_host(&graph, UnitId(2), Mode::Build, LINUX, alloc), Runner::Wasm);
+
+        // Control: macOS grants `perl` to `sha3-asm`, so `sha3-asm` stays native on macOS.
+        assert_eq!(super::missing_native_host_tool(&graph, UnitId(2), MACOS, alloc), None);
+        assert_eq!(super::placed_for_host(&graph, UnitId(2), Mode::Check, MACOS, alloc), Runner::Native { because: UnitId(3) });
+
+        // Control: `cc`-only scripts need only the pinned clang shelf and run native on Linux in Build.
+        assert_eq!(super::missing_native_host_tool(&graph, UnitId(4), LINUX, alloc), None);
+        assert_eq!(super::placed_for_host(&graph, UnitId(4), Mode::Build, LINUX, alloc), Runner::Native { because: UnitId(3) });
+
+        // A script that both cannot compile to wasm (`bindgen`) and depends on `cmake` stays native
+        // and is refused by `missing_native_host_tool` before launching the sandbox.
+        assert_eq!(super::placed_for_host(&graph, UnitId(5), Mode::Check, LINUX, alloc), Runner::Native { because: UnitId(1) });
+        assert_eq!(super::missing_native_host_tool(&graph, UnitId(5), LINUX, alloc), Some("cmake"));
     }
 }
