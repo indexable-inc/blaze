@@ -460,3 +460,179 @@ fn async_implied_bounds_and_concrete_type_outlives() {
         assert!(!v.findings.is_empty(), "{name} must fail borrowck: {line}");
     }
 }
+
+const FUTURE_OUTPUT_SLOTS_MAIN: &str = "use std::future::Future;
+
+fn main() {}
+
+trait Writer {
+    fn write(&self) -> i32;
+}
+
+trait ErrTrait {
+    fn code(&self) -> i32;
+}
+
+struct Owned;
+
+impl Writer for Owned {
+    fn write(&self) -> i32 {
+        1
+    }
+}
+
+struct Local(i32);
+
+fn read(l: &Local) -> i32 {
+    l.0
+}
+
+fn move_out(l: Local) -> i32 {
+    l.0
+}
+
+fn use_writer(w: Box<dyn Writer + 'static>) -> i32 {
+    w.write()
+}
+
+fn use_ref(r: &i32) -> i32 {
+    *r
+}
+
+fn block_on<F: Future>(f: F) -> F::Output {
+    let _ = f;
+    loop {}
+}
+
+fn needs_static<F: Future>(f: F) -> F::Output
+where
+    F::Output: 'static,
+{
+    let _ = f;
+    loop {}
+}
+
+async fn within<T>(f: impl Future<Output = T>) -> Result<T, Box<dyn ErrTrait + 'static>> {
+    Ok(f.await)
+}
+
+fn block_on_dyn_static_local_borrow() -> i32 {
+    let local = Local(7);
+    let w: Box<dyn Writer + 'static> = block_on(async {
+        let _ = read(&local);
+        let b: Box<dyn Writer + 'static> = Box::new(Owned);
+        b
+    });
+    let _ = move_out(local);
+    use_writer(w)
+}
+
+async fn within_async_wrapper_local_borrow() -> Result<i32, Box<dyn ErrTrait + 'static>> {
+    let local = Local(7);
+    let res = within(async {
+        let _ = read(&local);
+        42
+    })
+    .await?;
+    let _ = move_out(local);
+    Ok(res)
+}
+
+fn needs_static_output_local_borrow() -> i32 {
+    let local = Local(7);
+    let w: Box<dyn Writer + 'static> = needs_static(async {
+        let _ = read(&local);
+        let b: Box<dyn Writer + 'static> = Box::new(Owned);
+        b
+    });
+    let _ = move_out(local);
+    use_writer(w)
+}
+
+fn block_on_dangling_drop() -> i32 {
+    let local = Local(7);
+    let r: &i32 = block_on(async { &local.0 });
+    drop(local);
+    use_ref(r)
+}
+
+fn block_on_move_while_borrowed() -> i32 {
+    let local = Local(7);
+    let r = block_on(async { &local.0 });
+    let _ = move_out(local);
+    use_ref(r)
+}
+
+fn needs_static_output_captures_local_ref() -> i32 {
+    let local = Local(7);
+    let r = needs_static(async { &local.0 });
+    use_ref(r)
+}
+";
+
+#[test]
+fn async_block_future_output_slots() {
+    let heap = blaze_own::testing::heap();
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let files = [("/future-output-slots/src/main.rs".to_string(), FUTURE_OUTPUT_SLOTS_MAIN.to_string())];
+    let edition = edition::PackageEdition::of_manifest("2024").expect("a known edition");
+    let user = UserCrate {
+        name: "future_output_slots",
+        dir: "/future-output-slots/",
+        root: "/future-output-slots/src/main.rs",
+        files: &files,
+        edition,
+        panic: blaze_build::Panic::Unwind,
+    };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+
+    let sources = [SourceFile { path: "src/main.rs", text: FUTURE_OUTPUT_SLOTS_MAIN }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
+    let mut world = ProjectWorld::new(&names, &frame, &sources, heap.alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let bodies = world.bodies(heap.alloc());
+    let name_of = |b: &BodyRef<'_>| -> String {
+        match b {
+            BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name).unwrap_or("?").to_string(),
+            BodyRef::Member { name, .. } => name.to_string(),
+        }
+    };
+    let find = |n: &str| bodies.iter().find(|(b, _)| name_of(b) == n).map(|(b, _)| *b).unwrap_or_else(|| panic!("`{n}` listed"));
+    let text_of = |b: BodyRef<'_>| {
+        let k = match b {
+            BodyRef::Free(k) => k,
+            BodyRef::Member { container, .. } => container,
+        };
+        names.item_text(k).expect("the body's item text").text
+    };
+
+    for name in [
+        "block_on_dyn_static_local_borrow",
+        "within_async_wrapper_local_borrow",
+        "needs_static_output_local_borrow",
+    ] {
+        let b = find(name);
+        let (types, v) = world.check_borrows(b, heap.alloc());
+        let line = shown(text_of(b), &v);
+        println!("borrows {name}: {line}");
+        assert!(types.is_clean(), "{name}'s types: {types:?}");
+        assert!(v.is_clean(), "{name}: {line}");
+    }
+
+    for name in [
+        "block_on_dangling_drop",
+        "block_on_move_while_borrowed",
+        "needs_static_output_captures_local_ref",
+    ] {
+        let b = find(name);
+        let (types, v) = world.check_borrows(b, heap.alloc());
+        let line = shown(text_of(b), &v);
+        println!("borrows {name}: {line}");
+        assert!(types.is_clean(), "{name}'s types: {types:?}");
+        assert!(v.refused.is_none(), "{name} should be checked, not refused: {line}");
+        assert!(!v.findings.is_empty(), "{name} must fail borrowck: {line}");
+    }
+}

@@ -1222,17 +1222,22 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 self.body_slots(v.ty.ty, &mut sc.bodies, e)?;
             }
             self.body_slots(site.ty.ty, &mut sc.bodies, e)?;
-            // Also collect any nested body types inside a closure's own signature type so
-            // `caller.count(sig_ty)` knows their slot counts.
+            // Also collect any nested body types inside a closure's own signature type or an
+            // async block's output type so `caller.count(...)` knows their slot counts.
             let mut bi = 0usize;
             while bi < sc.bodies.len() {
                 let bt = sc.bodies[bi].0;
                 bi += 1;
-                if let PNode::Closure { owner, ordinal, .. } = self.node(bt, e)?
-                    && owner == self.body.owner
-                    && let Some(&sig_ty) = self.ck.closures.column::<2>().get(ordinal as usize)
-                {
-                    self.body_slots(sig_ty, &mut sc.bodies, e)?;
+                match self.node(bt, e)? {
+                    PNode::Closure { owner, ordinal, .. } if owner == self.body.owner => {
+                        if let Some(&sig_ty) = self.ck.closures.column::<2>().get(ordinal as usize) {
+                            self.body_slots(sig_ty, &mut sc.bodies, e)?;
+                        }
+                    }
+                    PNode::Future(_, out, _) => {
+                        self.body_slots(out, &mut sc.bodies, e)?;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1649,11 +1654,16 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             while bi < sc.bodies.len() {
                 let bt = sc.bodies[bi].0;
                 bi += 1;
-                if let PNode::Closure { owner, ordinal, .. } = self.node(bt, e)?
-                    && owner == self.body.owner
-                    && let Some(&sig_ty) = self.ck.closures.column::<2>().get(ordinal as usize)
-                {
-                    self.body_slots(sig_ty, &mut sc.bodies, e)?;
+                match self.node(bt, e)? {
+                    PNode::Closure { owner, ordinal, .. } if owner == self.body.owner => {
+                        if let Some(&sig_ty) = self.ck.closures.column::<2>().get(ordinal as usize) {
+                            self.body_slots(sig_ty, &mut sc.bodies, e)?;
+                        }
+                    }
+                    PNode::Future(_, out, _) => {
+                        self.body_slots(out, &mut sc.bodies, e)?;
+                    }
+                    _ => {}
                 }
             }
             let caller_base = BodyTypes::new(Columns::new(self.tys, &arity, &arity), &sc.bodies);
