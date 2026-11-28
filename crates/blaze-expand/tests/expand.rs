@@ -2996,6 +2996,18 @@ fn doc_comment_desugars_to_str_raw_with_minimal_hashes() {
             "forwarded {n}-hash doc comment must remain StrRaw(255)"
         );
         assert_eq!(forwarded.tokens.text_at(4), want.as_str());
+
+        // Final textual rendering (`write_tokens`) must still produce valid, lexable Rust source
+        // whose string literal decodes back to the exact original doc body (falling back to a
+        // cooked escaped string literal because `"` + 255 `#`s cannot fit in a raw string).
+        let mut rendered = blaze_own::AString::new_in(alloc);
+        blaze_expand::write_tokens(&forwarded.tokens, &mut rendered);
+        let relexed = lex(rendered.as_str(), Edition::E2021, alloc).expect("rendered saturated doc comment lexes");
+        let mut decoded = blaze_own::AString::new_in(alloc);
+        blaze_expand::write_token(&relexed, &relexed.tokens()[4], &mut decoded);
+        let mut value = blaze_own::AString::new_in(alloc);
+        assert!(blaze_expand::decode_str_literal(decoded.as_str(), |ch| value.push(ch)), "rendered literal decodes");
+        assert_eq!(value.as_str(), want.as_str());
     }
 
     // Bare `\r` (not followed by `\n`) in a doc comment is refused by the lexer, matching rustc.

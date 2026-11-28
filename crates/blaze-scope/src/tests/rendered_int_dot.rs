@@ -19,21 +19,32 @@ use crate::names::Written;
 const LIB: &str = "#![no_core]
 macro_rules! write_f { () => { pub fn f() -> u32 { 999.try_into() } } }
 write_f!();
+macro_rules! pass_item { ($($t:tt)*) => { $($t)* }; }
+pass_item! {
+    /// \"###############################################################################################################################################################################################################################################################
+    pub fn g() {}
+}
 ";
 
 static TEXTS: Texts = Texts(&[&[("/m/lib.rs", LIB)]]);
 
-#[test]
-fn an_integer_before_a_dot_in_an_expansion_stays_an_integer() {
+fn item_stream(name: &str) -> (&'static str, blaze_expand::TokenStream<'static>) {
+    let alloc = Alloc::global();
     let crates = [input("m", "/m/lib.rs", &[])];
     let names = resolved(&crates, &TEXTS);
     let key = names
-        .item_at(names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &["f"] }, Alloc::global())
-        .unwrap_or_else(|e| panic!("`f`, written by `write_f!`: {e}"))
+        .item_at(names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &[name] }, alloc)
+        .unwrap_or_else(|e| panic!("`{name}`: {e}"))
         .def
         .key;
-    let text = names.item_text(key).unwrap_or_else(|| panic!("`f` has no text")).text;
-    let stream = blaze_expand::lex(text, crate::Edition::E2021, Alloc::global()).unwrap_or_else(|e| panic!("`{text}` lexes: {e:?}"));
+    let text = names.item_text(key).unwrap_or_else(|| panic!("`{name}` has no text")).text;
+    let stream = blaze_expand::lex(text, crate::Edition::E2021, alloc).unwrap_or_else(|e| panic!("`{text}` lexes: {e:?}"));
+    (text, stream)
+}
+
+#[test]
+fn an_integer_before_a_dot_in_an_expansion_stays_an_integer() {
+    let (text, stream) = item_stream("f");
     let tokens = stream.tokens();
     let at = tokens
         .iter()
@@ -50,4 +61,26 @@ fn an_integer_before_a_dot_in_an_expansion_stays_an_integer() {
         "a `.` follows `999` in the rendered `{text}`: {:?}",
         tokens.get(at + 1).map(|t| t.kind)
     );
+}
+
+#[test]
+fn a_saturated_255_hash_doc_comment_renders_as_lexable_string() {
+    let (text, stream) = item_stream("g");
+    let tokens = stream.tokens();
+    assert!(
+        matches!(tokens.get(4).map(|t| t.kind), Some(TokenKind::Literal { kind: LitKind::Str, suffix_len: 0, .. })),
+        "saturated 255-hash doc literal should render as cooked Str in `{text}`, got {:?}",
+        tokens.get(4).map(|t| t.kind)
+    );
+    let alloc = stream.allocator();
+    let mut rendered_lit = blaze_own::AString::new_in(alloc);
+    blaze_expand::write_token(&stream, &tokens[4], &mut rendered_lit);
+    let mut decoded = blaze_own::AString::new_in(alloc);
+    assert!(blaze_expand::decode_str_literal(rendered_lit.as_str(), |ch| decoded.push(ch)), "rendered literal decodes");
+    let mut want = blaze_own::AString::new_in(alloc);
+    want.push_str(" \"");
+    for _ in 0..255 {
+        want.push('#');
+    }
+    assert_eq!(decoded.as_str(), want.as_str());
 }

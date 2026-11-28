@@ -4625,6 +4625,14 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
                 let (body, suffix) = text.split_at(split);
                 match kind {
                     LitKind::Str => quoted(&mut out, "", 0, '"', body, suffix),
+                    LitKind::StrRaw(n) | LitKind::DocStrRaw(n) if !blaze_expand::raw_str_fits(n, body) => {
+                        out.push('"');
+                        for ch in body.escape_debug() {
+                            out.push(ch);
+                        }
+                        out.push('"');
+                        out.push_str(suffix);
+                    }
                     LitKind::StrRaw(n) | LitKind::DocStrRaw(n) => quoted(&mut out, "r", n, '"', body, suffix),
                     LitKind::ByteStr => quoted(&mut out, "b", 0, '"', body, suffix),
                     LitKind::ByteStrRaw(n) => quoted(&mut out, "br", n, '"', body, suffix),

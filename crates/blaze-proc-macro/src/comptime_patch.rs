@@ -335,6 +335,19 @@ impl ParsedAdt {
 
 /// Render a single `TokenKind::Literal` back to valid Rust source syntax (including quotes).
 fn write_literal(out: &mut String, kind: LitKind, text: &str, suffix_len: u32) {
+    let split = text.len().saturating_sub(suffix_len as usize);
+    let (inside, suffix) = text.split_at(split);
+    if let LitKind::StrRaw(h) | LitKind::DocStrRaw(h) = kind
+        && !blaze_expand::raw_str_fits(h, inside)
+    {
+        out.push('"');
+        for ch in inside.escape_debug() {
+            out.push(ch);
+        }
+        out.push('"');
+        out.push_str(suffix);
+        return;
+    }
     let (prefix, hashes, quote) = match kind {
         LitKind::Byte => ("b", 0u8, "'"),
         LitKind::Char => ("", 0, "'"),
@@ -346,8 +359,6 @@ fn write_literal(out: &mut String, kind: LitKind, text: &str, suffix_len: u32) {
         LitKind::ByteStrRaw(h) => ("br", h, "\""),
         LitKind::CStrRaw(h) => ("cr", h, "\""),
     };
-    let split = text.len().saturating_sub(suffix_len as usize);
-    let (inside, suffix) = text.split_at(split);
     out.push_str(prefix);
     for _ in 0..hashes {
         out.push('#');

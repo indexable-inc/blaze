@@ -266,6 +266,28 @@ pub fn write_tokens(stream: &TokenStream<'_>, out: &mut AString<'_>) {
     }
 }
 
+/// Whether `r#...#"body"#...#` with `hashes` `#`s lexes back cleanly as one raw string literal
+/// without closing early (true for every lexed raw string literal and every doc comment except
+/// one saturated at `u8::MAX` whose body contains `"` followed by 255 or more `#`s).
+pub fn raw_str_fits(hashes: u8, body: &str) -> bool {
+    if hashes < u8::MAX {
+        return true;
+    }
+    let mut bytes = body.bytes().peekable();
+    while let Some(byte) = bytes.next() {
+        if byte == b'"' {
+            let mut run = 0u8;
+            while bytes.next_if_eq(&b'#').is_some() {
+                run = run.saturating_add(1);
+                if run == u8::MAX {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Writes the source text of `token`, one of `stream`'s, to `out`: what lexes back to it.
 pub fn write_token(stream: &TokenStream<'_>, token: &Token, out: &mut AString<'_>) {
     let text = stream.text_of(token);
@@ -290,6 +312,18 @@ pub fn write_token(stream: &TokenStream<'_>, token: &Token, out: &mut AString<'_
             Delim::Invisible => "",
         }),
         TokenKind::Literal { kind, suffix_len, .. } => {
+            let (body, suffix) = text.split_at(text.len() - suffix_len as usize);
+            if let LitKind::StrRaw(n) | LitKind::DocStrRaw(n) = kind
+                && !raw_str_fits(n, body)
+            {
+                out.push('"');
+                for ch in body.escape_debug() {
+                    out.push(ch);
+                }
+                out.push('"');
+                out.push_str(suffix);
+                return;
+            }
             let (prefix, quote, hashes) = match kind {
                 LitKind::Integer | LitKind::Float | LitKind::Err => {
                     out.push_str(text);
@@ -304,7 +338,6 @@ pub fn write_token(stream: &TokenStream<'_>, token: &Token, out: &mut AString<'_
                 LitKind::CStr => ("c", '"', 0),
                 LitKind::CStrRaw(n) => ("cr", '"', n),
             };
-            let (body, suffix) = text.split_at(text.len() - suffix_len as usize);
             out.push_str(prefix);
             (0..hashes).for_each(|_| out.push('#'));
             out.push(quote);
