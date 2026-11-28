@@ -2709,14 +2709,14 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     // `impl<T: ?Sized, I: Invariants<Aliasing = Shared>> Copy for Ptr<'_, T, I>`).
     {
         let body_tys = c.types.view();
-        let mut eval: Option<fields::InstDropEval<'a>> = None;
+        let mut eval: Option<fields::InstDropEval<'a, '_>> = None;
         for (idx, node) in body_tys.nodes().enumerate() {
             let tc::PNode::Adt(k, _) = *node else { continue };
             let Ok(at) = g.adts.binary_search_by_key(&k.0, |&(ak, _)| ak) else { continue };
             let af = g.adts[at].1;
             let Ok(pty_id) = u32::try_from(idx) else { continue };
             if af.needs_drop && !af.drop_impl {
-                let ev = eval.get_or_insert_with(|| fields::InstDropEval::new_in(alloc));
+                let ev = eval.get_or_insert_with(|| fields::InstDropEval::new_in(adt_facts.as_ref(), alloc));
                 if let Some(needs) = ev.eval_body_ty(r, langs, body_tys, tc::PTy(pty_id)) {
                     g.inst_drop.push((pty_id, needs));
                 }
@@ -2725,7 +2725,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 && plant != FactsPlant::NoCopyArgs
                 && g.copy_args.binary_search_by_key(&k.0, |&(ak, _, _)| ak).is_err()
             {
-                let ev = eval.get_or_insert_with(|| fields::InstDropEval::new_in(alloc));
+                let ev = eval.get_or_insert_with(|| fields::InstDropEval::new_in(adt_facts.as_ref(), alloc));
                 if let Some(is_copy) = ev.eval_body_copy(r, langs, owner, body_tys, tc::PTy(pty_id)) {
                     g.inst_copy.push((pty_id, is_copy));
                 }

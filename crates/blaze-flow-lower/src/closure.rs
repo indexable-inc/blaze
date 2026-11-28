@@ -1207,8 +1207,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     Expr::Call { callee, args } => {
                         let Some(es) = self.body.expr_lists.get(args.range()) else { continue };
                         let Some(arg_i) = es.iter().position(|&a| a == walk_cur) else { continue };
+                        let mut sig_for_call: Option<crate::SigLife<'_>> = None;
+                        let mut is_ctor = false;
                         match self.expr_def(callee) {
                             Some(Def::Ctor { adt, variant, .. }) => {
+                                is_ctor = true;
                                 if let Ok(col) = facts.regions().field(adt, variant, to_u32(arg_i))
                                     && let Ok(Some(m)) = self.find_unique_dyn_with_binder(col.ty(), col.as_slice(), 0, heads, want_dyn, e)
                                 {
@@ -1218,57 +1221,81 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                                 }
                             }
                             Some(Def::Fn(item)) => {
-                                if let Ok(sig) = facts.sig(item)
-                                    && let Some(in_slots) = sig.input(to_u32(arg_i))
-                                    && let Ok(in_ty) = self.sig_declared(sig, to_u32(arg_i), e)
-                                {
-                                    let base = self.fn_sig_param_binder(sig, to_u32(arg_i), heads);
-                                    if let Ok(Some(m)) = self.find_unique_dyn_with_binder(in_ty, in_slots, base, heads, want_dyn, e) {
-                                        found = Some(m);
-                                        stop = true;
-                                        break;
+                                if let Ok(sig) = facts.sig(item) {
+                                    sig_for_call = Some(sig);
+                                    if let Some(in_slots) = sig.input(to_u32(arg_i))
+                                        && let Ok(in_ty) = self.sig_declared(sig, to_u32(arg_i), e)
+                                    {
+                                        let base = self.fn_sig_param_binder(sig, to_u32(arg_i), heads);
+                                        if let Ok(Some(m)) = self.find_unique_dyn_with_binder(in_ty, in_slots, base, heads, want_dyn, e) {
+                                            found = Some(m);
+                                            stop = true;
+                                            break;
+                                        }
                                     }
                                 }
                             }
                             _ => {
                                 if let Some((item, _)) = self.callee_of(pe)
                                     && let Ok(sig) = facts.sig(item)
-                                    && let Some(in_slots) = sig.input(to_u32(arg_i))
-                                    && let Ok(in_ty) = self.sig_declared(sig, to_u32(arg_i), e)
                                 {
-                                    let base = self.fn_sig_param_binder(sig, to_u32(arg_i), heads);
-                                    if let Ok(Some(m)) = self.find_unique_dyn_with_binder(in_ty, in_slots, base, heads, want_dyn, e) {
-                                        found = Some(m);
-                                        stop = true;
-                                        break;
+                                    sig_for_call = Some(sig);
+                                    if let Some(in_slots) = sig.input(to_u32(arg_i))
+                                        && let Ok(in_ty) = self.sig_declared(sig, to_u32(arg_i), e)
+                                    {
+                                        let base = self.fn_sig_param_binder(sig, to_u32(arg_i), heads);
+                                        if let Ok(Some(m)) = self.find_unique_dyn_with_binder(in_ty, in_slots, base, heads, want_dyn, e) {
+                                            found = Some(m);
+                                            stop = true;
+                                            break;
+                                        }
                                     }
                                 }
                             }
                         }
                         // Generic UFCS container mutation (e.g. `Vec::push(&mut readers, (id, Box::new(...)))`):
-                        // trace sibling arguments to a unique container root carrying `want_dyn`.
-                        let mut arg_match: Option<(PTy, &'b [Region], u32)> = None;
-                        let mut ambiguous = false;
-                        for (j, &other) in es.iter().enumerate() {
-                            if j == arg_i {
-                                continue;
-                            }
-                            if let Ok(Some(m)) = self.trace_dyn_root(other, want_dyn, heads, e) {
-                                match arg_match {
-                                    None => arg_match = Some(m),
-                                    Some((_, prev_s, prev_b)) if prev_b == m.2 && prev_s == m.1 => {}
-                                    Some(_) => {
-                                        ambiguous = true;
-                                        break;
+                        // ONLY trace a sibling argument whose declared parameter type in `callee`'s
+                        // signature shares a generic type parameter with `arg_i`'s parameter type.
+                        if let Some(sig) = sig_for_call
+                            && let Ok(arg_ty) = self.sig_declared(sig, to_u32(arg_i), e)
+                        {
+                            let mut arg_match: Option<(PTy, &'b [Region], u32)> = None;
+                            let mut ambiguous = false;
+                            for (j, &other) in es.iter().enumerate() {
+                                if j == arg_i {
+                                    continue;
+                                }
+                                let Ok(other_ty) = self.sig_declared(sig, to_u32(j), e) else { continue };
+                                if !self.head_shares_type_param(arg_ty, other_ty, heads, e) {
+                                    continue;
+                                }
+                                if let Ok(Some(m)) = self.trace_dyn_root(other, want_dyn, heads, e) {
+                                    match arg_match {
+                                        None => arg_match = Some(m),
+                                        Some((_, prev_s, prev_b)) if prev_b == m.2 && prev_s == m.1 => {}
+                                        Some(_) => {
+                                            ambiguous = true;
+                                            break;
+                                        }
                                     }
                                 }
                             }
-                        }
-                        if !ambiguous && let Some(m) = arg_match {
-                            found = Some(m);
-                            stop = true;
-                        } else {
+                            if !ambiguous && let Some(m) = arg_match {
+                                found = Some(m);
+                                stop = true;
+                                break;
+                            }
+                            if let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                                && self.head_shares_type_param(arg_ty, out_ty, heads, e)
+                            {
+                                next_parent = Some(pe);
+                            } else {
+                                stop = true;
+                            }
+                        } else if is_ctor {
                             next_parent = Some(pe);
+                        } else {
+                            stop = true;
                         }
                         break;
                     }
@@ -1276,24 +1303,43 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         let Some(es) = self.body.expr_lists.get(args.range()) else { continue };
                         let Some(arg_i) = es.iter().position(|&a| a == walk_cur) else { continue };
                         let param_i = to_u32(arg_i + 1);
+                        let mut sig_for_call: Option<crate::SigLife<'_>> = None;
                         if let Some(pos) = self.ck.callees.column::<0>().iter().position(|&x| x == pe)
                             && let Some(&item) = self.ck.callees.column::<1>().get(pos)
                             && let Ok(sig) = facts.sig(item)
-                            && let Some(in_slots) = sig.input(param_i)
-                            && let Ok(in_ty) = self.sig_declared(sig, param_i, e)
                         {
-                            let base = self.fn_sig_param_binder(sig, param_i, heads);
-                            if let Ok(Some(m)) = self.find_unique_dyn_with_binder(in_ty, in_slots, base, heads, want_dyn, e) {
+                            sig_for_call = Some(sig);
+                            if let Some(in_slots) = sig.input(param_i)
+                                && let Ok(in_ty) = self.sig_declared(sig, param_i, e)
+                            {
+                                let base = self.fn_sig_param_binder(sig, param_i, heads);
+                                if let Ok(Some(m)) = self.find_unique_dyn_with_binder(in_ty, in_slots, base, heads, want_dyn, e) {
+                                    found = Some(m);
+                                    stop = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(sig) = sig_for_call
+                            && let Ok(arg_ty) = self.sig_declared(sig, param_i, e)
+                        {
+                            if let Ok(self_ty) = self.sig_declared(sig, 0, e)
+                                && self.head_shares_type_param(arg_ty, self_ty, heads, e)
+                                && let Ok(Some(m)) = self.trace_dyn_root(receiver, want_dyn, heads, e)
+                            {
                                 found = Some(m);
                                 stop = true;
                                 break;
                             }
-                        }
-                        if let Ok(Some(m)) = self.trace_dyn_root(receiver, want_dyn, heads, e) {
-                            found = Some(m);
-                            stop = true;
+                            if let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                                && self.head_shares_type_param(arg_ty, out_ty, heads, e)
+                            {
+                                next_parent = Some(pe);
+                            } else {
+                                stop = true;
+                            }
                         } else {
-                            next_parent = Some(pe);
+                            stop = true;
                         }
                         break;
                     }
@@ -1471,6 +1517,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     cur = base;
                 }
                 Expr::Call { callee, args } => {
+                    if matches!(self.expr_def(callee), Some(Def::Ctor { .. }))
+                        && let Some(&[only]) = self.body.expr_lists.get(args.range())
+                    {
+                        cur = only;
+                        continue;
+                    }
                     let callee_item = self.callee_of(cur).map(|(k, _)| k).or_else(|| match self.expr_def(callee) {
                         Some(Def::Fn(k)) => Some(k),
                         _ => None,
@@ -1484,10 +1536,16 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         if let Some(m) = self.find_unique_dyn_with_binder(out_ty, out_slots, base, heads, want_dyn, e)? {
                             return Ok(Some(m));
                         }
-                    }
-                    if let Some(&[only]) = self.body.expr_lists.get(args.range()) {
-                        cur = only;
-                        continue;
+                        // Only unwrap a unary call when its resolved signature ties its input's
+                        // generic type parameter into its return type (e.g. `RwLock::write(&x)`
+                        // or `Result::unwrap(x)`), never arbitrary `fn token<T>(_: T) -> Token`.
+                        if let Some(&[only]) = self.body.expr_lists.get(args.range())
+                            && let Ok(in_ty) = self.sig_declared(sig, 0, e)
+                            && self.head_shares_type_param(in_ty, out_ty, heads, e)
+                        {
+                            cur = only;
+                            continue;
+                        }
                     }
                     return Ok(None);
                 }
@@ -1501,8 +1559,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         if let Some(m) = self.find_unique_dyn_with_binder(out_ty, out_slots, base, heads, want_dyn, e)? {
                             return Ok(Some(m));
                         }
+                        if let Ok(self_ty) = self.sig_declared(sig, 0, e)
+                            && self.head_shares_type_param(self_ty, out_ty, heads, e)
+                        {
+                            cur = receiver;
+                            continue;
+                        }
                     }
-                    cur = receiver;
+                    return Ok(None);
                 }
                 Expr::Match { scrutinee, arms } => {
                     let Some(arm_list) = self.body.arms.get(arms.range()) else { return Ok(None) };
@@ -1614,6 +1678,49 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             }
         }
         Ok(None)
+    }
+
+    /// Collects every `PNode::Param(p)` appearing inside head-table type `root`.
+    fn collect_head_type_params(&self, root: PTy, heads: &blaze_borrow::Columns<'_>, out: &mut Vec<u32, A>, e: ExprId) {
+        use blaze_borrow::RegionTypes;
+        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
+        stack.push(root);
+        let mut steps = 0u32;
+        while let Some(cur) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                break;
+            }
+            match self.head_node(cur, e) {
+                Ok(PNode::Param(p)) => {
+                    if out.scan_for(&p).is_none() {
+                        out.push(p);
+                    }
+                }
+                Ok(_) => {
+                    if let Ok(kids) = heads.kids(cur) {
+                        for ci in 0..kids.len() {
+                            if let Some(child) = kids.get(ci) {
+                                stack.push(child);
+                            }
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Whether head-table types `a` and `b` share at least one generic type parameter `Param(p)`.
+    fn head_shares_type_param(&self, a: PTy, b: PTy, heads: &blaze_borrow::Columns<'_>, e: ExprId) -> bool {
+        let mut pa: Vec<u32, A> = Vec::new_in(self.alloc);
+        self.collect_head_type_params(a, heads, &mut pa, e);
+        if pa.is_empty() {
+            return false;
+        }
+        let mut pb: Vec<u32, A> = Vec::new_in(self.alloc);
+        self.collect_head_type_params(b, heads, &mut pb, e);
+        pa.iter().any(|p| pb.scan_for(p).is_some())
     }
 
     /// Searches a head-table type `(root, slots)` in exact pre-order (tracking binder indices

@@ -216,6 +216,55 @@ fn dyn_expect_negative_elided(v: &mut Vec<(u32, Box<dyn Fn(&(dyn MyErr + '_)) ->
     v.push((4u32, Box::new(move |link| link.downcast())));
 }
 
+fn first_arg<A, B>(a: A, _b: B) -> A {
+    a
+}
+
+fn dyn_expect_negative_unrelated_sibling() {
+    let _f: Box<dyn Fn(&(dyn MyErr + '_)) -> bool> =
+        first_arg(Box::new(move |link| link.downcast()), &READERS);
+}
+
+struct Sink<T>(PhantomData<T>);
+impl<T> Sink<T> {
+    fn push(&mut self, _v: T) {}
+}
+
+fn unrelated_sink<U, V>(_src: &U) -> Sink<V> {
+    Sink(PhantomData)
+}
+
+fn dyn_expect_negative_unrelated_unary_call() {
+    let mut s = unrelated_sink(&READERS);
+    if false {
+        let f: Box<dyn Fn(&(dyn MyErr + '_)) -> bool> = Box::new(|_| false);
+        s.push(f);
+    }
+    s.push(Box::new(move |link| link.downcast()));
+}
+
+struct OutlivesToken<'a, T>(PhantomData<&'a ()>, PhantomData<T>);
+impl<'a, T: 'a> Copy for OutlivesToken<'a, T> {}
+impl<'a, T: 'a> Clone for OutlivesToken<'a, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_outlives_static_scalar_ok() {
+    let t: OutlivesToken<'static, u8> = OutlivesToken(PhantomData, PhantomData);
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+fn copy_outlives_unproven_err<'short>(_x: &'short u8) {
+    let t: OutlivesToken<'static, &'short u8> = OutlivesToken(PhantomData, PhantomData);
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
 trait Sealed {}
 trait Alignment: Sealed {}
 trait Invariants {
@@ -335,6 +384,7 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         "dyn_expect_param_vec_tuple",
         "copy_proj_shared_ok",
         "copy_proj_generic_tuple_shared_ok",
+        "copy_outlives_static_scalar_ok",
     ] {
         let body = find(ok_fn);
         let (types, v) = world.check_borrows(body, heap.alloc());
@@ -342,25 +392,32 @@ fn dyn_closure_expectation_and_conditional_copy_projection() {
         assert!(v.is_clean(), "{ok_fn} borrows: {}", shown(text_of(body), &v));
     }
 
-    // Negative control: `dyn Fn(&(dyn MyErr + '_))` MUST still fail with E0521.
-    {
-        let body = find("dyn_expect_negative_elided");
+    // Negative controls: non-`'static` `dyn Fn(&(dyn MyErr + '_))` MUST still fail with E0521
+    // (including beside an unrelated `&READERS` sibling arg or through an unrelated unary call).
+    for err_fn in [
+        "dyn_expect_negative_elided",
+        "dyn_expect_negative_unrelated_sibling",
+        "dyn_expect_negative_unrelated_unary_call",
+    ] {
+        let body = find(err_fn);
         let (types, v) = world.check_borrows(body, heap.alloc());
-        assert!(types.is_clean(), "dyn_expect_negative_elided types: {types:?}");
-        assert!(v.refused.is_none(), "dyn_expect_negative_elided refused: {:?}", v.refused);
+        assert!(types.is_clean(), "{err_fn} types: {types:?}");
+        assert!(v.refused.is_none(), "{err_fn} refused: {:?}", v.refused);
         assert!(
             v.findings.iter().any(|d| d.code == "E0521"),
-            "dyn_expect_negative_elided expected E0521, got: {}",
+            "{err_fn} expected E0521, got: {}",
             shown(text_of(body), &v)
         );
     }
 
-    // Negative controls: `Ptr` with `Aliasing = Exclusive` MUST still fail with E0382
-    // (including when the invariant marker itself implements `Copy` or is a generic tuple).
+    // Negative controls: `Ptr` with `Aliasing = Exclusive` (including Copy markers and generic
+    // tuples) and `OutlivesToken<'static, &'short u8>` with an unproven `T: 'a` `Copy` bound
+    // MUST still fail with E0382.
     for err_fn in [
         "copy_proj_exclusive_err",
         "copy_proj_exclusive_copy_arg_err",
         "copy_proj_generic_tuple_exclusive_err",
+        "copy_outlives_unproven_err",
     ] {
         let body = find(err_fn);
         let (types, v) = world.check_borrows(body, heap.alloc());
