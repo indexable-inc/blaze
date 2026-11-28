@@ -269,6 +269,11 @@ pub trait Heads {
     fn const_bits(&self, key: LibKey) -> Option<u128> {
         self.const_len(key).map(u128::from)
     }
+    /// The evaluated primitive type (`bool`, `char`, `Int`, `Uint`) of the evaluated constant
+    /// `key`, when known.
+    fn const_ty(&self, _key: LibKey) -> Option<PNode> {
+        None
+    }
     /// Takes the anonymous constant `ask` to be made a head and evaluated
     /// ([`super::anon`]); `false` where these heads have no evaluator behind them (the
     /// default), and the expression stays the head's refusal.
@@ -758,11 +763,36 @@ fn bare_name<'v>(v: &View<'v>, t: lf::TypeId) -> Result<Option<&'v str>, Why> {
     }
 }
 
+/// Reads the target pointer width (`32` or `64`) from `module`'s crate cfg atoms, refusing with
+/// a named error when the crate or its `target_pointer_width` atom is missing rather than
+/// assuming 64-bit.
+fn target_pointer_width<'n, S: NamesSource<'n>>(names: S, module: LibKey, r: Range) -> Result<u32, Why> {
+    let krate = names
+        .crate_of(module)
+        .ok_or(Why::Unsupported("a pointer-sized constant literal whose module's crate is not read", r))?;
+    let atoms = names
+        .cfg_atoms(krate)
+        .ok_or(Why::Unsupported("a pointer-sized constant literal whose crate cfg is not read", r))?;
+    atoms
+        .iter()
+        .find(|(n, _)| *n == "target_pointer_width")
+        .and_then(|(_, w)| w.and_then(|w| w.parse::<u32>().ok()))
+        .filter(|&b| b == 32 || b == 64)
+        .ok_or(Why::Unsupported("a pointer-sized constant literal whose crate cfg has no valid `target_pointer_width`", r))
+}
+
 /// A const argument's value as the checker holds it (`PNode::ConstValue`), from the literal
 /// `text` of type `want` (the Reference, "Literal expressions"): `true`, `false`, or an integer
 /// literal, `-` before it for a signed type; its bits are the value's in `want`'s width, as
 /// blaze-consteval writes them. `None`: the text is no such literal.
-fn literal_value(tys: &mut PortableTys<'_>, text: &str, want: PTy, r: Range) -> Result<Option<PTy>, Why> {
+fn literal_value<'n, S: NamesSource<'n>>(
+    tys: &mut PortableTys<'_>,
+    text: &str,
+    want: PTy,
+    names: S,
+    module: LibKey,
+    r: Range,
+) -> Result<Option<PTy>, Why> {
     let node = *tys.view().get(want).ok_or(program(format!("a const parameter's type is past the type table"), r))?;
     let signed = match node {
         PNode::Bool => {
@@ -778,7 +808,6 @@ fn literal_value(tys: &mut PortableTys<'_>, text: &str, want: PTy, r: Range) -> 
         _ => return Ok(None),
     };
     let Some(&(name, _)) = PRIMS.iter().find(|(_, n)| *n == node) else { return Ok(None) };
-    let bits = int_bits(name);
     let (neg, digits) = match text.strip_prefix('-') {
         Some(rest) => (true, rest.trim_start()),
         None => (false, text),
@@ -790,6 +819,27 @@ fn literal_value(tys: &mut PortableTys<'_>, text: &str, want: PTy, r: Range) -> 
     if neg && !signed {
         return Err(program(format!("the const argument `{text}` is negative; its type `{name}` is unsigned"), r));
     }
+    let bits = match name {
+        "isize" | "usize" => match target_pointer_width(names, module, r) {
+            Ok(b) => b,
+            Err(err) => {
+                // Never silently assume 64-bit: if the crate's cfg was not read at all, or if
+                // the literal is negative (width-dependent two's complement) or exceeds 32-bit
+                // range, refuse with the named missing-pointer-width error. Only a non-negative
+                // literal that fits in 32 bits under an already-read empty synthetic cfg has
+                // identical validity and bit pattern across 32-bit and 64-bit targets.
+                let cfg_read = names.crate_of(module).and_then(|k| names.cfg_atoms(k)).is_some();
+                let fits_32 = !neg
+                    && if signed {
+                        value <= u128::from(i32::MAX.cast_unsigned())
+                    } else {
+                        value <= u128::from(u32::MAX)
+                    };
+                if cfg_read && fits_32 { 32 } else { return Err(err) }
+            }
+        },
+        _ => int_bits(name),
+    };
     let mask = if bits == 128 { u128::MAX } else { (1u128 << bits) - 1 };
     let most = if signed { mask >> 1 } else { mask };
     let fits = value <= most || (neg && value == most + 1);
@@ -800,8 +850,8 @@ fn literal_value(tys: &mut PortableTys<'_>, text: &str, want: PTy, r: Range) -> 
     Ok(Some(intern(tys, PNode::ConstValue { ty: want, bits })?))
 }
 
-/// An integer type's width by its name; `isize` and `usize` are 64 bits here, as
-/// [`usize_literal`] takes them.
+/// A fixed-width integer type's width by its name (`isize`/`usize` are read via
+/// [`target_pointer_width`]).
 fn int_bits(name: &str) -> u32 {
     match name {
         "i8" | "u8" => 8,
@@ -1120,11 +1170,11 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// ([`Why::ConstPath`] naming the text).
     fn const_value_bits(&self, env: &Env<'_>, text: &str, r: Range, ty: Option<PNode>) -> Result<u128, Why> {
         let text = text.trim();
-        self.const_value_bits_owned(env, text, text, r, ty, None, None)
+        self.const_value_bits_owned_typed(env, text, text, r, ty, None, None).map(|(bits, _)| bits)
     }
 
     #[expect(clippy::too_many_arguments, reason = "const value evaluation carrying original text, head owner, and substitution edits")]
-    fn const_value_bits_owned(
+    fn const_value_bits_owned_typed(
         &self,
         env: &Env<'_>,
         orig_source: &str,
@@ -1133,7 +1183,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         ty: Option<PNode>,
         carried_owner: Option<(super::anon::HeadOwner, Option<&str>, Option<super::anon::HeadSite<'n>>)>,
         carried_edits: Option<blaze_own::AVec<'static, super::anon::TextEdit>>,
-    ) -> Result<u128, Why> {
+    ) -> Result<(u128, Option<PNode>), Why> {
         let text = text.trim();
         let orig_source = orig_source.trim();
         let other = || Why::ConstPath(Box::from(text), r);
@@ -1197,7 +1247,8 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 if let (None, Some(why)) = (self.heads.const_bits(found.key), self.heads.anon_failed(found.key)) {
                     return Err(Why::ConstPath(format!("{text}: {why}").into_boxed_str(), r));
                 }
-                return self.heads.const_bits(found.key).ok_or(Why::NeedConst(found.key, r));
+                let bits = self.heads.const_bits(found.key).ok_or(Why::NeedConst(found.key, r))?;
+                return Ok((bits, self.heads.const_ty(found.key)));
             }
         }
         let Some(mut ask) = ty.and_then(|ty| super::anon::Ask::of(env.module, ty, text)) else { return Err(other()) };
@@ -1242,7 +1293,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             }
         }
         if let Some(bits) = self.heads.const_bits(ask.need) {
-            return Ok(bits);
+            return Ok((bits, self.heads.const_ty(ask.need)));
         }
         // Tried and refused by the evaluator (`size_of::<u8>()` where a call it needs does not
         // check): the head is refused by the expression's name with the evaluator's reason, as
@@ -1333,7 +1384,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // expression, never a literal with the suffix `usize << 0`.
         let digits = text.strip_prefix('-').map_or(text, str::trim_start);
         if Self::one_token(digits) {
-            if let Some(value) = literal_value(tys, text, ty, r)? {
+            if let Some(value) = literal_value(tys, text, ty, self.resolver.names, env.module, r)? {
                 return Ok(value);
             }
         }
@@ -1346,9 +1397,17 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // (`[u8; size_of::<Self>()]` in `impl u16`: front2/const_open.rs, state one): its
         // anonymous constant is filed with that `Self` in scope. Every other expression is
         // read as before; one over a generic parameter is refused there by name.
-        let bits = match super::const_open::ground_self(tys.view(), env, text) {
-            Some((self_ty, self_node)) => super::anon::self_value(self.heads, env.module, node, orig_text, text, self_ty, self_node, active_marks, orig_owner, inherent_edits, r)?,
-            None => self.const_value_bits_owned(env, orig_text, text, r, node, orig_owner, inherent_edits)?,
+        let (bits, eval_ty) = match super::const_open::ground_self(tys.view(), env, text) {
+            Some((self_ty, self_node)) => super::anon::self_value_typed(self.heads, env.module, node, orig_text, text, self_ty, self_node, active_marks, orig_owner, inherent_edits, r)?,
+            None => self.const_value_bits_owned_typed(env, orig_text, text, r, node, orig_owner, inherent_edits)?,
+        };
+        let ty = if node == Some(PNode::Infer) {
+            match eval_ty {
+                Some(prim) => intern(tys, prim)?,
+                None => ty,
+            }
+        } else {
+            ty
         };
         intern(tys, PNode::ConstValue { ty, bits })
     }
@@ -1553,16 +1612,22 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                             let is_type = local_type || (!is_const && (param.is_some() || names_a_type()));
                             if is_type {
                                 self.path_ty(tys, env, v, tp, &[])?
-                            } else if let Ok(Some(super::const_open::LocalArg::Const(bits))) = local {
-                                // The constant's bits in the parameter's type, as a module
-                                // constant's are (`const_term`). A scalar parameter only: a
-                                // fieldless enum's value is its variant under the enum's key
-                                // (const_enum.rs), which a body's constant's bits are not.
+                            } else if let Ok(Some(super::const_open::LocalArg::Const(bits, eval_ty))) = local {
+                                // The constant's bits in its evaluated primitive type (falling
+                                // back to the parameter's expected type only when evaluation
+                                // carried no primitive type), as `const_term` does for module
+                                // constants. A scalar parameter only: a fieldless enum's value
+                                // is its variant under the enum's key (const_enum.rs), which a
+                                // body's constant's bits are not.
                                 let ty = self.const_want(tys, env, v, target, index, ar)?;
                                 if !matches!(tys.view().get(ty), Some(PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Infer | PNode::Error)) {
                                     return Err(Why::Unsupported("a const argument naming a `const` the body declares, for a parameter whose type is no integer, `bool` or `char`", ar));
                                 }
-                                intern(tys, PNode::ConstValue { ty, bits })?
+                                let val_ty = match eval_ty {
+                                    Some(prim) => intern(tys, prim)?,
+                                    None => ty,
+                                };
+                                intern(tys, PNode::ConstValue { ty: val_ty, bits })?
                             } else if let Err(why) = local {
                                 // A body's constant not evaluated yet (`Why::NeedConst`: the
                                 // driver evaluates it and lowers again), or a body's value
@@ -7300,4 +7365,138 @@ fn arg_slots<'p>(
     let ln = usize::try_from(len).ok()?;
     let end = st.checked_add(ln)?;
     Some((pool.get(st..end)?, b))
+}
+
+#[cfg(test)]
+mod ptr_width_tests {
+    use super::*;
+    use blaze_ids::ContentId;
+    use blaze_own::AVec;
+
+    #[derive(Clone, Copy)]
+    struct CfgOnlySource<'n> {
+        krate: Option<usize>,
+        atoms: Option<&'n [(&'n str, Option<&'n str>)]>,
+    }
+
+    impl<'n> NamesSource<'n> for CfgOnlySource<'n> {
+        fn solved(self) -> Option<&'n blaze_scope::resolve::Names<'n>> { None }
+        fn head_lowerings(self) -> Option<&'n super::super::heads::HeadLowerings> { None }
+        fn gap(self, _question: &'static str, _key: Option<LibKey>) {}
+        fn crate_count(self) -> usize { usize::from(self.krate.is_some()) }
+        fn crate_of(self, _key: LibKey) -> Option<usize> { self.krate }
+        fn crate_key(self, _krate: usize) -> Option<blaze_id::CrateItemKey> { None }
+        fn root_module(self, _krate: usize) -> Option<LibKey> { None }
+        fn edition_of(self, _krate: usize) -> Option<blaze_surface::Edition> { None }
+        fn cfg_atoms(self, _krate: usize) -> Option<&'n [(&'n str, Option<&'n str>)]> { self.atoms }
+        fn proc_macro(self, _krate: usize) -> Option<bool> { Some(false) }
+        fn std_is(self, _krate: usize) -> Option<blaze_unit_graph::StdIs> { None }
+        fn root_attrs(self, _krate: usize) -> Option<blaze_scope::graph::RootAttrs> { None }
+        fn has_feature(self, _krate: usize, _name: &str) -> Option<bool> { None }
+        fn linked<'a>(self, _roots: &[usize], _alloc: Alloc<'a>) -> Option<Result<super::super::linked::Linked<'a>, super::super::linked::RootsError>> { None }
+        fn sysroot_std(self) -> Option<Option<usize>> { None }
+        fn may_write_incoherent(self, _krate: usize) -> Option<bool> { None }
+        fn walk(self, module: LibKey, _ns: blaze_surface::Namespace, _written: blaze_scope::names::Written<'_, &str>) -> Result<blaze_scope::names::Resolved, blaze_scope::names::PathError> {
+            Err(blaze_scope::names::PathError { module, at: 0, why: blaze_scope::names::Why::NotRead { module, layer: blaze_scope::names::Unheld::Step } })
+        }
+        fn written_module(self, module: LibKey, _n: u8) -> Result<LibKey, blaze_scope::names::PathError> {
+            Err(blaze_scope::names::PathError { module, at: 0, why: blaze_scope::names::Why::NotRead { module, layer: blaze_scope::names::Unheld::Step } })
+        }
+        fn traits_in_scope<'b>(self, module: LibKey, _alloc: Alloc<'b>) -> Result<AVec<'b, LibKey>, blaze_scope::names::PathError> {
+            Err(blaze_scope::names::PathError { module, at: 0, why: blaze_scope::names::Why::NotRead { module, layer: blaze_scope::names::Unheld::Step } })
+        }
+        fn traits_exported<'b>(self, module: LibKey, _alloc: Alloc<'b>) -> Result<AVec<'b, LibKey>, blaze_scope::names::PathError> {
+            Err(blaze_scope::names::PathError { module, at: 0, why: blaze_scope::names::Why::NotRead { module, layer: blaze_scope::names::Unheld::Step } })
+        }
+        fn variants(self, _owner: LibKey) -> Option<super::super::source::VariantRows<'n>> { None }
+        fn variant_of(self, _variant: LibKey) -> Option<(LibKey, u32)> { None }
+        fn has_text(self, _key: LibKey) -> bool { false }
+        fn text_of(self, _key: LibKey) -> Option<blaze_scope::task::ItemText<'n>> { None }
+        fn name_of(self, _key: LibKey) -> Option<&'n str> { None }
+        fn home_of(self, _key: LibKey) -> Option<LibKey> { None }
+        fn place_of(self, _key: LibKey) -> Option<blaze_scope::resolve::Place> { None }
+        fn item_start(self, _key: LibKey) -> Option<(blaze_scope::resolve::At, u32)> { None }
+        fn file_paths(self, _krate: usize, _file: u32) -> Option<super::super::source::FilePaths<'n>> { None }
+        fn file_text(self, _krate: usize, _file: u32) -> Option<&'n str> { None }
+        fn call_origin(self, _krate: usize, call: LibKey) -> Result<super::super::expansion_origin::CallOrigin<'n>, super::super::expansion_origin::Unmapped> {
+            Err(super::super::expansion_origin::Unmapped::NotServed { call })
+        }
+        fn member_beginning(self, _krate: usize, _item: blaze_typeck::ItemKey) -> Result<Option<LibKey>, crate::seam::PositionGap> { Ok(None) }
+        fn enclosing_keys(self, _krate: usize, _visit: impl FnMut(LibKey) -> Result<(), crate::seam::PositionGap>) -> Result<(), crate::seam::PositionGap> { Ok(()) }
+        fn expansion_text(self, _krate: usize, _call: LibKey) -> Option<&'n str> { None }
+        fn text_marks(self, _krate: usize, _call: LibKey) -> Result<Option<blaze_scope::crate_roots::TextMarks<'n>>, super::super::item_site::MarksLost> { Ok(None) }
+        fn extern_abi(self, _key: LibKey) -> Option<Option<&'n str>> { None }
+        fn is_wasm_import(self, _key: LibKey) -> Option<bool> { None }
+        fn attr_value(self, _key: LibKey, _attr: &'static str) -> Option<Option<blaze_scope::attr_values::RowValue<'n>>> { None }
+        fn in_sans_io_scope(self, _key: LibKey, _module: LibKey) -> bool { false }
+        fn kind_of_item(self, _key: LibKey) -> Option<blaze_surface::ItemKind> { None }
+        fn detail_of(self, _key: LibKey) -> Option<blaze_surface::ItemDetail> { None }
+        fn is_ctor(self, _key: LibKey) -> bool { false }
+        fn each_member(self, _owner: LibKey, _each: &mut dyn FnMut(super::super::source::MemberOf<'n>)) -> bool { false }
+        fn member_owner(self, _member: LibKey) -> Option<(LibKey, &'n str)> { None }
+        fn each_impl(self, _krate: usize, _each: &mut dyn FnMut(super::super::index::ImplAt<'n>)) {}
+        fn each_impl_row(self, _krate: usize, _each: &mut dyn FnMut(blaze_scope::items_record::ImplRow<'n>)) -> bool { false }
+        fn impl_with_header(self, _krate: usize, _key: LibKey, _module: LibKey) -> Option<super::super::index::ImplAt<'n>> { None }
+        fn each_lang(self, _krate: usize, _each: &mut dyn FnMut(&'n str, LibKey)) {}
+        fn macro_body_of(self, module: LibKey, _written: blaze_scope::names::Written<'_, &str>) -> Result<Option<blaze_scope::task::MacroBody<'n>>, blaze_scope::names::PathError> {
+            Err(blaze_scope::names::PathError { module, at: 0, why: blaze_scope::names::Why::NotRead { module, layer: blaze_scope::names::Unheld::Step } })
+        }
+        fn macro_at(self, module: LibKey, _written: blaze_scope::names::Written<'_, &str>) -> Result<super::super::source::MacroAt<'n>, blaze_scope::names::PathError> {
+            Err(blaze_scope::names::PathError { module, at: 0, why: blaze_scope::names::Why::NotRead { module, layer: blaze_scope::names::Unheld::Step } })
+        }
+        fn module_path(self, _module: LibKey) -> Option<&'n str> { None }
+        fn failed_call<'b>(self, _call: LibKey, _bump: blaze_own::Bump<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
+        where
+            'n: 'b,
+        {
+            None
+        }
+        fn each_item(self, _krate: usize, _each: &mut dyn FnMut(LibKey, LibKey)) -> bool { false }
+        fn each_export_candidate(self, _krate: usize, _alloc: Alloc<'_>, _each: &mut dyn FnMut(LibKey, Option<&'n str>, bool, bool)) -> bool { false }
+        fn block_binding(self, _module: LibKey, _ns: blaze_surface::Namespace, _name: &str) -> Option<Option<blaze_surface::Binding>> { None }
+        fn binds(self, _module: LibKey, _ns: blaze_surface::Namespace, _name: &'n str) -> bool { false }
+        fn key_beginning(self, _first: [u8; 16]) -> Option<LibKey> { None }
+        fn declared_lifetimes(self, _key: LibKey) -> Option<u32> { None }
+        fn assoc_lifetimes(self, _trait_: LibKey, _name: blaze_typeck::Name) -> Option<u32> { None }
+    }
+
+    #[test]
+    fn literal_value_refuses_missing_target_pointer_width_and_enforces_32_bit_overflow() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut tys = PortableTys::new_in(alloc);
+        let usize_ty = tys.intern(PNode::Uint(tc::UintTy::Usize)).expect("usize");
+        let u8_ty = tys.intern(PNode::Uint(tc::UintTy::U8)).expect("u8");
+        let module = LibKey(ContentId([9; 32]));
+        let r = Range::new(0, 1);
+
+        // Missing `cfg_atoms` refuses pointer-sized literals instead of silently assuming 64-bit.
+        let no_cfg = CfgOnlySource { krate: Some(0), atoms: None };
+        let err = literal_value(&mut tys, "0x1_0000_0000usize", usize_ty, no_cfg, module, r).expect_err("missing cfg_atoms must refuse");
+        assert!(matches!(err, Why::Unsupported(msg, _) if msg.contains("crate cfg")), "unexpected err: {err:?}");
+
+        // Present `cfg_atoms` without `target_pointer_width` refuses any value whose validity or
+        // bit representation depends on 32-bit vs 64-bit (never silently assumes 64-bit).
+        let isize_ty = tys.intern(PNode::Int(tc::IntTy::Isize)).expect("isize");
+        let empty_cfg = CfgOnlySource { krate: Some(0), atoms: Some(&[]) };
+        let err = literal_value(&mut tys, "0x1_0000_0000usize", usize_ty, empty_cfg, module, r).expect_err("missing target_pointer_width must refuse > u32::MAX");
+        assert!(matches!(err, Why::Unsupported(msg, _) if msg.contains("target_pointer_width")), "unexpected err: {err:?}");
+        let err = literal_value(&mut tys, "-1isize", isize_ty, empty_cfg, module, r).expect_err("missing target_pointer_width must refuse negative isize");
+        assert!(matches!(err, Why::Unsupported(msg, _) if msg.contains("target_pointer_width")), "unexpected err: {err:?}");
+
+        // Fixed-width literals (`u8`) do not depend on `target_pointer_width`.
+        let got_u8 = literal_value(&mut tys, "1u8", u8_ty, no_cfg, module, r).expect("u8 succeeds without cfg").expect("u8 literal");
+        assert_eq!(tys.view().get(got_u8), Some(&PNode::ConstValue { ty: u8_ty, bits: 1 }));
+
+        // 32-bit target rejects `0x1_0000_0000usize` overflow.
+        let w32 = [("target_pointer_width", Some("32"))];
+        let src32 = CfgOnlySource { krate: Some(0), atoms: Some(&w32) };
+        let err = literal_value(&mut tys, "0x1_0000_0000usize", usize_ty, src32, module, r).expect_err("32-bit must reject 2^32 usize");
+        assert!(matches!(err, Why::Program(ref msg, _) if msg.contains("overflows `usize`")), "unexpected 32-bit err: {err:?}");
+
+        // 64-bit target accepts `0x1_0000_0000usize`.
+        let w64 = [("target_pointer_width", Some("64"))];
+        let src64 = CfgOnlySource { krate: Some(0), atoms: Some(&w64) };
+        let got64 = literal_value(&mut tys, "0x1_0000_0000usize", usize_ty, src64, module, r).expect("64-bit accepts 2^32").expect("usize literal");
+        assert_eq!(tys.view().get(got64), Some(&PNode::ConstValue { ty: usize_ty, bits: 0x1_0000_0000 }));
+    }
 }

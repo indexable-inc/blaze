@@ -2639,7 +2639,8 @@ fn eval_len_inner<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
         Ok(asked) => {
             let active_before = r.store.active_consts_len();
             r.store.push_active_const(c);
-            let got = consts.value(r, prepared, checker_of(c)).map(int_of);
+            let item = checker_of(c);
+            let got = consts.value(r, prepared, item).map(int_of).map(|bits| (bits, consts.body_prim_ty(item)));
             r.store.truncate_active_consts(active_before);
             (got, asked)
         }
@@ -2656,7 +2657,7 @@ fn eval_len_inner<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
     // `anon_failed` so they propagate cleanly and can never poison a cached `AliasGap`.
     let anonymous = |k: LibKey| super::anon::need_key(checker_of(k)) == k;
     let eval_alloc = r.store.work_alloc();
-    let mut more: blaze_own::Vec<(LibKey, u128), blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(eval_alloc);
+    let mut more: blaze_own::Vec<(LibKey, u128, Option<tc::PNode>), blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(eval_alloc);
     let mut failed: blaze_own::Vec<(LibKey, Box<str>), blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(eval_alloc);
     let mut infra_err: Option<ConstFail> = None;
     for &o in asked.iter() {
@@ -2665,10 +2666,11 @@ fn eval_len_inner<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
         }
         let active_before = r.store.active_consts_len();
         r.store.push_active_const(o);
-        let got = consts.value(r, prepared, checker_of(o)).map(int_of);
+        let item = checker_of(o);
+        let got = consts.value(r, prepared, item).map(int_of);
         r.store.truncate_active_consts(active_before);
         match got {
-            Ok(Some(bits)) => more.push((o, bits)),
+            Ok(Some(bits)) => more.push((o, bits, consts.body_prim_ty(item))),
             Ok(None) => failed.push((o, Box::from("its value is not an integer of at most 16 bytes"))),
             Err(e) if e.infra_head_error().is_some() => {
                 infra_err = Some(e);
@@ -2681,8 +2683,8 @@ fn eval_len_inner<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
     if let Some(e) = infra_err {
         return Err(e);
     }
-    for &(o, bits) in more.iter() {
-        r.store.maps.file_bits(o, bits);
+    for &(o, bits, prim_ty) in more.iter() {
+        r.store.maps.file_bits_with_ty(o, bits, prim_ty);
     }
     for (o, why) in failed {
         r.store.maps.noted_const_result(o);
@@ -2697,8 +2699,9 @@ fn eval_len_inner<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
     };
     // The value's bits in its own type's width (at most 16 bytes): every reader knows the
     // type. `const_lens` keeps those of 64 bits for `Heads::const_len`.
-    let bits = value?.ok_or(ConstFail::NotUsize { item: checker_of(c) })?;
-    r.store.maps.file_bits(c, bits);
+    let (bits, prim_ty) = value?;
+    let bits = bits.ok_or(ConstFail::NotUsize { item: checker_of(c) })?;
+    r.store.maps.file_bits_with_ty(c, bits, prim_ty);
     if let Ok(v) = u64::try_from(bits) {
         r.store.maps.const_lens.insert(c, v);
     }

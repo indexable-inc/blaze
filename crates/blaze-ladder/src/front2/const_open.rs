@@ -355,9 +355,9 @@ pub(super) enum LocalArg {
     /// resolved as a type.").
     Type,
     /// A `const` the body declares (or imports via a block `use`), by its evaluated bits
-    /// (`foo::<CHUNK_SIZE>()` with `const CHUNK_SIZE: usize = ..;` or `use m::CHUNK_SIZE;` in
-    /// the body: the pinned core's ptr::swap_nonoverlapping_bytes).
-    Const(u128),
+    /// and primitive type when known (`foo::<CHUNK_SIZE>()` with `const CHUNK_SIZE: usize = ..;`
+    /// or `use m::CHUNK_SIZE;` in the body: the pinned core's ptr::swap_nonoverlapping_bytes).
+    Const(u128, Option<PNode>),
 }
 
 /// The local item that the plain-name generic argument `t` (its text `name`, at `range`) of
@@ -396,7 +396,7 @@ pub(super) fn local_arg<'n, H: Heads + ?Sized, S: NamesSource<'n>>(
         return match resolve_use_target(resolver, marks, locals, owner, module, view, scope, Some(p), name, &row, Ns::Value, range)? {
             Some(target) if target.kind == Kind::Const => {
                 let bits = const_item_bits(heads, target.key, name, range)?;
-                Ok(Some(LocalArg::Const(bits)))
+                Ok(Some(LocalArg::Const(bits, heads.const_ty(target.key))))
             }
             Some(_) => Err(Why::Unsupported("a const argument named through a `use` declared in the body that is not a constant", range)),
             None => {
@@ -412,7 +412,7 @@ pub(super) fn local_arg<'n, H: Heads + ?Sized, S: NamesSource<'n>>(
     match row.kind {
         LocalKind::Const => {
             let bits = const_item_bits(heads, row.key, name, range)?;
-            Ok(Some(LocalArg::Const(bits)))
+            Ok(Some(LocalArg::Const(bits, heads.const_ty(row.key))))
         }
         _ => Err(Why::Unsupported("a const argument naming an item of the body that is not a constant", range)),
     }

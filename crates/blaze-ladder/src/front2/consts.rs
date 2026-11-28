@@ -1154,6 +1154,16 @@ impl<'n> Consts<'n> {
         result
     }
 
+    /// The evaluated primitive type (`bool`, `char`, signed or unsigned integer) of the checked
+    /// constant body `item`, when known.
+    pub fn body_prim_ty(&self, item: ItemKey) -> Option<tc::PNode> {
+        let body = self.bodies.iter().find(|b| b.key == item)?;
+        let root = body.root.unwrap_or(body.typeck.root);
+        let ty = *body.checked.expr_ty.get(usize::try_from(root.0).ok()?)?;
+        let node = *body.checked.types.view().get(ty)?;
+        matches!(node, tc::PNode::Bool | tc::PNode::Char | tc::PNode::Int(_) | tc::PNode::Uint(_)).then_some(node)
+    }
+
     /// Evaluates the constant `c` a head or a body's conversion needs before an evaluation
     /// can go on ([`Consts::value_at`]'s work list) and files it exactly as `check::eval_len`
     /// files the one it is asked: its bits in `Maps::const_bits` (and `const_lens` when they
@@ -1169,10 +1179,10 @@ impl<'n> Consts<'n> {
         let item = super::keys::checker_of(c);
         let anonymous = super::anon::need_key(item) == c;
         super::anon::file_asked(&mut *r.store, &mut *r.keys).map_err(|e| ConstFail::Eval(format!("constant {item:?}: {e}").into_boxed_str()))?;
-        let bits = match self.value_key(r, prepared, item, Root::Plain, None) {
+        let (bits, prim_ty) = match self.value_key(r, prepared, item, Root::Plain, None) {
             Ok(key) => {
                 let row = self.records.iter().find(|x| x.record.key == key).ok_or(ConstFail::MissingRecord { item, key })?;
-                int_of(&row.record)
+                (int_of(&row.record), self.body_prim_ty(item))
             }
             Err(e) if !anonymous || super::const_open::needed_first(&e).is_some() || e.infra_head_error().is_some() => return Err(e),
             Err(e) => {
@@ -1183,7 +1193,7 @@ impl<'n> Consts<'n> {
         };
         match bits {
             Some(bits) => {
-                r.store.maps.file_bits(c, bits);
+                r.store.maps.file_bits_with_ty(c, bits, prim_ty);
                 if let Ok(v) = u64::try_from(bits) {
                     r.store.maps.const_lens.insert(c, v);
                 }

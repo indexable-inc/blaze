@@ -15,15 +15,15 @@ use super::world_items::{BodyWorld, Fill, Gap};
 use crate::resolve::{Kind, Ns, ResolveError};
 
 /// Stack-backed buffer for path segments (<= 8 segments hit zero heap allocations; longer
-/// paths spill into the body's resettable scratch `Alloc<'static>`).
-enum SmallPathBuf<'a> {
+/// paths spill into the scratch `Alloc`).
+pub(super) enum SmallPathBuf<'a, 'b> {
     Inline { buf: [&'a str; 8], len: usize },
-    Spill(OwnVec<&'a str, Alloc<'static>>),
+    Spill(OwnVec<&'a str, Alloc<'b>>),
 }
 
-impl<'a> SmallPathBuf<'a> {
+impl<'a, 'b> SmallPathBuf<'a, 'b> {
     #[inline]
-    fn with_capacity(cap: usize, alloc: Alloc<'static>) -> Self {
+    fn with_capacity(cap: usize, alloc: Alloc<'b>) -> Self {
         if cap <= 8 {
             Self::Inline { buf: [""; 8], len: 0 }
         } else {
@@ -32,7 +32,7 @@ impl<'a> SmallPathBuf<'a> {
     }
 
     #[inline]
-    fn push(&mut self, value: &'a str, alloc: Alloc<'static>) {
+    fn push(&mut self, value: &'a str, alloc: Alloc<'b>) {
         match self {
             Self::Inline { buf, len } => {
                 if let Some(slot) = buf.get_mut(*len) {
@@ -50,7 +50,7 @@ impl<'a> SmallPathBuf<'a> {
     }
 }
 
-impl<'a> core::ops::Deref for SmallPathBuf<'a> {
+impl<'a, 'b> core::ops::Deref for SmallPathBuf<'a, 'b> {
     type Target = [&'a str];
 
     #[inline]
@@ -215,35 +215,25 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
             written = through;
             at_module = hit.at;
         }
+        let mut use_dollar = None;
         if let Some(row) = via_use {
-            let mut through = SmallPathBuf::with_capacity(row.path.len() + written.len(), alloc);
-            if row.abs {
+            let expanded = match expand_local_use(self.names, &self.store.locals, self.owner, self.module, row, written.get(1..).unwrap_or(&[]), alloc) {
+                Ok(e) => e,
+                Err(gap) => return self.gap(Gap::Local(gap)),
+            };
+            let mut through = SmallPathBuf::with_capacity(expanded.segments.len() + usize::from(expanded.abs), alloc);
+            if expanded.abs {
                 through.push("{{root}}", alloc);
             }
-            for &seg in row.path.iter() {
+            for &seg in expanded.segments.iter() {
                 through.push(seg, alloc);
             }
-            for &seg in written[1..].iter() {
-                through.push(seg, alloc);
-            }
-            shift = (through.len() - written.len()) as u32;
+            shift = u32::try_from(through.len().saturating_sub(written.len())).unwrap_or(u32::MAX);
             written = through;
-            // The `use`'s path is read where the `use` is written (super::scope_table states the
-            // order): a first segment that is an item of a block around the `use` (`use
-            // __select_util::Out;` beside `mod __select_util { .. }` in the block an expansion
-            // wrote) is read at that item's block module, the scope table's for the item's
-            // scope (`Row::module`). Any other first segment is no block's: the body's module.
-            if let Some(&head) = row.path.first()
-                && !row.abs
-                && let Some(item) = self.store.locals.find(self.owner, Some(row.scope), head, LocalNs::Type).filter(|r| r.kind.in_block_module())
-            {
-                match item.module {
-                    Some(m) => {
-                        at_module = m;
-                        local_type = Some(item);
-                    }
-                    None => return self.gap(Gap::Local(LocalGap { item: item.key, form: item.kind.unplaced(), range: item.range })),
-                }
+            at_module = expanded.module;
+            use_dollar = expanded.dollar;
+            if expanded.local_type.is_some() {
+                local_type = expanded.local_type;
             }
         }
         // `::x`: blaze-lower writes the global root as a first segment `{{root}}`.
@@ -258,8 +248,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
         // written path's own.
         let dollar = match (&via_glob, via_use) {
             (Some(hit), _) => hit.dollar,
-            (None, Some(row)) if !row.abs => super::glob_uses::dollar_of(row.path.first().copied(), row.first_mark),
-            (None, Some(_)) => None,
+            (None, Some(_)) => use_dollar,
             (None, None) => site.dollar_crate,
         };
         let target = match self.resolver().path_with(at_module, dollar, abs, rest, ns) {
@@ -281,19 +270,10 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                     && local_type.is_none()
                     && let Some(row) = self.store.locals.find(self.owner, Some(scope.0), first, LocalNs::Value)
                     && row.kind == LocalKind::Use
+                    && let Ok(expanded) = expand_local_use(self.names, &self.store.locals, self.owner, self.module, row, &[], alloc)
+                    && let Ok(t) = self.resolver().path_with(expanded.module, expanded.dollar, expanded.abs, &expanded.segments, Ns::Type)
                 {
-                    let mut use_module = self.module;
-                    if let Some(&head) = row.path.first()
-                        && !row.abs
-                        && let Some(item) = self.store.locals.find(self.owner, Some(row.scope), head, LocalNs::Type).filter(|r| r.kind.in_block_module())
-                        && let Some(m) = item.module
-                    {
-                        use_module = m;
-                    }
-                    let use_dollar = if row.abs { None } else { super::glob_uses::dollar_of(row.path.first().copied(), row.first_mark) };
-                    if let Ok(t) = self.resolver().path_with(use_module, use_dollar, row.abs, row.path, Ns::Type) {
-                        return Ok(Err(PathMiss::At { segment: 0, after: None, why: MissWhy::NotAValue(checker_of(t.key)) }));
-                    }
+                    return Ok(Err(PathMiss::At { segment: 0, after: None, why: MissWhy::NotAValue(checker_of(t.key)) }));
                 }
                 // rustc_resolve late.rs `resolve_qpath`: a path of two or more segments that
                 // fails, whose first segment is a builtin type's name, is that builtin type
@@ -481,6 +461,219 @@ pub(super) fn fixed_alias<'a>(view: blaze_typeck::PTys<'_>, generics: u32, ty: P
     Some((adt, out))
 }
 
+/// Result of expanding a block-local `use` binding (following chained local `use` rows and
+/// block-module items).
+pub(super) struct ExpandedLocalUse<'a, 'b, 'l> {
+    pub abs: bool,
+    pub segments: SmallPathBuf<'a, 'b>,
+    pub module: blaze_id::ItemKey,
+    pub dollar: Option<blaze_id::CrateItemKey>,
+    pub local_type: Option<super::locals::Row<'l>>,
+}
+
+/// Rewrites a path starting at a block-local `use` row `row` (followed by `tail`), following
+/// chained block-local `use` rows (`use a::b as c; use c::d;`) and placing the final prefix at
+/// its block module when it names a block-local item (`LocalKind::in_block_module`).
+/// Opaque macro-generated import heads (`first_mark` with `Transparency::Opaque`) stop before
+/// caller-local lookup and resolve at their mark's definition site via [`super::item_site::site_in`].
+/// Cycle detection tracks visited `(key, scope, range, name)` rows rather than imposing a fixed
+/// hop limit, so arbitrarily deep valid chains resolve while cyclic imports terminate cleanly.
+pub(super) fn expand_local_use<'n, 'a, 'b, 'l: 'a, S: super::source::NamesSource<'n>>(
+    names: S,
+    locals: &super::locals::Locals<'l>,
+    owner: blaze_typeck::ItemKey,
+    default_module: blaze_id::ItemKey,
+    row: super::locals::Row<'l>,
+    tail: &[&'a str],
+    alloc: Alloc<'b>,
+) -> Result<ExpandedLocalUse<'a, 'b, 'l>, LocalGap> {
+    let mut abs = row.abs;
+    let mut cur_scope = row.scope;
+    let mut first_mark = row.first_mark;
+    let mut prefix = SmallPathBuf::with_capacity(row.path.len() + tail.len(), alloc);
+    for &seg in row.path.iter() {
+        prefix.push(seg, alloc);
+    }
+    let mut module = default_module;
+    let mut local_type = None;
+    let first_id = (row.key, row.scope, row.range, row.name);
+    let mut visited: OwnVec<(blaze_id::ItemKey, u32, blaze_surface::Range, &'l str), Alloc<'b>> = OwnVec::new_in(alloc);
+    loop {
+        let Some(&head) = prefix.first() else { break };
+        if !super::scope_table::invocation_name(abs, head, first_mark) {
+            break;
+        }
+        let Some(item) = locals.find(owner, Some(cur_scope), head, LocalNs::Type) else { break };
+        if item.kind.in_block_module() {
+            match item.module {
+                Some(m) => {
+                    module = m;
+                    local_type = Some(item);
+                    break;
+                }
+                None => return Err(LocalGap { item: item.key, form: item.kind.unplaced(), range: item.range }),
+            }
+        } else if item.kind == LocalKind::Use && !item.path.is_empty() {
+            let next_id = (item.key, item.scope, item.range, item.name);
+            let seen = if visited.is_empty() {
+                next_id == first_id
+            } else {
+                visited.iter().any(|&v| v == next_id)
+            };
+            if seen {
+                break;
+            }
+            if visited.is_empty() {
+                visited.push(first_id);
+            }
+            visited.push(next_id);
+            let mut next = SmallPathBuf::with_capacity(item.path.len() + prefix.len(), alloc);
+            for &seg in item.path.iter() {
+                next.push(seg, alloc);
+            }
+            for &seg in prefix.get(1..).unwrap_or(&[]) {
+                next.push(seg, alloc);
+            }
+            prefix = next;
+            abs = item.abs;
+            cur_scope = item.scope;
+            first_mark = item.first_mark;
+        } else {
+            break;
+        }
+    }
+    for &seg in tail.iter() {
+        prefix.push(seg, alloc);
+    }
+    let (module, dollar) = if local_type.is_some() {
+        (module, None)
+    } else if let Some(&head) = prefix.first()
+        && let Ok(site) = super::item_site::site_in(names, first_mark, head, abs, module)
+    {
+        (site.module, site.dollar_crate)
+    } else {
+        let dollar = if abs { None } else { super::glob_uses::dollar_of(prefix.first().copied(), first_mark) };
+        (module, dollar)
+    };
+    Ok(ExpandedLocalUse { abs, segments: prefix, module, dollar, local_type })
+}
+
+/// Resolution of a body path through block-local items, block-local `use` / glob `use`, hygiene
+/// marks, and the module resolver (mirroring [`BodyWorld::path`]).
+pub(super) struct ResolvedBodyPath {
+    pub target: crate::resolve::Target,
+    /// Segments consumed in the WRITTEN path (after subtracting any local-`use` / glob prefix).
+    pub consumed: u32,
+    /// Matches [`BodyWorld::path`]'s `plain`: read directly at the body's module with no block
+    /// item, block `use`, glob `use`, foreign mark, or `$crate`.
+    pub plain: bool,
+}
+
+/// Resolves a written body path `texts` (starting at `::` when `abs`) in `ns`, honoring block-local
+/// items, named and glob `use` declarations, chained `use`s, generic parameters, and macro marks
+/// identically to [`BodyWorld::path`]. Returns `None` when the path names `Self`, a local
+/// value-only item (`fn`/`const`/`static`), a shadowing generic parameter, or fails to resolve.
+#[expect(clippy::too_many_arguments, reason = "body path resolution mirrors BodyWorld::path inputs")]
+pub(super) fn resolve_body_path<'n, 'l, 'a, S: super::source::NamesSource<'n>>(
+    resolver: &crate::resolve::Paths<S>,
+    locals: &super::locals::Locals<'l>,
+    owner: blaze_typeck::ItemKey,
+    module: blaze_id::ItemKey,
+    params: &[(Name, u32)],
+    consts: &[(u32, PTy)],
+    scope: Option<u32>,
+    abs: bool,
+    texts: &[&'a str],
+    ns: Ns,
+    mark: Option<blaze_lower::mark_site::TextMark>,
+    alloc: Alloc<'a>,
+) -> Option<ResolvedBodyPath>
+where
+    'l: 'a,
+{
+    let &first = texts.first()?;
+    let site = super::item_site::site_in(resolver.names, mark, first, abs, module).ok()?;
+    let mut at_module = site.module;
+    let mut dollar = site.dollar_crate;
+    let mut resolved_abs = abs;
+    let mut via_use = None;
+    let mut via_glob = None;
+    let mut local_type = None;
+    if !abs {
+        if first == "Self" {
+            return None;
+        }
+        if let Some(scope) = scope {
+            let (found, glob) = super::scope_table::value_prefix(
+                resolver, locals, owner, module, Some(scope), first, texts.len() == 1, ns, mark, alloc,
+            )
+            .ok()?;
+            via_glob = glob;
+            if let Some(row) = found {
+                match row.kind {
+                    LocalKind::Use => via_use = Some(row),
+                    LocalKind::Struct
+                    | LocalKind::Enum
+                    | LocalKind::Union
+                    | LocalKind::TypeAlias
+                    | LocalKind::Trait
+                    | LocalKind::Mod
+                    | LocalKind::ExternCrate => {
+                        at_module = row.module?;
+                        local_type = Some(row);
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        if via_use.is_none()
+            && via_glob.is_none()
+            && local_type.is_none()
+            && let Some(&(_, i)) = params.iter().find(|(n, _)| *n == Name::of(first))
+        {
+            let is_type_only_in_value = texts.len() == 1 && ns == Ns::Value && !consts.iter().any(|&(c, _)| c == i);
+            if !is_type_only_in_value {
+                return None;
+            }
+        }
+    }
+    let plain = via_use.is_none()
+        && via_glob.is_none()
+        && local_type.is_none()
+        && site.module == module
+        && site.dollar_crate.is_none()
+        && !texts.iter().any(|t| *t == "$crate");
+    let mut shift = 0u32;
+    let target = if let Some(hit) = &via_glob {
+        let mut through = SmallPathBuf::with_capacity(hit.path.len() + texts.len(), alloc);
+        for &seg in hit.path.iter() {
+            through.push(seg, alloc);
+        }
+        for &seg in texts.get(1..).unwrap_or(&[]) {
+            through.push(seg, alloc);
+        }
+        shift = u32::try_from(through.len().saturating_sub(texts.len())).ok()?;
+        at_module = hit.at;
+        resolved_abs = hit.abs;
+        dollar = hit.dollar;
+        resolver.path_with(at_module, dollar, resolved_abs, &through, ns).ok()?
+    } else if let Some(row) = via_use {
+        let expanded = expand_local_use(resolver.names, locals, owner, module, row, texts.get(1..).unwrap_or(&[]), alloc).ok()?;
+        shift = u32::try_from(expanded.segments.len().saturating_sub(texts.len())).ok()?;
+        at_module = expanded.module;
+        resolved_abs = expanded.abs;
+        dollar = expanded.dollar;
+        resolver.path_with(at_module, dollar, resolved_abs, &expanded.segments, ns).ok()?
+    } else {
+        resolver.path_with(at_module, dollar, resolved_abs, texts, ns).ok()?
+    };
+    let consumed = target.consumed.checked_sub(shift)?;
+    if consumed == 0 {
+        return None;
+    }
+    Some(ResolvedBodyPath { target, consumed, plain })
+}
+
 /// The body's conversion's side of a path through a type alias ([`fixed_alias`]): what
 /// `blaze_lower::typeck::Types::alias_args` answers for front2.
 pub(super) struct AliasPaths<'a, 'b, 'l, H: super::types::Heads, S> {
@@ -494,53 +687,64 @@ pub(super) struct AliasPaths<'a, 'b, 'l, H: super::types::Heads, S> {
 
 impl<'n, H: super::types::Heads, S: super::source::NamesSource<'n>> AliasPaths<'_, '_, '_, H, S> {
     /// The Reference, "Type aliases": "A type alias defines a new name for an existing
-    /// type". So the plain path `p` of `view`, where its first segments name an alias of
-    /// [`fixed_alias`]'s shape, is given the ALIASED type's arguments on the alias's segment
-    /// (into `out`; the segment's index returned): the alias's parameters replaced by the
-    /// arguments written on that segment (`written[index]`; a parameter not written takes
-    /// its default, by the one home of that, `with_defaults`), or each by a hole when none
-    /// are written (an expression's or a pattern's path leaves them to inference). The path
-    /// is read as `BodyWorld::path` reads it (`Self` and the body's parameters first, then
-    /// the body's own items, then the names library at the body's module, in the value
-    /// namespace), and expanded only where that reading is the module's (`plain` there):
-    /// `None` for any other path, which is converted as written. An alias whose arguments
-    /// are its own parameters in order needs no expansion (`BodyWorld::alias_def`).
-    pub(super) fn expand(&self, view: &blaze_lower::View<'_>, p: blaze_typeck::PathIdx, written: &[&[PTy]], tys: &mut blaze_typeck::PortableTys<'_>, out: &mut dyn FnMut(PTy)) -> Result<Option<u32>, super::types::Why> {
+    /// type". So a body path `p` of `view` is given:
+    /// - for a struct, enum, union, or variant segment written short of parameters with defaults
+    ///   (`super::adt_paths::adt_segment_defaults`), its defaulted arguments — including through
+    ///   block-local `use`, glob `use`, or block-local type items;
+    /// - for a type alias whose aliased type is `Adt<own params>` (`same`) written short of
+    ///   alias defaults, its defaulted arguments;
+    /// - for a plain path through an alias of [`fixed_alias`]'s shape (`plain`, matching
+    ///   [`BodyWorld::path`]), the aliased type's arguments on the alias's segment.
+    /// `None` for any other path, which is converted as written.
+    pub(super) fn expand(
+        &self,
+        view: &blaze_lower::View<'_>,
+        p: blaze_typeck::PathIdx,
+        path_ns: blaze_lower::typeck::PathNs,
+        written: &[&[PTy]],
+        tys: &mut blaze_typeck::PortableTys<'_>,
+        out: &mut dyn FnMut(PTy),
+    ) -> Result<Option<u32>, super::types::Why> {
         use super::types::Why;
         let Some(scope) = view.path(p)?.scope else { return Ok(None) };
         let (abs, texts, _, r) = match super::types::path_texts(view, p) {
             Ok(read) => read,
-            // `$crate`, a parenthesized segment: no plain path (the world's `plain` is false
-            // for `$crate`; the conversion refuses the others itself).
+            // A parenthesized segment: converted as written.
             Err(Why::Unsupported(..)) => return Ok(None),
             Err(why) => return Err(why),
         };
-        let Some(&first) = texts.first() else { return Ok(None) };
-        // Only a path the world reads at the body's module as written (`plain` there): one an
-        // expansion's mark sends elsewhere (a `macro` item's name, `$crate`), or refuses, is
-        // converted as written and answered by `BodyWorld::path`.
-        match super::item_site::site_in(self.builder.resolver.names, view.mark_of_path(p)?, first, abs, self.env.module) {
-            Ok(site) if site.module == self.env.module && site.dollar_crate.is_none() => {}
-            _ => return Ok(None),
-        }
-        if !abs {
-            if first == "Self" || self.env.params.iter().any(|(n, _)| *n == Name::of(first)) {
-                return Ok(None);
-            }
-            if !matches!(super::scope_table::value_prefix(
-                &self.builder.resolver, self.locals, self.owner, self.env.module, Some(scope.0), first, texts.len() == 1, Ns::Value, view.mark_of_path(p)?, tys.alloc(),
-            ), Ok((None, None))) {
-                return Ok(None);
-            }
-        }
-        // A path the names library does not resolve is the world's to answer, as before.
-        let Ok(target) = self.builder.resolver.path(self.env.module, abs, &texts, Ns::Value) else { return Ok(None) };
+        let ns = match path_ns {
+            blaze_lower::typeck::PathNs::Type => Ns::Type,
+            blaze_lower::typeck::PathNs::Value => Ns::Value,
+        };
+        let mark = match super::item_site::path_mark(self.builder.marks, view, p, r) {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        let Some(resolved) = resolve_body_path(
+            &self.builder.resolver,
+            self.locals,
+            self.owner,
+            self.env.module,
+            self.env.params,
+            self.env.consts,
+            Some(scope.0),
+            abs,
+            &texts,
+            ns,
+            mark,
+            tys.alloc(),
+        ) else {
+            return Ok(None);
+        };
+        let target = resolved.target;
         // `Vec::<u8>::with_capacity(n)`: the struct's segment written short of parameters
         // that have defaults takes them (super::adt_paths, where the rule is quoted).
         if matches!(target.kind, Kind::Struct | Kind::Enum | Kind::Union) {
-            let Some(at) = target.consumed.checked_sub(1) else { return Ok(None) };
-            let Some(&shown) = texts.get(at as usize) else { return Ok(None) };
-            let own = written.get(at as usize).copied().unwrap_or(&[]);
+            let Some(at) = resolved.consumed.checked_sub(1) else { return Ok(None) };
+            let Ok(at_ix) = usize::try_from(at) else { return Ok(None) };
+            let Some(&shown) = texts.get(at_ix) else { return Ok(None) };
+            let own = written.get(at_ix).copied().unwrap_or(&[]);
             let filled = super::adt_paths::adt_segment_defaults(self.builder.heads, target.key, own, tys, shown, r, out)?;
             return Ok(filled.then_some(at));
         }
@@ -551,8 +755,8 @@ impl<'n, H: super::types::Heads, S: super::source::NamesSource<'n>> AliasPaths<'
         // variant's only where the variant was reached through it; a module's segment there
         // writes no arguments, so it is never the one taken.
         if let Kind::Variant { adt, .. } = target.kind {
-            let Some(v_at) = target.consumed.checked_sub(1) else { return Ok(None) };
-            let on = |i: u32| written.get(i as usize).copied().unwrap_or(&[]);
+            let Some(v_at) = resolved.consumed.checked_sub(1) else { return Ok(None) };
+            let on = |i: u32| usize::try_from(i).ok().and_then(|ix| written.get(ix)).copied().unwrap_or(&[]);
             let on_enum = v_at.checked_sub(1).filter(|&e| !on(e).is_empty());
             let on_variant = Some(v_at).filter(|&v| !on(v).is_empty());
             let at = match (on_enum, on_variant) {
@@ -561,28 +765,43 @@ impl<'n, H: super::types::Heads, S: super::source::NamesSource<'n>> AliasPaths<'
                 // Neither (inferred), or both (the language's E0109): as written.
                 _ => return Ok(None),
             };
-            let Some(&shown) = texts.get(at as usize) else { return Ok(None) };
+            let Ok(at_ix) = usize::try_from(at) else { return Ok(None) };
+            let Some(&shown) = texts.get(at_ix) else { return Ok(None) };
             let filled = super::adt_paths::adt_segment_defaults(self.builder.heads, adt, on(at), tys, shown, r, out)?;
             return Ok(filled.then_some(at));
         }
         if !matches!(target.kind, Kind::TypeAlias) {
             return Ok(None);
         }
-        let Some(at) = target.consumed.checked_sub(1) else { return Ok(None) };
-        let Some(&shown) = texts.get(at as usize) else { return Ok(None) };
+        let Some(at) = resolved.consumed.checked_sub(1) else { return Ok(None) };
+        let Ok(at_ix) = usize::try_from(at) else { return Ok(None) };
+        let Some(&shown) = texts.get(at_ix) else { return Ok(None) };
         let made = super::types::Heads::alias(self.builder.heads, target.key).ok_or(Why::Need(target.key))?;
         // A refused alias head is the world's gap naming it (`Gap::AliasHead`).
         let Some((generics, ty)) = made else { return Ok(None) };
         let alloc = tys.alloc();
         let Some((_, of)) = fixed_alias(tys.view(), generics, ty, alloc) else { return Ok(None) };
-        let same = of.len() == generics as usize && {
+        let Ok(generics_len) = usize::try_from(generics) else { return Ok(None) };
+        let same = of.len() == generics_len && {
             let v = tys.view();
-            of.iter().enumerate().all(|(i, a)| matches!(v.get(*a), Some(PNode::Param(p) | PNode::ConstParam(p)) if *p as usize == i))
+            of.iter().enumerate().all(|(i, a)| matches!(v.get(*a), Some(PNode::Param(p) | PNode::ConstParam(p)) if usize::try_from(*p).ok() == Some(i)))
         };
+        let own = written.get(at_ix).copied().unwrap_or(&[]);
         if same {
+            // `BodyWorld::alias_def` maps a pass-through alias to `Def::Adt` regardless of `plain`.
+            // When written short of defaulted alias parameters, fill those defaults here.
+            if own.is_empty() || own.len() >= generics_len {
+                return Ok(None);
+            }
+            let defaults = super::types::Heads::alias_defaults(self.builder.heads, target.key);
+            if !(own.len()..generics_len).all(|i| defaults.get(i).copied().flatten().is_some()) {
+                return Ok(None);
+            }
+        } else if !resolved.plain {
+            // Non-plain paths through a `fixed_alias` resolve as `Def::Alias` in `BodyWorld::path`
+            // and are expanded (including defaults) by `blaze-typeck` (`rules/alias_path.rs`).
             return Ok(None);
         }
-        let own = written.get(at as usize).copied().unwrap_or(&[]);
         let consts = super::types::Heads::const_params(self.builder.heads, target.key).ok_or(Why::Need(target.key))?;
         let mut stamped = OwnVec::new_in(alloc);
         let own_in: &[PTy] = if own.is_empty() || consts.is_empty() {
@@ -603,8 +822,8 @@ impl<'n, H: super::types::Heads, S: super::source::NamesSource<'n>> AliasPaths<'
         };
         let mut args = if own_in.is_empty() {
             let hole = super::types::intern(tys, PNode::Infer)?;
-            let mut holes = OwnVec::with_capacity_in(generics as usize, alloc);
-            holes.resize(generics as usize, hole);
+            let mut holes = OwnVec::with_capacity_in(generics_len, alloc);
+            holes.resize(generics_len, hole);
             holes
         } else {
             super::types::with_defaults(tys, own_in, generics, super::types::Heads::alias_defaults(self.builder.heads, target.key), shown, r)?

@@ -645,7 +645,7 @@ fn file_marks<'n>(
 /// An expression whose type is unknown or is not `bool`, `char` or an integer is
 /// [`Why::ConstPath`] naming its text.
 #[expect(clippy::too_many_arguments, reason = "self-typed anonymous constant lookup with head owner, substitution edits, and token marks")]
-pub fn self_value<H: super::types::Heads + ?Sized>(
+pub fn self_value_typed<H: super::types::Heads + ?Sized>(
     heads: &H,
     module: LibKey,
     ty: Option<PNode>,
@@ -657,7 +657,7 @@ pub fn self_value<H: super::types::Heads + ?Sized>(
     head_owner: Option<(HeadOwner, Option<&str>, Option<HeadSite<'_>>)>,
     edits: Option<AVec<'static, TextEdit>>,
     r: blaze_surface::Range,
-) -> Result<u128, Why> {
+) -> Result<(u128, Option<PNode>), Why> {
     let source = text.trim();
     let Some(mut ask) = ty.and_then(|ty| Ask::of_self(module, ty, source, self_ty, self_node)) else { return Err(Why::ConstPath(source.into(), r)) };
     if let Some(alloc) = heads.mark_alloc() {
@@ -685,7 +685,7 @@ pub fn self_value<H: super::types::Heads + ?Sized>(
         }
     }
     if let Some(bits) = heads.const_bits(ask.need) {
-        return Ok(bits);
+        return Ok((bits, heads.const_ty(ask.need)));
     }
     if let Some(why) = heads.anon_failed(ask.need) {
         return Err(Why::ConstPath(format!("{source}: {why}").into_boxed_str(), r));

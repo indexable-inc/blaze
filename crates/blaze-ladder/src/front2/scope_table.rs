@@ -193,29 +193,25 @@ pub(super) fn direct_name_in<'a, 'n, S: super::source::NamesSource<'n>>(
 }
 
 /// Whether a block `use` row resolves only in the type namespace (e.g. `use foo::bar::{self}`
-/// importing module `bar`, or importing a braced struct/trait/enum) and NOT in the value
-/// namespace. In Rust's namespaces a type-only `use` must not shadow an outer value binding
-/// (`fn bar()`) for a single-segment value path.
-pub(super) fn use_is_type_only<'n, S: super::source::NamesSource<'n>>(
+/// importing module `bar`, or importing a braced struct/trait/enum, including through a chained
+/// block-local `use`) and NOT in the value namespace. In Rust's namespaces a type-only `use` must
+/// not shadow an outer value binding (`fn bar()`) for a single-segment value path.
+pub(super) fn use_is_type_only<'n, 'l, 'a, S: super::source::NamesSource<'n>>(
     paths: &crate::resolve::Paths<S>,
-    locals: &super::locals::Locals<'_>,
+    locals: &super::locals::Locals<'l>,
     owner: blaze_typeck::ItemKey,
     module: LibKey,
-    row: &super::locals::Row<'_>,
-) -> bool {
-    let mut use_module = module;
-    if let Some(&head) = row.path.first()
-        && !row.abs
-        && let Some(item) = locals.find(owner, Some(row.scope), head, super::locals::LocalNs::Type).filter(|r| r.kind.in_block_module())
-    {
-        match item.module {
-            Some(m) => use_module = m,
-            None => return false,
-        }
-    }
-    let dollar = if row.abs { None } else { super::glob_uses::dollar_of(row.path.first().copied(), row.first_mark) };
-    !paths.resolves_exact(use_module, dollar, row.abs, row.path, crate::resolve::Ns::Value)
-        && paths.resolves_exact(use_module, dollar, row.abs, row.path, crate::resolve::Ns::Type)
+    row: &super::locals::Row<'l>,
+    alloc: Alloc<'a>,
+) -> bool
+where
+    'l: 'a,
+{
+    let Ok(expanded) = super::world_paths::expand_local_use(paths.names, locals, owner, module, *row, &[], alloc) else {
+        return false;
+    };
+    !paths.resolves_exact(expanded.module, expanded.dollar, expanded.abs, &expanded.segments, crate::resolve::Ns::Value)
+        && paths.resolves_exact(expanded.module, expanded.dollar, expanded.abs, &expanded.segments, crate::resolve::Ns::Type)
 }
 
 /// The first segment of an expression path. A local item keeps its body's key and shadows an
@@ -235,15 +231,16 @@ pub(super) fn value_prefix<'n, 'l: 'a, 'a, S: super::source::NamesSource<'n>>(
     alloc: Alloc<'a>,
 ) -> Result<(Option<super::locals::Row<'l>>, Option<super::glob_uses::Hit<'a>>), super::locals::LocalGap> {
     use super::locals::{LocalKind, LocalNs};
-    let ns = if single { LocalNs::Value } else { LocalNs::Type };
-    let mut row = if single && path_ns == crate::resolve::Ns::Value {
+    let in_value = single && path_ns == crate::resolve::Ns::Value;
+    let ns = if in_value { LocalNs::Value } else { LocalNs::Type };
+    let mut row = if in_value {
         locals.find_matching(owner, scope, first, ns, |r| {
-            r.kind != LocalKind::Use || !use_is_type_only(paths, locals, owner, module, r)
+            r.kind != LocalKind::Use || !use_is_type_only(paths, locals, owner, module, r, alloc)
         })
     } else {
         locals.find(owner, scope, first, ns)
     };
-    if row.is_none() && single {
+    if row.is_none() && in_value {
         row = locals.find(owner, scope, first, LocalNs::Type)
             .filter(|r| r.kind.in_block_module() && !matches!(r.kind, LocalKind::Mod | LocalKind::ExternCrate));
     }
@@ -255,7 +252,7 @@ pub(super) fn value_prefix<'n, 'l: 'a, 'a, S: super::source::NamesSource<'n>>(
         return Ok((row, None));
     }
     let Some(scope) = scope else { return Ok((row, None)) };
-    let ns = if single { crate::resolve::Ns::Value } else { crate::resolve::Ns::Type };
+    let ns = if in_value { crate::resolve::Ns::Value } else { crate::resolve::Ns::Type };
     let hit = super::glob_uses::before(locals, paths, module, owner, scope, first, ns, row.as_ref(), alloc)?;
     Ok((if hit.is_none() { row } else { None }, hit))
 }

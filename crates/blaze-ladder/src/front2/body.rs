@@ -710,10 +710,11 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
             return Types::ty(self, view, t, tys).map(ConstTerm::Is);
         }
         match local {
-            // A local `const` is that constant's value, its type left to the checker as for a
-            // module's constant.
-            Ok(Some(LocalArg::Const(bits))) => {
-                let made = match super::types::intern(tys, blaze_typeck::PNode::Infer) {
+            // A local `const` is that constant's value, stamped with its evaluated primitive type
+            // when known (or left to the checker otherwise).
+            Ok(Some(LocalArg::Const(bits, eval_ty))) => {
+                let node = eval_ty.unwrap_or(blaze_typeck::PNode::Infer);
+                let made = match super::types::intern(tys, node) {
                     Ok(ty) => super::types::intern(tys, blaze_typeck::PNode::ConstValue { ty, bits }),
                     Err(why) => Err(why),
                 };
@@ -734,9 +735,17 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
     /// segment ([`super::world_paths::AliasPaths::expand`], where the rule is quoted). An
     /// alias whose head is not made yet is `Why::Need`: the body is converted again once it
     /// is, as for a written type.
-    fn alias_args(&mut self, view: &View<'_>, path: blaze_typeck::PathIdx, written: &[&[blaze_typeck::PTy]], tys: &mut PortableTys<'_>, out: &mut dyn FnMut(blaze_typeck::PTy)) -> Result<Option<u32>, Refused> {
+    fn alias_args(
+        &mut self,
+        view: &View<'_>,
+        path: blaze_typeck::PathIdx,
+        ns: blaze_lower::typeck::PathNs,
+        written: &[&[blaze_typeck::PTy]],
+        tys: &mut PortableTys<'_>,
+        out: &mut dyn FnMut(blaze_typeck::PTy),
+    ) -> Result<Option<u32>, Refused> {
         let paths = super::world_paths::AliasPaths { builder: &self.builder, env: &self.env, locals: self.locals, owner: self.owner };
-        match paths.expand(view, path, written, tys, out) {
+        match paths.expand(view, path, ns, written, tys, out) {
             Ok(at) => Ok(at),
             Err(why) => {
                 self.failed = Some(why);
@@ -1065,6 +1074,23 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
                     Some(t) => tys.view().get(t).copied(),
                     None => None,
                 };
+                // A braced pointer-sized literal (`{ 1usize }`, `{ -1isize }`) skipped the
+                // target-unaware `blaze-lower` literal fast path. When its explicit suffix
+                // disagrees with the expected parameter type (e.g. `{ 1usize }` for `const B:
+                // bool`), evaluate it at its own inferred type so `blaze-typeck` reports E0308
+                // while preserving target-aware overflow checking.
+                let digits = text.strip_prefix('-').map_or(text, str::trim_start);
+                let ptr_lit_mismatch = parser::LexedStr::single_token(parser::Edition::CURRENT, digits)
+                    .is_some_and(|(kind, _)| kind.is_literal())
+                    && ((text.ends_with("usize") && node != Some(blaze_typeck::PNode::Uint(blaze_typeck::UintTy::Usize)))
+                        || (text.ends_with("isize") && node != Some(blaze_typeck::PNode::Int(blaze_typeck::IntTy::Isize))));
+                let eval_want_ty = |tys: &mut PortableTys<'_>| {
+                    if ptr_lit_mismatch {
+                        super::types::intern(tys, blaze_typeck::PNode::Infer)
+                    } else {
+                        want_ty(tys)
+                    }
+                };
                 // Of a type the checker finds (`Infer`): an expression naming an item of the
                 // body is still the body's constant, never read at the module, where the name
                 // means another item; it is filed with its type left to the checker when that
@@ -1074,7 +1100,7 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
                 let local = self.body_anon(source, marks, scope, node.unwrap_or(blaze_typeck::PNode::Infer), range, tys);
                 match local {
                     Some(made) => made,
-                    None => self.builder.const_term(tys, &self.env, text, range, &want_ty),
+                    None => self.builder.const_term(tys, &self.env, text, range, &eval_want_ty),
                 }
             }
         };
@@ -1203,11 +1229,18 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
             // can be made of it, refused by the expression's name.
             return Some(Err(Why::ConstPath(Box::from(text), range)));
         };
-        let bits = match super::anon::body_value(self.builder.heads, ask.carry_marks(marks), range) {
+        let ask = ask.carry_marks(marks);
+        let need = ask.need;
+        let bits = match super::anon::body_value(self.builder.heads, ask, range) {
             Ok(bits) => bits,
             Err(why) => return Some(Err(why)),
         };
-        Some(super::types::intern(tys, ty).and_then(|t| super::types::intern(tys, blaze_typeck::PNode::ConstValue { ty: t, bits })))
+        let val_ty = if ty == blaze_typeck::PNode::Infer {
+            super::types::Heads::const_ty(self.builder.heads, need).unwrap_or(ty)
+        } else {
+            ty
+        };
+        Some(super::types::intern(tys, val_ty).and_then(|t| super::types::intern(tys, blaze_typeck::PNode::ConstValue { ty: t, bits })))
     }
 
     /// The free fn a call's plain-path callee `path` names, resolved as [`BodyTypes::arg_param`]
@@ -1271,30 +1304,37 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
             return Ok(params.iter().find(|(i, _)| *i == at.index).map(|&(_, ty)| ty));
         }
         let Ok((abs, texts, segs, range)) = super::types::path_texts_of(view, at.path, false) else { return Ok(None) };
-        let seg = at.segment as usize;
+        let Ok(seg) = usize::try_from(at.segment) else { return Ok(None) };
         if seg >= texts.len() || segs.iter().take(seg + 1).any(|s| !matches!(s.kind, lf::SegKind::Ident | lf::SegKind::Crate | lf::SegKind::DollarCrate | lf::SegKind::SelfMod | lf::SegKind::Super)) {
             return Ok(None);
         }
-        if self.env.params.iter().any(|(n, _)| *n == Name::of(texts[0])) {
-            return Ok(None);
-        }
-        // A body that is a local item's or a body constant's, or whose blocks declare
-        // something the first segment may be: the module's answer may not be the path's.
-        if self.locals.head(self.owner).is_some() {
-            return Ok(None);
-        }
-        if let Some(b) = self.locals.body(self.owner) {
-            if b.rows.iter().any(|r| r.name == texts[0] || r.name == super::glob_uses::GLOB) {
-                return Ok(None);
-            }
-        }
-        let upto = &texts[..=seg];
+        let Some(upto) = texts.get(..=seg) else { return Ok(None) };
         let ns = if seg + 1 == texts.len() { Ns::Value } else { Ns::Type };
-        let site = super::item_site::written_site(&self.builder.resolver, self.builder.marks, self.env.module, view, at.path, abs, texts[0], range)?;
-        let Ok(found) = self.builder.resolver.path_with(site.module, site.dollar_crate, abs, upto, ns) else { return Ok(None) };
-        if found.consumed as usize != upto.len() {
+        let mark = super::item_site::path_mark(self.builder.marks, view, at.path, range)?;
+        let (owner, scope) = match self.locals.scope_or_declared(self.owner, view.path(at.path)?.scope.map(|s| s.0)) {
+            Some((o, s)) => (o, Some(s)),
+            None => (self.owner, None),
+        };
+        let Some(resolved) = super::world_paths::resolve_body_path(
+            &self.builder.resolver,
+            self.locals,
+            owner,
+            self.env.module,
+            self.env.params,
+            self.env.consts,
+            scope,
+            abs,
+            upto,
+            ns,
+            mark,
+            self.mark_alloc,
+        ) else {
+            return Ok(None);
+        };
+        if usize::try_from(resolved.consumed).ok() != Some(upto.len()) {
             return Ok(None);
         }
+        let found = resolved.target;
         let index = match found.kind {
             Kind::Trait => at.index + 1,
             Kind::Fn | Kind::Struct | Kind::Enum | Kind::Union | Kind::TypeAlias => at.index,
