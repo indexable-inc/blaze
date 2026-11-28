@@ -102,7 +102,7 @@ jobs:
     name: ${{ matrix.target }}
     needs: prepare
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -135,7 +135,7 @@ jobs:
               "$@"
             fi
           }
-          run_bounded 4500 blaze build --release -p blaze-cli --bin blaze -o target/release/blaze
+          run_bounded 9000 blaze build --release -p blaze-cli --bin blaze -o target/release/blaze
           run_bounded 1800 blaze build --release -p blaze-cli --bin blaze-fact-shim -o target/release/blaze-fact-shim
           run_bounded 1800 blaze build --release -p blaze-launcher --bin blaze-launcher -o target/release/blaze-launcher
       - name: Archive and checksum
