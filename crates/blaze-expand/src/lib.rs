@@ -112,7 +112,7 @@ mod writes_tests;
 pub use crate::writes::{AnyWhy, By, CallWrites, Callee, Callees, MOST_NESTED, MOST_WALK_DEPTH, MacroWrites, Nested, Written, WrittenNs, macro_writes};
 pub use crate::attr_path::{PathWord, PathWords, path_words, same_path};
 pub use crate::attr_value::{AttrLiteralError, MOST_ATTR_VALUE_DEPTH, attr_literal};
-pub use crate::literal::decode_name_value_str;
+pub use crate::literal::{decode_name_value_str, decode_str_literal};
 pub use crate::rules::{CopyPlant, rules_copy_plant, rules_oracle, rules_oracle_counts};
 pub use crate::{
     body::{
@@ -120,7 +120,11 @@ pub use crate::{
         parser_words, write_token, write_tokens,
     },
     call::{AlsoCopy, Call, CallKind, CallShape, CallSite, Constness, DeriveFacts, Eager, Inside},
-    cfg::{CfgAttrError, CfgPredicateError, Tri, cfg_attr_metas, cfg_predicate, cfg_predicate_at, cfg_predicate_tri},
+    cfg::{
+        CfgAttrError, CfgPredicateError, Tri, cfg_attr_metas, cfg_attr_metas_with_version, cfg_predicate,
+        cfg_predicate_at, cfg_predicate_at_with_version, cfg_predicate_tri, cfg_predicate_with_version,
+        eval_cfg_version_literal,
+    },
     derive::{attr_call, derive_attr, derive_meta},
     cx::{
         ExpandCx, HostAsk, HostError, HostWhy, IncludeAs, Included, OutsideRoot, Place, PlaceOf,

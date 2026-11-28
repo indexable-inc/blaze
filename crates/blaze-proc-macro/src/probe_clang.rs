@@ -301,7 +301,7 @@ impl CScriptProbes {
     /// deadline so C compiler probes executed by a build script stop immediately on cancellation
     /// or an earlier caller deadline rather than draining an independent 30-second probe budget.
     pub fn with_cx(&self, cx: &bstd::cx::Cx) -> Self {
-        let shared = SharedAlloc::global();
+        let shared = *OwnArc::allocator(&self.answerer);
         let bound = cx.bound();
         #[cfg(target_os = "linux")]
         let answerer: OwnArc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> = match &self.hermetic {
@@ -1555,7 +1555,6 @@ fn replace_pairs_escape_dollar<'a>(text: &str, pairs: &[(&str, &str)], alloc: Al
     out
 }
 
-// On every target: `CScriptProbes::answerer_id_in_cx` calls it with no `cfg`.
 fn own_str<'a>(s: &str, alloc: Alloc<'a>) -> AString<'a> {
     OwnString::from_str_in(s, alloc)
 }
@@ -4080,11 +4079,11 @@ mod tests {
             self, CanonicalProbe, ProbeAnswer, ProbeAnswerer,
         };
         use blaze_ids::ContentId;
-        use blaze_own::{AString, Alloc, Arc as OwnArc, SharedAlloc};
+        use blaze_own::{AString, Alloc, Arc as OwnArc, Share, SharedAlloc};
 
         struct CountingAnswerer {
-            id_calls: std::sync::Arc<AtomicUsize>,
-            answer_calls: std::sync::Arc<AtomicUsize>,
+            id_calls: OwnArc<AtomicUsize, SharedAlloc<'static>>,
+            answer_calls: OwnArc<AtomicUsize, SharedAlloc<'static>>,
         }
         impl ProbeAnswerer for CountingAnswerer {
             fn id<'a>(&self, _alloc: Alloc<'a>) -> Result<ContentId, AString<'a>> {
@@ -4106,8 +4105,9 @@ mod tests {
             }
         }
 
-        let shared = SharedAlloc::global();
-        let alloc = Alloc::global();
+        let heap = blaze_own::testing::heap();
+        let shared = heap.shared();
+        let alloc = heap.alloc();
         let clang_pin = [0x11u8; 32];
         let spawn = c_tasks_probe::Spawn {
             program: "cc",
@@ -4128,13 +4128,13 @@ mod tests {
         )
         .expect("canonicalize probe");
 
-        let id_calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let answer_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let id_calls = OwnArc::new_in(AtomicUsize::new(0), shared);
+        let answer_calls = OwnArc::new_in(AtomicUsize::new(0), shared);
         let base_probes = super::CScriptProbes {
             answerer: OwnArc::new_in(
                 CountingAnswerer {
-                    id_calls: std::sync::Arc::clone(&id_calls),
-                    answer_calls: std::sync::Arc::clone(&answer_calls),
+                    id_calls: id_calls.share(),
+                    answer_calls: answer_calls.share(),
                 },
                 shared,
             ),
@@ -4206,10 +4206,10 @@ mod tests {
                 work_base.clone(),
                 None,
                 "tasks",
-                std::path::Path::new("/shelf"),
+                Path::new("/shelf"),
                 "x86_64-unknown-linux-gnu",
                 None,
-                std::path::PathBuf::from("/work/tasks"),
+                PathBuf::from("/work/tasks"),
                 alloc,
             )
             .expect("construct HermeticClangProbe");

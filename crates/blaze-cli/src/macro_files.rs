@@ -360,7 +360,7 @@ pub(crate) fn read_script_files(
     let cx = cx.span("macro files: read a member build script's files with their stamps");
     let mut bytes = Bytes::new_in(frame, "a member build script's file");
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut record_file = |rel: &str| -> Result<(), CliError> {
+    let mut record_file = |rel: &str, rows: &mut Rows<'_>| -> Result<(), CliError> {
         let norm = rel.trim_start_matches("./");
         if norm.is_empty() || !seen.insert(String::from(norm)) {
             return Ok(());
@@ -371,11 +371,11 @@ pub(crate) fn read_script_files(
         }
         Ok(())
     };
-    record_file(script_root)?;
+    record_file(script_root, rows)?;
     if let Some(listed) = walked(&cx, root, dir, InPackage::Root, frame)? {
         for (name, is_dir) in listed.entries() {
             if !is_dir && name.ends_with(".rs") {
-                record_file(name)?;
+                record_file(name, rows)?;
             }
         }
     }
@@ -389,13 +389,21 @@ pub(crate) fn read_script_files(
         stack.push(String::from(parent));
         while let Some(dir_rel) = stack.pop() {
             let at = under(dir, &dir_rel);
-            let Some(listed) = walked(&cx, root, &at, InPackage::Beneath, frame)? else { continue };
+            let stamp = dir_stamp(&cx, root, stamps, Plant::None, &at)?;
+            let Some(listed) = (match stamp {
+                Some(_) => walked(&cx, root, &at, InPackage::Beneath, frame)?,
+                None => None,
+            }) else {
+                continue;
+            };
+            let (flags, id) = listing_id(Some(listed.entries()));
+            rows.push(LeafKind::MacroFolder, flags, &at, stamp.flatten(), id);
             for (name, is_dir) in listed.entries() {
                 let child = std::format!("{dir_rel}/{name}");
                 if is_dir {
                     stack.push(child);
                 } else if name.ends_with(".rs") {
-                    record_file(&child)?;
+                    record_file(&child, rows)?;
                 }
             }
         }

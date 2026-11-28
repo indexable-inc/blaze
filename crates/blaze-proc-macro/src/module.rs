@@ -740,17 +740,18 @@ mod header_tests {
         assert_ne!(v5_key, v11_key, "form 11 key must differ from stale form 5 key");
         assert_ne!(v4_key, v11_key, "form 11 key must differ from stale form 4 key");
 
-        let store = std::env::temp_dir().join(format!("blaze-pm-module-v11-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&store);
+        use std::{env, fs, process};
+        let store = env::temp_dir().join(format!("blaze-pm-module-v11-test-{}", process::id()));
+        let _ = fs::remove_dir_all(&store);
         let write_entry = |dir: &Path, id_text: &str, digest: &str, macros: &str| {
-            std::fs::create_dir_all(dir).expect("create module dir");
+            fs::create_dir_all(dir).expect("create module dir");
             for (name, body) in [
                 ("identity", id_text),
                 ("wasm-sha256", digest),
                 ("macros", macros),
                 ("decls", "__rustc_proc_macro_decls_blaze__\n"),
             ] {
-                std::fs::write(dir.join(name), body).expect(name);
+                fs::write(dir.join(name), body).expect(name);
             }
         };
         for (stale_key, stale_identity, stale_digest) in [
@@ -783,7 +784,7 @@ mod header_tests {
         assert_eq!(rec.macros.len(), 1);
         assert_eq!(rec.macros[0].name, "Demo");
 
-        let _ = std::fs::remove_dir_all(&store);
+        let _ = fs::remove_dir_all(&store);
     }
 
     #[test]

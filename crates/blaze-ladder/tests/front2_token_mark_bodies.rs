@@ -1166,12 +1166,16 @@ dep::make_body_macro_fn!();
             script: None,
         },
     ];
+    let bump = blaze_own::testing::bump();
+    let test_alloc = blaze_own::testing::heap().alloc();
     let crate_names: &'static [&'static str] = &["app", "dep", "procs"];
-    let keys: &'static [CrateItemKey] = Vec::leak(crates.iter().map(|c| c.key).collect());
+    let mut keys_vec = blaze_own::Vec::new_in(bump);
+    keys_vec.extend(crates.iter().map(|c| c.key));
+    let keys: &'static [CrateItemKey] = keys_vec.into_bump_slice();
     static WORLD: ProcWorld = ProcWorld;
     let body_sources: &'static dyn blaze_ladder::front2::body_host::BodySources =
-        Box::leak(Box::new(blaze_ladder::front2::body_host::Sourced(&WORLD)));
-    let names = resolve_crates(&crates, Sysroot::default(), &WORLD, &Serial, blaze_own::testing::bump())
+        bump.alloc_val(blaze_ladder::front2::body_host::Sourced(&WORLD));
+    let names = resolve_crates(&crates, Sysroot::default(), &WORLD, &Serial, bump)
         .unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     assert!(names.notes(0).is_empty(), "app scope notes must be empty: {:?}", names.notes(0));
 
@@ -1194,13 +1198,13 @@ dep::make_body_macro_fn!();
         ("body_call_neg_def", Asked::Free(fn_key("body_call_neg_def")), "OpaqueWithoutModule"),
     ];
 
-    let mut failed = Vec::new();
+    let mut failed = blaze_own::Vec::new_in(test_alloc);
     let sources = [SourceFile { path: "src/main.rs", text: APP }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
     {
-        let mut front = Front2::new(&names, &frame, &sources, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
-        let prepared = Prepares::new_in(blaze_own::testing::bump());
-        let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::testing::heap().alloc());
+        let mut front = Front2::new(&names, &frame, &sources, test_alloc).unwrap_or_else(|e| panic!("front2: {e}"));
+        let prepared = Prepares::new_in(bump);
+        let mut store = Store::new(front.index.lang("sized"), front.frame, test_alloc);
         store.sources = Some(body_sources);
         for &(name, f) in &positive_fns {
             let got = checked(&names, prepared, &mut front.keys, &front.index, &mut store, f);
@@ -1216,8 +1220,8 @@ dep::make_body_macro_fn!();
 
     let (records, frame) = reader(keys, crate_names, kept_of(&names));
     let mut front = Front2::from_records(records, frame, &[0, 1, 2]).unwrap_or_else(|e| panic!("front2 over records: {e}"));
-    let prepared = Prepares::new_in(blaze_own::testing::bump());
-    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::testing::heap().alloc());
+    let prepared = Prepares::new_in(bump);
+    let mut store = Store::new(front.index.lang("sized"), front.frame, test_alloc);
     store.sources = Some(body_sources);
     for &(name, f) in &positive_fns {
         let got = checked(records, prepared, &mut front.keys, &front.index, &mut store, f);
@@ -1229,8 +1233,7 @@ dep::make_body_macro_fn!();
         let got = checked(records, prepared, &mut front.keys, &front.index, &mut store, f);
         assert!(got.contains(expect), "{name} (records) must fail with {expect}, got: {got}");
     }
-    let errors: Vec<String> = records.errors().iter().map(|e| e.to_string()).collect();
-    assert!(errors.is_empty(), "the records filed {errors:?}");
+    assert!(records.errors().is_empty(), "the records filed {:?}", records.errors());
     assert!(failed.is_empty(), "positive CallSite.ctx bodies failed: {failed:?}");
 }
 
@@ -1333,9 +1336,12 @@ varint_same_arm!(i32, bad_int32);
         cfg: CFG,
         script: None,
     }];
+    let bump = blaze_own::testing::bump();
     let crate_names: &'static [&'static str] = &["varint_app"];
-    let keys: &'static [CrateItemKey] = Vec::leak(crates.iter().map(|c| c.key).collect());
-    let names = resolve_crates(&crates, Sysroot::default(), &VarintFiles, &Serial, blaze_own::testing::bump())
+    let mut keys_vec = blaze_own::Vec::new_in(bump);
+    keys_vec.extend(crates.iter().map(|c| c.key));
+    let keys: &'static [CrateItemKey] = keys_vec.into_bump_slice();
+    let names = resolve_crates(&crates, Sysroot::default(), &VarintFiles, &Serial, bump)
         .unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     assert!(names.notes(0).is_empty(), "varint_app scope notes must be empty: {:?}", names.notes(0));
 
@@ -1354,12 +1360,13 @@ varint_same_arm!(i32, bad_int32);
 
     let mut failed = Vec::new();
     let sources = [SourceFile { path: "src/main.rs", text: VARINT_ROOT }];
+    let test_alloc = blaze_own::testing::heap().alloc();
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
     {
-        let mut front = Front2::new(&names, &frame, &sources, Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
+        let mut front = Front2::new(&names, &frame, &sources, test_alloc).unwrap_or_else(|e| panic!("front2: {e}"));
         let solved = rows(&names, &front.index, &mut front.keys, front.frame, front.index.lang("sized"), &positive_fns, &mut failed);
         let prepared = Prepares::new_in(blaze_own::testing::bump());
-        let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+        let mut store = Store::new(front.index.lang("sized"), front.frame, test_alloc);
         let bad = checked(&names, prepared, &mut front.keys, &front.index, &mut store, bad_merge);
         println!("front2_token_mark_bodies varint names: {solved}; bad_int32::merge: {bad}");
         assert!(bad.contains("CantDeref"), "same-arm shadowing must fail with CantDeref (E0614) over names, got: {bad}");
@@ -1369,11 +1376,10 @@ varint_same_arm!(i32, bad_int32);
     let mut front = Front2::from_records(records, frame, &[0]).unwrap_or_else(|e| panic!("front2 over records: {e}"));
     let over_records = rows(records, &front.index, &mut front.keys, front.frame, front.index.lang("sized"), &positive_fns, &mut failed);
     let prepared = Prepares::new_in(blaze_own::testing::bump());
-    let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+    let mut store = Store::new(front.index.lang("sized"), front.frame, test_alloc);
     let bad_rec = checked(records, prepared, &mut front.keys, &front.index, &mut store, bad_merge);
     println!("front2_token_mark_bodies varint records: {over_records}; bad_int32::merge: {bad_rec}");
     assert!(bad_rec.contains("CantDeref"), "same-arm shadowing must fail with CantDeref (E0614) over records, got: {bad_rec}");
-    let errors: Vec<String> = records.errors().iter().map(|e| e.to_string()).collect();
-    assert!(errors.is_empty(), "the records filed {errors:?}");
+    assert!(records.errors().is_empty(), "the records filed {:?}", records.errors());
     assert!(failed.is_empty(), "recursive varint bodies failed: {failed:?}");
 }

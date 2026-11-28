@@ -654,7 +654,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         if unread > 0 {
             return Err(LazyRefusal::Unanswered { question: "text_of", item: format!("{unread} fns of {} whose bodies hold items", self.crate_shown(krate)).into_boxed_str() });
         }
-        let reading = Reading { edition, atoms, alloc };
+        let reading = Reading { edition, atoms, cfg_version: names.has_feature(krate, "cfg_version").unwrap_or(false), alloc };
         let mut by_key: Map<ItemKey, LocalEntry<'n>, Alloc<'n>> = Map::new_in(alloc);
         let mut after_call: Vec<LocalEntry<'n>, Global> = Vec::new_in(Global);
         let mut read = 0usize;

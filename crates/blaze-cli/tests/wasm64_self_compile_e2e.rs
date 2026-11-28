@@ -4,6 +4,8 @@
 //! BOTH `blaze_proc_macro::script::ScriptRuntime` (build scripts) AND `blaze_proc_macro::host::Runtime`
 //! (proc macros) — zero `rustc`, zero `wasm-lld`, zero `wasi-libc`, zero hand-built LIR.
 
+mod support;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -188,13 +190,12 @@ fn fixture(text: &str) -> Fixture {
 
 fn reader(f: &Fixture) -> NamesRecords<'static> {
     let a = alloc();
-    let frame: &'static blaze_mem::Frame = Box::leak(Box::new(
-        blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("reader frame"),
-    ));
-    let log: &'static Log<'static> = Box::leak(Box::new(Log::new(f.crate_names, a)));
-    let load: &'static Kept = Box::leak(Box::new(f.kept.clone()));
-    let records: &'static Records<'static> =
-        Box::leak(Box::new(Records::new(f.keys, load, log, frame, a)));
+    let bump = blaze_own::testing::bump();
+    let frame: &'static blaze_mem::Frame =
+        bump.alloc_val(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("reader frame"));
+    let log: &'static Log<'static> = bump.alloc_val(Log::new(f.crate_names, a));
+    let load: &'static Kept = bump.alloc_val(f.kept.clone());
+    let records: &'static Records<'static> = bump.alloc_val(Records::new(f.keys, load, log, frame, a));
     NamesRecords { records, frame, lang_crates: &LANG_CRATES, body_sources: None }
 }
 
@@ -659,16 +660,19 @@ fn main() {
     }
     let f = Fixture { kept, keys, crate_names };
     let pos = |name: &str| crate_names.iter().position(|&n| n == name);
-    let lang_crates: &'static [usize] = Vec::leak(
+    let bump = blaze_own::testing::bump();
+    let mut lang_vec = OwnVec::new_in(bump);
+    lang_vec.extend(
         [Some(0), pos("core"), pos("alloc"), pos("std"), pos("panic_abort"), pos("bstd"), pos("blaze_std")]
             .into_iter()
-            .flatten()
-            .collect(),
+            .flatten(),
     );
-    let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame")));
-    let log: &'static Log<'static> = Box::leak(Box::new(Log::new(f.crate_names, a)));
-    let load: &'static Kept = Box::leak(Box::new(f.kept.clone()));
-    let records: &'static Records<'static> = Box::leak(Box::new(Records::new(f.keys, load, log, frame, a)));
+    let lang_crates: &'static [usize] = lang_vec.into_bump_slice();
+    let frame: &'static blaze_mem::Frame =
+        bump.alloc_val(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame"));
+    let log: &'static Log<'static> = bump.alloc_val(Log::new(f.crate_names, a));
+    let load: &'static Kept = bump.alloc_val(f.kept.clone());
+    let records: &'static Records<'static> = bump.alloc_val(Records::new(f.keys, load, log, frame, a));
     let nr = NamesRecords { records, frame, lang_crates, body_sources: None };
 
     let mut b = builder();
@@ -973,16 +977,17 @@ fn main() {
     println!("cargo:rustc-env=GETRANDOM_BYTES={}", buf1.len() + buf2.len());
 }
 "#;
-    let home = std::env::var("HOME").expect("HOME");
-    let shelf_dir = std::path::PathBuf::from(&home).join(".blaze/v2/toolchain");
+    let base = support::fresh_home("wasm64_getrandom", true);
+    let shelf_dir = base.join("home/.blaze/v2/toolchain");
     if !shelf_dir.join(blaze_toolchain::PINNED.to_string()).exists() {
         eprintln!("skipping getrandom_v03_custom_backend test: pinned toolchain {} not on shelf", blaze_toolchain::PINNED);
         return;
     }
     let a = alloc();
+    let bump = blaze_own::testing::bump();
     let edition = edition::PackageEdition::of_manifest("2024").expect("2024");
     let root = "/wasm64_cli_e2e/build.rs";
-    let files = vec![(String::from(root), String::from(GETRANDOM_SCRIPT))];
+    let files = [(root.to_owned(), GETRANDOM_SCRIPT.to_owned())];
     let user = UserCrate {
         name: "getrandom_custom_build_rs",
         dir: DIR,
@@ -997,30 +1002,32 @@ fn main() {
         .expect("open wasm64 toolchain");
     let inputs = Inputs::new(&user, &tc).expect("inputs");
     let crates = inputs.crates();
-    let keys: &'static [CrateItemKey] = Vec::leak(crates.iter().map(|c| c.key).collect());
-    let crate_names: &'static [&'static str] = Vec::leak(crates.iter().map(|c| leak(c.name)).collect());
-    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("resolve");
+    let mut keys_vec = OwnVec::new_in(bump);
+    keys_vec.extend(crates.iter().map(|c| c.key));
+    let keys: &'static [CrateItemKey] = keys_vec.into_bump_slice();
+    let mut names_vec = OwnVec::new_in(bump);
+    names_vec.extend(crates.iter().map(|c| leak(c.name)));
+    let crate_names: &'static [&'static str] = names_vec.into_bump_slice();
+    let names = inputs.resolve(&crates, bump).expect("resolve");
     assert!(names.notes(0).is_empty(), "expected zero scope notes, got {:?}", names.notes(0));
     let mut kept = Kept::default();
     for c in names.crates().iter() {
-        kept.names.push(aligned(&names_record::encode(c, a).expect("names record"), blaze_own::testing::bump()));
-        kept.items.push(aligned(&items_record::encode_with(c, &names, a).expect("items record"), blaze_own::testing::bump()));
+        kept.names.push(aligned(&names_record::encode(c, a).expect("names record"), bump));
+        kept.items.push(aligned(&items_record::encode_with(c, &names, a).expect("items record"), bump));
         kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), leak(f.text))).collect());
         kept.expansions.push(c.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, leak(m.text)))).collect());
         kept.origins.push(c.expansions.iter().filter_map(|(call, e)| e.made.as_ref().map(|m| (*call, made_origins(*call, &m.origins)))).collect());
     }
     let f = Fixture { kept, keys, crate_names };
     let pos = |name: &str| crate_names.iter().position(|&n| n == name);
-    let lang_crates: &'static [usize] = Vec::leak(
-        [Some(0), pos("core"), pos("alloc"), pos("std"), pos("panic_abort")]
-            .into_iter()
-            .flatten()
-            .collect(),
-    );
-    let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame")));
-    let log: &'static Log<'static> = Box::leak(Box::new(Log::new(f.crate_names, a)));
-    let load: &'static Kept = Box::leak(Box::new(f.kept.clone()));
-    let records: &'static Records<'static> = Box::leak(Box::new(Records::new(f.keys, load, log, frame, a)));
+    let mut lang_vec = OwnVec::new_in(bump);
+    lang_vec.extend([Some(0), pos("core"), pos("alloc"), pos("std"), pos("panic_abort")].into_iter().flatten());
+    let lang_crates: &'static [usize] = lang_vec.into_bump_slice();
+    let frame: &'static blaze_mem::Frame =
+        bump.alloc_val(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame"));
+    let log: &'static Log<'static> = bump.alloc_val(Log::new(f.crate_names, a));
+    let load: &'static Kept = bump.alloc_val(f.kept.clone());
+    let records: &'static Records<'static> = bump.alloc_val(Records::new(f.keys, load, log, frame, a));
     let nr = NamesRecords { records, frame, lang_crates, body_sources: None };
 
     let mut b = builder();
@@ -1055,17 +1062,15 @@ fn main() {
     let checked = check_wasm64(wasm_out.as_slice()).expect("valid wasm64");
     assert!(checked.memory64);
 
-    let dir = std::env::temp_dir().join(format!("blaze-wasm64-getrandom-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir");
+    let dir = base.join("home");
     let rt = ScriptRuntime::new(&dir).expect("ScriptRuntime");
     let loaded = rt.load("getrandom_custom_build_rs", wasm_out.as_slice()).expect("ScriptRuntime loads wasm64");
     let env = Env { vars: OwnVec::new_in(a) };
     let script = Arc::new(Script {
         package: "getrandom_custom_pkg".to_owned(),
-        tree: Tree::Mem { files: Arc::new(Vec::new()), submodules: Arc::from([]), git: None },
+        tree: Tree::Mem { files: Arc::new(Default::default()), submodules: Arc::from([]), git: None },
         root: ScriptRoot::package(),
-        env: Vec::new(),
+        env: Default::default(),
         target: blaze_toolchain::WASM64_TARGET.to_owned(),
         host: "x86_64-unknown-linux-gnu".to_owned(),
         c_mode: CMode::Deferred,
@@ -1077,7 +1082,7 @@ fn main() {
             output: 1 << 20,
             line: 256 << 10,
         },
-        table: Arc::new(Vec::new()),
+        table: Arc::new(Default::default()),
         probes: None,
         c_probes: None,
         spawner: None,
@@ -1096,7 +1101,6 @@ fn main() {
         "expected GETRANDOM_BYTES=64, got {:?}",
         ran.outputs.env
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn read_wasm_u64_leb(bytes: &[u8], pos: &mut usize) -> u64 {
@@ -1120,10 +1124,10 @@ fn read_wasm_name<'a>(bytes: &'a [u8], pos: &mut usize) -> &'a str {
     s
 }
 
-fn parse_wasm_imports(wasm: &[u8]) -> Vec<(&str, &str)> {
+fn parse_wasm_imports<'a>(wasm: &'a [u8]) -> AVec<'static, (&'a str, &'a str)> {
     assert!(wasm.len() >= 8 && &wasm[..4] == b"\0asm", "valid wasm header");
     let mut pos = 8;
-    let mut imports = Vec::new();
+    let mut imports = OwnVec::new_in(alloc());
     while pos < wasm.len() {
         let sec_id = wasm[pos];
         pos += 1;
@@ -1361,14 +1365,15 @@ pub unsafe extern "C" fn blaze_proc_macro_expand(
 }
 "#;
 
-    let home = std::env::var("HOME").expect("HOME");
-    let shelf_dir = std::path::PathBuf::from(&home).join(".blaze/v2/toolchain");
+    let base = support::fresh_home("wasm64_pm_getenv", true);
+    let shelf_dir = base.join("home/.blaze/v2/toolchain");
     if !shelf_dir.join(blaze_toolchain::PINNED.to_string()).exists() {
         eprintln!("skipping real_std_proc_macro_shim_overrides_wasi_rt_getenv test: pinned toolchain not on shelf");
         return;
     }
 
     let a = alloc();
+    let bump = blaze_own::testing::bump();
     let id = blaze_toolchain::PINNED;
     let mut shelf = blaze_ladder::crates::DirShelf::new(shelf_dir.to_string_lossy().into_owned());
     let tc = Toolchain::open_target(&mut shelf, id, blaze_toolchain::WASM64_TARGET)
@@ -1377,7 +1382,7 @@ pub unsafe extern "C" fn blaze_proc_macro_expand(
     // Reuse `Inputs::new` to obtain the resolved wasm64 toolchain crates, then swap crate 0 for
     // our `UnitKind::ProcMacro` crate and inject crate 1 as `blaze_wasm64_pm_shim`.
     let ed24 = edition::PackageEdition::of_manifest("2024").expect("2024");
-    let dummy_files = vec![(String::from(ROOT), String::from("fn main() {}"))];
+    let dummy_files = [(ROOT.to_owned(), "fn main() {}".to_owned())];
     let dummy_user = UserCrate {
         name: "dummy",
         dir: DIR,
@@ -1399,10 +1404,10 @@ pub unsafe extern "C" fn blaze_proc_macro_expand(
 
     let pm_key = CrateItemKey(blaze_id::ContentId::of("wasm64 e2e pm", b"env_ver_pm"));
     let shim_key = CrateItemKey(blaze_id::ContentId::of("wasm64 e2e pm shim", SHIM_SRC.as_bytes()));
-    let pm_deps: &'static [(&'static str, usize)] = Vec::leak(vec![("proc_macro", pm_tc_idx)]);
-    let shim_deps: &'static [(&'static str, usize)] = Vec::leak(vec![("proc_macro", pm_tc_idx)]);
+    let pm_deps: &'static [(&'static str, usize)] = bump.alloc_slice_copy(&[("proc_macro", pm_tc_idx)]);
+    let shim_deps: &'static [(&'static str, usize)] = bump.alloc_slice_copy(&[("proc_macro", pm_tc_idx)]);
 
-    let mut all_crates: Vec<CrateInput<'_>> = Vec::with_capacity(base_crates.len() + 1);
+    let mut all_crates: AVec<'_, CrateInput<'_>> = OwnVec::with_capacity_in(base_crates.len() + 1, a);
     all_crates.push(CrateInput {
         name: "env_ver_pm",
         key: pm_key,
@@ -1428,13 +1433,9 @@ pub unsafe extern "C" fn blaze_proc_macro_expand(
         script: None,
     });
     for tc_crate in base_crates.iter().skip(1) {
-        let shifted_deps: &'static [(&'static str, usize)] = Vec::leak(
-            tc_crate
-                .deps
-                .iter()
-                .map(|&(name, dep)| (leak(name), dep + 1))
-                .collect(),
-        );
+        let mut shifted_vec = OwnVec::new_in(bump);
+        shifted_vec.extend(tc_crate.deps.iter().map(|&(name, dep)| (leak(name), dep + 1)));
+        let shifted_deps: &'static [(&'static str, usize)] = shifted_vec.into_bump_slice();
         all_crates.push(CrateInput { deps: shifted_deps, ..*tc_crate });
     }
 
@@ -1456,7 +1457,7 @@ pub unsafe extern "C" fn blaze_proc_macro_expand(
 
     struct PmE2eSources<'a, S> {
         inner: &'a S,
-        envs: Vec<Option<CrateEnv<'a>>>,
+        envs: [Option<CrateEnv<'a>>; 2],
     }
     impl<'a, S: SourceTexts<'a>> SourceTexts<'a> for PmE2eSources<'a, S> {
         fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
@@ -1501,36 +1502,41 @@ pub unsafe extern "C" fn blaze_proc_macro_expand(
     };
     let sources = PmE2eSources {
         inner: base_inputs.texts(),
-        envs: vec![mk_env("env_ver_pm", "/pm/"), mk_env("blaze_wasm64_pm_shim", "/shim/")],
+        envs: [mk_env("env_ver_pm", "/pm/"), mk_env("blaze_wasm64_pm_shim", "/shim/")],
     };
-    let names = resolve_crates(&all_crates, sysroot, &sources, &Serial, blaze_own::testing::bump())
+    let names = resolve_crates(all_crates.as_slice(), sysroot, &sources, &Serial, bump)
         .expect("resolve proc-macro + shim + wasm64 sysroot");
     assert!(names.notes(0).is_empty(), "pm notes: {:?}", names.notes(0));
     assert!(names.notes(1).is_empty(), "shim notes: {:?}", names.notes(1));
 
-    let keys: &'static [CrateItemKey] = Vec::leak(all_crates.iter().map(|c| c.key).collect());
-    let crate_names: &'static [&'static str] =
-        Vec::leak(all_crates.iter().map(|c| leak(c.name)).collect());
+    let mut keys_vec = OwnVec::new_in(bump);
+    keys_vec.extend(all_crates.iter().map(|c| c.key));
+    let keys: &'static [CrateItemKey] = keys_vec.into_bump_slice();
+    let mut names_vec = OwnVec::new_in(bump);
+    names_vec.extend(all_crates.iter().map(|c| leak(c.name)));
+    let crate_names: &'static [&'static str] = names_vec.into_bump_slice();
     let mut kept = Kept::default();
     for c in names.crates().iter() {
-        kept.names.push(aligned(&names_record::encode(c, a).expect("names record"), blaze_own::testing::bump()));
-        kept.items.push(aligned(&items_record::encode_with(c, &names, a).expect("items record"), blaze_own::testing::bump()));
+        kept.names.push(aligned(&names_record::encode(c, a).expect("names record"), bump));
+        kept.items.push(aligned(&items_record::encode_with(c, &names, a).expect("items record"), bump));
         kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), leak(f.text))).collect());
         kept.expansions.push(c.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, leak(m.text)))).collect());
         kept.origins.push(c.expansions.iter().filter_map(|(call, e)| e.made.as_ref().map(|m| (*call, made_origins(*call, &m.origins)))).collect());
     }
     let f = Fixture { kept, keys, crate_names };
     let pos = |name: &str| crate_names.iter().position(|&n| n == name);
-    let lang_crates: &'static [usize] = Vec::leak(
+    let mut lang_vec = OwnVec::new_in(bump);
+    lang_vec.extend(
         [Some(0), pos("core"), pos("alloc"), pos("std"), pos("proc_macro"), pos("panic_abort")]
             .into_iter()
-            .flatten()
-            .collect(),
+            .flatten(),
     );
-    let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame")));
-    let log: &'static Log<'static> = Box::leak(Box::new(Log::new(f.crate_names, a)));
-    let load: &'static Kept = Box::leak(Box::new(f.kept.clone()));
-    let records: &'static Records<'static> = Box::leak(Box::new(Records::new(f.keys, load, log, frame, a)));
+    let lang_crates: &'static [usize] = lang_vec.into_bump_slice();
+    let frame: &'static blaze_mem::Frame =
+        bump.alloc_val(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame"));
+    let log: &'static Log<'static> = bump.alloc_val(Log::new(f.crate_names, a));
+    let load: &'static Kept = bump.alloc_val(f.kept.clone());
+    let records: &'static Records<'static> = bump.alloc_val(Records::new(f.keys, load, log, frame, a));
     let nr = NamesRecords { records, frame, lang_crates, body_sources: None };
 
     let find_shim_fn = |name: &str| -> (LibKey, ItemKey) {
@@ -1600,27 +1606,40 @@ pub unsafe extern "C" fn blaze_proc_macro_expand(
     assert!(checked.memory64);
     let imports = parse_wasm_imports(wasm_out.as_slice());
     assert!(
-        imports.contains(&("blaze_proc_macro_64", "env_var")),
+        imports.as_slice().contains(&("blaze_proc_macro_64", "env_var")),
         "compiled wasm64 proc-macro MUST import blaze_proc_macro_64::env_var (shim getenv override), got imports={imports:?}"
     );
     assert!(
-        imports.contains(&("blaze_proc_macro_64", "current_dir")),
+        imports.as_slice().contains(&("blaze_proc_macro_64", "current_dir")),
         "compiled wasm64 proc-macro MUST import blaze_proc_macro_64::current_dir, got imports={imports:?}"
     );
 
     // Execute LIVE inside Wasmtime memory64 via `blaze_proc_macro::host::Runtime`!
-    let dir = std::env::temp_dir().join(format!("blaze-wasm64-pm-getenv-e2e-{}", std::process::id()));
+    let dir = base.join("mod");
     let pkg_dir = dir.join("pkg");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&pkg_dir).expect("pkg dir");
-    std::fs::write(dir.join("module.wasm"), wasm_out.as_slice()).expect("write module.wasm");
+    let io = bstd::test::native(&base).expect("native io");
+    let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("cx");
+    let fs = io.need_fs().expect("fs");
+    let root = fs.root();
+    let mod_dir = root
+        .make_dir(&cx, &bstd::path::Path::new("mod").expect("mod"), bstd::fs::Durable::No)
+        .expect("mod dir");
+    mod_dir
+        .make_dir(&cx, &bstd::path::Path::new("pkg").expect("pkg"), bstd::fs::Durable::No)
+        .expect("pkg dir");
+    let wasm_file = mod_dir
+        .create(&cx, &bstd::path::Path::new("module.wasm").expect("module.wasm"))
+        .expect("create module.wasm");
+    wasm_file
+        .write_at(&cx, 0, wasm_out.as_slice(), bstd::fs::Durable::No)
+        .expect("write module.wasm");
     let digest = sha256_hex(wasm_out.as_slice());
     let record = ModuleRecord {
         key: digest.clone(),
         name: "env_ver_pm".to_owned(),
         version: "0.1.0".to_owned(),
         wasm_sha256: digest,
-        macros: vec![Exported { index: 0, kind: ProcKind::FnLike, name: "pkg_version".to_owned(), helpers: Vec::new() }],
+        macros: [Exported { index: 0, kind: ProcKind::FnLike, name: "pkg_version".to_owned(), helpers: Default::default() }].into(),
         decls: "__rustc_proc_macro_decls_blaze__".to_owned(),
         dir: dir.clone(),
         compiled: dir.join("compiled"),
@@ -1628,7 +1647,7 @@ pub unsafe extern "C" fn blaze_proc_macro_expand(
     };
     let rt = Runtime::new(blaze_own::testing::heap()).expect("Runtime");
     let loaded = rt.load(&record).expect("load wasm64 proc-macro");
-    let env = PackageEnv::set_only(vec![("CARGO_PKG_VERSION".to_owned(), "9.8.7-e2e".to_owned())]).expect("PackageEnv");
+    let env = PackageEnv::set_only([("CARGO_PKG_VERSION".to_owned(), "9.8.7-e2e".to_owned())].into()).expect("PackageEnv");
     let pkg = Arc::new(Package::new(Files::Folder(pkg_dir), env).expect("Package"));
     let input = lex("", Edition::E2024, a).expect("lex");
     let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok("src/lib.rs") };
@@ -1636,15 +1655,18 @@ pub unsafe extern "C" fn blaze_proc_macro_expand(
         .expand(&loaded, &record.macros[0], &call, Edition::E2024, pkg, Limits::STANDARD, a)
         .expect("real std proc-macro expands live with host CARGO_PKG_VERSION");
 
-    let rendered: String = ran.produced.tokens.tokens().iter().map(|t| ran.produced.tokens.text_of(t)).collect();
+    let mut rendered = blaze_own::AString::new_in(a);
+    for t in ran.produced.tokens.tokens() {
+        rendered.push_str(ran.produced.tokens.text_of(t));
+    }
     assert!(
-        rendered.contains("9.8.7-e2e|"),
-        "expected host CARGO_PKG_VERSION in expanded tokens, got {rendered:?}"
+        rendered.as_str().contains("9.8.7-e2e|"),
+        "expected host CARGO_PKG_VERSION in expanded tokens, got {:?}",
+        rendered.as_str()
     );
     assert!(
         ran.produced.reads.list().iter().any(|r| ran.produced.reads.subject(r) == "env:CARGO_PKG_VERSION"),
         "expected tracked env:CARGO_PKG_VERSION read in {:?}",
         ran.produced.reads.list()
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }

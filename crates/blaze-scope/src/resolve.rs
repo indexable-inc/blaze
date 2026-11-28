@@ -59,7 +59,7 @@ use crate::task::{
     CallSrc, Cfg, Fill, FillEnv, FillReport, Files, First, Fragment, FragmentTokens, Held, ImplSrc,
     ItemText, LangSrc, Loc, LowerCx, LowerNote, Lowered, MacroBody, MacroSrc, Member, ModMade, Par,
     PreludeImport, RootInput, RootNote, RootPlan, TaskError, Tree, Variant, Where,
-    crate_root, crate_tools, file_attrs, lower, lower_in, walk,
+    crate_root, crate_tools, file_attrs, file_enables_feature, lower, lower_in, walk,
 };
 use crate::task::{joined, pop_dir};
 use crate::task::ExpandPart;
@@ -1644,7 +1644,8 @@ pub(crate) fn resolve_one_with<'a, 'r, 'p: 'a, S: SourceTexts<'a>, P: Par>(
         Some(prepared) => prepared,
         None => walked_files(graph, input, id, index, edition, &cfg, built, sources, par, &opts, &mut notes, bump)?,
     };
-    let Prepared { set, tree, low, listed, root_attrs, root_bytes, record } = prepared;
+    let Prepared { set, tree, low, listed, root_attrs, root_bytes, record, cfg_version } = prepared;
+    let cfg = cfg.with_cfg_version(cfg_version);
 
     // The records, written and read back: what the fill and later crates read.
     par.stage(crate::task::Stage::Decls);
@@ -2280,6 +2281,8 @@ struct Prepared<'a> {
     root_bytes: &'a [u8],
     /// The module tree record handed in (its bytes, read); `None`: it is written from the walk.
     record: Option<(&'a [u8], TreeRecord<'a>)>,
+    /// Whether the crate root enables `#![feature(cfg_version)]`.
+    cfg_version: bool,
 }
 
 /// Module `i`'s place, as its `ModuleDecls` record's head holds it.
@@ -2312,6 +2315,13 @@ fn walked_files<'a, S: SourceTexts<'a>, P: Par>(
     let mut set = FileSet::new_in(alloc);
     let root_outline = blaze_file_items::outline_auto_extensions(root_text, edition, blaze_file_items::Bodies::Skipped, alloc);
     let root_file = set.add(file_of(input.root, root_text, root_outline, input.shown_from, bump));
+    let cfg_version = file_enables_feature(cfg, &set.at(usize::try_from(root_file).unwrap_or(0)).outline, root_text, "cfg_version", alloc);
+    let cfg_with_version = if cfg_version {
+        Some(Cfg::from_atoms(cfg.atoms(), alloc).with_cfg_version(true))
+    } else {
+        None
+    };
+    let cfg = cfg_with_version.as_ref().unwrap_or(cfg);
     let mut root_dir = AString::from_str_in(input.root, alloc);
     pop_dir(&mut root_dir);
     let mut tried: HashMap<&'a str, (), Alloc<'a>> = HashMap::new_in(alloc);
@@ -2364,7 +2374,7 @@ fn walked_files<'a, S: SourceTexts<'a>, P: Par>(
     };
     let macro_exports = core::mem::replace(&mut low.macro_exports, AVec::new_in(alloc));
     let root_bytes = root_record_of(graph, input, id, root.id, &attrs, &tree, &mut low, &macro_exports, built, notes, bump)?;
-    Ok(Prepared { set, tree, low, listed, root_attrs, root_bytes, record: None })
+    Ok(Prepared { set, tree, low, listed, root_attrs, root_bytes, record: None, cfg_version })
 }
 
 /// The crate root's record from the root's lowering (`low.at[0]` is the root) and the crate's
@@ -2508,6 +2518,27 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
             path: AString::from_str_in(m.path, alloc),
         });
     }
+    let root_member = at.first() == Some(&0);
+    let stored = aligned(record.crate_root, bump);
+    let stored_view = CrateRootView::read(stored).map_err(|_| refuse(MemberRefusal::TreeCrateRoot))?;
+    let stored_cfg_version = stored_view.has_feature("cfg_version");
+    let cfg_version = if root_member {
+        let root = set.at(usize::try_from(tree.modules[0].file).unwrap_or(0));
+        let enabled = file_enables_feature(cfg, &root.outline, root.text, "cfg_version", alloc);
+        if enabled != stored_cfg_version {
+            return Ok(None);
+        }
+        enabled
+    } else {
+        stored_cfg_version
+    };
+    let cfg_with_version = if cfg_version {
+        Some(Cfg::from_atoms(cfg.atoms(), alloc).with_cfg_version(true))
+    } else {
+        None
+    };
+    let cfg = cfg_with_version.as_ref().unwrap_or(cfg);
+
     // Each member's text as the walk reads it: equal to its row, the walk makes the same
     // children of it.
     par.names_part(crate::task::NamesPart::Walk);
@@ -2525,8 +2556,6 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
 
     par.stage(crate::task::Stage::Lower);
     let listed = if input.implicit.proc_macro { sources.proc_exports(index) } else { None };
-    let root_member = at.first() == Some(&0);
-    let stored = aligned(record.crate_root, bump);
     let (tools, attrs) = if root_member {
         let root = set.at(tree.modules[0].file as usize);
         let attrs = file_attrs(cfg, &root.outline, root.text, alloc);
@@ -2541,7 +2570,6 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
     // The members' notes are kept only when the record holds: a tree made again notes its own.
     let mut own_notes = AVec::new_in(alloc);
     let mut low = lower_modules(input.key, input.implicit.entry, input.implicit.proc_macro, edition, cfg, &tools, &set, &tree, listed, &mut own_notes, par, opts, Some(at), sources.attr_order(), bump);
-    let stored_view = CrateRootView::read(stored).map_err(|_| refuse(MemberRefusal::TreeCrateRoot))?;
     if members_moved(input.key, &tree, &low, &record, &stored_view, bump) {
         return Ok(None);
     }
@@ -2581,7 +2609,7 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
             (root_attrs, root_record_of(graph, input, id, root_file, &attrs, &tree, &mut low, &exports, built, notes, bump)?)
         }
     };
-    Ok(Some(Prepared { set, tree, low, listed, root_attrs, root_bytes, record: Some((bytes, record)) }))
+    Ok(Some(Prepared { set, tree, low, listed, root_attrs, root_bytes, record: Some((bytes, record)), cfg_version }))
 }
 
 /// The crate's effective macro expansion recursion limit from its root file's attributes, or a
@@ -3400,6 +3428,10 @@ impl<'a, S: SourceTexts<'a>> ExpandCx for ParHost<'_, '_, 'a, S> {
         Ok(self.cfg.eval(&text).unwrap_or(false))
     }
 
+    fn cfg_version_enabled(&self) -> bool {
+        self.cfg.cfg_version_enabled()
+    }
+
     fn include(&self, _written: &str, _how: IncludeAs) -> Result<Included<'_>, HostError> {
         self.needs_serial.set(true);
         Err(HostError { ask: HostAsk::Include, why: HostWhy::Refused })
@@ -3835,7 +3867,7 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
             Call::fn_like(&input, site)
         }
         CallShape::Attr if src.implicit => {
-            let made = match ItemAttrs::new(input).implicit_call(atom) {
+            let made = match ItemAttrs::new(input).with_cfg_version(base.cfg.cfg_version_enabled()).implicit_call(atom) {
                 Ok(made) => made,
                 Err(error) => return fail_with(ExpandNote::ItemAttrs { macro_name: mac.name, error }, &mut notes, &mut last, eager_checked_cell.into_inner()),
             };
@@ -3848,7 +3880,7 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
                 Ok(stream) => stream,
                 Err(error) => return fail_with(ExpandNote::Lex { macro_name: mac.name, what: Lexed::Path, error }, &mut notes, &mut last, eager_checked_cell.into_inner()),
             };
-            let mut walk = ItemAttrs::new(input);
+            let mut walk = ItemAttrs::new(input).with_cfg_version(base.cfg.cfg_version_enabled());
             let attr = loop {
                 match walk.next(atom) {
                     Ok(NextAttr::Call { path, attr })
@@ -3875,7 +3907,7 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
             Call::attr(args.as_ref(), &item, site)
         }
         CallShape::Derive => {
-            let mut derives = match ItemAttrs::new(input).derives(atom) {
+            let mut derives = match ItemAttrs::new(input).with_cfg_version(base.cfg.cfg_version_enabled()).derives(atom) {
                 Ok(Some(derives)) => derives,
                 Ok(None) => return ParCallResult::Empty { notes, eager_checked: eager_checked_cell.into_inner(), called_seen: true },
                 Err(error) => return fail_with(ExpandNote::ItemAttrs { macro_name: mac.name, error }, &mut notes, &mut last, eager_checked_cell.into_inner()),
@@ -4319,6 +4351,10 @@ impl<'a, S: SourceTexts<'a>> ExpandCx for Host<'_, 'a, S> {
         let text = render_with(predicate, None, |_| None, &mut |_, _, _, _| {}, Option::<&mut AVec<'_, Option<u32>>>::None, self.alloc)
             .map_err(|_| HostError { ask: HostAsk::Cfg, why: HostWhy::Refused })?;
         Ok(self.cfg.eval(&text).unwrap_or(false))
+    }
+
+    fn cfg_version_enabled(&self) -> bool {
+        self.cfg.cfg_version_enabled()
     }
 
     /// The Reference ("Macros", built-in `include!`; core's `include_str!`): "The file is
@@ -4935,7 +4971,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
         CallShape::Attr if src.implicit => {
             // D104: no attribute names the call; it stands outermost, so the item is all of
             // the input, each `#[cfg_attr]` applied (blaze-expand `ItemAttrs::implicit_call`).
-            let made = match ItemAttrs::new(input).implicit_call(atom) {
+            let made = match ItemAttrs::new(input).with_cfg_version(base.cfg.cfg_version_enabled()).implicit_call(atom) {
                 Ok(made) => made,
                 Err(error) => {
                     item_note(error);
@@ -4953,7 +4989,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
             // `#[$crate::linkme::distributed_slice(..)]` statics, 2026-11-17).
             let plant = base.sources.attr_plant();
             let named = lexed(src.name, Lexed::Path)?;
-            let mut walk = ItemAttrs::new(input);
+            let mut walk = ItemAttrs::new(input).with_cfg_version(base.cfg.cfg_version_enabled());
             let attr = loop {
                 match walk.next(atom) {
                     Ok(NextAttr::Call { path, attr })
@@ -4989,7 +5025,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
             Call::attr(args.as_ref(), &item, site)
         }
         CallShape::Derive => {
-            let mut derives = match ItemAttrs::new(input).derives(atom) {
+            let mut derives = match ItemAttrs::new(input).with_cfg_version(base.cfg.cfg_version_enabled()).derives(atom) {
                 Ok(Some(derives)) => derives,
                 // The item's cfg is false: nothing of it is derived.
                 Ok(None) => return Some((DeclsBuilder::new_in(home), None)),

@@ -827,17 +827,21 @@ fn a_module_importing_build_script_process_loads_and_refuses_spawn() {
 #[test]
 fn the_proc_macro_host_covers_all_of_blaze_seed_except_fibers() {
     const SEED_FIBERS: [&str; 4] = ["fiber_drop", "fiber_new", "fiber_resume", "fiber_suspend"];
-    let mut covered: Vec<&str> = crate::host::SERVED_SEED
-        .iter()
-        .chain(crate::host::REFUSED_SEED)
-        .chain(crate::host::UNSERVED_SEED)
-        .chain(SEED_FIBERS.iter())
-        .copied()
-        .collect();
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut covered = blaze_own::Vec::new_in(alloc);
+    covered.extend(
+        crate::host::SERVED_SEED
+            .iter()
+            .chain(crate::host::REFUSED_SEED)
+            .chain(crate::host::UNSERVED_SEED)
+            .chain(SEED_FIBERS.iter())
+            .copied(),
+    );
     covered.sort_unstable();
-    let mut all: Vec<&str> = blaze_wasi::seed::FUNCTIONS.to_vec();
+    let mut all = blaze_own::Vec::new_in(alloc);
+    all.extend_from_slice(blaze_wasi::seed::FUNCTIONS);
     all.sort_unstable();
-    assert_eq!(covered, all);
+    assert_eq!(covered.as_slice(), all.as_slice());
 }
 
 /// A minimal `memory64` (`wasm64-blaze-wasip1`) proc-macro module with `blaze_proc_macro_64::output`
@@ -987,18 +991,26 @@ fn a_wasm64_module_importing_blaze_seed_loads_and_refuses_mutations() {
         (seed, "pread", 11),        // func 13
         (seed, "pwrite", 11),       // func 14
     ];
-    let run_in = |name: &str, body: &[u8], imports: &[(&str, &str, u8)], pkg_dir: &Path| -> Result<(), String> {
+    let alloc = blaze_own::testing::heap().alloc();
+    let run_in = |name: &str, body: &[u8], imports: &[(&str, &str, u8)], pkg_dir: &Path| -> Result<(), blaze_own::AString<'static>> {
         let module = module_in(&folder(name), wasm64_importing(body, imports), 1);
-        let loaded = runtime.load(&module).map_err(|e| format!("load: {e}"))?;
-        let alloc = blaze_own::testing::heap().alloc();
+        let loaded = runtime.load(&module).map_err(|e| {
+            let mut msg = blaze_own::AString::new_in(alloc);
+            let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("load: {e}"));
+            msg
+        })?;
         let input = lex("struct A;", EDITION, alloc).expect("the input lexes");
         let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok(CALL_FILE_SHOWN) };
         runtime
             .expand(&loaded, &module.macros[0], &call, EDITION, package(pkg_dir, &[]), Limits::STANDARD, alloc)
             .map(drop)
-            .map_err(|e| format!("call: {e}"))
+            .map_err(|e| {
+                let mut msg = blaze_own::AString::new_in(alloc);
+                let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("call: {e}"));
+                msg
+            })
     };
-    let assert_i32 = |body: &mut Vec<u8>, expected: i64| {
+    let assert_i32 = |body: &mut blaze_own::AVec<'static, u8>, expected: i64| {
         body.extend(op::i32(expected));
         body.push(op::NE);
         body.extend(op::IF);
@@ -1015,13 +1027,16 @@ fn a_wasm64_module_importing_blaze_seed_loads_and_refuses_mutations() {
     let keep_dir = pkg_dir.join("keep-dir");
     let keep_file = pkg_dir.join("keep-file");
     let new_dir = pkg_dir.join("new-dir");
-    std::fs::create_dir(&keep_dir).expect("temp dir");
-    std::fs::write(&keep_file, b"untouched").expect("temp file");
+    {
+        use std::fs;
+        fs::create_dir(&keep_dir).expect("temp dir");
+        fs::write(&keep_file, b"untouched").expect("temp file");
+    }
 
     let perm = i64::from(blaze_wasi::Errno::PERM.0);
     let notsup = i64::from(blaze_wasi::Errno::NOTSUP.0);
     let version = i64::from(blaze_wasi::seed::VERSION);
-    let mut body = Vec::new();
+    let mut body = blaze_own::AVec::new_in(alloc);
     // abi_version() == VERSION
     body.extend(op::call(1));
     assert_i32(&mut body, version);
@@ -1129,29 +1144,32 @@ fn a_wasm64_module_importing_blaze_seed_loads_and_refuses_mutations() {
     }
     assert_eq!(run_in("seed-called", &body, &extra, &pkg_dir), Ok(()));
     assert!(keep_dir.is_dir(), "remove_dir must never delete host directories");
-    assert_eq!(std::fs::read(&keep_file).expect("file still present"), b"untouched", "unlink must never delete host files");
+    {
+        use std::fs;
+        assert_eq!(fs::read(&keep_file).expect("file still present"), b"untouched", "unlink must never delete host files");
+    }
     assert!(!new_dir.exists(), "create_dir must never create host directories");
 
     // 3. Twin (rule 23): expecting success (0) from `remove_dir` must trap.
-    let mut expect_ok = Vec::new();
+    let mut expect_ok = blaze_own::AVec::new_in(alloc);
     expect_ok.extend(op::i64(64));
     expect_ok.extend(op::i64(17));
     expect_ok.extend(op::call(4));
     assert_i32(&mut expect_ok, 0);
     let twin = run_in("seed-twin", &expect_ok, &extra, &pkg_dir);
-    assert!(twin.as_ref().is_err_and(|e| e.starts_with("call: ")), "expecting 0 from remove_dir must trap: {twin:?}");
+    assert!(twin.as_ref().is_err_and(|e| e.as_str().starts_with("call: ")), "expecting 0 from remove_dir must trap: {twin:?}");
 
     // 4. `decommit` out-of-bounds traps with OutsideMemory (memory is 3 pages = 0x30000 bytes).
-    let mut oob = Vec::new();
+    let mut oob = blaze_own::AVec::new_in(alloc);
     oob.extend(op::i64(0x30000));
     oob.extend(op::i64(16));
     oob.extend(op::call(2));
     let oob_res = run_in("seed-decommit-oob", &oob, &extra, &pkg_dir);
-    assert!(oob_res.as_ref().is_err_and(|e| e.contains("outside its memory")), "{oob_res:?}");
+    assert!(oob_res.as_ref().is_err_and(|e| e.as_str().contains("outside its memory")), "{oob_res:?}");
 
     // 5. Control (rule 23): seed-only fibers remain unlinked and fail at load naming the import.
     let fiber = run_in("seed-fiber-unknown", &[], &[(seed, "fiber_suspend", 2)], &pkg_dir);
-    assert!(fiber.as_ref().is_err_and(|e| e.starts_with("load: ") && e.contains("fiber_suspend")), "{fiber:?}");
+    assert!(fiber.as_ref().is_err_and(|e| e.as_str().starts_with("load: ") && e.as_str().contains("fiber_suspend")), "{fiber:?}");
 }
 
 /// Proves [`crate::host::decommit_guest_range`] actually returns whole host pages to the OS
@@ -1160,13 +1178,12 @@ fn a_wasm64_module_importing_blaze_seed_loads_and_refuses_mutations() {
 #[test]
 #[allow(unsafe_code)]
 fn decommit_guest_range_discards_whole_pages_and_zeroes_edges() {
-    // SAFETY: `sysconf(_SC_PAGESIZE)` reads an immutable kernel constant.
-    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("page size");
+    let page = blaze_mem::page_size();
     let total = page * 4;
     // SAFETY: anonymous private mapping owned exclusively by this test and unmapped below.
     let raw = unsafe {
         libc::mmap(
-            std::ptr::null_mut(),
+            core::ptr::null_mut(),
             total,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANON,
@@ -1174,9 +1191,9 @@ fn decommit_guest_range_discards_whole_pages_and_zeroes_edges() {
             0,
         )
     };
-    assert_ne!(raw, libc::MAP_FAILED, "mmap failed: {}", std::io::Error::last_os_error());
+    assert_ne!(raw, libc::MAP_FAILED, "mmap failed");
     // SAFETY: `raw` is a valid readable/writable mapping of `total` bytes.
-    let buf = unsafe { std::slice::from_raw_parts_mut(raw.cast::<u8>(), total) };
+    let buf = unsafe { core::slice::from_raw_parts_mut(raw.cast::<u8>(), total) };
     buf.fill(0xA5);
 
     // Span unaligned head (last 17 bytes of page 0), whole pages 1 and 2, and unaligned tail (first 23 bytes of page 3).
@@ -1189,7 +1206,7 @@ fn decommit_guest_range_discards_whole_pages_and_zeroes_edges() {
         let mut vec = [0u8; 2];
         // SAFETY: `raw.add(page)` is page-aligned for 2 pages inside our live mapping.
         let rc = unsafe { libc::mincore(raw.cast::<u8>().add(page).cast(), page * 2, vec.as_mut_ptr()) };
-        assert_eq!(rc, 0, "mincore failed: {}", std::io::Error::last_os_error());
+        assert_eq!(rc, 0, "mincore failed");
         assert_eq!(vec, [0, 0], "decommitted interior pages must not remain resident");
     }
 

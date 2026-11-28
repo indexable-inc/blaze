@@ -1025,6 +1025,58 @@ pub(crate) unsafe fn decommit(
     Ok(false)
 }
 
+/// Discards whole host pages inside `slice` back to the OS so subsequent reads fault in fresh
+/// zero pages (leaving untouched pages unallocated), and zeroes any unaligned head/tail bytes.
+pub(crate) fn decommit_zeroed(slice: &mut [u8]) -> Result<(), i32> {
+    if slice.is_empty() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        let page = page_size();
+        if !page.is_power_of_two() {
+            return Err(22);
+        }
+        let base = slice.as_mut_ptr().addr();
+        let end = base.saturating_add(slice.len());
+        let aligned_start = base.checked_next_multiple_of(page).unwrap_or(end);
+        let aligned_end = end & !(page - 1);
+        if aligned_start >= aligned_end {
+            slice.fill(0);
+            return Ok(());
+        }
+        let head = aligned_start - base;
+        let body_len = aligned_end - aligned_start;
+        if let Some(prefix) = slice.get_mut(..head) {
+            prefix.fill(0);
+        }
+        if let Some(suffix) = slice.get_mut(head + body_len..) {
+            suffix.fill(0);
+        }
+        #[cfg(target_os = "linux")]
+        let flags = MapFlags::FIXED | MapFlags::PRIVATE | MapFlags::ANONYMOUS | MapFlags::NO_RESERVE;
+        #[cfg(not(target_os = "linux"))]
+        let flags = MapFlags::FIXED | MapFlags::PRIVATE | MapFlags::ANONYMOUS;
+        // SAFETY:
+        // - `slice` is exclusively borrowed, so no other reference or thread accesses `[base, end)`.
+        // - `aligned_start..aligned_end` is a page-aligned subrange strictly inside `slice`,
+        //   backed by a private `PROT_READ | PROT_WRITE` mapping.
+        // - `MAP_FIXED | MAP_PRIVATE | MAP_ANON` with `PROT_READ | PROT_WRITE` atomically replaces
+        //   those pages with fresh zero-on-demand anonymous pages while preserving permissions.
+        let ptr = unsafe { NonNull::new_unchecked(slice.as_mut_ptr().add(head)) };
+        timed(Kind::MapFixed, || unsafe {
+            mmap(Some(ptr), body_len, Prot::READ | Prot::WRITE, flags, None, 0)
+        })
+        .map(|_| ())
+        .map_err(|error| i32::try_from(error.raw()).unwrap_or(22))
+    }
+    #[cfg(not(unix))]
+    {
+        slice.fill(0);
+        Ok(())
+    }
+}
+
 /// Lets the kernel take the pages of `[ptr, ptr + bytes)` back while they stay reserved: the
 /// next touch after [`reuse`] finds them zeroed (Linux) or unspecified (macOS, Windows). Linux
 /// drops them at once (`MADV_DONTNEED`), so the resident set falls now, not under pressure;

@@ -187,7 +187,7 @@ pub fn find<'n, S: NamesSource<'n>>(names: S, roots: &[usize], alloc: Alloc<'_>)
     let mut out = all(Found::Missing);
     for &(r, key) in named.iter() {
         let at = r as usize;
-        let exported = match no_mangle(names, key, atoms, edition, alloc) {
+        let exported = match no_mangle(names, krate, key, atoms, edition, alloc) {
             Ok(exported) => exported,
             Err(why) => {
                 out.found[at] = why;
@@ -213,6 +213,7 @@ pub fn find<'n, S: NamesSource<'n>>(names: S, roots: &[usize], alloc: Alloc<'_>)
 /// inner path: blaze-lower's UNSAFE_META, as front2/links.rs reads it).
 fn no_mangle<'n, S: NamesSource<'n>>(
     names: S,
+    krate: usize,
     key: blaze_id::ItemKey,
     atoms: &'n [(&'n str, Option<&'n str>)],
     edition: blaze_surface::Edition,
@@ -222,7 +223,7 @@ fn no_mangle<'n, S: NamesSource<'n>>(
     if !text.contains("no_mangle") {
         return Ok(false);
     }
-    let sig = blaze_lower::lower_signature(text, edition, &mut CrateCfg(atoms), alloc).map_err(|_| Found::Attrs)?;
+    let sig = blaze_lower::lower_signature(text, edition, &mut CrateCfg::of(names, krate, atoms), alloc).map_err(|_| Found::Attrs)?;
     let v = sig.view();
     for &n in v.rows(v.list(head::ATTRS)).map_err(|_| Found::Attrs)? {
         let a = v.attr(n).map_err(|_| Found::Attrs)?;

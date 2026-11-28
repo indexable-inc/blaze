@@ -1008,6 +1008,10 @@ fn lowering_errors<'a>(findings: &[super::body::BodyFinding], verdict: &mut Body
                 text = blaze_own::format_in!(alloc, "this `asm!` breaks the Reference's inline-assembly rule {rule:?}");
                 ""
             }
+            K::UnstableCfgVersion => {
+                text.push_str("`cfg(version)` is experimental and subject to change");
+                "E0658"
+            }
         };
         push(verdict, code, text, range);
     }

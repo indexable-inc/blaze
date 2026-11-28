@@ -412,6 +412,65 @@ fn emit_macro_files<'a>(
                 }
             }
         }
+        // Also follow non-path (`Registry`/`Git`) `[build-dependencies]` of checkout packages with
+        // `build.rs` through `Cargo.lock` so `[patch.*]` checkout path crates reached by a build
+        // script are swept into `units_source` too (rule 21). Stop the lock walk at checkout path
+        // packages and continue only via manifest `Normal | Build` edges (`dep_stack`) so member
+        // `[dev-dependencies]` in `Cargo.lock` never enter `units_source` (rule 60).
+        let mut build_seen: Vec<bool, &Frame> = Vec::with_capacity_in(pkg_count, frame);
+        build_seen.resize(pkg_count, false);
+        let mut build_lock_stack: Vec<blaze_manifest::lock::LockId, &Frame> = Vec::new_in(frame);
+        for pkg in units.members.iter().chain(units.path_packages.iter()) {
+            if pkg.build.is_none() {
+                continue;
+            }
+            let Some(entry) = checkout_dirs.iter().find(|entry| entry.dir.as_str() == pkg.dir.as_str()) else {
+                continue;
+            };
+            let Some(lock_pkg) = lock.packages.get(entry.id.index()) else {
+                continue;
+            };
+            for dep in pkg.dependencies.iter() {
+                if dep.kind != blaze_manifest::layout::DepKind::Build
+                    || matches!(dep.source, blaze_manifest::layout::Source::Member(_) | blaze_manifest::layout::Source::Path(_))
+                {
+                    continue;
+                }
+                for &child in lock_pkg.deps.iter() {
+                    if lock.packages.get(child.index()).is_some_and(|p| p.name.as_str() == dep.package.as_str()) {
+                        push_lock(child, &mut build_seen, &mut build_lock_stack);
+                    }
+                }
+            }
+        }
+        while let Some(id) = build_lock_stack.pop() {
+            if let Some(Some(dir)) = dir_of_lock.get(id.index()) {
+                if let Some(idx) = units.path_packages.iter().position(|p| p.dir.as_str() == *dir) {
+                    push_pkg(true, idx, &mut seen_pkgs, &mut dep_stack);
+                } else if let Some(idx) = units.members.iter().position(|m| m.dir.as_str() == *dir) {
+                    push_pkg(false, idx, &mut seen_pkgs, &mut dep_stack);
+                } else {
+                    whole_dirs.insert(dir);
+                }
+                continue;
+            }
+            if let Some(pkg) = lock.packages.get(id.index()) {
+                for &dep in pkg.deps.iter() {
+                    push_lock(dep, &mut build_seen, &mut build_lock_stack);
+                }
+            }
+        }
+        while let Some((is_path, idx)) = dep_stack.pop() {
+            let Some(pkg) = (if is_path { units.path_packages.get(idx) } else { units.members.get(idx) }) else {
+                continue;
+            };
+            whole_dirs.insert(pkg.dir.as_str());
+            for dep in pkg.dependencies.iter() {
+                if matches!(dep.kind, blaze_manifest::layout::DepKind::Normal | blaze_manifest::layout::DepKind::Build) {
+                    push_dep_target(dep, units, &mut seen_pkgs, &mut dep_stack);
+                }
+            }
+        }
     }
     let mut emitted_dirs: blaze_own::BTreeSet<&'a str, &Frame> = blaze_own::BTreeSet::new_in(frame);
     for pkg in units.members.iter().chain(units.path_packages.iter()) {
@@ -1915,5 +1974,176 @@ unibind-test-support = { path = \"../unibind-test-support\" }
         let (src_b, _, key_b) = run_once("pub fn s2() {}");
         assert_ne!(src_a, src_b, "editing transitive dev-dep member must move units_source (rule 21)");
         assert_eq!(key_a, key_b, "editing uncompiled dev-dep member must not invalidate UnitGraph-scoped path proc-macro key");
+    }
+
+    /// Rule 21 regression test for `UnitGraph` `TwoValues`: a workspace member with `build.rs`
+    /// (`app`), a normal member dep (`normal_dep`), a build-dep (`build_dep`), and a dev-dep of
+    /// that build-dep (`dev_dep`).
+    ///
+    /// - Editing `normal_dep` or `dev_dep` leaves `units_source` (`UnitGraph`'s key) unchanged
+    ///   (rule 60) AND MUST leave `script_deps_digest` / `script_modules::subject` unchanged (both
+    ///   with and without `wasm_graph`) so two `UnitGraph` discoveries never produce `TwoValues`.
+    /// - Editing `build_dep` or `app/build.rs` moves `units_source` AND changes the module subject.
+    #[test]
+    fn build_script_unit_graph_key_matches_deps_digest_rule21() {
+        const ROOT_TOML: &str = "\
+[workspace]
+members = [\"crates/app\", \"crates/normal-dep\", \"crates/build-dep\", \"crates/dev-dep\"]
+";
+        const APP_TOML: &str = "\
+[package]
+name = \"app\"
+version = \"0.1.0\"
+edition = \"2024\"
+build = \"build.rs\"
+
+[dependencies]
+normal-dep = { path = \"../normal-dep\" }
+
+[build-dependencies]
+build-dep = { path = \"../build-dep\" }
+";
+        const NORMAL_TOML: &str = "[package]\nname = \"normal-dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+        const BUILD_TOML: &str = "\
+[package]
+name = \"build-dep\"
+version = \"0.1.0\"
+edition = \"2024\"
+
+[dev-dependencies]
+dev-dep = { path = \"../dev-dep\" }
+";
+        const DEV_TOML: &str = "[package]\nname = \"dev-dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+
+        let run_once = |normal_src: &str, dev_src: &str, build_dep_src: &str, build_rs_src: &str| {
+            let io = Io::simulated(SimWorld::new(1, Limits::USUAL));
+            let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+            let frame = cx.frame();
+            let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("data").expect("a path")).expect("open");
+            let put = |path: &str, text: &str| {
+                root.publish(&cx, &Path::new(path).expect("a path"), Content::bytes(text.as_bytes()), Durable::No).expect("write");
+            };
+            put("Cargo.toml", ROOT_TOML);
+            put("crates/app/Cargo.toml", APP_TOML);
+            put("crates/app/src/lib.rs", "");
+            put("crates/app/build.rs", build_rs_src);
+            put("crates/normal-dep/Cargo.toml", NORMAL_TOML);
+            put("crates/normal-dep/src/lib.rs", normal_src);
+            put("crates/build-dep/Cargo.toml", BUILD_TOML);
+            put("crates/build-dep/src/lib.rs", build_dep_src);
+            put("crates/dev-dep/Cargo.toml", DEV_TOML);
+            put("crates/dev-dep/src/lib.rs", dev_src);
+
+            let erased = blaze_own::Erased::new(frame);
+            let mut rows = Rows::new_in(frame);
+            let heap = blaze_own::testing::heap();
+            let laid = lay(&cx, &root, &FromMeta { swept_at_ns: 0 }, &mut rows, blaze_toolchain::ToolchainId([0; 32]), heap, frame, erased.handle()).expect("laid");
+            assert!(laid.root.findings.is_empty(), "{:?}", core::str::from_utf8(&laid.root.messages));
+            let source = sweep::units_source(rows.rows.iter().map(|leaf| (rows.path(leaf), leaf)), frame);
+            let lock = laid.lock.as_ref().expect("lock").lock;
+            let members = laid.parts.as_ref().expect("parts").member_dirs();
+            let app_id = lock.named("app").next().expect("app in lock");
+            let bdep_id = lock.named("build-dep").next().expect("build-dep in lock");
+
+            // Construct host + wasm64 UnitGraphs containing `app`'s BuildScript -> `build-dep` Lib.
+            let mk_graph = || {
+                let mut bs_deps = blaze_own::Vec::new_in(heap.alloc());
+                bs_deps.push(blaze_unit_graph::UnitDep {
+                    name: blaze_unit_graph::Text::from_str_in("build_dep", heap.alloc()),
+                    unit: blaze_unit_graph::UnitId(1),
+                });
+                let mut units = blaze_own::Vec::new_in(heap.alloc());
+                units.push(blaze_unit_graph::Unit {
+                    package: app_id,
+                    name: blaze_unit_graph::Text::from_str_in("app", heap.alloc()),
+                    version: blaze_unit_graph::Text::from_str_in("0.1.0", heap.alloc()),
+                    kind: UnitKind::BuildScript,
+                    for_host: true,
+                    edition: edition::PackageEdition::DEFAULT,
+                    crate_name: blaze_unit_graph::Text::from_str_in("build_script_build", heap.alloc()),
+                    root: blaze_unit_graph::Text::from_str_in("build.rs", heap.alloc()),
+                    features: blaze_own::Vec::new_in(heap.alloc()),
+                    cfg: blaze_own::Vec::new_in(heap.alloc()),
+                    deps: bs_deps,
+                    build_script: None,
+                    links: None,
+                });
+                units.push(blaze_unit_graph::Unit {
+                    package: bdep_id,
+                    name: blaze_unit_graph::Text::from_str_in("build-dep", heap.alloc()),
+                    version: blaze_unit_graph::Text::from_str_in("0.1.0", heap.alloc()),
+                    kind: UnitKind::Lib,
+                    for_host: true,
+                    edition: edition::PackageEdition::DEFAULT,
+                    crate_name: blaze_unit_graph::Text::from_str_in("build_dep", heap.alloc()),
+                    root: blaze_unit_graph::Text::from_str_in("src/lib.rs", heap.alloc()),
+                    features: blaze_own::Vec::new_in(heap.alloc()),
+                    cfg: blaze_own::Vec::new_in(heap.alloc()),
+                    deps: blaze_own::Vec::new_in(heap.alloc()),
+                    build_script: None,
+                    links: None,
+                });
+                blaze_unit_graph::UnitGraph {
+                    units,
+                    resolver: blaze_unit_graph::Resolver::V2,
+                    meta: blaze_own::Vec::new_in(heap.alloc()),
+                    left_out: blaze_own::Vec::new_in(heap.alloc()),
+                }
+            };
+            let graph = mk_graph();
+            let wasm_graph = mk_graph();
+            let ro = root.read_only();
+            let files = crate::macro_files::script_files_digest_in_dir(&cx, &ro, "crates/app", "build.rs", frame);
+            let deps_wg = blaze_proc_macro::script_unit::script_deps_digest(
+                &graph,
+                Some(&wasm_graph),
+                lock,
+                blaze_unit_graph::UnitId(0),
+                |dep_pkg| {
+                    members
+                        .iter()
+                        .find(|p| p.id == dep_pkg)
+                        .and_then(|p| crate::macro_files::package_files_digest_in_dir(&cx, &ro, p.dir.as_str(), frame))
+                },
+            )
+            .expect("deps with wg");
+            let deps_no_wg = blaze_proc_macro::script_unit::script_deps_digest(
+                &graph,
+                None,
+                lock,
+                blaze_unit_graph::UnitId(0),
+                |dep_pkg| {
+                    members
+                        .iter()
+                        .find(|p| p.id == dep_pkg)
+                        .and_then(|p| crate::macro_files::package_files_digest_in_dir(&cx, &ro, p.dir.as_str(), frame))
+                },
+            )
+            .expect("deps without wg");
+            let sub_wg = crate::script_modules::subject(crate::scripts::RanAs::Wasm, "app", "0.1.0", &[], files.as_deref(), deps_wg.as_deref());
+            let sub_no_wg = crate::script_modules::subject(crate::scripts::RanAs::Wasm, "app", "0.1.0", &[], files.as_deref(), deps_no_wg.as_deref());
+            (source, sub_wg, sub_no_wg)
+        };
+
+        let (src0, sub_wg0, sub_no_wg0) = run_once("pub fn n1() {}", "pub fn d1() {}", "pub fn b1() {}", "fn main() {}");
+        let (src_normal, sub_wg_normal, sub_no_wg_normal) = run_once("pub fn n2() {}", "pub fn d1() {}", "pub fn b1() {}", "fn main() {}");
+        assert_eq!(src0, src_normal, "editing normal dep must leave units_source unchanged (rule 60)");
+        assert_eq!(sub_wg0, sub_wg_normal, "editing normal dep must leave script module subject unchanged under wasm_graph (rule 21: no TwoValues)");
+        assert_eq!(sub_no_wg0, sub_no_wg_normal, "editing normal dep must leave script module subject unchanged without wasm_graph (rule 21: no TwoValues)");
+
+        let (src_dev, sub_wg_dev, sub_no_wg_dev) = run_once("pub fn n1() {}", "pub fn d2() {}", "pub fn b1() {}", "fn main() {}");
+        assert_eq!(src0, src_dev, "editing build-dep dev-dep must leave units_source unchanged (rule 60)");
+        assert_eq!(sub_wg0, sub_wg_dev, "editing build-dep dev-dep must leave script module subject unchanged under wasm_graph (rule 21: no TwoValues)");
+        assert_eq!(sub_no_wg0, sub_no_wg_dev, "editing build-dep dev-dep must leave script module subject unchanged without wasm_graph (rule 21: no TwoValues)");
+
+        let (src_bdep, sub_wg_bdep, sub_no_wg_bdep) = run_once("pub fn n1() {}", "pub fn d1() {}", "pub fn b2() {}", "fn main() {}");
+        assert_ne!(src0, src_bdep, "editing build-dep must move units_source (rule 21)");
+        assert_ne!(sub_wg0, sub_wg_bdep, "editing build-dep must move script module subject under wasm_graph (rule 21)");
+        assert_ne!(sub_no_wg0, sub_no_wg_bdep, "editing build-dep must move script module subject without wasm_graph (rule 21)");
+
+        let (src_brs, sub_wg_brs, sub_no_wg_brs) = run_once("pub fn n1() {}", "pub fn d1() {}", "pub fn b1() {}", "fn main() { /* v2 */ }");
+        assert_ne!(src0, src_brs, "editing build.rs must move units_source (rule 21)");
+        assert_ne!(sub_wg0, sub_wg_brs, "editing build.rs must move script module subject under wasm_graph (rule 21)");
+        assert_ne!(sub_no_wg0, sub_no_wg_brs, "editing build.rs must move script module subject without wasm_graph (rule 21)");
     }
 }

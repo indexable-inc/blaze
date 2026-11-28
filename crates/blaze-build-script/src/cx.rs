@@ -34,6 +34,10 @@ impl<C: ExpandCx> ExpandCx for ScriptCx<'_, C> {
         self.inner.cfg(predicate)
     }
 
+    fn cfg_version_enabled(&self) -> bool {
+        self.inner.cfg_version_enabled()
+    }
+
     fn include(&self, path: &str, how: IncludeAs) -> Result<Included<'_>, HostError> {
         let Some(file) = self.out.file_at(path) else {
             return self.inner.include(path, how);

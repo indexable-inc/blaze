@@ -121,6 +121,19 @@ fn crlf_len(s: &str) -> u64 {
     (s.len() - s.matches("\r\n").count()) as u64
 }
 
+/// Unquotes a `STRING` token (`"..."` or `r#"..."#`) without allocating; returns `None` for
+/// unclosed or suffixed string literals.
+pub(crate) fn str_body(text: &str) -> Option<&str> {
+    if let Some(raw) = text.strip_prefix('r') {
+        let hashes = raw.len() - raw.trim_start_matches('#').len();
+        let inner = raw.get(hashes..)?.strip_prefix('"')?;
+        let end = inner.len().checked_sub(hashes + 1)?;
+        let (body, tail) = inner.split_at(end);
+        return (tail.starts_with('"') && tail[1..].bytes().all(|b| b == b'#')).then_some(body);
+    }
+    text.strip_prefix('"')?.strip_suffix('"')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

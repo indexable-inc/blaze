@@ -122,6 +122,8 @@ pub const RUSTC_V: &str = RUST.rustc_v;
 pub const RUSTC_VERSION: &str = RUST.rustc_version;
 /// `release:` of `rustc -vV`.
 pub const RELEASE: &str = RUST.release;
+/// The pinned rustc's `(major, minor, patch)` release triple, parsed from [`RELEASE`] at compile time.
+pub const RUSTC_RELEASE_TRIPLE: (u16, u16, u16) = parse_release_triple(RUST_PATH, RUST.release);
 /// `commit-hash:` of `rustc -vV`.
 pub const COMMIT_HASH: &str = RUST.commit;
 /// `commit-date:` of `rustc -vV`.
@@ -756,4 +758,128 @@ const fn decimal(text: &str) -> Option<u64> {
         k += 1;
     }
     Some(value)
+}
+
+/// Parses a decimal `u16` in `bytes[start..end]`; `None` if empty, non-digit, or overflowing `u16`.
+const fn decimal_u16(bytes: &[u8], start: usize, end: usize) -> Option<u16> {
+    if start >= end || end > bytes.len() {
+        return None;
+    }
+    let (mut k, mut value) = (start, 0u16);
+    while k < end {
+        let digit: u16 = match at(bytes, k) {
+            b'0' => 0,
+            b'1' => 1,
+            b'2' => 2,
+            b'3' => 3,
+            b'4' => 4,
+            b'5' => 5,
+            b'6' => 6,
+            b'7' => 7,
+            b'8' => 8,
+            b'9' => 9,
+            _ => return None,
+        };
+        let Some(next) = value.checked_mul(10) else { return None };
+        let Some(next) = next.checked_add(digit) else { return None };
+        value = next;
+        k += 1;
+    }
+    Some(value)
+}
+
+/// Parses `"MAJOR.MINOR"` (patch 0) or `"MAJOR.MINOR.PATCH"` (RFC 2523 `#[cfg(version("..."))]`)
+/// into `(major, minor, patch)`. Returns `None` for any other format (including `".."`).
+pub const fn parse_cfg_version(spec: &str) -> Option<(u16, u16, u16)> {
+    let bytes = spec.as_bytes();
+    let mut dot1 = 0;
+    while dot1 < bytes.len() && at(bytes, dot1) != b'.' {
+        dot1 += 1;
+    }
+    if dot1 == bytes.len() {
+        return None;
+    }
+    let Some(major) = decimal_u16(bytes, 0, dot1) else { return None };
+    let mut dot2 = dot1 + 1;
+    while dot2 < bytes.len() && at(bytes, dot2) != b'.' {
+        dot2 += 1;
+    }
+    let Some(minor) = decimal_u16(bytes, dot1 + 1, dot2) else { return None };
+    if dot2 == bytes.len() {
+        return Some((major, minor, 0));
+    }
+    let Some(patch) = decimal_u16(bytes, dot2 + 1, bytes.len()) else { return None };
+    Some((major, minor, patch))
+}
+
+/// Evaluates `#[cfg(version(spec))]` against a compiler release `(major, minor, patch)`:
+/// `true` iff `spec` parses as `MAJOR.MINOR[.PATCH]` and `compiler >= spec`. Unrecognized
+/// version strings (such as `".."`) evaluate `false` per RFC 2523 / rustc `cfg_version`.
+pub const fn cfg_version_holds_for(spec: &str, compiler: (u16, u16, u16)) -> bool {
+    let Some(req) = parse_cfg_version(spec) else { return false };
+    compiler.0 > req.0
+        || (compiler.0 == req.0 && compiler.1 > req.1)
+        || (compiler.0 == req.0 && compiler.1 == req.1 && compiler.2 >= req.2)
+}
+
+/// Evaluates `#[cfg(version(spec))]` against the pinned nightly's release ([`RUSTC_RELEASE_TRIPLE`]).
+/// One home for every cfg evaluator in blaze (`blaze-lower`, `blaze-expand`, `blaze-scope`).
+pub const fn cfg_version_holds(spec: &str) -> bool {
+    cfg_version_holds_for(spec, RUSTC_RELEASE_TRIPLE)
+}
+
+/// Parses `RUST.release` (e.g. `"1.101.0-nightly"`) at compile time into `(major, minor, patch)`.
+const fn parse_release_triple(path: &str, release: &str) -> (u16, u16, u16) {
+    let bytes = release.as_bytes();
+    let mut end = 0;
+    while end < bytes.len() && at(bytes, end) != b'-' {
+        end += 1;
+    }
+    let mut dot1 = 0;
+    while dot1 < end && at(bytes, dot1) != b'.' {
+        dot1 += 1;
+    }
+    let mut dot2 = if dot1 < end { dot1 + 1 } else { end };
+    while dot2 < end && at(bytes, dot2) != b'.' {
+        dot2 += 1;
+    }
+    if dot1 < end && dot2 < end {
+        if let (Some(major), Some(minor), Some(patch)) =
+            (decimal_u16(bytes, 0, dot1), decimal_u16(bytes, dot1 + 1, dot2), decimal_u16(bytes, dot2 + 1, end))
+        {
+            return (major, minor, patch);
+        }
+    }
+    Msg::new().s(path).s(": release `").s(release).s("` is not `MAJOR.MINOR.PATCH[-channel]`").fail()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cfg_version_parses_and_compares_against_pinned_release() {
+        assert!(RUSTC_RELEASE_TRIPLE.0 >= 1 && RUSTC_RELEASE_TRIPLE.1 >= 76);
+        assert_eq!(parse_cfg_version("1.76"), Some((1, 76, 0)));
+        assert_eq!(parse_cfg_version("1.76.0"), Some((1, 76, 0)));
+        assert_eq!(parse_cfg_version("1.76.3"), Some((1, 76, 3)));
+        assert_eq!(parse_cfg_version(".."), None);
+        assert_eq!(parse_cfg_version(""), None);
+        assert_eq!(parse_cfg_version("1"), None);
+        assert_eq!(parse_cfg_version("1.76.0.1"), None);
+        assert_eq!(parse_cfg_version("1.76-nightly"), None);
+        assert_eq!(parse_cfg_version("1.76."), None);
+
+        assert!(cfg_version_holds("1.76"));
+        assert!(cfg_version_holds("1.76.0"));
+        assert!(!cfg_version_holds("99.0"));
+        assert!(!cfg_version_holds(".."));
+
+        assert!(cfg_version_holds_for("1.76", (1, 76, 0)));
+        assert!(cfg_version_holds_for("1.76.0", (1, 76, 0)));
+        assert!(!cfg_version_holds_for("1.76.1", (1, 76, 0)));
+        assert!(cfg_version_holds_for("1.76.1", (1, 76, 1)));
+        assert!(cfg_version_holds_for("1.76.9", (1, 77, 0)));
+        assert!(!cfg_version_holds_for("2.0", (1, 101, 0)));
+    }
 }

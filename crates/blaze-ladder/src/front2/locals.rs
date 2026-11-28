@@ -682,7 +682,7 @@ impl<'n> Locals<'n> {
                     let edition = names.edition_of(at.krate).ok_or(HeadError::NoText(at.item))?;
                     // Which declarations exist is the crate's cfg's to say (`cfg`, `cfg_attr`).
                     let atoms = names.cfg_atoms(at.krate).ok_or(HeadError::NoText(at.item))?;
-                    let (abi, decls) = match super::foreign_locals::declared(text, edition, &mut super::heads::CrateCfg(atoms), alloc) {
+                    let (abi, decls) = match super::foreign_locals::declared(text, edition, &mut super::heads::CrateCfg::of(names, at.krate, atoms), alloc) {
                         Ok(read) => read,
                         // A macro call inside the block (ring 0.17.14's `prefixed_extern!` in a
                         // body writes `extern "C" { prefixed_item! { .. } }`): what it declares

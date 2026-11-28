@@ -571,6 +571,17 @@ pub const WORDINGS: &[Wording] = &[
         args: 2,
         kind: Kind::Error,
     },
+    // `#[cfg(version(..))]` or `#[cfg_attr(version(..), ..)]` used without `#![feature(cfg_version)]`
+    // (RFC 2523, rustc E0658; blaze-cli names/module_missing.rs `CFG_VER_GATE_RULE`).
+    Wording {
+        area: Area::Cli,
+        number: 50,
+        name: "E0658",
+        headline: "`cfg(version)` is experimental and subject to change",
+        label: "add `#![feature(cfg_version)]` to the crate attributes to enable",
+        args: 0,
+        kind: Kind::Error,
+    },
     Wording {
         area: Area::Drive,
         number: 0xC0F6,

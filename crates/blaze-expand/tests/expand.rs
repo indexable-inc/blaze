@@ -1178,6 +1178,10 @@ fn a_cfg_predicate_is_read_from_its_tokens() {
         });
         (out, asked)
     };
+    let eval_ver = |text: &str| {
+        let tokens = lex(text, Edition::E2021, blaze_own::testing::heap().alloc()).expect("the predicate lexes");
+        blaze_expand::cfg_predicate_with_version(&tokens, true, blaze_own::testing::heap().alloc(), &mut |n, v| set(n, v))
+    };
     let cases = [
         ("unix", true),
         ("windows", false),
@@ -1191,6 +1195,27 @@ fn a_cfg_predicate_is_read_from_its_tokens() {
     for (text, want) in cases {
         assert_eq!(eval(text).0, Ok(want), "{text}");
     }
+    // `version(..)` requires `#![feature(cfg_version)]` (enforced whether true or false).
+    for gated in ["version(\"1.76\")", "version(\"99.0\")", "not(version(\"99.0\"))", "all(unix, version(\"99.0\"))"] {
+        assert!(matches!(eval(gated).0, Err(CfgPredicateError::UnstableCfgVersion { .. })), "{gated} must be gated");
+    }
+    // With `cfg_version` enabled, `version(..)` evaluates cooked escapes, line continuations, and raw strings.
+    let ver_cases = [
+        ("version(\"1.76\")", true),
+        ("version(\"1.76.0\")", true),
+        ("version(\"1.76\",)", true),
+        ("version(\"\\x31.76\")", true),
+        ("version(\"1.\\\n  76\")", true),
+        ("version(r\"1.76\")", true),
+        ("version(r#\"1.76\"#)", true),
+        ("version(\"99.0\")", false),
+        ("not(version(\"99.0\"))", true),
+        ("version(\"..\")", false),
+        ("all(unix, version(\"1.76\"), not(version(\"99.0\")))", true),
+    ];
+    for (text, want) in ver_cases {
+        assert_eq!(eval_ver(text), Ok(want), "{text}");
+    }
     assert_eq!(eval("all(unix, test)").1, ["unix", "test"]);
     assert!(matches!(eval("not(unix, test)").0, Err(CfgPredicateError::NotTakesOne { .. })));
     assert!(matches!(eval("not()").0, Err(CfgPredicateError::NotTakesOne { .. })));
@@ -1199,6 +1224,10 @@ fn a_cfg_predicate_is_read_from_its_tokens() {
     assert!(matches!(eval("all(unix,,)").0, Err(CfgPredicateError::Malformed { .. })));
     assert!(matches!(eval("unix test").0, Err(CfgPredicateError::Malformed { .. })));
     assert!(matches!(eval("feature = 3").0, Err(CfgPredicateError::Malformed { .. })));
+    for bad in ["version()", "version(123)", "version(\"1.76\", \"1.77\")", "version(unix)", "unknown_call(\"foo\")"] {
+        assert!(matches!(eval(bad).0, Err(CfgPredicateError::Malformed { .. })), "{bad}");
+        assert!(matches!(eval_ver(bad), Err(CfgPredicateError::Malformed { .. })), "{bad} (with cfg_version)");
+    }
     assert_eq!(eval("any(unix, unknown)").0, Err(CfgPredicateError::Atom(())));
 }
 
@@ -2848,9 +2877,8 @@ fn recursive_macro_rules_text_mark_preserves_distinct_local_hygiene() {
     //   [1] `let value = 42u64;` (Arm 1 template via `$from_val`)
     //   [2] `*value` (Arm 2 template)
     //   [3] `value as i32` (Arm 1 template via `$from_expr`)
-    let value_positions: std::vec::Vec<usize> = (0..exp2.tokens.len())
-        .filter(|&i| exp2.tokens.text_at(i) == "value")
-        .collect();
+    let mut value_positions = blaze_own::Vec::new_in(alloc);
+    value_positions.extend((0..exp2.tokens.len()).filter(|&i| exp2.tokens.text_at(i) == "value"));
     assert_eq!(value_positions.len(), 4, "expected 4 `value` tokens, got {value_positions:?}");
 
     let m_param = exp2.text_mark_of(value_positions[0], key2).expect("param mark");

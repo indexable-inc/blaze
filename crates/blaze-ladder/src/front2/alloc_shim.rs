@@ -260,7 +260,7 @@ pub fn declares<'n, S: NamesSource<'n>>(names: S, store: &Store<'_>, key: ItemKe
     let krate = names.crate_of(h.lib).ok_or_else(refuse)?;
     let atoms = names.cfg_atoms(krate).ok_or_else(unanswered)?;
     let edition = names.edition_of(krate).ok_or_else(unanswered)?;
-    let sig = blaze_lower::lower_signature(h.text, edition, &mut CrateCfg(atoms), alloc).map_err(|_| refuse())?;
+    let sig = blaze_lower::lower_signature(h.text, edition, &mut CrateCfg::of(names, krate, atoms), alloc).map_err(|_| refuse())?;
     let v = sig.view();
     for &n in v.rows(v.list(head::ATTRS)).map_err(|_| refuse())? {
         let a = v.attr(n).map_err(|_| refuse())?;
@@ -346,7 +346,7 @@ fn is_expansion_fn<'n, S: NamesSource<'n>>(names: S, krate: usize, key: LibKey, 
     let refuse = || Refused::Attrs { shim };
     let atoms = names.cfg_atoms(krate).ok_or_else(unanswered)?;
     let edition = names.edition_of(krate).ok_or_else(unanswered)?;
-    let sig = blaze_lower::lower_signature(text, edition, &mut CrateCfg(atoms), alloc).map_err(|_| refuse())?;
+    let sig = blaze_lower::lower_signature(text, edition, &mut CrateCfg::of(names, krate, atoms), alloc).map_err(|_| refuse())?;
     let v = sig.view();
     for &n in v.rows(v.list(head::ATTRS)).map_err(|_| refuse())? {
         let a = v.attr(n).map_err(|_| refuse())?;

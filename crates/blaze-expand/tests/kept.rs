@@ -7,17 +7,18 @@ use blaze_expand::kept::{Asked, KeptEntry, KeptError, KeptSet, SetPlant, SetSour
 use blaze_expand::{
     BuiltinFn, Call, CallKey, CallSite, Ctx, DefAt, DefSite, Edition, ExpandCx, Expanded, Expansion, Export, Held, HostAsk,
     HostError, HostWhy, IncludeAs, Included, LocalInner, MacroDefinition, OriginMaps, Place, PlaceOf, ProcCall, Produced,
-    ReadKind, SourceIndexes, TokenStream, call_key, expand, lex,
+    ReadAnswer, ReadKind, SourceIndexes, TokenStream, call_key, expand, lex,
 };
 use blaze_format::Aligned;
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_own::Alloc;
 
-/// The outside: one environment variable, one enabled cfg name, a line.
+/// The outside: one environment variable, one enabled cfg name, a line, and the `cfg_version` gate.
 struct Cx {
     var: Option<&'static str>,
     cfg: &'static str,
     line: u32,
+    cfg_version: bool,
 }
 
 impl ExpandCx for Cx {
@@ -27,6 +28,10 @@ impl ExpandCx for Cx {
 
     fn cfg(&self, predicate: &TokenStream<'_>) -> Result<bool, HostError> {
         Ok(predicate.tokens().first().is_some_and(|token| predicate.text_of(token) == self.cfg))
+    }
+
+    fn cfg_version_enabled(&self) -> bool {
+        self.cfg_version
     }
 
     fn include(&self, _: &str, _: IncludeAs) -> Result<Included<'_>, HostError> {
@@ -47,7 +52,7 @@ impl ExpandCx for Cx {
     }
 }
 
-const CX: Cx = Cx { var: Some("one"), cfg: "unix", line: 7 };
+const CX: Cx = Cx { var: Some("one"), cfg: "unix", line: 7, cfg_version: false };
 
 fn krate(byte: u8) -> CrateItemKey {
     CrateItemKey(ContentId([byte; 32]))
@@ -227,6 +232,45 @@ fn a_read_list_is_asked_again_and_names_what_moved() {
     let included = fn_like(&include, "\"a.txt\"", &CX).reads;
     assert_eq!(included.askable(), Err((0, ReadKind::IncludeStr)));
     assert_eq!(included.hold(&CX, Edition::E2021, blaze_own::testing::heap().alloc()), Ok(Held::NotAskable { read: 0, kind: ReadKind::IncludeStr }));
+}
+
+/// `cfg!(version(..))` records the crate's `cfg_version` gate as a `ReadKind::CrateFeature` read,
+/// so a kept expansion made with `#![feature(cfg_version)]` enabled is invalidated (and never
+/// reused as a stale `true`/`false`) when the feature is removed, and vice versa.
+#[test]
+fn cfg_version_read_is_recorded_and_invalidated_on_toggle() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let cfg_def = MacroDefinition::builtin_fn(BuiltinFn::Cfg, at(), alloc);
+    let cx_on = Cx { cfg_version: true, ..CX };
+    let cx_off = Cx { cfg_version: false, ..CX };
+
+    // 1. Expanded with `cfg_version` enabled: produces `true`, records `CrateFeature("cfg_version") = Bool(true)`.
+    let exp_on = fn_like(&cfg_def, "version(\"1.76\")", &cx_on);
+    assert!(exp_on.diagnostics.is_empty(), "{:?}", exp_on.diagnostics);
+    assert_eq!(exp_on.tokens.tokens().len(), 1);
+    assert_eq!(exp_on.tokens.text_at(0), "true");
+    assert_eq!(exp_on.reads.list().len(), 1);
+    assert_eq!(exp_on.reads.list()[0].kind, ReadKind::CrateFeature);
+    assert_eq!(exp_on.reads.subject(&exp_on.reads.list()[0]), "cfg_version");
+    assert_eq!(exp_on.reads.list()[0].answer, ReadAnswer::Bool(true));
+    assert_eq!(exp_on.reads.askable(), Ok(()));
+
+    // Round-trip through kept entry bytes and check `hold` against both enabled and disabled hosts.
+    let bytes = write_entry(&Asked::new_in(alloc), &exp_on, &same_maps(), alloc).expect("entry writes");
+    let aligned = Aligned::copy_from(&bytes);
+    let entry = KeptEntry::open(&aligned).expect("entry opens");
+    let reopened = entry.expansion(alloc).expect("expansion reads back");
+    assert_eq!(reopened.reads.hold(&cx_on, Edition::E2021, alloc), Ok(Held::Holds));
+    assert_eq!(reopened.reads.hold(&cx_off, Edition::E2021, alloc), Ok(Held::Moved { read: 0 }));
+
+    // 2. Expanded with `cfg_version` disabled: emits diagnostic AND records `CrateFeature("cfg_version") = Bool(false)`.
+    let exp_off = fn_like(&cfg_def, "version(\"1.76\")", &cx_off);
+    assert!(!exp_off.diagnostics.is_empty(), "ungated cfg!(version(..)) must emit a diagnostic");
+    assert_eq!(exp_off.reads.list().len(), 1);
+    assert_eq!(exp_off.reads.list()[0].kind, ReadKind::CrateFeature);
+    assert_eq!(exp_off.reads.list()[0].answer, ReadAnswer::Bool(false));
+    assert_eq!(exp_off.reads.hold(&cx_off, Edition::E2021, alloc), Ok(Held::Holds));
+    assert_eq!(exp_off.reads.hold(&cx_on, Edition::E2021, alloc), Ok(Held::Moved { read: 0 }));
 }
 
 /// A derive-like definition: three impls over the same forty-odd identifiers and punctuation,

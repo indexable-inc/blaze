@@ -1231,7 +1231,6 @@ impl core::fmt::Debug for CxSpawn {
 
 #[cfg(test)]
 mod cx_bound_dst {
-    use alloc::format;
     use core::time::Duration;
 
     use blaze_sim::{Broke, Config, Tape, check, control};
@@ -1239,6 +1238,7 @@ mod cx_bound_dst {
     use crate::{
         Plant, Stopped,
         io::{Io, Limits, SimWorld},
+        mem::format_in,
     };
 
     /// Deterministic `blaze_sim` model check driving [`super::CxBound`] across random
@@ -1254,17 +1254,17 @@ mod cx_bound_dst {
         let secondary_io = Io::planted(SimWorld::new(seed.wrapping_add(1), Limits::USUAL), plant);
         let caller_clock = caller_io
             .need_clock()
-            .map_err(|_| Broke::Oracle(format!("missing caller clock")))?;
+            .map_err(|_| Broke::Oracle("missing caller clock".into()))?;
         let secondary_clock = secondary_io
             .need_clock()
-            .map_err(|_| Broke::Oracle(format!("missing secondary clock")))?;
+            .map_err(|_| Broke::Oracle("missing secondary clock".into()))?;
 
         let caller_root = caller_io
             .cx(Duration::from_secs(60), crate::mem::TASK_FRAME)
-            .map_err(|e| Broke::Oracle(format!("caller root cx: {e}")))?;
+            .map_err(|_| Broke::Oracle("caller root cx failed".into()))?;
         let secondary_root = secondary_io
             .cx(Duration::from_secs(60), crate::mem::TASK_FRAME)
-            .map_err(|e| Broke::Oracle(format!("secondary root cx: {e}")))?;
+            .map_err(|e| Broke::Oracle(format_in!(caller_root.frame(), "secondary root cx: {e}").as_str().into()))?;
 
         let caller_deadline_at = caller_io.now().saturating_add(Duration::from_millis(caller_budget_ms));
         let caller_cx = caller_root.until(blaze_core::wait::Deadline::after(
@@ -1276,7 +1276,8 @@ mod cx_bound_dst {
         let _ = caller_cx.scope_with(|scope| {
             let bound = scope.cx().bound();
             let mut parent_cancelled = false;
-            let mut active_children: alloc::vec::Vec<super::Cx> = alloc::vec::Vec::new();
+            let mut active_children: blaze_own::Vec<super::Cx, _> =
+                blaze_own::Vec::new_in(blaze_own::testing::heap().alloc());
 
             for _ in 0..steps {
                 let op = *tape.one_of(&[0u8, 1, 2, 3, 4, 5, 6], "cx_bound op");
@@ -1302,22 +1303,25 @@ mod cx_bound_dst {
                         let res = bound.check();
                         if parent_cancelled {
                             if !matches!(res, Err(Stopped::Cancelled { .. })) {
-                                oracle_err = Some(Broke::Oracle(format!(
+                                oracle_err = Some(Broke::Oracle(format_in!(
+                                    caller_root.frame(),
                                     "bound.check() must return cancelled after parent cancel, got {res:?}"
-                                )));
+                                ).as_str().into()));
                                 return;
                             }
                         } else if expired {
                             if !matches!(res, Err(Stopped::Deadline { .. })) {
-                                oracle_err = Some(Broke::Oracle(format!(
+                                oracle_err = Some(Broke::Oracle(format_in!(
+                                    caller_root.frame(),
                                     "bound.check() must return deadline after caller expiry, got {res:?}"
-                                )));
+                                ).as_str().into()));
                                 return;
                             }
                         } else if res.is_err() {
-                            oracle_err = Some(Broke::Oracle(format!(
+                            oracle_err = Some(Broke::Oracle(format_in!(
+                                caller_root.frame(),
                                 "bound.check() unexpectedly failed while live: {res:?}"
-                            )));
+                            ).as_str().into()));
                             return;
                         }
                     }
@@ -1328,25 +1332,28 @@ mod cx_bound_dst {
                         let res = bound.remaining(cap);
                         if parent_cancelled {
                             if !matches!(res, Err(Stopped::Cancelled { .. })) {
-                                oracle_err = Some(Broke::Oracle(format!(
+                                oracle_err = Some(Broke::Oracle(format_in!(
+                                    caller_root.frame(),
                                     "bound.remaining() must return cancelled after parent cancel, got {res:?}"
-                                )));
+                                ).as_str().into()));
                                 return;
                             }
                         } else if expected_rem.is_zero() {
                             if !matches!(res, Err(Stopped::Deadline { .. })) {
-                                oracle_err = Some(Broke::Oracle(format!(
+                                oracle_err = Some(Broke::Oracle(format_in!(
+                                    caller_root.frame(),
                                     "bound.remaining() must return deadline after expiry, got {res:?}"
-                                )));
+                                ).as_str().into()));
                                 return;
                             }
                         } else {
                             match res {
                                 Ok(rem) if rem <= cap && rem <= expected_rem => {}
                                 other => {
-                                    oracle_err = Some(Broke::Oracle(format!(
+                                    oracle_err = Some(Broke::Oracle(format_in!(
+                                        caller_root.frame(),
                                         "bound.remaining({cap:?}) widened past expected {expected_rem:?}: {other:?}"
-                                    )));
+                                    ).as_str().into()));
                                     return;
                                 }
                             }
@@ -1362,16 +1369,18 @@ mod cx_bound_dst {
                         let res = bound.child_on(&secondary_io, max_budget, crate::mem::TASK_FRAME);
                         if parent_cancelled {
                             if !matches!(res, Err(Stopped::Cancelled { .. })) {
-                                oracle_err = Some(Broke::Oracle(format!(
+                                oracle_err = Some(Broke::Oracle(format_in!(
+                                    caller_root.frame(),
                                     "bound.child_on() must return cancelled after parent cancel, got {res:?}"
-                                )));
+                                ).as_str().into()));
                                 return;
                             }
                         } else if caller_rem_before.is_zero() {
                             if !matches!(res, Err(Stopped::Deadline { .. })) {
-                                oracle_err = Some(Broke::Oracle(format!(
+                                oracle_err = Some(Broke::Oracle(format_in!(
+                                    caller_root.frame(),
                                     "bound.child_on() must return deadline after caller expiry, got {res:?}"
-                                )));
+                                ).as_str().into()));
                                 return;
                             }
                         } else {
@@ -1380,19 +1389,21 @@ mod cx_bound_dst {
                                     let max_allowed = sec_now_before
                                         .saturating_add(caller_rem_before.min(max_budget));
                                     if child.deadline().get() > max_allowed {
-                                        oracle_err = Some(Broke::Oracle(format!(
+                                        oracle_err = Some(Broke::Oracle(format_in!(
+                                            caller_root.frame(),
                                             "child_on deadline {:?} widened past {:?}",
                                             child.deadline().get(),
                                             max_allowed
-                                        )));
+                                        ).as_str().into()));
                                         return;
                                     }
                                     active_children.push(child);
                                 }
                                 Err(e) => {
-                                    oracle_err = Some(Broke::Oracle(format!(
+                                    oracle_err = Some(Broke::Oracle(format_in!(
+                                        caller_root.frame(),
                                         "child_on unexpectedly failed while live: {e}"
-                                    )));
+                                    ).as_str().into()));
                                     return;
                                 }
                             }
@@ -1408,29 +1419,33 @@ mod cx_bound_dst {
                             let wait_res = secondary_clock.sleep(&child, sleep_dt);
                             if parent_cancelled {
                                 if !matches!(wait_res, Err(crate::clock::SleepError::Stopped(Stopped::Cancelled { .. }))) {
-                                    oracle_err = Some(Broke::Oracle(format!(
+                                    oracle_err = Some(Broke::Oracle(format_in!(
+                                        caller_root.frame(),
                                         "child wait on secondary Io must observe cancelled immediately after parent cancel, got {wait_res:?}"
-                                    )));
+                                    ).as_str().into()));
                                     return;
                                 }
                                 if secondary_io.now() != sec_before {
-                                    oracle_err = Some(Broke::Oracle(format!(
+                                    oracle_err = Some(Broke::Oracle(format_in!(
+                                        caller_root.frame(),
                                         "cancelled child wait advanced secondary clock from {sec_before:?} to {:?}",
                                         secondary_io.now()
-                                    )));
+                                    ).as_str().into()));
                                     return;
                                 }
                             } else if sec_before.saturating_add(sleep_dt) > child_deadline {
                                 if !matches!(wait_res, Err(crate::clock::SleepError::Stopped(Stopped::Deadline { .. }))) {
-                                    oracle_err = Some(Broke::Oracle(format!(
+                                    oracle_err = Some(Broke::Oracle(format_in!(
+                                        caller_root.frame(),
                                         "child wait past bounded deadline must return deadline, got {wait_res:?}"
-                                    )));
+                                    ).as_str().into()));
                                     return;
                                 }
                             } else if sec_before.saturating_add(sleep_dt) < child_deadline && wait_res.is_err() {
-                                oracle_err = Some(Broke::Oracle(format!(
+                                oracle_err = Some(Broke::Oracle(format_in!(
+                                    caller_root.frame(),
                                     "child wait before deadline unexpectedly failed: {wait_res:?}"
-                                )));
+                                ).as_str().into()));
                                 return;
                             }
                         }

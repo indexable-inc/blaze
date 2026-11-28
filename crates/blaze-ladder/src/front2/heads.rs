@@ -52,8 +52,26 @@ const MOST_STEPS: usize = 1 << 16;
 /// which holds no row for an item its body's lowering keys (front2/locals.rs).
 const LOCAL_NO_BODY: &str = "a fn or static declared in a body with no body, and no `extern` block of that body declares it (the Reference, [items.fn.body], [items.static.init])";
 
-/// A crate's cfg as blaze-lower asks it: an atom is on when the crate's set holds it.
-pub struct CrateCfg<'c>(pub &'c [(&'c str, Option<&'c str>)]);
+/// A crate's cfg as blaze-lower asks it: an atom is on when the crate's set holds it, and
+/// `cfg(version("..."))` is gated on `#![feature(cfg_version)]` at the crate root.
+pub struct CrateCfg<'c> {
+    pub atoms: &'c [(&'c str, Option<&'c str>)],
+    pub cfg_version: bool,
+}
+
+impl<'c> CrateCfg<'c> {
+    pub fn of<'n>(names: impl NamesSource<'n>, krate: usize, atoms: &'c [(&'c str, Option<&'c str>)]) -> CrateCfg<'c> {
+        CrateCfg { atoms, cfg_version: names.has_feature(krate, "cfg_version").unwrap_or(false) }
+    }
+
+    pub fn with_version(atoms: &'c [(&'c str, Option<&'c str>)], cfg_version: bool) -> CrateCfg<'c> {
+        CrateCfg { atoms, cfg_version }
+    }
+
+    pub fn atoms_only(atoms: &'c [(&'c str, Option<&'c str>)]) -> CrateCfg<'c> {
+        CrateCfg { atoms, cfg_version: false }
+    }
+}
 
 /// Signature parser invocations over one worker's records. A Bodies stretch reads its own
 /// count, including unsuccessful lowerings and a seed that froze a head on that worker.
@@ -74,7 +92,11 @@ impl HeadLowerings {
 
 impl blaze_lower::Cfg for CrateCfg<'_> {
     fn atom(&mut self, name: &str, value: Option<&str>) -> CfgAnswer {
-        if self.0.iter().any(|&(n, v)| n == name && v == value) { CfgAnswer::Yes } else { CfgAnswer::No }
+        if self.atoms.iter().any(|&(n, v)| n == name && v == value) { CfgAnswer::Yes } else { CfgAnswer::No }
+    }
+
+    fn cfg_version_enabled(&self) -> bool {
+        self.cfg_version
     }
 }
 
@@ -3264,7 +3286,8 @@ fn lower_in_with_scratch<'a, 's, 'n, S: super::source::NamesSource<'n>>(
     let krate = names.crate_of(key).ok_or(HeadError::NoText(key))?;
     // Over records a crate with no items record has no atoms and no edition: the source filed
     // why (`source::SourceError::NoRecord`), and the item has no text to lower.
-    let mut cfg = CrateCfg(names.cfg_atoms(krate).ok_or(HeadError::NoText(key))?);
+    let atoms = names.cfg_atoms(krate).ok_or(HeadError::NoText(key))?;
+    let mut cfg = CrateCfg::of(names, krate, atoms);
     let edition = names.edition_of(krate).ok_or(HeadError::NoText(key))?;
     let extensions = names.blaze_extensions(krate);
     HeadLowerings::starting(names);
