@@ -421,7 +421,8 @@ fn walk_nix_elf_closure(
     let Ok(interp_cstr) = CStr::from_bytes_until_nul(&interp_c) else {
         return Ok(false);
     };
-    // Check whether the ELF interpreter symlinks into `/nix/store/` (NixOS).
+    // Check whether the ELF interpreter is in `/nix/store/` (either directly, as a Nix-built
+    // executable's `PT_INTERP`, or via symlink such as `/lib/ld-linux-*.so.*` -> `nix-ld`).
     // Propagate filesystem/permission errors on `readlinkat` rather than treating them as
     // non-NixOS (only `EINVAL`, a regular non-symlink interpreter file, means non-symlink).
     let mut link_buf = [0u8; 512];
@@ -431,7 +432,7 @@ fn walk_nix_elf_closure(
             let nix_ld = nix && target.windows(6).any(|w| w == b"nix-ld");
             (nix, nix_ld)
         }
-        Err(blaze_sys::Errno::Inval) => (false, false),
+        Err(blaze_sys::Errno::Inval) => (interp_cstr.to_bytes().starts_with(b"/nix/store/"), false),
         Err(errno) => {
             return Err(Fault::Host { call: "readlinkat (nix ELF PT_INTERP)", code: errno.raw() });
         }
@@ -547,6 +548,9 @@ fn walk_nix_elf_closure(
             let slash = resolved.iter().rposition(|&b| b == b'/')?;
             resolved.get(..=slash)
         })
+    } else if is_nix {
+        let interp = interp_cstr.to_bytes();
+        interp.iter().rposition(|&b| b == b'/').and_then(|slash| interp.get(..=slash))
     } else {
         None
     };

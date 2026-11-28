@@ -18,9 +18,10 @@
 //! `<store>/proc-macro/compiled/<code key>` and its `.seal`, keyed by the wasm's digest and the
 //! runtime ([`COMPILED_DIR`]; `host.rs`, "Compiled records").
 
-use std::fs::{File, read, read_dir};
-use std::io::{Error as IoError, ErrorKind, Read};
-use std::path::{Path, PathBuf};
+use core::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
+use std::{fs::{self, File, read, read_dir}, io::{Error as IoError, ErrorKind, Read}, path::{Path, PathBuf}, process};
 
 use blaze_build_script::served::{InPackage, in_package};
 use blaze_expand::ProcKind;
@@ -840,7 +841,18 @@ pub struct ModuleRecord {
     /// When `Some`, this proc-macro module is a native host `.dylib`/`.so` executed directly
     /// through `NativeServerPool` (zero Wasmtime, zero `-Zbuild-std`, D175 fast path).
     pub native_dylib: Option<PathBuf>,
+    /// When `Some`, this proc-macro module is a Blaze-compiled standalone native executable
+    /// (`native.bin`, Tier-2) run confined under Landlock/seccomp (Linux) or Seatbelt (macOS)
+    /// over `CHILD_FD` via `NativeBinPool` (zero `rustc`, zero `rust-analyzer-proc-macro-srv`,
+    /// zero `dlopen`).
+    pub native_bin: Option<PathBuf>,
 }
+
+/// Filename of a Tier-2 Blaze-compiled standalone native proc-macro executable in a module record.
+pub const NATIVE_BIN_FILENAME: &str = "native.bin";
+
+/// Filename holding the SHA-256 hex digest of [`NATIVE_BIN_FILENAME`] in a module record.
+pub const BIN_SHA256_FILENAME: &str = "bin-sha256";
 
 /// A store's folder of compiled module code, under the store (host.rs, "Compiled records").
 pub const COMPILED_DIR: &str = "proc-macro/compiled";
@@ -849,6 +861,27 @@ impl ModuleRecord {
     /// The macro `name` of `kind`.
     pub fn find(&self, kind: ProcKind, name: &str) -> Option<&Exported> {
         self.macros.iter().find(|it| it.kind == kind && it.name == name)
+    }
+
+    /// Verifies `native.bin` against [`Self::wasm_sha256`] and returns its path.
+    pub fn verify_native_bin(&self) -> Result<&Path, ModuleError> {
+        let Some(ref path) = self.native_bin else {
+            return Err(ModuleError::Missing {
+                name: self.name.as_str().into(),
+                version: self.version.as_str().into(),
+                key: self.key.as_str().into(),
+            });
+        };
+        let bytes = read(path).map_err(|error| ModuleError::Io { path: path.to_path_buf(), error })?;
+        let found = sha256_hex(&bytes);
+        if found != self.wasm_sha256 {
+            return Err(ModuleError::Digest {
+                key: self.key.as_str().into(),
+                held: self.wasm_sha256.as_str().into(),
+                found,
+            });
+        }
+        Ok(path.as_path())
     }
 
     /// The module's wasm, `module.wasm` in its folder, checked against [`Self::wasm_sha256`]:
@@ -905,11 +938,17 @@ fn native_dylib_filename() -> &'static str {
     }
 }
 
-/// Whether `store` holds `id`'s module, by its key: the native `.dylib`'s digest (zero Wasm!)
-/// when present, else the wasm's digest as the record states it.
+/// Whether `store` holds `id`'s module, by its key: prefers Tier-2 `native.bin`, then native
+/// `.dylib`/`.so`, then `module.wasm`, returning `(key, digest)`.
 pub fn find_module(store: &Path, id: &CrateId<'_>) -> Result<(String, String), ModuleError> {
     let key = module_key(id);
     let dir = store.join("proc-macro/modules").join(&key);
+    let bin_digest = dir.join(BIN_SHA256_FILENAME);
+    if let Ok(held) = read(&bin_digest)
+        && dir.join(NATIVE_BIN_FILENAME).is_file()
+    {
+        return Ok((key, core::str::from_utf8(&held).unwrap_or("").trim().into()));
+    }
     let dylib_digest = dir.join("dylib-sha256");
     if let Ok(held) = std::fs::read(&dylib_digest) {
         if dir.join(native_dylib_filename()).is_file() {
@@ -924,19 +963,22 @@ pub fn find_module(store: &Path, id: &CrateId<'_>) -> Result<(String, String), M
     }
 }
 
-/// The record of `id` in `store` (prefers native `.dylib`/`.so` over `module.wasm` when present).
+/// The record of `id` in `store` (prefers Tier-2 `native.bin`, then native `.dylib`/`.so`, then `module.wasm`).
 pub fn read_module(store: &Path, id: &CrateId<'_>) -> Result<ModuleRecord, ModuleError> {
     read_module_by_key(store, module_key(id), id.name, id.version)
 }
 
-/// The record for `key` (`name` `version`) in `store` (prefers native `.dylib`/`.so` over
-/// `module.wasm` when present). Used both on initial registration ([`read_module`]) and when
-/// a `MacroModule` task self-compiles and publishes the module later in the same command.
+/// The record for `key` (`name` `version`) in `store` (prefers Tier-2 `native.bin`, then native
+/// `.dylib`/`.so`, then `module.wasm`). Verifies `native.bin`'s SHA-256 digest against
+/// `bin-sha256` before returning the record. Used both on initial registration ([`read_module`])
+/// and when a `MacroModule` task self-compiles and publishes the module later in the same command.
 pub fn read_module_by_key(store: &Path, key: String, name: &str, version: &str) -> Result<ModuleRecord, ModuleError> {
     let dir = store.join("proc-macro/modules").join(&key);
+    let bin_path = dir.join(NATIVE_BIN_FILENAME);
+    let is_native_bin = dir.join(BIN_SHA256_FILENAME).is_file() && bin_path.is_file();
     let native_path = dir.join(native_dylib_filename());
-    let is_native = dir.join("dylib-sha256").is_file() && native_path.is_file();
-    if !is_native && !dir.join("wasm-sha256").exists() {
+    let is_native_dylib = !is_native_bin && dir.join("dylib-sha256").is_file() && native_path.is_file();
+    if !is_native_bin && !is_native_dylib && !dir.join("wasm-sha256").exists() {
         return Err(ModuleError::Missing { name: name.to_owned(), version: version.to_owned(), key });
     }
     let read = |file: &str| -> Result<Vec<u8>, ModuleError> {
@@ -944,7 +986,21 @@ pub fn read_module_by_key(store: &Path, key: String, name: &str, version: &str) 
         std::fs::read(&path).map_err(|error| ModuleError::Io { path, error })
     };
     let text = |file: &str| -> Result<String, ModuleError> { Ok(String::from_utf8_lossy(&read(file)?).into_owned()) };
-    let held = text(if is_native { "dylib-sha256" } else { "wasm-sha256" })?.trim().to_owned();
+    let digest_file = if is_native_bin {
+        BIN_SHA256_FILENAME
+    } else if is_native_dylib {
+        "dylib-sha256"
+    } else {
+        "wasm-sha256"
+    };
+    let held = text(digest_file)?.trim().to_owned();
+    if is_native_bin {
+        let bin_bytes = read(NATIVE_BIN_FILENAME)?;
+        let found = sha256_hex(&bin_bytes);
+        if found != held {
+            return Err(ModuleError::Digest { key, held, found });
+        }
+    }
     let mut macros = Vec::new();
     for line in text("macros")?.lines() {
         let bad = || ModuleError::Macros { key: key.clone(), line: line.to_owned() };
@@ -960,7 +1016,7 @@ pub fn read_module_by_key(store: &Path, key: String, name: &str, version: &str) 
         let helpers = parts.next().unwrap_or("").split(',').filter(|it| !it.is_empty()).map(str::to_owned).collect();
         macros.push(Exported { index, kind, name: macro_name, helpers });
     }
-    let decls = if is_native {
+    let decls = if is_native_bin || is_native_dylib {
         dir.join("decls")
             .is_file()
             .then(|| text("decls").ok())
@@ -980,8 +1036,109 @@ pub fn read_module_by_key(store: &Path, key: String, name: &str, version: &str) 
         decls,
         dir,
         compiled: store.join(COMPILED_DIR),
-        native_dylib: is_native.then_some(native_path),
+        native_dylib: is_native_dylib.then_some(native_path),
+        native_bin: is_native_bin.then_some(bin_path),
     })
+}
+
+static WRITE_STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Atomically publishes a Tier-2 Blaze-compiled standalone native proc-macro module (`native.bin`
+/// with `0o755` executable mode, `bin-sha256`, `identity`, `macros`, and `decls`) into
+/// `<store>/proc-macro/modules/<key>` via a unique sibling staging directory and rename.
+#[expect(clippy::too_many_arguments, reason = "module publish record fields")]
+pub fn write_native_bin_module(
+    store: &Path,
+    key: &str,
+    name: &str,
+    version: &str,
+    identity_text: &str,
+    bin_bytes: &[u8],
+    macros: &[Exported],
+    decls: &str,
+) -> Result<ModuleRecord, ModuleError> {
+    let shared = blaze_own::SharedAlloc::global();
+    let modules_dir = store.join("proc-macro/modules");
+    fs::create_dir_all(&modules_dir).map_err(|error| ModuleError::Io {
+        path: modules_dir.to_path_buf(),
+        error,
+    })?;
+    let seq = WRITE_STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = process::id();
+    let mut stage_name = blaze_own::String::new_in(shared);
+    let _ = core::fmt::Write::write_fmt(&mut stage_name, format_args!(".tmp-{key}-{pid}-{seq}"));
+    let stage = modules_dir.join(stage_name.as_str());
+    let final_dir = modules_dir.join(key);
+
+    let _ = fs::remove_dir_all(&stage);
+    fs::create_dir_all(&stage).map_err(|error| ModuleError::Io {
+        path: stage.to_path_buf(),
+        error,
+    })?;
+
+    let write_all = || -> Result<(), ModuleError> {
+        let write_file = |file: &str, bytes: &[u8]| -> Result<(), ModuleError> {
+            let path = stage.join(file);
+            fs::write(&path, bytes).map_err(|error| ModuleError::Io { path, error })
+        };
+        let digest = sha256_hex(bin_bytes);
+        let mut digest_line = blaze_own::String::new_in(shared);
+        let _ = core::fmt::Write::write_fmt(&mut digest_line, format_args!("{digest}\n"));
+
+        let mut macros_text = blaze_own::String::new_in(shared);
+        for exported in macros {
+            let kind_word = match exported.kind {
+                ProcKind::Derive => "derive",
+                ProcKind::Attr => "attr",
+                ProcKind::FnLike => "bang",
+            };
+            let _ = core::fmt::Write::write_fmt(
+                &mut macros_text,
+                format_args!("{} {} {}", exported.index, kind_word, exported.name),
+            );
+            if !exported.helpers.is_empty() {
+                macros_text.push(' ');
+                for (idx, helper) in exported.helpers.iter().enumerate() {
+                    if idx > 0 {
+                        macros_text.push(',');
+                    }
+                    macros_text.push_str(helper);
+                }
+            }
+            macros_text.push('\n');
+        }
+
+        let mut decls_line = blaze_own::String::new_in(shared);
+        let _ = core::fmt::Write::write_fmt(&mut decls_line, format_args!("{decls}\n"));
+
+        write_file("identity", identity_text.as_bytes())?;
+        write_file(BIN_SHA256_FILENAME, digest_line.as_str().as_bytes())?;
+        write_file("macros", macros_text.as_str().as_bytes())?;
+        write_file("decls", decls_line.as_str().as_bytes())?;
+        write_file(NATIVE_BIN_FILENAME, bin_bytes)?;
+
+        #[cfg(unix)]
+        {
+            let bin_path = stage.join(NATIVE_BIN_FILENAME);
+            fs::set_permissions(&bin_path, fs::Permissions::from_mode(0o755))
+                .map_err(|error| ModuleError::Io { path: bin_path, error })?;
+        }
+        Ok(())
+    };
+
+    if let Err(err) = write_all() {
+        let _ = fs::remove_dir_all(&stage);
+        return Err(err);
+    }
+
+    if let Err(error) = fs::rename(&stage, &final_dir) {
+        let _ = fs::remove_dir_all(&stage);
+        if !final_dir.join(BIN_SHA256_FILENAME).is_file() {
+            return Err(ModuleError::Io { path: final_dir, error });
+        }
+    }
+
+    read_module_by_key(store, key.into(), name, version)
 }
 
 #[cfg(test)]
@@ -1073,6 +1230,72 @@ mod header_tests {
         assert_eq!(rec.wasm_sha256, "cafebabe");
         assert_eq!(rec.macros.len(), 1);
         assert_eq!(rec.macros[0].name, "Demo");
+
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn write_and_read_native_bin_module_verifies_digest_and_exec_permissions() {
+        use std::{env, fs, process};
+        let store = env::temp_dir().join(format!("blaze-pm-native-bin-test-{}", process::id()));
+        let _ = fs::remove_dir_all(&store);
+
+        let id = CrateId {
+            name: "sqlx_macros",
+            version: "0.9.0",
+            source: Source::Registry { checksum: "ab12" },
+            deps: "deps-tier2",
+            features: &["runtime-tokio", "postgres"],
+        };
+        let key = module_key(&id);
+        let id_text = identity(&id);
+        let bin_bytes = b"\x7fELF-synthetic-native-bin-payload";
+        let exports = vec![
+            Exported { index: 0, kind: ProcKind::FnLike, name: "expand_query".to_owned(), helpers: Vec::new() },
+            Exported { index: 1, kind: ProcKind::Derive, name: "FromRow".to_owned(), helpers: vec!["sqlx".to_owned()] },
+            Exported { index: 2, kind: ProcKind::Attr, name: "test".to_owned(), helpers: Vec::new() },
+        ];
+
+        let rec = write_native_bin_module(
+            &store,
+            &key,
+            id.name,
+            id.version,
+            &id_text,
+            bin_bytes,
+            &exports,
+            "__blaze_pm_decls__",
+        )
+        .expect("write native.bin module");
+
+        assert_eq!(rec.key, key);
+        assert_eq!(rec.wasm_sha256, sha256_hex(bin_bytes));
+        assert_eq!(rec.macros, exports);
+        assert_eq!(rec.decls, "__blaze_pm_decls__");
+        assert!(rec.native_dylib.is_none());
+        let bin_path = rec.native_bin.as_ref().expect("native_bin present");
+        assert_eq!(bin_path, &rec.dir.join(NATIVE_BIN_FILENAME));
+        assert_eq!(rec.verify_native_bin().expect("verify"), bin_path.as_path());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(bin_path).expect("meta").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "native.bin must have 0o755 executable permissions");
+        }
+
+        let (found_key, found_digest) = find_module(&store, &id).expect("find_module");
+        assert_eq!(found_key, key);
+        assert_eq!(found_digest, sha256_hex(bin_bytes));
+
+        let reread = read_module(&store, &id).expect("read_module");
+        assert_eq!(reread.native_bin.as_deref(), Some(bin_path.as_path()));
+        assert_eq!(reread.macros, exports);
+
+        // Tampering with native.bin MUST be rejected with ModuleError::Digest!
+        fs::write(bin_path, b"\x7fELF-tampered").expect("tamper");
+        assert!(matches!(read_module(&store, &id), Err(ModuleError::Digest { .. })));
+        assert!(matches!(rec.verify_native_bin(), Err(ModuleError::Digest { .. })));
 
         let _ = fs::remove_dir_all(&store);
     }

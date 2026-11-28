@@ -862,9 +862,9 @@ pub use inode_record::{
 };
 #[cfg(target_os = "linux")]
 pub use landlock::{
-    HostLdCaps, PreloadScanner, dl_dst_lib_token, dl_dst_platform_token, expand_rpath_tokens,
-    feed_nix_runtime_closure, feed_nix_runtime_closure_with, parse_ld_so_cache_match,
-    validate_rpath_entry, x86_64_fhs_hwcap_subdirs,
+    HostLdCaps, PreloadScanner, Prepared as PreparedConfine, dl_dst_lib_token, dl_dst_platform_token,
+    expand_rpath_tokens, feed_nix_runtime_closure, feed_nix_runtime_closure_with,
+    parse_ld_so_cache_match, validate_rpath_entry, x86_64_fhs_hwcap_subdirs,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use crate::rt::{AttemptSignal, LockBackend, LockPlant, LockRuntime, LockedIoHandshake, LockedIoPlant, NativeLockErr};
@@ -1796,6 +1796,76 @@ pub fn confinement<'a, 's>(spec: &'s HermeticSpec<'s>, files: &'s dyn RootFiles,
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (spec, files, alloc);
+        Err(Fault::NoBackend { os: "neither Linux nor macOS" })
+    }
+}
+
+/// Prepares a strictly read-only Linux Landlock + seccomp confinement (zero writable directories,
+/// `socket()` denied with `EPERM`, subprocess spawning denied while `clone(CLONE_THREAD)` /
+/// `epoll` / `eventfd2` / `pipe2` / `futex` / `getrandom` stay allowed) for a persistent served
+/// worker running `program` with read-only access to `read_roots` and its ELF runtime closure.
+#[cfg(target_os = "linux")]
+pub fn prepare_read_only(
+    program: &str,
+    read_roots: &[&str],
+    budget: Budget,
+    alloc: Alloc<'_>,
+) -> Result<PreparedConfine, Fault> {
+    let plan = Plan::read_only(program, read_roots, &landlock::SYSTEM, alloc)?;
+    landlock::prepare_with_exec(&plan, budget, false, None, Some(alloc))
+}
+
+/// Starts `spec` as a confined served child speaking bidirectional framed IPC over
+/// [`super::CHILD_FD`] with strictly read-only access to `read_roots` (zero writable directories,
+/// zero network, zero subprocess spawning):
+/// - Linux: prepares Landlock + seccomp via [`prepare_read_only`] and starts via
+///   [`Spawner::start_served_confined`].
+/// - macOS: renders a read-only Seatbelt SBPL profile and starts via `/usr/bin/sandbox-exec` +
+///   [`Spawner::start_served`].
+pub fn start_served_read_only(
+    spawner: &Spawner,
+    cx: &Cx,
+    spec: &super::RunSpec<'_>,
+    read_roots: &[&str],
+    budget: Budget,
+    alloc: Alloc<'_>,
+) -> Result<super::Started<super::Served>, Fault> {
+    #[cfg(target_os = "linux")]
+    {
+        let prepared = prepare_read_only(spec.program, read_roots, budget, alloc)?;
+        spawner.start_served_confined(cx, spec, &prepared.confine()).map_err(Fault::Run)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = budget;
+        let plan = Plan::read_only(spec.program, read_roots, &seatbelt::SYSTEM, alloc)?;
+        let profile = seatbelt::profile(&plan, alloc)?;
+        let text = profile
+            .get(..profile.len().saturating_sub(1))
+            .and_then(|bytes| core::str::from_utf8(bytes).ok())
+            .ok_or(Fault::PathRefused { at: 0 })?;
+        let mut args: AVec<'_, &str> = AVec::new_in(alloc);
+        for arg in ["-p", text, spec.program] {
+            args.try_push(arg).map_err(|_| Fault::OutOfMemory)?;
+        }
+        for arg in spec.args {
+            args.try_push(arg).map_err(|_| Fault::OutOfMemory)?;
+        }
+        let wrapped = super::RunSpec {
+            program: "/usr/bin/sandbox-exec",
+            arg0: None,
+            args: &args,
+            env: spec.env,
+            dir: spec.dir,
+            streams: spec.streams,
+            own_group: spec.own_group,
+            parent_death: spec.parent_death,
+        };
+        spawner.start_served(cx, &wrapped).map_err(Fault::Run)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (spawner, cx, spec, read_roots, budget, alloc);
         Err(Fault::NoBackend { os: "neither Linux nor macOS" })
     }
 }

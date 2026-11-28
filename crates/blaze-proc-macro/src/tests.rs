@@ -307,6 +307,7 @@ fn module_in(dir: &Path, wasm: impl AsRef<[u8]>, macros: u32) -> ModuleRecord {
         dir: dir.to_owned(),
         compiled: dir.join("compiled"),
         native_dylib: None,
+        native_bin: None,
     }
 }
 

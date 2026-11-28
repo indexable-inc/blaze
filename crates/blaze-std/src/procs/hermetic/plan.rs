@@ -131,6 +131,31 @@ impl<'a> Plan<'a> {
         Ok(plan)
     }
 
+    /// Builds a strictly read-only confinement plan with zero writable directories:
+    /// - `program`: single-file `Access::Exec` (`Why::Program`, which also admits its NixOS/FHS
+    ///   ELF runtime closure on Linux),
+    /// - each path in `read_roots`: subtree `Access::Read` (`Why::TreeRoot`),
+    /// - each path in `system`: subtree `Access::Read` (`Why::System`),
+    /// - `/dev/null`: single-file `Access::Write` (`Why::Null`).
+    pub fn read_only(
+        program: &str,
+        read_roots: &[&str],
+        system: &[&str],
+        alloc: Alloc<'a>,
+    ) -> Result<Plan<'a>, Fault> {
+        let mut plan = Plan { text: AVec::new_in(alloc), rows: AVec::new_in(alloc) };
+        plan.push(&[program.as_bytes()], false, Access::Exec, Why::Program)?;
+        for (idx, root) in read_roots.iter().enumerate() {
+            let id = u8::try_from(idx).map_err(|_| Fault::PlanOver { most: 256 })?;
+            plan.push(&[root.as_bytes()], true, Access::Read, Why::TreeRoot(RootId(id)))?;
+        }
+        for folder in system {
+            plan.push(&[folder.as_bytes()], true, Access::Read, Why::System)?;
+        }
+        plan.push(&[b"/dev/null"], false, Access::Write, Why::Null)?;
+        Ok(plan)
+    }
+
     fn push(&mut self, parts: &[&[u8]], subtree: bool, access: Access, why: Why) -> Result<(), Fault> {
         let at = self.rows.len() as u32;
         if at >= MOST_RULES {

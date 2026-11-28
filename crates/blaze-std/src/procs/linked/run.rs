@@ -31,6 +31,8 @@ pub use blaze_core::linked::{
     channel::{CHILD_FD, ChannelError, ChannelReady, Message, PREFIX, Read, Write, whole_messages},
     run::{Input, Output, ParentDeath, Streams},
 };
+#[cfg(target_os = "linux")]
+pub use blaze_core::linked::run::ChildConfine;
 use blaze_core::{
     Command, Sandbox,
     linked::{
@@ -335,10 +337,33 @@ impl Spawner {
 
     /// `spec` started with its channel as [`CHILD_FD`]: as [`Spawner::start`] otherwise.
     pub fn start_served(&self, cx: &Cx, spec: &RunSpec<'_>) -> Result<Started<Served>, RunError> {
+        self.start_served_with(cx, spec, None)
+    }
+
+    /// `spec` started confined with its channel as [`CHILD_FD`]: combines [`Spawner::start_served`]
+    /// (parent-side `channel::pair()`, passing `CHILD_FD` in `inherit`) and
+    /// [`Spawner::start_confined`] (entering `confine` last before `execve` in the child).
+    /// A refused confinement step is [`RunFault::Host`] naming it; the program never ran (rule 9).
+    #[cfg(target_os = "linux")]
+    pub fn start_served_confined(
+        &self,
+        cx: &Cx,
+        spec: &RunSpec<'_>,
+        confine: &blaze_core::linked::run::ChildConfine<'_>,
+    ) -> Result<Started<Served>, RunError> {
+        self.start_served_with(cx, spec, Some(confine))
+    }
+
+    fn start_served_with(
+        &self,
+        cx: &Cx,
+        spec: &RunSpec<'_>,
+        confine: Option<&blaze_core::linked::run::ChildConfine<'_>>,
+    ) -> Result<Started<Served>, RunError> {
         let refuse = |fault| RunError { step: RunStep::Start, proc: None, fault };
         let (parent, child_end) = channel::pair().map_err(|error| refuse(RunFault::Channel(error)))?;
         let given = [(child_end.fd(), CHILD_FD)];
-        let Started { child: run, pipes } = self.start_with(cx, spec, &given, None)?;
+        let Started { child: run, pipes } = self.start_with(cx, spec, &given, confine)?;
         // The child's end is dropped here: from now on the child holds the only copy, so its
         // exit closes the channel for this end's reads.
         drop(child_end);

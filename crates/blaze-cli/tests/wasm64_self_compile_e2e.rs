@@ -560,6 +560,7 @@ pub extern "C-unwind" fn main() -> u32 {
         dir: dir.clone(),
         compiled: dir.join("compiled"),
         native_dylib: None,
+        native_bin: None,
     };
 
     let rt = Runtime::new(blaze_own::testing::heap()).expect("Runtime initializes");
@@ -1644,6 +1645,7 @@ pub unsafe extern "C" fn blaze_proc_macro_expand(
         dir: dir.clone(),
         compiled: dir.join("compiled"),
         native_dylib: None,
+        native_bin: None,
     };
     let rt = Runtime::new(blaze_own::testing::heap()).expect("Runtime");
     let loaded = rt.load(&record).expect("load wasm64 proc-macro");
