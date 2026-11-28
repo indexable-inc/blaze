@@ -141,6 +141,7 @@ pub(super) fn task_expr(t: &Task) -> Option<ExprId> {
         | Task::StructBase(e)
         | Task::InitDefaults(e)
         | Task::FormatArgs(e)
+        | Task::FmtBorrow(e)
         | Task::Await(e)
         | Task::DoSuspend(e)
         | Task::Asm(e) => Some(e),

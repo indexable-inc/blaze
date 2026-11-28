@@ -497,6 +497,8 @@ enum Task {
     Ref,
     /// Build `format_args!` `e` from its arguments' references on top (walk/fmt.rs).
     FormatArgs(ExprId),
+    /// Evaluates a dual-use `format_args!` argument through only its initial shared borrow `&T`.
+    FmtBorrow(ExprId),
     /// The poll loop of `.await` `e`, its operand's value on top (coroutine.rs `await_poll`).
     Await(ExprId),
     /// One-shot `.do` suspension `e`, its request operand's value on top (coroutine.rs `do_suspend`).
@@ -5141,6 +5143,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             }
             Task::Repeat(e) => self.repeat(e)?,
             Task::FormatArgs(e) => self.format_args_done(e)?,
+            Task::FmtBorrow(a) => self.format_args_borrow(a)?,
             Task::Await(e) => self.await_poll(e)?,
             Task::DoSuspend(e) => self.do_suspend(e)?,
             Task::Asm(e) => self.asm_done(e)?,
