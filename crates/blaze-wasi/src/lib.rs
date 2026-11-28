@@ -230,6 +230,14 @@ pub enum Filetype {
     SymbolicLink = 7,
 }
 
+/// WASI's `fdstat`: a descriptor's file type and granted base/inheriting rights.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Fdstat {
+    pub filetype: Filetype,
+    pub rights_base: u64,
+    pub rights_inheriting: u64,
+}
+
 /// WASI's `filestat`: what a file is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Filestat {
@@ -325,6 +333,15 @@ pub trait System {
     fn read(&mut self, fd: u32, into: &mut [u8]) -> Answer<usize>;
     /// What `fd` is, for `fd_fdstat_get`.
     fn fd_filetype(&mut self, fd: u32) -> Answer<Filetype>;
+    /// What `fd` is and the base/inheriting rights it holds, for `fd_fdstat_get`. Defaults to
+    /// every right on the descriptor's [`System::fd_filetype`].
+    fn fd_fdstat(&mut self, fd: u32) -> Answer<Fdstat> {
+        Ok(self.fd_filetype(fd)?.map(|filetype| Fdstat {
+            filetype,
+            rights_base: u64::MAX,
+            rights_inheriting: u64::MAX,
+        }))
+    }
     fn set_fd_flags(&mut self, fd: u32, flags: u32) -> Answer<()>;
     fn close(&mut self, fd: u32) -> Answer<()>;
     /// Moves `fd`'s position by `offset` from `whence` (0 the start, 1 where it is, 2 the end):

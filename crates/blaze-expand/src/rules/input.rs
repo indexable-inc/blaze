@@ -639,7 +639,7 @@ fn literal_kind(kind: LitKind) -> SyntaxKind {
         LitKind::Char => SyntaxKind::CHAR,
         LitKind::Integer => SyntaxKind::INT_NUMBER,
         LitKind::Float => SyntaxKind::FLOAT_NUMBER,
-        LitKind::Str | LitKind::StrRaw(_) => SyntaxKind::STRING,
+        LitKind::Str | LitKind::StrRaw(_) | LitKind::DocStrRaw(_) => SyntaxKind::STRING,
         LitKind::ByteStr | LitKind::ByteStrRaw(_) => SyntaxKind::BYTE_STRING,
         LitKind::CStr | LitKind::CStrRaw(_) => SyntaxKind::C_STRING,
         LitKind::Err => SyntaxKind::ERROR,

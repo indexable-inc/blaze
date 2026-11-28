@@ -1095,8 +1095,8 @@ impl SourceTexts<'static> for Timed<'_> {
         self.procs?.keys[krate]
     }
 
-    fn proc_exports(&self, krate: usize) -> Option<&'static [blaze_scope::task::ProcExport<'static>]> {
-        self.procs?.exports[krate]
+    fn proc_exports(&self, krate: usize) -> Result<Option<&'static [blaze_scope::task::ProcExport<'static>]>, &'static str> {
+        Ok(self.procs.and_then(|p| p.exports.get(krate).copied().flatten()))
     }
 
     fn run_proc_macro<'b>(
@@ -1199,13 +1199,14 @@ fn procs_of<P: blaze_world::Packages<'static>>(store: &FsPath, out: &FsPath, roo
     // What each macro crate's module declares to the host: its exports, in place of its text's
     // attributes (a derive declared through `synstructure::decl_derive!` has none written).
     // Copied out once (the hook owns the records) and leaked with the rest of `--procs`.
-    let with: std::collections::BTreeSet<blaze_id::CrateItemKey> = procs.crates().filter(|c| c.2).map(|c| c.0).collect();
     let exports = keys
         .iter()
         .map(|key| {
-            let key = (*key).filter(|k| with.contains(k))?;
+            let key = (*key)?;
             let list: Vec<blaze_scope::task::ProcExport<'static>> = procs
                 .exports(key)
+                .ok()
+                .flatten()?
                 .iter()
                 .map(|e| blaze_scope::task::ProcExport { kind: e.kind, name: String::leak(e.name.clone()), helpers: String::leak(e.helpers.join(", ")) })
                 .collect();

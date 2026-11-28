@@ -325,11 +325,13 @@ impl crate::front_load::OpenByNeed for HeadsScopeRecords<'_, '_, '_, '_> {
         world_at: usize,
         nfiles: usize,
         file: u32,
+        expected_surface: ContentId,
         edition: blaze_surface::Edition,
         text: &'s str,
         verify_digest: bool,
+        bump: blaze_own::Bump<'s>,
     ) -> Option<Result<blaze_scope::items_record::CurrentFile<'s>, blaze_scope::items_record::ItemsRecordError>> {
-        self.lazy.pack_file_items(world_at, nfiles, file, edition, text, verify_digest)
+        self.lazy.pack_file_items(world_at, nfiles, file, expected_surface, edition, text, verify_digest, bump)
     }
 }
 
@@ -5328,6 +5330,7 @@ fn heads_of<'p>(
                     }
                     // Frozen through the split's one source, its reads its cells' own (engine_heads_once.rs
                     // `one_head`; a head that does not freeze is frozen again alone, as before).
+                    let unserved_before = opened.load.unserved_len();
                     let made = crate::engine_heads_once::one_head(&job_cx, &mut source, &mut owners, *want, task, &mut |id| cur.worked.reads.push(id), &mut cur.failed);
                     cur.incomplete_reads |= cur.failed.is_some();
                     cur.at_head += 1;
@@ -5362,7 +5365,12 @@ fn heads_of<'p>(
                             cur.worked.payload.extend_from_slice(&u32::try_from(made.bytes.len()).unwrap_or(u32::MAX).to_le_bytes());
                             cur.worked.payload.extend_from_slice(&made.bytes);
                         }
-                        Err(cause) => {
+                        Err(mut cause) => {
+                            if let Some(words) = opened.load.with_first_unserved_error_since(unserved_before, |err| {
+                                crate::engine_head_notes::leak(g, format_args!("{}; expansion read failed: {err}", cause.words))
+                            }) {
+                                cause.words = words;
+                            }
                             let head = crate::engine_head_consts::head_label(records, *want, g);
                             let digest = cause.digest(HEAD_FAILED_DOMAIN);
                             cur.worked.defines.push((cell, digest));

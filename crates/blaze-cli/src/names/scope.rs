@@ -193,7 +193,7 @@ impl<'t, 'n> SourceTexts<'n> for ParTexts<'t, 'n> {
         self.inner.proc_macro_key(krate)
     }
 
-    fn proc_exports(&self, krate: usize) -> Option<&'n [ProcExport<'n>]> {
+    fn proc_exports(&self, krate: usize) -> Result<Option<&'n [ProcExport<'n>]>, &'n str> {
         self.inner.proc_exports(krate)
     }
 
@@ -566,6 +566,7 @@ fn blocks_differential(
                 callers,
                 by_need: None,
                 run_stopped: core::cell::Cell::new(None),
+                proc_exports_cache: core::cell::OnceCell::new(),
                 activity: job.board.map(|board| (board, job.clock)),
             };
             let par = FilePar { cx: &span, meter: metered, heap: job.kept, workers: job.workers, oracle: NamesOracle::Off, now, seen: RefCell::new(None), in_par_map: AtomicUsize::new(0) };
@@ -614,6 +615,7 @@ fn blocks_differential(
             callers,
             by_need: None,
             run_stopped: core::cell::Cell::new(None),
+            proc_exports_cache: core::cell::OnceCell::new(),
             activity: job.board.map(|board| (board, job.clock)),
         };
         let par = FilePar { cx: &span, meter: metered, heap: job.kept, workers: job.workers, oracle: NamesOracle::Off, now, seen: RefCell::new(None), in_par_map: AtomicUsize::new(0) };
@@ -686,6 +688,7 @@ fn resolve_metered(
         callers,
         by_need: None,
         run_stopped: core::cell::Cell::new(None),
+        proc_exports_cache: core::cell::OnceCell::new(),
         activity: job.board.map(|board| (board, job.clock)),
     };
     let now = || crate::engine_times::ns(job.clock.now().since_start());

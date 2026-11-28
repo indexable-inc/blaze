@@ -28,6 +28,7 @@ mod resolve_tests;
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
+    process::ExitCode,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -653,7 +654,7 @@ fn add(into: &mut FileStats, s: FileStats) {
     into.unhandled += s.unhandled;
 }
 
-fn main() {
+fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     // `--no-proc-macros`: register no macro crate, so every procedural macro call is left
     // unresolved: the "before" of the bodies' check.
@@ -709,12 +710,17 @@ fn main() {
         if let Some(at) = built.iter().position(|m| m.name == name && m.version == version) {
             assert_eq!(crate_key(&built.swap_remove(at).key), key, "{name} {version}: the builder's module key is the crate's");
         }
-        // A crate with no module lists no exports here, so a call of it reads as unresolved
-        // (its exports are in its source, which this example does not read).
-        let exports = procs.exports(key);
-        if exports.is_empty() {
-            println!("macro crate {name} {version}: no module");
-        }
+        let exports = match procs.exports(key) {
+            Ok(Some(exports)) => exports,
+            Ok(None) => {
+                eprintln!("macro crate {name} {version}: not registered in runner");
+                return ExitCode::FAILURE;
+            }
+            Err(error) => {
+                eprintln!("macro crate {name} {version}: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
         for e in exports {
             macros.push(Macro { package, krate: key, kind: e.kind, name: e.name.clone(), helpers: e.helpers.clone() });
         }
@@ -921,4 +927,5 @@ fn main() {
             show("failed expansions, by what and path", &failed);
         }
     }
+    ExitCode::SUCCESS
 }

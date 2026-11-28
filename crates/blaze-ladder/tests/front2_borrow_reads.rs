@@ -225,3 +225,175 @@ fn borrow_reads_move_the_body_digest() {
 
     println!("BORROW READS: moves typeck rows equal, Token's row moved, digest moved; calls pick's head row moved, digest moved");
 }
+
+#[test]
+fn type_outlives_subject_change_moves_clauses_read_digest() {
+    const WITH_PARAM: &str = "fn main() {}
+
+fn check_outlives<'a, 'k, T>(x: &'a ())
+where
+    (&'a (), T): 'k,
+{
+    let _ = x;
+}
+";
+    const WITHOUT_PARAM: &str = "fn main() {}
+
+fn check_outlives<'a, 'k, T>(x: &'a ())
+where
+    &'a (): 'k,
+{
+    let _ = x;
+}
+";
+    let run = |text: &'static str| -> Seen {
+        let heap = blaze_own::testing::heap();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let shelf = format!("{home}/.blaze/v2/toolchain");
+        let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+        let files = [("/outlives-read/src/main.rs".to_string(), text.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("a known edition");
+        let user = UserCrate { name: "outlives_read", dir: "/outlives-read/", root: "/outlives-read/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let sources = [SourceFile { path: "src/main.rs", text }];
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
+        let mut world = ProjectWorld::new(&names, &frame, &sources, heap.alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+        let bodies = world.bodies(heap.alloc());
+        let target = bodies
+            .iter()
+            .find(|(b, _)| match b {
+                BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name) == Some("check_outlives"),
+                BodyRef::Member { name, .. } => *name == "check_outlives",
+            })
+            .map(|(b, _)| *b)
+            .expect("`check_outlives` listed");
+        let (types, borrows) = world.check_borrows(target, heap.alloc());
+        assert!(borrows.is_clean(), "`check_outlives` is borrow checked clean: {borrows:?}");
+        seen("check_outlives", &types)
+    };
+    const CLAUSES_DETAIL: u64 = 11;
+    let a = run(WITH_PARAM);
+    let b = run(WITHOUT_PARAM);
+    let a11: Vec<Read> = of_kind(&a.rows, FactKind::BorrowHead).into_iter().filter(|r| r.fact.detail == CLAUSES_DETAIL).collect();
+    let b11: Vec<Read> = of_kind(&b.rows, FactKind::BorrowHead).into_iter().filter(|r| r.fact.detail == CLAUSES_DETAIL).collect();
+    assert!(!a11.is_empty(), "clauses_read rows recorded for `check_outlives`: {a11:?}");
+    assert_eq!(keys_of(&a11), keys_of(&b11), "same BorrowHead detail-11 fact keys: {a11:?} then {b11:?}");
+    let moved: Vec<(Read, Read)> = a11.iter().zip(b11.iter()).filter(|(x, y)| x != y).map(|(x, y)| (*x, *y)).collect();
+    assert_eq!(
+        moved.len(),
+        1,
+        "changing `(&'a (), T): 'k` to `&'a (): 'k` (same slots and RHS, different subject type) must move `check_outlives`'s clauses_read digest: {a11:?} then {b11:?}"
+    );
+    assert_ne!(a.digest, b.digest, "body read digest must change when TypeOutlives subject type changes");
+}
+
+#[test]
+fn fn_ptr_abi_and_wide_tuple_clause_subjects_move_clauses_read_digest() {
+    let run = |text: String| -> Seen {
+        let heap = blaze_own::testing::heap();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let shelf = format!("{home}/.blaze/v2/toolchain");
+        let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+        let files = [("/clause-hash/src/main.rs".to_string(), text.clone())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("a known edition");
+        let user = UserCrate { name: "clause_hash", dir: "/clause-hash/", root: "/clause-hash/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let sources = [SourceFile { path: "src/main.rs", text: text.as_str() }];
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
+        let mut world = ProjectWorld::new(&names, &frame, &sources, heap.alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+        let bodies = world.bodies(heap.alloc());
+        let target = bodies
+            .iter()
+            .find(|(b, _)| match b {
+                BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name) == Some("target"),
+                BodyRef::Member { name, .. } => *name == "target",
+            })
+            .map(|(b, _)| *b)
+            .expect("`target` listed");
+        let (types, borrows) = world.check_borrows(target, heap.alloc());
+        assert!(borrows.is_clean(), "`target` is borrow checked clean: {borrows:?}");
+        seen("target", &types)
+    };
+    const CLAUSES_DETAIL: u64 = 11;
+
+    // 1. Function-pointer ABI change (`fn(&'a ())` vs `extern "C" fn(&'a ())`) must move clauses_read.
+    let rust_abi = run("fn main() {}\nfn target<'a, 'k>(x: &'a ()) where fn(&'a ()): 'k { let _ = x; }\n".to_string());
+    let c_abi = run("fn main() {}\nfn target<'a, 'k>(x: &'a ()) where extern \"C\" fn(&'a ()): 'k { let _ = x; }\n".to_string());
+    let r11: Vec<Read> = of_kind(&rust_abi.rows, FactKind::BorrowHead).into_iter().filter(|r| r.fact.detail == CLAUSES_DETAIL).collect();
+    let c11: Vec<Read> = of_kind(&c_abi.rows, FactKind::BorrowHead).into_iter().filter(|r| r.fact.detail == CLAUSES_DETAIL).collect();
+    assert_eq!(keys_of(&r11), keys_of(&c11), "same detail-11 keys for fn ptr ABI test");
+    let moved_abi: Vec<_> = r11.iter().zip(c11.iter()).filter(|(x, y)| x != y).collect();
+    assert_eq!(moved_abi.len(), 1, "changing fn ptr ABI must move `target`'s clauses_read digest: {r11:?} then {c11:?}");
+
+    // 2. Wide 130-element tuple differing only in element #129 (`u8` vs `u16`) must move clauses_read.
+    let mut prefix = String::from("&'a ()");
+    for _ in 1..129 {
+        prefix.push_str(", u8");
+    }
+    let wide_a = run(format!("fn main() {{}}\nfn target<'a, 'k>(x: &'a ()) where ({prefix}, u8): 'k {{ let _ = x; }}\n"));
+    let wide_b = run(format!("fn main() {{}}\nfn target<'a, 'k>(x: &'a ()) where ({prefix}, u16): 'k {{ let _ = x; }}\n"));
+    let wa11: Vec<Read> = of_kind(&wide_a.rows, FactKind::BorrowHead).into_iter().filter(|r| r.fact.detail == CLAUSES_DETAIL).collect();
+    let wb11: Vec<Read> = of_kind(&wide_b.rows, FactKind::BorrowHead).into_iter().filter(|r| r.fact.detail == CLAUSES_DETAIL).collect();
+    assert_eq!(keys_of(&wa11), keys_of(&wb11), "same detail-11 keys for wide tuple test");
+    let moved_wide: Vec<_> = wa11.iter().zip(wb11.iter()).filter(|(x, y)| x != y).collect();
+    assert_eq!(moved_wide.len(), 1, "changing element #129 of a 130-element tuple must move `target`'s clauses_read digest: {wa11:?} then {wb11:?}");
+}
+
+#[test]
+fn unread_owner_regions_still_files_clauses_read_row() {
+    // Two explicit trait-object lifetime bounds cause `heads_regions` to refuse the fn's
+    // region record while typeck still checks clean, exercising the `Err(_)` arm for
+    // `owner_regions.outlives(owner)` and verifying that detail-11 `clauses_read` is still
+    // filed and moves once the signature becomes readable.
+    const UNREAD: &str = "fn main() {}
+
+fn unread_owner(_: &'static (dyn Send + 'static + 'static)) {}
+";
+    const READABLE: &str = "fn main() {}
+
+fn unread_owner(_: &'static (dyn Send + 'static))
+where
+    &'static (): 'static,
+{}
+";
+    let run = |text: &'static str| -> Seen {
+        let heap = blaze_own::testing::heap();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let shelf = format!("{home}/.blaze/v2/toolchain");
+        let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+        let files = [("/unread-owner/src/main.rs".to_string(), text.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("a known edition");
+        let user = UserCrate { name: "unread_owner", dir: "/unread-owner/", root: "/unread-owner/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let sources = [SourceFile { path: "src/main.rs", text }];
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
+        let mut world = ProjectWorld::new(&names, &frame, &sources, heap.alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+        let bodies = world.bodies(heap.alloc());
+        let target = bodies
+            .iter()
+            .find(|(b, _)| match b {
+                BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name) == Some("unread_owner"),
+                BodyRef::Member { name, .. } => *name == "unread_owner",
+            })
+            .map(|(b, _)| *b)
+            .expect("`unread_owner` listed");
+        let (types, _borrows) = world.check_borrows(target, heap.alloc());
+        seen("unread_owner", &types)
+    };
+    const CLAUSES_DETAIL: u64 = 11;
+    let unread = run(UNREAD);
+    let readable = run(READABLE);
+    let u11: Vec<Read> = of_kind(&unread.rows, FactKind::BorrowHead).into_iter().filter(|r| r.fact.detail == CLAUSES_DETAIL).collect();
+    let r11: Vec<Read> = of_kind(&readable.rows, FactKind::BorrowHead).into_iter().filter(|r| r.fact.detail == CLAUSES_DETAIL).collect();
+    assert!(!u11.is_empty(), "unread owner region facts must still file a detail-11 clauses_read row: {u11:?}");
+    assert_eq!(keys_of(&u11), keys_of(&r11), "same BorrowHead detail-11 keys across unread -> readable recovery: {u11:?} then {r11:?}");
+    let moved: Vec<_> = u11.iter().zip(r11.iter()).filter(|(x, y)| x != y).collect();
+    assert_eq!(moved.len(), 1, "recovering unread owner region facts must move its detail-11 clauses_read row: {u11:?} then {r11:?}");
+    assert_ne!(unread.digest, readable.digest, "body read digest must move when unread owner clauses become readable");
+}

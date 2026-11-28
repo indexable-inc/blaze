@@ -77,6 +77,9 @@ pub(crate) enum LoadError {
     NotWhole { name: Name, why: &'static str },
     /// The record's payload is not a `CrateScope` payload of this form.
     Sections { name: Name, error: SectionsError },
+    /// The exports section does not open as this build's `scope_record::VERSION` (catches stale
+    /// `CrateScope` records whose expansion directory points to an older `RECORD_FORM`).
+    Exports { name: Name, error: blaze_scope::crate_scope::RecordRead },
     /// A section does not open as its record.
     Names { name: Name, error: NamesRecordError },
     Items { name: Name, error: ItemsRecordError },
@@ -94,6 +97,7 @@ impl core::fmt::Display for LoadError {
             LoadError::NotInStore { name, at } => write!(f, "not in the store: {name:?} at key {at:?} (rule: front_load.rs)"),
             LoadError::NotWhole { name, why } => write!(f, "the record of {name:?} is not a whole record: {why} (rule: front_load.rs)"),
             LoadError::Sections { name, error } => write!(f, "the record of {name:?}: {error}"),
+            LoadError::Exports { name, error } => write!(f, "the exports section of {name:?} does not open: {error:?} (rule: front_load.rs)"),
             LoadError::Names { name, error } => write!(f, "the names section of {name:?} does not open: {error:?} (rule: front_load.rs)"),
             LoadError::Items { name, error } => write!(f, "the items section of {name:?} does not open: {error:?} (rule: front_load.rs)"),
             LoadError::Expansions { name, error } => write!(f, "the expansion texts of {name:?}: {error}"),
@@ -109,22 +113,25 @@ impl core::fmt::Display for LoadError {
 /// expansion text records deferred to the keyed demand seam.
 pub(crate) fn crate_records<'n>(name: Name, payload: &[u8], key: CrateItemKey, bump: Bump<'n>) -> Result<CrateRecords<'n>, LoadError> {
     let parts = sections::sections(payload).map_err(|error| LoadError::Sections { name, error })?;
+    let exports = blaze_scope::resolve::aligned(parts.exports, bump);
     let names = blaze_scope::resolve::aligned(parts.names, bump);
     let items = blaze_scope::resolve::aligned(parts.items, bump);
     let expansions = blaze_scope::resolve::aligned(parts.expansions, bump);
-    checked_records(name, key, names, items, expansions, bump.alloc())
+    checked_records(name, key, exports, names, items, expansions, bump.alloc())
 }
 
-/// A crate's three sections, each 16-aligned where it lies (copied by [`crate_records`], or in
+/// A crate's sections, each 16-aligned where it lies (copied by [`crate_records`], or in
 /// a segment's mapping, engine_records.rs), checked once as `key`'s (rule 74).
 pub(crate) fn checked_records<'n>(
     name: Name,
     key: CrateItemKey,
+    exports: &'n [u8],
     names: &'n [u8],
     items: &'n [u8],
     expansions: &'n [u8],
     alloc: Alloc<'n>,
 ) -> Result<CrateRecords<'n>, LoadError> {
+    let exports_proof = blaze_scope::scope_record::Verified::check_header(exports).map_err(|error| LoadError::Exports { name, error })?;
     let expansions = ExpansionTexts::open(expansions).map_err(|error| LoadError::Expansions { name, error })?;
     let names_proof = Verified::check(names).map_err(|error| LoadError::Names { name, error })?;
     let found = names_proof.key();
@@ -139,20 +146,27 @@ pub(crate) fn checked_records<'n>(
     if found != key {
         return Err(LoadError::OtherCrate { name, asked: key, found, which: "items" });
     }
+    let exports_found = exports_proof.key();
+    if exports_found != key {
+        return Err(LoadError::OtherCrate { name, asked: key, found: exports_found, which: "exports" });
+    }
     Ok(CrateRecords { key, file_slots: &[], names, names_proof, items, items_proof, edition, expansions })
 }
 
 /// O(1) lazy-validated variant of [`checked_records`] for in-place local CAS records
 /// (`engine_records::InPlace`): verifies headers, alignment, all section bounds, column headers,
-/// crate keys, edition, `CrateRoot`, and expansion directory upfront, deferring module scope
-/// `ScopeView::read`, variant UTF-8, and `ItemsRecord` string UTF-8 checks until accessed.
+/// crate keys, edition, `CrateRoot`, `scope_record::VERSION` on `exports`, and expansion
+/// directory upfront, deferring module scope `ScopeView::read`, variant UTF-8, and `ItemsRecord`
+/// string UTF-8 checks until accessed.
 pub(crate) fn checked_records_lazy<'n>(
     name: Name,
     key: CrateItemKey,
+    exports: &'n [u8],
     names: &'n [u8],
     items: &'n [u8],
     expansions: &'n [u8],
 ) -> Result<CrateRecords<'n>, LoadError> {
+    let exports_proof = blaze_scope::scope_record::Verified::check_header(exports).map_err(|error| LoadError::Exports { name, error })?;
     let expansions = ExpansionTexts::open(expansions).map_err(|error| LoadError::Expansions { name, error })?;
     let names_proof = Verified::check_header(names).map_err(|error| LoadError::Names { name, error })?;
     let found = names_proof.key();
@@ -163,6 +177,10 @@ pub(crate) fn checked_records_lazy<'n>(
     let (found, edition) = (items_proof.key(), items_proof.edition());
     if found != key {
         return Err(LoadError::OtherCrate { name, asked: key, found, which: "items" });
+    }
+    let exports_found = exports_proof.key();
+    if exports_found != key {
+        return Err(LoadError::OtherCrate { name, asked: key, found: exports_found, which: "exports" });
     }
     Ok(CrateRecords { key, file_slots: &[], names, names_proof, items, items_proof, edition, expansions })
 }
@@ -297,11 +315,13 @@ pub(crate) fn pack_file_items_head<'a>(
 }
 
 /// Opens a persisted pack/dependency `FileItems` CAS record in place (zero-copy), validating the
-/// drive envelope, matching `text_digest`, and `FileItemsView` columns/alignment (rule 3, 21).
+/// drive envelope, matching `text_digest`, `expected_surface`, and `FileItemsView`
+/// columns/alignment (rule 3, 21).
 pub(crate) fn open_pack_file_items<'n>(
     bytes: &'n [u8],
     file: u32,
     text_digest: ContentId,
+    expected_surface: ContentId,
 ) -> Result<(ContentId, blaze_surface::FileItemsView<'n>), ItemsRecordError> {
     let view = match blaze_drive::record::open(bytes) {
         Ok(blaze_drive::record::Stored::Whole(view)) => view,
@@ -332,6 +352,13 @@ pub(crate) fn open_pack_file_items<'n>(
             what: "cached pack FileItems view digest disagrees with file text (front_load.rs)",
         });
     }
+    if view.out != expected_surface {
+        return Err(ItemsRecordError::FileItemsSurfaceConflict {
+            file,
+            expected: expected_surface,
+            found: view.out,
+        });
+    }
     Ok((view.out, fi))
 }
 
@@ -342,6 +369,7 @@ enum CachedPackFileItems {
         edition: u8,
         key: Key,
         text_digest: ContentId,
+        surface: ContentId,
     },
     Owned {
         edition: u8,
@@ -367,7 +395,13 @@ impl CachedPackFileItems {
         }
     }
 
-    fn open<'s>(&'s self, snapshot: &'s StoreSnapshot, file: u32, text: &'s str) -> Option<Result<CurrentFile<'s>, ItemsRecordError>> {
+    fn surface(&self) -> ContentId {
+        match self {
+            CachedPackFileItems::Snapshot { surface, .. } | CachedPackFileItems::Owned { surface, .. } => *surface,
+        }
+    }
+
+    fn open<'s>(&'s self, snapshot: &'s StoreSnapshot, file: u32, text: &'s str, expected_surface: ContentId) -> Option<Result<CurrentFile<'s>, ItemsRecordError>> {
         match self {
             CachedPackFileItems::Snapshot { key, text_digest, .. } => {
                 let bytes = match snapshot.get(*key) {
@@ -385,12 +419,19 @@ impl CachedPackFileItems {
                         }));
                     }
                 };
-                match open_pack_file_items(bytes, file, *text_digest) {
+                match open_pack_file_items(bytes, file, *text_digest, expected_surface) {
                     Ok((surface, view)) => Some(Ok(CurrentFile { text, surface, view })),
                     Err(err) => Some(Err(err)),
                 }
             }
             CachedPackFileItems::Owned { surface, buf, offset, len, .. } => {
+                if *surface != expected_surface {
+                    return Some(Err(ItemsRecordError::FileItemsSurfaceConflict {
+                        file,
+                        expected: expected_surface,
+                        found: *surface,
+                    }));
+                }
                 let end = offset.checked_add(*len)?;
                 let bytes = buf.get(*offset..end)?;
                 let view = match blaze_surface::FileItemsView::read(bytes) {
@@ -454,16 +495,24 @@ impl<'r> ScopeRecords<'r> {
     /// Build or fetch cached `CurrentFile` for file `(world_at, file)` (sized by `nfiles`).
     /// Checks the committed CAS snapshot first (zero-copy `FileItemsView` without re-outlining)
     /// before outlining once in a task frame and sharing across all workers and epochs.
-    /// When `verify_digest` is `true` (checkout `/0/` files), validates the cached entry's
-    /// `text_digest` against `text` so a concurrent edit never reuses a stale outline.
+    /// Validates the cached entry's `surface` against `expected_surface` (failing loudly with
+    /// [`ItemsRecordError::FileItemsSurfaceConflict`] on a conflicting CAS/cached entry instead
+    /// of silently re-outlining) and, when `verify_digest` is `true` (checkout `/0/` files),
+    /// validates `text_digest` against `text` so a concurrent edit never reuses a stale outline.
+    /// On a cold CAS miss whose fresh outline disagrees with `expected_surface` (stale
+    /// `ItemsRecord`), returns the already-built uncached [`CurrentFile`] in `bump` without
+    /// populating the shared cell or retrying a second outline.
+    #[expect(clippy::too_many_arguments, reason = "pack file items lookup: crate slot, file, expected surface, edition, text, verify flag, bump")]
     pub(crate) fn cached_pack_file_items<'s>(
         &'s self,
         world_at: usize,
         nfiles: usize,
         file: u32,
+        expected_surface: ContentId,
         edition: blaze_surface::Edition,
         text: &'s str,
         verify_digest: bool,
+        bump: Bump<'s>,
     ) -> Option<Result<CurrentFile<'s>, ItemsRecordError>> {
         let caches = self
             .file_caches
@@ -479,17 +528,24 @@ impl<'r> ScopeRecords<'r> {
             if verify_digest && entry.text_digest() != ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes()) {
                 return None;
             }
-            return entry.open(self.snapshot, file, text);
+            if entry.surface() != expected_surface {
+                return Some(Err(ItemsRecordError::FileItemsSurfaceConflict {
+                    file,
+                    expected: expected_surface,
+                    found: entry.surface(),
+                }));
+            }
+            return entry.open(self.snapshot, file, text, expected_surface);
         }
         let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
         let key = pack_file_items_key(edition, digest);
         match self.snapshot.get(key) {
             Ok(Some(bytes)) => {
-                let (surface, view) = match open_pack_file_items(bytes, file, digest) {
+                let (surface, view) = match open_pack_file_items(bytes, file, digest, expected_surface) {
                     Ok(opened) => opened,
                     Err(err) => return Some(Err(err)),
                 };
-                let _ = cell.set(CachedPackFileItems::Snapshot { edition: edition.byte(), key, text_digest: digest });
+                let _ = cell.set(CachedPackFileItems::Snapshot { edition: edition.byte(), key, text_digest: digest, surface });
                 return Some(Ok(CurrentFile { text, surface, view }));
             }
             Ok(None) => {}
@@ -500,7 +556,16 @@ impl<'r> ScopeRecords<'r> {
                 }));
             }
         }
-        let (surface, buf, offset, len) = match blaze_mem::frame::task(blaze_mem::Tag::Parse, |scratch| {
+        enum Built<'s> {
+            Cached {
+                surface: ContentId,
+                buf: Vec<u8, blaze_own::SharedAlloc<'static>>,
+                offset: usize,
+                len: usize,
+            },
+            Uncached(CurrentFile<'s>),
+        }
+        let built = match blaze_mem::frame::task(blaze_mem::Tag::Parse, |scratch| {
             let erased = blaze_own::Erased::new(scratch);
             let alloc = erased.handle();
             let outline = blaze_file_items::outline(text, edition, alloc);
@@ -509,22 +574,42 @@ impl<'r> ScopeRecords<'r> {
                 Err(why) => return Err(ItemsRecordError::FileItemsBuild { file, why }),
             };
             let surface = outline.surface();
+            if surface != expected_surface {
+                // Fresh outline disagrees with `ItemsRecord`: do not poison the shared cell and do
+                // not return `None` (which would re-outline the file a second time via
+                // `CurrentFile::from_text`); return the already-built uncached view directly so
+                // `ItemsRecord::check_file` reports `ItemsRecordError::Stale` in one pass.
+                let view = match blaze_surface::FileItemsView::read(blaze_scope::resolve::aligned(&encoded, bump)) {
+                    Ok(v) => v,
+                    Err(why) => return Err(ItemsRecordError::FileItemsRead { file, why }),
+                };
+                return Ok(Built::Uncached(CurrentFile { text, surface, view }));
+            }
             let len = encoded.len();
             let mut buf = Vec::with_capacity_in(len.saturating_add(15), self.heap.shared());
             buf.resize(len.saturating_add(15), 0);
             let offset = (16 - (buf.as_ptr().addr() & 15)) & 15;
             let Some(dst) = offset.checked_add(len).and_then(|end| buf.get_mut(offset..end)) else {
-                return Ok(None);
+                return Err(ItemsRecordError::FileItemsUnavailable {
+                    file,
+                    what: "cached pack FileItems buffer bounds overflowed (front_load.rs)",
+                });
             };
             dst.copy_from_slice(&encoded);
-            Ok(Some((surface, buf, offset, len)))
+            Ok(Built::Cached { surface, buf, offset, len })
         }) {
-            Ok(Some(v)) => v,
-            Ok(None) => return None,
+            Ok(v) => v,
             Err(why) => return Some(Err(why)),
         };
+        let (surface, buf, offset, len) = match built {
+            Built::Uncached(current) => return Some(Ok(current)),
+            Built::Cached { surface, buf, offset, len } => (surface, buf, offset, len),
+        };
         let Some(check_slice) = offset.checked_add(len).and_then(|end| buf.get(offset..end)) else {
-            return None;
+            return Some(Err(ItemsRecordError::FileItemsUnavailable {
+                file,
+                what: "cached pack FileItems slice bounds invalid (front_load.rs)",
+            }));
         };
         if let Err(why) = blaze_surface::FileItemsView::read(check_slice) {
             return Some(Err(ItemsRecordError::FileItemsRead { file, why }));
@@ -537,7 +622,7 @@ impl<'r> ScopeRecords<'r> {
         if verify_digest && entry.text_digest() != digest {
             return None;
         }
-        entry.open(self.snapshot, file, text)
+        entry.open(self.snapshot, file, text, expected_surface)
     }
 
     /// What it did so far.
@@ -622,17 +707,20 @@ impl core::fmt::Display for ByNeedError {
 pub(crate) trait OpenByNeed: Sync {
     fn open<'s>(&'s self, one: &Unopened) -> Result<CrateRecords<'s>, &'static str>;
 
-    /// Cached `FileItems` view keyed by `(world_at, file)` (sized by `nfiles`). When
-    /// `verify_digest` is `true`, validates the cached entry's `text_digest` against `text`.
-    /// Returns `None` if no shared cache slot is available.
+    /// Cached `FileItems` view keyed by `(world_at, file)` (sized by `nfiles`), validated
+    /// against `expected_surface`. When `verify_digest` is `true`, also validates the cached
+    /// entry's `text_digest` against `text`. Returns `None` if no matching cache slot is available.
+    #[expect(clippy::too_many_arguments, reason = "pack file items lookup: crate slot, file, expected surface, edition, text, verify flag, bump")]
     fn pack_file_items<'s>(
         &'s self,
         _world_at: usize,
         _nfiles: usize,
         _file: u32,
+        _expected_surface: ContentId,
         _edition: blaze_surface::Edition,
         _text: &'s str,
         _verify_digest: bool,
+        _bump: Bump<'s>,
     ) -> Option<Result<CurrentFile<'s>, ItemsRecordError>> {
         None
     }
@@ -648,11 +736,13 @@ impl OpenByNeed for ScopeRecords<'_> {
         world_at: usize,
         nfiles: usize,
         file: u32,
+        expected_surface: ContentId,
         edition: blaze_surface::Edition,
         text: &'s str,
         verify_digest: bool,
+        bump: Bump<'s>,
     ) -> Option<Result<CurrentFile<'s>, ItemsRecordError>> {
-        self.cached_pack_file_items(world_at, nfiles, file, edition, text, verify_digest)
+        self.cached_pack_file_items(world_at, nfiles, file, expected_surface, edition, text, verify_digest, bump)
     }
 }
 
@@ -862,8 +952,22 @@ impl<'n> StoreLoad<'n> {
     }
 
     /// The macro calls whose expansion a question asked and none was served, in asked order.
+    #[cfg_attr(not(test), expect(dead_code, reason = "inspected by front_load tests; engine paths use `unserved_len` / `with_first_unserved_error_since`"))]
     pub(crate) fn unserved(&self) -> core::cell::Ref<'_, AVec<'n, Unserved>> {
         self.unserved.borrow()
+    }
+
+    /// Number of unserved expansion lookups recorded so far on this loader.
+    pub(crate) fn unserved_len(&self) -> usize {
+        self.unserved.borrow().len()
+    }
+
+    /// Passes the first [`ExpansionReadError`] recorded at or after index `since` to `f`
+    /// without cloning or allocating, returning `None` if no expansion read errored since `since`.
+    pub(crate) fn with_first_unserved_error_since<R>(&self, since: usize, f: impl FnOnce(&ExpansionReadError) -> R) -> Option<R> {
+        let list = self.unserved.borrow();
+        let err = list.get(since..)?.iter().find_map(|entry| entry.why.as_ref())?;
+        Some(f(err))
     }
 
     /// `answer` for the call `call` of crate `krate`: `Some` served, else filed unserved.
@@ -935,7 +1039,7 @@ impl<'n> Load<'n> for StoreLoad<'n> {
                     })
                 };
                 if let Some((world_at, nfiles)) = target
-                    && let Some(res) = records.pack_file_items(world_at, nfiles, index, edition, text, full.starts_with("/0/"))
+                    && let Some(res) = records.pack_file_items(world_at, nfiles, index, surface, edition, text, full.starts_with("/0/"), bump)
                 {
                     return res.map(Some);
                 }
@@ -1077,10 +1181,11 @@ mod tests {
         let g = Alloc::global();
         let mut out = std::vec::Vec::new();
         for c in names.crates().iter() {
+            let e = blaze_scope::crate_scope::error_record(c.key, c.name, c.edition, g).unwrap_or_else(|e| panic!("exports record of `{}`: {e:?}", c.name));
             let n = blaze_scope::names_record::encode(c, g).unwrap_or_else(|e| panic!("names record of `{}`: {e:?}", c.name));
             let i = blaze_scope::items_record::encode(c, g).unwrap_or_else(|e| panic!("items record of `{}`: {e:?}", c.name));
             let split = blaze_scope::expansion_records::write(c, g).unwrap_or_else(|e| panic!("expansions of `{}`: {e}", c.name));
-            out.push(sections::write(0, [&[], &[], &n[..], &i[..], &[], &split.directory[..], &[], &[]]));
+            out.push(sections::write(0, [&e[..], &[], &n[..], &i[..], &[], &split.directory[..], &[], &[]]));
         }
         out
     }
@@ -1407,14 +1512,22 @@ mod tests {
         let snapshot = store.commit_for_body_reads().expect("committed snapshot");
         let stored_bytes = snapshot.get(k2021).expect("snapshot get").expect("present in snapshot");
 
-        let (got_surface, view) = open_pack_file_items(stored_bytes, 0, digest).expect("zero-copy open");
+        let (got_surface, view) = open_pack_file_items(stored_bytes, 0, digest, surface).expect("zero-copy open");
         assert_eq!(got_surface, surface);
         assert_eq!(view.file(), digest);
         assert_eq!(view.len(), outline.items().len());
 
-        // Stale / mismatched digest or corrupt record must be refused (rule 3, rule 21).
-        assert!(open_pack_file_items(stored_bytes, 0, other_digest).is_err(), "mismatched digest must be refused");
-        assert!(open_pack_file_items(&stored_bytes[..8], 0, digest).is_err(), "truncated bytes must be refused");
+        // Stale / mismatched digest, conflicting surface, or corrupt record must be refused (rule 3, rule 21).
+        assert!(open_pack_file_items(stored_bytes, 0, other_digest, surface).is_err(), "mismatched digest must be refused");
+        assert!(open_pack_file_items(&stored_bytes[..8], 0, digest, surface).is_err(), "truncated bytes must be refused");
+        let wrong_surface = ContentId([0xEE; 32]);
+        match open_pack_file_items(stored_bytes, 0, digest, wrong_surface) {
+            Err(ItemsRecordError::FileItemsSurfaceConflict { file: 0, expected, found }) => {
+                assert_eq!((expected, found), (wrong_surface, surface));
+            }
+            Ok(_) => panic!("conflicting surface must return typed FileItemsSurfaceConflict"),
+            Err(other) => panic!("expected FileItemsSurfaceConflict, got {other:?}"),
+        }
 
         // Lazy `ScopeRecords::slots` stays unallocated until first crate ask.
         let scope_records = ScopeRecords::new(&snapshot, 16, heap);
@@ -1473,8 +1586,9 @@ mod tests {
         store.put(&cx, stale_key, &stale_old_bytes).expect("put stale record under old producer key");
         let snap_pos = store.commit_for_body_reads().expect("commit positive snapshot");
         let scope_pos = ScopeRecords::new(&snap_pos, 4, heap);
+        let bump_pos = blaze_own::testing::bump();
         let opened_pos = scope_pos
-            .cached_pack_file_items(1, 2, 0, Edition::E2024, text, false)
+            .cached_pack_file_items(1, 2, 0, fresh_surface, Edition::E2024, text, false, bump_pos)
             .expect("cached_pack_file_items must return Some")
             .expect("positive path must succeed");
         assert_eq!(
@@ -1482,9 +1596,9 @@ mod tests {
             "stale pack FileItems under prior producer key must not poison current surface"
         );
 
-        // Negative causal control (Rule 23): planting the stale surface under `current_key`
-        // (what happened before NAMES_DOMAIN + CODE_BUILDER_SOURCE were bound) returns
-        // `stale_surface != fresh_surface`, reproducing the exact `ItemsRecordError::Stale` cause.
+        // Negative causal control (Rule 23): planting a conflicting surface under `current_key`
+        // must fail loudly with typed `FileItemsSurfaceConflict` instead of returning a stale
+        // surface or silently re-outlining on every command.
         let io_neg = Io::simulated(SimWorld::new(73, Limits::USUAL));
         let cx_neg = io_neg.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root context");
         let err_neg = io_neg.need_err().expect("stderr");
@@ -1495,18 +1609,17 @@ mod tests {
         store_neg.put(&cx_neg, current_key, &stale_cur_bytes).expect("put stale record under current key");
         let snap_neg = store_neg.commit_for_body_reads().expect("commit negative snapshot");
         let scope_neg = ScopeRecords::new(&snap_neg, 4, heap);
-        let opened_neg = scope_neg
-            .cached_pack_file_items(1, 2, 0, Edition::E2024, text, false)
+        let bump_neg = blaze_own::testing::bump();
+        match scope_neg
+            .cached_pack_file_items(1, 2, 0, fresh_surface, Edition::E2024, text, false, bump_neg)
             .expect("cached_pack_file_items must return Some")
-            .expect("negative control opens planted record");
-        assert_eq!(
-            opened_neg.surface, stale_surface,
-            "causal control: colliding key surfaces the planted stale digest"
-        );
-        assert_ne!(
-            opened_neg.surface, fresh_surface,
-            "causal control: colliding stale digest disagrees with fresh outline surface"
-        );
+        {
+            Err(ItemsRecordError::FileItemsSurfaceConflict { file: 0, expected, found }) => {
+                assert_eq!((expected, found), (fresh_surface, stale_surface));
+            }
+            Ok(_) => panic!("conflicting CAS surface under current_key must return typed error"),
+            Err(other) => panic!("expected FileItemsSurfaceConflict, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1535,6 +1648,165 @@ mod tests {
             "proc_macro",
         ] {
             assert!(!is_lang_crate_name(skip), "pure toolchain dep `{skip}` must be skipped");
+        }
+    }
+
+    #[test]
+    fn crate_records_and_lazy_reject_stale_exports_version_and_accept_current() {
+        use crate::engine_records::{InPlace, ReadCounts, ReadError, open_record};
+        use blaze_cas::plain::Aligned16;
+        use blaze_scope::crate_scope::RecordRead;
+
+        let names = solved();
+        let c = &names.crates()[0];
+        let g = blaze_own::testing::heap().alloc();
+        let bump = blaze_own::testing::bump();
+        let mut exports = blaze_scope::crate_scope::error_record(c.key, c.name, c.edition, g).expect("exports");
+        let names_sec = blaze_scope::names_record::encode(c, g).expect("names");
+        let items_sec = blaze_scope::items_record::encode(c, g).expect("items");
+        let split = blaze_scope::expansion_records::write(c, g).expect("expansions");
+
+        let wrap_record = |payload: &[u8]| -> &'static [u8] {
+            let name = scope_name(c.key);
+            let head = blaze_drive::record::write_plain_head(
+                name,
+                ContentId::of("blaze-cli front load exports version test", b"source"),
+                ContentId::of("blaze-cli front load exports version test", b"out"),
+                &[],
+                payload.len(),
+                g,
+            );
+            let mut whole = Vec::with_capacity_in(head.len() + payload.len(), g);
+            whole.extend_from_slice(&head);
+            whole.extend_from_slice(payload);
+            blaze_scope::resolve::aligned(&whole, bump)
+        };
+
+        // Positive control: current `scope_record::VERSION` opens cleanly on both eager and lazy paths.
+        let current_payload = sections::write(0, [&exports[..], &[], &names_sec[..], &items_sec[..], &[], &split.directory[..], &[], &[]]);
+        assert!(crate_records(scope_name(c.key), &current_payload, c.key, bump).is_ok(), "current exports VERSION must open");
+        let mut counts = ReadCounts::default();
+        let current_aligned = Aligned16::new(wrap_record(&current_payload)).expect("aligned");
+        assert!(open_record::<InPlace>(scope_name(c.key), current_aligned, c.key, &mut counts, g).is_ok(), "lazy InPlace must open current exports VERSION");
+
+        // Negative control: downgrade `scope_record::VERSION` from 10 -> 9 (pre-`083ffadb3` stale CrateScope).
+        let current_ver = u32::from_le_bytes([exports[4], exports[5], exports[6], exports[7]]);
+        let stale_ver = current_ver - 1;
+        exports[4..8].copy_from_slice(&stale_ver.to_le_bytes());
+        let stale_payload = sections::write(0, [&exports[..], &[], &names_sec[..], &items_sec[..], &[], &split.directory[..], &[], &[]]);
+        match crate_records(scope_name(c.key), &stale_payload, c.key, bump) {
+            Err(LoadError::Exports { error: RecordRead::NotThisRecord, .. }) => {}
+            other => panic!("stale exports VERSION {stale_ver} must be rejected as LoadError::Exports(NotThisRecord), got {other:?}"),
+        }
+        let stale_aligned = Aligned16::new(wrap_record(&stale_payload)).expect("aligned");
+        match open_record::<InPlace>(scope_name(c.key), stale_aligned, c.key, &mut counts, g) {
+            Err(ReadError::Load(LoadError::Exports { error: RecordRead::NotThisRecord, .. })) => {}
+            other => panic!("lazy InPlace must reject stale exports VERSION {stale_ver}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cached_pack_file_items_validates_surface_and_rejects_conflicting_cas_entry() {
+        use crate::store::{CommandStore, Facts, Home};
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let text = "pub fn surface_guard(x: u32) -> u32 { x + 7 }\n";
+        let ed = Edition::E2021;
+        let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
+        let cas_key = pack_file_items_key(ed, digest);
+        let outline = blaze_file_items::outline(text, ed, alloc);
+        let real_surface = outline.surface();
+        let stale_surface = ContentId([0x5C; 32]);
+        assert_ne!(real_surface, stale_surface);
+        let raw = outline.to_file_items(text, digest, alloc).expect("to_file_items");
+
+        let make_record = |surface: ContentId| {
+            let head = pack_file_items_head(cas_key, digest, surface, raw.len(), alloc);
+            let mut buf = Vec::with_capacity_in(head.len() + raw.len(), alloc);
+            buf.extend_from_slice(&head);
+            buf.extend_from_slice(&raw);
+            buf
+        };
+
+        let io = Io::simulated(SimWorld::new(79, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root context");
+        let err = io.need_err().expect("stderr");
+        let home = Home::of(&cx, &io.need_fs().expect("files"), Some("/h")).expect("test home");
+        let lent = home.open_store(&blaze_cas::plain::Settings::default(), Facts { boot: Some(1), nonce: 79 }, alloc).expect("store");
+        let mut store = CommandStore::new(&cx, &lent, false, 0, None, io.need_clock().expect("clock"), &err, alloc).expect("command store");
+
+        // Negative control: CAS holds a conflicting `FileItems` record with `stale_surface != real_surface`
+        // under the current `pack_file_items_key`: must fail loudly with typed `FileItemsSurfaceConflict`
+        // instead of silently re-outlining.
+        store.put(&cx, cas_key, &make_record(stale_surface)).expect("put stale record");
+        let stale_snap = store.commit_for_body_reads().expect("stale snapshot");
+        let bump = blaze_own::testing::bump();
+        let scope_records = ScopeRecords::new(&stale_snap, 4, heap);
+        match scope_records
+            .cached_pack_file_items(0, 2, 0, real_surface, ed, text, false, bump)
+            .expect("must return Some(Err)")
+        {
+            Err(ItemsRecordError::FileItemsSurfaceConflict { file: 0, expected, found }) => {
+                assert_eq!((expected, found), (real_surface, stale_surface));
+            }
+            Ok(_) => panic!("conflicting CAS surface must fail loudly"),
+            Err(other) => panic!("expected FileItemsSurfaceConflict, got {other:?}"),
+        }
+
+        // Cold CAS miss where `ItemsRecord` expects a stale surface (`stale_surface != real_surface`):
+        // must return `Some(Ok(CurrentFile { surface: real_surface, .. }))` directly (never `None`,
+        // avoiding a second outline via `CurrentFile::from_text`), while leaving the shared cell
+        // empty so a matching caller still populates the cell cleanly.
+        let home_cold = Home::of(&cx, &io.need_fs().expect("files"), Some("/h-cold")).expect("test home cold");
+        let lent_cold = home_cold.open_store(&blaze_cas::plain::Settings::default(), Facts { boot: Some(1), nonce: 81 }, alloc).expect("store cold");
+        let mut store_cold = CommandStore::new(&cx, &lent_cold, false, 0, None, io.need_clock().expect("clock"), &err, alloc).expect("command store cold");
+        let empty_snap = store_cold.commit_for_body_reads().expect("empty snapshot");
+        let cold_records = ScopeRecords::new(&empty_snap, 4, heap);
+        let uncached_mismatch = cold_records
+            .cached_pack_file_items(0, 2, 0, stale_surface, ed, text, false, bump)
+            .expect("cold mismatched surface must return Some(Ok(CurrentFile)) directly without falling back to None")
+            .expect("valid uncached CurrentFile");
+        assert_eq!(uncached_mismatch.surface, real_surface);
+        assert_eq!(uncached_mismatch.view.len(), outline.items().len());
+        let cold_cell_empty = cold_records
+            .file_caches
+            .get()
+            .and_then(|crates| crates.get(0))
+            .and_then(|files| files.get())
+            .and_then(|files| files.get(0))
+            .is_some_and(|cell| cell.get().is_none());
+        assert!(cold_cell_empty, "cold mismatched outline must not populate the shared cell");
+        let cold_match = cold_records
+            .cached_pack_file_items(0, 2, 0, real_surface, ed, text, false, bump)
+            .expect("matching cold outline must succeed")
+            .expect("valid CurrentFile");
+        assert_eq!(cold_match.surface, real_surface);
+
+        // Positive control: a fresh store holds a matching `real_surface` record and serves it directly.
+        let home2 = Home::of(&cx, &io.need_fs().expect("files"), Some("/h2")).expect("test home 2");
+        let lent2 = home2.open_store(&blaze_cas::plain::Settings::default(), Facts { boot: Some(1), nonce: 80 }, alloc).expect("store 2");
+        let mut store2 = CommandStore::new(&cx, &lent2, false, 0, None, io.need_clock().expect("clock"), &err, alloc).expect("command store 2");
+        store2.put(&cx, cas_key, &make_record(real_surface)).expect("put fresh record");
+        let fresh_snap = store2.commit_for_body_reads().expect("fresh snapshot");
+        let fresh_records = ScopeRecords::new(&fresh_snap, 4, heap);
+        let hit = fresh_records
+            .cached_pack_file_items(0, 2, 0, real_surface, ed, text, false, bump)
+            .expect("matching CAS record")
+            .expect("valid CurrentFile");
+        assert_eq!(hit.surface, real_surface);
+        assert_eq!(hit.view.len(), outline.items().len());
+
+        // Negative control (in-memory cell): querying the populated slot with a mismatched surface
+        // must fail loudly with typed `FileItemsSurfaceConflict`.
+        match fresh_records
+            .cached_pack_file_items(0, 2, 0, stale_surface, ed, text, false, bump)
+            .expect("must return Some(Err)")
+        {
+            Err(ItemsRecordError::FileItemsSurfaceConflict { file: 0, expected, found }) => {
+                assert_eq!((expected, found), (stale_surface, real_surface));
+            }
+            Ok(_) => panic!("mismatched in-memory surface must fail loudly"),
+            Err(other) => panic!("expected FileItemsSurfaceConflict, got {other:?}"),
         }
     }
 }

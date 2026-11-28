@@ -378,14 +378,14 @@ pub fn flow_of<'a>(
     alloc: Alloc<'a>,
 ) -> Result<(Flow<Alloc<'a>>, AVec<'a, ParamOrigin>, Option<Refusal>), Refusal> {
     // With each flow, its placeholders for the body's type parameters (blaze-flow-lower
-    // param_outlives.rs): an `UnprovenOutlives` from one is E0310 or a refusal by name. An async
-    // block's lowering makes none. And the first stricter relation it used
-    // (blaze-flow-lower `Lowered::coarse`): the body is refused by it only on a finding.
+    // param_outlives.rs): an `UnprovenOutlives` from one is E0310 or a refusal by name. And the
+    // first stricter relation it used (blaze-flow-lower `Lowered::coarse`): the body is refused
+    // by it only on a finding.
     match of {
         FlowOf::Owner if view.coroutine.is_some() => lower_async_fn(view, done, facts, alloc).map(|l| (l.flow, l.params, l.coarse)),
         FlowOf::Owner => lower(view, done, facts, alloc).map(|l| (l.flow, l.params, l.coarse)),
         FlowOf::Closure(e) => lower_closure(view, done, e, facts, alloc).map(|l| (l.flow, l.params, l.coarse)),
-        FlowOf::AsyncBlock(e) => lower_async(view, done, e, facts, alloc).map(|l| (l.flow, AVec::new_in(alloc), l.coarse)),
+        FlowOf::AsyncBlock(e) => lower_async(view, done, e, facts, alloc).map(|l| (l.flow, l.params, l.coarse)),
     }
 }
 

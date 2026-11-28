@@ -2156,7 +2156,21 @@ fn render(stream: &TokenStream<'_>) -> String {
                 let hashes = |n: u8| "#".repeat(usize::from(n));
                 match kind {
                     LitKind::Str => format!("\"{body}\"{suffix}"),
-                    LitKind::StrRaw(n) => format!("r{0}\"{body}\"{0}{suffix}", hashes(n)),
+                    LitKind::StrRaw(n) | LitKind::DocStrRaw(n) if !blaze_expand::raw_str_fits(n, body) => {
+                        if !glued {
+                            out.push(' ');
+                        }
+                        out.push('"');
+                        for ch in body.escape_debug() {
+                            out.push(ch);
+                        }
+                        out.push('"');
+                        out.push_str(suffix);
+                        glued = !matches!(token.kind.spacing(), Spacing::Alone);
+                        at += 1;
+                        continue;
+                    }
+                    LitKind::StrRaw(n) | LitKind::DocStrRaw(n) => format!("r{0}\"{body}\"{0}{suffix}", hashes(n)),
                     LitKind::ByteStr => format!("b\"{body}\"{suffix}"),
                     LitKind::ByteStrRaw(n) => format!("br{0}\"{body}\"{0}{suffix}", hashes(n)),
                     LitKind::CStr => format!("c\"{body}\"{suffix}"),

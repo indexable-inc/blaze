@@ -45,3 +45,20 @@ fn each_list_of_calls_is_exactly_what_its_link_defines() {
     assert_eq!(defined(W32::MODULE, link::<W32, Nothing>), sorted(FUNCTIONS));
     assert_eq!(defined(W64::MODULE, link::<W64, Nothing>), sorted(FUNCTIONS));
 }
+
+#[test]
+fn put_fdstat_writes_retained_rights_to_guest_memory() {
+    use core::marker::PhantomData;
+
+    use crate::{Fdstat, Filetype, layout::Mem};
+
+    let mut bytes = [0u8; 32];
+    let mut mem = Mem::<W32> { bytes: &mut bytes, call: "fd_fdstat_get", width: PhantomData };
+    let base = (1u64 << 13) | (1u64 << 18);
+    let inheriting = 1u64 << 18;
+    mem.put_fdstat(4, &Fdstat { filetype: Filetype::Directory, rights_base: base, rights_inheriting: inheriting })
+        .expect("put_fdstat fits");
+    assert_eq!(bytes[4], Filetype::Directory as u8);
+    assert_eq!(u64::from_le_bytes(bytes[12..20].try_into().unwrap()), base);
+    assert_eq!(u64::from_le_bytes(bytes[20..28].try_into().unwrap()), inheriting);
+}

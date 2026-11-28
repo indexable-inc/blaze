@@ -80,7 +80,10 @@ pub(crate) mod sections;
 // (`items_record`) + expansions directory instead of dead `done.inner`.
 // Source 21: Section 6 (`links`) `TABLE_FORM` 2 includes Rust `.init_array` / `__mod_init_func`
 // initializer statics.
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 21";
+// Source 22: `scope_record::VERSION` 10 and `expansion_records::RECORD_FORM` 3 (84-byte
+// hygiene-bearing `TextMark`s in expansion `OriginColumn`s); invalidates pre-`083ffadb3`
+// `CrateScope` records whose expansion directories point to form-2 expansion records.
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 22";
 /// The out: the exports record, Section 2 (`NAMES_OUT_DOMAIN`), Section 3 (`ITEMS_OUT_DOMAIN`),
 /// the crate's expansion record keys (`EXPANSIONS_OUT_DOMAIN`), AND the checkout files the crate
 /// holds ([`crate_out`]). "1" was the names record alone, but a body's check reads its crate's
@@ -2013,6 +2016,21 @@ pub(crate) fn tell_public(store: &mut dyn Store<'_>, names: &Names<'_>) {
     store.toolchain_crates(&toolchain);
 }
 
+/// The `CrateScope` task source for crate `key`: mixes a proc-macro tag byte under `SOURCE_DOMAIN`
+/// so proc-macro crates automatically inherit every future `SOURCE_DOMAIN` bump while invalidating
+/// pre-fix cached proc-macro `CrateScope` records computed before `JobTexts::proc_exports` was wired
+/// (without churning non-proc-macro crates).
+pub(crate) fn crate_scope_source(key: blaze_id::CrateItemKey, proc_macro: bool) -> ContentId {
+    if proc_macro {
+        let mut tagged = [0u8; 33];
+        tagged[..32].copy_from_slice(&key.0.0);
+        tagged[32] = 1;
+        ContentId::of(SOURCE_DOMAIN, &tagged)
+    } else {
+        ContentId::of(SOURCE_DOMAIN, &key.0.0)
+    }
+}
+
 /// The `CrateScope` parts the graph's record names: one per crate of the world, by subject,
 /// its source the same key's digest. Owed (drive.md): every part runs, so a
 /// `#![no_core]` workspace still resolves all 15 toolchain crates cold; a `Need` locates its
@@ -2023,7 +2041,8 @@ pub(crate) fn parts(names: &Names<'_>) -> std::vec::Vec<(Name, ContentId), Globa
     let mut parts = std::vec::Vec::with_capacity(list.len());
     for r in 0..list.len() {
         let key = list.key(r);
-        parts.push((blaze_drive::key::crate_scope_name(&key), ContentId::of(SOURCE_DOMAIN, &key.0.0)));
+        let source = crate_scope_source(key, CrateGraph::proc_macro(list, r));
+        parts.push((blaze_drive::key::crate_scope_name(&key), source));
     }
     parts.sort_unstable_by_key(|(name, _)| name.subject);
     parts.dedup_by_key(|(name, _)| name.subject);

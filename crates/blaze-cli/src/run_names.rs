@@ -270,6 +270,7 @@ pub(crate) fn names_records_envs<'n>(
             callers,
             by_need,
             run_stopped: core::cell::Cell::new(None),
+            proc_exports_cache: core::cell::OnceCell::new(),
             activity: None,
         },
         frame,

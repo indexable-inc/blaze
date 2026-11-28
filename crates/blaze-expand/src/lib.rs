@@ -117,7 +117,7 @@ pub use crate::rules::{CopyPlant, rules_copy_plant, rules_oracle, rules_oracle_c
 pub use crate::{
     body::{
         BodyWord, BodyWords, Fragment, ParserWords, body_words, glued_in_text, local_hygiene,
-        parser_words, write_token, write_tokens,
+        parser_words, raw_str_fits, write_token, write_tokens,
     },
     call::{AlsoCopy, Call, CallKind, CallShape, CallSite, Constness, DeriveFacts, Eager, Inside},
     cfg::{

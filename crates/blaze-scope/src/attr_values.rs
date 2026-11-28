@@ -634,12 +634,19 @@ impl<'q, 'r, 'a, C: ExpandCx> Driver<'q, 'r, 'a, C> {
         }
         let token = stream.tokens()[lo];
         match token.kind {
-            TokenKind::Literal { kind: LitKind::Str | LitKind::StrRaw(_), suffix_len: 0, .. } => {
+            TokenKind::Literal {
+                kind: LitKind::Str | LitKind::StrRaw(_) | LitKind::DocStrRaw(_),
+                suffix_len: 0,
+                ..
+            } => {
                 let mut text = AString::new_in(self.alloc());
                 write_token(stream, &token, &mut text);
                 attr_literal(&text, self.edition, self.bump).map_err(|_| self.refused(ValueWhy::Escape))
             }
-            TokenKind::Literal { kind: LitKind::Str | LitKind::StrRaw(_), .. } => Err(self.refused(ValueWhy::Suffixed)),
+            TokenKind::Literal {
+                kind: LitKind::Str | LitKind::StrRaw(_) | LitKind::DocStrRaw(_),
+                ..
+            } => Err(self.refused(ValueWhy::Suffixed)),
             _ => Err(self.refused(ValueWhy::NotAString)),
         }
     }

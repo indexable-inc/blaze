@@ -395,12 +395,17 @@ impl<'r> ProcMacros<'r> {
         }
     }
 
-    /// The macros `key`'s module exports; none when it has no module.
-    pub fn exports(&self, key: CrateItemKey) -> &[Exported] {
-        match self.crates.iter().find(|it| it.key == key).map(MacroCrate::resolve_module) {
-            Some(Ok(module)) => &module.macros,
-            _ => &[],
-        }
+    /// The macros `key`'s module exports:
+    /// - `Ok(Some(macros))` when `key` is registered and has a loaded module (including an empty
+    ///   slice when the module exports zero macros),
+    /// - `Ok(None)` when `key` is not registered with this runner,
+    /// - `Err(error)` when `key` is registered but its module is missing or unreadable (never
+    ///   silently collapsed to `Ok(None)`, rule 3).
+    pub fn exports(&self, key: CrateItemKey) -> Result<Option<&[Exported]>, &ModuleError> {
+        let Some(krate) = self.crates.iter().find(|it| it.key == key) else {
+            return Ok(None);
+        };
+        krate.resolve_module().map(|module| Some(module.macros.as_slice()))
     }
 
     /// Each registered crate: its key, `name version`, and whether it has a module.
@@ -980,5 +985,55 @@ mod listed_dir_tests {
         assert!(materialize_listed_in(root, &listed([("../bad", b"x".as_slice()), ("/bad", b"y".as_slice())]), 5, alloc).is_none());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exports_distinguishes_loaded_empty_from_missing_or_unregistered() {
+        use blaze_expand::ProcKind;
+        use blaze_id::{ContentId, CrateItemKey};
+
+        use crate::host::{Limits, Runtime};
+        use crate::module::{Exported, ModuleError, ModuleRecord};
+        use crate::record::DirStore;
+
+        let heap = blaze_own::testing::heap();
+        let runtime = Runtime::new(heap).expect("runtime");
+        let tmp = std::env::temp_dir();
+        let store = DirStore::new(tmp.as_path());
+        let mut procs = super::ProcMacros::new(&runtime, &store, Limits::STANDARD);
+
+        let key_with = CrateItemKey(ContentId([1; 32]));
+        let key_empty = CrateItemKey(ContentId([2; 32]));
+        let key_missing = CrateItemKey(ContentId([3; 32]));
+        let key_unknown = CrateItemKey(ContentId([4; 32]));
+
+        let mk = |name: &str, macros: Vec<Exported>| ModuleRecord {
+            key: String::from("k"),
+            name: String::from(name),
+            version: String::from("0.1.0"),
+            wasm_sha256: String::from("00"),
+            macros,
+            decls: String::from("_DECLS"),
+            dir: std::path::PathBuf::new(),
+            compiled: std::path::PathBuf::new(),
+            native_dylib: None,
+        };
+        let exported = vec![Exported { index: 0, kind: ProcKind::Derive, name: "Template".into(), helpers: vec!["template".into()] }];
+        procs.add_crate(key_with, "askama_macros", "0.15.6", Ok(mk("askama_macros", exported.clone())));
+        procs.add_crate(key_empty, "empty_macros", "0.1.0", Ok(mk("empty_macros", Vec::new())));
+        procs.add_crate(
+            key_missing,
+            "missing_macros",
+            "0.1.0",
+            Err(ModuleError::Missing { name: "missing_macros".into(), version: "0.1.0".into(), key: "missing".into() }),
+        );
+
+        assert_eq!(procs.exports(key_with).ok().flatten(), Some(exported.as_slice()));
+        assert_eq!(procs.exports(key_empty).ok().flatten(), Some(&[][..]));
+        assert!(
+            matches!(procs.exports(key_missing), Err(ModuleError::Missing { .. })),
+            "missing registered module must return Err(ModuleError::Missing), not Ok(None)"
+        );
+        assert_eq!(procs.exports(key_unknown).ok(), Some(None));
     }
 }

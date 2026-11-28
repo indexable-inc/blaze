@@ -90,7 +90,9 @@ pub(crate) enum HeadsFrom {
 }
 
 /// The domain of a dependency head's record key ([`dependency_key`]).
-const DEPENDENCY_DOMAIN: &str = "blaze-cli engine dependency head 1";
+/// 2: invalidates pre-fix closed-dependency `BZFZ` records that may have cached a poisoned
+/// `AliasGap` produced from an infrastructure `HeadError::NoText` during constant evaluation.
+const DEPENDENCY_DOMAIN: &str = "blaze-cli engine dependency head 2";
 /// The domain of a cell's key in the request's shared tables.
 const CELL_DOMAIN: &str = "blaze-cli engine frozen head cell 1";
 /// The domain of the root's name ([`root_name`]).

@@ -691,11 +691,13 @@ fn file<'n, S: NamesSource<'n>>(
 }
 
 /// Answers the leaf under need key `c` and every other asked leaf with no answer yet (one round
-/// for a head of many leaves), with the evaluator `r` holds. `false`: `c` is no leaf's need key
+/// for a head of many leaves), with the evaluator `r` holds. `None`: `c` is no leaf's need key
 /// (nothing done). Called by `check::eval_len` before it evaluates `c` as a constant.
-pub fn eval_asked<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey) -> bool {
+/// An infrastructure failure (`HeadError::NoText`, `Cfg`, `Filed`) is propagated as `Some(Err(..))`
+/// instead of being filed as a leaf refusal.
+pub fn eval_asked<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey) -> Option<Result<(), ConstFail>> {
     if !r.store.maps.inherents.borrow().has(c) {
-        return false;
+        return None;
     }
     let mut from = 0usize;
     loop {
@@ -727,9 +729,19 @@ pub fn eval_asked<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
         {
             b.clear_provisional();
         }
-        file(r, e.need, out, &mut |r, need_c| super::check::eval_len(r, need_c));
+        match out {
+            Err(InherentFail::Eval { error, .. }) if error.infra_head_error().is_some() => {
+                r.store.maps.inherents.borrow_mut().set(e.need, State::Asked);
+                return Some(Err(error));
+            }
+            Err(InherentFail::Fill { error, .. }) if super::consts::check_infra_head_error(&error).is_some() => {
+                r.store.maps.inherents.borrow_mut().set(e.need, State::Asked);
+                return Some(Err(ConstFail::Check { item: checker_of(e.need), error }));
+            }
+            out => file(r, e.need, out, &mut |r, need_c| super::check::eval_len(r, need_c)),
+        }
     }
-    true
+    Some(Ok(()))
 }
 
 /// The evaluator's work list (consts.rs `Consts::first`) asks the leaf `c` while an evaluation
@@ -746,13 +758,17 @@ pub fn first<'n, S: NamesSource<'n>>(consts: &mut Consts<'n>, r: &mut Records<'_
         Ok(Some((constant, ty))) => match consts.value(r, prepared, constant).map(int_of) {
             Ok(Some(bits)) => Ok(Some((bits, ty))),
             Ok(None) => Err(InherentFail::NotInteger { constant }),
-            Err(error) if super::const_open::needed_first(&error).is_some() => {
+            Err(error) if super::const_open::needed_first(&error).is_some() || error.infra_head_error().is_some() => {
                 r.store.maps.inherents.borrow_mut().set(c, State::Asked);
                 return Some(Err(error));
             }
             Err(error) => Err(InherentFail::Eval { constant, error }),
         },
         Ok(None) => Ok(None),
+        Err(InherentFail::Fill { error, .. }) if super::consts::check_infra_head_error(&error).is_some() => {
+            r.store.maps.inherents.borrow_mut().set(c, State::Asked);
+            return Some(Err(ConstFail::Check { item: checker_of(c), error }));
+        }
         Err(e) => Err(e),
     };
     file(r, c, out, &mut |r, need_c| consts.eval_const_need(r, prepared, need_c));

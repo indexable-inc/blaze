@@ -89,13 +89,14 @@ fn stored() -> std::vec::Vec<Stored> {
     let names: Names<'static> = blaze_scope::resolve::resolve_crates(&inputs, sysroot, &Files, &blaze_scope::task::Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("the three crates' names: {e:?}"));
     let mut out = std::vec::Vec::new();
     for c in names.crates().iter() {
+        let e = blaze_scope::crate_scope::error_record(c.key, c.name, c.edition, g).unwrap_or_else(|e| panic!("exports record of `{}`: {e:?}", c.name));
         let n = blaze_scope::names_record::encode(c, g).unwrap_or_else(|e| panic!("names record of `{}`: {e:?}", c.name));
         let i = blaze_scope::items_record::encode(c, g).unwrap_or_else(|e| panic!("items record of `{}`: {e:?}", c.name));
         // The writer names.rs `scope_record` writes through: the directory is the section, the
         // expansion records are put beside the crate's record (front_load.rs's tests' `payloads`).
         let split = blaze_scope::expansion_records::write(c, g).unwrap_or_else(|e| panic!("expansions of `{}`: {e}", c.name));
         let extras: std::vec::Vec<(Key, std::vec::Vec<u8>)> = split.records.iter().map(|r| (Key(r.key), r.bytes.to_vec())).collect();
-        let payload = sections::write(0, [&[], &[], &n[..], &i[..], &[], &split.directory[..], &[], &[]]);
+        let payload = sections::write(0, [&e[..], &[], &n[..], &i[..], &[], &split.directory[..], &[], &[]]);
         let parts = sections::sections(&payload).unwrap_or_else(|e| panic!("the sections of `{}`: {e}", c.name));
         let (names_bytes, items_bytes, expansions_bytes) = (parts.names.to_vec(), parts.items.to_vec(), parts.expansions.to_vec());
         let name = blaze_drive::key::crate_scope_name(&c.key);

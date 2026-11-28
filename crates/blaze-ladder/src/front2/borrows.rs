@@ -1603,7 +1603,10 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         {
             let owner_regions = r.store.regions.reader(r.store.work_alloc());
             let owner_views = owner_regions.clauses(owner).ok();
-            let mut read_owner_clauses = false;
+            let mut read_owner_clauses = match owner_regions.outlives(owner) {
+                Ok(os) => os.iter().any(|o| matches!(o, tc::region_facts::Outlives::Type { .. })),
+                Err(_) => true,
+            };
             if let Some(head) = r.store.fns.get(&owner)
                 && let super::types::SelfTy::Trait(lib) = head.self_
             {
@@ -1646,7 +1649,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 }
             }
             if read_owner_clauses {
-                g.reads.push(clauses_read(owner.0, &owner_regions));
+                g.reads.push(clauses_read(owner.0, &owner_regions, r.store.tys.view(), alloc));
             }
         }
         if !param_traits.is_empty() {
@@ -1716,7 +1719,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                         let t_views = if !direct.is_empty() && t_len > 0 {
                             if clauses_recorded.scan_for(&t).is_none() {
                                 clauses_recorded.push(t);
-                                g.reads.push(clauses_read(t.0, &t_regions));
+                                g.reads.push(clauses_read(t.0, &t_regions, r.store.tys.view(), alloc));
                             }
                             t_regions.clauses(t).ok()
                         } else {
@@ -1980,7 +1983,14 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     // item bounds, and nested alias traits so `regions.clauses` and `assoc_items` are loaded for
     // supertrait elaboration in `blaze-borrow`.
     {
-        fn push_clause_traits(stys: tc::PTys<'_>, cl: &tc::PClause, traits: &mut AVec<'_, u128>) {
+        fn push_clause_traits<'a>(
+            stys: tc::PTys<'_>,
+            cl: &tc::PClause,
+            st: &mut AVec<'a, tc::PTy>,
+            seen: &mut blaze_hash::Map<u32, (), blaze_hash::FixedState, Alloc<'a>>,
+            traits: &mut AVec<'a, u128>,
+            opaques: &mut AVec<'a, u128>,
+        ) {
             let (args, extra_ty) = match *cl {
                 tc::PClause::Trait { trait_: sup, args } => {
                     if traits.scan_for(&sup.0).is_none() {
@@ -1994,70 +2004,71 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                     }
                     (Some(args), Some(term))
                 }
+                tc::PClause::TypeOutlives { ty, .. } => (None, Some(ty)),
                 _ => (None, None),
             };
-            let mut st = [tc::PTy(0); 32];
-            let mut len = 0usize;
+            st.clear();
             if let Some(args) = args
                 && let Ok(list) = stys.list(args)
             {
                 for &t in list {
-                    if len < st.len() {
-                        st[len] = t;
-                        len += 1;
+                    if seen.insert(t.0, ()).is_none() {
+                        st.push(t);
                     }
                 }
             }
             if let Some(t) = extra_ty
-                && len < st.len()
+                && seen.insert(t.0, ()).is_none()
             {
-                st[len] = t;
-                len += 1;
+                st.push(t);
             }
             let mut steps = 0u32;
-            while len > 0 && steps < 64 {
-                len -= 1;
+            while let Some(cur) = st.pop() {
+                if steps >= super::adt_variance::MOST_LAID_NODES {
+                    break;
+                }
                 steps += 1;
-                let Ok(node) = stys.node(st[len]) else { continue };
+                let Ok(node) = stys.node(cur) else { continue };
                 match node {
-                    tc::PNode::Alias { trait_: at, args: al, .. }
-                    | tc::PNode::ExProj { trait_: at, args: al, .. }
-                    | tc::PNode::ExTrait(at, al) => {
+                    tc::PNode::Alias { trait_: at, .. } | tc::PNode::ExTrait(at, _) | tc::PNode::ExProj { trait_: at, .. } => {
                         if traits.scan_for(&at.0).is_none() {
                             traits.push(at.0);
                         }
-                        if let Ok(xs) = stys.list(al) {
-                            for &x in xs {
-                                if len < st.len() {
-                                    st[len] = x;
-                                    len += 1;
-                                }
-                            }
-                        }
                     }
-                    tc::PNode::Adt(_, al)
-                    | tc::PNode::Tuple(al)
-                    | tc::PNode::Dynamic(al)
-                    | tc::PNode::Opaque(_, al) => {
-                        if let Ok(xs) = stys.list(al) {
-                            for &x in xs {
-                                if len < st.len() {
-                                    st[len] = x;
-                                    len += 1;
-                                }
-                            }
-                        }
-                    }
-                    tc::PNode::Ref(_, x)
-                    | tc::PNode::Ptr(_, x)
-                    | tc::PNode::Slice(x)
-                    | tc::PNode::Array(x, _) => {
-                        if len < st.len() {
-                            st[len] = x;
-                            len += 1;
+                    tc::PNode::Opaque(ok, _) => {
+                        if opaques.scan_for(&ok.0).is_none() {
+                            opaques.push(ok.0);
                         }
                     }
                     _ => {}
+                }
+                if let Ok((list, last)) = super::adt_variance::children(stys, cur, node) {
+                    for &ch in list {
+                        if seen.insert(ch.0, ()).is_none() {
+                            st.push(ch);
+                        }
+                    }
+                    if let Some(ch) = last
+                        && seen.insert(ch.0, ()).is_none()
+                    {
+                        st.push(ch);
+                    }
+                }
+            }
+        }
+
+        let mut clause_st: AVec<'a, tc::PTy> = AVec::new_in(alloc);
+        let mut clause_seen: blaze_hash::Map<u32, (), blaze_hash::FixedState, Alloc<'a>> =
+            blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc, capacity: None });
+
+        // Gather nested traits and opaques inside `owner`'s `TypeOutlives` subjects (e.g.
+        // `where (<() as UnusedProj<'a>>::Assoc, &'b U): 'k`) so their heads, RPITIT rows,
+        // and arities are loaded before `load_declared_bounds` decomposes the subject.
+        if let Some(p) = r.store.preds.get(&owner) {
+            let stys = r.store.tys.view();
+            for cl in p.clauses.iter() {
+                if matches!(cl, tc::PClause::TypeOutlives { .. }) {
+                    push_clause_traits(stys, cl, &mut clause_st, &mut clause_seen, &mut traits, &mut opaques);
                 }
             }
         }
@@ -2077,23 +2088,25 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             let stys = r.store.tys.view();
             if let Some(p) = r.store.preds.get(&tk) {
                 for cl in p.clauses.iter() {
-                    push_clause_traits(stys, cl, &mut traits);
+                    push_clause_traits(stys, cl, &mut clause_st, &mut clause_seen, &mut traits, &mut opaques);
                 }
             }
             if let Some(def) = r.store.trait_defs.get(&tk) {
                 for sc in def.supertraits.iter() {
-                    push_clause_traits(stys, sc, &mut traits);
+                    push_clause_traits(stys, sc, &mut clause_st, &mut clause_seen, &mut traits, &mut opaques);
                 }
                 for a in def.assoc.iter() {
                     g.assoc_items.push((tk.0, a.name, a.item));
                     if let Some(ap) = r.store.preds.get(&a.item) {
                         for ac in ap.clauses.iter() {
-                            push_clause_traits(stys, ac, &mut traits);
+                            push_clause_traits(stys, ac, &mut clause_st, &mut clause_seen, &mut traits, &mut opaques);
                         }
                     }
                 }
             }
         }
+        opaques.sort_unstable();
+        opaques.dedup();
         traits.sort_unstable();
         traits.dedup();
         g.assoc_items.sort_unstable_by_key(|&(k, n, _)| (k, n));
@@ -2419,6 +2432,9 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             let ik = tc::ItemKey(k);
             if let Ok(sig) = reader.sig(ik) {
                 walk_ty(sig.col.ty());
+                if let Some(out) = sig.written_output {
+                    walk_ty(out.ty());
+                }
             }
             if let Ok(cls) = reader.clauses(ik) {
                 for cv in cls {
@@ -2828,14 +2844,15 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             }
             g.reads.push(impl_read(imp, &names, &regions));
         }
+        let stys = r.store.tys.view();
         for &k in traits.iter() {
-            g.reads.push(clauses_read(k, &regions));
+            g.reads.push(clauses_read(k, &regions, stys, alloc));
         }
         for &k in opaques.iter() {
-            g.reads.push(clauses_read(k, &regions));
+            g.reads.push(clauses_read(k, &regions, stys, alloc));
         }
         for &(_, _, a_item) in g.assoc_items.iter() {
-            g.reads.push(clauses_read(a_item.0, &regions));
+            g.reads.push(clauses_read(a_item.0, &regions, stys, alloc));
         }
         // The generic shape of each head whose signature regions are filed: where its type
         // parameters stand among its positions (blaze-flow-lower generic_call.rs), counted by
@@ -2993,6 +3010,9 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 let ik = tc::ItemKey(k);
                 if let Ok(sig) = regions.sig(ik) {
                     walker.walk_ty(sig.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    if let Some(out) = sig.written_output {
+                        walker.walk_ty(out.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
                 }
                 if let Ok(cls) = regions.clauses(ik) {
                     for cv in cls {
@@ -3351,7 +3371,12 @@ fn owner_implied_input<'n, 'a, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner
     let reader = r.store.regions.reader(alloc);
     let tys = r.store.tys.view();
     match reader.sig(owner) {
-        Ok(sig) => input.piece(owner.0, tys, &arity, sig.col.ty(), sig.col.as_slice()),
+        Ok(sig) => {
+            input.piece(owner.0, tys, &arity, sig.col.ty(), sig.col.as_slice());
+            if let Some(out) = sig.written_output {
+                input.piece(owner.0, tys, &arity, out.ty(), out.as_slice());
+            }
+        }
         Err(u) => input.unread(owner.0, u),
     }
     let imp = match r.keys.origin(owner) {
@@ -3807,7 +3832,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
                     cf.map(|cf| (cf.lowered.flow, cf.lowered.params, cf.externals, cf.lowered.coarse))
                 }
                 FlowOf::AsyncBlock(block) => {
-                    blaze_flow_lower::lower_async(&view, done, block, &nested, alloc).map(|la| (la.flow, AVec::new_in(alloc), la.externals, la.coarse))
+                    blaze_flow_lower::lower_async(&view, done, block, &nested, alloc).map(|la| (la.flow, la.params, la.externals, la.coarse))
                 }
                 FlowOf::Owner => continue,
             }

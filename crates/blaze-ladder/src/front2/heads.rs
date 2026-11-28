@@ -4788,6 +4788,9 @@ impl<'n> Store<'n> {
             (Want::Head(_), ItemDetail::TraitAlias) => self.trait_alias(names, keys, key, module, &v),
             (Want::Head(_), ItemDetail::TypeAlias) => match self.alias(names, keys, key, module, &v) {
                 Err(why @ (Why::Need(_) | Why::NeedConst(..))) => Err(why),
+                Err(Why::Resolve(crate::resolve::ResolveError::NoText { key: missing }, _)) => {
+                    return Err(HeadError::NoText(missing));
+                }
                 Err(why) => {
                     self.maps.aliases.insert(key, None);
                     self.maps.alias_gaps.insert(key, AliasGap::made(why));
@@ -9129,5 +9132,297 @@ pub extern \"C\" fn main() -> i32 {
 }
 ");
         assert_eq!(nested_ok, Ok(77));
+    }
+
+    #[test]
+    fn alias_const_eval_propagates_no_text_instead_of_caching_alias_gap() {
+        use super::{HeadError, Why};
+        use blaze_scope::graph::Sysroot;
+        use blaze_scope::resolve::{CrateInput, SourceTexts, resolve_crates};
+        use blaze_surface::Edition;
+        use blaze_unit_graph::{Implicit, Prelude, StdIs};
+        use crate::front2::source::{Load, LoadedExpansion, Log, Records as SourceRecords};
+        use crate::front2::tables::head::HeadCells;
+
+        const SRC: &str = "#![no_core]
+#[lang = \"sized\"]
+pub trait Sized {}
+
+#[rustc_intrinsic]
+pub const fn size_of<T>() -> usize;
+
+macro_rules! gen_missing {
+    () => {
+        pub struct MissingTarget;
+        pub const fn missing_const_fn() -> usize { 4 }
+    };
+}
+gen_missing!();
+
+pub struct WrapperWithMissingField {
+    pub field: MissingTarget,
+}
+
+pub fn non_const_fn() -> usize { 4 }
+
+pub type AliasDirectMissing = MissingTarget;
+pub type AliasConstNoText = [u8; { missing_const_fn() + 1 }];
+pub type AliasAdtLayoutNoText = [u8; { size_of::<WrapperWithMissingField>() }];
+pub type AliasUserRefusal = [u8; { non_const_fn() + 1 }];
+";
+
+        struct Mem(&'static str);
+        impl<'a> SourceTexts<'a> for Mem {
+            fn read(&self, _krate: usize, path: &str) -> Option<&'a str> {
+                (path == "/0/lib.rs").then_some(self.0)
+            }
+        }
+
+        struct MissingExpansionsLoad<'n> {
+            names: &'n [u8],
+            items: &'n [u8],
+        }
+
+        impl<'n> Load<'n> for MissingExpansionsLoad<'n> {
+            fn names(&self, krate: usize) -> Option<&'n [u8]> {
+                (krate == 0).then_some(self.names)
+            }
+            fn items(&self, krate: usize) -> Option<&'n [u8]> {
+                (krate == 0).then_some(self.items)
+            }
+            fn file(&self, krate: usize, _path: blaze_scope::package_path::PackagePath<'_>) -> Option<&'n str> {
+                (krate == 0).then_some(SRC)
+            }
+            fn expansion(&self, _krate: usize, _call: LibKey) -> Option<LoadedExpansion<'n>> {
+                // Simulates an unserved macro expansion record (`OldForm` / `Missing` in CAS).
+                None
+            }
+        }
+
+        let bump = blaze_own::testing::bump();
+        let g = blaze_own::testing::heap().alloc();
+        let frame = blaze_mem::Frame::new(blaze_mem::Tag::Other).expect("frame");
+        let crate_key = blaze_id::CrateItemKey(blaze_ids::ContentId::of("blaze-ladder alias no-text test", b"app"));
+        let input = CrateInput {
+            name: "app",
+            key: crate_key,
+            edition: Edition::E2021,
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false },
+            root: "/0/lib.rs",
+            shown_from: "/",
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let solved = resolve_crates(&[input], Sysroot::default(), &Mem(SRC), &blaze_scope::task::Serial, bump)
+            .unwrap_or_else(|e| panic!("resolve fixture: {e:?}"));
+        let c = &solved.crates()[0];
+        let names_bytes = blaze_scope::resolve::aligned(&blaze_scope::names_record::encode(c, g).expect("names record"), bump);
+        let items_bytes = blaze_scope::resolve::aligned(&blaze_scope::items_record::encode(c, g).expect("items record"), bump);
+        let load: &MissingExpansionsLoad<'_> = frame.alloc(MissingExpansionsLoad { names: names_bytes, items: items_bytes });
+        let crate_keys: &[blaze_id::CrateItemKey] = frame.alloc_slice_copy(&[crate_key]);
+        let crate_names: &[&str] = frame.alloc_slice_copy(&["app"]);
+        let log: &Log<'_> = frame.alloc(Log::new(crate_names, g));
+        let names: &SourceRecords<'_> = frame.alloc(SourceRecords::new(crate_keys, load, log, &frame, g));
+
+        let find = |wanted: &str| -> LibKey {
+            let mut found = None;
+            solved.each_item(0, &mut |key, _| {
+                if solved.name_of(key) == Some(wanted) {
+                    found = Some(key);
+                }
+            });
+            found.unwrap_or_else(|| panic!("`{wanted}` in fixture"))
+        };
+
+        let sized = Some(find("Sized"));
+        let missing_target = find("MissingTarget");
+        let missing_const_fn = find("missing_const_fn");
+        let alias_direct = find("AliasDirectMissing");
+        let alias_const_no_text = find("AliasConstNoText");
+        let alias_adt_layout_no_text = find("AliasAdtLayoutNoText");
+        let alias_user_refusal = find("AliasUserRefusal");
+
+        // 1. Direct missing expansion text inside `Store::alias` (`type AliasDirectMissing = MissingTarget;`):
+        //    `Store::step` propagates `Err(HeadError::NoText)` instead of recording a cached `AliasGap`.
+        let mut store = Store::new(sized, &frame, g);
+        let mut keys = Keys::new();
+        match store.ensure(names, &mut keys, Want::Head(alias_direct)) {
+            Err(HeadError::NoText(k)) => assert_eq!(k, missing_target),
+            other => panic!("direct NoText in alias must propagate HeadError::NoText, got {other:?}"),
+        }
+        assert!(!store.maps.alias_gaps.contains_key(&alias_direct), "NoText must not record AliasGap");
+        assert!(!store.maps.aliases.contains_key(&alias_direct), "NoText must not record aliases entry");
+
+        // 2. Infrastructure `HeadError::NoText` during const evaluation of a type alias's anonymous
+        //    const expression must NOT be swallowed into `anon_failed` or persisted as an `AliasGap`.
+        let index = crate::front2::index::Index::from_source(names, &[0]).expect("index");
+        let prepared = blaze_lower::scoped::Prepares::new_in(bump);
+        let mut store = Store::new(sized, &frame, g);
+        let mut keys = Keys::new();
+        let need_c = match store.ensure(names, &mut keys, Want::Head(alias_const_no_text)) {
+            Err(HeadError::Item(k, Why::NeedConst(c, _))) if k == alias_const_no_text => c,
+            other => panic!("expected NeedConst for AliasConstNoText, got {other:?}"),
+        };
+        {
+            let mut consts = crate::front2::consts::Consts::default();
+            let mut buckets = Some(crate::front2::buckets::Buckets::for_source_in(names, &index, g));
+            let mut r = crate::front2::check::Records {
+                names,
+                keys: &mut keys,
+                index: &index,
+                store: &mut store,
+                buckets: &mut buckets,
+                order: crate::front2::check::BuildOrder::AsAsked,
+                consts: Some((&mut consts, &prepared)),
+            };
+            let err = crate::front2::check::eval_len(&mut r, need_c).expect_err("eval_len must propagate NoText instead of Ok(())");
+            assert!(
+                matches!(err.infra_head_error(), Some(HeadError::NoText(k)) if k == missing_const_fn),
+                "eval_len error must carry infra HeadError::NoText({missing_const_fn:?}), got {err:?}"
+            );
+        }
+        assert!(store.maps.anon_failed.is_empty(), "NoText must never be filed in anon_failed");
+        assert!(!store.maps.alias_gaps.contains_key(&alias_const_no_text), "NoText must never record AliasGap");
+
+        // Also verify `SeededHeads::cell` (`freeze_seeded`) refuses with `FreezeError::Head(HeadError::NoText)`
+        // and never produces a poisoned `BZFZ` record containing `AliasGap`.
+        let mut consts_src = crate::front2::tables::head::StoreConsts { names, index: &index, prepared: &prepared };
+        let mut seeded = crate::front2::tables::head::SeededHeads::new(crate::front2::tables::head::SeededHeadsOpts {
+            names,
+            sized,
+            pointers: crate::front2::receiver::Pointers::NOT_LOOKED_UP,
+            known: None,
+            owners: None,
+            consts: Some(&mut consts_src),
+            frame: &frame,
+            scratch: g,
+            alloc: g,
+        });
+        let err = match seeded.cell(Want::Head(alias_const_no_text)) {
+            Ok(_) => panic!("freeze_seeded must NOT freeze a poisoned AliasGap BZFZ on HeadError::NoText"),
+            Err(err) => err,
+        };
+        let own_err = match &err {
+            crate::front2::tables::head::FreezeError::Again { failed, .. } => {
+                match seeded.failure(*failed).map(|(f, _)| f) {
+                    Some(crate::front2::tables::head::CellFailure::Own(inner)) => inner,
+                    other => panic!("expected CellFailure::Own for {failed:?}, got {other:?}"),
+                }
+            }
+            other => other,
+        };
+        match own_err {
+            crate::front2::tables::head::FreezeError::Head { error: HeadError::NoText(k), .. } => {
+                assert_eq!(*k, missing_const_fn);
+            }
+            other => panic!("expected FreezeError::Head(HeadError::NoText), got {other:?}"),
+        }
+
+        // 2b. Wrapped `HeadError::Item(_, Why::Resolve(ResolveError::NoText { .. }, _))` during
+        //     `adt_row` layout evaluation (`size_of::<WrapperWithMissingField>()`) inside a type
+        //     alias's anonymous const expression must also propagate `HeadError::NoText` instead
+        //     of being stringified into `ConstFail::AdtRow` and cached as an `AliasGap`.
+        let mut store = Store::new(sized, &frame, g);
+        let mut keys = Keys::new();
+        let adt_need = match store.ensure(names, &mut keys, Want::Head(alias_adt_layout_no_text)) {
+            Err(HeadError::Item(k, Why::NeedConst(c, _))) if k == alias_adt_layout_no_text => c,
+            other => panic!("expected NeedConst for AliasAdtLayoutNoText, got {other:?}"),
+        };
+        {
+            let mut consts = crate::front2::consts::Consts::default();
+            let mut buckets = Some(crate::front2::buckets::Buckets::for_source_in(names, &index, g));
+            let mut r = crate::front2::check::Records {
+                names,
+                keys: &mut keys,
+                index: &index,
+                store: &mut store,
+                buckets: &mut buckets,
+                order: crate::front2::check::BuildOrder::AsAsked,
+                consts: Some((&mut consts, &prepared)),
+            };
+            let err = crate::front2::check::eval_len(&mut r, adt_need).expect_err("eval_len must propagate wrapped NoText from adt_row");
+            assert!(
+                matches!(err.infra_head_error(), Some(HeadError::NoText(k)) if k == missing_target),
+                "adt_row wrapped NoText must carry infra HeadError::NoText({missing_target:?}), got {err:?}"
+            );
+        }
+        assert!(store.maps.anon_failed.is_empty(), "wrapped adt_row NoText must never be filed in anon_failed");
+        assert!(!store.maps.alias_gaps.contains_key(&alias_adt_layout_no_text), "wrapped adt_row NoText must never record AliasGap");
+
+        let mut consts_src = crate::front2::tables::head::StoreConsts { names, index: &index, prepared: &prepared };
+        let mut seeded = crate::front2::tables::head::SeededHeads::new(crate::front2::tables::head::SeededHeadsOpts {
+            names,
+            sized,
+            pointers: crate::front2::receiver::Pointers::NOT_LOOKED_UP,
+            known: None,
+            owners: None,
+            consts: Some(&mut consts_src),
+            frame: &frame,
+            scratch: g,
+            alloc: g,
+        });
+        let err = match seeded.cell(Want::Head(alias_adt_layout_no_text)) {
+            Ok(_) => panic!("freeze_seeded must NOT freeze a poisoned AliasGap BZFZ on wrapped adt_row NoText"),
+            Err(err) => err,
+        };
+        let own_err = match &err {
+            crate::front2::tables::head::FreezeError::Again { failed, .. } => {
+                match seeded.failure(*failed).map(|(f, _)| f) {
+                    Some(crate::front2::tables::head::CellFailure::Own(inner)) => inner,
+                    other => panic!("expected CellFailure::Own for {failed:?}, got {other:?}"),
+                }
+            }
+            other => other,
+        };
+        match own_err {
+            crate::front2::tables::head::FreezeError::Head { error: HeadError::NoText(k), .. } => {
+                assert_eq!(*k, missing_target);
+            }
+            other => panic!("expected FreezeError::Head(HeadError::NoText({missing_target:?})), got {other:?}"),
+        }
+
+        // 3. Positive control: a genuine user const-eval refusal (calling a non-`const fn`) STILL
+        //    records `AliasGap` and freezes cleanly as a refused alias.
+        let mut store = Store::new(sized, &frame, g);
+        let mut keys = Keys::new();
+        let user_need = match store.ensure(names, &mut keys, Want::Head(alias_user_refusal)) {
+            Err(HeadError::Item(k, Why::NeedConst(c, _))) if k == alias_user_refusal => c,
+            other => panic!("expected NeedConst for AliasUserRefusal, got {other:?}"),
+        };
+        {
+            let mut consts = crate::front2::consts::Consts::default();
+            let mut buckets = Some(crate::front2::buckets::Buckets::for_source_in(names, &index, g));
+            let mut r = crate::front2::check::Records {
+                names,
+                keys: &mut keys,
+                index: &index,
+                store: &mut store,
+                buckets: &mut buckets,
+                order: crate::front2::check::BuildOrder::AsAsked,
+                consts: Some((&mut consts, &prepared)),
+            };
+            crate::front2::check::eval_len(&mut r, user_need).expect("genuine user const refusal files into anon_failed and returns Ok");
+        }
+        assert!(store.maps.anon_failed.contains_key(&user_need), "user const refusal must be recorded in anon_failed");
+        store.ensure(names, &mut keys, Want::Head(alias_user_refusal)).expect("user const refusal must settle into AliasGap");
+        assert!(store.maps.aliases.get(&alias_user_refusal).copied().flatten().is_none());
+        let gap = store.maps.alias_gaps.get(&alias_user_refusal).expect("user const refusal must record AliasGap");
+        assert!(gap.text.contains("non_const_fn"), "AliasGap should explain the user const refusal: {}", gap.text);
+
+        let mut consts_src = crate::front2::tables::head::StoreConsts { names, index: &index, prepared: &prepared };
+        let mut seeded = crate::front2::tables::head::SeededHeads::new(crate::front2::tables::head::SeededHeadsOpts {
+            names,
+            sized,
+            pointers: crate::front2::receiver::Pointers::NOT_LOOKED_UP,
+            known: None,
+            owners: None,
+            consts: Some(&mut consts_src),
+            frame: &frame,
+            scratch: g,
+            alloc: g,
+        });
+        assert!(seeded.cell(Want::Head(alias_user_refusal)).is_ok(), "genuine user const refusal must still freeze as AliasGap");
     }
 }

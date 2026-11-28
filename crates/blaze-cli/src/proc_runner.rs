@@ -106,6 +106,8 @@ impl core::fmt::Display for KeepError {
 
 #[cfg(feature = "sandbox")]
 pub(crate) use with_sandbox::{ProcRunner, make};
+#[cfg(all(test, feature = "sandbox"))]
+pub(crate) use with_sandbox::TestProcEnv;
 #[cfg(not(feature = "sandbox"))]
 pub(crate) use without_sandbox::{ProcRunner, make};
 
@@ -266,6 +268,20 @@ mod with_sandbox {
             Some(self.keys[at].1)
         }
 
+        /// The macros the built module of the proc-macro crate at world index `krate` declares to
+        /// the host:
+        /// - `Ok(Some(exports))` when its module is present in the store (including an empty slice
+        ///   when the module exports zero macros),
+        /// - `Ok(None)` when `krate` is not a registered proc-macro crate,
+        /// - `Err(error)` when `krate` is registered but its module is missing or unreadable (never
+        ///   silently collapsed to `Ok(None)`, rule 3).
+        pub(crate) fn exports_of(&self, krate: usize) -> Result<Option<&[blaze_proc_macro::module::Exported]>, &ModuleError> {
+            let Some(key) = self.key_of(krate) else {
+                return Ok(None);
+            };
+            self.procs.exports(key)
+        }
+
         /// Package name of the proc-macro crate that defines `def` (for live status attribution).
         pub(crate) fn crate_name(&self, def: &MacroDefinition<'_>) -> Option<&str> {
             let blaze_expand::MacroKind::ProcMacro { krate, .. } = def.kind() else {
@@ -321,6 +337,76 @@ mod with_sandbox {
         /// The command's macro-module loads so far: the profile's `macro modules` line.
         pub(crate) fn module_loads(&self) -> blaze_proc_macro::host::ModuleLoads {
             self.procs.module_loads()
+        }
+    }
+
+    /// Owned test fixture backing [`ProcRunner`] instances for unit tests with zero `Box::leak`:
+    /// owns the Wasmtime runtime and expansion record store on the test's stack and lends them
+    /// to each [`ProcRunner<'r>`] created via [`Self::runner`].
+    #[cfg(test)]
+    pub(crate) struct TestProcEnv {
+        runtime: blaze_proc_macro::host::Runtime,
+        records: blaze_proc_macro::record::DirStore,
+        heap: &'static blaze_own::Heap,
+    }
+
+    #[cfg(test)]
+    impl TestProcEnv {
+        pub(crate) fn new(heap: &'static blaze_own::Heap) -> Self {
+            let runtime = blaze_proc_macro::host::Runtime::new(heap).expect("test wasmtime runtime");
+            let records_dir = std::env::temp_dir();
+            let records = blaze_proc_macro::record::DirStore::new(records_dir.as_path());
+            Self { runtime, records, heap }
+        }
+
+        pub(crate) fn runner<'r>(
+            &'r self,
+            entries: std::vec::Vec<(usize, CrateItemKey, &str, Result<blaze_proc_macro::module::ModuleRecord, ModuleError>)>,
+        ) -> ProcRunner<'r> {
+            use blaze_world::crate_list::{HEADER_LEN, NONE, VERSION};
+
+            static EMPTY_LIST_BYTES: [u8; HEADER_LEN] = {
+                let mut buf = [0u8; HEADER_LEN];
+                buf[0] = b'B';
+                buf[1] = b'Z';
+                buf[2] = b'C';
+                buf[3] = b'L';
+                let ver = VERSION.to_le_bytes();
+                buf[4] = ver[0];
+                buf[5] = ver[1];
+                let none = NONE.to_le_bytes();
+                let mut i = 0;
+                while i < 5 {
+                    let off = 20 + i * 4;
+                    buf[off] = none[0];
+                    buf[off + 1] = none[1];
+                    buf[off + 2] = none[2];
+                    buf[off + 3] = none[3];
+                    i += 1;
+                }
+                buf
+            };
+            let list = CrateList::open(&EMPTY_LIST_BYTES).expect("valid empty BZCL header");
+            let mut procs = ProcMacros::new(&self.runtime, &self.records, blaze_proc_macro::host::Limits::STANDARD);
+            let mut keys = std::vec::Vec::new_in(Global);
+            let mut crate_names = blaze_own::Vec::new_in(self.heap.shared());
+            for (at, key, name, module) in entries {
+                procs.add_crate(key, name, "0.1.0", module);
+                keys.push((at, key));
+                crate_names.push((key, blaze_own::String::from_str_in(name, self.heap.shared())));
+            }
+            keys.sort_unstable_by_key(|(at, _)| *at);
+            crate_names.sort_unstable_by_key(|(key, _)| *key);
+            crate_names.dedup_by_key(|(key, _)| *key);
+            let callers = LazyCallers {
+                slots: &[],
+                list,
+                placed: &[],
+                package_of: &[],
+                checkout: "",
+                heap: self.heap,
+            };
+            ProcRunner { procs, keys, crate_names, callers }
         }
     }
 
@@ -402,6 +488,12 @@ mod without_sandbox {
 
     impl ProcRunner<'_> {
         pub(crate) fn key_of(&self, _krate: usize) -> Option<CrateItemKey> {
+            match self {
+                ProcRunner::Never(never, _) => match *never {},
+            }
+        }
+
+        pub(crate) fn exports_of(&self, _krate: usize) -> Result<Option<&[blaze_proc_macro::module::Exported]>, &blaze_proc_macro::module::ModuleError> {
             match self {
                 ProcRunner::Never(never, _) => match *never {},
             }

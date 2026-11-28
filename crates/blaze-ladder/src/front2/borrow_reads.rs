@@ -22,7 +22,7 @@
 //! a body whose types were not checked clean was not borrow checked and lists none.
 
 use blaze_flow_lower::{AdtFacts, BodyOut, CalleeFacts, FieldLead, FieldRegion, Region, RegionsUnread, SigLife, UnreadWhy, Variance};
-use blaze_own::Alloc;
+use blaze_own::{AVec, Alloc};
 use blaze_typeck as tc;
 use blaze_typeck::StableHasher;
 
@@ -479,10 +479,203 @@ pub fn drop_adt_read(
 /// The detail of a [`FactKind::BorrowHead`] row holding a trait's or opaque's region clauses
 /// (supertrait elaboration and `impl Trait` bounds in `blaze-borrow`).
 pub const CLAUSES_DETAIL: u64 = 11;
-const CLAUSES_DOMAIN: &str = "blaze-ladder front2 borrow clauses v1";
+const CLAUSES_DOMAIN: &str = "blaze-ladder front2 borrow clauses v2";
+
+/// Hashes the full structural shape of a portable type `root` in `tys` using canonical DFS
+/// DAG memoization (table-index-independent, lossless across arbitrarily wide or deeply shared
+/// clause subjects, `O(unique nodes)`).
+fn hash_clause_ty<'a>(
+    tys: tc::PTys<'_>,
+    root: tc::PTy,
+    h: &mut StableHasher,
+    stack: &mut AVec<'a, tc::PTy>,
+    seen: &mut blaze_hash::Map<u32, u32, blaze_hash::FixedState, Alloc<'a>>,
+) {
+    stack.clear();
+    seen.clear();
+    let mut next_ord = 0u32;
+    stack.push(root);
+    let push_list = |tys: tc::PTys<'_>, list: tc::List, stack: &mut AVec<'a, tc::PTy>, h: &mut StableHasher| {
+        if let Ok(es) = tys.list(list) {
+            h.u32(u32::try_from(es.len()).unwrap_or(u32::MAX));
+            for &e in es.iter().rev() {
+                stack.push(e);
+            }
+        } else {
+            h.tag(0xfd);
+        }
+    };
+    while let Some(ty) = stack.pop() {
+        if let Some(&ord) = seen.get(&ty.0) {
+            h.tag(0xfe);
+            h.u32(ord);
+            continue;
+        }
+        seen.insert(ty.0, next_ord);
+        next_ord = next_ord.wrapping_add(1);
+        match tys.node(ty) {
+            Ok(tc::PNode::Bool) => h.tag(1),
+            Ok(tc::PNode::Char) => h.tag(2),
+            Ok(tc::PNode::Int(i)) => {
+                h.tag(3);
+                h.tag(match i {
+                    tc::IntTy::Isize => 0,
+                    tc::IntTy::I8 => 1,
+                    tc::IntTy::I16 => 2,
+                    tc::IntTy::I32 => 3,
+                    tc::IntTy::I64 => 4,
+                    tc::IntTy::I128 => 5,
+                });
+            }
+            Ok(tc::PNode::Uint(u)) => {
+                h.tag(4);
+                h.tag(match u {
+                    tc::UintTy::Usize => 0,
+                    tc::UintTy::U8 => 1,
+                    tc::UintTy::U16 => 2,
+                    tc::UintTy::U32 => 3,
+                    tc::UintTy::U64 => 4,
+                    tc::UintTy::U128 => 5,
+                });
+            }
+            Ok(tc::PNode::Float(f)) => {
+                h.tag(5);
+                h.tag(match f {
+                    tc::FloatTy::F16 => 0,
+                    tc::FloatTy::F32 => 1,
+                    tc::FloatTy::F64 => 2,
+                    tc::FloatTy::F128 => 3,
+                });
+            }
+            Ok(tc::PNode::Never) => h.tag(6),
+            Ok(tc::PNode::Str) => h.tag(7),
+            Ok(tc::PNode::Ptr(m, inner)) => {
+                h.tag(8);
+                h.tag(u8::from(m == tc::Mutbl::Mut));
+                stack.push(inner);
+            }
+            Ok(tc::PNode::Ref(m, inner)) => {
+                h.tag(9);
+                h.tag(u8::from(m == tc::Mutbl::Mut));
+                stack.push(inner);
+            }
+            Ok(tc::PNode::Slice(inner)) => {
+                h.tag(10);
+                stack.push(inner);
+            }
+            Ok(tc::PNode::Array(elem, len)) => {
+                h.tag(11);
+                stack.push(len);
+                stack.push(elem);
+            }
+            Ok(tc::PNode::Pat(elem, ranges)) => {
+                h.tag(12);
+                push_list(tys, ranges, stack, h);
+                stack.push(elem);
+            }
+            Ok(tc::PNode::ConstValue { ty: ct, bits }) => {
+                h.tag(13);
+                h.u128(bits);
+                stack.push(ct);
+            }
+            Ok(tc::PNode::ConstParam(cp)) => {
+                h.tag(14);
+                h.u32(cp);
+            }
+            Ok(tc::PNode::Param(p)) => {
+                h.tag(15);
+                h.u32(p);
+            }
+            Ok(tc::PNode::Tuple(l)) => {
+                h.tag(16);
+                push_list(tys, l, stack, h);
+            }
+            Ok(tc::PNode::Record(s, l)) => {
+                h.tag(17);
+                h.u64(s.0);
+                push_list(tys, l, stack, h);
+            }
+            Ok(tc::PNode::Union(l)) => {
+                h.tag(18);
+                push_list(tys, l, stack, h);
+            }
+            Ok(tc::PNode::Adt(k, args)) => {
+                h.tag(19);
+                h.u128(k.0);
+                push_list(tys, args, stack, h);
+            }
+            Ok(tc::PNode::Alias { trait_, name, args }) => {
+                h.tag(20);
+                h.u128(trait_.0);
+                h.u64(name.0);
+                push_list(tys, args, stack, h);
+            }
+            Ok(tc::PNode::FnDef(k, args)) => {
+                h.tag(21);
+                h.u128(k.0);
+                push_list(tys, args, stack, h);
+            }
+            Ok(tc::PNode::FnPtr(args, hdr)) => {
+                h.tag(22);
+                h.u32(u32::from(hdr.bits()));
+                push_list(tys, args, stack, h);
+            }
+            Ok(tc::PNode::Opaque(k, args)) => {
+                h.tag(23);
+                h.u128(k.0);
+                push_list(tys, args, stack, h);
+            }
+            Ok(tc::PNode::Foreign(k)) => {
+                h.tag(24);
+                h.u128(k.0);
+            }
+            Ok(tc::PNode::Dynamic(preds)) => {
+                h.tag(25);
+                push_list(tys, preds, stack, h);
+            }
+            Ok(tc::PNode::ExTrait(k, args)) => {
+                h.tag(26);
+                h.u128(k.0);
+                push_list(tys, args, stack, h);
+            }
+            Ok(tc::PNode::ExProj { trait_, name, args, term }) => {
+                h.tag(27);
+                h.u128(trait_.0);
+                h.u64(name.0);
+                stack.push(term);
+                push_list(tys, args, stack, h);
+            }
+            Ok(tc::PNode::ExAuto(k)) => {
+                h.tag(28);
+                h.u128(k.0);
+            }
+            Ok(tc::PNode::Closure { owner, ordinal, args }) => {
+                h.tag(29);
+                h.u128(owner.0);
+                h.u32(ordinal);
+                push_list(tys, args, stack, h);
+            }
+            Ok(tc::PNode::Future(e, out, int)) => {
+                h.tag(30);
+                h.u32(e.0);
+                stack.push(int);
+                stack.push(out);
+            }
+            Ok(tc::PNode::Coroutine { owner, ordinal, args }) => {
+                h.tag(31);
+                h.u128(owner.0);
+                h.u32(ordinal);
+                push_list(tys, args, stack, h);
+            }
+            Ok(tc::PNode::Infer) => h.tag(32),
+            Ok(tc::PNode::Error) => h.tag(33),
+            Err(_) => h.tag(0xfc),
+        }
+    }
+}
 
 /// The row of what the borrow check read of item `item`'s region clauses and lifetime count.
-pub fn clauses_read(item: u128, regions: &dyn blaze_flow_lower::RegionFacts) -> Read {
+pub fn clauses_read(item: u128, regions: &dyn blaze_flow_lower::RegionFacts, tys: tc::PTys<'_>, alloc: Alloc<'_>) -> Read {
     let mut h = StableHasher::new(CLAUSES_DOMAIN);
     let key = tc::ItemKey(item);
     match regions.lifetime_params(key) {
@@ -499,12 +692,23 @@ pub fn clauses_read(item: u128, regions: &dyn blaze_flow_lower::RegionFacts) -> 
         Ok(cls) => {
             h.tag(1);
             h.u32(u32::try_from(cls.len()).unwrap_or(u32::MAX));
+            let mut stack: AVec<'_, tc::PTy> = AVec::new_in(alloc);
+            let mut seen: blaze_hash::Map<u32, u32, blaze_hash::FixedState, Alloc<'_>> =
+                blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc, capacity: None });
             for cv in cls {
                 h.u32(cv.nth);
                 h.u32(cv.binders);
+                hash_clause_ty(tys, cv.col.ty(), &mut h, &mut stack, &mut seen);
                 h.u32(u32::try_from(cv.col.as_slice().len()).unwrap_or(u32::MAX));
                 for &r in cv.col.as_slice() {
                     region(&mut h, r);
+                }
+                match cv.outlives {
+                    Some(r) => {
+                        h.tag(1);
+                        region(&mut h, r);
+                    }
+                    None => h.tag(0),
                 }
             }
         }

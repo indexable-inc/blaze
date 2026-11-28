@@ -86,9 +86,24 @@ pub enum LitKind {
     CStrRaw(u8),
     /// A literal the lexer refused, kept so its error is reported where it is used.
     Err,
+    /// A doc comment (`///`, `//!`, `/** */`, `/*! */`) desugared to `#[doc = r"..."]` with
+    /// minimal `#` count (saturated at `u8::MAX`, matching `rustc_ast/src/tokenstream.rs`):
+    /// matches `LitKind::StrRaw(n)` in declarative `macro_rules!`, skips as a comment when
+    /// written directly in a `macro_rules!` matcher, and escapes to cooked `LitKind::Str` at the
+    /// proc-macro server boundary (matching `rustc_expand`'s `proc_macro_server.rs`).
+    DocStrRaw(u8),
 }
 
 impl LitKind {
+    /// The literal kind as declarative macros and source rendering see it:
+    /// `DocStrRaw(n)` is `StrRaw(n)`.
+    pub const fn without_doc_provenance(self) -> LitKind {
+        match self {
+            LitKind::DocStrRaw(hashes) => LitKind::StrRaw(hashes),
+            other => other,
+        }
+    }
+
     fn bytes(self) -> [u8; 2] {
         match self {
             LitKind::Byte => [0, 0],
@@ -102,6 +117,7 @@ impl LitKind {
             LitKind::CStr => [8, 0],
             LitKind::CStrRaw(hashes) => [9, hashes],
             LitKind::Err => [10, 0],
+            LitKind::DocStrRaw(hashes) => [11, hashes],
         }
     }
 }
@@ -1115,8 +1131,27 @@ fn literal_parts(text: &str) -> (LitKind, &str, &str) {
     (lit, inside, if suffix == "_" { "" } else { suffix })
 }
 
-/// The doc comment `token` as the attribute it stands for, `#[doc = ".."]` (`#![..]` when
-/// inner), its text quoted as a proc macro sees it; `None` if it is not a doc comment's text.
+/// The minimal raw-string `#` count `n` (saturated at `u8::MAX`, matching `rustc_ast`'s
+/// `tokenstream.rs` doc-comment desugaring) such that no `"` followed by `n` `#`s occurs in
+/// `text`.
+fn raw_str_hashes(text: &str) -> u8 {
+    let mut bytes = text.bytes().peekable();
+    let mut needed = 0u8;
+    while let Some(byte) = bytes.next() {
+        if byte == b'"' {
+            let mut hashes = 0u8;
+            while bytes.next_if_eq(&b'#').is_some() {
+                hashes = hashes.saturating_add(1);
+            }
+            needed = needed.max(hashes.saturating_add(1));
+        }
+    }
+    needed
+}
+
+/// The doc comment `token` as the attribute it stands for, `#[doc = r"..."]` (`#![..]` when
+/// inner), unconditionally desugared to `LitKind::DocStrRaw(n)` matching `rustc_ast`; `None` if
+/// it is not a doc comment's text.
 fn doc_comment(
     out: &mut TokenStream<'_>,
     scratch: &mut blaze_own::AString<'_>,
@@ -1126,19 +1161,24 @@ fn doc_comment(
     ctx: Ctx,
 ) -> Option<Result<(), StreamError>> {
     // A line comment's token ends before its LF, so its break's CR is no part of it; inside, each
-    // CR LF is one LF of the value (parser::line_break).
+    // CR LF is one LF of the value (parser::line_break). Bare CRs in doc comments are already
+    // refused by `parser::LexedStr::new`.
     let token = match token.starts_with("//") {
         true => parser::line_break::line_comment_text(token, followed_by_lf),
         false => token,
     };
     let from_end = if token.starts_with("/*") && token.ends_with("*/") { 2 } else { 0 };
     let body = token.get(3..token.len().checked_sub(from_end)?)?;
-    scratch.clear();
-    for piece in parser::line_break::without_break_crs(body) {
-        for char in piece.escape_debug() {
-            scratch.push(char);
+    let normalized = if body.contains('\r') {
+        scratch.clear();
+        for piece in parser::line_break::without_break_crs(body) {
+            scratch.push_str(piece);
         }
-    }
+        scratch.as_str()
+    } else {
+        body
+    };
+    let lit_kind = LitKind::DocStrRaw(raw_str_hashes(normalized));
     let write = |out: &mut TokenStream<'_>| -> Result<(), StreamError> {
         out.punct('#', Spacing::Alone, ctx)?;
         if inner {
@@ -1147,8 +1187,8 @@ fn doc_comment(
         out.open(Delim::Bracket, ctx)?;
         out.push(TokenKind::Ident { raw: Raw::No, spacing: Spacing::Alone }, "doc", ctx)?;
         out.punct('=', Spacing::Alone, ctx)?;
-        let kind = TokenKind::Literal { kind: LitKind::Str, suffix_len: 0, spacing: Spacing::Alone };
-        out.push(kind, scratch.as_str(), ctx)?;
+        let kind = TokenKind::Literal { kind: lit_kind, suffix_len: 0, spacing: Spacing::Alone };
+        out.push(kind, normalized, ctx)?;
         out.close(Delim::Bracket, ctx)
     };
     Some(write(out))
