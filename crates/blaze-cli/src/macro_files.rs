@@ -403,35 +403,42 @@ pub(crate) fn read_script_files(
     Ok(())
 }
 
+/// `rel` beneath the member folder `dir`, relative to the checkout, allocated in `frame`.
+fn under_in<'f>(dir: &str, rel: &str, frame: &'f Frame) -> blaze_own::String<&'f Frame> {
+    let mut out = blaze_own::String::with_capacity_in(dir.len() + rel.len() + 1, frame);
+    match (dir.is_empty(), rel.is_empty()) {
+        (true, _) => out.push_str(rel),
+        (false, true) => out.push_str(dir),
+        (false, false) => {
+            out.push_str(dir);
+            out.push('/');
+            out.push_str(rel);
+        }
+    }
+    out
+}
+
 /// Computes the exact same `files <sha256>` digest as `blaze_proc_macro::script_unit::script_files_digest`
 /// through the sans-IO checkout `Dir<ReadOnly>` (so simulated test worlds and on-disk checkouts
-/// produce identical digests).
-pub(crate) fn script_files_digest_in_dir(
+/// produce identical digests). Streams one file at a time through a single reused frame buffer into
+/// [`blaze_proc_macro::module::FilesHasher`], allocating zero bytes of file data on the global heap.
+pub(crate) fn script_files_digest_in_dir<'f>(
     cx: &Cx,
     root: &Dir<bstd::fs::ReadOnly>,
     dir: &str,
     script_root: &str,
-    frame: &Frame,
-) -> Option<String> {
-    let mut files: std::vec::Vec<(String, std::vec::Vec<u8, Global>), Global> = std::vec::Vec::new_in(Global);
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut bytes = Bytes::new_in(frame, "script files digest read");
-    let mut push_file = |rel: &str| {
+    out_frame: &'f Frame,
+    scratch: &Frame,
+) -> Option<&'f str> {
+    let mut rel_paths: Vec<blaze_own::String<&Frame>, &Frame> = Vec::new_in(scratch);
+    let mut add_path = |rel: &str| {
         let norm = rel.trim_start_matches("./");
-        if norm.is_empty() || !seen.insert(String::from(norm)) {
-            return;
-        }
-        let path = under(dir, norm);
-        let Ok(p) = Path::new(&path) else { return };
-        bytes.clear();
-        if root.read_all(cx, &p, &mut bytes).is_ok() {
-            let mut held = std::vec::Vec::new_in(Global);
-            held.extend_from_slice(bytes.as_slice());
-            files.push((String::from(norm), held));
+        if !norm.is_empty() {
+            rel_paths.push(blaze_own::String::from_str_in(norm, scratch));
         }
     };
-    push_file("Cargo.toml");
-    push_file(script_root);
+    add_path("Cargo.toml");
+    add_path(script_root);
     let list_at = |at: &str| {
         if at.is_empty() {
             root.own_entries(cx).ok()
@@ -444,7 +451,7 @@ pub(crate) fn script_files_digest_in_dir(
             if listed.kind(i) == EntryKind::File {
                 let name = listed.name(i);
                 if name.ends_with(".rs") {
-                    push_file(name);
+                    add_path(name);
                 }
             }
         }
@@ -455,44 +462,62 @@ pub(crate) fn script_files_digest_in_dir(
         && parent != "src"
         && !parent.starts_with("src/")
     {
-        let mut stack: std::vec::Vec<String, Global> = std::vec::Vec::new_in(Global);
-        stack.push(String::from(parent));
+        let mut stack: Vec<blaze_own::String<&Frame>, &Frame> = Vec::new_in(scratch);
+        stack.push(blaze_own::String::from_str_in(parent, scratch));
         while let Some(dir_rel) = stack.pop() {
-            let at = under(dir, &dir_rel);
-            let Some(listed) = list_at(&at) else { continue };
+            let at = under_in(dir, dir_rel.as_str(), scratch);
+            let Some(listed) = list_at(at.as_str()) else { continue };
             for i in 0..listed.len() {
                 let name = listed.name(i);
-                let child = std::format!("{dir_rel}/{name}");
+                let mut child = blaze_own::String::with_capacity_in(dir_rel.len() + 1 + name.len(), scratch);
+                child.push_str(dir_rel.as_str());
+                child.push('/');
+                child.push_str(name);
                 match listed.kind(i) {
                     EntryKind::Dir => stack.push(child),
-                    EntryKind::File if name.ends_with(".rs") => push_file(&child),
+                    EntryKind::File if name.ends_with(".rs") => add_path(child.as_str()),
                     _ => {}
                 }
             }
         }
     }
-    Some(blaze_proc_macro::module::files_digest(&mut files))
+    rel_paths.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    rel_paths.dedup_by(|a, b| a.as_str() == b.as_str());
+    let mut hasher = blaze_proc_macro::module::FilesHasher::new();
+    let mut bytes = Bytes::new_in(scratch, "script files digest read");
+    for norm in rel_paths.iter() {
+        let path = under_in(dir, norm.as_str(), scratch);
+        let Ok(p) = Path::new(path.as_str()) else { continue };
+        bytes.clear();
+        if root.read_all(cx, &p, &mut bytes).is_ok() {
+            hasher.update_file(norm.as_str(), bytes.as_slice());
+        }
+    }
+    let hex = hasher.finish_hex_in(scratch);
+    Some(out_frame.alloc_str(hex.as_str()))
 }
 
 /// Computes the exact same package-wide `files_digest` as `blaze_proc_macro::module::package_files`
 /// through the sans-IO checkout `Dir<ReadOnly>`, used for path build-dependencies and path
-/// proc-macro dependencies (rule 21).
-pub(crate) fn package_files_digest_in_dir(
+/// proc-macro dependencies (rule 21). Collects & sorts relative paths in `scratch`, then streams
+/// one file at a time into a single reused frame buffer feeding [`blaze_proc_macro::module::FilesHasher`]
+/// with zero bytes of file data allocated on the global heap.
+pub(crate) fn package_files_digest_in_dir<'f>(
     cx: &Cx,
     root: &Dir<bstd::fs::ReadOnly>,
     dir: &str,
-    frame: &Frame,
-) -> Option<String> {
-    let mut files: std::vec::Vec<(String, std::vec::Vec<u8, Global>), Global> = std::vec::Vec::new_in(Global);
-    let mut folders: std::vec::Vec<String, Global> = std::vec::Vec::new_in(Global);
-    let mut bytes = Bytes::new_in(frame, "package files digest read");
-    folders.push(String::new());
+    out_frame: &'f Frame,
+    scratch: &Frame,
+) -> Option<&'f str> {
+    let mut rel_paths: Vec<blaze_own::String<&Frame>, &Frame> = Vec::new_in(scratch);
+    let mut folders: Vec<blaze_own::String<&Frame>, &Frame> = Vec::new_in(scratch);
+    folders.push(blaze_own::String::new_in(scratch));
     while let Some(rel) = folders.pop() {
-        let at = under(dir, &rel);
+        let at = under_in(dir, rel.as_str(), scratch);
         let listed = if at.is_empty() {
             root.own_entries(cx).ok()?
         } else {
-            let p = Path::new(&at).ok()?;
+            let p = Path::new(at.as_str()).ok()?;
             root.entries(cx, &p).ok()??
         };
         let place = if rel.is_empty() { InPackage::Root } else { InPackage::Beneath };
@@ -506,22 +531,35 @@ pub(crate) fn package_files_digest_in_dir(
             if !in_package(name.as_bytes(), is_dir, place) {
                 continue;
             }
-            let entry = if rel.is_empty() { String::from(name) } else { std::format!("{rel}/{name}") };
+            let entry = if rel.is_empty() {
+                blaze_own::String::from_str_in(name, scratch)
+            } else {
+                let mut s = blaze_own::String::with_capacity_in(rel.len() + 1 + name.len(), scratch);
+                s.push_str(rel.as_str());
+                s.push('/');
+                s.push_str(name);
+                s
+            };
             if is_dir {
                 folders.push(entry);
             } else {
-                let path = under(dir, &entry);
-                let Ok(p) = Path::new(&path) else { continue };
-                bytes.clear();
-                if root.read_all(cx, &p, &mut bytes).is_ok() {
-                    let mut held = std::vec::Vec::new_in(Global);
-                    held.extend_from_slice(bytes.as_slice());
-                    files.push((entry, held));
-                }
+                rel_paths.push(entry);
             }
         }
     }
-    Some(blaze_proc_macro::module::files_digest(&mut files))
+    rel_paths.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    let mut hasher = blaze_proc_macro::module::FilesHasher::new();
+    let mut bytes = Bytes::new_in(scratch, "package files digest read");
+    for entry in rel_paths.iter() {
+        let path = under_in(dir, entry.as_str(), scratch);
+        let Ok(p) = Path::new(path.as_str()) else { continue };
+        bytes.clear();
+        if root.read_all(cx, &p, &mut bytes).is_ok() {
+            hasher.update_file(entry.as_str(), bytes.as_slice());
+        }
+    }
+    let hex = hasher.finish_hex_in(scratch);
+    Some(out_frame.alloc_str(hex.as_str()))
 }
 
 #[cfg(test)]
@@ -544,5 +582,60 @@ mod tests {
         let id = ContentId(digest_bytes(&hex).expect("64 hex digits"));
         assert_eq!(files_hex(&id), hex);
         assert_eq!(digest_bytes("not hex"), None);
+    }
+
+    #[test]
+    fn streaming_in_dir_digests_match_exact_wire_format() {
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(42, bstd::io::Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, 4 << 20).expect("cx");
+        let fs = io.need_fs().expect("fs");
+        let root_rw = fs.open_dir(&cx, &Path::new("ws").expect("ws")).expect("open ws");
+        let write = |rel: &str, data: &[u8]| {
+            root_rw
+                .publish(&cx, &Path::new(rel).expect("path"), bstd::fs::Content::bytes(data), bstd::fs::Durable::No)
+                .expect("write");
+        };
+        write("pkg/Cargo.toml", b"[package]\nname = \"pkg\"\n");
+        write("pkg/build/main.rs", b"mod aux; fn main() {}\n");
+        write("pkg/build/aux.rs", b"pub const N: usize = 7;\n");
+        write("pkg/extra.rs", b"// top-level rs\n");
+        write("pkg/src/lib.rs", b"pub fn lib() {}\n");
+        write("pkg/target/out.bin", b"excluded by in_package");
+
+        let wire_oracle = |entries: &[(&str, &[u8])]| -> String {
+            let mut sorted = entries.to_vec();
+            sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+            let mut wire = std::vec::Vec::new_in(Global);
+            for (p, b) in sorted {
+                wire.extend_from_slice(p.as_bytes());
+                wire.push(0);
+                wire.extend_from_slice(&(b.len() as u64).to_le_bytes());
+                wire.extend_from_slice(b);
+            }
+            blaze_proc_macro::module::sha256_hex(&wire)
+        };
+
+        let out_frame = Frame::new(bstd::mem::Tag::Other).expect("out_frame");
+        let scratch = Frame::new(bstd::mem::Tag::Other).expect("scratch");
+        let root_ro = root_rw.read_only();
+
+        let pkg_got = package_files_digest_in_dir(&cx, &root_ro, "pkg", &out_frame, &scratch).expect("pkg digest");
+        let pkg_want = wire_oracle(&[
+            ("Cargo.toml", b"[package]\nname = \"pkg\"\n"),
+            ("build/aux.rs", b"pub const N: usize = 7;\n"),
+            ("build/main.rs", b"mod aux; fn main() {}\n"),
+            ("extra.rs", b"// top-level rs\n"),
+            ("src/lib.rs", b"pub fn lib() {}\n"),
+        ]);
+        assert_eq!(pkg_got, pkg_want, "streaming package_files_digest_in_dir must match exact wire digest");
+
+        let script_got = script_files_digest_in_dir(&cx, &root_ro, "pkg", "./build/main.rs", &out_frame, &scratch).expect("script digest");
+        let script_want = wire_oracle(&[
+            ("Cargo.toml", b"[package]\nname = \"pkg\"\n"),
+            ("build/aux.rs", b"pub const N: usize = 7;\n"),
+            ("build/main.rs", b"mod aux; fn main() {}\n"),
+            ("extra.rs", b"// top-level rs\n"),
+        ]);
+        assert_eq!(script_got, script_want, "streaming script_files_digest_in_dir must match exact wire digest");
     }
 }

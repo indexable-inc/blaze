@@ -1209,14 +1209,75 @@ fn path_pkg_files_digest(
     members: &[(LockId, &str, blaze_world::PathKind)],
     pkg_id: LockId,
 ) -> Option<std::string::String> {
+    use blaze_build_script::served::{InPackage, in_package};
+    use std::io::Read as _;
     let (_, dir, _) = members.iter().find(|(id, _, _)| *id == pkg_id)?;
     let pkg_dir = if dir.is_empty() {
         checkout.path().to_path_buf()
     } else {
         checkout.path().join(dir)
     };
-    let mut files = blaze_proc_macro::module::package_files(&pkg_dir).ok()?;
-    Some(blaze_proc_macro::module::files_digest(&mut files))
+    let scratch = Frame::new(Tag::Other).ok()?;
+    let mut rel_paths: blaze_own::Vec<blaze_own::String<&Frame>, &Frame> = blaze_own::Vec::new_in(&scratch);
+    let mut folders: blaze_own::Vec<blaze_own::String<&Frame>, &Frame> = blaze_own::Vec::new_in(&scratch);
+    folders.push(blaze_own::String::new_in(&scratch));
+    while let Some(rel) = folders.pop() {
+        let folder_buf;
+        let folder: &Path = if rel.is_empty() {
+            pkg_dir.as_path()
+        } else {
+            folder_buf = pkg_dir.join(rel.as_str());
+            folder_buf.as_path()
+        };
+        let entries = std::fs::read_dir(folder).ok()?;
+        let place = if rel.is_empty() { InPackage::Root } else { InPackage::Beneath };
+        for entry in entries {
+            let entry = entry.ok()?;
+            let file_name = entry.file_name();
+            let kind = entry.file_type().ok()?;
+            if !in_package(file_name.as_encoded_bytes(), kind.is_dir(), place) {
+                continue;
+            }
+            let name = file_name.to_string_lossy();
+            let at = if rel.is_empty() {
+                blaze_own::String::from_str_in(name.as_ref(), &scratch)
+            } else {
+                let mut s = blaze_own::String::with_capacity_in(rel.len() + 1 + name.len(), &scratch);
+                s.push_str(rel.as_str());
+                s.push('/');
+                s.push_str(name.as_ref());
+                s
+            };
+            if kind.is_dir() {
+                folders.push(at);
+            } else if kind.is_file() {
+                rel_paths.push(at);
+            }
+        }
+    }
+    rel_paths.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    let mut hasher = blaze_proc_macro::module::FilesHasher::new();
+    let mut buf: blaze_own::Vec<u8, &Frame> = blaze_own::Vec::new_in(&scratch);
+    let mut chunk = [0u8; 16 * 1024];
+    for rel in rel_paths.iter() {
+        buf.clear();
+        let mut file = std::fs::File::open(pkg_dir.join(rel.as_str())).ok()?;
+        loop {
+            match file.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Some(slice) = chunk.get(..n) {
+                        buf.extend_from_slice(slice);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            }
+        }
+        hasher.update_file(rel.as_str(), buf.as_slice());
+    }
+    let hex = hasher.finish_hex_in(&scratch);
+    Some(std::string::String::from(hex.as_str()))
 }
 
 /// Computes the build-script files digest (`Cargo.toml` + `build.rs` root) when `pkg_id` is a

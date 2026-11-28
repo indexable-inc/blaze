@@ -252,6 +252,49 @@ fn display_eq(value: &impl core::fmt::Display, expected: &str) -> bool {
     write!(writer, "{value}").is_ok() && writer.ok && writer.rest.is_empty()
 }
 
+/// Streaming SHA-256 hasher for [`files_digest`]: feeds each `(path, bytes)` entry in sorted
+/// byte order of `path` as `path || 0u8 || (bytes.len() as u64).to_le_bytes() || bytes` without
+/// concatenating file contents into a buffer.
+pub struct FilesHasher {
+    hasher: blaze_sha256::Sha256,
+}
+
+impl Default for FilesHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FilesHasher {
+    pub const fn new() -> Self {
+        Self { hasher: blaze_sha256::Sha256::new() }
+    }
+
+    /// Feeds one regular file entry. Callers must pass entries in ascending byte order of `path`
+    /// to match [`files_digest`].
+    pub fn update_file(&mut self, path: &str, bytes: &[u8]) {
+        self.hasher.update(path.as_bytes());
+        self.hasher.update(&[0]);
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        self.hasher.update(&len.to_le_bytes());
+        self.hasher.update(bytes);
+    }
+
+    pub fn finish(self) -> [u8; 32] {
+        self.hasher.finish()
+    }
+
+    pub fn finish_hex_in<A: core::alloc::Allocator>(self, alloc: A) -> blaze_own::String<A> {
+        use core::fmt::Write as _;
+        let digest = self.hasher.finish();
+        let mut out = blaze_own::String::with_capacity_in(digest.len() * 2, alloc);
+        for byte in digest {
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
+}
+
 /// The digest a path package's sources are pinned by: SHA-256 over its files, in the byte
 /// order of their paths relative to the package's folder, each as the path, a zero byte, its
 /// length as 8 little-endian bytes and its bytes. `files` holds every regular file of the
@@ -260,14 +303,11 @@ fn display_eq(value: &impl core::fmt::Display, expected: &str) -> bool {
 /// builder's module by it).
 pub fn files_digest(files: &mut [(String, Vec<u8>)]) -> String {
     files.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-    let mut all = Vec::new();
+    let mut hasher = FilesHasher::new();
     for (path, bytes) in files.iter() {
-        all.extend_from_slice(path.as_bytes());
-        all.push(0);
-        all.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        all.extend_from_slice(bytes);
+        hasher.update_file(path.as_str(), bytes.as_slice());
     }
-    sha256_hex(&all)
+    hex(&hasher.finish())
 }
 
 /// The files of the package at `dir` that [`files_digest`] covers, by their paths relative to
@@ -297,7 +337,7 @@ pub fn package_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, ModuleError> 
     Ok(out)
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     use core::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -931,5 +971,55 @@ mod header_tests {
             d_ba.as_str(),
             "swapping features A and B between two same-name/version packages from different sources must change the digest"
         );
+    }
+
+    #[test]
+    fn streaming_files_digest_and_package_files_digest_match_exact_wire_format() {
+        let dir = std::env::temp_dir().join(format!("blaze-module-streaming-digest-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/nested")).expect("mkdir src/nested");
+        std::fs::create_dir_all(dir.join("target/ignored")).expect("mkdir target");
+        std::fs::write(dir.join("Cargo.toml"), b"[package]\nname = \"demo\"\n").expect("write Cargo.toml");
+        std::fs::write(dir.join("src/lib.rs"), b"pub fn a() -> u32 { 1 }\n").expect("write src/lib.rs");
+        std::fs::write(dir.join("src/nested/mod.rs"), b"pub const X: &[u8] = b\"\x00\xff\";\n").expect("write nested");
+        std::fs::write(dir.join("target/ignored/out.bin"), b"must be excluded").expect("write ignored");
+
+        // Reference oracle using explicit `path || 0u8 || len_le64 || bytes` concatenation.
+        let mut expected_entries = vec![
+            ("Cargo.toml", &b"[package]\nname = \"demo\"\n"[..]),
+            ("src/lib.rs", &b"pub fn a() -> u32 { 1 }\n"[..]),
+            ("src/nested/mod.rs", &b"pub const X: &[u8] = b\"\x00\xff\";\n"[..]),
+        ];
+        expected_entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let mut wire = Vec::new();
+        for (path, bytes) in &expected_entries {
+            wire.extend_from_slice(path.as_bytes());
+            wire.push(0);
+            wire.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            wire.extend_from_slice(bytes);
+        }
+        let oracle = sha256_hex(&wire);
+
+        // `files_digest` (unsorted input) must match oracle bit-for-bit.
+        let mut unsorted: Vec<(String, Vec<u8>)> = expected_entries
+            .iter()
+            .rev()
+            .map(|(p, b)| ((*p).to_owned(), (*b).to_vec()))
+            .collect();
+        assert_eq!(files_digest(&mut unsorted), oracle);
+
+        // `package_files` + `files_digest` must match oracle.
+        let mut collected = package_files(&dir).expect("package_files");
+        assert_eq!(files_digest(&mut collected), oracle);
+
+        // `FilesHasher::finish_hex_in` must match oracle as well.
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut hasher = FilesHasher::new();
+        for (path, bytes) in &expected_entries {
+            hasher.update_file(path, bytes);
+        }
+        assert_eq!(hasher.finish_hex_in(alloc).as_str(), oracle);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

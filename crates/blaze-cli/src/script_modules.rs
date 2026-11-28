@@ -124,9 +124,9 @@ pub(crate) struct ScriptModule {
     pub ran_as: RanAs,
     pub package: &'static str,
     pub version: &'static str,
-    pub features: std::vec::Vec<&'static str, std::alloc::Global>,
-    pub files: Option<std::string::String>,
-    pub deps: Option<std::string::String>,
+    pub features: &'static [&'static str],
+    pub files: Option<&'static str>,
+    pub deps: Option<&'static str>,
 }
 
 /// What one lookup is for: the run's placement and the script unit's exact graph id, package,
