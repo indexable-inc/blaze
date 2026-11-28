@@ -496,6 +496,14 @@ impl BorrowLangs {
     }
 }
 
+#[derive(Clone, Copy)]
+enum InstCopyEntry {
+    Yes,
+    No,
+    IfOutlives(u32, u32),
+    Unknown,
+}
+
 /// The facts of one body, gathered before it is lowered (blaze-flow-lower's [`Facts`]): every
 /// table sorted by checker key, looked up by binary search.
 pub struct BorrowFacts<'a> {
@@ -517,6 +525,12 @@ pub struct BorrowFacts<'a> {
     /// needs are in `copy_need` (borrow_fields.rs `copy_args_of`; `Facts::copy_args`).
     copy_args: AVec<'a, (u128, u32, u32)>,
     copy_need: AVec<'a, bool>,
+    /// Instantiated body `PTy`s (sorted by `PTy::0`) whose `Copy` impl was resolved by
+    /// `borrow_fields::InstDropEval` when `copy_args` returned `None` (e.g. conditional `Copy`
+    /// impls with associated-type projection bounds or extra outlives obligations), for
+    /// `Facts::inst_is_copy`.
+    inst_copy: AVec<'a, (u32, InstCopyEntry)>,
+    inst_copy_outlives: AVec<'a, blaze_flow_lower::CopyOutlives>,
     /// Per ADT whose structural drop summary was read, sorted by checker key: where its
     /// arguments' drop flags are in `drop_need` (borrow_fields.rs `drop_facts_of`; `Facts::drop_args`).
     drop_args: AVec<'a, (u128, u32, u32)>,
@@ -669,6 +683,8 @@ impl<'a> BorrowFacts<'a> {
             suppressed_field_regions: AVec::new_in(alloc),
             copy_args: AVec::new_in(alloc),
             copy_need: AVec::new_in(alloc),
+            inst_copy: AVec::new_in(alloc),
+            inst_copy_outlives: AVec::new_in(alloc),
             drop_args: AVec::new_in(alloc),
             drop_need: AVec::new_in(alloc),
             inst_drop: AVec::new_in(alloc),
@@ -826,6 +842,19 @@ impl Facts for ReadBy<'_, '_> {
         let start = usize::try_from(start).ok()?;
         let end = start.checked_add(usize::try_from(len).ok()?)?;
         self.facts.copy_need.get(start..end)
+    }
+    fn inst_is_copy(&self, ty: tc::PTy) -> Option<blaze_flow_lower::InstCopy<'_>> {
+        let at = self.facts.inst_copy.binary_search_by_key(&ty.0, |&(k, _)| k).ok()?;
+        match self.facts.inst_copy.get(at)?.1 {
+            InstCopyEntry::Yes => Some(blaze_flow_lower::InstCopy::Yes),
+            InstCopyEntry::No => Some(blaze_flow_lower::InstCopy::No),
+            InstCopyEntry::IfOutlives(start, len) => {
+                let s = usize::try_from(start).ok()?;
+                let e = s.checked_add(usize::try_from(len).ok()?)?;
+                Some(blaze_flow_lower::InstCopy::IfOutlives(self.facts.inst_copy_outlives.get(s..e)?))
+            }
+            InstCopyEntry::Unknown => Some(blaze_flow_lower::InstCopy::Unknown),
+        }
     }
     fn drop_args(&self, adt: tc::ItemKey) -> Option<&[bool]> {
         let at = self.facts.drop_args.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
@@ -2711,29 +2740,51 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     if let Some(guard) = alias_guard {
         guard.push_reads(&mut g.reads);
     }
-    // Evaluate instantiated structural drop glue for concrete body `PNode::Adt` types whose
-    // uninstantiated ADT summary had `needs_drop && !drop_impl` (e.g. `Flatten<...>`,
-    // `Split<'_, &str>`, `SplitWhitespace<'_>` whose fields hold `PNode::Alias`).
+    // Evaluate instantiated structural drop glue (when `needs_drop && !drop_impl`) and
+    // instantiated conditional `Copy` impls (when `copy && copy_args.is_none()`, e.g.
+    // `impl<T: ?Sized, I: Invariants<Aliasing = Shared>> Copy for Ptr<'_, T, I>`).
     {
         let body_tys = c.types.view();
-        let mut eval: Option<fields::InstDropEval<'a>> = None;
+        let mut eval: Option<fields::InstDropEval<'a, '_>> = None;
         for (idx, node) in body_tys.nodes().enumerate() {
             let tc::PNode::Adt(k, _) = *node else { continue };
             let Ok(at) = g.adts.binary_search_by_key(&k.0, |&(ak, _)| ak) else { continue };
             let af = g.adts[at].1;
-            if !af.needs_drop || af.drop_impl {
-                continue;
-            }
             let Ok(pty_id) = u32::try_from(idx) else { continue };
-            let ev = eval.get_or_insert_with(|| fields::InstDropEval::new_in(alloc));
-            if let Some(needs) = ev.eval_body_ty(r, langs, body_tys, tc::PTy(pty_id)) {
-                g.inst_drop.push((pty_id, needs));
+            if af.needs_drop && !af.drop_impl {
+                let ev = eval.get_or_insert_with(|| fields::InstDropEval::new_in(adt_facts.as_ref(), alloc));
+                if let Some(needs) = ev.eval_body_ty(r, langs, body_tys, tc::PTy(pty_id)) {
+                    g.inst_drop.push((pty_id, needs));
+                }
+            }
+            if af.copy
+                && plant != FactsPlant::NoCopyArgs
+                && g.copy_args.binary_search_by_key(&k.0, |&(ak, _, _)| ak).is_err()
+            {
+                let ev = eval.get_or_insert_with(|| fields::InstDropEval::new_in(adt_facts.as_ref(), alloc));
+                if let Some(ans) = ev.eval_body_copy(r, langs, owner, body_tys, tc::PTy(pty_id)) {
+                    let entry = match ans {
+                        fields::InstCopyOwned::Yes => InstCopyEntry::Yes,
+                        fields::InstCopyOwned::No => InstCopyEntry::No,
+                        fields::InstCopyOwned::IfOutlives(obs) => {
+                            let start = g.inst_copy_outlives.len();
+                            g.inst_copy_outlives.extend_from_slice(&obs);
+                            match (u32::try_from(start).ok(), u32::try_from(obs.len()).ok()) {
+                                (Some(s), Some(l)) => InstCopyEntry::IfOutlives(s, l),
+                                _ => InstCopyEntry::Unknown,
+                            }
+                        }
+                        fields::InstCopyOwned::Unknown => InstCopyEntry::Unknown,
+                    };
+                    g.inst_copy.push((pty_id, entry));
+                }
             }
         }
         if let Some(ev) = eval {
             ev.push_reads(&mut g.reads);
         }
         g.inst_drop.sort_unstable_by_key(|&(k, _)| k);
+        g.inst_copy.sort_unstable_by_key(|&(k, _)| k);
     }
     let target_name = tc::Name::of("Target");
     let prev_selected_len = selected.len();

@@ -111,6 +111,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 | PNode::Coroutine { .. }
                 | PNode::Infer
                 | PNode::Error => return Ok(true),
+                PNode::FnPtr(l, _) if captures => stack.extend_from_slice(self.list(l, e)?),
                 PNode::FnPtr(l, _) | PNode::FnDef(_, l) => {
                     for &x in self.list(l, e)? {
                         if self.npos(x, e)? > 0 {

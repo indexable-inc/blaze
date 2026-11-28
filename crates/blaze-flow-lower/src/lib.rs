@@ -503,6 +503,18 @@ pub trait Facts {
     /// lowering does not check (`T: Tr`) gives `None`. Whoever answers files the read of the
     /// impl's header in the body's read list (rule 21).
     fn copy_args(&self, adt: ItemKey) -> Option<&[bool]>;
+    /// Whether the instantiated type `ty` (in the body's own `PTys` table) implements `Copy`,
+    /// consulted when an ADT's `Copy` impl has clauses beyond simple per-argument `T: Copy`
+    /// bounds (`Facts::copy_args(k)` returned `None`, e.g. `impl<T: ?Sized, I: Invariants<Aliasing = Shared>> Copy for Ptr<'_, T, I>`
+    /// or `impl<'a, T: 'a> Copy for OutlivesToken<'a, T>`).
+    /// `Some(InstCopy::Yes)` proves `ty: Copy`; `Some(InstCopy::No)` proves `ty: !Copy`;
+    /// `Some(InstCopy::IfOutlives(obs))` proves `ty: Copy` iff every outlives obligation in `obs`
+    /// holds on the place's live origins; `Some(InstCopy::Unknown)` reports an incomplete or
+    /// budget-exhausted proof and refuses the body instead of falling back to derive-style checks;
+    /// `None` falls back to checking every generic argument.
+    fn inst_is_copy(&self, _ty: PTy) -> Option<InstCopy<'_>> {
+        None
+    }
     /// For each generic argument of `adt` (the record's argument list, as
     /// [`Facts::copy_args`] counts it), whether `adt`'s drop glue drops a value of that
     /// argument: `[false]` for `slice::Iter<'a, T>` (holds `NonNull<T>`, `*const T`,
@@ -544,6 +556,37 @@ pub trait Facts {
     fn alias_copy(&self, _alias: PTy) -> bool {
         false
     }
+}
+
+/// One extra outlives obligation required by an instantiated ADT's `Copy` impl beyond what the
+/// ADT's own well-formedness guarantees (e.g. `impl<'a, T: 'a> Copy for OutlivesToken<'a, T>` or
+/// `impl<'a, T: Marker<'a>> Copy for Marked<'a, T>`).
+/// A lifetime index of `u32::MAX` denotes `'static`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CopyOutlives {
+    /// ADT lifetime slot `long` must outlive ADT lifetime slot `short`.
+    Region { long: u32, short: u32 },
+    /// Every origin and type parameter inside ADT type argument `arg` must outlive ADT lifetime
+    /// slot `region`.
+    Arg { arg: u32, region: u32 },
+    /// ADT lifetime slot `slot` must equal the enclosing owner's region `owner_region` (`u32::MAX`
+    /// for `'static`, else `Region::Param(owner_region)`).
+    SlotEqOwner { slot: u32, owner_region: u32 },
+}
+
+/// Instantiated `Copy` answer for [`Facts::inst_is_copy`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstCopy<'a> {
+    /// Proved `Copy` unconditionally for this instantiation.
+    Yes,
+    /// Proved not `Copy` for this instantiation.
+    No,
+    /// All non-outlives clauses hold; `Copy` holds iff every obligation holds on the place's live
+    /// origins and the body's known outlives bounds.
+    IfOutlives(&'a [CopyOutlives]),
+    /// Conditional `Copy` evaluation hit an incomplete fact or solver bound; lowering refuses the
+    /// body with [`Form::Bound`] rather than falling back to derive-style argument checking.
+    Unknown,
 }
 
 /// Which check of a signature's laying refused it ([`Form::SigPositionsUnaligned`]). `input`:
@@ -1989,7 +2032,12 @@ pub fn pty_is_copy<'a, 'c, F: Facts, A: Allocator + Copy, E>(
                 match walk.adt_args {
                     AdtCopyArgs::All => stack.extend_from_slice(args),
                     AdtCopyArgs::Facts => match walk.facts.copy_args(k) {
-                        None => stack.extend_from_slice(args),
+                        None => match walk.facts.inst_is_copy(t) {
+                            Some(InstCopy::Yes) => {}
+                            Some(InstCopy::No | InstCopy::IfOutlives(_)) => return set_false(),
+                            Some(InstCopy::Unknown) => return Err(on_err(CopyWalkError::Bound)),
+                            None => stack.extend_from_slice(args),
+                        },
                         Some(need) if need.len() == args.len() => {
                             for (&a, &req) in args.iter().zip(need.iter()) {
                                 if req {
@@ -3695,11 +3743,470 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         Ok(())
     }
 
-    fn operand(&self, v: Val, e: ExprId) -> Result<Operand, Refusal> {
+    /// Whether `long: short` is provably known in this flow (`long == short`, `long` is the
+    /// universal `'static` placeholder, or `(long, short)` is reachable through `self.b.known_edges()`
+    /// and existential-target `self.b.subset_edges()`, never traversing unproven universal-to-universal
+    /// subset constraints).
+    fn origin_outlives_known(&self, long: Origin, short: Origin) -> bool {
+        if long == short {
+            return true;
+        }
+        if let Some(&(_, st)) = self.uni.iter().find(|(r, _)| *r == Region::Static)
+            && long == st
+        {
+            return true;
+        }
+        let edges = self.b.known_edges();
+        let subsets = self.b.subset_edges();
+        if edges.is_empty() && subsets.is_empty() {
+            return false;
+        }
+        let Ok(n_origs) = usize::try_from(self.b.origins_len()) else {
+            return false;
+        };
+        if long.index() >= n_origs || short.index() >= n_origs {
+            return false;
+        }
+        let mut visited: Vec<bool, A> = Vec::with_capacity_in(n_origs, self.alloc);
+        visited.resize(n_origs, false);
+        let mut stack: Vec<Origin, A> = Vec::new_in(self.alloc);
+        if let Some(slot) = visited.get_mut(long.index()) {
+            *slot = true;
+        }
+        stack.push(long);
+        while let Some(cur) = stack.pop() {
+            for &(from, into) in edges {
+                if from != cur {
+                    continue;
+                }
+                if into == short {
+                    return true;
+                }
+                if let Some(slot) = visited.get_mut(into.index())
+                    && !*slot
+                {
+                    *slot = true;
+                    stack.push(into);
+                }
+            }
+            for &(_, from, into) in subsets {
+                if from != cur || self.b.is_placeholder(into) {
+                    continue;
+                }
+                if into == short {
+                    return true;
+                }
+                if let Some(slot) = visited.get_mut(into.index())
+                    && !*slot
+                {
+                    *slot = true;
+                    stack.push(into);
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether `o` is a higher-ranked (`Region::Late`) binder origin of a `fn(...) -> ...` pointer
+    /// type (not constrained to any non-`'static` free lifetime placeholder), so it is not an
+    /// outlives component of `for<'r> fn(&'r u8): 'target`.
+    fn is_fn_ptr_late_origin(&self, o: Origin) -> bool {
+        if !self.facts.fn_binders() || self.b.is_placeholder(o) {
+            return false;
+        }
+        let is_uni_late = |x: Origin| {
+            self.uni.iter().any(|&(r, uo)| uo == x && matches!(r, Region::Late { .. }))
+        };
+        if is_uni_late(o) {
+            return true;
+        }
+        let static_o = self.uni.iter().find(|&&(r, _)| r == Region::Static).map(|&(_, uo)| uo);
+        let Ok(n_origs) = usize::try_from(self.b.origins_len()) else {
+            return false;
+        };
+        if o.index() >= n_origs {
+            return false;
+        }
+        let subsets = self.b.subset_edges();
+        let mut visited: Vec<bool, A> = Vec::with_capacity_in(n_origs, self.alloc);
+        visited.resize(n_origs, false);
+        let mut stack: Vec<Origin, A> = Vec::new_in(self.alloc);
+        if let Some(slot) = visited.get_mut(o.index()) {
+            *slot = true;
+        }
+        stack.push(o);
+        let mut saw_late = false;
+        while let Some(cur) = stack.pop() {
+            if is_uni_late(cur) {
+                saw_late = true;
+            }
+            for &(_, from, into) in subsets {
+                let nb = if from == cur {
+                    into
+                } else if into == cur {
+                    from
+                } else {
+                    continue;
+                };
+                if self.b.is_placeholder(nb) {
+                    if Some(nb) != static_o {
+                        return false;
+                    }
+                    continue;
+                }
+                if let Some(slot) = visited.get_mut(nb.index())
+                    && !*slot
+                {
+                    *slot = true;
+                    stack.push(nb);
+                }
+            }
+        }
+        saw_late
+    }
+
+    /// Verifies that every free-region origin component of `arg_ty` (at flattened offset
+    /// `start_off` inside `origs`) outlives `target`, skipping higher-ranked `Region::Late`
+    /// binder origins inside `PNode::FnPtr` while still requiring free regions (e.g. `'short` in
+    /// `fn(&'short u8)`) to outlive `target`, matching rustc's RFC 1214 outlives rules.
+    fn arg_origins_outlive_known(
+        &self,
+        arg_ty: PTy,
+        start_off: u32,
+        origs: &[Origin],
+        target: Origin,
+        e: ExprId,
+    ) -> Result<bool, Refusal> {
+        let mut stack: Vec<(PTy, u32, bool), A> = Vec::new_in(self.alloc);
+        stack.push((arg_ty, start_off, false));
+        let mut steps = 0u32;
+        while let Some((t, cur_off, in_fn_ptr)) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse(Form::Bound, e);
+            }
+            let check_origin = |pos: u32| -> bool {
+                let Some(&o) = usize::try_from(pos).ok().and_then(|ix| origs.get(ix)) else {
+                    return false;
+                };
+                if in_fn_ptr && self.is_fn_ptr_late_origin(o) {
+                    return true;
+                }
+                self.origin_outlives_known(o, target)
+            };
+            match self.node(t, e)? {
+                PNode::Ref(_, inner) => {
+                    if !check_origin(cur_off) {
+                        return Ok(false);
+                    }
+                    let Some(next) = cur_off.checked_add(1) else {
+                        return Ok(false);
+                    };
+                    stack.push((inner, next, in_fn_ptr));
+                }
+                PNode::Ptr(_, inner) | PNode::Slice(inner) | PNode::Array(inner, _) | PNode::Pat(inner, _) => {
+                    stack.push((inner, cur_off, in_fn_ptr));
+                }
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => {
+                    let mut c_off = cur_off;
+                    for &el in self.list(l, e)? {
+                        let n = self.npos(el, e)?;
+                        stack.push((el, c_off, in_fn_ptr));
+                        let Some(next) = c_off.checked_add(n) else {
+                            return Ok(false);
+                        };
+                        c_off = next;
+                    }
+                }
+                PNode::FnPtr(l, _) => {
+                    let mut c_off = cur_off;
+                    for &el in self.list(l, e)? {
+                        let n = self.npos(el, e)?;
+                        stack.push((el, c_off, true));
+                        let Some(next) = c_off.checked_add(n) else {
+                            return Ok(false);
+                        };
+                        c_off = next;
+                    }
+                }
+                PNode::Adt(k, l) => {
+                    let lts = self.adt_facts(k, e)?.lifetimes;
+                    for j in 0..lts {
+                        let Some(pos) = cur_off.checked_add(j) else {
+                            return Ok(false);
+                        };
+                        if !check_origin(pos) {
+                            return Ok(false);
+                        }
+                    }
+                    let Some(mut c_off) = cur_off.checked_add(lts) else {
+                        return Ok(false);
+                    };
+                    for &a in self.list(l, e)? {
+                        let n = self.npos(a, e)?;
+                        stack.push((a, c_off, in_fn_ptr));
+                        let Some(next) = c_off.checked_add(n) else {
+                            return Ok(false);
+                        };
+                        c_off = next;
+                    }
+                }
+                _ => {
+                    let n = self.npos(t, e)?;
+                    for j in 0..n {
+                        let Some(pos) = cur_off.checked_add(j) else {
+                            return Ok(false);
+                        };
+                        if !check_origin(pos) {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Verifies that every extra [`CopyOutlives`] obligation on an ADT at `(adt_ty, adt_off)`
+    /// inside `origs` holds under `known_edges()`.
+    fn check_copy_outlives(
+        &mut self,
+        adt_ty: PTy,
+        adt_off: u32,
+        origs: &[Origin],
+        obs: &[CopyOutlives],
+        e: ExprId,
+    ) -> Result<bool, Refusal> {
+        let PNode::Adt(k, l) = self.node(adt_ty, e)? else {
+            return Ok(false);
+        };
+        let lifetimes = self.adt_facts(k, e)?.lifetimes;
+        let adt_npos = self.npos(adt_ty, e)?;
+        let args = self.list(l, e)?;
+        let region_orig = |s: &mut Self, idx: u32| -> Option<Origin> {
+            if idx == u32::MAX {
+                Some(s.universal(Region::Static))
+            } else if idx < adt_npos {
+                let pos = adt_off.checked_add(idx)?;
+                origs.get(usize::try_from(pos).ok()?).copied()
+            } else {
+                None
+            }
+        };
+        for &ob in obs {
+            match ob {
+                CopyOutlives::Region { long, short } => {
+                    let (Some(ol), Some(os)) = (region_orig(self, long), region_orig(self, short)) else {
+                        return Ok(false);
+                    };
+                    if !self.origin_outlives_known(ol, os) {
+                        return Ok(false);
+                    }
+                }
+                CopyOutlives::Arg { arg, region } => {
+                    let Some(os) = region_orig(self, region) else {
+                        return Ok(false);
+                    };
+                    let Ok(arg_ix) = usize::try_from(arg) else {
+                        return Ok(false);
+                    };
+                    let Some(&arg_ty) = args.get(arg_ix) else {
+                        return Ok(false);
+                    };
+                    let mut off = lifetimes;
+                    for &prev in args.get(..arg_ix).unwrap_or(&[]) {
+                        off = off.saturating_add(self.npos(prev, e)?);
+                    }
+                    let Some(arg_start) = adt_off.checked_add(off) else {
+                        return Ok(false);
+                    };
+                    if !self.arg_origins_outlive_known(arg_ty, arg_start, origs, os, e)? {
+                        return Ok(false);
+                    }
+                    let mut params: Vec<u32, A> = Vec::new_in(self.alloc);
+                    if self.outlives_components(arg_ty, e, &mut params, true)? {
+                        return Ok(false);
+                    }
+                    for &u in params.iter() {
+                        let pu = self.param_origin(u);
+                        if !self.origin_outlives_known(pu, os) {
+                            return Ok(false);
+                        }
+                    }
+                }
+                CopyOutlives::SlotEqOwner { slot, owner_region } => {
+                    let Some(os) = region_orig(self, slot) else {
+                        return Ok(false);
+                    };
+                    let owner_r = if owner_region == u32::MAX {
+                        Region::Static
+                    } else {
+                        Region::Param(owner_region)
+                    };
+                    let oo = self.universal(owner_r);
+                    if !(self.origin_outlives_known(os, oo) && self.origin_outlives_known(oo, os)) {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Region-aware `Copy` check for a type `root_ty` whose flattened origins are `origs`:
+    /// verifies [`InstCopy::IfOutlives`] obligations on ADTs and traverses closure by-value
+    /// captures with their concrete capture origins.
+    fn ty_origs_is_copy(&mut self, root_ty: PTy, origs: &[Origin], e: ExprId) -> Result<bool, Refusal> {
+        if self.is_copy_pty(root_ty, e)? {
+            return Ok(true);
+        }
+        let mut stack: Vec<(PTy, u32), A> = Vec::new_in(self.alloc);
+        stack.push((root_ty, 0));
+        let mut steps = 0u32;
+        while let Some((t, off)) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse(Form::Bound, e);
+            }
+            match self.node(t, e)? {
+                PNode::Bool
+                | PNode::Char
+                | PNode::Int(_)
+                | PNode::Uint(_)
+                | PNode::Float(_)
+                | PNode::Never
+                | PNode::Ptr(..)
+                | PNode::FnDef(..)
+                | PNode::FnPtr(..)
+                | PNode::ConstValue { .. }
+                | PNode::ConstParam(_)
+                | PNode::Ref(Mutbl::Not, _) => {}
+                PNode::Ref(Mutbl::Mut, _) => return Ok(false),
+                PNode::Array(elem, _) | PNode::Pat(elem, _) => stack.push((elem, off)),
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => {
+                    let elems = self.list(l, e)?;
+                    let mut cur_off = off;
+                    for &el in elems {
+                        let n = self.npos(el, e)?;
+                        stack.push((el, cur_off));
+                        cur_off = cur_off.saturating_add(n);
+                    }
+                }
+                PNode::Adt(k, l) => {
+                    let f = self.adt_facts(k, e)?;
+                    if !f.copy {
+                        return Ok(false);
+                    }
+                    let args = self.list(l, e)?;
+                    let mut arg_offs: Vec<(PTy, u32), A> = Vec::new_in(self.alloc);
+                    let mut cur_off = off.saturating_add(f.lifetimes);
+                    for &a in args {
+                        let n = self.npos(a, e)?;
+                        arg_offs.push((a, cur_off));
+                        cur_off = cur_off.saturating_add(n);
+                    }
+                    let facts: &'b F = self.facts;
+                    match facts.copy_args(k) {
+                        None => match facts.inst_is_copy(t) {
+                            Some(InstCopy::Yes) => {}
+                            Some(InstCopy::No) => return Ok(false),
+                            Some(InstCopy::IfOutlives(obs)) => {
+                                if !self.check_copy_outlives(t, off, origs, obs, e)? {
+                                    return Ok(false);
+                                }
+                            }
+                            Some(InstCopy::Unknown) => return self.refuse(Form::Bound, e),
+                            None => {
+                                for &(a, ao) in arg_offs.iter() {
+                                    stack.push((a, ao));
+                                }
+                            }
+                        },
+                        Some(need) if need.len() == arg_offs.len() => {
+                            for (&(a, ao), &req) in arg_offs.iter().zip(need.iter()) {
+                                if req {
+                                    stack.push((a, ao));
+                                }
+                            }
+                        }
+                        Some(_) => return self.refuse(Form::CopyArgsUnaligned { adt: k }, e),
+                    }
+                }
+                PNode::Param(i) => {
+                    if !self.facts.param_copy(i) {
+                        return Ok(false);
+                    }
+                }
+                PNode::Alias { .. } | PNode::Opaque(..) => {
+                    if !self.facts.alias_copy(t) {
+                        return Ok(false);
+                    }
+                }
+                PNode::Closure { owner, ordinal, .. } if owner == self.body.owner => {
+                    let ck: &'c Checked<'c> = self.ck;
+                    let Ok(ord_ix) = usize::try_from(ordinal) else {
+                        return self.refuse(Form::Malformed, e);
+                    };
+                    let Some(&ce) = ck.closures.column::<0>().get(ord_ix) else {
+                        return self.refuse(Form::Malformed, e);
+                    };
+                    let mut cap_off = off;
+                    for f in ck.env_fields_by::<blaze_typeck::Places>(ce) {
+                        let Some(ct) = f.place_ty(ck) else {
+                            return self.refuse(Form::Malformed, e);
+                        };
+                        let n = self.npos(ct, e)?;
+                        match f.how {
+                            blaze_typeck::CaptureKind::ByMutRef => return Ok(false),
+                            blaze_typeck::CaptureKind::ByRef => {
+                                cap_off = cap_off.saturating_add(1).saturating_add(n);
+                            }
+                            blaze_typeck::CaptureKind::ByValue => {
+                                stack.push((ct, cap_off));
+                                cap_off = cap_off.saturating_add(n);
+                            }
+                        }
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Region-aware `Copy` check for a place `p` of type `ty`: identical to [`Self::is_copy`],
+    /// except that an ADT whose `Copy` impl returned [`InstCopy::IfOutlives`] verifies its extra
+    /// outlives obligations against `p`'s live origins and `self.b.known_edges()`.
+    fn place_is_copy(&mut self, p: Place, ty: TyD, e: ExprId) -> Result<bool, Refusal> {
+        if let Some(m) = ty.wrap {
+            return Ok(m == Mutbl::Not);
+        }
+        if self.is_copy_pty(ty.ty, e)? {
+            return Ok(true);
+        }
+        let pi = self.info(p);
+        if !pi.exact {
+            return Ok(false);
+        }
+        let (Ok(start), Ok(len)) = (usize::try_from(pi.start), usize::try_from(pi.len)) else {
+            return Ok(false);
+        };
+        let Some(end) = start.checked_add(len) else {
+            return Ok(false);
+        };
+        let Some(slice) = self.origs.get(start..end) else {
+            return Ok(false);
+        };
+        let mut origs: Vec<Origin, A> = Vec::with_capacity_in(len, self.alloc);
+        origs.extend_from_slice(slice);
+        self.ty_origs_is_copy(ty.ty, &origs, e)
+    }
+
+    fn operand(&mut self, v: Val, e: ExprId) -> Result<Operand, Refusal> {
         Ok(match v.at {
             At::Const => Operand::Const,
             At::Place(p) => {
-                if self.plant == Plant::AllCopy || self.is_copy(v.ty, e)? {
+                if self.plant == Plant::AllCopy || self.place_is_copy(p, v.ty, e)? {
                     Operand::Copy(p)
                 } else {
                     // Moving a non-`Copy` field out of a `union` moves the whole union place
@@ -7235,10 +7742,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 // expression has an extended temporary scope then so does its operand" (`let x =
                 // &mk().f;` extends `mk()`; an arm's `&mk().f` died at the arm's end otherwise).
                 if let Expr::Ref { operand, .. } = self.expr(e)? {
-                    self.extend_root(p, operand)?;
                     if self.const_init && m == Mutbl::Not {
                         self.promote_const_init_temp(p, operand, e)?;
                     }
+                    self.extend_root(p, operand)?;
                 }
             }
         }
@@ -7371,9 +7878,113 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         self.extend_temp(at, STATIC_EXTENDED, e)
     }
 
+    /// Whether `root_ty` is `Copy` when every lifetime slot inside it is `'static` (used during
+    /// constant promotion, where promoted temporaries live for `'static`). Preserves conditional
+    /// `Copy` (`InstCopy::IfOutlives`) while requiring every generic type parameter in an `Arg`
+    /// outlives obligation to outlive `'static` and every `SlotEqOwner` to equal `'static`.
+    fn ty_is_copy_static(&mut self, root_ty: PTy, e: ExprId) -> Result<bool, Refusal> {
+        if self.is_copy_pty(root_ty, e)? {
+            return Ok(true);
+        }
+        let mut stack = TyStack::new(root_ty, self.alloc);
+        let mut steps = 0u32;
+        while let Some(t) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse(Form::Bound, e);
+            }
+            match self.node(t, e)? {
+                PNode::Bool
+                | PNode::Char
+                | PNode::Int(_)
+                | PNode::Uint(_)
+                | PNode::Float(_)
+                | PNode::Never
+                | PNode::Ptr(..)
+                | PNode::FnDef(..)
+                | PNode::FnPtr(..)
+                | PNode::ConstValue { .. }
+                | PNode::ConstParam(_)
+                | PNode::Ref(Mutbl::Not, _) => {}
+                PNode::Ref(Mutbl::Mut, _) => return Ok(false),
+                PNode::Array(elem, _) | PNode::Pat(elem, _) => stack.push(elem),
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => {
+                    stack.extend_from_slice(self.list(l, e)?);
+                }
+                PNode::Adt(k, l) => {
+                    let f = self.adt_facts(k, e)?;
+                    if !f.copy {
+                        return Ok(false);
+                    }
+                    let args = self.list(l, e)?;
+                    let facts: &'b F = self.facts;
+                    match facts.copy_args(k) {
+                        None => match facts.inst_is_copy(t) {
+                            Some(InstCopy::Yes) => {}
+                            Some(InstCopy::No) => return Ok(false),
+                            Some(InstCopy::IfOutlives(obs)) => {
+                                let st = self.universal(Region::Static);
+                                for &ob in obs {
+                                    match ob {
+                                        CopyOutlives::Region { .. } => {}
+                                        CopyOutlives::Arg { arg, .. } => {
+                                            let Ok(arg_ix) = usize::try_from(arg) else {
+                                                return Ok(false);
+                                            };
+                                            let Some(&arg_ty) = args.get(arg_ix) else {
+                                                return Ok(false);
+                                            };
+                                            let mut params: Vec<u32, A> = Vec::new_in(self.alloc);
+                                            if self.outlives_components(arg_ty, e, &mut params, true)? {
+                                                return Ok(false);
+                                            }
+                                            for &u in params.iter() {
+                                                let pu = self.param_origin(u);
+                                                if !self.origin_outlives_known(pu, st) {
+                                                    return Ok(false);
+                                                }
+                                            }
+                                        }
+                                        CopyOutlives::SlotEqOwner { owner_region, .. } => {
+                                            if owner_region != u32::MAX {
+                                                return Ok(false);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Some(InstCopy::Unknown) => return self.refuse(Form::Bound, e),
+                            None => stack.extend_from_slice(args),
+                        },
+                        Some(need) if need.len() == args.len() => {
+                            for (&a, &req) in args.iter().zip(need.iter()) {
+                                if req {
+                                    stack.push(a);
+                                }
+                            }
+                        }
+                        Some(_) => return self.refuse(Form::CopyArgsUnaligned { adt: k }, e),
+                    }
+                }
+                PNode::Param(i) => {
+                    if !self.facts.param_copy(i) {
+                        return Ok(false);
+                    }
+                }
+                PNode::Alias { .. } | PNode::Opaque(..) => {
+                    if !self.facts.alias_copy(t) {
+                        return Ok(false);
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
     /// Whether a value of `ty` has no drop glue and is guaranteed `Freeze` (no interior
     /// mutability). Conservative `false` for non-`Copy` ADTs and unresolved/opaque types.
-    fn const_init_freeze_no_drop(&self, ty: TyD, e: ExprId) -> Result<bool, Refusal> {
+    fn const_init_freeze_no_drop(&mut self, ty: TyD, e: ExprId) -> Result<bool, Refusal> {
         if self.needs_drop(ty, e)? {
             return Ok(false);
         }
@@ -7404,9 +8015,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 PNode::Tuple(l) | PNode::Record(_, l) => stack.extend_from_slice(self.list(l, e)?),
                 PNode::Array(elem, _) | PNode::Slice(elem) | PNode::Pat(elem, _) => stack.push(elem),
                 // In Rust, `Copy` structurally requires every field to be `Copy` (E0204), and
-                // `UnsafeCell<T>` is `!Copy`, so any `Copy` ADT is guaranteed `Freeze` + no-drop.
+                // `UnsafeCell<T>` is `!Copy`, so any `Copy` ADT at `'static` is guaranteed
+                // `Freeze` + no-drop.
                 PNode::Adt(..) => {
-                    if !self.is_copy_pty(t, e)? {
+                    if !self.ty_is_copy_static(t, e)? {
                         return Ok(false);
                     }
                 }
@@ -7823,7 +8435,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         // The Reference, "Comparison operators": the operands are place expressions, borrowed
         // by the operator: read, never moved.
         let cmp = matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
-        let read = |s: &Self, v: Val| -> Result<Operand, Refusal> {
+        let read = |s: &mut Self, v: Val| -> Result<Operand, Refusal> {
             match (cmp, v.at) {
                 (true, At::Place(p)) => Ok(Operand::Copy(p)),
                 _ => s.operand(v, e),
@@ -11133,7 +11745,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             // A guard over a by-value binding of a non-`Copy` type (pattern_forms.rs, "Match
             // guards"): bound by shared reference for the guard, moved once it holds.
             let moves = match arm.guard {
-                Some(_) => self.guard_moves(arm.pat)? && self.plant != Plant::GuardBindsByValue,
+                Some(_) => self.guard_moves(arm.pat, val, e)? && self.plant != Plant::GuardBindsByValue,
                 None => false,
             };
             if let Some(g) = arm.guard {
@@ -11157,12 +11769,131 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         Ok(())
     }
 
-    /// Whether a pattern binds a non-`Copy` value by value (its guard would see it moved).
-    fn guard_moves(&self, p: PatId) -> Result<bool, Refusal> {
-        let mut stack: Vec<PatId, A> = Vec::new_in(self.alloc);
-        stack.push(p);
+    /// Computes the flattened origin slice of field `fi` of `adt`/`variant` from the parent ADT's
+    /// origin slice `parent_origs`, mirroring `field_origs` without mutating `self.origs`.
+    fn slice_field_origs(
+        &mut self,
+        adt: ItemKey,
+        args: &[PTy],
+        variant: u32,
+        fi: u32,
+        parent_origs: &[Origin],
+        e: ExprId,
+    ) -> Result<Option<Vec<Origin, A>>, Refusal> {
+        let Some(regions) = self.facts.field_regions(adt, variant, fi) else {
+            return Ok(None);
+        };
+        let lifetimes = self.adt_facts(adt, e)?.lifetimes;
+        let mut at: Vec<(u32, u32), A> = Vec::with_capacity_in(args.len(), self.alloc);
+        let mut total = lifetimes;
+        for &a in args {
+            let n = self.npos(a, e)?;
+            at.push((total, n));
+            total = total.saturating_add(n);
+        }
+        if usize::try_from(total).ok() != Some(parent_origs.len()) {
+            return Ok(None);
+        }
+        let mut out: Vec<Origin, A> = Vec::new_in(self.alloc);
+        let mut bound: Vec<(u32, Origin), A> = Vec::new_in(self.alloc);
+        let Ok(max_pos) = usize::try_from(MOST_POSITIONS) else {
+            return Ok(None);
+        };
+        for &r in regions {
+            if out.len() > max_pos {
+                return Ok(None);
+            }
+            match r {
+                FieldRegion::Lifetime(i) if i < lifetimes => {
+                    let Some(&o) = usize::try_from(i).ok().and_then(|ix| parent_origs.get(ix)) else {
+                        return Ok(None);
+                    };
+                    out.push(o);
+                }
+                FieldRegion::Static => {
+                    out.push(self.universal(Region::Static));
+                }
+                FieldRegion::Arg(i) => {
+                    let Some(&(off, n)) = usize::try_from(i).ok().and_then(|ix| at.get(ix)) else {
+                        return Ok(None);
+                    };
+                    let (Ok(s), Ok(len)) = (usize::try_from(off), usize::try_from(n)) else {
+                        return Ok(None);
+                    };
+                    let Some(end) = s.checked_add(len) else {
+                        return Ok(None);
+                    };
+                    let Some(sl) = parent_origs.get(s..end) else {
+                        return Ok(None);
+                    };
+                    out.extend_from_slice(sl);
+                }
+                FieldRegion::Bound(v) => {
+                    let o = match bound.iter().find(|(x, _)| *x == v) {
+                        Some(&(_, o)) => o,
+                        None => {
+                            let o = self.b.origin(false);
+                            bound.push((v, o));
+                            o
+                        }
+                    };
+                    out.push(o);
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// Whether a pattern binds a non-`Copy` value by value (its guard would see it moved),
+    /// tracking the scrutinee's live origins so conditional `Copy` (`InstCopy::IfOutlives`) is
+    /// proved accurately when the body's bounds establish it.
+    fn guard_moves(&mut self, p: PatId, scrut: Val, e: ExprId) -> Result<bool, Refusal> {
+        let init_state = match scrut.at {
+            At::Place(sp) => {
+                let pi = self.info(sp);
+                if pi.exact
+                    && let (Ok(start), Ok(len)) = (usize::try_from(pi.start), usize::try_from(pi.len))
+                    && let Some(end) = start.checked_add(len)
+                    && let Some(sl) = self.origs.get(start..end)
+                {
+                    let mut v: Vec<Origin, A> = Vec::with_capacity_in(len, self.alloc);
+                    v.extend_from_slice(sl);
+                    Some((scrut.ty, v))
+                } else {
+                    None
+                }
+            }
+            At::Const => None,
+        };
+        let peel_refs = |s: &Self, mut ty: TyD, origs: &[Origin]| -> Result<Option<(PTy, usize)>, Refusal> {
+            let mut drop = 0usize;
+            if ty.wrap.is_some() {
+                if drop >= origs.len() {
+                    return Ok(None);
+                }
+                drop += 1;
+                ty.wrap = None;
+            }
+            let mut t = ty.ty;
+            for _ in 0..16 {
+                match s.node(t, e)? {
+                    PNode::Ref(_, inner) => {
+                        if drop >= origs.len() {
+                            return Ok(None);
+                        }
+                        drop += 1;
+                        t = inner;
+                    }
+                    _ => break,
+                }
+            }
+            Ok(Some((t, drop)))
+        };
+        let mut stack: Vec<(PatId, Option<(TyD, Vec<Origin, A>)>), A> = Vec::new_in(self.alloc);
+        stack.push((p, init_state));
         let mut steps = 0usize;
-        while let Some(p) = stack.pop() {
+        while let Some((p, state)) = stack.pop() {
             steps += 1;
             if steps > self.body.pats.len() + 1 {
                 return self.refuse_pat(Form::Bound, p);
@@ -11171,22 +11902,205 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 Some(x) => *x,
                 None => return self.refuse_pat(Form::Malformed, p),
             };
-            if let Pat::Bind { ann, .. } = pat {
-                let lt = self.ck.local_ty.get(p.ix()).copied().unwrap_or(PTy(0));
-                // By value when no `ref` is written and the binding's type is the matched
-                // place's (`pat_ty`): one bound by reference under a default binding mode has
-                // `&pat_ty` (the Reference, "Binding modes"). The binding's type alone does not
-                // say it: `Some(count)` over `Option<&mut usize>` binds a `&mut usize` BY VALUE,
-                // and taken as by reference it was moved before the guard's fake borrow of the
-                // scrutinee, a false E0382 at the `match` (tempo zones-antithesis checks.rs:434,
-                // zones/node role.rs:767).
-                let Some(&pt) = self.ck.pat_ty.get(p.ix()) else { return self.refuse_pat(Form::Malformed, p) };
-                let by_value = ann.by_ref.is_none() && pt == lt;
-                if by_value && !self.is_copy(TyD::of(lt), self.body.root)? {
-                    return Ok(true);
+            match pat {
+                Pat::Bind { ann, sub, .. } => {
+                    let lt = self.ck.local_ty.get(p.ix()).copied().unwrap_or(PTy(0));
+                    // By value when no `ref` is written and the binding's type is the matched
+                    // place's (`pat_ty`): one bound by reference under a default binding mode has
+                    // `&pat_ty` (the Reference, "Binding modes"). The binding's type alone does not
+                    // say it: `Some(count)` over `Option<&mut usize>` binds a `&mut usize` BY VALUE,
+                    // and taken as by reference it was moved before the guard's fake borrow of the
+                    // scrutinee, a false E0382 at the `match` (tempo zones-antithesis checks.rs:434,
+                    // zones/node role.rs:767).
+                    let Some(&pt) = self.ck.pat_ty.get(p.ix()) else { return self.refuse_pat(Form::Malformed, p) };
+                    let by_value = ann.by_ref.is_none() && pt == lt;
+                    if by_value {
+                        let is_copy = match &state {
+                            Some((cur_ty, cur_origs)) if cur_ty.wrap.is_none() && cur_ty.ty == lt => {
+                                self.ty_origs_is_copy(lt, cur_origs, e)?
+                            }
+                            _ => self.is_copy(TyD::of(lt), e)?,
+                        };
+                        if !is_copy {
+                            return Ok(true);
+                        }
+                    }
+                    if let Some(s) = sub {
+                        stack.push((s, state));
+                    }
+                }
+                Pat::Ref { inner, .. } => {
+                    let next = match state {
+                        Some((mut ty, origs)) => {
+                            if ty.wrap.is_some() {
+                                ty.wrap = None;
+                                origs.get(1..).map(|rest| {
+                                    let mut v: Vec<Origin, A> = Vec::with_capacity_in(rest.len(), self.alloc);
+                                    v.extend_from_slice(rest);
+                                    (ty, v)
+                                })
+                            } else if let PNode::Ref(_, inner_ty) = self.node(ty.ty, e)? {
+                                origs.get(1..).map(|rest| {
+                                    let mut v: Vec<Origin, A> = Vec::with_capacity_in(rest.len(), self.alloc);
+                                    v.extend_from_slice(rest);
+                                    (TyD::of(inner_ty), v)
+                                })
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    };
+                    stack.push((inner, next));
+                }
+                Pat::Or { alts } => {
+                    let alts = self.body.pat_lists.get(alts.range()).unwrap_or(&[]);
+                    for &alt in alts {
+                        let dup = state.as_ref().map(|(ty, origs)| {
+                            let mut v: Vec<Origin, A> = Vec::with_capacity_in(origs.len(), self.alloc);
+                            v.extend_from_slice(origs);
+                            (*ty, v)
+                        });
+                        stack.push((alt, dup));
+                    }
+                }
+                Pat::Tuple { elems, .. } => {
+                    let es = self.body.pat_lists.get(elems.range()).unwrap_or(&[]);
+                    let mut pushed = false;
+                    if let Some((ty, origs)) = &state
+                        && let Some((base_ty, drop)) = peel_refs(self, *ty, origs)?
+                        && let PNode::Tuple(tl) = self.node(base_ty, e)?
+                        && let Ok(tys) = self.list(tl, e)
+                        && tys.len() == es.len()
+                        && let Some(rest) = origs.get(drop..)
+                    {
+                        let mut off = 0usize;
+                        let mut ok = true;
+                        let mut entries: Vec<(PatId, TyD, Vec<Origin, A>), A> = Vec::with_capacity_in(es.len(), self.alloc);
+                        for (&sp, &el_ty) in es.iter().zip(tys.iter()) {
+                            let Ok(n) = usize::try_from(self.npos(el_ty, e)?) else {
+                                ok = false;
+                                break;
+                            };
+                            let Some(end) = off.checked_add(n) else {
+                                ok = false;
+                                break;
+                            };
+                            let Some(sl) = rest.get(off..end) else {
+                                ok = false;
+                                break;
+                            };
+                            let mut v: Vec<Origin, A> = Vec::with_capacity_in(n, self.alloc);
+                            v.extend_from_slice(sl);
+                            entries.push((sp, TyD::of(el_ty), v));
+                            off = end;
+                        }
+                        if ok {
+                            for (sp, ety, ev) in entries {
+                                stack.push((sp, Some((ety, ev))));
+                            }
+                            pushed = true;
+                        }
+                    }
+                    if !pushed {
+                        for &sp in es {
+                            stack.push((sp, None));
+                        }
+                    }
+                }
+                Pat::TupleStruct { elems, rest, .. } => {
+                    let es = self.body.pat_lists.get(elems.range()).unwrap_or(&[]);
+                    let mut pushed = false;
+                    if let Some((ty, origs)) = &state
+                        && let Some((base_ty, drop)) = peel_refs(self, *ty, origs)?
+                        && let PNode::Adt(adt, args_l) = self.node(base_ty, e)?
+                        && let Ok((v_adt, variant)) = self.variant_of(p)
+                        && v_adt == adt
+                        && let Some(n_fields) = self.facts.field_count(adt, variant)
+                        && let Ok(n_fields_usize) = usize::try_from(n_fields)
+                        && let Some(parent_origs) = origs.get(drop..)
+                    {
+                        let args = self.list(args_l, e)?;
+                        for (j, &sp) in es.iter().enumerate() {
+                            let fi = field_index(j, es.len(), n_fields_usize, rest);
+                            let next = match (
+                                self.ck.pat_ty.get(sp.ix()).copied(),
+                                self.slice_field_origs(adt, args, variant, fi, parent_origs, e)?,
+                            ) {
+                                (Some(fty), Some(fv)) => Some((TyD::of(fty), fv)),
+                                _ => None,
+                            };
+                            stack.push((sp, next));
+                        }
+                        pushed = true;
+                    }
+                    if !pushed {
+                        for &sp in es {
+                            stack.push((sp, None));
+                        }
+                    }
+                }
+                Pat::Struct { fields, .. } => {
+                    let fs = self.body.field_pats.get(fields.range()).unwrap_or(&[]);
+                    let mut pushed = false;
+                    if let Some((ty, origs)) = &state
+                        && let Some((base_ty, drop)) = peel_refs(self, *ty, origs)?
+                        && let PNode::Adt(adt, args_l) = self.node(base_ty, e)?
+                        && let Ok((v_adt, variant)) = self.variant_of(p)
+                        && v_adt == adt
+                        && let Some(parent_origs) = origs.get(drop..)
+                    {
+                        let args = self.list(args_l, e)?;
+                        for f in fs {
+                            let next = match (
+                                self.facts.field(adt, variant, f.name),
+                                self.ck.pat_ty.get(f.pat.ix()).copied(),
+                            ) {
+                                (Some(fi), Some(fty)) => self
+                                    .slice_field_origs(adt, args, variant, fi, parent_origs, e)?
+                                    .map(|fv| (TyD::of(fty), fv)),
+                                _ => None,
+                            };
+                            stack.push((f.pat, next));
+                        }
+                        pushed = true;
+                    }
+                    if !pushed {
+                        for f in fs {
+                            stack.push((f.pat, None));
+                        }
+                    }
+                }
+                Pat::Slice { elems, .. } => {
+                    let es = self.body.pat_lists.get(elems.range()).unwrap_or(&[]);
+                    let elem_state = if let Some((ty, origs)) = &state
+                        && let Some((base_ty, drop)) = peel_refs(self, *ty, origs)?
+                        && let Some(rest) = origs.get(drop..)
+                    {
+                        match self.node(base_ty, e)? {
+                            PNode::Array(el, _) | PNode::Slice(el) => Some((el, rest)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    for &sp in es {
+                        let next = elem_state.map(|(el, rest)| {
+                            let mut v: Vec<Origin, A> = Vec::with_capacity_in(rest.len(), self.alloc);
+                            v.extend_from_slice(rest);
+                            (TyD::of(el), v)
+                        });
+                        stack.push((sp, next));
+                    }
+                }
+                _ => {
+                    let mut subs: Vec<PatId, A> = Vec::new_in(self.alloc);
+                    self.sub_pats(pat, &mut subs)?;
+                    for sp in subs {
+                        stack.push((sp, None));
+                    }
                 }
             }
-            self.sub_pats(pat, &mut stack)?;
         }
         Ok(false)
     }

@@ -350,44 +350,44 @@ fn read_copy_impl<'a>(store: &Store<'_>, langs: super::BorrowLangs, adt: tc::Ite
     let [sized, meta_sized, pointee_sized, destruct] = langs.relates_nothing;
     let sized = sized.or_else(|| store.sized.map(checker_of));
     let adt_preds = store.preds.get(&adt)?;
-    // Lazily populated mapping from impl lifetime param index to ADT lifetime param index,
-    // read from `imp`'s self_ty region column when `imp` has a `RegionOutlives` clause.
-    let mut lt_map: Option<AVec<'a, Option<u32>>> = None;
-    for c in store.preds.get(&imp)?.clauses.iter() {
-        if let tc::PClause::RegionOutlives { long, short } = *c {
-            let map = match &mut lt_map {
-                Some(m) => m,
-                slot @ None => {
-                    let reader = store.regions.reader(store.work_alloc());
-                    let adt_lts = usize::try_from(store.adts.get(&adt)?.lifetimes).ok()?;
-                    let (self_col, _) = reader.impl_header(imp).ok()?;
-                    let self_slice = self_col.as_slice();
-                    if self_slice.len() < adt_lts {
+    // Always verify that `imp`'s self-type ADT lifetime slots are unconstrained (distinct
+    // `Region::Param`s). If the impl fixes `'static` (e.g. `Copy for StaticToken<'static, T>`)
+    // or equates two lifetimes (e.g. `Copy for SamePair<'a, 'a, T>`), return `None` so
+    // region-aware `inst_is_copy` enforces the exact lifetime obligations.
+    let adt_lts = usize::try_from(store.adts.get(&adt)?.lifetimes).ok()?;
+    let mut lt_map: AVec<'a, Option<u32>> = AVec::new_in(alloc);
+    {
+        let reader = store.regions.reader(store.work_alloc());
+        if let Ok((self_col, _)) = reader.impl_header(imp) {
+            let self_slice = self_col.as_slice();
+            if self_slice.len() != adt_lts {
+                return None;
+            }
+            for (j, &r) in self_slice.iter().enumerate() {
+                let Region::Param(imp_p) = r else {
+                    return None;
+                };
+                let pi = usize::try_from(imp_p).ok()?;
+                if lt_map.len() <= pi {
+                    lt_map.resize(pi + 1, None);
+                }
+                if let Some(entry) = lt_map.get_mut(pi) {
+                    if entry.is_some() {
                         return None;
                     }
-                    let mut m: AVec<'a, Option<u32>> = AVec::new_in(alloc);
-                    for (j, &r) in self_slice.get(..adt_lts)?.iter().enumerate() {
-                        if let Region::Param(imp_p) = r {
-                            let pi = usize::try_from(imp_p).ok()?;
-                            if m.len() <= pi {
-                                m.resize(pi + 1, None);
-                            }
-                            if let Some(entry) = m.get_mut(pi) {
-                                if entry.is_some() {
-                                    // Same impl lifetime bound twice on the ADT: cannot invert uniquely.
-                                    return None;
-                                }
-                                *entry = u32::try_from(j).ok();
-                            }
-                        }
-                    }
-                    slot.insert(m)
+                    *entry = u32::try_from(j).ok();
                 }
-            };
+            }
+        } else if adt_lts > 0 {
+            return None;
+        }
+    }
+    for c in store.preds.get(&imp)?.clauses.iter() {
+        if let tc::PClause::RegionOutlives { long, short } = *c {
             let map_reg = |r: Region| -> Option<Region> {
                 match r {
                     Region::Static => Some(Region::Static),
-                    Region::Param(p) => usize::try_from(p).ok().and_then(|pi| map.get(pi).copied().flatten()).map(Region::Param),
+                    Region::Param(p) => usize::try_from(p).ok().and_then(|pi| lt_map.get(pi).copied().flatten()).map(Region::Param),
                     Region::Late { .. } => None,
                 }
             };
@@ -1396,48 +1396,90 @@ struct InstAdtInfo {
     drop_impl: Option<bool>,
 }
 
+/// Owned result of [`InstDropEval::eval_body_copy`].
+pub(super) enum InstCopyOwned<'a> {
+    Yes,
+    No,
+    IfOutlives(AVec<'a, blaze_flow_lower::CopyOutlives>),
+    Unknown,
+}
+
+#[derive(Clone, Copy)]
+enum ReqRegs<'r> {
+    Exact(&'r [Region]),
+    Mapped(&'r [Option<u32>]),
+    Unchecked,
+}
+
 enum ImplMatch<'a> {
     Selected { imp: tc::ItemKey, subst: AVec<'a, tc::PTy>, trait_arg_count: usize },
+    SelectedIfOutlives {
+        imp: tc::ItemKey,
+        subst: AVec<'a, tc::PTy>,
+        trait_arg_count: usize,
+        outlives: AVec<'a, blaze_flow_lower::CopyOutlives>,
+    },
     None,
+    OutlivesUnproven,
     Unknown,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Truth {
+enum Truth<'a> {
     True,
+    TrueIfOutlives(AVec<'a, blaze_flow_lower::CopyOutlives>),
     False,
+    OutlivesUnproven,
     Unknown,
 }
 
-/// Bounded, sound instantiated drop-glue evaluator for concrete `PTy`s whose ADT summary was
-/// conservatively `needs_drop && !drop_impl` (e.g. `Flatten<...>`, `Split<'_, &str>`,
-/// `SplitWhitespace<'_>` whose fields hold `PNode::Alias`).
-///
-/// Substitutes ADT generic parameters into fields, normalizes `PNode::Alias` projections through
-/// `front2`'s impl index with strict `where`-clause verification (disqualifying non-matching
-/// blanket impls only when a clause is proven false), and proves `Some(false)` ONLY when every
-/// dropping field has zero drop glue. Returns `Some(true)` when any field or explicit `Drop` impl
-/// drops, or `None` when uncertain/generic — never unsoundly returning `Some(false)`.
-pub(super) struct InstDropEval<'a> {
+fn hash_region(h: &mut tc::StableHasher, r: Region) {
+    match r {
+        Region::Static => h.tag(0),
+        Region::Param(p) => {
+            h.tag(1);
+            h.u32(p);
+        }
+        Region::Late { binder, var } => {
+            h.tag(2);
+            h.u32(binder);
+            h.u32(var);
+        }
+    }
+}
+
+/// Bounded, sound instantiated drop-glue and conditional-`Copy` evaluator for concrete `PTy`s.
+pub(super) struct InstDropEval<'a, 'f> {
     tys: tc::PortableTys<'a>,
     memo: AVec<'a, (tc::PTy, Option<bool>)>,
     active: AVec<'a, tc::PTy>,
     active_goals: AVec<'a, (tc::ItemKey, tc::PTy)>,
     adt_cache: AVec<'a, (tc::ItemKey, InstAdtInfo)>,
+    adt_facts: Option<&'f crate::front2::adt_facts::AdtFactsTable<'a>>,
+    strict_outlives: bool,
+    owner_loaded: Option<tc::ItemKey>,
+    owner_clauses_incomplete: bool,
+    owner_traits: AVec<'a, (tc::ItemKey, AVec<'a, tc::PTy>, Option<AVec<'a, Region>>)>,
+    owner_projs: AVec<'a, (tc::ItemKey, tc::Name, AVec<'a, tc::PTy>, tc::PTy, Option<AVec<'a, Region>>)>,
     read_adts: AVec<'a, (u128, u64)>,
     read_impls: AVec<'a, (u128, u64)>,
     read_queries: AVec<'a, (u128, u64, u64)>,
     alloc: Alloc<'a>,
 }
 
-impl<'a> InstDropEval<'a> {
-    pub(super) fn new_in(alloc: Alloc<'a>) -> InstDropEval<'a> {
+impl<'a, 'f> InstDropEval<'a, 'f> {
+    pub(super) fn new_in(adt_facts: Option<&'f crate::front2::adt_facts::AdtFactsTable<'a>>, alloc: Alloc<'a>) -> InstDropEval<'a, 'f> {
         InstDropEval {
             tys: tc::PortableTys::new_in(alloc),
             memo: AVec::new_in(alloc),
             active: AVec::new_in(alloc),
             active_goals: AVec::new_in(alloc),
             adt_cache: AVec::new_in(alloc),
+            adt_facts,
+            strict_outlives: false,
+            owner_loaded: None,
+            owner_clauses_incomplete: false,
+            owner_traits: AVec::new_in(alloc),
+            owner_projs: AVec::new_in(alloc),
             read_adts: AVec::new_in(alloc),
             read_impls: AVec::new_in(alloc),
             read_queries: AVec::new_in(alloc),
@@ -1453,9 +1495,301 @@ impl<'a> InstDropEval<'a> {
         body_tys: tc::PTys<'_>,
         ty: tc::PTy,
     ) -> Option<bool> {
+        self.strict_outlives = false;
         let mut budget = MOST_INST_DROP_STEPS;
         let root = self.copy_from_table(body_tys, ty, None, 0, &mut budget)?;
         self.eval_inst_ty(r, langs, root, 0, &mut budget)
+    }
+
+    /// Evaluates whether the instantiated body type `ty` (in `body_tys`) implements `Copy`,
+    /// solving conditional `Copy` impls (including associated-type projection clauses like
+    /// `I: Invariants<Aliasing = Shared>`) under `owner`'s `where` clauses (with region columns
+    /// preserved) and returning any extra `TypeOutlives`/`RegionOutlives` obligations not
+    /// guaranteed by the ADT's well-formedness (`adt_facts`) or trivial `'static`-ness for
+    /// region-aware verification in `blaze-flow-lower`.
+    pub(super) fn eval_body_copy<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        langs: super::BorrowLangs,
+        owner: tc::ItemKey,
+        body_tys: tc::PTys<'_>,
+        ty: tc::PTy,
+    ) -> Option<InstCopyOwned<'a>> {
+        let copy = langs.copy?;
+        self.strict_outlives = true;
+        self.ensure_owner_clauses(r, owner);
+        let mut budget = MOST_INST_DROP_STEPS;
+        let Some(root) = self.copy_from_table(body_tys, ty, None, 0, &mut budget) else {
+            self.strict_outlives = false;
+            return Some(InstCopyOwned::Unknown);
+        };
+        let res = match self.prove_trait(r, langs, copy, &[root], Some(&[]), 0, &mut budget) {
+            Truth::True => Some(InstCopyOwned::Yes),
+            Truth::TrueIfOutlives(obs) => Some(InstCopyOwned::IfOutlives(obs)),
+            Truth::False | Truth::OutlivesUnproven if !self.owner_clauses_incomplete => Some(InstCopyOwned::No),
+            Truth::False | Truth::OutlivesUnproven | Truth::Unknown => Some(InstCopyOwned::Unknown),
+        };
+        self.strict_outlives = false;
+        res
+    }
+
+    fn ensure_owner_clauses<'n, S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, owner: tc::ItemKey) {
+        if self.owner_loaded == Some(owner) {
+            return;
+        }
+        self.owner_loaded = Some(owner);
+        self.owner_clauses_incomplete = false;
+        self.owner_traits.clear();
+        self.owner_projs.clear();
+        let mut budget = MOST_INST_DROP_STEPS;
+        if let Some(preds) = r.store.preds.get(&owner) {
+            let stys = r.store.tys.view();
+            let reader = r.store.regions.reader(r.store.work_alloc());
+            let owner_cregs = reader.clauses(owner).ok();
+            let alloc = self.alloc;
+            let clause_regs = |nth: usize| -> Option<AVec<'a, Region>> {
+                let nth32 = u32::try_from(nth).ok()?;
+                let cv = owner_cregs?.iter().find(|c| c.nth == nth32)?;
+                let mut v: AVec<'a, Region> = AVec::with_capacity_in(cv.col.as_slice().len(), alloc);
+                v.extend_from_slice(cv.col.as_slice());
+                Some(v)
+            };
+            for (nth, c) in preds.clauses.iter().enumerate() {
+                match *c {
+                    tc::PClause::Trait { trait_, args } => {
+                        if let Ok(al) = stys.list(args) {
+                            let mut inst: AVec<'a, tc::PTy> = AVec::with_capacity_in(al.len(), self.alloc);
+                            let mut ok = true;
+                            for &a in al {
+                                match self.copy_from_table(stys, a, None, 0, &mut budget) {
+                                    Some(t) => inst.push(t),
+                                    None => {
+                                        ok = false;
+                                        self.owner_clauses_incomplete = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            let regs = clause_regs(nth);
+                            if ok
+                                && !self.owner_traits.iter().any(|(ot, oa, or)| {
+                                    *ot == trait_
+                                        && oa.as_slice() == inst.as_slice()
+                                        && or.as_deref() == regs.as_deref()
+                                })
+                            {
+                                self.owner_traits.push((trait_, inst, regs));
+                            }
+                        } else {
+                            self.owner_clauses_incomplete = true;
+                        }
+                    }
+                    tc::PClause::Projection { trait_, name, args, term } => {
+                        if let Ok(al) = stys.list(args) {
+                            let mut inst: AVec<'a, tc::PTy> = AVec::with_capacity_in(al.len(), self.alloc);
+                            let mut ok = true;
+                            for &a in al {
+                                match self.copy_from_table(stys, a, None, 0, &mut budget) {
+                                    Some(t) => inst.push(t),
+                                    None => {
+                                        ok = false;
+                                        self.owner_clauses_incomplete = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            let regs = clause_regs(nth);
+                            if ok {
+                                if let Some(iterm) = self.copy_from_table(stys, term, None, 0, &mut budget) {
+                                    if !self.owner_projs.iter().any(|(pt, pn, pa, _, pr)| {
+                                        *pt == trait_
+                                            && *pn == name
+                                            && pa.as_slice() == inst.as_slice()
+                                            && pr.as_deref() == regs.as_deref()
+                                    }) {
+                                        self.owner_projs.push((trait_, name, inst, iterm, regs));
+                                    }
+                                } else {
+                                    self.owner_clauses_incomplete = true;
+                                }
+                            }
+                        } else {
+                            self.owner_clauses_incomplete = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Elaborate all reachable supertraits of `owner`'s trait clauses (deduplicated to break
+        // cycles; bounded by `budget` and flagging `owner_clauses_incomplete` if truncated or if a
+        // supertrait definition is unread) and record Rule 21 digests for each trait inspected.
+        let super_shape_digest = tc::StableHasher::new("blaze-ladder front2 inst drop super shape v1").finish();
+        let mut cursor = 0usize;
+        while cursor < self.owner_traits.len() {
+            if budget == 0 {
+                self.owner_clauses_incomplete = true;
+                break;
+            }
+            let Some((tr, tr_args, tr_regs_opt)) = self.owner_traits.get(cursor) else { break };
+            let tr = *tr;
+            let mut subst: AVec<'a, tc::PTy> = AVec::with_capacity_in(tr_args.len(), self.alloc);
+            subst.extend_from_slice(tr_args);
+            let tr_regs: Option<AVec<'a, Region>> = tr_regs_opt.as_ref().map(|v| {
+                let mut copy: AVec<'a, Region> = AVec::with_capacity_in(v.len(), self.alloc);
+                copy.extend_from_slice(v);
+                copy
+            });
+            cursor += 1;
+            if !r.store.trait_defs.contains_key(&tr)
+                && let Some(lib) = r.keys.library_in(r.names, tr)
+            {
+                super::ensure_one(r, Want::Members(lib));
+            }
+            let mut h = tc::StableHasher::new("blaze-ladder front2 inst drop super v2");
+            if let Some(def) = r.store.trait_defs.get(&tr) {
+                h.tag(1);
+                h.u32(u32::try_from(def.supertraits.len()).unwrap_or(u32::MAX));
+                let stys = r.store.tys.view();
+                let reader = r.store.regions.reader(r.store.work_alloc());
+                let tr_own_lts = reader.lifetime_params(tr).ok().map(|p| p.count());
+                if let Some(n) = tr_own_lts {
+                    h.tag(1);
+                    h.u32(n);
+                } else {
+                    h.tag(0);
+                }
+                let tr_cregs = reader.clauses(tr).ok();
+                if let Some(cls) = tr_cregs {
+                    h.tag(1);
+                    h.u32(u32::try_from(cls.len()).unwrap_or(u32::MAX));
+                    for cv in cls {
+                        h.u32(cv.nth);
+                        h.u32(u32::try_from(cv.col.as_slice().len()).unwrap_or(u32::MAX));
+                        for &reg in cv.col.as_slice() {
+                            hash_region(&mut h, reg);
+                        }
+                    }
+                } else {
+                    h.tag(0);
+                }
+                let alloc = self.alloc;
+                let mut hstack: AVec<'a, tc::PTy> = AVec::new_in(alloc);
+                for (s_nth, sc) in def.supertraits.iter().enumerate() {
+                    let s_regs = || -> Option<AVec<'a, Region>> {
+                        let nth32 = u32::try_from(s_nth).ok()?;
+                        let cv = tr_cregs?.iter().find(|c| c.nth == nth32)?;
+                        let sl = cv.col.as_slice();
+                        if sl.is_empty() {
+                            return Some(AVec::new_in(alloc));
+                        }
+                        let mut v: AVec<'a, Region> = AVec::with_capacity_in(sl.len(), alloc);
+                        for &reg in sl {
+                            match reg {
+                                Region::Static => v.push(Region::Static),
+                                Region::Param(p) => {
+                                    let own_n = tr_own_lts?;
+                                    if p >= own_n {
+                                        return None;
+                                    }
+                                    let pi = usize::try_from(p).ok()?;
+                                    let &owner_r = tr_regs.as_deref()?.get(pi)?;
+                                    v.push(owner_r);
+                                }
+                                Region::Late { .. } => return None,
+                            }
+                        }
+                        Some(v)
+                    };
+                    match *sc {
+                        tc::PClause::Trait { trait_: sup, args: sargs } => {
+                            h.tag(1);
+                            h.u128(sup.0);
+                            if let Ok(al) = stys.list(sargs) {
+                                h.u32(u32::try_from(al.len()).unwrap_or(u32::MAX));
+                                let mut inst: AVec<'a, tc::PTy> = AVec::with_capacity_in(al.len(), self.alloc);
+                                let mut ok = true;
+                                for &a in al {
+                                    let mut hb = MOST_DROP_NODES;
+                                    hash_pty_structural(stys, a, &mut h, &mut hb, &mut hstack);
+                                    if ok {
+                                        match self.copy_from_table(stys, a, Some(&subst), 0, &mut budget) {
+                                            Some(t) => inst.push(t),
+                                            None => {
+                                                ok = false;
+                                                self.owner_clauses_incomplete = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                let regs = s_regs();
+                                if ok
+                                    && !self.owner_traits.iter().any(|(ot, oa, or)| {
+                                        *ot == sup
+                                            && oa.as_slice() == inst.as_slice()
+                                            && or.as_deref() == regs.as_deref()
+                                    })
+                                {
+                                    self.owner_traits.push((sup, inst, regs));
+                                }
+                            } else {
+                                self.owner_clauses_incomplete = true;
+                            }
+                        }
+                        tc::PClause::Projection { trait_: sup, name, args: sargs, term } => {
+                            h.tag(2);
+                            h.u128(sup.0);
+                            h.u64(name.0);
+                            if let Ok(al) = stys.list(sargs) {
+                                h.u32(u32::try_from(al.len()).unwrap_or(u32::MAX));
+                                let mut inst: AVec<'a, tc::PTy> = AVec::with_capacity_in(al.len(), self.alloc);
+                                let mut ok = true;
+                                for &a in al {
+                                    let mut hb = MOST_DROP_NODES;
+                                    hash_pty_structural(stys, a, &mut h, &mut hb, &mut hstack);
+                                    if ok {
+                                        match self.copy_from_table(stys, a, Some(&subst), 0, &mut budget) {
+                                            Some(t) => inst.push(t),
+                                            None => {
+                                                ok = false;
+                                                self.owner_clauses_incomplete = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                let mut hb = MOST_DROP_NODES;
+                                hash_pty_structural(stys, term, &mut h, &mut hb, &mut hstack);
+                                let regs = s_regs();
+                                if ok {
+                                    if let Some(iterm) = self.copy_from_table(stys, term, Some(&subst), 0, &mut budget) {
+                                        if !self.owner_projs.iter().any(|(pt, pn, pa, _, pr)| {
+                                            *pt == sup
+                                                && *pn == name
+                                                && pa.as_slice() == inst.as_slice()
+                                                && pr.as_deref() == regs.as_deref()
+                                        }) {
+                                            self.owner_projs.push((sup, name, inst, iterm, regs));
+                                        }
+                                    } else {
+                                        self.owner_clauses_incomplete = true;
+                                    }
+                                }
+                            } else {
+                                self.owner_clauses_incomplete = true;
+                            }
+                        }
+                        _ => h.tag(0),
+                    }
+                }
+            } else {
+                h.tag(0);
+                self.owner_clauses_incomplete = true;
+            }
+            let super_digest = h.finish();
+            if !self.read_queries.iter().any(|&(t, sd, _)| t == tr.0 && sd == super_shape_digest) {
+                self.read_queries.push((tr.0, super_shape_digest, super_digest));
+            }
+        }
     }
 
     /// Flushes deduplicated Rule 21 read rows for every ADT, impl, and trait query inspected.
@@ -1615,11 +1949,11 @@ impl<'a> InstDropEval<'a> {
         } else {
             super::has_impl(r, langs.drop, adt).ok()
         };
-        let (made, is_union, generics) = match BodyHeadFacts::new(&*r.store, r.names).adt(adt) {
-            Some(row) => (true, row.kind == tc::AdtKind::Union, row.generics),
-            None => (false, false, 0),
+        let (made, is_union, generics, lifetimes) = match BodyHeadFacts::new(&*r.store, r.names).adt(adt) {
+            Some(row) => (true, row.kind == tc::AdtKind::Union, row.generics, row.lifetimes),
+            None => (false, false, 0, 0),
         };
-        let mut h = tc::StableHasher::new("blaze-ladder front2 inst drop adt v1");
+        let mut h = tc::StableHasher::new("blaze-ladder front2 inst drop adt v2");
         h.tag(u8::from(made));
         h.tag(u8::from(is_union));
         h.tag(u8::from(inert));
@@ -1630,6 +1964,7 @@ impl<'a> InstDropEval<'a> {
             Some(true) => h.tag(2),
         }
         h.u32(generics);
+        h.u32(lifetimes);
         if let Some(row) = BodyHeadFacts::new(&*r.store, r.names).adt(adt) {
             let stys = r.store.tys.view();
             let mut stack: AVec<'a, tc::PTy> = AVec::new_in(self.alloc);
@@ -1883,6 +2218,14 @@ impl<'a> InstDropEval<'a> {
             norm_args.push(self.normalize_deep(r, langs, a, norm_depth + 1, budget)?);
         }
         let &self_ty = norm_args.first()?;
+        if let Some(&(_, _, _, pterm, _)) = self.owner_projs.iter().find(|(pt, pn, pa, _, pr)| {
+            *pt == trait_
+                && *pn == name
+                && pa.as_slice() == norm_args.as_slice()
+                && (!self.strict_outlives || pr.as_deref() == Some(&[]))
+        }) {
+            return self.normalize_deep(r, langs, pterm, norm_depth + 1, budget);
+        }
         // Builtin `FnOnce::Output` on `FnPtr` or `FnDef`.
         if langs.fn_traits.contains(&Some(trait_)) && name == tc::Name::of("Output") {
             match self.tys.view().node(self_ty).ok()? {
@@ -1900,7 +2243,9 @@ impl<'a> InstDropEval<'a> {
                 _ => {}
             }
         }
-        let ImplMatch::Selected { imp, subst, trait_arg_count } = self.select_impl(r, langs, trait_, &norm_args, norm_depth + 1, budget) else {
+        let ImplMatch::Selected { imp, subst, trait_arg_count } =
+            self.select_impl(r, langs, trait_, &norm_args, ReqRegs::Exact(&[]), norm_depth + 1, budget)
+        else {
             return None;
         };
         let assoc_ty = {
@@ -1921,7 +2266,7 @@ impl<'a> InstDropEval<'a> {
         if self.read_impls.iter().any(|&(k, _)| k == imp.0) {
             return;
         }
-        let mut h = tc::StableHasher::new("blaze-ladder front2 inst drop impl v1");
+        let mut h = tc::StableHasher::new("blaze-ladder front2 inst drop impl v3");
         if let Some(head) = store.impls.get(&imp) {
             h.tag(1);
             h.u32(head.generics);
@@ -1942,10 +2287,55 @@ impl<'a> InstDropEval<'a> {
                 }
             }
             h.u32(u32::try_from(head.assoc.len()).unwrap_or(u32::MAX));
+            let reader = store.regions.reader(store.work_alloc());
             for &(name, ty) in head.assoc.iter() {
                 h.u64(name.0);
                 let mut hb = MOST_DROP_NODES;
                 hash_pty_structural(stys, ty, &mut h, &mut hb, &mut stack);
+                if let Ok(acol) = reader.impl_assoc(imp, name) {
+                    h.tag(1);
+                    let asl = acol.as_slice();
+                    h.u32(u32::try_from(asl.len()).unwrap_or(u32::MAX));
+                    for &r in asl {
+                        hash_region(&mut h, r);
+                    }
+                } else {
+                    h.tag(0);
+                }
+            }
+            if let Ok((self_col, trait_col)) = reader.impl_header(imp) {
+                h.tag(1);
+                let sl = self_col.as_slice();
+                h.u32(u32::try_from(sl.len()).unwrap_or(u32::MAX));
+                for &r in sl {
+                    hash_region(&mut h, r);
+                }
+                if let Some(tcol) = trait_col {
+                    h.tag(1);
+                    let tsl = tcol.as_slice();
+                    h.u32(u32::try_from(tsl.len()).unwrap_or(u32::MAX));
+                    for &r in tsl {
+                        hash_region(&mut h, r);
+                    }
+                } else {
+                    h.tag(0);
+                }
+            } else {
+                h.tag(0);
+            }
+            if let Ok(cls) = reader.clauses(imp) {
+                h.tag(1);
+                h.u32(u32::try_from(cls.len()).unwrap_or(u32::MAX));
+                for cv in cls {
+                    h.u32(cv.nth);
+                    let sl = cv.col.as_slice();
+                    h.u32(u32::try_from(sl.len()).unwrap_or(u32::MAX));
+                    for &r in sl {
+                        hash_region(&mut h, r);
+                    }
+                }
+            } else {
+                h.tag(0);
             }
             if let Some(preds) = store.preds.get(&imp) {
                 h.tag(1);
@@ -1977,6 +2367,17 @@ impl<'a> InstDropEval<'a> {
                             let mut hb = MOST_DROP_NODES;
                             hash_pty_structural(stys, term, &mut h, &mut hb, &mut stack);
                         }
+                        tc::PClause::TypeOutlives { ty, region } => {
+                            h.tag(4);
+                            let mut hb = MOST_DROP_NODES;
+                            hash_pty_structural(stys, ty, &mut h, &mut hb, &mut stack);
+                            hash_region(&mut h, region);
+                        }
+                        tc::PClause::RegionOutlives { long, short } => {
+                            h.tag(5);
+                            hash_region(&mut h, long);
+                            hash_region(&mut h, short);
+                        }
                         _ => h.tag(3),
                     }
                 }
@@ -1995,6 +2396,7 @@ impl<'a> InstDropEval<'a> {
         langs: super::BorrowLangs,
         trait_: tc::ItemKey,
         args: &[tc::PTy],
+        req_regs: ReqRegs<'_>,
         norm_depth: u32,
         budget: &mut u32,
     ) -> ImplMatch<'a> {
@@ -2006,8 +2408,10 @@ impl<'a> InstDropEval<'a> {
         if self.active_goals.scan_for(&(trait_, self_ty)).is_some() {
             return ImplMatch::Unknown;
         }
-        let Some(shape) = shape_of(self.tys.view(), self_ty) else {
-            return ImplMatch::Unknown;
+        let shape = match shape_of(self.tys.view(), self_ty) {
+            Some(s) => s,
+            None if matches!(self.tys.view().node(self_ty), Ok(tc::PNode::Param(_))) => tc::Shape::Param,
+            None => return ImplMatch::Unknown,
         };
         let (impls, has_gap) = if let Some(v) = answer_impls(r, trait_, shape) {
             (v, false)
@@ -2041,7 +2445,9 @@ impl<'a> InstDropEval<'a> {
         }
         self.active_goals.push((trait_, self_ty));
         let mut matched: Option<(tc::ItemKey, AVec<'a, tc::PTy>, usize)> = None;
+        let mut matched_outlives: Option<(tc::ItemKey, AVec<'a, tc::PTy>, usize, AVec<'a, blaze_flow_lower::CopyOutlives>)> = None;
         let mut saw_unknown = false;
+        let mut saw_outlives_unproven = false;
         let after_self = &args[1..];
         for &imp in impls.iter() {
             if !r.store.impls.contains_key(&imp) {
@@ -2109,31 +2515,381 @@ impl<'a> InstDropEval<'a> {
                 saw_unknown = true;
                 continue;
             };
+            // When checking a trait goal under `strict_outlives`, verify the candidate impl's
+            // header regions. For a top-level `Copy` impl (`norm_depth == 1`, `req_regs == Some(&[])`),
+            // map every slot of `self_col` (both top-level ADT lifetimes and lifetimes nested
+            // inside type arguments, e.g. `Copy for NestedRef<'a, &'a u8>` or
+            // `Copy for TwoArgs<'a, T, &'a u8>`) to its exact concrete origin index in `self_ty`,
+            // translating `'static` and repeated lifetime params into `CopyOutlives` obligations.
+            let mut header_obs: AVec<'a, blaze_flow_lower::CopyOutlives> = AVec::new_in(self.alloc);
+            if self.strict_outlives {
+                let top_copy_slot_pos = if norm_depth == 1
+                    && matches!(req_regs, ReqRegs::Exact(&[]))
+                    && let Some(pat_self) = r.store.impls.get(&imp).map(|h| h.self_ty)
+                {
+                    let mut pos: AVec<'a, u32> = AVec::new_in(self.alloc);
+                    let mut next_concrete = 0u32;
+                    if self.map_self_col_slots(r, langs, pat_self, self_ty, &mut pos, &mut next_concrete, 0, budget) {
+                        Some(pos)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let check_self_col = |sc: &[Region], obs: &mut AVec<'a, blaze_flow_lower::CopyOutlives>| -> bool {
+                    if let Some(slot_pos) = &top_copy_slot_pos
+                        && slot_pos.len() == sc.len()
+                    {
+                        for (j, &reg) in sc.iter().enumerate() {
+                            let Some(&cj) = slot_pos.get(j) else { return false };
+                            match reg {
+                                Region::Static => {
+                                    let ob = blaze_flow_lower::CopyOutlives::SlotEqOwner {
+                                        slot: cj,
+                                        owner_region: u32::MAX,
+                                    };
+                                    if obs.scan_for(&ob).is_none() {
+                                        obs.push(ob);
+                                    }
+                                }
+                                Region::Param(_) => {
+                                    if let Some(prev_i) = sc.get(..j).and_then(|pref| pref.iter().position(|r| *r == reg)) {
+                                        let Some(&ci) = slot_pos.get(prev_i) else { return false };
+                                        let ob1 = blaze_flow_lower::CopyOutlives::Region { long: ci, short: cj };
+                                        let ob2 = blaze_flow_lower::CopyOutlives::Region { long: cj, short: ci };
+                                        if obs.scan_for(&ob1).is_none() {
+                                            obs.push(ob1);
+                                        }
+                                        if obs.scan_for(&ob2).is_none() {
+                                            obs.push(ob2);
+                                        }
+                                    }
+                                }
+                                Region::Late { .. } => return false,
+                            }
+                        }
+                        true
+                    } else {
+                        sc.iter().enumerate().all(|(i, reg)| {
+                            matches!(*reg, Region::Param(_))
+                                && sc.get(..i).is_some_and(|prev| !prev.contains(reg))
+                        })
+                    }
+                };
+                let regs_ok = match req_regs {
+                    ReqRegs::Exact(rr) => {
+                        let reader = r.store.regions.reader(r.store.work_alloc());
+                        match reader.impl_header(imp) {
+                            Ok((self_col, Some(tcol))) => {
+                                let sc = self_col.as_slice();
+                                let tc = tcol.as_slice();
+                                check_self_col(sc, &mut header_obs)
+                                    && tc.len() == rr.len().saturating_add(sc.len())
+                                    && tc.get(..rr.len()) == Some(rr)
+                                    && tc.get(rr.len()..) == Some(sc)
+                            }
+                            Ok((self_col, None)) => {
+                                let sc = self_col.as_slice();
+                                rr.is_empty() && check_self_col(sc, &mut header_obs)
+                            }
+                            Err(_) => false,
+                        }
+                    }
+                    ReqRegs::Mapped(mapped) => {
+                        let reader = r.store.regions.reader(r.store.work_alloc());
+                        match reader.impl_header(imp) {
+                            Ok((self_col, Some(tcol))) => {
+                                let sc = self_col.as_slice();
+                                let tc = tcol.as_slice();
+                                if !check_self_col(sc, &mut header_obs)
+                                    || tc.len() != mapped.len().saturating_add(sc.len())
+                                    || tc.get(mapped.len()..) != Some(sc)
+                                {
+                                    false
+                                } else {
+                                    let trait_regs = tc.get(..mapped.len()).unwrap_or(&[]);
+                                    let mut ok = true;
+                                    for (j, (&imp_r, &req_slot)) in trait_regs.iter().zip(mapped.iter()).enumerate() {
+                                        match imp_r {
+                                            Region::Static => {
+                                                if let Some(slot) = req_slot {
+                                                    let ob = blaze_flow_lower::CopyOutlives::SlotEqOwner {
+                                                        slot,
+                                                        owner_region: u32::MAX,
+                                                    };
+                                                    if header_obs.scan_for(&ob).is_none() {
+                                                        header_obs.push(ob);
+                                                    }
+                                                }
+                                            }
+                                            Region::Param(_) => {
+                                                if sc.contains(&imp_r) {
+                                                    ok = false;
+                                                    break;
+                                                }
+                                                if let Some(prev_i) =
+                                                    trait_regs.get(..j).and_then(|pref| pref.iter().position(|r| *r == imp_r))
+                                                {
+                                                    let Some(&prev_slot) = mapped.get(prev_i) else {
+                                                        ok = false;
+                                                        break;
+                                                    };
+                                                    match (prev_slot, req_slot) {
+                                                        (None, None) => {}
+                                                        (None, Some(s)) | (Some(s), None) => {
+                                                            let ob = blaze_flow_lower::CopyOutlives::SlotEqOwner {
+                                                                slot: s,
+                                                                owner_region: u32::MAX,
+                                                            };
+                                                            if header_obs.scan_for(&ob).is_none() {
+                                                                header_obs.push(ob);
+                                                            }
+                                                        }
+                                                        (Some(s1), Some(s2)) if s1 != s2 => {
+                                                            let ob1 = blaze_flow_lower::CopyOutlives::Region { long: s1, short: s2 };
+                                                            let ob2 = blaze_flow_lower::CopyOutlives::Region { long: s2, short: s1 };
+                                                            if header_obs.scan_for(&ob1).is_none() {
+                                                                header_obs.push(ob1);
+                                                            }
+                                                            if header_obs.scan_for(&ob2).is_none() {
+                                                                header_obs.push(ob2);
+                                                            }
+                                                        }
+                                                        (Some(_), Some(_)) => {}
+                                                    }
+                                                }
+                                            }
+                                            Region::Late { .. } => {
+                                                ok = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    ok
+                                }
+                            }
+                            Ok((self_col, None)) => {
+                                let sc = self_col.as_slice();
+                                mapped.is_empty() && check_self_col(sc, &mut header_obs)
+                            }
+                            Err(_) => false,
+                        }
+                    }
+                    ReqRegs::Unchecked => false,
+                };
+                if !regs_ok {
+                    saw_outlives_unproven = true;
+                    continue;
+                }
+            }
             match self.check_impl_clauses(r, langs, imp, &subst, norm_depth + 1, budget) {
                 Truth::True => {
-                    if matched.is_some() {
+                    if matched.is_some() || matched_outlives.is_some() {
                         // Two distinct impls both proved: ambiguous, refuse conservatively.
                         self.active_goals.pop();
                         return ImplMatch::Unknown;
                     }
-                    matched = Some((imp, subst, trait_arg_count));
+                    if header_obs.is_empty() {
+                        matched = Some((imp, subst, trait_arg_count));
+                    } else {
+                        matched_outlives = Some((imp, subst, trait_arg_count, header_obs));
+                    }
+                }
+                Truth::TrueIfOutlives(mut obs) => {
+                    if matched.is_some() || matched_outlives.is_some() {
+                        self.active_goals.pop();
+                        return ImplMatch::Unknown;
+                    }
+                    for &ob in header_obs.iter() {
+                        if obs.scan_for(&ob).is_none() {
+                            obs.push(ob);
+                        }
+                    }
+                    matched_outlives = Some((imp, subst, trait_arg_count, obs));
                 }
                 Truth::False => {}
+                Truth::OutlivesUnproven => saw_outlives_unproven = true,
                 Truth::Unknown => saw_unknown = true,
             }
         }
         self.active_goals.pop();
-        match (matched, saw_unknown || has_gap) {
-            (Some((imp, subst, trait_arg_count)), false) => ImplMatch::Selected { imp, subst, trait_arg_count },
+        match (matched, matched_outlives, saw_unknown || has_gap) {
+            (Some((imp, subst, trait_arg_count)), None, false) => ImplMatch::Selected { imp, subst, trait_arg_count },
             // By Rust coherence (E0119) + RFC 1210, a positive impl with no `default` items cannot
             // be overlapped or specialized by another impl, so an unrelated candidate gap or
             // unknown clause in a large bucket (e.g. `IntoIterator for &T`) cannot override it.
             // Conversely, `ImplMatch::None` still requires `!saw_unknown && !has_gap`.
-            (Some((imp, subst, trait_arg_count)), true) if self.impl_has_no_default(r, imp) => {
+            (Some((imp, subst, trait_arg_count)), None, true) if self.impl_has_no_default(r, imp) => {
                 ImplMatch::Selected { imp, subst, trait_arg_count }
             }
-            (None, false) => ImplMatch::None,
+            (None, Some((imp, subst, trait_arg_count, outlives)), false) => {
+                ImplMatch::SelectedIfOutlives { imp, subst, trait_arg_count, outlives }
+            }
+            (None, Some((imp, subst, trait_arg_count, outlives)), true) if self.impl_has_no_default(r, imp) => {
+                ImplMatch::SelectedIfOutlives { imp, subst, trait_arg_count, outlives }
+            }
+            (None, None, false) if saw_outlives_unproven => ImplMatch::OutlivesUnproven,
+            (None, None, false) if shape != tc::Shape::Param => ImplMatch::None,
+            (None, None, _) if self.strict_outlives && !matches!(req_regs, ReqRegs::Exact(&[])) => ImplMatch::OutlivesUnproven,
             _ => ImplMatch::Unknown,
+        }
+    }
+
+    /// Flattened region-slot count (`npos`) of concrete `ty` in `self.tys` (for skipping over
+    /// concrete type arguments substituted into impl `Param` positions).
+    fn concrete_npos<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        langs: super::BorrowLangs,
+        ty: tc::PTy,
+        depth: u32,
+        budget: &mut u32,
+    ) -> Option<u32> {
+        if depth > MOST_INST_NORM_DEPTH || *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        match self.tys.view().node(ty).ok()? {
+            tc::PNode::Bool
+            | tc::PNode::Char
+            | tc::PNode::Int(_)
+            | tc::PNode::Uint(_)
+            | tc::PNode::Float(_)
+            | tc::PNode::Str
+            | tc::PNode::Never
+            | tc::PNode::ConstValue { .. }
+            | tc::PNode::ConstParam(_)
+            | tc::PNode::Param(_)
+            | tc::PNode::Foreign(_) => Some(0),
+            tc::PNode::Ref(_, inner) => Some(1u32.checked_add(self.concrete_npos(r, langs, inner, depth + 1, budget)?)?),
+            tc::PNode::Ptr(_, inner) | tc::PNode::Slice(inner) | tc::PNode::Array(inner, _) | tc::PNode::Pat(inner, _) => {
+                self.concrete_npos(r, langs, inner, depth + 1, budget)
+            }
+            tc::PNode::Tuple(l) | tc::PNode::Record(_, l) | tc::PNode::Union(l) => {
+                let elems = self.copy_own_list(l)?;
+                let mut n = 0u32;
+                for &el in elems.iter() {
+                    n = n.checked_add(self.concrete_npos(r, langs, el, depth + 1, budget)?)?;
+                }
+                Some(n)
+            }
+            tc::PNode::Adt(adt, l) => {
+                let info = self.adt_info(r, langs, adt);
+                if !info.made {
+                    return None;
+                }
+                let mut n = r.store.adts.get(&adt)?.lifetimes;
+                let args = self.copy_own_list(l)?;
+                for &a in args.iter() {
+                    n = n.checked_add(self.concrete_npos(r, langs, a, depth + 1, budget)?)?;
+                }
+                Some(n)
+            }
+            _ => None,
+        }
+    }
+
+    /// Maps every region slot in impl header pattern `pat_ty` (in `r.store.tys`) to its exact
+    /// flattened concrete origin offset in `concrete_ty` (in `self.tys`), advancing
+    /// `*next_concrete` past any concrete regions inside `Param` substitutions.
+    #[allow(clippy::too_many_arguments)]
+    fn map_self_col_slots<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        langs: super::BorrowLangs,
+        pat_ty: tc::PTy,
+        concrete_ty: tc::PTy,
+        out_pos: &mut AVec<'a, u32>,
+        next_concrete: &mut u32,
+        depth: u32,
+        budget: &mut u32,
+    ) -> bool {
+        if depth > MOST_INST_NORM_DEPTH || *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        let Ok(pat_node) = r.store.tys.view().node(pat_ty) else { return false };
+        let Ok(conc_node) = self.tys.view().node(concrete_ty) else { return false };
+        match (pat_node, conc_node) {
+            (tc::PNode::Param(_), _) => {
+                let Some(n) = self.concrete_npos(r, langs, concrete_ty, depth + 1, budget) else {
+                    return false;
+                };
+                let Some(next) = next_concrete.checked_add(n) else { return false };
+                *next_concrete = next;
+                true
+            }
+            (
+                tc::PNode::Bool
+                | tc::PNode::Char
+                | tc::PNode::Int(_)
+                | tc::PNode::Uint(_)
+                | tc::PNode::Float(_)
+                | tc::PNode::Str
+                | tc::PNode::Never
+                | tc::PNode::ConstValue { .. }
+                | tc::PNode::ConstParam(_)
+                | tc::PNode::Foreign(_),
+                _,
+            ) => true,
+            (tc::PNode::Ref(_, pi), tc::PNode::Ref(_, ci)) => {
+                out_pos.push(*next_concrete);
+                let Some(next) = next_concrete.checked_add(1) else { return false };
+                *next_concrete = next;
+                self.map_self_col_slots(r, langs, pi, ci, out_pos, next_concrete, depth + 1, budget)
+            }
+            (tc::PNode::Ptr(_, pi), tc::PNode::Ptr(_, ci))
+            | (tc::PNode::Slice(pi), tc::PNode::Slice(ci))
+            | (tc::PNode::Array(pi, _), tc::PNode::Array(ci, _))
+            | (tc::PNode::Pat(pi, _), tc::PNode::Pat(ci, _)) => {
+                self.map_self_col_slots(r, langs, pi, ci, out_pos, next_concrete, depth + 1, budget)
+            }
+            (tc::PNode::Tuple(pl), tc::PNode::Tuple(cl))
+            | (tc::PNode::Record(_, pl), tc::PNode::Record(_, cl))
+            | (tc::PNode::Union(pl), tc::PNode::Union(cl)) => {
+                let Ok(ps) = r.store.tys.view().list(pl) else { return false };
+                let mut pat_elems: AVec<'a, tc::PTy> = AVec::with_capacity_in(ps.len(), self.alloc);
+                pat_elems.extend_from_slice(ps);
+                let Some(conc_elems) = self.copy_own_list(cl) else { return false };
+                if pat_elems.len() != conc_elems.len() {
+                    return false;
+                }
+                for (&pe, &ce) in pat_elems.iter().zip(conc_elems.iter()) {
+                    if !self.map_self_col_slots(r, langs, pe, ce, out_pos, next_concrete, depth + 1, budget) {
+                        return false;
+                    }
+                }
+                true
+            }
+            (tc::PNode::Adt(padt, pl), tc::PNode::Adt(cadt, cl)) if padt == cadt => {
+                let info = self.adt_info(r, langs, padt);
+                if !info.made {
+                    return false;
+                }
+                let Some(lts) = r.store.adts.get(&padt).map(|row| row.lifetimes) else {
+                    return false;
+                };
+                for _ in 0..lts {
+                    out_pos.push(*next_concrete);
+                    let Some(next) = next_concrete.checked_add(1) else { return false };
+                    *next_concrete = next;
+                }
+                let Ok(ps) = r.store.tys.view().list(pl) else { return false };
+                let mut pat_args: AVec<'a, tc::PTy> = AVec::with_capacity_in(ps.len(), self.alloc);
+                pat_args.extend_from_slice(ps);
+                let Some(conc_args) = self.copy_own_list(cl) else { return false };
+                if pat_args.len() != conc_args.len() {
+                    return false;
+                }
+                for (&pa, &ca) in pat_args.iter().zip(conc_args.iter()) {
+                    if !self.map_self_col_slots(r, langs, pa, ca, out_pos, next_concrete, depth + 1, budget) {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => false,
         }
     }
 
@@ -2155,22 +2911,164 @@ impl<'a> InstDropEval<'a> {
         subst: &[tc::PTy],
         norm_depth: u32,
         budget: &mut u32,
-    ) -> Truth {
+    ) -> Truth<'a> {
         // Snapshot instantiated clauses from `r.store.preds` before recursively querying `r`.
         enum InstClause<'a> {
-            Trait(tc::ItemKey, AVec<'a, tc::PTy>),
+            Trait(tc::ItemKey, AVec<'a, tc::PTy>, Option<AVec<'a, Region>>),
+            /// Trait clause on a top-level `Copy` impl whose region column mentions impl lifetime
+            /// parameters mapped through `lt_map` (`None` = `'static`, `Some(slot)` = ADT lifetime slot).
+            TraitMapped(tc::ItemKey, AVec<'a, tc::PTy>, AVec<'a, Option<u32>>),
             Proj(tc::ItemKey, tc::Name, AVec<'a, tc::PTy>, tc::PTy),
+            /// Projection clause on a conditional `Copy` impl whose region column mentions
+            /// `'static` or impl lifetime parameters mapped through `lt_map`.
+            ProjMapped(tc::ItemKey, tc::Name, AVec<'a, tc::PTy>, tc::PTy, AVec<'a, Option<u32>>),
+            TypeOutlives(tc::PTy, Option<blaze_flow_lower::CopyOutlives>),
+            RegionOutlives(blaze_flow_lower::CopyOutlives),
+            OutlivesUnproven,
             Unknown,
         }
         let mut clauses: AVec<'a, InstClause<'a>> = AVec::new_in(self.alloc);
         {
+            use crate::front2::adt_outlives::Required;
             let Some(preds) = r.store.preds.get(&imp) else {
                 return Truth::Unknown;
             };
             let stys = r.store.tys.view();
-            for c in preds.clauses.iter() {
+            let reader = r.store.regions.reader(r.store.work_alloc());
+            let imp_cregs = if self.strict_outlives { reader.clauses(imp).ok() } else { None };
+            // When checking a `Copy` impl under `strict_outlives`, invert `imp`'s self type
+            // `Adt(adt, params...)` and its lifetime parameters against `adt_facts.required(adt)`
+            // (which holds both declared and RFC-2093 inferred outlives requirements of `adt`) and
+            // map impl lifetime params to the ADT's lifetime slots for outlives and regioned trait bounds.
+            let mut adt_req: Option<(Option<crate::front2::adt_outlives::Requirements<'_>>, AVec<'a, Option<u32>>, AVec<'a, Option<u32>>)> = None;
+            if self.strict_outlives
+                && let Some(head) = r.store.impls.get(&imp)
+                && let Ok(tc::PNode::Adt(adt, l)) = stys.node(head.self_ty)
+                && let Ok(self_args) = stys.list(l)
+            {
+                let mut param_of: AVec<'a, Option<u32>> = AVec::new_in(self.alloc);
+                let mut ok = true;
+                for &a in self_args {
+                    match stys.node(a) {
+                        Ok(tc::PNode::Param(p)) => {
+                            if param_of.scan_for(&Some(p)).is_some() {
+                                ok = false;
+                                break;
+                            }
+                            param_of.push(Some(p));
+                        }
+                        Ok(tc::PNode::ConstParam(_) | tc::PNode::ConstValue { .. }) => param_of.push(None),
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok
+                    && let Some(adt_row) = r.store.adts.get(&adt)
+                    && let Ok(adt_lts) = usize::try_from(adt_row.lifetimes)
+                    && let Ok((self_col, _)) = reader.impl_header(imp)
+                    && let Some(self_prefix) = self_col.as_slice().get(..adt_lts)
+                {
+                    let mut lt_map: AVec<'a, Option<u32>> = AVec::new_in(self.alloc);
+                    let mut lt_ok = true;
+                    for (j, &reg) in self_prefix.iter().enumerate() {
+                        if let Region::Param(imp_p) = reg {
+                            let Ok(pi) = usize::try_from(imp_p) else {
+                                lt_ok = false;
+                                break;
+                            };
+                            if lt_map.len() <= pi {
+                                lt_map.resize(pi + 1, None);
+                            }
+                            if let Some(slot) = lt_map.get_mut(pi)
+                                && slot.is_none()
+                            {
+                                *slot = u32::try_from(j).ok();
+                            }
+                        }
+                    }
+                    if lt_ok {
+                        let req = self.adt_facts.and_then(|table| table.required(adt.0).ok());
+                        adt_req = Some((req, param_of, lt_map));
+                    }
+                }
+            }
+            // `eval_body_copy` calls `prove_trait(norm_depth = 0)` -> `select_impl(1)` ->
+            // `check_impl_clauses(2)`. Only emit concrete `CopyOutlives` obligations at that
+            // top-level `Copy` impl, where `param_of`/`lt_map` map directly to the ADT's own args.
+            let can_emit_copy_ob = self.strict_outlives && norm_depth == 2;
+            for (nth, c) in preds.clauses.iter().enumerate() {
                 match *c {
-                    tc::PClause::TypeOutlives { .. } | tc::PClause::RegionOutlives { .. } => {}
+                    tc::PClause::RegionOutlives { long, short } => {
+                        if !self.strict_outlives || long == Region::Static || long == short {
+                            continue;
+                        }
+                        if let Some((req_opt, _, lt_map)) = &adt_req {
+                            let map_reg = |reg: Region| -> Option<Region> {
+                                match reg {
+                                    Region::Static => Some(Region::Static),
+                                    Region::Param(p) => usize::try_from(p).ok().and_then(|pi| lt_map.get(pi).copied().flatten()).map(Region::Param),
+                                    Region::Late { .. } => None,
+                                }
+                            };
+                            if let (Some(al), Some(as_)) = (map_reg(long), map_reg(short)) {
+                                if al == Region::Static
+                                    || al == as_
+                                    || req_opt.is_some_and(|req| req.regions.contains(&(al, as_)))
+                                {
+                                    continue;
+                                }
+                                if can_emit_copy_ob {
+                                    let to_idx = |reg: Region| match reg {
+                                        Region::Static => Some(u32::MAX),
+                                        Region::Param(j) => Some(j),
+                                        Region::Late { .. } => None,
+                                    };
+                                    if let (Some(li), Some(si)) = (to_idx(al), to_idx(as_)) {
+                                        clauses.push(InstClause::RegionOutlives(blaze_flow_lower::CopyOutlives::Region { long: li, short: si }));
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        clauses.push(if adt_req.is_some() { InstClause::OutlivesUnproven } else { InstClause::Unknown });
+                    }
+                    tc::PClause::TypeOutlives { ty, region } => {
+                        if !self.strict_outlives {
+                            continue;
+                        }
+                        let mut copy_ob: Option<blaze_flow_lower::CopyOutlives> = None;
+                        if let Some((req_opt, param_of, lt_map)) = &adt_req {
+                            let mapped_reg = match region {
+                                Region::Static => Some(Region::Static),
+                                Region::Param(p) => usize::try_from(p).ok().and_then(|pi| lt_map.get(pi).copied().flatten()).map(Region::Param),
+                                Region::Late { .. } => None,
+                            };
+                            if let (Ok(tc::PNode::Param(p)), Some(ar)) = (stys.node(ty), mapped_reg)
+                                && let Some(j) = param_of.iter().position(|&q| q == Some(p))
+                                && let Ok(j32) = u32::try_from(j)
+                            {
+                                if req_opt.is_some_and(|req| req.params.contains(&(j32, ar))) {
+                                    continue;
+                                }
+                                if can_emit_copy_ob {
+                                    let r_idx = match ar {
+                                        Region::Static => Some(u32::MAX),
+                                        Region::Param(k) => Some(k),
+                                        Region::Late { .. } => None,
+                                    };
+                                    if let Some(ri) = r_idx {
+                                        copy_ob = Some(blaze_flow_lower::CopyOutlives::Arg { arg: j32, region: ri });
+                                    }
+                                }
+                            }
+                        }
+                        match self.copy_from_table(stys, ty, Some(subst), 0, budget) {
+                            Some(inst_ty) => clauses.push(InstClause::TypeOutlives(inst_ty, copy_ob)),
+                            None => clauses.push(if adt_req.is_some() { InstClause::OutlivesUnproven } else { InstClause::Unknown }),
+                        }
+                    }
                     tc::PClause::Trait { trait_, args } => {
                         let Ok(al) = stys.list(args) else {
                             clauses.push(InstClause::Unknown);
@@ -2187,8 +3085,56 @@ impl<'a> InstDropEval<'a> {
                                 }
                             }
                         }
+                        let mut mapped_regs: Option<AVec<'a, Option<u32>>> = None;
+                        let req_regs = if self.strict_outlives {
+                            u32::try_from(nth)
+                                .ok()
+                                .and_then(|nth32| imp_cregs.and_then(|cls| cls.iter().find(|cv| cv.nth == nth32)))
+                                .and_then(|cv| {
+                                    let sl = cv.col.as_slice();
+                                    if sl.is_empty() || sl.iter().all(|reg| *reg == Region::Static) {
+                                        let mut v: AVec<'a, Region> = AVec::with_capacity_in(sl.len(), self.alloc);
+                                        v.extend_from_slice(sl);
+                                        Some(v)
+                                    } else {
+                                        if can_emit_copy_ob
+                                            && let Some((_, _, lt_map)) = &adt_req
+                                        {
+                                            let mut mv: AVec<'a, Option<u32>> = AVec::with_capacity_in(sl.len(), self.alloc);
+                                            let mut all_mapped = true;
+                                            for &reg in sl {
+                                                match reg {
+                                                    Region::Static => mv.push(None),
+                                                    Region::Param(p) => {
+                                                        if let Some(slot) = usize::try_from(p).ok().and_then(|pi| lt_map.get(pi).copied().flatten()) {
+                                                            mv.push(Some(slot));
+                                                        } else {
+                                                            all_mapped = false;
+                                                            break;
+                                                        }
+                                                    }
+                                                    Region::Late { .. } => {
+                                                        all_mapped = false;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            if all_mapped {
+                                                mapped_regs = Some(mv);
+                                            }
+                                        }
+                                        None
+                                    }
+                                })
+                        } else {
+                            Some(AVec::new_in(self.alloc))
+                        };
                         if ok {
-                            clauses.push(InstClause::Trait(trait_, inst_args));
+                            if let Some(mv) = mapped_regs {
+                                clauses.push(InstClause::TraitMapped(trait_, inst_args, mv));
+                            } else {
+                                clauses.push(InstClause::Trait(trait_, inst_args, req_regs));
+                            }
                         } else {
                             clauses.push(InstClause::Unknown);
                         }
@@ -2209,9 +3155,58 @@ impl<'a> InstDropEval<'a> {
                                 }
                             }
                         }
+                        let mut proj_mapped: Option<AVec<'a, Option<u32>>> = None;
+                        let proj_regs_ok = if self.strict_outlives {
+                            u32::try_from(nth)
+                                .ok()
+                                .and_then(|nth32| imp_cregs.and_then(|cls| cls.iter().find(|cv| cv.nth == nth32)))
+                                .is_some_and(|cv| {
+                                    let sl = cv.col.as_slice();
+                                    if sl.is_empty() {
+                                        return true;
+                                    }
+                                    if sl.iter().all(|reg| *reg == Region::Static) {
+                                        let mut mv: AVec<'a, Option<u32>> = AVec::with_capacity_in(sl.len(), self.alloc);
+                                        mv.resize(sl.len(), None);
+                                        proj_mapped = Some(mv);
+                                        return false;
+                                    }
+                                    if can_emit_copy_ob
+                                        && let Some((_, _, lt_map)) = &adt_req
+                                    {
+                                        let mut mv: AVec<'a, Option<u32>> = AVec::with_capacity_in(sl.len(), self.alloc);
+                                        let mut all_mapped = true;
+                                        for &reg in sl {
+                                            match reg {
+                                                Region::Static => mv.push(None),
+                                                Region::Param(p) => {
+                                                    if let Some(slot) = usize::try_from(p).ok().and_then(|pi| lt_map.get(pi).copied().flatten()) {
+                                                        mv.push(Some(slot));
+                                                    } else {
+                                                        all_mapped = false;
+                                                        break;
+                                                    }
+                                                }
+                                                Region::Late { .. } => {
+                                                    all_mapped = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if all_mapped {
+                                            proj_mapped = Some(mv);
+                                        }
+                                    }
+                                    false
+                                })
+                        } else {
+                            true
+                        };
                         let inst_term = self.copy_from_table(stys, term, Some(subst), 0, budget);
-                        match (ok, inst_term) {
-                            (true, Some(t)) => clauses.push(InstClause::Proj(trait_, name, inst_args, t)),
+                        match (ok, proj_regs_ok, proj_mapped, inst_term) {
+                            (true, true, _, Some(t)) => clauses.push(InstClause::Proj(trait_, name, inst_args, t)),
+                            (true, false, Some(mv), Some(t)) => clauses.push(InstClause::ProjMapped(trait_, name, inst_args, t, mv)),
+                            (true, false, None, Some(_)) => clauses.push(InstClause::OutlivesUnproven),
                             _ => clauses.push(InstClause::Unknown),
                         }
                     }
@@ -2222,14 +3217,293 @@ impl<'a> InstDropEval<'a> {
             }
         }
         let mut any_unknown = false;
+        let mut any_outlives_unproven = false;
+        let mut extra_outlives: AVec<'a, blaze_flow_lower::CopyOutlives> = AVec::new_in(self.alloc);
         for cl in clauses.iter() {
             match cl {
                 InstClause::Unknown => any_unknown = true,
-                InstClause::Trait(ct, cargs) => {
-                    match self.prove_trait(r, langs, *ct, cargs, norm_depth, budget) {
+                InstClause::OutlivesUnproven => any_outlives_unproven = true,
+                InstClause::RegionOutlives(ob) => {
+                    if extra_outlives.scan_for(ob).is_none() {
+                        extra_outlives.push(*ob);
+                    }
+                }
+                InstClause::TypeOutlives(inst_ty, copy_ob) => {
+                    if !self.is_trivially_static(r, langs, *inst_ty, 0, budget) {
+                        if let Some(ob) = *copy_ob {
+                            if extra_outlives.scan_for(&ob).is_none() {
+                                extra_outlives.push(ob);
+                            }
+                        } else if self.adt_facts.is_some() {
+                            any_outlives_unproven = true;
+                        } else {
+                            any_unknown = true;
+                        }
+                    }
+                }
+                InstClause::Trait(ct, cargs, req_regs) => {
+                    match self.prove_trait(r, langs, *ct, cargs, req_regs.as_deref(), norm_depth, budget) {
                         Truth::True => {}
+                        Truth::TrueIfOutlives(_) => any_outlives_unproven = true,
                         Truth::False => return Truth::False,
+                        Truth::OutlivesUnproven => any_outlives_unproven = true,
                         Truth::Unknown => any_unknown = true,
+                    }
+                }
+                InstClause::TraitMapped(ct, cargs, mapped) => {
+                    let mut norm_args: AVec<'a, tc::PTy> = AVec::with_capacity_in(cargs.len(), self.alloc);
+                    let mut norm_ok = true;
+                    for &a in cargs.iter() {
+                        match self.normalize_deep(r, langs, a, norm_depth + 1, budget) {
+                            Some(na) => norm_args.push(na),
+                            None => {
+                                norm_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !norm_ok {
+                        any_unknown = true;
+                        continue;
+                    }
+                    // Match `owner_traits` for `(ct, norm_args)` and translate each mapped ADT
+                    // lifetime slot into a `CopyOutlives::SlotEqOwner` obligation to be verified
+                    // against the concrete place's origins in `blaze-flow-lower`.
+                    let mut matched_obs: Option<AVec<'a, blaze_flow_lower::CopyOutlives>> = None;
+                    let mut ambiguous = false;
+                    for (ot, oargs, oregs) in self.owner_traits.iter() {
+                        let Some(or) = oregs.as_deref() else { continue };
+                        if *ot != *ct || oargs.as_slice() != norm_args.as_slice() || or.len() != mapped.len() {
+                            continue;
+                        }
+                        let mut obs: AVec<'a, blaze_flow_lower::CopyOutlives> = AVec::new_in(self.alloc);
+                        let mut row_ok = true;
+                        for (&m_slot, &owner_r) in mapped.iter().zip(or.iter()) {
+                            match (m_slot, owner_r) {
+                                (None, Region::Static) => {}
+                                (Some(slot), Region::Static) => {
+                                    let ob = blaze_flow_lower::CopyOutlives::SlotEqOwner { slot, owner_region: u32::MAX };
+                                    if obs.scan_for(&ob).is_none() {
+                                        obs.push(ob);
+                                    }
+                                }
+                                (Some(slot), Region::Param(k)) => {
+                                    let ob = blaze_flow_lower::CopyOutlives::SlotEqOwner { slot, owner_region: k };
+                                    if obs.scan_for(&ob).is_none() {
+                                        obs.push(ob);
+                                    }
+                                }
+                                _ => {
+                                    row_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if row_ok {
+                            match &matched_obs {
+                                None => matched_obs = Some(obs),
+                                Some(prev) if prev.as_slice() == obs.as_slice() => {}
+                                Some(_) => {
+                                    ambiguous = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if !ambiguous && let Some(obs) = matched_obs {
+                        for &ob in obs.iter() {
+                            if extra_outlives.scan_for(&ob).is_none() {
+                                extra_outlives.push(ob);
+                            }
+                        }
+                    } else if ambiguous {
+                        any_unknown = true;
+                    } else {
+                        // Also consult concrete trait impls when no owner clause matched (e.g.
+                        // `impl<'a> Marker<'a> for Concrete` under `impl<'a, T: Marker<'a>> Copy`).
+                        match self.select_impl(r, langs, *ct, &norm_args, ReqRegs::Mapped(mapped), norm_depth + 1, budget) {
+                            ImplMatch::Selected { .. } => {}
+                            ImplMatch::SelectedIfOutlives { outlives, .. } => {
+                                for &ob in outlives.iter() {
+                                    if extra_outlives.scan_for(&ob).is_none() {
+                                        extra_outlives.push(ob);
+                                    }
+                                }
+                            }
+                            ImplMatch::None => return Truth::False,
+                            ImplMatch::OutlivesUnproven => any_outlives_unproven = true,
+                            ImplMatch::Unknown => any_unknown = true,
+                        }
+                    }
+                }
+                InstClause::ProjMapped(pt, pn, pargs, pterm, mapped) => {
+                    let mut norm_args: AVec<'a, tc::PTy> = AVec::with_capacity_in(pargs.len(), self.alloc);
+                    let mut norm_ok = true;
+                    for &a in pargs.iter() {
+                        match self.normalize_deep(r, langs, a, norm_depth + 1, budget) {
+                            Some(na) => norm_args.push(na),
+                            None => {
+                                norm_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    let Some(norm_term) = self.normalize_deep(r, langs, *pterm, norm_depth + 1, budget) else {
+                        any_unknown = true;
+                        continue;
+                    };
+                    if !norm_ok {
+                        any_unknown = true;
+                        continue;
+                    }
+                    let mut matched_obs: Option<AVec<'a, blaze_flow_lower::CopyOutlives>> = None;
+                    let mut ambiguous = false;
+                    let mut saw_owner_unknown = false;
+                    for op_ix in 0..self.owner_projs.len() {
+                        let Some((opt, opn, opargs, opterm, oregs)) = self.owner_projs.get(op_ix) else { break };
+                        let Some(or) = oregs.as_deref() else { continue };
+                        if *opt != *pt || *opn != *pn || opargs.as_slice() != norm_args.as_slice() || or.len() != mapped.len() {
+                            continue;
+                        }
+                        let opterm = *opterm;
+                        let mut obs: AVec<'a, blaze_flow_lower::CopyOutlives> = AVec::new_in(self.alloc);
+                        let mut row_ok = true;
+                        for (&m_slot, &owner_r) in mapped.iter().zip(or.iter()) {
+                            match (m_slot, owner_r) {
+                                (None, Region::Static) => {}
+                                (Some(slot), Region::Static) => {
+                                    let ob = blaze_flow_lower::CopyOutlives::SlotEqOwner { slot, owner_region: u32::MAX };
+                                    if obs.scan_for(&ob).is_none() {
+                                        obs.push(ob);
+                                    }
+                                }
+                                (Some(slot), Region::Param(k)) => {
+                                    let ob = blaze_flow_lower::CopyOutlives::SlotEqOwner { slot, owner_region: k };
+                                    if obs.scan_for(&ob).is_none() {
+                                        obs.push(ob);
+                                    }
+                                }
+                                _ => {
+                                    row_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !row_ok {
+                            continue;
+                        }
+                        let Some(norm_opterm) = self.normalize_deep(r, langs, opterm, norm_depth + 1, budget) else {
+                            saw_owner_unknown = true;
+                            continue;
+                        };
+                        if norm_opterm != norm_term {
+                            continue;
+                        }
+                        match &matched_obs {
+                            None => matched_obs = Some(obs),
+                            Some(prev) if prev.as_slice() == obs.as_slice() => {}
+                            Some(_) => {
+                                ambiguous = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !ambiguous && let Some(obs) = matched_obs {
+                        for &ob in obs.iter() {
+                            if extra_outlives.scan_for(&ob).is_none() {
+                                extra_outlives.push(ob);
+                            }
+                        }
+                    } else if ambiguous || saw_owner_unknown {
+                        any_unknown = true;
+                    } else {
+                        // Consult concrete impls when no owner projection matched (e.g.
+                        // `impl<'a> Has<'a> for Concrete { type Out = u8; }`).
+                        match self.select_impl(r, langs, *pt, &norm_args, ReqRegs::Mapped(mapped), norm_depth + 1, budget) {
+                            ImplMatch::Selected { imp, subst, trait_arg_count } => {
+                                let assoc_ty = r.store.impls.get(&imp).and_then(|head| {
+                                    head.assoc.iter().find(|&&(n, _)| n == *pn).map(|&(_, t)| t)
+                                });
+                                let assoc_regs_empty = r
+                                    .store
+                                    .regions
+                                    .reader(r.store.work_alloc())
+                                    .impl_assoc(imp, *pn)
+                                    .is_ok_and(|c| c.as_slice().is_empty());
+                                if let Some(aty) = assoc_ty {
+                                    let mut full_subst: AVec<'a, tc::PTy> =
+                                        AVec::with_capacity_in(subst.len() + norm_args.len(), self.alloc);
+                                    full_subst.extend_from_slice(&subst);
+                                    if let Some(gat_args) = norm_args.get(1 + trait_arg_count..) {
+                                        full_subst.extend_from_slice(gat_args);
+                                    }
+                                    let stys = r.store.tys.view();
+                                    let norm_assoc = self
+                                        .copy_from_table(stys, aty, Some(&full_subst), 0, budget)
+                                        .and_then(|inst| self.normalize_deep(r, langs, inst, norm_depth + 1, budget));
+                                    match norm_assoc {
+                                        Some(na) if na == norm_term && assoc_regs_empty => {}
+                                        Some(na)
+                                            if na != norm_term
+                                                && self.is_concrete_normalized(na)
+                                                && self.is_concrete_normalized(norm_term) =>
+                                        {
+                                            return Truth::False;
+                                        }
+                                        Some(_) if !assoc_regs_empty => any_outlives_unproven = true,
+                                        _ => any_unknown = true,
+                                    }
+                                } else {
+                                    any_unknown = true;
+                                }
+                            }
+                            ImplMatch::SelectedIfOutlives { imp, subst, trait_arg_count, outlives } => {
+                                let assoc_ty = r.store.impls.get(&imp).and_then(|head| {
+                                    head.assoc.iter().find(|&&(n, _)| n == *pn).map(|&(_, t)| t)
+                                });
+                                let assoc_regs_empty = r
+                                    .store
+                                    .regions
+                                    .reader(r.store.work_alloc())
+                                    .impl_assoc(imp, *pn)
+                                    .is_ok_and(|c| c.as_slice().is_empty());
+                                if let Some(aty) = assoc_ty {
+                                    let mut full_subst: AVec<'a, tc::PTy> =
+                                        AVec::with_capacity_in(subst.len() + norm_args.len(), self.alloc);
+                                    full_subst.extend_from_slice(&subst);
+                                    if let Some(gat_args) = norm_args.get(1 + trait_arg_count..) {
+                                        full_subst.extend_from_slice(gat_args);
+                                    }
+                                    let stys = r.store.tys.view();
+                                    let norm_assoc = self
+                                        .copy_from_table(stys, aty, Some(&full_subst), 0, budget)
+                                        .and_then(|inst| self.normalize_deep(r, langs, inst, norm_depth + 1, budget));
+                                    match norm_assoc {
+                                        Some(na) if na == norm_term && assoc_regs_empty => {
+                                            for &ob in outlives.iter() {
+                                                if extra_outlives.scan_for(&ob).is_none() {
+                                                    extra_outlives.push(ob);
+                                                }
+                                            }
+                                        }
+                                        Some(na)
+                                            if na != norm_term
+                                                && self.is_concrete_normalized(na)
+                                                && self.is_concrete_normalized(norm_term) =>
+                                        {
+                                            return Truth::False;
+                                        }
+                                        Some(_) if !assoc_regs_empty => any_outlives_unproven = true,
+                                        _ => any_unknown = true,
+                                    }
+                                } else {
+                                    any_unknown = true;
+                                }
+                            }
+                            ImplMatch::None => return Truth::False,
+                            ImplMatch::OutlivesUnproven => any_outlives_unproven = true,
+                            ImplMatch::Unknown => any_unknown = true,
+                        }
                     }
                 }
                 InstClause::Proj(pt, pn, pargs, pterm) => {
@@ -2255,7 +3529,66 @@ impl<'a> InstDropEval<'a> {
                 }
             }
         }
-        if any_unknown { Truth::Unknown } else { Truth::True }
+        if any_outlives_unproven {
+            Truth::OutlivesUnproven
+        } else if any_unknown {
+            Truth::Unknown
+        } else if !extra_outlives.is_empty() {
+            Truth::TrueIfOutlives(extra_outlives)
+        } else {
+            Truth::True
+        }
+    }
+
+    /// Whether `ty` in `self.tys` is provably `'static` (contains no references, no lifetime-bearing
+    /// ADTs, and no generic/alias/opaque/dyn/closure nodes), so `ty: 'r` holds for every region `'r`.
+    fn is_trivially_static<'n, S: NamesSource<'n>>(
+        &mut self,
+        r: &mut Records<'_, 'n, S>,
+        langs: super::BorrowLangs,
+        ty: tc::PTy,
+        depth: u32,
+        budget: &mut u32,
+    ) -> bool {
+        if depth > MOST_INST_NORM_DEPTH || *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        let Ok(node) = self.tys.view().node(ty) else {
+            return false;
+        };
+        match node {
+            tc::PNode::Bool
+            | tc::PNode::Char
+            | tc::PNode::Int(_)
+            | tc::PNode::Uint(_)
+            | tc::PNode::Float(_)
+            | tc::PNode::Str
+            | tc::PNode::Never
+            | tc::PNode::ConstValue { .. }
+            | tc::PNode::ConstParam(_)
+            | tc::PNode::Foreign(_) => true,
+            tc::PNode::Ptr(_, inner) | tc::PNode::Slice(inner) | tc::PNode::Array(inner, _) | tc::PNode::Pat(inner, _) => {
+                self.is_trivially_static(r, langs, inner, depth + 1, budget)
+            }
+            tc::PNode::Tuple(l) | tc::PNode::Record(_, l) | tc::PNode::Union(l) => {
+                let Some(elems) = self.copy_own_list(l) else { return false };
+                elems.iter().all(|&el| self.is_trivially_static(r, langs, el, depth + 1, budget))
+            }
+            tc::PNode::Adt(adt, args_list) => {
+                let info = self.adt_info(r, langs, adt);
+                if !info.made {
+                    return false;
+                }
+                let lts = BodyHeadFacts::new(&*r.store, r.names).adt(adt).map(|row| row.lifetimes);
+                if lts != Some(0) {
+                    return false;
+                }
+                let Some(args) = self.copy_own_list(args_list) else { return false };
+                args.iter().all(|&a| self.is_trivially_static(r, langs, a, depth + 1, budget))
+            }
+            _ => false,
+        }
     }
 
     fn is_concrete_normalized(&self, ty: tc::PTy) -> bool {
@@ -2271,9 +3604,10 @@ impl<'a> InstDropEval<'a> {
         langs: super::BorrowLangs,
         trait_: tc::ItemKey,
         raw_args: &[tc::PTy],
+        req_regs: Option<&[Region]>,
         norm_depth: u32,
         budget: &mut u32,
-    ) -> Truth {
+    ) -> Truth<'a> {
         if norm_depth > MOST_INST_NORM_DEPTH || *budget == 0 {
             return Truth::Unknown;
         }
@@ -2290,8 +3624,25 @@ impl<'a> InstDropEval<'a> {
             }
         }
         let Some(&self_ty) = args.first() else { return Truth::Unknown };
+        let owner_matches = |want_tr: tc::ItemKey| -> bool {
+            self.owner_traits.iter().any(|(ot, oargs, oregs)| {
+                *ot == want_tr
+                    && oargs.as_slice() == args.as_slice()
+                    && (!self.strict_outlives
+                        || matches!((req_regs, oregs.as_deref()), (Some(rr), Some(or)) if rr == or))
+            })
+        };
+        if owner_matches(trait_) {
+            return Truth::True;
+        }
+        if Some(trait_) == meta_sized
+            && let Some(sz) = sized
+            && owner_matches(sz)
+        {
+            return Truth::True;
+        }
         if Some(trait_) == sized || Some(trait_) == meta_sized {
-            return match self.is_known_sized(r, self_ty, 0, budget) {
+            return match self.is_known_sized(r, sized, self_ty, 0, budget) {
                 Some(true) => Truth::True,
                 Some(false) if Some(trait_) == sized => Truth::False,
                 _ => Truth::Unknown,
@@ -2339,9 +3690,69 @@ impl<'a> InstDropEval<'a> {
                 _ => {}
             }
         }
-        match self.select_impl(r, langs, trait_, &args, norm_depth + 1, budget) {
+        if Some(trait_) == langs.copy {
+            match self.tys.view().node(self_ty) {
+                Ok(
+                    tc::PNode::Bool
+                    | tc::PNode::Char
+                    | tc::PNode::Int(_)
+                    | tc::PNode::Uint(_)
+                    | tc::PNode::Float(_)
+                    | tc::PNode::Never
+                    | tc::PNode::Ptr(..)
+                    | tc::PNode::Ref(tc::Mutbl::Not, _)
+                    | tc::PNode::FnDef(..)
+                    | tc::PNode::FnPtr(..)
+                    | tc::PNode::ConstValue { .. }
+                    | tc::PNode::ConstParam(_),
+                ) => return Truth::True,
+                Ok(
+                    tc::PNode::Ref(tc::Mutbl::Mut, _)
+                    | tc::PNode::Str
+                    | tc::PNode::Slice(_)
+                    | tc::PNode::Dynamic(_)
+                    | tc::PNode::Foreign(_),
+                ) => return Truth::False,
+                Ok(tc::PNode::Array(elem, _) | tc::PNode::Pat(elem, _)) => {
+                    return self.prove_trait(r, langs, trait_, &[elem], Some(&[]), norm_depth + 1, budget);
+                }
+                Ok(tc::PNode::Tuple(l) | tc::PNode::Record(_, l) | tc::PNode::Union(l)) => {
+                    let Some(elems) = self.copy_own_list(l) else { return Truth::Unknown };
+                    let mut any_unknown = false;
+                    let mut any_outlives_unproven = false;
+                    for &el in elems.iter() {
+                        match self.prove_trait(r, langs, trait_, &[el], Some(&[]), norm_depth + 1, budget) {
+                            Truth::True => {}
+                            Truth::TrueIfOutlives(_) => any_outlives_unproven = true,
+                            Truth::False => return Truth::False,
+                            Truth::OutlivesUnproven => any_outlives_unproven = true,
+                            Truth::Unknown => any_unknown = true,
+                        }
+                    }
+                    return if any_outlives_unproven {
+                        Truth::OutlivesUnproven
+                    } else if any_unknown {
+                        Truth::Unknown
+                    } else {
+                        Truth::True
+                    };
+                }
+                Ok(tc::PNode::Adt(..)) => {}
+                Ok(tc::PNode::Param(_)) => {
+                    return if self.strict_outlives { Truth::False } else { Truth::Unknown };
+                }
+                Ok(_) | Err(_) => return Truth::Unknown,
+            }
+        }
+        let req = match req_regs {
+            Some(rr) => ReqRegs::Exact(rr),
+            None => ReqRegs::Unchecked,
+        };
+        match self.select_impl(r, langs, trait_, &args, req, norm_depth + 1, budget) {
             ImplMatch::Selected { .. } => Truth::True,
+            ImplMatch::SelectedIfOutlives { outlives, .. } => Truth::TrueIfOutlives(outlives),
             ImplMatch::None => Truth::False,
+            ImplMatch::OutlivesUnproven => Truth::OutlivesUnproven,
             ImplMatch::Unknown => Truth::Unknown,
         }
     }
@@ -2349,6 +3760,7 @@ impl<'a> InstDropEval<'a> {
     fn is_known_sized<'n, S: NamesSource<'n>>(
         &mut self,
         r: &mut Records<'_, 'n, S>,
+        sized: Option<tc::ItemKey>,
         ty: tc::PTy,
         depth: u32,
         budget: &mut u32,
@@ -2372,11 +3784,20 @@ impl<'a> InstDropEval<'a> {
             | tc::PNode::ConstValue { .. }
             | tc::PNode::ConstParam(_) => Some(true),
             tc::PNode::Str | tc::PNode::Slice(_) | tc::PNode::Dynamic(_) | tc::PNode::Foreign(_) => Some(false),
-            tc::PNode::Pat(inner, _) => self.is_known_sized(r, inner, depth + 1, budget),
+            tc::PNode::Pat(inner, _) => self.is_known_sized(r, sized, inner, depth + 1, budget),
+            tc::PNode::Param(_) => {
+                if let Some(sz) = sized
+                    && self.owner_traits.iter().any(|(ot, oargs, _)| *ot == sz && oargs.as_slice() == [ty])
+                {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
             tc::PNode::Tuple(l) | tc::PNode::Record(_, l) | tc::PNode::Union(l) => {
                 let elems = self.copy_own_list(l)?;
                 for &e in elems.iter() {
-                    if !self.is_known_sized(r, e, depth + 1, budget)? {
+                    if !self.is_known_sized(r, sized, e, depth + 1, budget)? {
                         return Some(false);
                     }
                 }
@@ -2400,7 +3821,7 @@ impl<'a> InstDropEval<'a> {
                     let stys = r.store.tys.view();
                     self.copy_from_table(stys, last.ty, Some(&args), 0, budget)?
                 };
-                self.is_known_sized(r, last_field, depth + 1, budget)
+                self.is_known_sized(r, sized, last_field, depth + 1, budget)
             }
             _ => None,
         }
@@ -2796,7 +4217,7 @@ pub(super) fn inst_needs_drop<'n, 'a, S: NamesSource<'n>>(
     reads: &mut AVec<'a, Read>,
     alloc: Alloc<'a>,
 ) -> Option<bool> {
-    let mut eval = InstDropEval::new_in(alloc);
+    let mut eval = InstDropEval::new_in(None, alloc);
     let res = eval.eval_body_ty(r, langs, body_tys, ty);
     eval.push_reads(reads);
     res

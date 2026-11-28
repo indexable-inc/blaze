@@ -89,14 +89,14 @@ fn own_bodies_move_and_borrow_checked() {
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
     let mut world = ProjectWorld::new(&names, &frame, &sources, heap.alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let bodies = world.bodies(heap.alloc());
+    let bodies = world.listed_with(blaze_ladder::front2::project_records::Listing::FnsAndInitializers, heap.alloc());
     let name_of = |b: &BodyRef<'_>| -> String {
         match b {
             BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name).unwrap_or("?").to_string(),
             BodyRef::Member { name, .. } => name.to_string(),
         }
     };
-    let find = |n: &str| bodies.iter().find(|(b, _)| name_of(b) == n).map(|(b, _)| *b).unwrap_or_else(|| panic!("`{n}` listed"));
+    let find = |n: &str| bodies.iter().find(|l| name_of(&l.body) == n).map(|l| l.body).unwrap_or_else(|| panic!("`{n}` listed"));
     let text_of = |b: BodyRef<'_>| {
         let k = match b {
             BodyRef::Free(k) => k,
@@ -387,14 +387,14 @@ fn async_implied_bounds_and_concrete_type_outlives() {
     let sources = [SourceFile { path: "src/main.rs", text: ASYNC_AND_TYPE_OUTLIVES_MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
     let mut world = ProjectWorld::new(&names, &frame, &sources, heap.alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let bodies = world.bodies(heap.alloc());
+    let bodies = world.listed_with(blaze_ladder::front2::project_records::Listing::FnsAndInitializers, heap.alloc());
     let name_of = |b: &BodyRef<'_>| -> String {
         match b {
             BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name).unwrap_or("?").to_string(),
             BodyRef::Member { name, .. } => name.to_string(),
         }
     };
-    let find = |n: &str| bodies.iter().find(|(b, _)| name_of(b) == n).map(|(b, _)| *b).unwrap_or_else(|| panic!("`{n}` listed"));
+    let find = |n: &str| bodies.iter().find(|l| name_of(&l.body) == n).map(|l| l.body).unwrap_or_else(|| panic!("`{n}` listed"));
     let text_of = |b: BodyRef<'_>| {
         let k = match b {
             BodyRef::Free(k) => k,
@@ -593,14 +593,14 @@ fn async_block_future_output_slots() {
     let sources = [SourceFile { path: "src/main.rs", text: FUTURE_OUTPUT_SLOTS_MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
     let mut world = ProjectWorld::new(&names, &frame, &sources, heap.alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let bodies = world.bodies(heap.alloc());
+    let bodies = world.listed_with(blaze_ladder::front2::project_records::Listing::FnsAndInitializers, heap.alloc());
     let name_of = |b: &BodyRef<'_>| -> String {
         match b {
             BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name).unwrap_or("?").to_string(),
             BodyRef::Member { name, .. } => name.to_string(),
         }
     };
-    let find = |n: &str| bodies.iter().find(|(b, _)| name_of(b) == n).map(|(b, _)| *b).unwrap_or_else(|| panic!("`{n}` listed"));
+    let find = |n: &str| bodies.iter().find(|l| name_of(&l.body) == n).map(|l| l.body).unwrap_or_else(|| panic!("`{n}` listed"));
     let text_of = |b: BodyRef<'_>| {
         let k = match b {
             BodyRef::Free(k) => k,
@@ -634,5 +634,930 @@ fn async_block_future_output_slots() {
         assert!(types.is_clean(), "{name}'s types: {types:?}");
         assert!(v.refused.is_none(), "{name} should be checked, not refused: {line}");
         assert!(!v.findings.is_empty(), "{name} must fail borrowck: {line}");
+    }
+}
+
+const DYN_AND_COPY_MAIN: &str = r#"
+use core::cell::UnsafeCell;
+use core::marker::PhantomData;
+use core::ops::{Deref, DerefMut};
+
+trait MyErr {}
+
+impl dyn MyErr + 'static {
+    fn downcast(&self) -> bool {
+        true
+    }
+}
+
+type Reader = Box<dyn Fn(&(dyn MyErr + 'static)) -> bool + Send + Sync>;
+
+struct Lock<T>(UnsafeCell<T>);
+unsafe impl<T: Send> Sync for Lock<T> {}
+
+struct Guard<'a, T>(&'a mut T);
+
+impl<T> Deref for Guard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.0
+    }
+}
+
+impl<T> DerefMut for Guard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.0
+    }
+}
+
+impl<T> Lock<T> {
+    const fn new(v: T) -> Self {
+        Self(UnsafeCell::new(v))
+    }
+    fn write(&self) -> Guard<'_, T> {
+        unsafe { Guard(&mut *self.0.get()) }
+    }
+    fn try_write(&self) -> Result<Guard<'_, T>, ()> {
+        Ok(self.write())
+    }
+}
+
+static READERS: Lock<Vec<(u32, Reader)>> = Lock::new(Vec::new());
+
+fn dyn_expect_static_local_guard() {
+    let mut readers = READERS.write();
+    readers.push((
+        1u32,
+        Box::new(move |link| link.downcast()),
+    ));
+}
+
+fn dyn_expect_static_chained_unwrap() {
+    READERS
+        .try_write()
+        .unwrap()
+        .push((2u32, Box::new(move |link| link.downcast())));
+}
+
+fn dyn_expect_param_vec_tuple(v: &mut Vec<(u32, Reader)>) {
+    v.push((3u32, Box::new(move |link| link.downcast())));
+}
+
+fn dyn_expect_owner_return_ok() -> (u32, Reader) {
+    (5u32, Box::new(move |link| link.downcast()))
+}
+
+fn dyn_expect_negative_elided(v: &mut Vec<(u32, Box<dyn Fn(&(dyn MyErr + '_)) -> bool>)>) {
+    v.push((4u32, Box::new(move |link| link.downcast())));
+}
+
+fn dyn_expect_negative_unrelated_owner_param(_other: &Vec<Reader>) {
+    let _f: Box<dyn Fn(&(dyn MyErr + '_)) -> bool> = Box::new(move |link| link.downcast());
+}
+
+struct Carrier<A, C>(PhantomData<(A, C)>);
+fn pick<A, B, C>(p: (A, B), _c: &Carrier<A, C>) -> (A, B) {
+    p
+}
+
+fn dyn_expect_negative_sibling_other_param() {
+    let c: Carrier<u32, Reader> = Carrier(PhantomData);
+    let _pair: (u32, Box<dyn Fn(&(dyn MyErr + '_)) -> bool>) =
+        pick((0u32, Box::new(move |link| link.downcast())), &c);
+}
+
+struct Wrap<T>(T);
+fn unrelated_wrap<F>(_f: F) -> Wrap<Reader> {
+    loop {}
+}
+
+fn dyn_expect_negative_unrelated_wrapper_call() -> Wrap<Reader> {
+    unrelated_wrap::<Box<dyn Fn(&(dyn MyErr + '_)) -> bool>>(Box::new(move |link| link.downcast()))
+}
+
+fn first_arg<A, B>(a: A, _b: B) -> A {
+    a
+}
+
+fn dyn_expect_negative_unrelated_sibling() {
+    let _f: Box<dyn Fn(&(dyn MyErr + '_)) -> bool> =
+        first_arg(Box::new(move |link| link.downcast()), &READERS);
+}
+
+struct Sink<T>(PhantomData<T>);
+impl<T> Sink<T> {
+    fn push(&mut self, _v: T) {}
+}
+
+fn unrelated_sink<U, V>(_src: &U) -> Sink<V> {
+    Sink(PhantomData)
+}
+
+fn dyn_expect_negative_unrelated_unary_call() {
+    let mut s = unrelated_sink(&READERS);
+    if false {
+        let f: Box<dyn Fn(&(dyn MyErr + '_)) -> bool> = Box::new(|_| false);
+        s.push(f);
+    }
+    s.push(Box::new(move |link| link.downcast()));
+}
+
+struct OutlivesToken<'a, T>(PhantomData<&'a ()>, PhantomData<T>);
+impl<'a, T: 'a> Copy for OutlivesToken<'a, T> {}
+impl<'a, T: 'a> Clone for OutlivesToken<'a, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_outlives_static_scalar_ok() {
+    let t: OutlivesToken<'static, u8> = OutlivesToken(PhantomData, PhantomData);
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+impl<'a, T> OutlivesToken<'a, T> {
+    const fn new(_: T) -> Self {
+        OutlivesToken(PhantomData, PhantomData)
+    }
+}
+
+const PROMOTED_OUTLIVES: &'static OutlivesToken<'static, &'static u8> = {
+    let r = &OutlivesToken::new(&1u8);
+    r
+};
+const NON_FREEZE_CELL: &'static core::cell::Cell<u8> = {
+    let r = &core::cell::Cell::new(1u8);
+    r
+};
+
+struct StaticToken<'a, T>(PhantomData<&'a ()>, PhantomData<T>);
+impl<T: Copy> Copy for StaticToken<'static, T> {}
+impl<T: Copy> Clone for StaticToken<'static, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_constrained_static_ok(t: StaticToken<'static, u8>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+fn copy_constrained_static_err<'short>(t: StaticToken<'short, u8>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+struct SamePair<'a, 'b, T>(PhantomData<&'a ()>, PhantomData<&'b ()>, PhantomData<T>);
+impl<'a, T: Copy> Copy for SamePair<'a, 'a, T> {}
+impl<'a, T: Copy> Clone for SamePair<'a, 'a, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_constrained_same_pair_ok<'a>(p: SamePair<'a, 'a, u8>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_constrained_same_pair_err<'a, 'b>(p: SamePair<'a, 'b, u8>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+trait Parent<'x> {}
+trait Child<'x>: Parent<'x> {}
+struct SuperWrap<'a, T>(PhantomData<&'a ()>, PhantomData<T>);
+impl<'a, T: Copy + Parent<'a>> Copy for SuperWrap<'a, T> {}
+impl<'a, T: Copy + Parent<'a>> Clone for SuperWrap<'a, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_supertrait_region_ok<'a, T: Copy + Child<'a>>(w: SuperWrap<'a, T>) {
+    let a = w;
+    let b = w;
+    let _ = (a, b);
+}
+
+fn copy_supertrait_region_mismatch_err<'a, 'b, T: Copy + Child<'b>>(w: SuperWrap<'a, T>) {
+    let a = w;
+    let b = w;
+    let _ = (a, b);
+}
+
+trait Has<'a> {
+    type Out;
+}
+struct ProjToken<'a, T>(PhantomData<&'a ()>, PhantomData<T>);
+impl<'a, T: Has<'a, Out = u8>> Copy for ProjToken<'a, T> {}
+impl<'a, T: Has<'a, Out = u8>> Clone for ProjToken<'a, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_proj_region_ok<'a, T: Has<'a, Out = u8>>(p: ProjToken<'a, T>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_proj_region_mismatch_err<'a, 'b, T: Has<'b, Out = u8>>(p: ProjToken<'a, T>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_proj_region_wrong_out_err<'a, T: Has<'a, Out = u16>>(p: ProjToken<'a, T>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+struct ConcreteHas;
+impl<'a> Has<'a> for ConcreteHas {
+    type Out = u8;
+}
+
+struct ConcreteHasWrong;
+impl<'a> Has<'a> for ConcreteHasWrong {
+    type Out = u16;
+}
+
+struct StaticOnlyHas;
+impl Has<'static> for StaticOnlyHas {
+    type Out = u8;
+}
+
+fn copy_mapped_proj_concrete_impl_ok<'a>(p: ProjToken<'a, ConcreteHas>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_mapped_proj_static_impl_ok(p: ProjToken<'static, StaticOnlyHas>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_mapped_proj_concrete_wrong_out_err<'a>(p: ProjToken<'a, ConcreteHasWrong>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_mapped_proj_static_impl_short_err<'short>(p: ProjToken<'short, StaticOnlyHas>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+#[derive(Clone, Copy)]
+struct ConcreteMarker;
+impl<'a> Marker<'a> for ConcreteMarker {}
+
+fn copy_mapped_trait_concrete_impl_ok<'a>(p: MarkedLt<'a, ConcreteMarker>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_outlives_fn_ptr_hrtb_ok(t: OutlivesToken<'static, fn(&u8)>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+fn copy_outlives_fn_ptr_same_lt_ok<'a>(t: OutlivesToken<'a, fn(&'a u8)>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+fn copy_outlives_fn_ptr_free_short_err<'short>(t: OutlivesToken<'static, fn(&'short u8)>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+fn copy_outlives_fn_ptr_param_err<T>(t: OutlivesToken<'static, fn(T)>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+fn dyn_expect_destructuring_reassign_err(
+    s: Vec<Reader>,
+    non_static: (Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool + Send + Sync>>, u32),
+) {
+    let mut readers = s;
+    let _other;
+    (readers, _other) = non_static;
+    readers.push(Box::new(move |link| link.downcast()));
+}
+
+fn dyn_expect_reassigned_after_use_ok(static_r: Vec<Reader>) {
+    let mut r = static_r;
+    r.push(Box::new(move |link| link.downcast()));
+    r = Vec::new();
+    let _ = r;
+}
+
+fn dyn_expect_reassigned_in_own_rhs_ok(static_r: Vec<Reader>) {
+    let mut r = static_r;
+    r = {
+        r.push(Box::new(move |link| link.downcast()));
+        Vec::new()
+    };
+    let _ = r;
+}
+
+fn take_fn_ptr_static(_f: fn(&(dyn MyErr + 'static)) -> bool) {}
+
+fn fn_ptr_expect_deep_parens_ok() {
+    take_fn_ptr_static((((((((((((((((((((|link| link.downcast()))))))))))))))))))));
+}
+
+fn dyn_expect_reassigned_in_own_lhs_after_rhs_err(
+    static_r: Vec<Reader>,
+    non_static: Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool + Send + Sync>>,
+) {
+    let mut r = static_r;
+    let mut arr = [0u8; 1];
+    arr[{
+        r.push(Box::new(move |link| link.downcast()));
+        0
+    }] = {
+        r = non_static;
+        1
+    };
+    let _ = arr;
+}
+
+fn dyn_expect_primitive_assign_op_rhs_ok(
+    static_r: Vec<Reader>,
+    non_static: Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool + Send + Sync>>,
+) {
+    let mut r = static_r;
+    let mut arr = [0u8; 1];
+    arr[{
+        r = non_static;
+        0
+    }] += {
+        r.push(Box::new(move |link| link.downcast()));
+        1
+    };
+    let _ = (arr, r);
+}
+
+fn dyn_expect_primitive_assign_op_lhs_after_rhs_err(
+    static_r: Vec<Reader>,
+    non_static: Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool + Send + Sync>>,
+) {
+    let mut r = static_r;
+    let mut arr = [0u8; 1];
+    arr[{
+        r.push(Box::new(move |link| link.downcast()));
+        0
+    }] += {
+        r = non_static;
+        1
+    };
+    let _ = (arr, r);
+}
+
+fn overwrite_vec<T>(slot: &mut Vec<T>, next: Vec<T>) {
+    *slot = next;
+}
+
+fn dyn_expect_mut_ref_overwrite_err(
+    static_r: Vec<Reader>,
+    non_static: Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool + Send + Sync>>,
+) {
+    let mut r = static_r;
+    overwrite_vec(&mut r, non_static);
+    r.push(Box::new(move |link| link.downcast()));
+}
+
+fn dyn_expect_mut_method_extend_err(
+    static_r: Vec<Reader>,
+    non_static: Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool + Send + Sync>>,
+) {
+    let mut r = static_r;
+    r.extend(non_static);
+    r.push(Box::new(move |link| link.downcast()));
+}
+
+fn dyn_expect_reassigned_in_loop_err(
+    static_r: Vec<Reader>,
+    non_static: Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool + Send + Sync>>,
+) {
+    let mut r = static_r;
+    let mut opt = Some(non_static);
+    for _ in 0..2 {
+        r.push(Box::new(move |link| link.downcast()));
+        if let Some(ns) = opt.take() {
+            r = ns;
+        }
+    }
+}
+
+struct NestedRef<'a, T>(PhantomData<&'a ()>, PhantomData<T>);
+impl<'a> Copy for NestedRef<'a, &'a u8> {}
+impl<'a> Clone for NestedRef<'a, &'a u8> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_nested_ref_same_ok<'a>(n: NestedRef<'a, &'a u8>) {
+    let a = n;
+    let b = n;
+    let _ = (a, b);
+}
+
+fn copy_nested_ref_diff_err<'a, 'b>(n: NestedRef<'a, &'b u8>) {
+    let a = n;
+    let b = n;
+    let _ = (a, b);
+}
+
+struct TwoArgs<'a, T, U>(PhantomData<&'a ()>, PhantomData<T>, PhantomData<U>);
+impl<'a, T> Copy for TwoArgs<'a, T, &'a u8> {}
+impl<'a, T> Clone for TwoArgs<'a, T, &'a u8> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_nested_after_param_ok<'a, 'b>(x: TwoArgs<'a, &'b u8, &'a u8>) {
+    let a = x;
+    let b = x;
+    let _ = (a, b);
+}
+
+fn copy_nested_after_param_err<'a, 'b>(x: TwoArgs<'a, &'a u8, &'b u8>) {
+    let a = x;
+    let b = x;
+    let _ = (a, b);
+}
+
+fn copy_outlives_static_ref_ok(t: OutlivesToken<'static, &'static u8>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+fn copy_outlives_free_fn_bound_ok<'a, 'b: 'a>(t: OutlivesToken<'a, &'b u8>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+fn copy_outlives_generic_bound_ok<'a, T: 'a>(t: OutlivesToken<'a, T>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+fn copy_outlives_unproven_err<'short>(_x: &'short u8) {
+    let t: OutlivesToken<'static, &'short u8> = OutlivesToken(PhantomData, PhantomData);
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+fn copy_outlives_unproven_param_err<'short>(t: OutlivesToken<'static, &'short u8>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+fn copy_outlives_free_fn_missing_bound_err<'a, 'b>(t: OutlivesToken<'a, &'b u8>) {
+    let a = t;
+    let b = t;
+    let _ = (a, b);
+}
+
+trait Marker<'a> {}
+struct Marked<T>(PhantomData<T>);
+impl<T: Marker<'static>> Copy for Marked<T> {}
+impl<T: Marker<'static>> Clone for Marked<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_trait_region_static_ok<T: Marker<'static>>(m: Marked<T>) {
+    let a = m;
+    let b = m;
+    let _ = (a, b);
+}
+
+fn copy_trait_region_short_err<'short, T: Marker<'short>>(m: Marked<T>) {
+    let a = m;
+    let b = m;
+    let _ = (a, b);
+}
+
+struct MarkedLt<'a, T>(PhantomData<&'a ()>, PhantomData<T>);
+impl<'a, T: Copy + Marker<'a>> Copy for MarkedLt<'a, T> {}
+impl<'a, T: Copy + Marker<'a>> Clone for MarkedLt<'a, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_trait_region_param_ok<'a, T: Copy + Marker<'a>>(m: MarkedLt<'a, T>) {
+    let a = m;
+    let b = m;
+    let _ = (a, b);
+}
+
+fn copy_trait_region_param_static_ok<T: Copy + Marker<'static>>(m: MarkedLt<'static, T>) {
+    let a = m;
+    let b = m;
+    let _ = (a, b);
+}
+
+fn copy_trait_region_param_mismatch_err<'a, 'b, T: Copy + Marker<'b>>(m: MarkedLt<'a, T>) {
+    let a = m;
+    let b = m;
+    let _ = (a, b);
+}
+
+fn copy_outlives_match_guard_ok<'a, T: 'a>(t: OutlivesToken<'a, T>) {
+    match t {
+        x if true => {
+            let _ = (x, t);
+        }
+        _ => {}
+    }
+}
+
+fn copy_outlives_match_guard_err<'short>(t: OutlivesToken<'static, &'short u8>) {
+    match t {
+        x if true => {
+            let _ = (x, t);
+        }
+        _ => {}
+    }
+}
+
+fn copy_outlives_closure_capture_ok<'a, T: 'a>(t: OutlivesToken<'a, T>) {
+    let c = move || {
+        let _x = t;
+    };
+    let a = c;
+    let b = c;
+    let _ = (a, b);
+}
+
+fn copy_outlives_closure_capture_err<'short>(t: OutlivesToken<'static, &'short u8>) {
+    let c = move || {
+        let _x = t;
+    };
+    let a = c;
+    let b = c;
+    let _ = (a, b);
+}
+
+struct BoxSink<T>(T);
+impl<T> BoxSink<T> {
+    fn push(&mut self, _v: T) {}
+}
+
+fn dyn_expect_ctor_wrap_seed_ok(seed: Reader) {
+    let mut w = BoxSink(seed);
+    w.push(Box::new(move |link| link.downcast()));
+}
+
+struct MethodSink;
+impl MethodSink {
+    fn put<T>(&mut self, _exemplar: &T, _value: T) {}
+}
+
+fn dyn_expect_method_sibling_ok(exemplar: &Reader) {
+    let mut s = MethodSink;
+    s.put(exemplar, Box::new(move |link| link.downcast()));
+}
+
+fn id_res<T, E>(r: Result<T, E>) -> Result<T, E> {
+    r
+}
+
+fn dyn_expect_match_ok_static_ok<'a>(res: Result<Vec<Reader>, Vec<Box<dyn Fn(&(dyn MyErr + 'a)) -> bool>>>) {
+    let mut v = match id_res(res) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    v.push(Box::new(move |link| link.downcast()));
+}
+
+fn dyn_expect_match_err_elided_err(res: Result<Vec<Reader>, Vec<Box<dyn Fn(&(dyn MyErr + '_)) -> bool>>>) {
+    let mut v = match id_res(res) {
+        Err(v) => v,
+        Ok(_) => return,
+    };
+    v.push(Box::new(move |link| link.downcast()));
+}
+
+fn dyn_expect_match_err_short_err<'a>(res: Result<Vec<Reader>, Vec<Box<dyn Fn(&(dyn MyErr + 'a)) -> bool>>>) {
+    let mut v = match id_res(res) {
+        Err(v) => v,
+        Ok(_) => return,
+    };
+    v.push(Box::new(move |link| link.downcast()));
+}
+
+struct Holder<T> {
+    readers: T,
+}
+
+fn dyn_expect_destructured_generic_param_ok(Holder { mut readers }: Holder<Vec<Reader>>) {
+    readers.push(Box::new(move |link| link.downcast()));
+}
+
+fn dyn_expect_long_alias_chain_ok(v0: &mut Vec<Reader>) {
+    let v1 = v0;
+    let v2 = v1;
+    let v3 = v2;
+    let v4 = v3;
+    let v5 = v4;
+    let v6 = v5;
+    let v7 = v6;
+    let v8 = v7;
+    let v9 = v8;
+    let v10 = v9;
+    let v11 = v10;
+    let v12 = v11;
+    let v13 = v12;
+    let v14 = v13;
+    let v15 = v14;
+    let v16 = v15;
+    let v17 = v16;
+    let v18 = v17;
+    let v19 = v18;
+    let v20 = v19;
+    let v21 = v20;
+    let v22 = v21;
+    let v23 = v22;
+    let v24 = v23;
+    let v25 = v24;
+    let v26 = v25;
+    let v27 = v26;
+    let v28 = v27;
+    let v29 = v28;
+    let v30 = v29;
+    v30.push(Box::new(move |link| link.downcast()));
+}
+
+trait Sealed {}
+trait Alignment: Sealed {}
+trait Invariants {
+    type Aliasing;
+}
+
+struct Shared;
+struct Exclusive;
+
+struct SharedInv;
+impl Invariants for SharedInv {
+    type Aliasing = Shared;
+}
+
+struct ExclusiveInv;
+impl Invariants for ExclusiveInv {
+    type Aliasing = Exclusive;
+}
+
+#[derive(Clone, Copy)]
+struct ExclusiveCopyInv;
+impl Invariants for ExclusiveCopyInv {
+    type Aliasing = Exclusive;
+}
+
+impl<A, AA: Alignment> Invariants for (A, AA) {
+    type Aliasing = A;
+}
+
+struct Ptr<'a, T: ?Sized, I>(&'a T, PhantomData<I>);
+
+impl<'a, T: 'a + ?Sized, I: Invariants<Aliasing = Shared>> Copy for Ptr<'a, T, I> {}
+impl<'a, T: 'a + ?Sized, I: Invariants<Aliasing = Shared>> Clone for Ptr<'a, T, I> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+fn copy_proj_shared_ok(x: &u8) {
+    let p: Ptr<'_, u8, SharedInv> = Ptr(x, PhantomData);
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_proj_generic_tuple_shared_ok<A: Alignment>(p: Ptr<'_, u8, (Shared, A)>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_proj_exclusive_err(x: &u8) {
+    let p: Ptr<'_, u8, ExclusiveInv> = Ptr(x, PhantomData);
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_proj_exclusive_copy_arg_err(x: &u8) {
+    let p: Ptr<'_, u8, ExclusiveCopyInv> = Ptr(x, PhantomData);
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn copy_proj_generic_tuple_exclusive_err<A: Alignment>(p: Ptr<'_, u8, (Exclusive, A)>) {
+    let a = p;
+    let b = p;
+    let _ = (a, b);
+}
+
+fn main() {}
+"#;
+
+#[test]
+fn dyn_closure_expectation_and_conditional_copy_projection() {
+    let heap = blaze_own::testing::heap();
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let files = [("/dyn-copy-test/src/main.rs".to_string(), DYN_AND_COPY_MAIN.to_string())];
+    let edition = edition::PackageEdition::of_manifest("2024").expect("a known edition");
+    let user = UserCrate {
+        name: "dyn_copy_test",
+        dir: "/dyn-copy-test/",
+        root: "/dyn-copy-test/src/main.rs",
+        files: &files,
+        edition,
+        panic: blaze_build::Panic::Unwind,
+    };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+
+    let sources = [SourceFile { path: "src/main.rs", text: DYN_AND_COPY_MAIN }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
+    let mut world = ProjectWorld::new(&names, &frame, &sources, heap.alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let bodies = world.listed_with(blaze_ladder::front2::project_records::Listing::FnsAndInitializers, heap.alloc());
+    let name_of = |b: &BodyRef<'_>| -> String {
+        match b {
+            BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name).unwrap_or("?").to_string(),
+            BodyRef::Member { name, .. } => name.to_string(),
+        }
+    };
+    let find = |n: &str| bodies.iter().find(|l| name_of(&l.body) == n).map(|l| l.body).unwrap_or_else(|| panic!("`{n}` listed"));
+    let text_of = |b: BodyRef<'_>| {
+        let k = match b {
+            BodyRef::Free(k) => k,
+            BodyRef::Member { container, .. } => container,
+        };
+        names.item_text(k).expect("the body's item text").text
+    };
+
+    for ok_fn in [
+        "dyn_expect_static_local_guard",
+        "dyn_expect_static_chained_unwrap",
+        "dyn_expect_param_vec_tuple",
+        "dyn_expect_owner_return_ok",
+        "dyn_expect_ctor_wrap_seed_ok",
+        "dyn_expect_method_sibling_ok",
+        "dyn_expect_match_ok_static_ok",
+        "dyn_expect_destructured_generic_param_ok",
+        "dyn_expect_long_alias_chain_ok",
+        "dyn_expect_reassigned_after_use_ok",
+        "dyn_expect_reassigned_in_own_rhs_ok",
+        "dyn_expect_primitive_assign_op_rhs_ok",
+        "fn_ptr_expect_deep_parens_ok",
+        "copy_proj_shared_ok",
+        "copy_proj_generic_tuple_shared_ok",
+        "copy_outlives_static_scalar_ok",
+        "copy_outlives_static_ref_ok",
+        "copy_outlives_free_fn_bound_ok",
+        "copy_outlives_generic_bound_ok",
+        "copy_outlives_match_guard_ok",
+        "copy_outlives_closure_capture_ok",
+        "copy_trait_region_static_ok",
+        "copy_trait_region_param_ok",
+        "copy_trait_region_param_static_ok",
+        "copy_constrained_static_ok",
+        "copy_constrained_same_pair_ok",
+        "copy_nested_ref_same_ok",
+        "copy_nested_after_param_ok",
+        "copy_supertrait_region_ok",
+        "copy_proj_region_ok",
+        "copy_mapped_proj_concrete_impl_ok",
+        "copy_mapped_proj_static_impl_ok",
+        "copy_mapped_trait_concrete_impl_ok",
+        "copy_outlives_fn_ptr_hrtb_ok",
+        "copy_outlives_fn_ptr_same_lt_ok",
+        "PROMOTED_OUTLIVES",
+    ] {
+        let body = find(ok_fn);
+        let (types, v) = world.check_borrows(body, heap.alloc());
+        assert!(types.is_clean(), "{ok_fn} types: {types:?}");
+        assert!(v.is_clean(), "{ok_fn} borrows: {}", shown(text_of(body), &v));
+    }
+
+    // Negative controls: non-`'static` `dyn Fn(&(dyn MyErr + '_))` MUST still fail with E0521
+    // (including beside an unrelated `&READERS` sibling arg, unrelated owner param, sibling arg
+    // using a different generic parameter, unrelated unary wrapper call, `Err(v)` match arm,
+    // destructuring assignment target, or reassignment inside an enclosing loop).
+    for err_fn in [
+        "dyn_expect_negative_elided",
+        "dyn_expect_negative_unrelated_owner_param",
+        "dyn_expect_negative_sibling_other_param",
+        "dyn_expect_negative_unrelated_wrapper_call",
+        "dyn_expect_negative_unrelated_sibling",
+        "dyn_expect_negative_unrelated_unary_call",
+        "dyn_expect_match_err_elided_err",
+        "dyn_expect_destructuring_reassign_err",
+        "dyn_expect_reassigned_in_loop_err",
+        "dyn_expect_reassigned_in_own_lhs_after_rhs_err",
+        "dyn_expect_primitive_assign_op_lhs_after_rhs_err",
+        "dyn_expect_mut_ref_overwrite_err",
+        "dyn_expect_mut_method_extend_err",
+    ] {
+        let body = find(err_fn);
+        let (types, v) = world.check_borrows(body, heap.alloc());
+        assert!(types.is_clean(), "{err_fn} types: {types:?}");
+        assert!(v.refused.is_none(), "{err_fn} refused: {:?}", v.refused);
+        assert!(
+            v.findings.iter().any(|d| d.code == "E0521"),
+            "{err_fn} expected E0521, got: {}",
+            shown(text_of(body), &v)
+        );
+    }
+
+    // Named early-bound `'a` in `Err(v)` arm and non-`Freeze` `Cell<u8>` constant promotion
+    // must still fail borrowck.
+    for err_fn in ["dyn_expect_match_err_short_err", "NON_FREEZE_CELL"] {
+        let body = find(err_fn);
+        let (types, v) = world.check_borrows(body, heap.alloc());
+        assert!(types.is_clean(), "{err_fn} types: {types:?}");
+        assert!(v.refused.is_none(), "{err_fn} refused: {:?}", v.refused);
+        assert!(
+            !v.findings.is_empty(),
+            "{err_fn} expected borrow error, got: {}",
+            shown(text_of(body), &v)
+        );
+    }
+
+    // Negative controls: `Ptr` with `Aliasing = Exclusive` (including Copy markers and generic
+    // tuples), `OutlivesToken` with unproven `T: 'a` `Copy` bounds (including guards and closure
+    // captures), constrained self-lifetime impls (`'static`, `'a/'a`), supertrait regions,
+    // regioned projection bounds, and `Marked`/`MarkedLt` mismatches MUST fail with E0382.
+    for err_fn in [
+        "copy_proj_exclusive_err",
+        "copy_proj_exclusive_copy_arg_err",
+        "copy_proj_generic_tuple_exclusive_err",
+        "copy_outlives_unproven_err",
+        "copy_outlives_unproven_param_err",
+        "copy_outlives_free_fn_missing_bound_err",
+        "copy_outlives_match_guard_err",
+        "copy_outlives_closure_capture_err",
+        "copy_trait_region_short_err",
+        "copy_trait_region_param_mismatch_err",
+        "copy_constrained_static_err",
+        "copy_constrained_same_pair_err",
+        "copy_nested_ref_diff_err",
+        "copy_nested_after_param_err",
+        "copy_supertrait_region_mismatch_err",
+        "copy_proj_region_mismatch_err",
+        "copy_proj_region_wrong_out_err",
+        "copy_mapped_proj_concrete_wrong_out_err",
+        "copy_mapped_proj_static_impl_short_err",
+        "copy_outlives_fn_ptr_free_short_err",
+        "copy_outlives_fn_ptr_param_err",
+    ] {
+        let body = find(err_fn);
+        let (types, v) = world.check_borrows(body, heap.alloc());
+        assert!(types.is_clean(), "{err_fn} types: {types:?}");
+        assert!(v.refused.is_none(), "{err_fn} refused: {:?}", v.refused);
+        assert!(
+            v.findings.iter().any(|d| d.code == "E0382"),
+            "{err_fn} expected E0382, got: {}",
+            shown(text_of(body), &v)
+        );
     }
 }
