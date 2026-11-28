@@ -908,7 +908,7 @@ impl TreeRunner for ShelfTree<'_> {
         // the tree built (D112) or links against a split Linux libc root, each granted tool and
         // what it starts; read the roots; write the tree's folder alone.
         let runs_out_dir = host_tools::runs_out_dir(self.tools.tools);
-        let needs_linker = runs_out_dir || (setting.sysroot == Sysroot::LinuxHost && setting.sdk_lib.is_some());
+        let needs_linker = runs_out_dir || setting.sysroot == Sysroot::LinuxHost;
         let linker: &[&str] = if needs_linker { &["bin/ld64.lld", "bin/ld.lld", "bin/lld"] } else { &[] };
         let mut held: AVec<'a, AString<'a>> = Vec::new_in(alloc);
         for name in ["bin/clang-23", "bin/clang", "bin/clang++", "bin/llvm-ar"].iter().chain(linker) {
@@ -918,10 +918,10 @@ impl TreeRunner for ShelfTree<'_> {
             }
         }
         // `SHELF_MEMBERS_LINUX` guarantees `bin/lld` but does not require a `bin/ld.lld` alias.
-        // When linking against a split Linux libc root, resolve `<shelf>/bin/ld.lld` if present or
-        // stage `<folder>/bin/ld.lld -> <shelf>/bin/lld` so `-fuse-ld=<path>` always invokes lld
-        // in GNU ELF mode without depending on an optional shelf symlink.
-        let ld_lld_path: Option<AString<'a>> = if setting.sysroot == Sysroot::LinuxHost && setting.sdk_lib.is_some() {
+        // On Linux (both FHS and NixOS), resolve `<shelf>/bin/ld.lld` if present or stage
+        // `<folder>/ld.lld -> <shelf>/bin/lld` so `-fuse-ld=<path>` always invokes lld in GNU ELF
+        // mode without relying on ambient system `/usr/bin/ld`.
+        let ld_lld_path: Option<AString<'a>> = if setting.sysroot == Sysroot::LinuxHost {
             let shelf_ld = joined(&[shelf, "/bin/ld.lld"], alloc);
             if Path::new(shelf_ld.as_str()).exists() {
                 Some(shelf_ld)
@@ -1355,9 +1355,9 @@ mod tree_spelling_tests {
                 "\"-Wl,-rpath,/nix/store/def-glibc/lib\"\n",
                 "\"-Wl,-rpath,/nix/store/extra-lib/lib\"\n",
                 "\"-Wl,--dynamic-linker=/nix/store/def-glibc/lib/ld-linux-aarch64.so.1\"\n",
-                "\"-fuse-ld=/h/work/trees/abc/ld.lld\"\n",
                 "-rtlib=compiler-rt\n",
                 "--unwindlib=none\n",
+                "\"-fuse-ld=/h/work/trees/abc/ld.lld\"\n",
                 "-Wno-unused-command-line-argument\n",
             )
         );

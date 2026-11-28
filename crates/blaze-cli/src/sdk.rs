@@ -943,6 +943,7 @@ pub(crate) struct ResolvedLinuxHost<'f> {
     pub(crate) sdk_lib: Option<&'f str>,
     pub(crate) sdk_dynamic_linker: Option<&'f str>,
     pub(crate) sdk_rpaths: &'f [&'f str],
+    pub(crate) sdk_extra_reads: &'f [&'f str],
     pub(crate) sdk_version: &'f str,
     pub(crate) id: [u8; 32],
 }
@@ -957,6 +958,7 @@ impl<'f> ResolvedLinuxHost<'f> {
             sdk_lib: self.sdk_lib,
             sdk_dynamic_linker: self.sdk_dynamic_linker,
             sdk_rpaths: self.sdk_rpaths,
+            sdk_extra_reads: self.sdk_extra_reads,
             sdk_version: self.sdk_version,
         }
     }
@@ -989,6 +991,11 @@ pub(crate) fn linux_host_with_id<'f>(
         rpaths_vec.push(crate::work::held_str(rpath.as_str(), frame));
     }
     let sdk_rpaths: &'f [&'f str] = rpaths_vec.into_bump_slice();
+    let mut reads_vec = blaze_own::Vec::with_capacity_in(keyed.sdk_extra_reads.len(), frame);
+    for path in keyed.sdk_extra_reads.iter() {
+        reads_vec.push(crate::work::held_str(path.as_str(), frame));
+    }
+    let sdk_extra_reads: &'f [&'f str] = reads_vec.into_bump_slice();
     let sdk_version = crate::work::held_str(keyed.sdk_version.as_str(), frame);
     Ok(Some(ResolvedLinuxHost {
         sysroot,
@@ -997,6 +1004,7 @@ pub(crate) fn linux_host_with_id<'f>(
         sdk_lib,
         sdk_dynamic_linker,
         sdk_rpaths,
+        sdk_extra_reads,
         sdk_version,
         id: keyed.sdk_digest,
     }))

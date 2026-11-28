@@ -54,7 +54,7 @@ use blaze_drive::{Input, Kind, Name, Task, Want};
 use blaze_ids::ContentId;
 use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::{AVec, Alloc, Erased};
-use blaze_proc_macro::native_unit::{NativeSetting, placed_for_host};
+use blaze_proc_macro::native_unit::{NativeSetting, placed};
 use blaze_proc_macro::script::ScriptRuntime;
 use blaze_proc_macro::script_sandbox::{ScriptRoot, Tree, dir_tree, mem_tree_with_submodules};
 use blaze_proc_macro::script_unit::{self, Setting, links_closure};
@@ -117,7 +117,7 @@ pub(crate) fn placement(home: Option<&str>, graph: &UnitGraph<'_>, script: UnitI
             let store = Path::new(home).join(STORE_UNDER_HOME);
             RanAs::of(&blaze_proc_macro::native_unit::placed_in_store(&store, graph, script, MODE, crate::graph::TRIPLE, alloc))
         }
-        None => RanAs::of(&placed_for_host(graph, script, MODE, crate::graph::TRIPLE, alloc)),
+        None => RanAs::of(&placed(graph, script, MODE, alloc)),
     }
 }
 

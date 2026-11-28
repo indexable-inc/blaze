@@ -257,6 +257,7 @@ fn scripts_linux_native_sysroot_id_moves_key_and_handles_missing_sysroot() {
         sdk_lib: Some("/nix/store/def-glibc/lib"),
         sdk_dynamic_linker: Some("/nix/store/def-glibc/lib/ld-linux-aarch64.so.1"),
         sdk_rpaths: &[],
+        sdk_extra_reads: &[],
         sdk_version: "1111111111111111111111111111111111111111111111111111111111111111",
         id: [0x11; 32],
     }));

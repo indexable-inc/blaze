@@ -636,13 +636,14 @@ pub fn format_linux_clang_cfg<'a>(
                 push_cfg_quoted(&mut cfg, dyn_flag.as_str());
             }
         }
-        if let Some(ld_lld) = link.ld_lld {
-            let mut ld_flag = String::from_str_in("-fuse-ld=", alloc);
-            ld_flag.push_str(ld_lld);
-            push_cfg_quoted(&mut cfg, ld_flag.as_str());
-        }
         cfg.push_str("-rtlib=compiler-rt\n");
         cfg.push_str("--unwindlib=none\n");
+    }
+
+    if let Some(ld_lld) = link.ld_lld {
+        let mut ld_flag = String::from_str_in("-fuse-ld=", alloc);
+        ld_flag.push_str(ld_lld);
+        push_cfg_quoted(&mut cfg, ld_flag.as_str());
     }
 
     cfg.push_str("-Wno-unused-command-line-argument\n");

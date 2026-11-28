@@ -81,6 +81,17 @@ fn format_linux_clang_cfg_gates_runtime_linker_paths() {
     assert!(probe.as_str().contains("\"-Wl,-rpath,/nix/store/glibc/lib\"\n"));
     assert!(probe.as_str().contains("\"-Wl,-rpath,/nix/store/extra/lib\"\n"));
     assert!(probe.as_str().contains("\"-Wl,--dynamic-linker=/nix/store/glibc/lib/ld-linux-aarch64.so.1\"\n"));
+
+    // FHS Linux without `lib_dir` STILL configures `-fuse-ld=<shelf ld.lld>` when provided.
+    let fhs_with_ld = super::format_linux_clang_cfg(
+        "/usr",
+        super::LinuxClangLink { ld_lld: Some("/h/shelf/bin/ld.lld"), ..super::LinuxClangLink::default() },
+        &[],
+        shelf,
+        alloc,
+    );
+    assert!(fhs_with_ld.as_str().contains("\"--sysroot=/\"\n"));
+    assert!(fhs_with_ld.as_str().contains("\"-fuse-ld=/h/shelf/bin/ld.lld\"\n"));
 }
 
 #[test]

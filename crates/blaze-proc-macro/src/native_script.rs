@@ -1022,7 +1022,7 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
     let staged_ld_lld: Option<AString<'a>> = linux_cfg_dir
         .map(|dir| blaze_own::format_in!(alloc, "{dir}/ld.lld"))
         .filter(|path| Path::new(path.as_str()).exists());
-    let needs_linker = runs_out_dir || (c.sysroot_kind == Sysroot::LinuxHost && (staged_ld_lld.is_some() || !c.sysroot_extra_reads.is_empty()));
+    let needs_linker = runs_out_dir || c.sysroot_kind == Sysroot::LinuxHost;
     let linker: &[&str] = if needs_linker { &["bin/ld64.lld", "bin/ld.lld", "bin/lld"] } else { &[] };
     let mut exec: AVec<'a, AString<'a>> = Vec::new_in(alloc);
     for name in ["bin/clang-23", "bin/clang", "bin/clang++", "bin/llvm-ar"].iter().chain(linker) {
