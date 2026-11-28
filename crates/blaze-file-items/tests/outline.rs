@@ -957,7 +957,7 @@ fn the_oracle_catches_a_hash_of_file_positions() {
 /// moves it. A wrong fix fails here either way: the old surface (signature digests) moves on the
 /// type edits; a digest of the name alone stays on the attribute, form and macro edits.
 ///
-/// Prints `names digest: 6 edits kept the surface, 11 moved it`.
+/// Prints `names digest: 6 edits kept the surface, 12 moved it`.
 #[test]
 fn a_type_edit_keeps_the_surface_and_a_name_edit_moves_it() {
     let (before, after) = (parse("fn f(x: u8) {}\n"), parse("fn f(x: u16) {}\n"));
@@ -974,11 +974,11 @@ fn a_type_edit_keeps_the_surface_and_a_name_edit_moves_it() {
         ("a where clause", "fn f<T>(t: T) {}\n", "fn f<T>(t: T) where T: Copy {}\n"),
         (
             "a body under a tool's attribute on an impl's member",
-            "struct S;\nimpl S {\n    #[tracing::instrument]\n    fn a(&self) { x() }\n}\n",
-            "struct S;\nimpl S {\n    #[tracing::instrument]\n    fn a(&self) { y() }\n}\n",
+            "struct S;\nimpl S {\n    #[rustfmt::skip]\n    fn a(&self) { x() }\n}\n",
+            "struct S;\nimpl S {\n    #[rustfmt::skip]\n    fn a(&self) { y() }\n}\n",
         ),
     ];
-    let moves: [(&str, &str, &str); 11] = [
+    let moves: [(&str, &str, &str); 12] = [
         ("renaming `f`", "fn f(x: u8) {}\n", "fn g(x: u8) {}\n"),
         ("adding `pub`", "fn f(x: u8) {}\n", "pub fn f(x: u8) {}\n"),
         ("adding `#[derive(Clone)]` to a struct", "struct S { a: u8 }\n", "#[derive(Clone)]\nstruct S { a: u8 }\n"),
@@ -1002,6 +1002,11 @@ fn a_type_edit_keeps_the_surface_and_a_name_edit_moves_it() {
             "#[derive(Clone)]\nstruct S { a: u16 }\n",
         ),
         ("a body under an attribute macro", "#[tokio::main]\nfn f() { a() }\n", "#[tokio::main]\nfn f() { b() }\n"),
+        (
+            "a body under an attribute macro on an impl's member",
+            "struct S;\nimpl S {\n    #[tracing::instrument]\n    fn a(&self) { x() }\n}\n",
+            "struct S;\nimpl S {\n    #[tracing::instrument]\n    fn a(&self) { y() }\n}\n",
+        ),
     ];
     for (what, old, new) in keeps {
         assert_eq!(parse(old).surface(), parse(new).surface(), "{what} moved the surface:\n{old}\nto\n{new}");

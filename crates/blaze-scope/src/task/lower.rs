@@ -3427,12 +3427,14 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
     /// `None`, this fragment's top-level entries (an expansion of a call in the owner's body:
     /// the Reference, "Macro invocation": a macro may be invoked where an associated item is
     /// expected, inside `impl` and `trait` blocks, and expands to zero or more associated
-    /// items). A member that is itself a macro call is declared like a module's call
-    /// ([`Lower::fn_like_call`]) with `parent_key` as its owner: the fill expands it through
-    /// the same hook, and what it writes joins `parent_key`'s members, a call it writes in turn
-    /// the same way. A named member is keyed by its owner, kind and name wherever it is
-    /// written; a call written by an expansion by that expansion's call (its owner's own calls
-    /// are counted in the owner's body, an expansion's in its own text).
+    /// items). A member that is itself a macro call, or that carries an attribute macro, is
+    /// declared like a module's call ([`Lower::fn_like_call`], [`Lower::item`]) with
+    /// `parent_key` as its owner: the fill expands it through the same hook, and what it writes
+    /// joins `parent_key`'s members, a call it writes in turn the same way (an item taken by an
+    /// attribute macro is replaced by its expansion, never kept beside it). A named member is
+    /// keyed by its owner, kind and name wherever it is written; a call written by an expansion
+    /// by that expansion's call (its owner's own calls are counted in the owner's body, an
+    /// expansion's in its own text).
     fn assoc(&mut self, parent: Option<ItemIndex>, parent_key: ItemKey) {
         let outline = self.outline;
         let text = self.text;
@@ -3440,17 +3442,38 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
         let mut members = AVec::new_in(self.alloc);
         for (idx, item) in outline.children(parent) {
             let attrs = self.attrs(item);
+            if attrs.cfg_version_gated {
+                self.note(LowerNoteKind::UnstableCfgVersion, item.range.start, "cfg(version(..))");
+            }
             if !attrs.cfg_ok {
                 continue;
             }
             let name = item.name.map(|r| unraw(item.text(text, r)));
+            let whole = &text[item.range.start as usize..item.range.end as usize];
+            if let Some(path) = attrs.attr_macro {
+                // The item is the call's input: what it declares is the expansion's (any later
+                // attribute macros too, lowered from the expansion with `members_of = Some(parent_key)`).
+                let at = item.range.start;
+                let call_owner = written_by.unwrap_or(parent_key);
+                let call = self.key(call_owner, "attr", path);
+                let Some(parsed) = parse_path_marked_in(path, self.krate, &|s| self.mark_of(s), self.scratch, self.alloc) else {
+                    self.note(LowerNoteKind::AttrMacroNotLowered { attr: path }, at, name.unwrap_or("_"));
+                    continue;
+                };
+                let pos = self.next_pos();
+                self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: Some(idx.0), role: CallRole::Call });
+                let place = self.call_in_text(idx, item, whole);
+                let tokens = self.call_tokens(whole, crate::nested_input::InputCut::Whole);
+                let src = CallSrc { module: self.module, owner: Some(parent_key), name: path, input: whole, kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place, tokens, answered: 0, on: None };
+                self.out.calls.push((call, src));
+                continue;
+            }
             let is_call = matches!(item.detail, ItemDetail::MacroCall { .. });
             let key_owner = match written_by {
                 Some(call) if is_call => call,
                 _ => parent_key,
             };
             let key = self.key(key_owner, "assoc", name.unwrap_or(""));
-            let whole = &text[item.range.start as usize..item.range.end as usize];
             members.push(Member { key, name, item: idx, detail: item.detail, text: whole, written_by });
             self.attr_checks(idx, item.range.start, &attrs.checks);
             if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(item.range.start), self.written, self.depth, (self.owner, self.pos), self.marks, self.tokens) {
