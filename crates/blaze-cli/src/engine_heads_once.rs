@@ -583,8 +583,12 @@ impl HeadsOnce {
         let keys: Vec<Key, Alloc<'static>> = {
             let puts = self.pending_puts(g);
             for (key, names_at, bytes) in puts.iter() {
-                let encoded = crate::store::record_codec::encode_selective_in(bytes, g)
-                    .map_err(|_| CliError::Text { what: "a closed dependency head could not be compressed into BZR1 (engine_heads_once.rs `put_dependencies`)" })?;
+                let encoded = crate::store::record_codec::encode_selective_in(
+                    bytes,
+                    crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+                    g,
+                )
+                .map_err(|_| CliError::Text { what: "a closed dependency head could not be compressed into BZR1 (engine_heads_once.rs `put_dependencies`)" })?;
                 let parts: [&[u8]; 2] = [&names_at.0.0, encoded.as_slice()];
                 ledger.put(Stage::Heads, *key, &parts, 0);
                 store.put_parts(cx, *key, &parts)?;

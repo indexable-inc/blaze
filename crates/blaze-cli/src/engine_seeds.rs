@@ -1093,8 +1093,12 @@ impl<'p> RequestTable<'p> {
                 not_put.no_names = not_put.no_names.saturating_add(1);
                 continue;
             };
-            let encoded = crate::store::record_codec::encode_selective_in(one.bytes, g)
-                .map_err(|_| CliError::Text { what: "a dependency head could not be compressed into BZR1 (engine_seeds.rs `RequestTable::merge`)" })?;
+            let encoded = crate::store::record_codec::encode_selective_in(
+                one.bytes,
+                crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+                g,
+            )
+            .map_err(|_| CliError::Text { what: "a dependency head could not be compressed into BZR1 (engine_seeds.rs `RequestTable::merge`)" })?;
             let body = encoded.as_slice();
             let mut payload = blaze_own::Vec::with_capacity_in(KEY_BYTES + body.len(), g);
             payload.extend_from_slice(&names_at.0.0);

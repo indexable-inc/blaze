@@ -3054,8 +3054,12 @@ impl Listings {
         puts.extend(self.held.pin().iter().filter(|(key, held)| held.made && !put.contains(*key)).map(|(key, held)| (*key, held.bytes)));
         puts.sort_unstable_by_key(|(key, _)| *key);
         for (key, bytes) in puts.iter() {
-            let encoded = crate::store::record_codec::encode_selective_in(bytes, g)
-                .map_err(|_| CliError::Text { what: "a crate head listing record could not be compressed into BZR1 (engine_heads.rs `Listings::put_made`)" })?;
+            let encoded = crate::store::record_codec::encode_selective_in(
+                bytes,
+                crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+                g,
+            )
+            .map_err(|_| CliError::Text { what: "a crate head listing record could not be compressed into BZR1 (engine_heads.rs `Listings::put_made`)" })?;
             let stored = encoded.as_slice();
             ledger.put(stage, *key, &[stored], 0);
             store.put(cx, *key, stored)?;

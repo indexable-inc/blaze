@@ -103,6 +103,11 @@ const PRE_VIEW_FORMS: [&[u8; 4]; 2] = [b"BEF7", b"BEF8"];
 /// never migrated (their lint blocks hold ranges with children's lengths in them).
 const PRE_OWN_FORMS: [&[u8; 4]; 2] = [b"BEF9", b"BEFA"];
 const LINES_DOMAIN: &str = "blaze-cli engine-check lines";
+/// Maximum uncompressed `BEFB`/`BEFC` printed-lines record size encoded into or decoded from a
+/// `BZR1` envelope (512 MiB: large monorepos easily exceed the 64 MiB default while remaining
+/// strictly bounded against decompression bombs; payloads above this cap stay raw zero-copy,
+/// rules 3, 18, 26).
+pub(crate) const LINES_MAX_DECODED_BYTES: usize = 512 << 20;
 /// A finding with no path of its own.
 const NO_PATH: u32 = u32::MAX;
 const FINDING: u8 = 0;
@@ -219,11 +224,29 @@ impl Class {
 pub(crate) struct LinesError {
     pub(crate) at: usize,
     pub(crate) what: &'static str,
+    pub(crate) codec: Option<crate::store::record_codec::RecordCodecError>,
+}
+
+impl LinesError {
+    pub(crate) const fn at(at: usize, what: &'static str) -> Self {
+        Self { at, what, codec: None }
+    }
+
+    pub(crate) const fn codec(error: crate::store::record_codec::RecordCodecError) -> Self {
+        Self {
+            at: 0,
+            what: "the BZR1 compressed lines envelope is damaged or refused",
+            codec: Some(error),
+        }
+    }
 }
 
 impl fmt::Display for LinesError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "the printed lines' record (engine_lines.rs) is refused at byte {}: {}", self.at, self.what)
+        match self.codec {
+            Some(codec) => write!(f, "the printed lines' record (engine_lines.rs) is refused at byte {}: {}: {codec}", self.at, self.what),
+            None => write!(f, "the printed lines' record (engine_lines.rs) is refused at byte {}: {}", self.at, self.what),
+        }
     }
 }
 
@@ -512,11 +535,13 @@ impl<'a> Lines<'a> {
             word(&mut out, len_of(bytes));
             out.extend_from_slice(bytes);
         }
-        // Selectively compress large (>= 4 KiB) `BEFB`/`BEFC` lines records into a `BZR1` fast-Zstd
-        // envelope when compressed output is strictly < 85% of raw size; small/incompressible
-        // records stay raw with zero framing overhead (rule 25: deterministic).
+        // Selectively compress large (4 KiB..=LINES_MAX_DECODED_BYTES) `BEFB`/`BEFC` lines records
+        // into a `BZR1` fast-Zstd envelope when compressed output is strictly < 85% of raw size;
+        // small, incompressible, or over-cap records stay raw with zero framing overhead so the
+        // encoder never writes a `BZR1` envelope that `decode_in_frame`/`decode` would refuse
+        // (rules 3, 18, 25, 26).
         if let Ok(crate::store::record_codec::Encoded::Compressed(compressed)) =
-            crate::store::record_codec::encode_selective_in(out.as_slice(), self.alloc)
+            crate::store::record_codec::encode_selective_in(out.as_slice(), LINES_MAX_DECODED_BYTES, self.alloc)
         {
             return (Key(ContentId::of(LINES_DOMAIN, &compressed)), compressed);
         }
@@ -574,7 +599,7 @@ impl<'m> Last<'m, '_> {
                 Entry::Note { class: Class::Failure | Class::Unchecked | Class::Borrows, words } => {
                     return core::str::from_utf8(words)
                         .map(|words| Some(Refusal::Note(words)))
-                        .map_err(|_| LinesError { at: reader.at, what: "a body's refusal note is not UTF-8" });
+                        .map_err(|_| LinesError::at(reader.at, "a body's refusal note is not UTF-8"));
                 }
                 Entry::Noted { finding } => return Ok(Some(Refusal::Finding(finding))),
                 _ => {}
@@ -624,7 +649,7 @@ impl<'m> Reader<'m> {
     }
 
     fn take(&mut self, n: usize, what: &'static str) -> Result<&'m [u8], LinesError> {
-        let end = self.at.checked_add(n).filter(|end| *end <= self.bytes.len()).ok_or(LinesError { at: self.at, what })?;
+        let end = self.at.checked_add(n).filter(|end| *end <= self.bytes.len()).ok_or(LinesError::at(self.at, what))?;
         let taken = &self.bytes[self.at..end];
         self.at = end;
         Ok(taken)
@@ -683,24 +708,24 @@ fn entry<'m>(reader: &mut Reader<'m>) -> Result<Entry<'m>, LinesError> {
                 len => Some(reader.take(len as usize, "a finding's path")?),
             };
             if path.is_some_and(|path| core::str::from_utf8(path).is_err()) {
-                return Err(LinesError { at: reader.at, what: "a finding's path is not UTF-8" });
+                return Err(LinesError::at(reader.at, "a finding's path is not UTF-8"));
             }
             let words = reader.sized("a finding's words")?;
             Ok(Entry::Finding { rule, start, end, path, words })
         }
         NOTE => {
             let at = reader.at;
-            let class = Class::of_byte(reader.byte("a note's class")?).ok_or(LinesError { at, what: "a note's class is none of the six" })?;
+            let class = Class::of_byte(reader.byte("a note's class")?).ok_or(LinesError::at(at, "a note's class is none of the six"))?;
             let words = reader.sized("a note's words")?;
             if core::str::from_utf8(words).is_err() {
-                return Err(LinesError { at: reader.at, what: "a note's words are not UTF-8" });
+                return Err(LinesError::at(reader.at, "a note's words are not UTF-8"));
             }
             Ok(Entry::Note { class, words })
         }
         NOTED => {
             let at = reader.at + 4;
             let bytes = reader.sized("a noted finding")?;
-            let finding = blaze_report::finding::decode(bytes).map_err(|why| LinesError { at: at + why.at, what: why.what })?;
+            let finding = blaze_report::finding::decode(bytes).map_err(|why| LinesError::at(at + why.at, why.what))?;
             Ok(Entry::Noted { finding })
         }
         PLACED => {
@@ -708,10 +733,10 @@ fn entry<'m>(reader: &mut Reader<'m>) -> Result<Entry<'m>, LinesError> {
             let start = reader.u32("a placed finding's start")?;
             let end = reader.u32("a placed finding's end")?;
             let at = reader.at;
-            let path = core::str::from_utf8(reader.sized("a placed finding's path")?).map_err(|_| LinesError { at, what: "a placed finding's path is not UTF-8" })?;
+            let path = core::str::from_utf8(reader.sized("a placed finding's path")?).map_err(|_| LinesError::at(at, "a placed finding's path is not UTF-8"))?;
             let chain = reader.u64("a placed finding's item chain")?;
             let at = reader.at;
-            let edition = blaze_surface::Edition::from_byte(reader.byte("a placed finding's edition")?).ok_or(LinesError { at, what: "a placed finding's edition byte is no edition" })?;
+            let edition = blaze_surface::Edition::from_byte(reader.byte("a placed finding's edition")?).ok_or(LinesError::at(at, "a placed finding's edition byte is no edition"))?;
             let words = reader.sized("a placed finding's words")?;
             Ok(Entry::Placed { rule, start, end, path, chain, edition, words })
         }
@@ -726,13 +751,13 @@ fn entry<'m>(reader: &mut Reader<'m>) -> Result<Entry<'m>, LinesError> {
             let inside = match inside {
                 0 if (from, to) == (0, 0) => None,
                 1 => Some((from, to)),
-                _ => return Err(LinesError { at, what: "a token-placed finding's inside flag is neither 0 (with no range) nor 1" }),
+                _ => return Err(LinesError::at(at, "a token-placed finding's inside flag is neither 0 (with no range) nor 1")),
             };
             let at_path = reader.at;
-            let path = core::str::from_utf8(reader.sized("a token-placed finding's path")?).map_err(|_| LinesError { at: at_path, what: "a token-placed finding's path is not UTF-8" })?;
+            let path = core::str::from_utf8(reader.sized("a token-placed finding's path")?).map_err(|_| LinesError::at(at_path, "a token-placed finding's path is not UTF-8"))?;
             let chain = reader.u64("a token-placed finding's item chain")?;
             let at_edition = reader.at;
-            let edition = blaze_surface::Edition::from_byte(reader.byte("a token-placed finding's edition")?).ok_or(LinesError { at: at_edition, what: "a token-placed finding's edition byte is no edition" })?;
+            let edition = blaze_surface::Edition::from_byte(reader.byte("a token-placed finding's edition")?).ok_or(LinesError::at(at_edition, "a token-placed finding's edition byte is no edition"))?;
             let words = reader.sized("a token-placed finding's words")?;
             Ok(Entry::PlacedTokens { rule, at: parser::token_key::TokenPlace { first, last, inside }, path, chain, edition, words })
         }
@@ -741,44 +766,44 @@ fn entry<'m>(reader: &mut Reader<'m>) -> Result<Entry<'m>, LinesError> {
             let start = reader.u32("a lint unit's finding's start")?;
             let end = reader.u32("a lint unit's finding's end")?;
             let at = reader.at;
-            let path = core::str::from_utf8(reader.sized("a lint unit's finding's path")?).map_err(|_| LinesError { at, what: "a lint unit's finding's path is not UTF-8" })?;
+            let path = core::str::from_utf8(reader.sized("a lint unit's finding's path")?).map_err(|_| LinesError::at(at, "a lint unit's finding's path is not UTF-8"))?;
             let at = reader.at;
             let in_item = reader.byte("a lint unit's finding's item flag")?;
             let chain = reader.u64("a lint unit's finding's item chain")?;
             let chain = match (in_item, chain) {
                 (0, 0) => None,
                 (1, chain) => Some(chain),
-                _ => return Err(LinesError { at, what: "a lint unit's finding's item flag is neither 0 (with no chain) nor 1" }),
+                _ => return Err(LinesError::at(at, "a lint unit's finding's item flag is neither 0 (with no chain) nor 1")),
             };
             let at = reader.at;
-            let edition = blaze_surface::Edition::from_byte(reader.byte("a lint unit's finding's edition")?).ok_or(LinesError { at, what: "a lint unit's finding's edition byte is no edition" })?;
+            let edition = blaze_surface::Edition::from_byte(reader.byte("a lint unit's finding's edition")?).ok_or(LinesError::at(at, "a lint unit's finding's edition byte is no edition"))?;
             let words = reader.sized("a lint unit's finding's words")?;
             Ok(Entry::PlacedOwn { rule, start, end, path, chain, edition, words })
         }
         VIEW => {
             let at_kind = reader.at;
-            let kind = Kind::from_u8(reader.byte("a view's base kind")?).ok_or(LinesError { at: at_kind, what: "a view's base kind is no task kind" })?;
+            let kind = Kind::from_u8(reader.byte("a view's base kind")?).ok_or(LinesError::at(at_kind, "a view's base kind is no task kind"))?;
             let base = Name::new(kind, reader.digest("a view's base subject")?);
             let at_place = reader.at;
             let at = reader.u32("a view's place")?;
             let units = reader.u32("a view's unit count")?;
             if units < 2 || at >= units {
-                return Err(LinesError { at: at_place, what: "a view's place is not below its unit count, or the count is under two" });
+                return Err(LinesError::at(at_place, "a view's place is not below its unit count, or the count is under two"));
             }
             let from = reader.at;
             for _ in 0..units {
                 let at_flag = reader.at;
                 if reader.byte("a view's unit flag")? > 1 {
-                    return Err(LinesError { at: at_flag, what: "a view's unit flag is neither 0 nor 1" });
+                    return Err(LinesError::at(at_flag, "a view's unit flag is neither 0 nor 1"));
                 }
                 let at_name = reader.at;
                 if core::str::from_utf8(reader.sized("a view's unit name")?).is_err() {
-                    return Err(LinesError { at: at_name, what: "a view's unit name is not UTF-8" });
+                    return Err(LinesError::at(at_name, "a view's unit name is not UTF-8"));
                 }
             }
             Ok(Entry::View(RowView { base, at, units, labels: &reader.bytes[from..reader.at] }))
         }
-        _ => Err(LinesError { at: reader.at - 1, what: "an entry's tag is none of finding, note, placed finding, token-placed finding, noted finding, view and own-placed finding" }),
+        _ => Err(LinesError::at(reader.at - 1, "an entry's tag is none of finding, note, placed finding, token-placed finding, noted finding, view and own-placed finding")),
     }
 }
 
@@ -787,12 +812,12 @@ fn entry<'m>(reader: &mut Reader<'m>) -> Result<Entry<'m>, LinesError> {
 pub(crate) fn decode_in_frame<'b, 'a>(bytes: &'b [u8], frame: &'b Frame, alloc: SharedAlloc<'a>) -> Result<Last<'b, 'a>, LinesError> {
     let raw: &'b [u8] = match crate::store::record_codec::decode_if_envelope_in(
         bytes,
-        crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+        LINES_MAX_DECODED_BYTES,
         frame,
     ) {
         Ok(crate::store::record_codec::Decoded::Borrowed(raw)) => raw,
         Ok(crate::store::record_codec::Decoded::Owned(decompressed)) => decompressed.into_bump_slice(),
-        Err(_) => return Err(LinesError { at: 0, what: "the BZR1 compressed lines envelope is damaged or refused" }),
+        Err(why) => return Err(LinesError::codec(why)),
     };
     decode_raw(raw, alloc)
 }
@@ -803,12 +828,12 @@ pub(crate) fn decode_in_frame<'b, 'a>(bytes: &'b [u8], frame: &'b Frame, alloc: 
 pub(crate) fn decode<'m>(bytes: &'m [u8], alloc: SharedAlloc<'static>) -> Result<Last<'m, 'static>, LinesError> {
     let raw: &'m [u8] = match crate::store::record_codec::decode_if_envelope_in(
         bytes,
-        crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+        LINES_MAX_DECODED_BYTES,
         alloc,
     ) {
         Ok(crate::store::record_codec::Decoded::Borrowed(raw)) => raw,
         Ok(crate::store::record_codec::Decoded::Owned(decompressed)) => decompressed.leak_static(),
-        Err(_) => return Err(LinesError { at: 0, what: "the BZR1 compressed lines envelope is damaged or refused" }),
+        Err(why) => return Err(LinesError::codec(why)),
     };
     decode_raw(raw, alloc)
 }
@@ -820,35 +845,35 @@ fn decode_raw<'m, 'a>(bytes: &'m [u8], alloc: SharedAlloc<'a>) -> Result<Last<'m
         form if form == LINES_MAGIC => None,
         // Before a body's note was a noted finding (D164) it was its words: refused as an older
         // form, and the request is answered in full (rule 26), as BEF1 and BEF2 were.
-        form if OLDER_FORMS.iter().any(|old| form == *old) => return Err(LinesError { at: 0, what: "the form is BEF3 to BEF6, older than BEFB and BEFC (a body's note was its words, not a noted finding)" }),
+        form if OLDER_FORMS.iter().any(|old| form == *old) => return Err(LinesError::at(0, "the form is BEF3 to BEF6, older than BEFB and BEFC (a body's note was its words, not a noted finding)")),
         // Before a body's rows at its units' views named their view (D191): refused, and the
         // request is answered in full (rule 26).
-        form if PRE_VIEW_FORMS.iter().any(|old| form == *old) => return Err(LinesError { at: 0, what: "the form is BEF7 or BEF8, older than BEFB and BEFC (a body was one row, checked under its first holder: D191)" }),
+        form if PRE_VIEW_FORMS.iter().any(|old| form == *old) => return Err(LinesError::at(0, "the form is BEF7 or BEF8, older than BEFB and BEFC (a body was one row, checked under its first holder: D191)")),
         // Before a lint unit's finding was placed in its own text: refused, and the request is
         // answered in full (rule 26).
-        form if PRE_OWN_FORMS.iter().any(|old| form == *old) => return Err(LinesError { at: 0, what: "the form is BEF9 or BEFA, older than BEFB and BEFC (a lint unit's finding held its children's lengths)" }),
-        _ => return Err(LinesError { at: 0, what: "the form is neither BEFB nor BEFC" }),
+        form if PRE_OWN_FORMS.iter().any(|old| form == *old) => return Err(LinesError::at(0, "the form is BEF9 or BEFA, older than BEFB and BEFC (a lint unit's finding held its children's lengths)")),
+        _ => return Err(LinesError::at(0, "the form is neither BEFB nor BEFC")),
     };
     let count = reader.u32("the block count")?;
     let mut blocks: SVec<'a, (Name, &'m [u8])> = SVec::new_in(alloc);
     for _ in 0..count {
         let at = reader.at;
-        let kind = Kind::from_u8(reader.byte("a block's kind")?).ok_or(LinesError { at, what: "a block's kind is no task kind" })?;
+        let kind = Kind::from_u8(reader.byte("a block's kind")?).ok_or(LinesError::at(at, "a block's kind is no task kind"))?;
         let mut subject = [0; 32];
         subject.copy_from_slice(reader.take(32, "a block's subject")?);
         let name = Name::new(kind, ContentId(subject));
         if blocks.last().is_some_and(|(last, _)| *last >= name) {
-            return Err(LinesError { at, what: "the blocks are not sorted by name, one each" });
+            return Err(LinesError::at(at, "the blocks are not sorted by name, one each"));
         }
         let block = reader.sized("a block's entries")?;
         let mut inner = Reader { bytes: block, at: 0 };
         while inner.at < block.len() {
-            entry(&mut inner).map_err(|why| LinesError { at: reader.at - block.len() + why.at, what: why.what })?;
+            entry(&mut inner).map_err(|why| LinesError::at(reader.at - block.len() + why.at, why.what))?;
         }
         blocks.push((name, block));
     }
     if reader.at != bytes.len() {
-        return Err(LinesError { at: reader.at, what: "bytes follow the last block" });
+        return Err(LinesError::at(reader.at, "bytes follow the last block"));
     }
     Ok(Last { blocks, placement })
 }
@@ -858,7 +883,7 @@ pub(crate) fn head_notes<'m>(block: &'m [u8], each: &mut dyn FnMut(&'m str)) -> 
     let mut reader = Reader { bytes: block, at: 0 };
     while reader.at < block.len() {
         if let Entry::Note { class: Class::Head, words } = entry(&mut reader)? {
-            each(core::str::from_utf8(words).map_err(|_| LinesError { at: reader.at, what: "a note's words are not UTF-8" })?);
+            each(core::str::from_utf8(words).map_err(|_| LinesError::at(reader.at, "a note's words are not UTF-8"))?);
         }
     }
     Ok(())
@@ -892,7 +917,7 @@ pub(crate) fn not_checked_whole(block: &[u8]) -> Result<bool, LinesError> {
         match entry(&mut reader)? {
             Entry::Note { class: Class::Failure | Class::Unchecked | Class::Waited, .. } => return Ok(true),
             Entry::Noted { finding } => {
-                let kind = finding.kind().map_err(|_| LinesError { at: reader.at, what: "a noted finding's rule has no row in blaze_report::frame::words::WORDINGS" })?;
+                let kind = finding.kind().map_err(|_| LinesError::at(reader.at, "a noted finding's rule has no row in blaze_report::frame::words::WORDINGS"))?;
                 if kind != blaze_report::frame::words::Kind::BorrowsUnchecked {
                     return Ok(true);
                 }
@@ -1844,7 +1869,7 @@ impl<'m> Rendered<'m> {
         match r.take(4, "the rendered answer's form")? {
             form if form == RENDER_FORM => {}
             form if OLD_RENDER_FORMS.iter().any(|old| form == *old) => return Ok(Rendered::older()),
-            _ => return Err(LinesError { at: 0, what: "the rendered answer is neither BER3 nor an older BER1 or BER2" }),
+            _ => return Err(LinesError::at(0, "the rendered answer is neither BER3 nor an older BER1 or BER2")),
         }
         let lines = Key(r.digest("the semantic lines and placement key")?);
         let presentation = r.digest("the rendered presentation key")?;
@@ -1856,21 +1881,21 @@ impl<'m> Rendered<'m> {
         let (types, borrows) = (n()?, n()?);
         let fix_bytes = r.sized("the rendered fix ids")?;
         if fix_bytes.len() > MOST_BLOCKS * (crate::fix::FULL + 1) {
-            return Err(LinesError { at: r.at, what: "the rendered fix list exceeds its byte cap" });
+            return Err(LinesError::at(r.at, "the rendered fix list exceeds its byte cap"));
         }
-        let fixes = core::str::from_utf8(fix_bytes).map_err(|_| LinesError { at: r.at, what: "invalid UTF-8 in the rendered fix ids" })?;
+        let fixes = core::str::from_utf8(fix_bytes).map_err(|_| LinesError::at(r.at, "invalid UTF-8 in the rendered fix ids"))?;
         if !fixes.is_empty() && fixes.split(' ').enumerate().any(|(i, id)| {
             i >= MOST_BLOCKS || !(crate::fix::SHORT..=crate::fix::FULL).contains(&id.len()) || !id.bytes().all(|b| crate::fix::ALPHABET.contains(&b))
         }) {
-            return Err(LinesError { at: r.at, what: "invalid id in the rendered answer's fix list" });
+            return Err(LinesError::at(r.at, "invalid id in the rendered answer's fix list"));
         }
         let index = r.sized("the rendered row index")?;
         if index.len() > MOST_RENDER_BYTES {
-            return Err(LinesError { at: r.at, what: "the rendered row index exceeds its byte cap" });
+            return Err(LinesError::at(r.at, "the rendered row index exceeds its byte cap"));
         }
         let stream = r.sized("the rendered stream")?;
         if stream.len() > MOST_RENDER_BYTES || r.at != bytes.len() {
-            return Err(LinesError { at: r.at, what: "the rendered stream is oversized or has trailing bytes" });
+            return Err(LinesError::at(r.at, "the rendered stream is oversized or has trailing bytes"));
         }
         Ok(Self { lines, presentation, tally, counts, behind, types, borrows, fixes, index, stream, old_form: false })
     }
@@ -1885,7 +1910,7 @@ impl<'m> Rendered<'m> {
         while index.at < self.index.len() {
             rows += 1;
             if rows > MOST_BLOCKS {
-                return Err(LinesError { at: index.at, what: "too many rows in the rendered answer" });
+                return Err(LinesError::at(index.at, "too many rows in the rendered answer"));
             }
             let at = index.at;
             let tag = index.byte("a rendered row's tag")?;
@@ -1895,14 +1920,14 @@ impl<'m> Rendered<'m> {
                 ROW_BLOCK => {
                     let block = stream.take(len, "a block outside the rendered stream")?;
                     if previous.blocks.insert(key, block).is_some_and(|was| was != block) {
-                        return Err(LinesError { at: index.at, what: "two different rendered blocks have the same input key" });
+                        return Err(LinesError::at(index.at, "two different rendered blocks have the same input key"));
                     }
                 }
                 ROW_FILE => {
                     let flag = |byte: u8, at: usize, what: &'static str| match byte {
                         0 => Ok(false),
                         1 => Ok(true),
-                        _ => Err(LinesError { at, what }),
+                        _ => Err(LinesError::at(at, what)),
                     };
                     let gap = flag(index.byte("a file section's gap")?, index.at, "a file section's gap is neither 0 nor 1")?;
                     let drew = flag(index.byte("a file section's file mark")?, index.at, "a file section's file mark is neither 0 nor 1")?;
@@ -1910,28 +1935,28 @@ impl<'m> Rendered<'m> {
                     let deltas = Deltas { failures: n()?, errors: n()?, warnings: n()?, notes: n()?, fixable: n()?, types: n()?, borrows: n()? };
                     let count = index.u32("a file section's id count")? as usize;
                     if count > MOST_BLOCKS || previous.ids.len() + count > MOST_BLOCKS {
-                        return Err(LinesError { at: index.at, what: "too many ids in the rendered answer's sections" });
+                        return Err(LinesError::at(index.at, "too many ids in the rendered answer's sections"));
                     }
                     let from = previous.ids.len();
                     for _ in 0..count {
                         let mut full = [0u8; crate::fix::FULL];
                         full.copy_from_slice(index.take(crate::fix::FULL, "a file section's id")?);
                         let shown = index.byte("a file section's id length")?;
-                        let id = crate::fix::Id::of_parts(full, shown).ok_or(LinesError { at: index.at, what: "a file section's id is not of the id alphabet or its shown length is outside SHORT..=FULL" })?;
+                        let id = crate::fix::Id::of_parts(full, shown).ok_or(LinesError::at(index.at, "a file section's id is not of the id alphabet or its shown length is outside SHORT..=FULL"))?;
                         let fix = flag(index.byte("a file section's fix mark")?, index.at, "a file section's fix mark is neither 0 nor 1")?;
                         previous.ids.push((id, fix));
                     }
                     let bytes = stream.take(len, "a file section outside the rendered stream")?;
                     let row = FileRow { gap, drew, deltas, ids: (from, previous.ids.len()), bytes };
                     if previous.files.insert(key, row).is_some() {
-                        return Err(LinesError { at, what: "two file sections of the rendered answer have the same key" });
+                        return Err(LinesError::at(at, "two file sections of the rendered answer have the same key"));
                     }
                 }
-                _ => return Err(LinesError { at, what: "a rendered row's tag is neither a drawing (0) nor a file's section (1)" }),
+                _ => return Err(LinesError::at(at, "a rendered row's tag is neither a drawing (0) nor a file's section (1)")),
             }
         }
         if stream.at != self.stream.len() {
-            return Err(LinesError { at: stream.at, what: "the row index does not cover the rendered stream" });
+            return Err(LinesError::at(stream.at, "the row index does not cover the rendered stream"));
         }
         Ok(previous)
     }
@@ -2112,7 +2137,7 @@ fn next_entry_path<'m>(reader: &mut Reader<'m>) -> Result<Option<&'m str>, Lines
     match tag {
         NOTE => {
             let at = reader.at;
-            Class::of_byte(reader.byte("a note's class")?).ok_or(LinesError { at, what: "a note's class is none of the six" })?;
+            Class::of_byte(reader.byte("a note's class")?).ok_or(LinesError::at(at, "a note's class is none of the six"))?;
             let _ = reader.sized("a note's words")?;
             Ok(None)
         }
@@ -2122,18 +2147,18 @@ fn next_entry_path<'m>(reader: &mut Reader<'m>) -> Result<Option<&'m str>, Lines
         }
         VIEW => {
             let at_kind = reader.at;
-            Kind::from_u8(reader.byte("a view's base kind")?).ok_or(LinesError { at: at_kind, what: "a view's base kind is no task kind" })?;
+            Kind::from_u8(reader.byte("a view's base kind")?).ok_or(LinesError::at(at_kind, "a view's base kind is no task kind"))?;
             let _ = reader.take(32, "a view's base subject")?;
             let at_place = reader.at;
             let at = reader.u32("a view's place")?;
             let units = reader.u32("a view's unit count")?;
             if units < 2 || at >= units {
-                return Err(LinesError { at: at_place, what: "a view's place is not below its unit count, or the count is under two" });
+                return Err(LinesError::at(at_place, "a view's place is not below its unit count, or the count is under two"));
             }
             for _ in 0..units {
                 let at_flag = reader.at;
                 if reader.byte("a view's unit flag")? > 1 {
-                    return Err(LinesError { at: at_flag, what: "a view's unit flag is neither 0 nor 1" });
+                    return Err(LinesError::at(at_flag, "a view's unit flag is neither 0 nor 1"));
                 }
                 let _ = reader.sized("a view's unit name")?;
             }
@@ -2144,13 +2169,13 @@ fn next_entry_path<'m>(reader: &mut Reader<'m>) -> Result<Option<&'m str>, Lines
             match entry(reader)? {
                 Entry::Finding { path: Some(path), .. } => core::str::from_utf8(path)
                     .map(Some)
-                    .map_err(|_| LinesError { at: reader.at, what: "a finding's path is not UTF-8" }),
+                    .map_err(|_| LinesError::at(reader.at, "a finding's path is not UTF-8")),
                 Entry::Finding { rule, path: None, words, .. } => {
                     if crate::names::placed(rule) && words.contains(&0x1F) {
                         match crate::names::place_pieces(words) {
                             Ok((Some((path, _, _)), _)) => Ok(Some(path)),
                             Ok((None, _)) => Ok(None),
-                            Err(_) => Err(LinesError { at: reader.at, what: "a finding's place pieces are malformed" }),
+                            Err(_) => Err(LinesError::at(reader.at, "a finding's place pieces are malformed")),
                         }
                     } else {
                         Ok(None)
@@ -2604,7 +2629,7 @@ impl<'m, 'f> ViewSlot<'m, 'f> {
         };
         let Ok(decoded) = crate::store::record_codec::decode_if_envelope_in(
             held.bytes,
-            crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+            LINES_MAX_DECODED_BYTES,
             frame,
         ) else {
             return Ok(None);
@@ -3121,5 +3146,106 @@ mod section_tests {
         }
         let truncated = &bytes_befb[..bytes_befb.len() - 4];
         assert!(decode_in_frame(truncated, &frame, alloc).is_err(), "truncated BZR1 Lines record must be refused");
+    }
+
+    /// Regression for giant monorepos (e.g. >64 MiB uncompressed `BEFC` printed-lines record):
+    /// `Lines::record_for` compresses and `decode_in_frame` decodes records past the 64 MiB
+    /// `DEFAULT_MAX_DECODED_BYTES` cap up to `LINES_MAX_DECODED_BYTES` (512 MiB), while concrete
+    /// `RecordCodecError` diagnostics (including exact byte counts and codec failures) are
+    /// preserved in `LinesError` and its `Display` output (rules 3, 18, 19, 26).
+    #[test]
+    fn lines_bzr1_over_64_mib_round_trips_and_surfaces_codec_errors() {
+        use crate::store::record_codec::{
+            DEFAULT_MAX_DECODED_BYTES, HEADER_LEN, MAGIC, RecordCodecError, VERSION, decode_if_envelope_in,
+        };
+
+        // Virtual reservation matching production's bump Frame: doubling Vec growth during
+        // decompression of a 65 MiB payload consumes ~2.5-3x bump address space.
+        let frame = Frame::with_reserve(512 << 20, bstd::mem::Tag::Other).expect("512 MiB test frame");
+        let alloc = blaze_own::testing::heap().shared();
+
+        // Build a valid BEFC Lines record whose uncompressed size exceeds 64 MiB (~65 MiB) using
+        // repetitive UTF-8 note text so Level::Fast compresses and decompresses it in milliseconds.
+        let mut lines = Lines::new_in(alloc);
+        let chunk = std::vec![b'a'; 1 << 20];
+        for i in 0u32..65 {
+            let name = Name::new(Kind::BodyCheck, ContentId::of("bzr1 65mib lines", &i.to_le_bytes()));
+            lines.note(name, Class::Unchecked, &chunk);
+        }
+        let placement = ContentId([0x77; 32]);
+        let (_placed, bytes_befc) = lines.record_for(placement);
+        assert!(crate::store::record_codec::is_envelope(&bytes_befc), "65 MiB BEFC record must compress into BZR1");
+
+        // Negative control reproducing the live bug: the old 64 MiB cap rejects this exact record
+        // with RecordCodecError::OutputTooLarge.
+        let old_cap_err = decode_if_envelope_in(&bytes_befc, DEFAULT_MAX_DECODED_BYTES, &frame)
+            .err()
+            .expect("65 MiB BZR1 BEFC record must exceed the 64 MiB default cap");
+        assert!(
+            matches!(
+                old_cap_err,
+                RecordCodecError::OutputTooLarge { declared, limit }
+                    if declared > DEFAULT_MAX_DECODED_BYTES && limit == DEFAULT_MAX_DECODED_BYTES
+            ),
+            "expected OutputTooLarge past 64 MiB, got {old_cap_err:?}"
+        );
+
+        // Positive: decode_in_frame accepts the >64 MiB BZR1 BEFC record and round-trips every block.
+        let decoded = decode_in_frame(&bytes_befc, &frame, alloc).expect("decode_in_frame must accept >64 MiB BZR1 BEFC");
+        assert_eq!(decoded.placement, Some(placement));
+        assert!(decoded.blocks().eq(lines.blocks()), "all 65 blocks must round-trip identically");
+
+        // Concrete RecordCodecError propagation in LinesError (rule 19):
+        // 1. Corrupt compressed payload -> RecordCodecError::Zstd preserved in both field and Display.
+        let mut corrupt_zstd = bytes_befc.as_slice().to_vec();
+        let last_idx = corrupt_zstd.len() - 1;
+        corrupt_zstd[last_idx] ^= 0xFF;
+        let zstd_err = decode_in_frame(&corrupt_zstd, &frame, alloc).err().expect("corrupt zstd must fail");
+        assert!(
+            matches!(zstd_err.codec, Some(RecordCodecError::Zstd(_))),
+            "expected RecordCodecError::Zstd, got {:?}",
+            zstd_err.codec
+        );
+        let zstd_msg = std::format!("{zstd_err}");
+        assert!(
+            zstd_msg.contains("BZR1 record zstd codec failed"),
+            "LinesError Display must include concrete zstd error: {zstd_msg}"
+        );
+
+        // 2. Unsupported envelope version -> RecordCodecError::UnsupportedVersion preserved.
+        let mut bad_ver = bytes_befc.as_slice().to_vec();
+        bad_ver[4] = VERSION + 1;
+        let ver_err = decode(&bad_ver, alloc).err().expect("unsupported version must fail");
+        assert_eq!(
+            ver_err.codec,
+            Some(RecordCodecError::UnsupportedVersion { found: VERSION + 1, wanted: VERSION })
+        );
+        let ver_msg = std::format!("{ver_err}");
+        assert!(
+            ver_msg.contains("version 2 is unsupported"),
+            "LinesError Display must name unsupported version: {ver_msg}"
+        );
+
+        // 3. Declared length past LINES_MAX_DECODED_BYTES -> OutputTooLarge names declared and limit.
+        let over_cap = u32::try_from(LINES_MAX_DECODED_BYTES + 1).expect("512 MiB + 1 fits in u32");
+        let mut header = [0u8; HEADER_LEN];
+        header[0..4].copy_from_slice(&MAGIC);
+        header[4] = VERSION;
+        header[5] = 1; // Codec::Zstd
+        header[8..12].copy_from_slice(&over_cap.to_le_bytes());
+        let cap_err = decode_in_frame(&header, &frame, alloc).err().expect("declared > 512 MiB must fail");
+        assert_eq!(
+            cap_err.codec,
+            Some(RecordCodecError::OutputTooLarge {
+                declared: LINES_MAX_DECODED_BYTES + 1,
+                limit: LINES_MAX_DECODED_BYTES,
+            })
+        );
+        let cap_msg = std::format!("{cap_err}");
+        assert!(
+            cap_msg.contains(&std::format!("declares {}", LINES_MAX_DECODED_BYTES + 1))
+                && cap_msg.contains(&std::format!("past limit {LINES_MAX_DECODED_BYTES}")),
+            "LinesError Display must include exact declared and limit byte counts: {cap_msg}"
+        );
     }
 }

@@ -1160,7 +1160,7 @@ fn strip_leading_view(mut block: &[u8]) -> Result<&[u8], crate::engine_lines::Li
     const VIEW_TAG: u8 = 5;
     fn take<'b>(rest: &mut &'b [u8], total: usize, n: usize, what: &'static str) -> Result<&'b [u8], crate::engine_lines::LinesError> {
         if rest.len() < n {
-            return Err(crate::engine_lines::LinesError { at: total.saturating_sub(rest.len()), what });
+            return Err(crate::engine_lines::LinesError::at(total.saturating_sub(rest.len()), what));
         }
         let (head, tail) = rest.split_at(n);
         *rest = tail;
@@ -1194,7 +1194,7 @@ fn parse_leading_view<'b, 'a>(
     const VIEW_TAG: u8 = 5;
     fn take<'b>(rest: &mut &'b [u8], total: usize, n: usize, what: &'static str) -> Result<&'b [u8], crate::engine_lines::LinesError> {
         if rest.len() < n {
-            return Err(crate::engine_lines::LinesError { at: total.saturating_sub(rest.len()), what });
+            return Err(crate::engine_lines::LinesError::at(total.saturating_sub(rest.len()), what));
         }
         let (head, tail) = rest.split_at(n);
         *rest = tail;
@@ -1202,7 +1202,7 @@ fn parse_leading_view<'b, 'a>(
     }
     fn take_u32(rest: &mut &[u8], total: usize, what: &'static str) -> Result<u32, crate::engine_lines::LinesError> {
         let bytes = take(rest, total, 4, what)?;
-        let arr: [u8; 4] = bytes.try_into().map_err(|_| crate::engine_lines::LinesError { at: total.saturating_sub(rest.len()), what })?;
+        let arr: [u8; 4] = bytes.try_into().map_err(|_| crate::engine_lines::LinesError::at(total.saturating_sub(rest.len()), what))?;
         Ok(u32::from_le_bytes(arr))
     }
     let Some((&first, mut rest)) = block.split_first() else {
@@ -1215,11 +1215,11 @@ fn parse_leading_view<'b, 'a>(
     let kind_byte = take(&mut rest, total, 1, "a view entry's base kind")?
         .first()
         .copied()
-        .ok_or(crate::engine_lines::LinesError { at: 1, what: "a view entry's base kind" })?;
-    let kind = Kind::from_u8(kind_byte).ok_or(crate::engine_lines::LinesError { at: 1, what: "a view entry's base kind is no task kind" })?;
+        .ok_or(crate::engine_lines::LinesError::at(1, "a view entry's base kind"))?;
+    let kind = Kind::from_u8(kind_byte).ok_or(crate::engine_lines::LinesError::at(1, "a view entry's base kind is no task kind"))?;
     let subject_bytes: [u8; 32] = take(&mut rest, total, 32, "a view entry's base subject")?
         .try_into()
-        .map_err(|_| crate::engine_lines::LinesError { at: 2, what: "a view entry's base subject" })?;
+        .map_err(|_| crate::engine_lines::LinesError::at(2, "a view entry's base subject"))?;
     let base = Name::new(kind, blaze_ids::ContentId(subject_bytes));
     let at = take_u32(&mut rest, total, "a view entry's place")?;
     let count = take_u32(&mut rest, total, "a view entry's unit count")?;
@@ -1228,10 +1228,10 @@ fn parse_leading_view<'b, 'a>(
         let flag = take(&mut rest, total, 1, "a view entry's unit flag")?
             .first()
             .copied()
-            .ok_or(crate::engine_lines::LinesError { at: total.saturating_sub(rest.len()), what: "a view entry's unit flag" })?;
+            .ok_or(crate::engine_lines::LinesError::at(total.saturating_sub(rest.len()), "a view entry's unit flag"))?;
         let len = usize::try_from(take_u32(&mut rest, total, "a view entry's unit name length")?).unwrap_or(usize::MAX);
         let name_bytes = take(&mut rest, total, len, "a view entry's unit name")?;
-        let name = core::str::from_utf8(name_bytes).map_err(|_| crate::engine_lines::LinesError { at: total.saturating_sub(rest.len()), what: "a view entry's unit name is not UTF-8" })?;
+        let name = core::str::from_utf8(name_bytes).map_err(|_| crate::engine_lines::LinesError::at(total.saturating_sub(rest.len()), "a view entry's unit name is not UTF-8"))?;
         units.push(crate::engine_lines::ViewUnit { test: flag == 1, name });
     }
     Ok(Some((base, at, units, rest)))

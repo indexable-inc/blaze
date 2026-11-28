@@ -148,7 +148,11 @@ pub(crate) fn prepare_typed_in<'a, A: Allocator + Copy>(
     raw: &'a [u8],
     alloc: A,
 ) -> Result<(Key, crate::store::record_codec::Encoded<'a, A>), crate::store::record_codec::RecordCodecError> {
-    let encoded = crate::store::record_codec::encode_selective_in(raw, alloc)?;
+    let encoded = crate::store::record_codec::encode_selective_in(
+        raw,
+        crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+        alloc,
+    )?;
     let key = typed_key(encoded.as_slice());
     Ok((key, encoded))
 }
@@ -530,7 +534,11 @@ impl blaze_ladder::front2::program::lazy::typed::KeptBodies for StoreTyped<'_> {
         let Ok(raw) = blaze_typeck::checked_record::encode(checked, self.from.alloc) else {
             return;
         };
-        let Ok(encoded) = crate::store::record_codec::encode_selective_in(raw.as_slice(), self.from.alloc) else {
+        let Ok(encoded) = crate::store::record_codec::encode_selective_in(
+            raw.as_slice(),
+            crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+            self.from.alloc,
+        ) else {
             return;
         };
         match put_dep_typed_if_absent(self.from.lent, dep_key, encoded.as_slice()) {
@@ -589,7 +597,11 @@ impl blaze_ladder::front2::program::lazy::typed::KeptBodies for SnapshotTyped<'_
         let Ok(raw) = blaze_typeck::checked_record::encode(checked, self.alloc) else {
             return;
         };
-        let Ok(encoded) = crate::store::record_codec::encode_selective_in(raw.as_slice(), shared) else {
+        let Ok(encoded) = crate::store::record_codec::encode_selective_in(
+            raw.as_slice(),
+            crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+            shared,
+        ) else {
             return;
         };
         let bytes = match encoded {
@@ -906,7 +918,12 @@ mod tests {
 
         // 2. Hit with small raw Checked record (Toolchain).
         let small_raw = sample_checked_bytes(4, alloc);
-        let small_enc = crate::store::record_codec::encode_selective_in(small_raw.as_slice(), alloc).expect("encode small");
+        let small_enc = crate::store::record_codec::encode_selective_in(
+            small_raw.as_slice(),
+            crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+            alloc,
+        )
+        .expect("encode small");
         assert!(!small_enc.is_compressed());
         let mut saw_hit = None;
         let hit_tc = super::decode_body_source(
@@ -933,7 +950,12 @@ mod tests {
 
         // 3. Hit with large BZR1-compressed Checked record (Dependency).
         let large_raw = sample_checked_bytes(2048, alloc);
-        let large_enc = crate::store::record_codec::encode_selective_in(large_raw.as_slice(), alloc).expect("encode large");
+        let large_enc = crate::store::record_codec::encode_selective_in(
+            large_raw.as_slice(),
+            crate::store::record_codec::DEFAULT_MAX_DECODED_BYTES,
+            alloc,
+        )
+        .expect("encode large");
         assert!(large_enc.is_compressed(), "large checked record should use BZR1 Zstd envelope");
         saw_hit = None;
         let hit_dep = super::decode_body_source(

@@ -40,6 +40,9 @@ pub(crate) const COMPRESS_MAX_RATIO_PCT: usize = 85;
 pub(crate) const DEFAULT_MAX_DECODED_BYTES: usize = 64 << 20;
 
 /// Maximum Zstd window size accepted on decode (8 MiB, matching `ZstdLimits::USUAL`).
+/// `blaze-zstd` emits a 1 MiB window (`WINDOW_DESC_1M`) at `Level::Fast` for any payload larger
+/// than 128 KiB (and a single-segment window `<= 128 KiB` for smaller payloads), so 8 MiB always
+/// covers `FAST_ZSTD_OPTS` regardless of payload size.
 const MAX_WINDOW_BYTES: usize = 8 << 20;
 
 /// Fast single-probe Zstd with RFC 8878 32-bit `XXH64` content checksum for corruption detection.
@@ -222,18 +225,25 @@ fn write_envelope<A: Allocator + Copy>(
     Ok(out)
 }
 
-/// Selectively compresses `raw` into a `BZR1` Zstd envelope when `raw.len() >= 4 KiB` and the
-/// framed output is strictly smaller than `85%` of `raw.len()`; otherwise returns
-/// [`Encoded::Raw`] with zero framing overhead.
+/// Selectively compresses `raw` into a `BZR1` Zstd envelope when `COMPRESS_MIN_BYTES <= raw.len()
+/// <= max_decoded_bytes` and the framed output is strictly smaller than `85%` of `raw.len()`;
+/// otherwise returns [`Encoded::Raw`] with zero framing overhead.
+///
+/// Enforces encode/decode symmetry (rules 3, 18, 26): pass the exact `max_decoded_bytes` cap that
+/// the paired [`decode_if_envelope_in`] call enforces so this encoder never produces a `BZR1`
+/// envelope that its decoder would immediately reject with [`RecordCodecError::OutputTooLarge`].
+/// Payloads larger than `max_decoded_bytes` remain [`Encoded::Raw`] and round-trip zero-copy via
+/// [`Decoded::Borrowed`].
 ///
 /// Use for record types whose raw bytes already carry a distinct magic that cannot collide with
 /// [`MAGIC`] (`b"BZR1"`), such as `TypedBody` (`BZCHKD07`), frozen dependency heads (`BZFZ`),
 /// crate head listings (`BLZLSTJ\x01` / `BLZLSTP\x01`), `Lines` (`BEFB`/`BEFC`), and native images.
 pub(crate) fn encode_selective_in<'a, A: Allocator + Copy>(
     raw: &'a [u8],
+    max_decoded_bytes: usize,
     alloc: A,
 ) -> Result<Encoded<'a, A>, RecordCodecError> {
-    if raw.len() < COMPRESS_MIN_BYTES {
+    if raw.len() < COMPRESS_MIN_BYTES || raw.len() > max_decoded_bytes {
         return Ok(Encoded::Raw(raw));
     }
     let raw_len = u32::try_from(raw.len()).map_err(|_| RecordCodecError::InputTooLarge { len: raw.len() })?;
@@ -434,7 +444,7 @@ mod tests {
         for i in 0..2040usize {
             small.push(u8::try_from(i % 17).unwrap_or(0));
         }
-        let enc_small = encode_selective_in(small.as_slice(), alloc).expect("encode small");
+        let enc_small = encode_selective_in(small.as_slice(), DEFAULT_MAX_DECODED_BYTES, alloc).expect("encode small");
         assert!(!enc_small.is_compressed(), "records under 4 KiB must stay raw");
         assert_eq!(enc_small.as_slice(), small.as_slice());
         let dec_small = decode_if_envelope_in(enc_small.as_slice(), DEFAULT_MAX_DECODED_BYTES, alloc).expect("decode small");
@@ -451,7 +461,7 @@ mod tests {
             structured.extend_from_slice(&word.to_le_bytes());
         }
         assert!(structured.len() >= COMPRESS_MIN_BYTES);
-        let enc_struct = encode_selective_in(structured.as_slice(), alloc).expect("encode structured");
+        let enc_struct = encode_selective_in(structured.as_slice(), DEFAULT_MAX_DECODED_BYTES, alloc).expect("encode structured");
         assert!(enc_struct.is_compressed(), "structured 32 KiB record must compress");
         assert!(
             enc_struct.as_slice().len() * 2 < structured.len(),
@@ -474,7 +484,7 @@ mod tests {
             let v = state.wrapping_mul(0x2545_f491_4f6c_dd1d);
             incomp.extend_from_slice(&v.to_le_bytes());
         }
-        let enc_incomp = encode_selective_in(incomp.as_slice(), alloc).expect("encode incompressible");
+        let enc_incomp = encode_selective_in(incomp.as_slice(), DEFAULT_MAX_DECODED_BYTES, alloc).expect("encode incompressible");
         assert!(!enc_incomp.is_compressed(), "incompressible record must stay raw (85% gate)");
         assert_eq!(enc_incomp.as_slice(), incomp.as_slice());
     }
@@ -582,7 +592,7 @@ mod tests {
             let mut small = blaze_own::Vec::with_capacity_in(128, alloc);
             small.extend_from_slice(magic);
             small.resize(128, 0x2a);
-            let enc_small = encode_selective_in(small.as_slice(), alloc).expect("encode small");
+            let enc_small = encode_selective_in(small.as_slice(), DEFAULT_MAX_DECODED_BYTES, alloc).expect("encode small");
             assert!(!enc_small.is_compressed(), "small payload stays raw");
             let dec_small = decode_if_envelope_in(enc_small.as_slice(), DEFAULT_MAX_DECODED_BYTES, alloc).expect("decode small");
             assert!(!dec_small.was_compressed(), "small decode is zero-copy");
@@ -594,12 +604,67 @@ mod tests {
             while large.len() < (16 << 10) {
                 large.extend_from_slice(b"struct_item_row_payload_entry\0\0\0");
             }
-            let enc_large = encode_selective_in(large.as_slice(), alloc).expect("encode large");
+            let enc_large = encode_selective_in(large.as_slice(), DEFAULT_MAX_DECODED_BYTES, alloc).expect("encode large");
             assert!(enc_large.is_compressed(), "large structured payload compresses into BZR1");
             assert!(enc_large.as_slice().len() < large.len() / 2, "must shrink substantially");
             let dec_large = decode_if_envelope_in(enc_large.as_slice(), DEFAULT_MAX_DECODED_BYTES, alloc).expect("decode large");
             assert!(dec_large.was_compressed(), "large decode decompresses BZR1");
             assert_eq!(dec_large.as_slice(), large.as_slice());
         }
+    }
+
+    /// Payloads exceeding `DEFAULT_MAX_DECODED_BYTES` (64 MiB) round-trip cleanly through `BZR1`
+    /// when encoded and decoded with a higher cap (proving `bstd::zstd`'s `Level::Fast` 1 MiB
+    /// window stays well within `MAX_WINDOW_BYTES`), are refused with `OutputTooLarge` under
+    /// `DEFAULT_MAX_DECODED_BYTES`, and stay raw (zero-copy decodable) when encoded with a cap
+    /// below their size (rules 3, 18, 26).
+    #[test]
+    fn bzr1_large_payload_over_64_mib_round_trips_and_bounded_encode_enforces_symmetry() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let big_len: usize = 65 << 20;
+        let high_cap: usize = 512 << 20;
+
+        let mut big = blaze_own::Vec::with_capacity_in(big_len, alloc);
+        big.extend_from_slice(b"BEFC");
+        big.resize(big_len, 0x3cu8);
+        // Touch the tail so length and end-of-stream integrity are verified end-to-end.
+        big[big_len - 4..].copy_from_slice(b"TAIL");
+
+        // 1. Positive: 65 MiB payload compresses into BZR1 and round-trips byte-exact under 512 MiB cap.
+        let enc_high = encode_selective_in(big.as_slice(), high_cap, alloc).expect("encode 65 MiB under 512 MiB cap");
+        assert!(enc_high.is_compressed(), "65 MiB compressible payload must compress into BZR1");
+        assert!(
+            enc_high.as_slice().len() < (1 << 20),
+            "65 MiB repetitive payload must compress tightly, got {} bytes",
+            enc_high.as_slice().len()
+        );
+        let dec_high = decode_if_envelope_in(enc_high.as_slice(), high_cap, alloc).expect("decode 65 MiB under 512 MiB cap");
+        assert!(dec_high.was_compressed(), "65 MiB decode must decompress BZR1");
+        assert_eq!(dec_high.as_slice().len(), big_len);
+        assert_eq!(&dec_high.as_slice()[..4], b"BEFC");
+        assert_eq!(&dec_high.as_slice()[big_len - 4..], b"TAIL");
+        assert_eq!(dec_high.as_slice(), big.as_slice());
+
+        // 2. Negative control: decoding that same 65 MiB BZR1 envelope under DEFAULT_MAX_DECODED_BYTES
+        //    (64 MiB) fails explicitly with OutputTooLarge before allocating.
+        let err = decode_if_envelope_in(enc_high.as_slice(), DEFAULT_MAX_DECODED_BYTES, alloc)
+            .err()
+            .expect("65 MiB BZR1 envelope must be refused under 64 MiB cap");
+        assert_eq!(
+            err,
+            RecordCodecError::OutputTooLarge { declared: big_len, limit: DEFAULT_MAX_DECODED_BYTES }
+        );
+
+        // 3. Encode/decode symmetry: encoding 65 MiB under a 64 MiB cap refuses to emit a BZR1
+        //    envelope that the paired 64 MiB decoder would reject; it leaves the payload raw so
+        //    decode_if_envelope_in(..., DEFAULT_MAX_DECODED_BYTES, ...) succeeds zero-copy.
+        let enc_bounded = encode_selective_in(big.as_slice(), DEFAULT_MAX_DECODED_BYTES, alloc)
+            .expect("bounded encode above cap stays raw");
+        assert!(!enc_bounded.is_compressed(), "payload exceeding max_decoded_bytes must not be wrapped in BZR1");
+        let dec_bounded = decode_if_envelope_in(enc_bounded.as_slice(), DEFAULT_MAX_DECODED_BYTES, alloc)
+            .expect("raw payload above BZR1 cap must decode zero-copy");
+        assert!(!dec_bounded.was_compressed(), "raw payload above cap borrows zero-copy");
+        assert_eq!(dec_bounded.as_slice().len(), big_len);
+        assert_eq!(&dec_bounded.as_slice()[big_len - 4..], b"TAIL");
     }
 }
