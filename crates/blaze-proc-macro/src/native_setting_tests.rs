@@ -344,6 +344,35 @@ fn linux_host_native_setting_accepts_linux_shelf_and_features_h() {
             }
             other => panic!("expected NoSdk, got {other}"),
         }
+
+        // Negative control: symlinks to non-regular targets (`/dev/zero`, `/dev/null`, and a real
+        // Unix FIFO) inside a non-FHS sysroot must be rejected immediately as `NoSdk` without
+        // opening or blocking.
+        let fifo_dir = home.join("fifo-target");
+        fs::create_dir_all(&fifo_dir).expect("fifo dir");
+        let fifo_path = fifo_dir.join("hang.fifo");
+        let fifo_c = std::ffi::CString::new(fifo_path.to_str().expect("utf8 fifo")).expect("cstr");
+        // SAFETY: `fifo_c` is a valid NUL-terminated path pointing into our temp test dir.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0, "mkfifo failed");
+
+        for (tag, target) in [
+            ("dev-null", std::path::Path::new("/dev/null")),
+            ("dev-zero", std::path::Path::new("/dev/zero")),
+            ("fifo", fifo_path.as_path()),
+        ] {
+            let hostile_sdk = home.join(format!("glibc-hostile-{tag}"));
+            fs::create_dir_all(hostile_sdk.join("include")).expect("hostile inc");
+            fs::write(hostile_sdk.join(LINUX_HOST_SYSROOT_MARKER), b"#define __GLIBC__ 2\n").expect("hostile features.h");
+            std::os::unix::fs::symlink(target, hostile_sdk.join("include/hostile.h")).expect("hostile symlink");
+            let err = command_native_setting(home_s, hostile_sdk.to_str().expect("utf8"), "test", LINUX_HOST, alloc)
+                .expect_err("non-regular symlink target must be refused immediately");
+            match err {
+                NativeSettingError::NoSdk { path, .. } => {
+                    assert!(path.as_str().ends_with("/include/hostile.h"), "expected hostile.h path for {tag}, got {}", path.as_str());
+                }
+                other => panic!("expected NoSdk for {tag}, got {other}"),
+            }
+        }
     }
     let _ = fs::remove_dir_all(&home);
 }

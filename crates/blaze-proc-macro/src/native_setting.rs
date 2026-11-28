@@ -24,7 +24,10 @@
 //! digests, and marked local (host_tools.rs, MARK "host-tool"): never offered to a shared cache.
 
 use core::time::Duration;
-use std::{fs, io};
+use std::{
+    fs,
+    io::{self, Read as _},
+};
 
 use blaze_build_script::toolchain::{self, PinError, Sysroot};
 use blaze_pins::{CLANG_JSON, CLANG_PATH};
@@ -336,7 +339,8 @@ pub fn native_setting_with_link<'a>(
     }
     // nm-row: every member the native runs start or load is on the shelf (a link must lead to
     // a file); a shelf unpacked before a member was added is refused naming it.
-    let member_there = |member: &str| fs::metadata(text(&[shelf.as_str(), "/", member], alloc).as_str()).is_ok();
+    let stat_meta = |path: &str| fs::metadata(path);
+    let member_there = |member: &str| stat_meta(text(&[shelf.as_str(), "/", member], alloc).as_str()).is_ok();
     if let Some(member) = toolchain::shelf_missing_for(sysroot, member_there) {
         return Err(NativeSettingError::ShelfIncomplete { shelf, member });
     }
@@ -347,9 +351,71 @@ pub fn native_setting_with_link<'a>(
         Sysroot::LinuxHost => toolchain::LINUX_HOST_SYSROOT_MARKER,
         Sysroot::Pinned { .. } => return Err(NativeSettingError::PinnedSysroot { host }),
     };
-    let read_file = |path: &str| fs::read(path);
+    // Explicit bound on any single SDK marker, header, or runtime library file read while keying
+    // a host sysroot (rule 18): rejects non-regular targets (FIFOs, `/dev/zero`, sockets) BEFORE
+    // opening so malformed or hostile host sysroots can never hang or exhaust memory.
+    const MAX_SDK_FILE_BYTES: u64 = 64 * 1024 * 1024;
+    let open_regular = |path: &str| -> io::Result<(fs::File, u64)> {
+        let meta = stat_meta(path)?;
+        if !meta.is_file() {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let expected_len = meta.len();
+        if expected_len > MAX_SDK_FILE_BYTES {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+        let file = fs::File::open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        Ok((file, expected_len))
+    };
+    let read_bounded = |path: &str| -> io::Result<AVec<'a, u8>> {
+        let (mut file, expected_len) = open_regular(path)?;
+        let cap = usize::try_from(expected_len).unwrap_or(0);
+        let mut out: AVec<'a, u8> = Vec::with_capacity_in(cap, alloc);
+        let mut buf = [0u8; 16 * 1024];
+        let mut total = 0u64;
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            total = total.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+            if total > MAX_SDK_FILE_BYTES {
+                return Err(io::Error::from(io::ErrorKind::InvalidData));
+            }
+            if let Some(chunk) = buf.get(..n) {
+                out.extend_from_slice(chunk);
+            }
+        }
+        Ok(out)
+    };
+    let hash_regular = |sha: &mut blaze_sha256::Sha256, path: &str| -> io::Result<()> {
+        let (mut file, expected_len) = open_regular(path)?;
+        sha.update(&expected_len.to_le_bytes());
+        let mut buf = [0u8; 16 * 1024];
+        let mut total = 0u64;
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            total = total.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+            if total > MAX_SDK_FILE_BYTES {
+                return Err(io::Error::from(io::ErrorKind::InvalidData));
+            }
+            if let Some(chunk) = buf.get(..n) {
+                sha.update(chunk);
+            }
+        }
+        if total != expected_len {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+        Ok(())
+    };
     let settings_path = text(&[sdk.as_str(), "/", marker_rel], alloc);
-    let settings = read_file(settings_path.as_str()).map_err(|error| NativeSettingError::NoSdk { path: settings_path.clone(), error })?;
+    let settings = read_bounded(settings_path.as_str()).map_err(|error| NativeSettingError::NoSdk { path: settings_path.clone(), error })?;
     let sdk_extra = match sysroot {
         Sysroot::LinuxHost => {
             // On NixOS, `<glibc-dev>/include/linux` (and `asm/`, `asm-generic/`) symlinks into a
@@ -464,58 +530,59 @@ pub fn native_setting_with_link<'a>(
                             }
                             match entry.kind {
                                 bstd::fs::EntryKind::File => {
-                                    let bytes = read_file(full.as_str())
-                                        .map_err(|error| NativeSettingError::NoSdk { path: full, error })?;
                                     sha.update(b"F");
                                     sha.update(&u64::try_from(name.len()).unwrap_or(u64::MAX).to_le_bytes());
                                     sha.update(name.as_bytes());
-                                    sha.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
-                                    sha.update(&bytes);
+                                    hash_regular(sha, full.as_str())
+                                        .map_err(|error| NativeSettingError::NoSdk { path: full, error })?;
                                 }
                                 bstd::fs::EntryKind::Link => {
                                     sha.update(b"L");
                                     sha.update(&u64::try_from(name.len()).unwrap_or(u64::MAX).to_le_bytes());
                                     sha.update(name.as_bytes());
-                                    match read_file(full.as_str()) {
-                                        Ok(bytes) => {
-                                            sha.update(b"f");
-                                            sha.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
-                                            sha.update(&bytes);
+                                    let meta = stat_meta(full.as_str())
+                                        .map_err(|error| NativeSettingError::NoSdk { path: String::from_str_in(full.as_str(), alloc), error })?;
+                                    if meta.is_file() {
+                                        sha.update(b"f");
+                                        hash_regular(sha, full.as_str())
+                                            .map_err(|error| NativeSettingError::NoSdk { path: full, error })?;
+                                    } else if meta.is_dir() {
+                                        // Hash the symlinked directory's actual contents under
+                                        // its symlink name so retargeting e.g. `include/asm`
+                                        // from `arch-a` to `arch-b` always moves `sdk_version`
+                                        // while remaining path-independent across copies.
+                                        let real_target = resolved(
+                                            &full,
+                                            |path, err| NativeSettingError::NoSdk { path, error: err },
+                                            alloc,
+                                        )?;
+                                        if ancestors.len() >= MAX_LINK_DEPTH
+                                            || ancestors.iter().any(|a| a.as_str() == real_target.as_str())
+                                        {
+                                            return Err(NativeSettingError::NoSdk {
+                                                path: full,
+                                                error: io::Error::from(io::ErrorKind::InvalidInput),
+                                            });
                                         }
-                                        Err(error) if error.kind() == io::ErrorKind::IsADirectory => {
-                                            // Hash the symlinked directory's actual contents under
-                                            // its symlink name so retargeting e.g. `include/asm`
-                                            // from `arch-a` to `arch-b` always moves `sdk_version`
-                                            // while remaining path-independent across copies.
-                                            let real_target = resolved(
-                                                &full,
-                                                |path, err| NativeSettingError::NoSdk { path, error: err },
-                                                alloc,
-                                            )?;
-                                            if ancestors.len() >= MAX_LINK_DEPTH
-                                                || ancestors.iter().any(|a| a.as_str() == real_target.as_str())
-                                            {
-                                                return Err(NativeSettingError::NoSdk {
-                                                    path: full,
-                                                    error: io::Error::from(io::ErrorKind::InvalidInput),
-                                                });
-                                            }
-                                            sha.update(b"d");
-                                            let mut next_anc: AVec<'a, AString<'a>> = Vec::with_capacity_in(ancestors.len() + 1, alloc);
-                                            for a in ancestors.iter() {
-                                                next_anc.push(String::from_str_in(a.as_str(), alloc));
-                                            }
-                                            next_anc.push(String::from_str_in(real_target.as_str(), alloc));
-                                            let next_prefix = if prefix.is_empty() {
-                                                String::from_str_in(name, alloc)
-                                            } else {
-                                                text(&[prefix.as_str(), "/", name], alloc)
-                                            };
-                                            sub_dirs.push((next_prefix, real_target, next_anc));
+                                        sha.update(b"d");
+                                        let mut next_anc: AVec<'a, AString<'a>> = Vec::with_capacity_in(ancestors.len() + 1, alloc);
+                                        for a in ancestors.iter() {
+                                            next_anc.push(String::from_str_in(a.as_str(), alloc));
                                         }
-                                        Err(error) => {
-                                            return Err(NativeSettingError::NoSdk { path: full, error });
-                                        }
+                                        next_anc.push(String::from_str_in(real_target.as_str(), alloc));
+                                        let next_prefix = if prefix.is_empty() {
+                                            String::from_str_in(name, alloc)
+                                        } else {
+                                            text(&[prefix.as_str(), "/", name], alloc)
+                                        };
+                                        sub_dirs.push((next_prefix, real_target, next_anc));
+                                    } else {
+                                        // Reject symlinks to FIFOs, devices (`/dev/zero`), or
+                                        // sockets without opening them.
+                                        return Err(NativeSettingError::NoSdk {
+                                            path: full,
+                                            error: io::Error::from(io::ErrorKind::InvalidInput),
+                                        });
                                     }
                                 }
                                 _ => {
@@ -548,14 +615,12 @@ pub fn native_setting_with_link<'a>(
                     }
                 }
                 if let Some(dyn_linker) = sdk_dynamic_linker.as_ref() {
-                    let bytes = read_file(dyn_linker.as_str())
-                        .map_err(|error| NativeSettingError::NoSdk { path: String::from_str_in(dyn_linker.as_str(), alloc), error })?;
                     let loader_name = dyn_linker.as_str().rsplit('/').next().unwrap_or("");
                     sha.update(b"dyn\0");
                     sha.update(&u64::try_from(loader_name.len()).unwrap_or(u64::MAX).to_le_bytes());
                     sha.update(loader_name.as_bytes());
-                    sha.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
-                    sha.update(&bytes);
+                    hash_regular(&mut sha, dyn_linker.as_str())
+                        .map_err(|error| NativeSettingError::NoSdk { path: String::from_str_in(dyn_linker.as_str(), alloc), error })?;
                 }
                 for rpath in sdk_rpaths.iter() {
                     hash_dir(&mut sha, rpath.as_str(), b"rpath\0", &mut ignored_loader)?;
