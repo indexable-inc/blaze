@@ -66,8 +66,8 @@ pub enum ClosureError {
     NotLocked { name: String, version: String },
     /// A path package in the closure: its sources are pinned by nothing in the lock.
     Unpinned { name: String, version: String },
-    /// The resolved `wasm64-blaze-wasip1` unit graph has no `ProcMacro` unit matching this
-    /// package and exact feature set.
+    /// The resolved `wasm64-blaze-wasip1` unit graph has no unique `ProcMacro` unit matching this
+    /// package and containing its requested feature set.
     WasmRootMissing { name: String, version: String },
 }
 
@@ -79,7 +79,7 @@ impl std::fmt::Display for ClosureError {
                 write!(f, "{name} {version} is a path package under a proc-macro crate: the lock pins nothing of its sources")
             }
             ClosureError::WasmRootMissing { name, version } => {
-                write!(f, "{name} {version}: no matching ProcMacro unit with exact features in the wasm64 unit graph")
+                write!(f, "{name} {version}: no unique matching ProcMacro unit containing requested features in the wasm64 unit graph")
             }
         }
     }
@@ -479,15 +479,69 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// stale form-10 wasm64 proc-macro modules whose `std::env::var` calls missed host env vars.
 pub const MODULE_HEADER: &str = "blaze proc-macro module wasm64 11";
 
+/// Result of comparing a candidate `wasm_graph` unit's feature set against the requested
+/// `host_graph` feature set (`want_sorted_dedup`, sorted and deduplicated).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FeatureMatch {
+    /// Candidate is missing at least one requested feature.
+    Missing,
+    /// Candidate has the exact same feature set (`got == want`).
+    Exact,
+    /// Candidate contains every requested feature plus WASI-added features (`got ⊃ want`).
+    Superset,
+}
+
+/// Classifies `unit.features` against `want_sorted_dedup` without global heap allocation.
+pub(crate) fn classify_unit_features<A: core::alloc::Allocator + Copy>(
+    unit: &blaze_unit_graph::Unit<'_>,
+    want_sorted_dedup: &[&str],
+    alloc: A,
+) -> FeatureMatch {
+    if unit.features.len() < want_sorted_dedup.len() {
+        return FeatureMatch::Missing;
+    }
+    let mut got = blaze_own::Vec::with_capacity_in(unit.features.len(), alloc);
+    for f in unit.features.iter() {
+        got.push(f.as_str());
+    }
+    got.sort_unstable();
+    got.dedup();
+    if got.len() < want_sorted_dedup.len() {
+        return FeatureMatch::Missing;
+    }
+    let mut gi = 0usize;
+    for &want in want_sorted_dedup {
+        while let Some(&g) = got.get(gi) {
+            if g < want {
+                gi += 1;
+            } else {
+                break;
+            }
+        }
+        if got.get(gi).copied() != Some(want) {
+            return FeatureMatch::Missing;
+        }
+        gi += 1;
+    }
+    if got.len() == want_sorted_dedup.len() {
+        FeatureMatch::Exact
+    } else {
+        FeatureMatch::Superset
+    }
+}
+
 /// Folds the resolved `wasm64-blaze-wasip1` dependency closure's unified feature sets (bound to
 /// each package's source pin — registry checksum/source, git commit+URL, or path files digest)
 /// into a proc-macro crate's `deps` digest so enabling, removing, or swapping features across
 /// dependencies (including same-name/same-version packages from different sources and dependency
 /// build-script closures) invalidates the module key (rule 21).
 ///
-/// Requires an exact `(package, UnitKind::ProcMacro, features)` match in `wasm_graph` (returning
-/// [`ClosureError::WasmRootMissing`] otherwise) and refuses any reachable `LockSource::Path`
-/// dependency whose digest cannot be supplied ([`ClosureError::Unpinned`], rule 3).
+/// Prefers a unique exact `(package, UnitKind::ProcMacro, features)` match in `wasm_graph`, else
+/// accepts a unique feature superset when WASI target-gated dependencies unify extra features onto
+/// the proc-macro unit (folding those extra root features into the digest, rule 21). Returns
+/// [`ClosureError::WasmRootMissing`] when missing or ambiguous, and refuses any reachable
+/// `LockSource::Path` dependency whose digest cannot be supplied ([`ClosureError::Unpinned`],
+/// rule 3).
 pub fn deps_with_wasm_features<S: AsRef<str>, D: AsRef<str>, A: core::alloc::Allocator + Copy>(
     lock_deps: &str,
     lock: &Lock<'_>,
@@ -504,20 +558,34 @@ pub fn deps_with_wasm_features<S: AsRef<str>, D: AsRef<str>, A: core::alloc::All
     }
     want_feats.sort_unstable();
     want_feats.dedup();
-    let feats_match = |u: &blaze_unit_graph::Unit<'_>| -> bool {
-        let mut got = blaze_own::Vec::with_capacity_in(u.features.len(), alloc);
-        for f in u.features.iter() {
-            got.push(f.as_str());
+    let mut exact_idx: Option<usize> = None;
+    let mut exact_count: usize = 0;
+    let mut superset_idx: Option<usize> = None;
+    let mut superset_count: usize = 0;
+    for (i, u) in wasm_graph.units.iter().enumerate() {
+        if u.package != package || u.kind != blaze_unit_graph::UnitKind::ProcMacro {
+            continue;
         }
-        got.sort_unstable();
-        got.dedup();
-        got.as_slice() == want_feats.as_slice()
+        match classify_unit_features(u, want_feats.as_slice(), alloc) {
+            FeatureMatch::Missing => {}
+            FeatureMatch::Exact => {
+                exact_idx.get_or_insert(i);
+                exact_count += 1;
+            }
+            FeatureMatch::Superset => {
+                superset_idx.get_or_insert(i);
+                superset_count += 1;
+            }
+        }
+    }
+    let matched = if exact_count == 1 {
+        exact_idx.map(|i| (i, false))
+    } else if exact_count == 0 && superset_count == 1 {
+        superset_idx.map(|i| (i, true))
+    } else {
+        None
     };
-    let Some(root_idx) = wasm_graph
-        .units
-        .iter()
-        .position(|u| u.package == package && u.kind == blaze_unit_graph::UnitKind::ProcMacro && feats_match(u))
-    else {
+    let Some((root_idx, has_extra_wasm_root_feats)) = matched else {
         let root_pkg = lock.package(package);
         let mut version = blaze_own::String::new_in(alloc);
         let _ = write!(version, "{}", root_pkg.version);
@@ -572,6 +640,25 @@ pub fn deps_with_wasm_features<S: AsRef<str>, D: AsRef<str>, A: core::alloc::All
         path_cache.push(None);
     }
     let mut rows = blaze_own::Vec::<blaze_own::String<A>, A>::new_in(alloc);
+    if has_extra_wasm_root_feats
+        && let Some(root_u) = wasm_graph.units.get(root_idx)
+    {
+        let mut rfeats = blaze_own::Vec::with_capacity_in(root_u.features.len(), alloc);
+        for f in root_u.features.iter() {
+            rfeats.push(f.as_str());
+        }
+        rfeats.sort_unstable();
+        rfeats.dedup();
+        let mut row = blaze_own::String::new_in(alloc);
+        row.push_str("root-wasm-features ");
+        for (i, f) in rfeats.iter().enumerate() {
+            if i > 0 {
+                row.push(',');
+            }
+            row.push_str(f);
+        }
+        rows.push(row);
+    }
     while let Some(idx) = stack.pop() {
         let Some(u) = wasm_graph.units.get(idx) else { continue };
         push_deps(u, &mut visited, &mut stack);
@@ -1218,6 +1305,41 @@ mod header_tests {
         assert_eq!(
             err_unpinned,
             ClosureError::Unpinned { name: "wasi_bs_helper".to_owned(), version: "0.1.0".to_owned() }
+        );
+
+        // 4. WASI-added superset feature on ProcMacro root succeeds and invalidates the key (rule 21),
+        //    while missing requested features and ambiguous supersets still return `WasmRootMissing`.
+        let mut wg_sup_units = OwnVec::new_in(alloc);
+        wg_sup_units.push(mk_unit(0, "demo_pm", UnitKind::ProcMacro, &["feat_a", "wasi_extra"], &[("dep_lib", 1)], None));
+        wg_sup_units.push(mk_unit(1, "dep_lib", UnitKind::Lib, &[], &[], Some(2)));
+        wg_sup_units.push(mk_unit(1, "dep_lib", UnitKind::BuildScript, &[], &[("wasi_bs_helper", 3)], None));
+        wg_sup_units.push(mk_unit(2, "wasi_bs_helper", UnitKind::Lib, &[], &[], None));
+        let wg_sup = UnitGraph { units: wg_sup_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        let d_sup = deps_with_wasm_features("base", &lock, &wg_sup, LockId(0), &["feat_a"], |id| (id == LockId(2)).then_some("helper-v1"), alloc)
+            .expect("unique WASI feature superset must succeed");
+        assert_ne!(
+            d_sup.as_str(),
+            d_v1.as_str(),
+            "WASI-added root feature on ProcMacro must invalidate the module key (rule 21)"
+        );
+
+        let err_sup_missing = deps_with_wasm_features("base", &lock, &wg_sup, LockId(0), &["feat_a", "missing"], |id| (id == LockId(2)).then_some("helper-v1"), alloc)
+            .expect_err("missing requested feature must still fail closed");
+        assert_eq!(
+            err_sup_missing,
+            ClosureError::WasmRootMissing { name: "demo_pm".to_owned(), version: "0.1.0".to_owned() }
+        );
+
+        let mut wg_ambig_units = OwnVec::new_in(alloc);
+        wg_ambig_units.push(mk_unit(0, "demo_pm", UnitKind::ProcMacro, &["feat_a", "wasi_x"], &[], None));
+        wg_ambig_units.push(mk_unit(0, "demo_pm", UnitKind::ProcMacro, &["feat_a", "wasi_y"], &[], None));
+        let wg_ambig = UnitGraph { units: wg_ambig_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+        let err_ambig = deps_with_wasm_features("base", &lock, &wg_ambig, LockId(0), &["feat_a"], |_| None::<&str>, alloc)
+            .expect_err("ambiguous superset units must fail closed");
+        assert_eq!(
+            err_ambig,
+            ClosureError::WasmRootMissing { name: "demo_pm".to_owned(), version: "0.1.0".to_owned() }
         );
     }
 

@@ -2184,9 +2184,61 @@ fn checkout_package_from_member<'a>(
     package
 }
 
+/// Result of comparing a candidate `wasm_graph` unit's feature set against the requested
+/// `host_graph` feature set (`want_sorted_dedup`, sorted and deduplicated).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FeatureMatch {
+    /// Candidate is missing at least one requested feature.
+    Missing,
+    /// Candidate has the exact same feature set (`got == want`).
+    Exact,
+    /// Candidate contains every requested feature plus WASI-added features (`got ⊃ want`).
+    Superset,
+}
+
+fn classify_unit_features(unit: &Unit<'_>, want_sorted_dedup: &[&str], alloc: Alloc<'_>) -> FeatureMatch {
+    if unit.features.len() < want_sorted_dedup.len() {
+        return FeatureMatch::Missing;
+    }
+    let mut got: AVec<'_, &str> = OwnVec::with_capacity_in(unit.features.len(), alloc);
+    for f in unit.features.iter() {
+        got.push(f.as_str());
+    }
+    got.sort_unstable();
+    got.dedup();
+    if got.len() < want_sorted_dedup.len() {
+        return FeatureMatch::Missing;
+    }
+    let mut gi = 0usize;
+    for &want in want_sorted_dedup {
+        while let Some(&g) = got.get(gi) {
+            if g < want {
+                gi += 1;
+            } else {
+                break;
+            }
+        }
+        if got.get(gi).copied() != Some(want) {
+            return FeatureMatch::Missing;
+        }
+        gi += 1;
+    }
+    if got.len() == want_sorted_dedup.len() {
+        FeatureMatch::Exact
+    } else {
+        FeatureMatch::Superset
+    }
+}
+
 /// Locates the matching `BuildScript` or `ProcMacro` unit in `wasm_graph` corresponding to
-/// `root_unit` in `host_graph`, preserving distinct `HostFeatureSide` namespaces and exact
-/// feature sets.
+/// `root_unit` in `host_graph`, preserving distinct `HostFeatureSide` namespaces and requiring
+/// every host-resolved feature to be present in `wasm_graph`.
+///
+/// Target-gated WASI dependencies (e.g., `rustix` enabling `libc?/extra_traits` on
+/// `wasm64-blaze-wasip1` when `libc` is inactive on Linux) can unify strictly more features onto
+/// the same `(package, kind, HostFeatureSide)` unit in `wasm_graph`. Prefers a unique exact
+/// feature match, else accepts a unique feature superset on the exact same `HostFeatureSide`, and
+/// fails closed when missing or ambiguous.
 fn locate_root_in_wasm_graph(
     host_graph: &UnitGraph<'_>,
     wasm_graph: &UnitGraph<'_>,
@@ -2212,17 +2264,59 @@ fn locate_root_in_wasm_graph(
         want_root_feats.push(f.as_str());
     }
     want_root_feats.sort_unstable();
-    let root_idx = wasm_graph.units.iter().enumerate().position(|(i, u)| {
-        u32::try_from(i).is_ok_and(|uid| {
-            u.package == root.package
-                && u.kind == want_kind
-                && wasm_graph.host_unit_side(UnitId(uid)) == want_side
-                && sorted_features_match(u, want_root_feats.as_slice())
-        })
-    });
+    want_root_feats.dedup();
+    let mut exact_idx: Option<usize> = None;
+    let mut exact_count: usize = 0;
+    let mut superset_idx: Option<usize> = None;
+    let mut superset_count: usize = 0;
+    for (i, u) in wasm_graph.units.iter().enumerate() {
+        let Ok(uid) = u32::try_from(i) else { continue };
+        if u.package != root.package
+            || u.kind != want_kind
+            || wasm_graph.host_unit_side(UnitId(uid)) != want_side
+        {
+            continue;
+        }
+        match classify_unit_features(u, want_root_feats.as_slice(), alloc) {
+            FeatureMatch::Missing => {}
+            FeatureMatch::Exact => {
+                exact_idx.get_or_insert(i);
+                exact_count += 1;
+            }
+            FeatureMatch::Superset => {
+                superset_idx.get_or_insert(i);
+                superset_count += 1;
+            }
+        }
+    }
+    let root_idx = if exact_count == 1 {
+        exact_idx
+    } else if exact_count > 1 {
+        return Err(fail(format_args!(
+            "wasm64 resolution for {} {} produced {exact_count} ambiguous {:?} units matching side {:?} and features {:?}",
+            root.name.as_str(),
+            root.version.as_str(),
+            want_kind,
+            want_side,
+            want_root_feats.as_slice()
+        )));
+    } else if superset_count == 1 {
+        superset_idx
+    } else if superset_count > 1 {
+        return Err(fail(format_args!(
+            "wasm64 resolution for {} {} produced {superset_count} ambiguous {:?} units matching side {:?} and containing features {:?}",
+            root.name.as_str(),
+            root.version.as_str(),
+            want_kind,
+            want_side,
+            want_root_feats.as_slice()
+        )));
+    } else {
+        None
+    };
     let Some(root_idx) = root_idx else {
         return Err(fail(format_args!(
-            "wasm64 resolution for {} {} produced no exact {:?} unit matching side {:?} and features {:?}",
+            "wasm64 resolution for {} {} produced no {:?} unit matching side {:?} and containing features {:?}",
             root.name.as_str(),
             root.version.as_str(),
             want_kind,
@@ -5733,15 +5827,15 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
             a,
         );
         let bs_feat_err = locate_root_in_wasm_graph(&host_graph, &wg_wrong_feats, UnitId(0), CompileMode::BuildScript, a)
-            .expect_err("inexact BuildScript features in wasm_graph must be refused");
+            .expect_err("BuildScript missing requested features in wasm_graph must be refused");
         assert!(
-            bstd::mem::format_in!(&frame, "{bs_feat_err}").as_str().contains("no exact"),
+            bstd::mem::format_in!(&frame, "{bs_feat_err}").as_str().contains("produced no"),
             "unexpected error: {bs_feat_err}"
         );
         let pm_feat_err = locate_root_in_wasm_graph(&host_graph, &wg_wrong_feats, UnitId(2), CompileMode::ProcMacro, a)
-            .expect_err("inexact ProcMacro features in wasm_graph must be refused");
+            .expect_err("ProcMacro missing requested features in wasm_graph must be refused");
         assert!(
-            bstd::mem::format_in!(&frame, "{pm_feat_err}").as_str().contains("no exact"),
+            bstd::mem::format_in!(&frame, "{pm_feat_err}").as_str().contains("produced no"),
             "unexpected error: {pm_feat_err}"
         );
 
@@ -5758,7 +5852,7 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         let bs_side_err = locate_root_in_wasm_graph(&host_graph, &wg_wrong_side, UnitId(0), CompileMode::BuildScript, a)
             .expect_err("wrong HostFeatureSide BuildScript in wasm_graph must be refused");
         assert!(
-            bstd::mem::format_in!(&frame, "{bs_side_err}").as_str().contains("no exact"),
+            bstd::mem::format_in!(&frame, "{bs_side_err}").as_str().contains("produced no"),
             "unexpected error: {bs_side_err}"
         );
 
@@ -5781,8 +5875,87 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         let orphan_wrong_side_err = locate_root_in_wasm_graph(&host_graph, &wg_orphan_host, UnitId(0), CompileMode::BuildScript, a)
             .expect_err("orphan Host-side foo BuildScript must be refused for Target-side root");
         assert!(
-            bstd::mem::format_in!(&frame, "{orphan_wrong_side_err}").as_str().contains("no exact"),
+            bstd::mem::format_in!(&frame, "{orphan_wrong_side_err}").as_str().contains("produced no"),
             "unexpected error: {orphan_wrong_side_err}"
+        );
+
+        // Wasm graph 4 (libc 0.2.191 / rustix regression): WASI-only target dep adds `extra_traits`
+        // onto `libc (BuildScript, Host)` -> `["default", "extra_traits", "std"]`, and `wasi_extra`
+        // onto `my-macro (ProcMacro, Host)` -> `["macros", "wasi_extra"]`. Unique supersets on the
+        // exact same `HostFeatureSide` MUST resolve cleanly.
+        let wg_superset = make_graph(
+            [
+                make_u(3, "libc", UnitKind::BuildScript, true, HostFeatureSide::Host, None, &["default", "extra_traits", "std"]),
+                make_u(2, "my-macro", UnitKind::ProcMacro, true, HostFeatureSide::Host, None, &["macros", "wasi_extra"]),
+                make_u(1, "foo", UnitKind::BuildScript, true, HostFeatureSide::Host, None, &["extra", "std"]),
+            ]
+            .into(),
+            a,
+        );
+        assert_eq!(
+            locate_root_in_wasm_graph(&host_graph, &wg_superset, UnitId(3), CompileMode::BuildScript, a)
+                .expect("WASI-added extra_traits superset on Host-side libc BuildScript must match"),
+            UnitId(0)
+        );
+        assert_eq!(
+            locate_root_in_wasm_graph(&host_graph, &wg_superset, UnitId(2), CompileMode::ProcMacro, a)
+                .expect("WASI-added superset on ProcMacro must match"),
+            UnitId(1)
+        );
+        // Negative 1: wrong HostFeatureSide (Host vs Target) MUST still fail closed even for a superset.
+        let superset_wrong_side = locate_root_in_wasm_graph(&host_graph, &wg_superset, UnitId(0), CompileMode::BuildScript, a)
+            .expect_err("Host-side superset must be refused for Target-side root");
+        assert!(
+            bstd::mem::format_in!(&frame, "{superset_wrong_side}").as_str().contains("produced no"),
+            "unexpected error: {superset_wrong_side}"
+        );
+
+        // Negative 2: missing requested feature (`["default", "missing", "std"]` vs `["default", "extra_traits", "std"]`)
+        // MUST still fail closed.
+        let host_missing_feat = make_graph(
+            [
+                make_u(3, "libc", UnitKind::BuildScript, true, HostFeatureSide::Host, None, &["default", "missing", "std"]),
+            ]
+            .into(),
+            a,
+        );
+        let missing_feat_err = locate_root_in_wasm_graph(&host_missing_feat, &wg_superset, UnitId(0), CompileMode::BuildScript, a)
+            .expect_err("missing requested feature must be refused even when wasm has extra features");
+        assert!(
+            bstd::mem::format_in!(&frame, "{missing_feat_err}").as_str().contains("produced no"),
+            "unexpected error: {missing_feat_err}"
+        );
+
+        // Negative 3: two distinct superset units on the same `(package, kind, side)` MUST fail
+        // closed as ambiguous.
+        let wg_ambiguous = make_graph(
+            [
+                make_u(3, "libc", UnitKind::BuildScript, true, HostFeatureSide::Host, None, &["default", "extra_a", "std"]),
+                make_u(3, "libc", UnitKind::BuildScript, true, HostFeatureSide::Host, None, &["default", "extra_b", "std"]),
+            ]
+            .into(),
+            a,
+        );
+        let ambig_err = locate_root_in_wasm_graph(&host_graph, &wg_ambiguous, UnitId(3), CompileMode::BuildScript, a)
+            .expect_err("multiple superset units must fail closed as ambiguous");
+        assert!(
+            bstd::mem::format_in!(&frame, "{ambig_err}").as_str().contains("ambiguous"),
+            "unexpected error: {ambig_err}"
+        );
+
+        // Exact match is preferred when both an exact match and a strict superset exist.
+        let wg_exact_and_superset = make_graph(
+            [
+                make_u(3, "libc", UnitKind::BuildScript, true, HostFeatureSide::Host, None, &["default", "extra_traits", "std"]),
+                make_u(3, "libc", UnitKind::BuildScript, true, HostFeatureSide::Host, None, &["default", "std"]),
+            ]
+            .into(),
+            a,
+        );
+        assert_eq!(
+            locate_root_in_wasm_graph(&host_graph, &wg_exact_and_superset, UnitId(3), CompileMode::BuildScript, a)
+                .expect("unique exact match must win over strict superset"),
+            UnitId(1)
         );
 
         // Exact match on package + kind + side + features succeeds.

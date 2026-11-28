@@ -201,18 +201,19 @@ impl core::fmt::Display for DepsDigestError {
 impl core::error::Error for DepsDigestError {}
 
 /// Canonical SHA-256 digest of a build-script unit's transitive `UnitKind::Lib | UnitKind::ProcMacro`
-/// build-dependencies (resolved against `wasm_graph` when present and matching the script's exact
-/// host-feature side and feature set, so every WASI-side unified dependency feature and WASI-only
-/// direct/transitive build-dep enters the module key without pulling in the package's normal or
-/// dev dependencies from `Cargo.lock`, rules 21 & 60).
+/// build-dependencies (resolved against `wasm_graph` when present and uniquely matching the
+/// script's exact host-feature side with an exact or WASI-unified superset feature set, so every
+/// WASI-added root feature, WASI-side unified dependency feature, and WASI-only direct/transitive
+/// build-dep enters the module key without pulling in the package's normal or dev dependencies from
+/// `Cargo.lock`, rules 21 & 60).
 ///
 /// When `wasm_graph` is absent (e.g. native build scripts or minimal toolchains without
-/// `wasm64-blaze-wasip1`) or does not contain an exact side-and-feature match for `script`, falls
+/// `wasm64-blaze-wasip1`) or does not contain a unique side-and-feature match for `script`, falls
 /// back to supplementing host `graph` build-deps with lock-pinned (non-path) `Cargo.lock` metadata
 /// so registry/git WASI-only deps still invalidate the digest while unkeyed normal/dev checkout
 /// path files are never read into `UnitGraph`'s sealed `CrateList` (Rule 21: prevents `TwoValues`).
-/// Returns `Ok(None)` when the build script has no build-dependencies (and, in fallback mode, no
-/// lock dependencies).
+/// Returns `Ok(None)` when the build script has no build-dependencies, no WASI-added root features
+/// beyond `graph`, and (in fallback mode) no lock dependencies.
 pub fn script_deps_digest(
     graph: &UnitGraph<'_>,
     wasm_graph: Option<&UnitGraph<'_>>,
@@ -239,14 +240,16 @@ pub fn script_deps_digest_with<S: AsRef<str>, A: core::alloc::Allocator>(
     let Some(root) = graph.units.get(script.index()) else { return Ok(None) };
     let frame = bstd::mem::Frame::new(bstd::mem::Tag::Other).map_err(DepsDigestError)?;
 
-    // When the resolved `wasm64-blaze-wasip1` host-unit graph is available and contains an exact
-    // side-and-feature match for `script`, walk its exact build-dependency closure so every
-    // WASI-only dependency and workspace-unified WASI feature set enters the digest without
-    // touching `Cargo.lock` normal/dev dependencies (rule 21: `UnitGraph`'s key only covers
-    // build-deps, rule 60: normal `.rs` edits never invalidate `build.rs` modules). Any missing or
-    // mismatched side/feature falls back to the host graph + conservative lock walk instead of
-    // silently binding to another side's build-script unit.
-    let (active_graph, active_root, resolved_wasm) = match wasm_graph {
+    // When the resolved `wasm64-blaze-wasip1` host-unit graph is available and contains a unique
+    // side-and-feature match for `script` (preferring an exact feature match, else accepting a
+    // unique feature superset when WASI target-gated deps unify extra features onto the script's
+    // host-feature side), walk its exact build-dependency closure and fold any WASI-added root
+    // features into the digest so every WASI-only dependency and workspace-unified WASI feature
+    // enters the module key without touching `Cargo.lock` normal/dev dependencies (rule 21:
+    // `UnitGraph`'s key only covers build-deps, rule 60: normal `.rs` edits never invalidate
+    // `build.rs` modules). Any missing, ambiguous, or wrong-side match falls back to the host
+    // graph + conservative lock walk instead of silently binding to another side's unit.
+    let (active_graph, active_root, resolved_wasm, has_extra_wasm_root_feats) = match wasm_graph {
         Some(wg) => {
             let want_side = graph.host_unit_side(script);
             let mut want_feats = blaze_own::Vec::with_capacity_in(root.features.len(), &frame);
@@ -255,33 +258,49 @@ pub fn script_deps_digest_with<S: AsRef<str>, A: core::alloc::Allocator>(
             }
             want_feats.sort_unstable();
             want_feats.dedup();
-            let feats_match = |u: &Unit<'_>| -> bool {
-                let mut got = blaze_own::Vec::with_capacity_in(u.features.len(), &frame);
-                for f in u.features.iter() {
-                    got.push(f.as_str());
+            let mut exact_uid: Option<UnitId> = None;
+            let mut exact_count: usize = 0;
+            let mut superset_uid: Option<UnitId> = None;
+            let mut superset_count: usize = 0;
+            for (i, u) in wg.units.iter().enumerate() {
+                let Ok(uid_raw) = u32::try_from(i) else { continue };
+                let uid = UnitId(uid_raw);
+                if u.package != root.package
+                    || u.kind != UnitKind::BuildScript
+                    || wg.host_unit_side(uid) != want_side
+                {
+                    continue;
                 }
-                got.sort_unstable();
-                got.dedup();
-                got.as_slice() == want_feats.as_slice()
-            };
-            let exact = wg.units.iter().enumerate().find_map(|(i, u)| {
-                let uid = UnitId(u32::try_from(i).ok()?);
-                (u.package == root.package
-                    && u.kind == UnitKind::BuildScript
-                    && wg.host_unit_side(uid) == want_side
-                    && feats_match(u))
-                .then_some(uid)
-            });
-            match exact {
-                Some(uid) => (wg, uid, true),
-                None => (graph, script, false),
+                match crate::module::classify_unit_features(u, want_feats.as_slice(), &frame) {
+                    crate::module::FeatureMatch::Missing => {}
+                    crate::module::FeatureMatch::Exact => {
+                        exact_uid.get_or_insert(uid);
+                        exact_count += 1;
+                    }
+                    crate::module::FeatureMatch::Superset => {
+                        superset_uid.get_or_insert(uid);
+                        superset_count += 1;
+                    }
+                }
+            }
+            if exact_count == 1
+                && let Some(uid) = exact_uid
+            {
+                (wg, uid, true, false)
+            } else if exact_count == 0
+                && superset_count == 1
+                && let Some(uid) = superset_uid
+            {
+                (wg, uid, true, true)
+            } else {
+                (graph, script, false, false)
             }
         }
-        None => (graph, script, false),
+        None => (graph, script, false, false),
     };
 
     let active_root_unit = active_graph.units.get(active_root.index());
-    if resolved_wasm && active_root_unit.is_none_or(|u| u.deps.is_empty()) {
+    if resolved_wasm && !has_extra_wasm_root_feats && active_root_unit.is_none_or(|u| u.deps.is_empty()) {
         return Ok(None);
     }
 
@@ -357,6 +376,25 @@ pub fn script_deps_digest_with<S: AsRef<str>, A: core::alloc::Allocator>(
     }
 
     let mut lines = blaze_own::Vec::<blaze_own::String<&bstd::mem::Frame>, _>::new_in(&frame);
+    if has_extra_wasm_root_feats
+        && let Some(active_root_unit) = active_root_unit
+    {
+        let mut root_feats = blaze_own::Vec::with_capacity_in(active_root_unit.features.len(), &frame);
+        for f in active_root_unit.features.iter() {
+            root_feats.push(f.as_str());
+        }
+        root_feats.sort_unstable();
+        root_feats.dedup();
+        let mut row = blaze_own::String::new_in(&frame);
+        row.push_str("root-wasm-features ");
+        for (i, f) in root_feats.iter().enumerate() {
+            if i > 0 {
+                row.push(',');
+            }
+            row.push_str(f);
+        }
+        lines.push(row);
+    }
     while let Some(uid) = stack.pop() {
         let Some(u) = active_graph.units.get(uid.index()) else { continue };
         push_deps(u, &mut visited, &mut stack);
@@ -1939,5 +1977,65 @@ mod tests {
             None,
             "orphan Host-side BuildScript in wasm_graph must match Host-side root instead of falling back"
         );
+
+        // Case 4 (libc 0.2.191 / rustix regression): WASI-only target dep adds `extra_traits` to
+        // Host-side `app` BuildScript (`["default", "std"]` -> `["default", "extra_traits", "std"]`).
+        // Must match wasm_graph without falling back to Cargo.lock, AND must return a distinct
+        // `Some(digest)` covering the WASI-added root features (Rule 21).
+        let mut host_libc_units = OwnVec::new_in(alloc);
+        host_libc_units.push(mk_unit(0, "app", UnitKind::BuildScript, true, HostFeatureSide::Host, &["default", "std"], &[], None));
+        host_libc_units.push(mk_unit(0, "app", UnitKind::Lib, true, HostFeatureSide::Host, &["default", "std"], &[], Some(0)));
+        let host_libc_graph = UnitGraph { units: host_libc_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        let mut wg_sup_a_units = OwnVec::new_in(alloc);
+        wg_sup_a_units.push(mk_unit(0, "app", UnitKind::BuildScript, true, HostFeatureSide::Host, &["default", "extra_traits", "std"], &[], None));
+        let wg_sup_a = UnitGraph { units: wg_sup_a_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        let mut wg_sup_b_units = OwnVec::new_in(alloc);
+        wg_sup_b_units.push(mk_unit(0, "app", UnitKind::BuildScript, true, HostFeatureSide::Host, &["default", "extra_other", "std"], &[], None));
+        let wg_sup_b = UnitGraph { units: wg_sup_b_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        let d_sup_a = super::script_deps_digest(&host_libc_graph, Some(&wg_sup_a), &lock_a, UnitId(0), |id| {
+            panic!("matched superset wasm root with zero build-deps must not fall back to lock path dep {id:?}")
+        })
+        .expect("ok")
+        .expect("WASI-added root features must produce Some(digest) for Rule 21");
+        let d_sup_b = super::script_deps_digest(&host_libc_graph, Some(&wg_sup_b), &lock_a, UnitId(0), |id| {
+            panic!("matched superset wasm root with zero build-deps must not fall back to lock path dep {id:?}")
+        })
+        .expect("ok")
+        .expect("second WASI-added root feature set must produce Some(digest)");
+        assert_ne!(d_sup_a, d_sup_b, "distinct WASI-added root features must produce distinct deps digests");
+
+        // Negative controls for superset matching:
+        // - Wrong HostFeatureSide (Target vs Host) still falls back (reads lock).
+        // - Missing requested feature (`["default", "missing", "std"]` vs `["default", "extra_traits", "std"]`) falls back.
+        // - Ambiguous superset (two distinct superset units on the same side) falls back.
+        let mut host_target_libc_units = OwnVec::new_in(alloc);
+        host_target_libc_units.push(mk_unit(0, "app", UnitKind::BuildScript, true, HostFeatureSide::Target, &["default", "std"], &[], None));
+        let host_target_libc = UnitGraph { units: host_target_libc_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        let mut host_missing_libc_units = OwnVec::new_in(alloc);
+        host_missing_libc_units.push(mk_unit(0, "app", UnitKind::BuildScript, true, HostFeatureSide::Host, &["default", "missing", "std"], &[], None));
+        let host_missing_libc = UnitGraph { units: host_missing_libc_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        let mut wg_ambig_units = OwnVec::new_in(alloc);
+        wg_ambig_units.push(mk_unit(0, "app", UnitKind::BuildScript, true, HostFeatureSide::Host, &["default", "extra_a", "std"], &[], None));
+        wg_ambig_units.push(mk_unit(0, "app", UnitKind::BuildScript, true, HostFeatureSide::Host, &["default", "extra_b", "std"], &[], None));
+        let wg_ambig = UnitGraph { units: wg_ambig_units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        for (label, hg, wg) in [
+            ("wrong side superset", &host_target_libc, &wg_sup_a),
+            ("missing requested feature", &host_missing_libc, &wg_sup_a),
+            ("ambiguous supersets", &host_libc_graph, &wg_ambig),
+        ] {
+            let d_lock_a = super::script_deps_digest(hg, Some(wg), &lock_a, UnitId(0), |id| (id == LockId(3)).then(|| "w-v1".to_owned()))
+                .expect("ok")
+                .expect("fallback must return Some");
+            let d_lock_b = super::script_deps_digest(hg, Some(wg), &lock_b, UnitId(0), |id| (id == LockId(3)).then(|| "w-v1".to_owned()))
+                .expect("ok")
+                .expect("fallback must return Some for lock_b");
+            assert_ne!(d_lock_a, d_lock_b, "{label}: must fall back to lock walk instead of matching invalid wasm root");
+        }
     }
 }
