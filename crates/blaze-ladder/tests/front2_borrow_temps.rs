@@ -248,6 +248,95 @@ fn transitive_strict_drop_in_outer(c: bool) -> Vec<u8> {
     out
 }
 
+fn side_effect_u32() -> u32 {
+    1
+}
+
+fn mut_empty_array_iter_mut<'a>() -> core::slice::IterMut<'a, u32> {
+    [].iter_mut()
+}
+
+fn mut_empty_array_ref() -> &'static mut [u32] {
+    &mut []
+}
+
+fn mut_empty_array_as_mut_slice() -> &'static mut [u32] {
+    [].as_mut_slice()
+}
+
+fn mut_empty_repeat_const<'a>() -> core::slice::IterMut<'a, u32> {
+    [0u32; 0].iter_mut()
+}
+
+fn mut_nonempty_array_iter_mut<'a>() -> core::slice::IterMut<'a, u32> {
+    [1u32].iter_mut()
+}
+
+fn mut_empty_repeat_side_effect<'a>() -> core::slice::IterMut<'a, u32> {
+    [side_effect_u32(); 0].iter_mut()
+}
+
+fn mut_empty_repeat_local_ref<'a>() -> &'static mut [&'a mut u32] {
+    let mut x = 1u32;
+    &mut [&mut x; 0]
+}
+
+#[repr(align(8))]
+struct AlignedData<T>(T);
+
+impl<T> std::ops::Deref for AlignedData<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for AlignedData<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+const TEST_DATA: AlignedData<[u8; 4]> = AlignedData([1, 2, 3, 4]);
+const CELL_DATA: AlignedData<std::cell::Cell<u8>> = AlignedData(std::cell::Cell::new(1));
+
+struct DropWrap([u8; 4]);
+impl Drop for DropWrap {
+    fn drop(&mut self) {}
+}
+impl std::ops::Deref for DropWrap {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+const DROP_DATA: DropWrap = DropWrap([1, 2, 3, 4]);
+
+fn const_freeze_deref_explicit() -> &'static [u8] {
+    &*TEST_DATA
+}
+
+fn const_freeze_deref_call() -> usize {
+    let r = slice_id(&*TEST_DATA);
+    r.len()
+}
+
+fn const_freeze_deref_autoderef() -> &'static [u8] {
+    TEST_DATA.as_slice()
+}
+
+fn const_cell_deref_not_promoted() -> &'static std::cell::Cell<u8> {
+    &*CELL_DATA
+}
+
+fn const_drop_deref_not_promoted() -> &'static [u8] {
+    &*DROP_DATA
+}
+
+fn const_deref_mut_not_promoted() -> &'static mut [u8] {
+    &mut *TEST_DATA
+}
+
 fn main() {}
 "#;
 
@@ -301,6 +390,13 @@ fn temporaries_live_and_die_where_rust_says() {
         "STATIC_META",
         "closure_ref_capture_in_arc_drop_order",
         "static_lazylock_deref",
+        "mut_empty_array_iter_mut",
+        "mut_empty_array_ref",
+        "mut_empty_array_as_mut_slice",
+        "mut_empty_repeat_const",
+        "const_freeze_deref_explicit",
+        "const_freeze_deref_call",
+        "const_freeze_deref_autoderef",
     ];
     let twins = [
         "fn_ext",
@@ -316,6 +412,12 @@ fn temporaries_live_and_die_where_rust_says() {
         "closure_drop_capture_in_arc_drop_order",
         "const_vec_deref_temp",
         "transitive_strict_drop_in_outer",
+        "mut_nonempty_array_iter_mut",
+        "mut_empty_repeat_side_effect",
+        "mut_empty_repeat_local_ref",
+        "const_cell_deref_not_promoted",
+        "const_drop_deref_not_promoted",
+        "const_deref_mut_not_promoted",
     ];
     let all: Vec<&str> = oracles.iter().chain(twins.iter()).copied().collect();
     let rows = verdicts(&all);

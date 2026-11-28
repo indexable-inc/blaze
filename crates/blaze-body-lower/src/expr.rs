@@ -222,17 +222,110 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         self.facts.constant_initializer() && self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok()
     }
 
+    /// Lowers `e`'s leading adjustment at `lo` when `e` is promoted (`Checked::promoted`):
+    /// - leading `AdjustKind::Borrow { raw: false, .. }` (shared autoref or mutable empty array):
+    ///   the promoted `'static` constant address (or non-scheduled local inside a const init);
+    /// - leading `AdjustKind::Deref { overloaded: Some(Mutbl::Not) }`: calls `Deref::deref` on the
+    ///   promoted `'static` constant address (never a dangling frame temporary).
+    fn promoted_leading(&mut self, e: ExprId, lo: usize) -> Result<Option<Val>, LowerError> {
+        if matches!(self.expr(e)?, Expr::Ref { .. } | Expr::Index { .. }) {
+            return Ok(None);
+        }
+        let span = self.span(e);
+        let at = At::Expr(e);
+        match self.adjust(lo) {
+            Some((AdjustKind::Borrow { raw: false, .. }, to)) if self.is_promoted(e) => {
+                let c = self.b.new_const(ConstDecl { kind: ConstKind::Promoted(e.0), ty: to });
+                Ok(Some(Val::Op(Operand::Const(c), to)))
+            }
+            Some((AdjustKind::Borrow { mutbl, two_phase, raw: false }, to)) if self.is_const_promoted(e) => {
+                let p = self.const_promoted_place(e)?;
+                let t = self.temp(e, to, Role::Borrow)?;
+                let kind = match (mutbl, two_phase) {
+                    (Mutbl::Not, _) => BorrowKind::Shared,
+                    (Mutbl::Mut, true) => BorrowKind::TwoPhase,
+                    (Mutbl::Mut, false) => BorrowKind::Mut,
+                };
+                let o = self.b.origin(false);
+                let loan = self.b.borrow(t, kind, p, o, span);
+                if kind == BorrowKind::TwoPhase {
+                    self.activate.push(loan);
+                }
+                Ok(Some(Val::Place(t, to)))
+            }
+            Some((AdjustKind::Deref { overloaded: Some(Mutbl::Not) }, to)) if self.is_promoted(e) => {
+                let self_ty = self.expr_ty(e)?;
+                if let PNode::Adt(k, _) = self.node(self_ty, at)?
+                    && self.adt_facts(k, at)?.is_box
+                {
+                    return Ok(None);
+                }
+                let arg_ty = self.find_ty(PNode::Ref(Mutbl::Not, self_ty), at)?;
+                let c = self.b.new_const(ConstDecl { kind: ConstKind::Promoted(e.0), ty: arg_ty });
+                Ok(Some(self.deref_overloaded(e, self_ty, to, Mutbl::Not, Operand::Const(c))?))
+            }
+            Some((AdjustKind::Deref { overloaded: Some(Mutbl::Not) }, to)) if self.is_const_promoted(e) => {
+                let self_ty = self.expr_ty(e)?;
+                if let PNode::Adt(k, _) = self.node(self_ty, at)?
+                    && self.adt_facts(k, at)?.is_box
+                {
+                    return Ok(None);
+                }
+                let p = self.const_promoted_place(e)?;
+                let arg_ty = self.find_ty(PNode::Ref(Mutbl::Not, self_ty), at)?;
+                let arg_temp = self.temp(e, arg_ty, Role::Borrow)?;
+                let o = self.b.origin(false);
+                self.b.borrow(arg_temp, BorrowKind::Shared, p, o, span);
+                Ok(Some(self.deref_overloaded(e, self_ty, to, Mutbl::Not, Operand::Copy(arg_temp))?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Evaluates unadjusted `e` into a non-scheduled local so a promoted borrow inside a
+    /// `const`/`static` initializer lives until root return (interned into `Origin::Data`).
+    fn const_promoted_place(&mut self, e: ExprId) -> Result<Place, LowerError> {
+        let ty = self.expr_ty(e)?;
+        let span = self.span(e);
+        let l = self.b.new_local(LocalDecl { ty, kind: LocalKind::Temp(e, Role::Value), mutbl: Mutbl::Mut });
+        let p = self.b.local_place(l);
+        if self.is_place_expr(e)? {
+            let sp = self.place_unadjusted(e)?;
+            let op = self.use_val(Val::Place(sp, ty), e)?;
+            self.b.assign(p, Value::Use(op), span);
+        } else if let Some(op) = self.const_operand(e)? {
+            self.b.assign(p, Value::Use(op), span);
+        } else {
+            self.value_into(p, e)?;
+        }
+        Ok(p)
+    }
+
+    /// Calls `Deref::deref` / `DerefMut::deref_mut` on `arg_op` (`&Self` / `&mut Self`) and
+    /// returns the dereferenced place `*ret` of type `to`.
+    fn deref_overloaded(&mut self, e: ExprId, self_ty: PTy, to: PTy, mutbl: Mutbl, arg_op: Operand) -> Result<Val, LowerError> {
+        let at = At::Expr(e);
+        let Some(key) = self.facts.deref_fn(mutbl) else {
+            return self.refuse(Construct::OverloadedDeref, e);
+        };
+        let Ok(args_list) = self.b.intern_list(&[self_ty]) else {
+            return self.refuse(Construct::Malformed, e);
+        };
+        let ret_ty = self.find_ty(PNode::Ref(mutbl, to), at)?;
+        let ret_temp = self.temp(e, ret_ty, Role::Value)?;
+        let act = self.activate.len();
+        self.emit_call_ty(Callee::Method { key, args: args_list }, &[arg_op], ret_temp, ret_ty, e, act)?;
+        let d = self.b.project(ret_temp, Proj::Deref);
+        Ok(Val::Place(d, to))
+    }
+
     fn val_inner(&mut self, e: ExprId) -> Result<Val, LowerError> {
         let (lo, hi) = self.adjust_rows(e);
-        // A shared autoref promoted to `'static` (`Checked::promoted`): the constant's address,
-        // never a frame temporary; any coercions after it (e.g. `Unsize`) run from `lo + 1`.
+        // A promoted autoref or overloaded-`Deref` receiver (`Checked::promoted`): the constant's
+        // address, never a frame temporary; any coercions after it (e.g. `Unsize`) run from `lo + 1`.
         if hi > lo
-            && !matches!(self.expr(e)?, Expr::Ref { .. } | Expr::Index { .. })
-            && let Some((AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. }, to)) = self.adjust(lo)
-            && self.is_promoted(e)
+            && let Some(mut v) = self.promoted_leading(e, lo)?
         {
-            let c = self.b.new_const(ConstDecl { kind: ConstKind::Promoted(e.0), ty: to });
-            let mut v = Val::Op(Operand::Const(c), to);
             for i in (lo + 1)..hi {
                 let Some((k, next_to)) = self.adjust(i) else {
                     return self.refuse(Construct::Malformed, e);
@@ -270,6 +363,17 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
 
     /// Lowers `e` applying only adjustments `lo..end` (used by array-to-slice overloaded index).
     fn val_prefix(&mut self, e: ExprId, lo: usize, end: usize) -> Result<Val, LowerError> {
+        if end > lo
+            && let Some(mut v) = self.promoted_leading(e, lo)?
+        {
+            for i in (lo + 1)..end {
+                let Some((k, next_to)) = self.adjust(i) else {
+                    return self.refuse(Construct::Malformed, e);
+                };
+                v = self.apply(v, k, next_to, e)?;
+            }
+            return Ok(v);
+        }
         let ty = self.expr_ty(e)?;
         let mut v = if self.is_place_expr(e)? {
             Val::Place(self.place_unadjusted(e)?, ty)
@@ -344,9 +448,6 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
                     let d = self.b.project(p, Proj::DerefBox);
                     return Ok(Val::Place(d, to));
                 }
-                let Some(key) = self.facts.deref_fn(mutbl) else {
-                    return self.refuse(Construct::OverloadedDeref, e);
-                };
                 let arg_ty = self.find_ty(PNode::Ref(mutbl, self_ty), at)?;
                 let arg_temp = self.temp(e, arg_ty, Role::Borrow)?;
                 let bkind = match mutbl {
@@ -359,15 +460,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
                     Mutbl::Not => Operand::Copy(arg_temp),
                     Mutbl::Mut => Operand::Move(arg_temp),
                 };
-                let Ok(args_list) = self.b.intern_list(&[self_ty]) else {
-                    return self.refuse(Construct::Malformed, e);
-                };
-                let ret_ty = self.find_ty(PNode::Ref(mutbl, to), at)?;
-                let ret_temp = self.temp(e, ret_ty, Role::Value)?;
-                let act = self.activate.len();
-                self.emit_call_ty(Callee::Method { key, args: args_list }, &[arg_op], ret_temp, ret_ty, e, act)?;
-                let d = self.b.project(ret_temp, Proj::Deref);
-                Ok(Val::Place(d, to))
+                self.deref_overloaded(e, self_ty, to, mutbl, arg_op)
             }
             AdjustKind::Borrow { mutbl, two_phase, raw } => {
                 let p = self.to_place(v, e)?;
@@ -768,7 +861,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
                 let ty = self.expr_ty(e)?;
                 Ok(Some(Operand::Const(self.b.new_const(ConstDecl { kind: ConstKind::Anon(e), ty }))))
             }
-            Expr::Ref { mutbl: Mutbl::Not, .. } if self.is_promoted(e) => {
+            Expr::Ref { .. } if self.is_promoted(e) => {
                 let ty = self.expr_ty(e)?;
                 Ok(Some(Operand::Const(self.b.new_const(ConstDecl { kind: ConstKind::Promoted(e.0), ty }))))
             }
@@ -1505,16 +1598,20 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
     /// (`Checked::promoted`) is the promoted constant, and its operand's code does not run here.
     fn ref_into(&mut self, dest: Place, e: ExprId, mutbl: Mutbl, operand: ExprId) -> Result<(), LowerError> {
         let span = self.span(e);
-        if mutbl == Mutbl::Not && self.is_const_promoted(e) {
+        if self.is_const_promoted(e) {
             let oty = self.adjusted_ty(operand)?;
             let l = self.b.new_local(LocalDecl { ty: oty, kind: LocalKind::Temp(operand, Role::Value), mutbl: Mutbl::Mut });
             let p = self.b.local_place(l);
             self.lower_into(p, operand)?;
+            let kind = match mutbl {
+                Mutbl::Not => BorrowKind::Shared,
+                Mutbl::Mut => BorrowKind::Mut,
+            };
             let o = self.b.origin(false);
-            self.b.borrow(dest, BorrowKind::Shared, p, o, span);
+            self.b.borrow(dest, kind, p, o, span);
             return Ok(());
         }
-        if mutbl == Mutbl::Not && self.is_promoted(e) {
+        if self.is_promoted(e) {
             let ty = self.expr_ty(e)?;
             let c = self.b.new_const(ConstDecl { kind: ConstKind::Promoted(e.0), ty });
             self.b.assign(dest, Value::Use(Operand::Const(c)), span);

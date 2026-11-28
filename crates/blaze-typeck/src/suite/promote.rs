@@ -688,3 +688,263 @@ fn shared_index_base_and_non_capturing_closure_are_promoted() {
         assert!(c.promoted.is_empty(), "`&|| local` must NOT be promoted: {:?}", c.promoted);
     }
 }
+
+/// Mutable empty-array promotion (`&mut []`, `[].iter_mut()`, `&mut [0u8; 0]`):
+/// - `&mut []`, `[].as_mut_slice()`, and `&mut [0u8; 0]` are promoted to `'static`.
+/// - Non-empty mutable arrays (`&mut [1u8]`, `[1u8].as_mut_slice()`), side-effecting repeats
+///   (`[side_effect(); 0]`), and local repeats (`[local; 0]`) are NOT promoted.
+#[test]
+fn mut_empty_array_is_promoted_and_non_empty_or_side_effect_is_not() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Default::default(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let copy = fx.tr("Copy", 1, Default::default(), &[]);
+    fx.lang(LangItem::Copy, copy);
+    let freeze = fx.tr("Freeze", 1, Default::default(), &[]);
+    fx.auto(freeze);
+    fx.lang(LangItem::Freeze, freeze);
+    let u8_ = fx.u8();
+    let slice_u8 = fx.ty(PNode::Slice(u8_));
+    let mut_slice_u8 = fx.r(Mutbl::Mut, slice_u8);
+    let arr0_u8 = fx.array(u8_, 0);
+    let mut_arr0_u8 = fx.r(Mutbl::Mut, arr0_u8);
+    let arr1_u8 = fx.array(u8_, 1);
+    let mut_arr1_u8 = fx.r(Mutbl::Mut, arr1_u8);
+    let slice_imp = fx.imp("impl [u8]", 0, slice_u8, None, &[], Default::default());
+    fx.impl_fn(slice_imp, "as_mut_slice", true, &[mut_slice_u8], mut_slice_u8);
+    fx.func("side_effect", 0, &[], u8_, Default::default());
+
+    let f_ref_empty = fx.func("f_ref_empty", 0, &[], mut_arr0_u8, Default::default());
+    let f_autoref_empty = fx.func("f_autoref_empty", 0, &[], mut_slice_u8, Default::default());
+    let f_ref_repeat_zero = fx.func("f_ref_repeat_zero", 0, &[], mut_arr0_u8, Default::default());
+    let f_ref_nonempty = fx.func("f_ref_nonempty", 0, &[], mut_arr1_u8, Default::default());
+    let f_autoref_nonempty = fx.func("f_autoref_nonempty", 0, &[], mut_slice_u8, Default::default());
+    let f_repeat_side_effect = fx.func("f_repeat_side_effect", 0, &[], mut_arr0_u8, Default::default());
+    let f_repeat_local = fx.func("f_repeat_local", 0, &[u8_], mut_arr0_u8, Default::default());
+    fx.finish();
+
+    // Positive 1: `&mut []` promotes the `Expr::Ref`.
+    {
+        let mut bb = Bb::new();
+        let arr = bb.array(&[]);
+        let r = bb.borrow(Mutbl::Mut, arr);
+        let root = bb.block(&[], Some(r));
+        let c = check_body(&fx, &bb, f_ref_empty, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert_eq!(&c.promoted[..], &[r][..], "`&mut []` must be promoted: {:?}", c.promoted);
+    }
+
+    // Positive 2: `[].as_mut_slice()` promotes the empty array receiver.
+    {
+        let mut bb = Bb::new();
+        let arr = bb.array(&[]);
+        let call = bb.method(arr, "as_mut_slice", &[]);
+        let root = bb.block(&[], Some(call));
+        let c = check_body(&fx, &bb, f_autoref_empty, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert_eq!(&c.promoted[..], &[arr][..], "`[].as_mut_slice()` must promote receiver: {:?}", c.promoted);
+    }
+
+    // Positive 3: `&mut [0u8; 0]` promotes when element is promotable.
+    {
+        let mut bb = Bb::new();
+        let zero = bb.int(None);
+        let bb_usize = bb.ty(PNode::Uint(UintTy::Usize));
+        let len0 = bb.ty(PNode::ConstValue { ty: bb_usize, bits: 0 });
+        let rep = bb.e(crate::body::Expr::Repeat { elem: zero, len: len0, count: None });
+        let r = bb.borrow(Mutbl::Mut, rep);
+        let root = bb.block(&[], Some(r));
+        let c = check_body(&fx, &bb, f_ref_repeat_zero, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert_eq!(&c.promoted[..], &[r][..], "`&mut [0u8; 0]` must be promoted: {:?}", c.promoted);
+    }
+
+    // Negative 1: `&mut [1u8]` must NOT promote.
+    {
+        let mut bb = Bb::new();
+        let one = bb.int(None);
+        let arr = bb.array(&[one]);
+        let r = bb.borrow(Mutbl::Mut, arr);
+        let root = bb.block(&[], Some(r));
+        let c = check_body(&fx, &bb, f_ref_nonempty, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert!(c.promoted.is_empty(), "`&mut [1u8]` must NOT be promoted: {:?}", c.promoted);
+    }
+
+    // Negative 2: `[1u8].as_mut_slice()` must NOT promote.
+    {
+        let mut bb = Bb::new();
+        let one = bb.int(None);
+        let arr = bb.array(&[one]);
+        let call = bb.method(arr, "as_mut_slice", &[]);
+        let root = bb.block(&[], Some(call));
+        let c = check_body(&fx, &bb, f_autoref_nonempty, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert!(c.promoted.is_empty(), "`[1u8].as_mut_slice()` must NOT be promoted: {:?}", c.promoted);
+    }
+
+    // Negative 3: `&mut [side_effect(); 0]` must NOT promote.
+    {
+        let mut bb = Bb::new();
+        let callee = bb.path(&["side_effect"]);
+        let call = bb.call(callee, &[]);
+        let bb_usize = bb.ty(PNode::Uint(UintTy::Usize));
+        let len0 = bb.ty(PNode::ConstValue { ty: bb_usize, bits: 0 });
+        let rep = bb.e(crate::body::Expr::Repeat { elem: call, len: len0, count: None });
+        let r = bb.borrow(Mutbl::Mut, rep);
+        let root = bb.block(&[], Some(r));
+        let c = check_body(&fx, &bb, f_repeat_side_effect, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert!(c.promoted.is_empty(), "`&mut [side_effect(); 0]` must NOT be promoted: {:?}", c.promoted);
+    }
+
+    // Negative 4: `&mut [local; 0]` must NOT promote.
+    {
+        let mut bb = Bb::new();
+        let pl = bb.param("local");
+        let ll = bb.local(pl);
+        let bb_usize = bb.ty(PNode::Uint(UintTy::Usize));
+        let len0 = bb.ty(PNode::ConstValue { ty: bb_usize, bits: 0 });
+        let rep = bb.e(crate::body::Expr::Repeat { elem: ll, len: len0, count: None });
+        let r = bb.borrow(Mutbl::Mut, rep);
+        let root = bb.block(&[], Some(r));
+        let c = check_body(&fx, &bb, f_repeat_local, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert!(c.promoted.is_empty(), "`&mut [local; 0]` must NOT be promoted: {:?}", c.promoted);
+    }
+}
+
+/// Shared overloaded `Deref` promotion (`&*TEST_DATA` and `TEST_DATA.len()`):
+/// - `const TEST_DATA: AlignedData<[u8; 4]>` (`Freeze`, no drop) with `&*TEST_DATA` or auto-deref
+///   promotes the `TEST_DATA` receiver (`AdjustKind::Deref { overloaded: Some(Not) }`).
+/// - `!Freeze` (`UnsafeCell`), `Drop`, `DerefMut` (`&mut *TEST_DATA`), and local values are NOT promoted.
+#[test]
+fn overloaded_deref_on_freeze_const_is_promoted() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Default::default(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let copy = fx.tr("Copy", 1, Default::default(), &[]);
+    fx.lang(LangItem::Copy, copy);
+    let freeze = fx.tr("Freeze", 1, Default::default(), &[]);
+    fx.auto(freeze);
+    fx.lang(LangItem::Freeze, freeze);
+    let drop_tr = fx.tr("Drop", 1, Default::default(), &[]);
+    fx.lang(LangItem::Drop, drop_tr);
+    let deref = fx.tr("Deref", 1, Default::default(), &["Target"]);
+    fx.lang(LangItem::Deref, deref);
+    let p0 = fx.param(0);
+    let deref_sup = fx.bound(deref, &[p0]);
+    let deref_mut = fx.tr("DerefMut", 1, std::vec![deref_sup], &[]);
+    fx.lang(LangItem::DerefMut, deref_mut);
+
+    let u8_ = fx.u8();
+    let arr4 = fx.array(u8_, 4);
+    let r_arr4 = fx.r(Mutbl::Not, arr4);
+    let rm_arr4 = fx.r(Mutbl::Mut, arr4);
+    let slice_u8 = fx.ty(PNode::Slice(u8_));
+    let r_slice_u8 = fx.r(Mutbl::Not, slice_u8);
+    let slice_imp = fx.imp("impl [u8]", 0, slice_u8, None, &[], Default::default());
+    fx.impl_fn(slice_imp, "as_slice", true, &[r_slice_u8], r_slice_u8);
+
+    let aligned_k = fx.tuple_strukt("AlignedData", 1, &[p0]);
+    let aligned_p0 = fx.adt(aligned_k, &[p0]);
+    fx.imp("impl<T> Deref for AlignedData<T>", 1, aligned_p0, Some((deref, &[])), &[("Target", p0)], Default::default());
+    fx.imp("impl<T> DerefMut for AlignedData<T>", 1, aligned_p0, Some((deref_mut, &[])), &[], Default::default());
+    let aligned_arr4 = fx.adt(aligned_k, &[arr4]);
+    fx.konst("TEST_DATA", aligned_arr4);
+
+    let uc = fx.strukt("UnsafeCell", 1, &[("value", p0)]);
+    let uc_p0 = fx.adt(uc, &[p0]);
+    let neg = fx.imp("!Freeze for UnsafeCell<T>", 1, uc_p0, Some((freeze, &[])), &[], Default::default());
+    fx.set_polarity(neg, ImplPolarity::Negative);
+    let uc_u8 = fx.adt(uc, &[u8_]);
+    let aligned_cell = fx.adt(aligned_k, &[uc_u8]);
+    let r_uc_u8 = fx.r(Mutbl::Not, uc_u8);
+    fx.konst("CELL_DATA", aligned_cell);
+
+    let drop_wrap_k = fx.tuple_strukt("DropWrap", 0, &[arr4]);
+    let drop_wrap = fx.adt(drop_wrap_k, &[]);
+    fx.imp("impl Drop for DropWrap", 0, drop_wrap, Some((drop_tr, &[])), &[], Default::default());
+    fx.imp("impl Deref for DropWrap", 0, drop_wrap, Some((deref, &[])), &[("Target", arr4)], Default::default());
+    fx.konst("DROP_DATA", drop_wrap);
+
+    let f_explicit = fx.func("f_explicit", 0, &[], r_arr4, Default::default());
+    let f_autoderef = fx.func("f_autoderef", 0, &[], r_slice_u8, Default::default());
+    let f_cell = fx.func("f_cell", 0, &[], r_uc_u8, Default::default());
+    let f_drop = fx.func("f_drop", 0, &[], r_arr4, Default::default());
+    let f_mut = fx.func("f_mut", 0, &[], rm_arr4, Default::default());
+    let f_local = fx.func("f_local", 0, &[aligned_arr4], r_arr4, Default::default());
+    fx.finish();
+
+    // Positive 1: `&*TEST_DATA` promotes `TEST_DATA`.
+    {
+        let mut bb = Bb::new();
+        let td = bb.path(&["TEST_DATA"]);
+        let star = bb.e(crate::body::Expr::Unary { op: crate::body::UnOp::Deref, operand: td });
+        let r = bb.borrow(Mutbl::Not, star);
+        let root = bb.block(&[], Some(r));
+        let c = check_body(&fx, &bb, f_explicit, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert_eq!(&c.promoted[..], &[td][..], "`&*TEST_DATA` must promote `TEST_DATA`: {:?}", c.promoted);
+    }
+
+    // Positive 2: `TEST_DATA.as_slice()` (auto-deref) promotes `TEST_DATA`.
+    {
+        let mut bb = Bb::new();
+        let td = bb.path(&["TEST_DATA"]);
+        let call = bb.method(td, "as_slice", &[]);
+        let root = bb.block(&[], Some(call));
+        let c = check_body(&fx, &bb, f_autoderef, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert_eq!(&c.promoted[..], &[td][..], "`TEST_DATA.as_slice()` must promote `TEST_DATA`: {:?}", c.promoted);
+    }
+
+    // Negative 1: `&*CELL_DATA` (`!Freeze`) must NOT promote.
+    {
+        let mut bb = Bb::new();
+        let cd = bb.path(&["CELL_DATA"]);
+        let star = bb.e(crate::body::Expr::Unary { op: crate::body::UnOp::Deref, operand: cd });
+        let r = bb.borrow(Mutbl::Not, star);
+        let root = bb.block(&[], Some(r));
+        let c = check_body(&fx, &bb, f_cell, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert!(c.promoted.is_empty(), "`&*CELL_DATA` (`!Freeze`) must NOT be promoted: {:?}", c.promoted);
+    }
+
+    // Negative 2: `&*DROP_DATA` (`impl Drop`) must NOT promote.
+    {
+        let mut bb = Bb::new();
+        let dd = bb.path(&["DROP_DATA"]);
+        let star = bb.e(crate::body::Expr::Unary { op: crate::body::UnOp::Deref, operand: dd });
+        let r = bb.borrow(Mutbl::Not, star);
+        let root = bb.block(&[], Some(r));
+        let c = check_body(&fx, &bb, f_drop, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert!(c.promoted.is_empty(), "`&*DROP_DATA` (`Drop`) must NOT be promoted: {:?}", c.promoted);
+    }
+
+    // Negative 3: `&mut *TEST_DATA` (`DerefMut`) must NOT promote.
+    {
+        let mut bb = Bb::new();
+        let td = bb.path(&["TEST_DATA"]);
+        let star = bb.e(crate::body::Expr::Unary { op: crate::body::UnOp::Deref, operand: td });
+        let r = bb.borrow(Mutbl::Mut, star);
+        let root = bb.block(&[], Some(r));
+        let c = check_body(&fx, &bb, f_mut, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert!(c.promoted.is_empty(), "`&mut *TEST_DATA` (`DerefMut`) must NOT be promoted: {:?}", c.promoted);
+    }
+
+    // Negative 4: `&*local` must NOT promote.
+    {
+        let mut bb = Bb::new();
+        let pl = bb.param("local");
+        let ll = bb.local(pl);
+        let star = bb.e(crate::body::Expr::Unary { op: crate::body::UnOp::Deref, operand: ll });
+        let r = bb.borrow(Mutbl::Not, star);
+        let root = bb.block(&[], Some(r));
+        let c = check_body(&fx, &bb, f_local, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert!(c.promoted.is_empty(), "`&*local` must NOT be promoted: {:?}", c.promoted);
+    }
+}

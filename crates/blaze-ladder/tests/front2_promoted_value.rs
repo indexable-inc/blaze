@@ -445,3 +445,99 @@ pub extern "C" fn main() -> i32 {
         .unwrap_or_else(|e| panic!("static_empty JIT run failed: {e}"));
     assert_eq!(got, 42, "promoted const field borrow must outlive stack frame and stay aligned");
 }
+
+/// End-to-end runtime verification for:
+/// 1. Mutable empty-array promotion (`&mut []` and `[].as_mut_slice()` -> non-null, aligned, len 0).
+/// 2. Overloaded `Deref` promotion on a `Freeze` non-drop `const` (`&*TEST_DATA` on `#[repr(align(8))]
+///    AlignedData<[u8; 8]>` -> returned `&'static [u8; 8]` survives stack clobbering and stays 8-byte
+///    aligned).
+#[test]
+fn promoted_mut_empty_array_and_const_deref_run() {
+    use blaze_ladder::run::{FrontChoice, run_with};
+
+    const PROGRAM: &str = r#"#![feature(no_core, lang_items, rustc_attrs, auto_traits)]
+#![no_core]
+#![no_main]
+
+#[lang = "pointee_sized"]
+trait PointeeSized {}
+
+#[lang = "meta_sized"]
+trait MetaSized: PointeeSized {}
+
+#[lang = "sized"]
+trait Sized: MetaSized {}
+
+#[lang = "copy"]
+trait Copy {}
+
+#[lang = "freeze"]
+unsafe auto trait Freeze {}
+
+#[lang = "deref"]
+trait Deref {
+    type Target: ?Sized;
+    fn deref(&self) -> &Self::Target;
+}
+
+#[repr(align(8))]
+struct AlignedData<T>(T);
+
+impl<T> Deref for AlignedData<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+const TEST_DATA: AlignedData<[u8; 8]> = AlignedData([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+
+#[inline(never)]
+fn empty_mut_ref() -> &'static mut [u64; 0] {
+    &mut []
+}
+
+#[inline(never)]
+fn deref_const_ref() -> &'static [u8; 8] {
+    &*TEST_DATA
+}
+
+#[inline(never)]
+fn clobber_stack(seed: u64) -> u64 {
+    let a = [seed, seed ^ 1, seed ^ 2, seed ^ 3, seed ^ 4, seed ^ 5, seed ^ 6, seed ^ 7];
+    let b = [seed ^ 8, seed ^ 9, seed ^ 10, seed ^ 11, seed ^ 12, seed ^ 13, seed ^ 14, seed ^ 15];
+    let [a0, a1, a2, a3, a4, a5, a6, a7] = a;
+    let [b0, b1, b2, b3, b4, b5, b6, b7] = b;
+    a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ a6 ^ a7 ^ b0 ^ b1 ^ b2 ^ b3 ^ b4 ^ b5 ^ b6 ^ b7
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    let e = empty_mut_ref();
+    let d = deref_const_ref();
+    let _ = clobber_stack(0xDEAD_BEEF_CAFE_BABE);
+    let e_addr = (e as *mut [u64; 0]) as usize;
+    if e_addr == 0 || (e_addr & 7) != 0 {
+        return 1;
+    }
+    let d_addr = (d as *const [u8; 8]) as usize;
+    if d_addr == 0 || (d_addr & 7) != 0 {
+        return 2;
+    }
+    let [b0, b1, b2, b3, b4, b5, b6, b7] = *d;
+    if b0 != 0x11 || b1 != 0x22 || b2 != 0x33 || b3 != 0x44
+        || b4 != 0x55 || b5 != 0x66 || b6 != 0x77 || b7 != 0x88
+    {
+        return 3;
+    }
+    42
+}
+"#;
+
+    let heap = blaze_own::testing::heap();
+    let files = [SourceFile { path: "src/main.rs", text: PROGRAM }];
+    let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
+    let got = run_with(&files, "src/main.rs", None, FrontChoice::New(new), heap.shared())
+        .unwrap_or_else(|e| panic!("mut empty array + const deref JIT run failed: {e}"));
+    assert_eq!(got, 42, "promoted `&mut []` and `&*TEST_DATA` must outlive stack frame and stay aligned");
+}

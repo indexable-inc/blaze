@@ -15,7 +15,9 @@
 //! borrow points into the returning fn's frame: a dangling vtable, silently wrong code.
 //!
 //! The rule as decided here, after the walk (the expression tree and the solver are the
-//! checker's): an `Expr::Ref { mutbl: Not, operand }` is listed in `Checked::promoted` when
+//! checker's): an `Expr::Ref { mutbl: Not, operand }` (or a leading shared autoref or leading
+//! shared overloaded `Deref` adjustment on an expression, e.g. `Fork::B.boxed()` or `&*CONST`)
+//! is listed in `Checked::promoted` when
 //! - its operand is promotable: a literal; a path to a `const`, a fn item or a unit or tuple
 //!   ctor; a tuple, array or struct literal (no `..base`) of promotable operands; a call of a
 //!   fn item whose attributes carry `#[rustc_promotable]` ([`TypeAttrs::PROMOTABLE`]), or of a
@@ -27,6 +29,10 @@
 //!   the lang `freeze` trait (`may_hold`, an auto trait: core/src/marker.rs `pub unsafe auto
 //!   trait Freeze {}`, `impl<T: PointeeSized> !Freeze for UnsafeCell<T> {}`) and the ADT's
 //!   fields for an ADT.
+//!
+//! Mutable borrows (`&mut operand`) and mutable autorefs (`operand.iter_mut()`) are listed only
+//! when the operand is a promotable zero-length array `[T; 0]` (e.g. `&mut []`, `[].iter_mut()`,
+//! `[0u8; 0].iter_mut()`), which has zero size, no interior mutability, and no drop glue.
 //!
 //! "Where possible" is narrowed, never widened: a type this rule cannot decide (a parameter, a
 //! projection, an opaque, a closure, a future, a trait object, a variable) is not listed, and
@@ -87,6 +93,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 *slot = true;
             }
         }
+        let owned_box = self.lang(LangItem::OwnedBox)?;
         // The whole tree from the root, each expression with whether it is under a const block.
         let mut work: Vec<(ExprId, bool), Alloc<'a>> = Vec::new_in(self.alloc);
         let mut kids: Vec<ExprId, Alloc<'a>> = Vec::new_in(self.alloc);
@@ -118,7 +125,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                             }
                         }
                     }
-                    Expr::Ref { mutbl: Mutbl::Mut, .. } => {}
+                    Expr::Ref { mutbl: Mutbl::Mut, operand } => {
+                        if self.promotable_mut_empty_array(operand, &has_deref)? {
+                            found.push(x);
+                        }
+                    }
                     Expr::Index { base, .. } => {
                         if matches!(
                             first_adjust.get(x.ix()).copied().flatten(),
@@ -128,16 +139,28 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                             found.push(x);
                         }
                     }
-                    _ => {
-                        if matches!(
-                            first_adjust.get(x.ix()).copied().flatten(),
-                            Some(AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. })
-                        ) && self.expr_ty.get(x.ix()).is_some()
-                            && self.promotable_value(x, &has_deref)?
-                        {
-                            found.push(x);
+                    _ => match first_adjust.get(x.ix()).copied().flatten() {
+                        Some(AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. }) => {
+                            if self.expr_ty.get(x.ix()).is_some() && self.promotable_value(x, &has_deref)? {
+                                found.push(x);
+                            }
                         }
-                    }
+                        Some(AdjustKind::Borrow { mutbl: Mutbl::Mut, raw: false, .. }) => {
+                            if self.promotable_mut_empty_array(x, &has_deref)? {
+                                found.push(x);
+                            }
+                        }
+                        Some(AdjustKind::Deref { overloaded: Some(Mutbl::Not) }) => {
+                            if let Some(&ty) = self.expr_ty.get(x.ix()) {
+                                let t = self.ty.resolve(ty)?;
+                                let is_box = matches!(self.view(t), TyView::Adt(k, _) if owned_box == Some(k));
+                                if !is_box && self.promotable_value(x, &has_deref)? {
+                                    found.push(x);
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
                 }
             }
             kids.clear();
@@ -179,6 +202,24 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             return Ok(false);
         }
         self.promotable_value(base, has_deref)
+    }
+
+    /// Whether `op` is a promotable zero-length array `[T; 0]` (e.g. `&mut []`, `[].iter_mut()`,
+    /// `[0u8; 0].iter_mut()`). Rust's rvalue static promotion promotes `&mut` borrows only for
+    /// empty arrays, which have zero size, no interior mutability, and no drop glue.
+    fn promotable_mut_empty_array(&mut self, op: ExprId, has_deref: &[bool]) -> Result<bool, Stop> {
+        let Some(&ty) = self.expr_ty.get(op.ix()) else {
+            return Ok(false);
+        };
+        let t = self.ty.resolve(ty)?;
+        let TyView::Array(_, len) = self.view(t) else {
+            return Ok(false);
+        };
+        let len = self.ty.resolve(len)?;
+        if !matches!(self.view(len), TyView::ConstValue { bits: 0, .. }) {
+            return Ok(false);
+        }
+        self.promotable_value(op, has_deref)
     }
 
     /// What value path or ctor `x` resolved to, if the walk recorded it.
