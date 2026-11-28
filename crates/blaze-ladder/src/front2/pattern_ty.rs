@@ -46,7 +46,8 @@ impl<'n, H: Heads, S: NamesSource<'n>> Builder<'_, H, S> {
         sink: Option<&mut super::types::RegionSink<'_>>,
     ) -> Result<PTy, Why> {
         let text = v.text_at(v.type_range(t)?)?;
-        let x = super::type_expand::expand_type_text(self.resolver.names, env.module, text, self.marks, r, tys.alloc())?;
+        let text_marks = self.marks_for(text);
+        let x = super::type_expand::expand_type_text(self.resolver.names, env.module, text, text_marks, r, tys.alloc())?;
         // A fn's return type with a macro in it is expanded whole by `heads.rs` `fn_head`
         // before its opaques are numbered, so no return opaque arrives here. An `impl Trait`
         // a type macro writes anywhere else (a parameter's type, a field, an alias) is refused
@@ -57,18 +58,27 @@ impl<'n, H: Heads, S: NamesSource<'n>> Builder<'_, H, S> {
         if !impls.is_empty() {
             return Err(Why::Unsupported("an `impl Trait` a type macro writes outside a fn's return type", r));
         }
-        // The expansion is a text of its own, read at `env.module`: its own expansion marks carry
-        // `$crate`/def-site hygiene onto constant expressions inside the expanded type, while
-        // enclosing head ownership is carried through `ExpandedOwner` so item-declaring const
-        // blocks in the expansion map back to the `blaze-scope` expansion block modules created
-        // under the direct head call.
+        // `marks` stays strictly for the view's non-expansion buffer (`text`, covered by
+        // `text_marks` when `text` came from an enclosing macro expansion), while `expanded_marks`
+        // carries `$crate`/def-site hygiene over `x.view().expanded` for constant expressions
+        // written inside the expanded type. Enclosing head ownership is carried through
+        // `ExpandedOwner` so item-declaring const blocks in the expansion map back to the
+        // `blaze-scope` expansion block modules created under the direct head call.
         let exp_marks = x.expansion_marks();
         let expanded = self.owner.and_then(|(item, owner_text)| {
             blaze_scope::expansion_origins::offset_in(owner_text, text).map(|base_offset| {
-                super::types::ExpandedOwner { item, owner_text, base_offset, view: x.view(), marks: exp_marks }
+                super::types::ExpandedOwner { item, owner_text, base_offset, view: x.view() }
             })
         });
-        let own = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks: exp_marks, owner: self.owner, owner_key: self.owner_key, expanded };
+        let own = Builder {
+            resolver: crate::resolve::Paths { names: self.resolver.names },
+            heads: self.heads,
+            marks: text_marks,
+            owner: self.owner,
+            owner_key: self.owner_key,
+            expanded,
+            expanded_marks: exp_marks,
+        };
         let own_env = Env { anon: &[], ..*env };
         match sink {
             Some(s) => {

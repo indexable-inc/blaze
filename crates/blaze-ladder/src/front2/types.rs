@@ -857,7 +857,6 @@ pub(super) struct ExpandedOwner<'b> {
     pub(super) owner_text: &'b str,
     pub(super) base_offset: u32,
     pub(super) view: View<'b>,
-    pub(super) marks: Option<blaze_scope::crate_roots::TextMarks<'b>>,
 }
 
 /// The type builder of one item: its resolver, over the names source `S`
@@ -865,8 +864,10 @@ pub(super) struct ExpandedOwner<'b> {
 pub struct Builder<'b, H: Heads, S> {
     pub resolver: Paths<S>,
     pub heads: &'b H,
-    /// The marks of the tokens of the text this builder reads paths from (front2 item_site.rs,
+    /// The marks of the tokens of the view's **non-expansion** text (front2 item_site.rs,
     /// token-mark-F1): `None` for a text written in a file, or one that keeps no column.
+    /// Invariant: when `Some(m)`, every non-expansion slice read from the view is inside `m.text`
+    /// (never the separate `view.expanded` buffer; those marks live in `expanded_marks`).
     pub marks: Option<blaze_scope::crate_roots::TextMarks<'b>>,
     /// The enclosing library item and the exact scanned text (`impl_header` for an `impl`, whole
     /// text for a `fn`/`const`/`static` with `body_holds_items`) that `blaze-scope` built block
@@ -881,24 +882,29 @@ pub struct Builder<'b, H: Heads, S> {
     /// maps const blocks inside macro expansions back to the enclosing head call's expansion
     /// block modules.
     pub(super) expanded: Option<ExpandedOwner<'b>>,
+    /// Token marks over the expansion buffer (`view.expanded_text()`) when walking an expanded
+    /// type's view (`pattern_ty.rs` / `heads.rs`), kept separate from `marks` so non-expansion
+    /// paths never query the expansion buffer's column, and preserved even when `expanded` is
+    /// `None`.
+    pub(super) expanded_marks: Option<blaze_scope::crate_roots::TextMarks<'b>>,
 }
 
 impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
-    /// Selects the token-mark column whose text holds `slice` (`self.marks` or `self.expanded`'s
-    /// expansion marks), falling back to `self.marks`.
-    fn marks_for(&self, slice: &str) -> Option<blaze_scope::crate_roots::TextMarks<'b>> {
+    /// Selects the token-mark column whose text holds `slice` (`self.marks` for the view's
+    /// non-expansion text or `self.expanded_marks` for its expansion buffer), returning `None`
+    /// when neither column covers `slice`.
+    pub(super) fn marks_for(&self, slice: &str) -> Option<blaze_scope::crate_roots::TextMarks<'b>> {
         if let Some(m) = self.marks
             && blaze_scope::expansion_origins::offset_in(m.text, slice).is_some()
         {
             return Some(m);
         }
-        if let Some(exp) = self.expanded
-            && let Some(em) = exp.marks
+        if let Some(em) = self.expanded_marks
             && blaze_scope::expansion_origins::offset_in(em.text, slice).is_some()
         {
             return Some(em);
         }
-        self.marks
+        None
     }
 
     /// Resolves the `blaze-scope` `MacroCall` key and outermost owner-text call offset for
@@ -2405,6 +2411,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 owner: Some((alias, alias_text.text)),
                 owner_key: Some(super::keys::checker_of(alias)),
                 expanded: None,
+                expanded_marks: None,
             };
             let mut full = blaze_own::Vec::with_capacity_in(want + 1, alloc);
             full.push(self_ty);
@@ -4630,6 +4637,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 owner: Some((item_key, def_owner_text)),
                 owner_key: Some(super::keys::checker_of(item_key)),
                 expanded: None,
+                expanded_marks: None,
             };
             let mut def_sink = RegionSink::new_in(alloc);
             def_sink.default_depth = s.default_depth + 1;
@@ -5936,6 +5944,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 owner: Some((alias_key, alias_text.text)),
                 owner_key: Some(super::keys::checker_of(alias_key)),
                 expanded: None,
+                expanded_marks: None,
             };
             // Fill any omitted defaulted type/const arguments declared by the trait alias
             // (`trait Alias<T = &'static u8> = Gen<T>;`, `trait Alias<const N: usize = 3> = Gen<N>;`)
