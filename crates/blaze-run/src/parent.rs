@@ -487,7 +487,7 @@ impl<'a> Parent<'a> {
                 }
                 _ => {}
             }
-            self.wait(*slot, Asker::Start)?;
+            self.record_wait(*slot, Asker::Start)?;
             if let Start::Waiting { left } = &mut self.start {
                 *left += 1;
             }
@@ -519,7 +519,7 @@ impl<'a> Parent<'a> {
                 out.push(Effect::Answer { thread, slot, answer: Answer::Failed(error) });
             }
             State::Compiling { priority, deadline } if self.plant == Plant::CompileTwice => {
-                self.wait(slot, Asker::Thread(thread))?;
+                self.record_wait(slot, Asker::Thread(thread))?;
                 let key = self.key(slot);
                 out.push(Effect::Compile { slot, key, priority, deadline });
             }
@@ -528,7 +528,7 @@ impl<'a> Parent<'a> {
             | State::Queued { .. }
             | State::Compiling { .. }
             | State::Blocked { .. } => {
-                self.wait(slot, Asker::Thread(thread))?;
+                self.record_wait(slot, Asker::Thread(thread))?;
                 self.want(slot, Priority::Asked, out);
             }
         }
@@ -572,7 +572,7 @@ impl<'a> Parent<'a> {
         Ok(())
     }
 
-    fn wait(&mut self, slot: SlotId, asker: Asker) -> Result<(), Error> {
+    fn record_wait(&mut self, slot: SlotId, asker: Asker) -> Result<(), Error> {
         if self.waiters.contains(&(slot, asker)) {
             return Ok(());
         }

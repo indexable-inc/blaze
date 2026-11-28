@@ -583,6 +583,11 @@ impl<A: Allocator> Response<A> {
             Framing::Empty | Framing::Length { left: 0 } => State::Ended { whole, framing },
             _ => State::Body { whole, framing },
         };
+        if let Framing::Length { left } = framing
+            && left > self.limits.most_body
+        {
+            return Err(Why::BodyOver { most: self.limits.most_body });
+        }
         Ok(())
     }
 
@@ -610,12 +615,7 @@ impl<A: Allocator> Response<A> {
             _ if empty => Framing::Empty,
             (Some(coding), None) if coding.eq_ignore_ascii_case(b"chunked") => Framing::Chunked(NEW_CHUNK),
             (Some(_), None) => return Err(Why::TransferEncoding),
-            (None, Some(n)) => {
-                if n > self.limits.most_body {
-                    return Err(Why::BodyOver { most: self.limits.most_body });
-                }
-                Framing::Length { left: n }
-            }
+            (None, Some(n)) => Framing::Length { left: n },
             (None, None) => Framing::Close,
         };
         Ok((framing, length))

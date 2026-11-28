@@ -4,7 +4,7 @@
 //! clock; this decides nothing the machine does not, it only carries effects out and answers
 //! in.
 
-#![blaze::sans_io]
+#![blaze::driver]
 
 use core::net::SocketAddr;
 

@@ -16,6 +16,7 @@
 //!   `FlushedProof` minted only by `Flush`—making durability ordering checkable in types.
 
 mod direct;
+mod direct_net;
 mod handler;
 mod net;
 #[cfg(test)]
@@ -41,6 +42,9 @@ pub use direct::{
     plan_chain_write_flush_with, plan_flush, plan_flush_with, plan_read_into, plan_read_into_with,
     plan_rename_flushed, plan_rename_flushed_with, plan_stat, plan_stat_with, plan_sync_dir,
     plan_sync_dir_with, plan_write_from, plan_write_from_with,
+};
+pub use direct_net::{
+    DirectNetBackend, DirectNetHandler, DirectNetHandlerError, InMemoryDirectNet, NativeDirectNet,
 };
 pub use handler::{DriverHandler, DriverHandlerError, SimHandler, SimHandlerError};
 pub use net::{

@@ -2525,6 +2525,7 @@ dependencies = [
  "blaze-id",
  "blaze-ids",
  "blaze-lex",
+ "blaze-machine",
  "blaze-manifest",
  "blaze-own",
  "blaze-proc-macro",

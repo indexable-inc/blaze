@@ -4629,270 +4629,406 @@ impl<'n> Store<'n> {
     /// Through `&self`: every table it files into is [`Rows`], so a head imported while a
     /// body's check holds answers from this store moves none of them.
     pub fn file_heads<I: IntoIterator<Item = (HeadAt, Head<'n>)>>(&self, want: Want, heads: I) -> Result<(), HeadError> {
-        let lib = want.key();
         for (at, head) in heads {
-            match head {
-                Head::Fn { key, head, preds, static_, regions, misses } => {
-                    if let Some(r) = regions {
-                        self.regions.file(key, r);
-                    }
-                    // The signature's E0412s, as the store that made the head kept them: the
-                    // fn's own body check says them (front2 check.rs).
-                    if misses.is_empty() {
-                        self.type_misses.remove(&key);
-                    } else {
-                        self.type_misses.insert(key, misses);
-                    }
-                    if let Some(p) = preds {
-                        let p = blaze_own::Box::into_inner(p);
-                        let owner = if head.container.is_some() { Want::MemberFn(head.lib, key) } else { Want::Fn(head.lib) };
-                        self.record_where_const_owners(owner, &p.clauses);
-                        self.preds.insert(key, p);
-                    }
-                    if let Some(m) = static_ {
-                        self.statics.insert(key, m);
-                    }
-                    // A free function's const parameters are read through `Maps` while a
-                    // body converts its generic arguments.  Imported fn heads carry that
-                    // row only in `FnHead::consts`, so publish it under the library key here.
-                    // Members keep their container's parameters in this field and must stay
-                    // out of the free-item map.
-                    if head.container.is_none() {
-                        let mut own_consts = blaze_own::Vec::with_capacity_in(head.consts.len(), self.maps.alloc);
-                        own_consts.extend_from_slice(&head.consts);
-                        self.maps.const_params.insert(head.lib, own_consts);
-                    }
-                    self.fns.insert(key, head);
+            self.file_one_head(want, at, head)?;
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn file_one_head(&self, want: Want, at: HeadAt, head: Head<'n>) -> Result<(), HeadError> {
+        match head {
+            Head::Fn { key, head, preds, static_, regions, misses } => {
+                self.file_fn_head(key, head, preds, static_, regions, misses);
+                Ok(())
+            }
+            Head::Adt { key, row, defaults, const_params, field_defaults, preds, life, fieldless, regions } => {
+                self.file_adt_head(key, row, defaults, const_params, field_defaults, preds, life, fieldless, regions);
+                Ok(())
+            }
+            Head::Ctor { key, sig, regions } => {
+                self.file_ctor_head(key, sig, regions);
+                Ok(())
+            }
+            Head::Trait { key, head, extra, supers, super_lifetimes, const_params, preds, assoc_side, life, regions } => {
+                self.file_trait_head(want, at, key, head, extra, supers, super_lifetimes, const_params, preds, assoc_side, life, regions)
+            }
+            Head::Impl { key, head, preds, frame, life, regions } => {
+                self.file_impl_head(want, at, key, head, preds, frame, life, regions)
+            }
+            Head::Alias { key, generics, ty, defaults, const_params, slots } => {
+                self.file_alias_head(key, generics, ty, defaults, const_params, slots);
+                Ok(())
+            }
+            Head::AliasRefused { key, why } => self.file_alias_refused_head(want, at, key, why),
+            Head::FnRefused { key, why } => self.file_fn_refused_head(want, at, key, why),
+            Head::TraitAlias { key, head } => {
+                self.file_trait_alias_head(key, head);
+                Ok(())
+            }
+            Head::Opaque { key, fn_, index, preds, regions } => {
+                self.file_opaque_head(key, fn_, index, preds, regions);
+                Ok(())
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn file_fn_head(
+        &self,
+        key: ItemKey,
+        head: FnHead<'n>,
+        preds: Option<super::head_record::HeadPreds>,
+        static_: Option<tc::Mutbl>,
+        regions: Option<super::head_record::FiledRegions>,
+        misses: blaze_own::Vec<HeadMiss, Alloc<'static>>,
+    ) {
+        if let Some(r) = regions {
+            self.regions.file(key, r);
+        }
+        // The signature's E0412s, as the store that made the head kept them: the
+        // fn's own body check says them (front2 check.rs).
+        if misses.is_empty() {
+            self.type_misses.remove(&key);
+        } else {
+            self.type_misses.insert(key, misses);
+        }
+        if let Some(p) = preds {
+            let p = blaze_own::Box::into_inner(p);
+            let owner = if head.container.is_some() { Want::MemberFn(head.lib, key) } else { Want::Fn(head.lib) };
+            self.record_where_const_owners(owner, &p.clauses);
+            self.preds.insert(key, p);
+        }
+        if let Some(m) = static_ {
+            self.statics.insert(key, m);
+        }
+        // A free function's const parameters are read through `Maps` while a
+        // body converts its generic arguments.  Imported fn heads carry that
+        // row only in `FnHead::consts`, so publish it under the library key here.
+        // Members keep their container's parameters in this field and must stay
+        // out of the free-item map.
+        if head.container.is_none() {
+            let mut own_consts = blaze_own::Vec::with_capacity_in(head.consts.len(), self.maps.alloc);
+            own_consts.extend_from_slice(&head.consts);
+            self.maps.const_params.insert(head.lib, own_consts);
+        }
+        self.fns.insert(key, head);
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn file_adt_head(
+        &self,
+        key: LibKey,
+        row: AdtRow,
+        defaults: blaze_own::Vec<Option<PTy>, Alloc<'static>>,
+        const_params: blaze_own::Vec<(u32, PTy), Alloc<'static>>,
+        field_defaults: blaze_own::Vec<Option<ItemKey>, Alloc<'static>>,
+        preds: Option<super::head_record::HeadPreds>,
+        life: Option<Result<super::lifetimes::AdtLife, super::lifetimes::LifeRefusal>>,
+        fieldless: Option<u32>,
+        regions: Option<super::head_record::FiledRegions>,
+    ) {
+        if let Some(l) = life {
+            self.file_adt_life(key, l);
+        }
+        let ck = checker_of(key);
+        if let Some(r) = regions {
+            self.regions.file(ck, r);
+        }
+        // The walk reads a library ADT's count from the names (D155, types.rs
+        // `declared_lifetimes`), and this map only for a BODY-LOCAL one (no item in
+        // the names world), whose row is the one home of its count.
+        self.maps.adt_lifetimes.insert(ck, row.lifetimes);
+        if let Some(n) = fieldless {
+            self.maps.fieldless_enums.insert(ck, n);
+        }
+        self.maps.generics.insert(key, (row.generics, defaults));
+        self.adt_declarations.insert(ck, AdtDeclaration { lifetimes: row.lifetimes, marks: row.marks });
+        self.maps.const_params.insert(key, const_params);
+        self.field_defaults.insert(ck, field_defaults);
+        if let Some(p) = preds {
+            let p = blaze_own::Box::into_inner(p);
+            self.record_where_const_owners(Want::Adt(key), &p.clauses);
+            self.preds.insert(ck, p);
+        }
+        self.adts.insert(ck, row);
+    }
+
+    #[inline(never)]
+    fn file_ctor_head(&self, key: ItemKey, sig: CtorSig, regions: Option<super::head_record::FiledRegions>) {
+        if let Some(r) = regions {
+            self.regions.file(key, r);
+        }
+        self.ctors.insert(key, sig);
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn file_trait_assoc_sides(
+        &self,
+        want: Want,
+        at: HeadAt,
+        key: LibKey,
+        trait_generics: u32,
+        extra: Option<&TraitExtra>,
+        const_params: &[(u32, PTy)],
+        assoc_side: blaze_own::Vec<super::head_record::AssocSide, Alloc<'static>>,
+    ) -> Result<(), HeadError> {
+        for side in assoc_side {
+            let item = extra.and_then(|x| x.assoc.iter().find(|a| a.name == side.name)).map(|a| a.item);
+            if let Some(n) = side.generics {
+                self.maps.assoc_generics.insert((key, side.name), n);
+            }
+            if let Some(w) = side.where_ {
+                self.maps.assoc_where.insert((key, side.name), w);
+            }
+            if let (Some(item), Some(generics)) = (item, side.generics)
+                && generics != 0
+            {
+                let mut checker = Vec::with_capacity_in(const_params.len() + side.consts.as_ref().map_or(0, |c| c.len()), self.tys.alloc());
+                checker.extend_from_slice(const_params);
+                if let Some(own) = &side.consts {
+                    checker.extend(own.iter().map(|&(i, t)| (trait_generics + i, t)));
                 }
-                Head::Adt { key, row, defaults, const_params, field_defaults, preds, life, fieldless, regions } => {
-                    if let Some(l) = life {
-                        self.file_adt_life(key, l);
-                    }
-                    let ck = checker_of(key);
-                    if let Some(r) = regions {
-                        self.regions.file(ck, r);
-                    }
-                    // The walk reads a library ADT's count from the names (D155, types.rs
-                    // `declared_lifetimes`), and this map only for a BODY-LOCAL one (no item in
-                    // the names world), whose row is the one home of its count.
-                    self.maps.adt_lifetimes.insert(ck, row.lifetimes);
-                    if let Some(n) = fieldless {
-                        self.maps.fieldless_enums.insert(ck, n);
-                    }
-                    self.maps.generics.insert(key, (row.generics, defaults));
-                    self.adt_declarations.insert(ck, AdtDeclaration { lifetimes: row.lifetimes, marks: row.marks });
-                    self.maps.const_params.insert(key, const_params);
-                    self.field_defaults.insert(ck, field_defaults);
-                    if let Some(p) = preds {
-                        let p = blaze_own::Box::into_inner(p);
-                        self.record_where_const_owners(Want::Adt(key), &p.clauses);
-                        self.preds.insert(ck, p);
-                    }
-                    self.adts.insert(ck, row);
+                self.gat_const_params.insert(item, checker);
+            }
+            if let Some(c) = side.consts {
+                self.maps.assoc_consts.insert((key, side.name), c);
+            }
+            // Its item bounds (form 11), under its key as `Store::trait_members`
+            // files them (the decoder refuses bounds with no members row).
+            if let Some(b) = side.bounds {
+                let Some(item) = item else {
+                    return Err(HeadError::Filed { want, at, what: "an associated type's item bounds with no members row" });
+                };
+                self.preds.insert(item, blaze_own::Box::into_inner(b));
+            }
+            // Its item-bound regions state (form 37), under its key as
+            // `Store::trait_members` files it.
+            match side.regions {
+                super::head_record::AssocRegions::None => {}
+                super::head_record::AssocRegions::Laid(r) => {
+                    let Some(item) = item else {
+                        return Err(HeadError::Filed { want, at, what: "an associated type's regions with no members row" });
+                    };
+                    self.regions.file(item, r);
                 }
-                Head::Ctor { key, sig, regions } => {
-                    if let Some(r) = regions {
-                        self.regions.file(key, r);
-                    }
-                    self.ctors.insert(key, sig);
+                super::head_record::AssocRegions::Unlaid(u) => {
+                    let Some(item) = item else {
+                        return Err(HeadError::Filed { want, at, what: "an associated type's unlaid regions with no members row" });
+                    };
+                    self.regions.file_unlaid(item, u, u.name());
                 }
-                Head::Trait { key, head, extra, supers, super_lifetimes, const_params, preds, assoc_side, life, regions } => {
-                    let ck = checker_of(key);
-                    // Its declared counts are the names' (D155, types.rs `declared_lifetimes`):
-                    // the record carries none and nothing is filed for them.
-                    if let Some(Ok(l)) = &life {
-                        // Its members' container group and names (D148), as `trait_head` files
-                        // them: its declared lifetimes.
-                        // A trait has no regions side here: its record's lifetime names that do
-                        // not line up are the record's own error.
-                        self.restore_container(ck, l, None).map_err(|what| HeadError::Filed { want, at, what })?;
-                        if let Some(r) = regions.as_ref() {
-                            let param_bounds = extract_container_param_bounds(self.tys.view(), &r.regions().clauses, self.tys.alloc());
-                            if !param_bounds.is_empty()
-                                && let Some(prev) = self.container_regions.get(&ck)
-                            {
-                                let mut names = Vec::with_capacity_in(prev.names.len(), self.tys.alloc());
-                                names.extend_from_slice(&prev.names);
-                                self.container_regions.insert(ck, ContainerRegions {
-                                    names,
-                                    count: prev.count,
-                                    self_regions: None,
-                                    self_binders: 0,
-                                    trait_regions: None,
-                                    param_bounds,
-                                });
-                            }
-                        }
-                    }
-                    if let Some(l) = life {
-                        self.file_container_life(ck, l);
-                    }
-                    if let Some(r) = regions {
-                        self.regions.file(ck, r);
-                    }
-                    let trait_generics = head.generics;
-                    for side in assoc_side {
-                        let item = extra.as_ref().and_then(|x| x.assoc.iter().find(|a| a.name == side.name)).map(|a| a.item);
-                        if let Some(n) = side.generics {
-                            self.maps.assoc_generics.insert((key, side.name), n);
-                        }
-                        if let Some(w) = side.where_ {
-                            self.maps.assoc_where.insert((key, side.name), w);
-                        }
-                        if let (Some(item), Some(generics)) = (item, side.generics)
-                            && generics != 0
-                        {
-                            let mut checker = Vec::with_capacity_in(const_params.len() + side.consts.as_ref().map_or(0, |c| c.len()), self.tys.alloc());
-                            checker.extend_from_slice(&const_params);
-                            if let Some(own) = &side.consts {
-                                checker.extend(own.iter().map(|&(i, t)| (trait_generics + i, t)));
-                            }
-                            self.gat_const_params.insert(item, checker);
-                        }
-                        if let Some(c) = side.consts {
-                            self.maps.assoc_consts.insert((key, side.name), c);
-                        }
-                        // Its item bounds (form 11), under its key as `Store::trait_members`
-                        // files them (the decoder refuses bounds with no members row).
-                        if let Some(b) = side.bounds {
-                            let Some(item) = item else {
-                                return Err(HeadError::Filed { want, at, what: "an associated type's item bounds with no members row" });
-                            };
-                            self.preds.insert(item, blaze_own::Box::into_inner(b));
-                        }
-                        // Its item-bound regions state (form 37), under its key as
-                        // `Store::trait_members` files it.
-                        match side.regions {
-                            super::head_record::AssocRegions::None => {}
-                            super::head_record::AssocRegions::Laid(r) => {
-                                let Some(item) = item else {
-                                    return Err(HeadError::Filed { want, at, what: "an associated type's regions with no members row" });
-                                };
-                                self.regions.file(item, r);
-                            }
-                            super::head_record::AssocRegions::Unlaid(u) => {
-                                let Some(item) = item else {
-                                    return Err(HeadError::Filed { want, at, what: "an associated type's unlaid regions with no members row" });
-                                };
-                                self.regions.file_unlaid(item, u, u.name());
-                            }
-                            super::head_record::AssocRegions::HeadRefused => {
-                                let Some(item) = item else {
-                                    return Err(HeadError::Filed { want, at, what: "an associated type's refused regions with no members row" });
-                                };
-                                self.regions.file_refused(item);
-                            }
-                        }
-                    }
-                    // Filed with its members (`Store::trait_members`), as `trait_defs` is.
-                    if extra.is_some() || !supers.is_empty() {
-                        self.maps.supers.insert(key, supers);
-                        let super_projs = match &extra {
-                            Some(x) => extract_super_projs(self.tys.view(), &x.supertraits, self.maps.alloc),
-                            None => blaze_own::Vec::new_in(self.maps.alloc),
-                        };
-                        if !super_projs.is_empty() {
-                            record_super_proj_regions_from_reader(&self.maps, &self.regions, self.tys.view(), ck);
-                        }
-                        self.maps.super_projs.insert(key, super_projs);
-                    }
-                    if let Some(sl) = super_lifetimes {
-                        self.maps.super_lifetimes.insert(key, sl);
-                    }
-                    if let Some(x) = extra {
-                        self.trait_defs.insert(ck, x);
-                        self.maps.trait_members_made.insert(key, ());
-                    }
-                    if let Some(p) = preds {
-                        let p = blaze_own::Box::into_inner(p);
-                        self.record_where_const_owners(Want::Members(key), &p.clauses);
-                        self.preds.insert(ck, p);
-                    }
-                    self.maps.const_params.insert(key, const_params);
-                    self.maps.traits.insert(key, head);
-                }
-                Head::Impl { key, head, preds, frame, life, regions } => {
-                    if key != checker_of(lib) {
-                        return Err(HeadError::Filed { want, at, what: "an impl other than the cell's own" });
-                    }
-                    // Its members' container group and names (D148), as `impl_` files them: the
-                    // group is its filed regions' count, when they were made.
-                    // A disagreement there is the regions' and never the head's (D148: the
-                    // erased head is whole): the head is filed, its regions refused by name
-                    // (`RegionsUnread`), and its members' scope made from its header's text
-                    // when a member is first made (`impl_scope_from_text`, over no regions).
-                    let mut regions = regions;
-                    if let Some(Ok(l)) = &life
-                        && let Err(what) = self.restore_container(key, l, Some((regions.as_ref(), head.self_ty)))
-                    {
-                        regions = None;
-                        self.container_regions.remove(&key);
-                        self.container_scopes.remove(&key);
-                        self.regions.file_unlaid(key, super::head_record::Unlaid::Disagree, what);
-                    }
-                    if let Some(l) = life {
-                        self.file_container_life(key, l);
-                    }
-                    if let Some(r) = regions {
-                        self.regions.file(key, r);
-                    }
-                    if let Some(f) = frame {
-                        let mut own_consts = blaze_own::Vec::with_capacity_in(f.consts.len(), self.maps.alloc);
-                        own_consts.extend_from_slice(&f.consts);
-                        self.maps.const_params.insert(lib, own_consts);
-                        self.member_frames.insert(key, f);
-                    }
-                    if let Some(p) = preds {
-                        let p = blaze_own::Box::into_inner(p);
-                        self.record_where_const_owners(Want::Impl(lib), &p.clauses);
-                        self.preds.insert(key, p);
-                    }
-                    self.impls.insert(key, head);
-                }
-                Head::Alias { key, generics, ty, defaults, const_params, slots } => {
-                    match slots {
-                        Some(laid) => {
-                            self.maps.alias_slots.insert(key, laid);
-                        }
-                        None => {
-                            self.maps.alias_slots.remove(&key);
-                        }
-                    }
-                    self.maps.alias_defaults.insert(key, defaults);
-                    self.maps.const_params.insert(key, const_params);
-                    self.maps.aliases.insert(key, Some((generics, ty)));
-                }
-                Head::AliasRefused { key, why } => {
-                    let text = core::str::from_utf8(&why).map_err(|_| HeadError::Filed { want, at, what: "a refused type alias whose why is not UTF-8" })?;
-                    self.maps.aliases.insert(key, None);
-                    self.maps.alias_gaps.insert(key, AliasGap { text: text.into(), why: None });
-                }
-                // A member refused alone: its gap again, its why the record's text (form 13).
-                Head::FnRefused { key, why } => {
-                    let text = core::str::from_utf8(&why).map_err(|_| HeadError::Filed { want, at, what: "a refused member fn whose why is not UTF-8" })?;
-                    self.fn_gaps.insert(key, Why::Program(text.into(), Range::new(0, 0)));
-                    self.regions.file_refused(key);
-                }
-                Head::TraitAlias { key, head } => {
-                    self.maps.trait_aliases.insert(key, head);
-                }
-                Head::Opaque { key, fn_, index, preds, regions } => {
-                    // Its captured lifetimes, for the one region counter (types.rs
-                    // `HeadsArity`), as `fn_head` files them (D148).
-                    if let Some(n) = regions.as_ref().and_then(|r| r.regions().opaque_captures) {
-                        self.maps.opaque_lifetimes.insert(key, n);
-                    }
-                    if let Some(r) = regions {
-                        self.regions.file(key, r);
-                    }
-                    if let Some(p) = preds {
-                        self.preds.insert(key, blaze_own::Box::into_inner(p));
-                    }
-                    self.opaques.insert(key, (fn_, index));
+                super::head_record::AssocRegions::HeadRefused => {
+                    let Some(item) = item else {
+                        return Err(HeadError::Filed { want, at, what: "an associated type's refused regions with no members row" });
+                    };
+                    self.regions.file_refused(item);
                 }
             }
         }
         Ok(())
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn file_trait_head(
+        &self,
+        want: Want,
+        at: HeadAt,
+        key: LibKey,
+        head: TraitHead,
+        extra: Option<TraitExtra>,
+        supers: blaze_own::Vec<(LibKey, List), Alloc<'static>>,
+        super_lifetimes: Option<SuperLifetimes>,
+        const_params: blaze_own::Vec<(u32, PTy), Alloc<'static>>,
+        preds: Option<super::head_record::HeadPreds>,
+        assoc_side: blaze_own::Vec<super::head_record::AssocSide, Alloc<'static>>,
+        life: Option<Result<super::lifetimes::ContainerLife, super::lifetimes::LifeRefusal>>,
+        regions: Option<super::head_record::FiledRegions>,
+    ) -> Result<(), HeadError> {
+        let ck = checker_of(key);
+        // Its declared counts are the names' (D155, types.rs `declared_lifetimes`):
+        // the record carries none and nothing is filed for them.
+        if let Some(Ok(l)) = &life {
+            // Its members' container group and names (D148), as `trait_head` files
+            // them: its declared lifetimes.
+            // A trait has no regions side here: its record's lifetime names that do
+            // not line up are the record's own error.
+            self.restore_container(ck, l, None).map_err(|what| HeadError::Filed { want, at, what })?;
+            if let Some(r) = regions.as_ref() {
+                let param_bounds = extract_container_param_bounds(self.tys.view(), &r.regions().clauses, self.tys.alloc());
+                if !param_bounds.is_empty()
+                    && let Some(prev) = self.container_regions.get(&ck)
+                {
+                    let mut names = Vec::with_capacity_in(prev.names.len(), self.tys.alloc());
+                    names.extend_from_slice(&prev.names);
+                    self.container_regions.insert(ck, ContainerRegions {
+                        names,
+                        count: prev.count,
+                        self_regions: None,
+                        self_binders: 0,
+                        trait_regions: None,
+                        param_bounds,
+                    });
+                }
+            }
+        }
+        if let Some(l) = life {
+            self.file_container_life(ck, l);
+        }
+        if let Some(r) = regions {
+            self.regions.file(ck, r);
+        }
+        self.file_trait_assoc_sides(want, at, key, head.generics, extra.as_ref(), &const_params, assoc_side)?;
+        // Filed with its members (`Store::trait_members`), as `trait_defs` is.
+        if extra.is_some() || !supers.is_empty() {
+            self.maps.supers.insert(key, supers);
+            let super_projs = match &extra {
+                Some(x) => extract_super_projs(self.tys.view(), &x.supertraits, self.maps.alloc),
+                None => blaze_own::Vec::new_in(self.maps.alloc),
+            };
+            if !super_projs.is_empty() {
+                record_super_proj_regions_from_reader(&self.maps, &self.regions, self.tys.view(), ck);
+            }
+            self.maps.super_projs.insert(key, super_projs);
+        }
+        if let Some(sl) = super_lifetimes {
+            self.maps.super_lifetimes.insert(key, sl);
+        }
+        if let Some(x) = extra {
+            self.trait_defs.insert(ck, x);
+            self.maps.trait_members_made.insert(key, ());
+        }
+        if let Some(p) = preds {
+            let p = blaze_own::Box::into_inner(p);
+            self.record_where_const_owners(Want::Members(key), &p.clauses);
+            self.preds.insert(ck, p);
+        }
+        self.maps.const_params.insert(key, const_params);
+        self.maps.traits.insert(key, head);
+        Ok(())
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn file_impl_head(
+        &self,
+        want: Want,
+        at: HeadAt,
+        key: ItemKey,
+        head: ImplHead,
+        preds: Option<super::head_record::HeadPreds>,
+        frame: Option<MemberFrame>,
+        life: Option<Result<super::lifetimes::ContainerLife, super::lifetimes::LifeRefusal>>,
+        mut regions: Option<super::head_record::FiledRegions>,
+    ) -> Result<(), HeadError> {
+        let lib = want.key();
+        if key != checker_of(lib) {
+            return Err(HeadError::Filed { want, at, what: "an impl other than the cell's own" });
+        }
+        // Its members' container group and names (D148), as `impl_` files them: the
+        // group is its filed regions' count, when they were made.
+        // A disagreement there is the regions' and never the head's (D148: the
+        // erased head is whole): the head is filed, its regions refused by name
+        // (`RegionsUnread`), and its members' scope made from its header's text
+        // when a member is first made (`impl_scope_from_text`, over no regions).
+        if let Some(Ok(l)) = &life
+            && let Err(what) = self.restore_container(key, l, Some((regions.as_ref(), head.self_ty)))
+        {
+            regions = None;
+            self.container_regions.remove(&key);
+            self.container_scopes.remove(&key);
+            self.regions.file_unlaid(key, super::head_record::Unlaid::Disagree, what);
+        }
+        if let Some(l) = life {
+            self.file_container_life(key, l);
+        }
+        if let Some(r) = regions {
+            self.regions.file(key, r);
+        }
+        if let Some(f) = frame {
+            let mut own_consts = blaze_own::Vec::with_capacity_in(f.consts.len(), self.maps.alloc);
+            own_consts.extend_from_slice(&f.consts);
+            self.maps.const_params.insert(lib, own_consts);
+            self.member_frames.insert(key, f);
+        }
+        if let Some(p) = preds {
+            let p = blaze_own::Box::into_inner(p);
+            self.record_where_const_owners(Want::Impl(lib), &p.clauses);
+            self.preds.insert(key, p);
+        }
+        self.impls.insert(key, head);
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn file_alias_head(
+        &self,
+        key: LibKey,
+        generics: u32,
+        ty: PTy,
+        defaults: blaze_own::Vec<Option<PTy>, Alloc<'static>>,
+        const_params: blaze_own::Vec<(u32, PTy), Alloc<'static>>,
+        slots: Option<AliasRegions>,
+    ) {
+        match slots {
+            Some(laid) => {
+                self.maps.alias_slots.insert(key, laid);
+            }
+            None => {
+                self.maps.alias_slots.remove(&key);
+            }
+        }
+        self.maps.alias_defaults.insert(key, defaults);
+        self.maps.const_params.insert(key, const_params);
+        self.maps.aliases.insert(key, Some((generics, ty)));
+    }
+
+    #[inline(never)]
+    fn file_alias_refused_head(&self, want: Want, at: HeadAt, key: LibKey, why: blaze_own::Vec<u8, Alloc<'static>>) -> Result<(), HeadError> {
+        let text = core::str::from_utf8(&why).map_err(|_| HeadError::Filed { want, at, what: "a refused type alias whose why is not UTF-8" })?;
+        self.maps.aliases.insert(key, None);
+        self.maps.alias_gaps.insert(key, AliasGap { text: text.into(), why: None });
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn file_fn_refused_head(&self, want: Want, at: HeadAt, key: ItemKey, why: blaze_own::Vec<u8, Alloc<'static>>) -> Result<(), HeadError> {
+        // A member refused alone: its gap again, its why the record's text (form 13).
+        let text = core::str::from_utf8(&why).map_err(|_| HeadError::Filed { want, at, what: "a refused member fn whose why is not UTF-8" })?;
+        self.fn_gaps.insert(key, Why::Program(text.into(), Range::new(0, 0)));
+        self.regions.file_refused(key);
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn file_trait_alias_head(&self, key: LibKey, head: TraitAliasHead) {
+        self.maps.trait_aliases.insert(key, head);
+    }
+
+    #[inline(never)]
+    fn file_opaque_head(
+        &self,
+        key: ItemKey,
+        fn_: ItemKey,
+        index: u32,
+        preds: Option<super::head_record::HeadPreds>,
+        regions: Option<super::head_record::FiledRegions>,
+    ) {
+        // Its captured lifetimes, for the one region counter (types.rs
+        // `HeadsArity`), as `fn_head` files them (D148).
+        if let Some(n) = regions.as_ref().and_then(|r| r.regions().opaque_captures) {
+            self.maps.opaque_lifetimes.insert(key, n);
+        }
+        if let Some(r) = regions {
+            self.regions.file(key, r);
+        }
+        if let Some(p) = preds {
+            self.preds.insert(key, blaze_own::Box::into_inner(p));
+        }
+        self.opaques.insert(key, (fn_, index));
     }
 
     /// A restored trait's or impl's `container_regions` and `container_scopes` (D148), from its

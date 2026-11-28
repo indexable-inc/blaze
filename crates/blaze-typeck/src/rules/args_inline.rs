@@ -104,6 +104,13 @@ pub enum TypedFinding {
         local: crate::ids::Name,
         at: Range,
     },
+    /// `suspend-in-sans-io`: a `.do` suspension point inside a `#![blaze::sans_io]` body
+    /// (rules/capability.rs), forbidden because sans-IO cores must be pure, synchronous state
+    /// transitions that return requests rather than suspending.
+    SuspendInSansIo {
+        owner: ItemKey,
+        at: Range,
+    },
 }
 
 impl TypedFinding {
@@ -115,6 +122,7 @@ impl TypedFinding {
             TypedFinding::Cost { .. } => "cost-contract",
             TypedFinding::CapabilityInSansIo { .. } => "capability-in-sans-io",
             TypedFinding::LocalBorrowAcrossDo { .. } => "local-borrow-across-do",
+            TypedFinding::SuspendInSansIo { .. } => "suspend-in-sans-io",
         }
     }
 
@@ -125,7 +133,8 @@ impl TypedFinding {
             | TypedFinding::UnsafeOpInUnsafeFn { at, .. }
             | TypedFinding::Cost { at, .. }
             | TypedFinding::CapabilityInSansIo { at, .. }
-            | TypedFinding::LocalBorrowAcrossDo { at, .. } => at,
+            | TypedFinding::LocalBorrowAcrossDo { at, .. }
+            | TypedFinding::SuspendInSansIo { at, .. } => at,
         }
     }
 
@@ -138,6 +147,7 @@ impl TypedFinding {
             TypedFinding::Cost { violation, at, .. } => (at.start, at.end, 2, violation as u8),
             TypedFinding::CapabilityInSansIo { borrowed, at, .. } => (at.start, at.end, 3, if borrowed { 1 } else { 0 }),
             TypedFinding::LocalBorrowAcrossDo { at, .. } => (at.start, at.end, 4, 0),
+            TypedFinding::SuspendInSansIo { at, .. } => (at.start, at.end, 5, 0),
         }
     }
 }

@@ -1204,3 +1204,180 @@ fn real_rust_sans_io_and_syscalls_attr_policy_enforcement() {
         }),
     );
 }
+
+/// Real `#![no_core]` `#![blaze::sans_io]` Rust source attempting `.do` suspension inside a
+/// sans-IO core, triggering `suspend-in-sans-io` (`TypedFinding::SuspendInSansIo`).
+const BAD_SANS_IO_DO_PROGRAM: &str = r#"#![feature(no_core, lang_items, register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::sans_io]
+#![no_core]
+#![no_main]
+
+#[lang = "sized"]
+trait Sized {}
+
+#[lang = "copy"]
+trait Copy {}
+
+impl Copy for u64 {}
+
+trait Request {
+    type Answer;
+}
+
+struct Ping(u64);
+impl Copy for Ping {}
+
+impl Request for Ping {
+    type Answer = u64;
+}
+
+fn bad_core(req: Ping) -> u64 {
+    req.do
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    let _ = bad_core(Ping(1));
+    0
+}
+"#;
+
+/// Exact control for [`BAD_SANS_IO_DO_PROGRAM`] without `#![blaze::sans_io]`: the same `.do`
+/// body must pass clean with zero findings.
+const OK_DRIVER_DO_PROGRAM: &str = r#"#![feature(no_core, lang_items, register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![no_core]
+#![no_main]
+
+#[lang = "sized"]
+trait Sized {}
+
+#[lang = "copy"]
+trait Copy {}
+
+impl Copy for u64 {}
+
+trait Request {
+    type Answer;
+}
+
+struct Ping(u64);
+impl Copy for Ping {}
+
+impl Request for Ping {
+    type Answer = u64;
+}
+
+fn bad_core(req: Ping) -> u64 {
+    req.do
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    let _ = bad_core(Ping(1));
+    0
+}
+"#;
+
+#[test]
+fn real_rust_do_inside_sans_io_body_is_rejected_by_typeck() {
+    let alloc = Alloc::global();
+    let tc = Toolchain::none(alloc);
+
+    // 1. With `#![blaze::sans_io]`: `.do` inside `bad_core` emits `suspend-in-sans-io` through
+    //    both `ProjectWorld::check` and `Front2Program::check_all`.
+    {
+        let root = "/sans-io-do-bad/src/main.rs";
+        let files = [(root.to_owned(), BAD_SANS_IO_DO_PROGRAM.to_owned())];
+        let user = UserCrate {
+            name: "sans_io_do_bad",
+            dir: "/sans-io-do-bad/",
+            root,
+            files: &files,
+            edition: edition::PackageEdition::of_manifest(EDITION).expect("blaze edition"),
+            panic: Panic::Abort,
+        };
+        let inputs = Inputs::new(&user, &tc).expect("inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("resolve names");
+        let sources = [SourceFile { path: "src/main.rs", text: BAD_SANS_IO_DO_PROGRAM }];
+
+        let check_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("check frame");
+        let mut world = ProjectWorld::new(&names, &check_frame, &sources, alloc).expect("project world");
+        let bad_lib_key = names
+            .items(0)
+            .find_map(|(k, _, _)| (names.item_text(k)?.name == Some("bad_core")).then_some(k))
+            .expect("bad_core item");
+        let verdict = world.check(BodyRef::Free(bad_lib_key), alloc);
+        assert!(verdict.is_clean(), "bad_core should finish typecheck with a typed lint finding: {verdict:?}");
+        assert_eq!(verdict.findings.len(), 1, "expected 1 suspend-in-sans-io finding: {:?}", verdict.findings);
+        assert_eq!(verdict.findings[0].lint, "suspend-in-sans-io");
+        assert!(
+            verdict.findings[0].text.contains("cannot suspend via `.do`"),
+            "unexpected finding text: {}",
+            verdict.findings[0].text,
+        );
+
+        let prog_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("program frame");
+        let mut program = Front2Program::new(&names, &prog_frame, &sources, alloc).expect("front2 program");
+        let checked = program.check_all().expect("check_all");
+        let bad_idx = (0..program.fn_count())
+            .find(|&i| {
+                let path = program.function(i).path;
+                path == "bad_core" || path.ends_with("::bad_core")
+            })
+            .expect("bad_core row in Front2Program");
+        let bad_checked = checked[bad_idx].as_ref().expect("bad_core checked record");
+        assert!(bad_checked.suspends, "bad_core must mark checked.suspends == true");
+        assert_eq!(bad_checked.findings.len(), 1, "expected 1 TypedFinding: {:?}", bad_checked.findings);
+        assert_eq!(bad_checked.findings[0].lint(), "suspend-in-sans-io");
+        assert!(
+            matches!(bad_checked.findings[0], TypedFinding::SuspendInSansIo { .. }),
+            "expected TypedFinding::SuspendInSansIo, got {:?}",
+            bad_checked.findings[0],
+        );
+    }
+
+    // 2. Control without `#![blaze::sans_io]`: the exact same `.do` function passes clean with
+    //    zero findings.
+    {
+        let root = "/sans-io-do-ok/src/main.rs";
+        let files = [(root.to_owned(), OK_DRIVER_DO_PROGRAM.to_owned())];
+        let user = UserCrate {
+            name: "sans_io_do_ok",
+            dir: "/sans-io-do-ok/",
+            root,
+            files: &files,
+            edition: edition::PackageEdition::of_manifest(EDITION).expect("blaze edition"),
+            panic: Panic::Abort,
+        };
+        let inputs = Inputs::new(&user, &tc).expect("inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("resolve names");
+        let sources = [SourceFile { path: "src/main.rs", text: OK_DRIVER_DO_PROGRAM }];
+
+        let check_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("check frame");
+        let mut world = ProjectWorld::new(&names, &check_frame, &sources, alloc).expect("project world");
+        let ok_lib_key = names
+            .items(0)
+            .find_map(|(k, _, _)| (names.item_text(k)?.name == Some("bad_core")).then_some(k))
+            .expect("bad_core item");
+        let verdict = world.check(BodyRef::Free(ok_lib_key), alloc);
+        assert!(verdict.is_clean(), "driver `.do` must typecheck clean: {verdict:?}");
+        assert!(verdict.findings.is_empty(), "driver `.do` must emit 0 findings: {:?}", verdict.findings);
+
+        let prog_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("program frame");
+        let mut program = Front2Program::new(&names, &prog_frame, &sources, alloc).expect("front2 program");
+        let checked = program.check_all().expect("check_all");
+        let ok_idx = (0..program.fn_count())
+            .find(|&i| {
+                let path = program.function(i).path;
+                path == "bad_core" || path.ends_with("::bad_core")
+            })
+            .expect("bad_core row in Front2Program");
+        let ok_checked = checked[ok_idx].as_ref().expect("bad_core checked record");
+        assert!(ok_checked.suspends, "driver `.do` must mark checked.suspends == true");
+        assert!(ok_checked.findings.is_empty(), "driver `.do` must emit 0 TypedFindings: {:?}", ok_checked.findings);
+    }
+}

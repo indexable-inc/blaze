@@ -716,6 +716,663 @@ fn object_tables<'n, S: super::source::NamesSource<'n>>(
     Ok(())
 }
 
+type RowPathEntry = (ItemKey, Result<super::row_path::RowPath, super::row_path::NoRowPath>);
+
+struct ClassifiedFns {
+    bodiless: Vec<RowPathEntry, Global>,
+    ctors: Vec<RowPathEntry, Global>,
+    declared: Vec<RowPathEntry, Global>,
+    left: HashMap<ItemKey, Box<str>, Global>,
+}
+
+struct ReloweredBodies<'n> {
+    tys: PortableTys<'static>,
+    main: Vec<(Body<'n>, Checked<'static>, super::row_path::RowPath), Global>,
+    bodies: Vec<(Body<'n>, Checked<'static>, super::row_path::RowPath), Global>,
+    spec_lowered: blaze_own::Vec<
+        (ItemKey, blaze_own::Vec<PTy, Alloc<'static>>, Body<'n>, Checked<'static>, super::row_path::RowPath),
+        Alloc<'static>,
+    >,
+}
+
+struct TabledProgram<'n> {
+    fns: Vec<Tabled<'n>, Global>,
+    by_key: HashMap<ItemKey, usize, Global>,
+    entry: Option<usize>,
+    inline_for_specs: blaze_own::Vec<super::inline_for::SpecRow, Alloc<'static>>,
+    langs: [(LangItem, Option<ItemKey>); SEAM_LANGS.len()],
+}
+
+#[inline(never)]
+fn resolve_start_roots<'n>(
+    names: &'n Names<'n>,
+    starts: Starts<'_>,
+    store: &mut Store<'n>,
+    keys: &mut super::keys::Keys,
+    alloc: Alloc<'static>,
+) -> Result<(Vec<LibKey, Global>, Option<super::start::Entry2>, bool), Front2Refusal> {
+    let mut roots: Vec<LibKey, Global> = Vec::new_in(Global);
+    let mut start2: Option<super::start::Entry2> = None;
+    let tests = match starts {
+        Starts::Main => {
+            let written = Written { kind: PathKind::Plain, segments: &["main"] };
+            // A miss behind a failed call (D104's implicit `::std::main` that took no arm)
+            // names that call and why (blaze-scope failed_call.rs), never "no `main`"; one
+            // behind an attribute call that wrote no `main` names that call (main_call.rs).
+            let found = names::path(names, names.root(0), Namespace::Values, written, alloc).map_err(|error| {
+                match blaze_scope::failed_call::FailedCall::of(names, &error, "main") {
+                    Some(failed) => Front2Refusal::MainNotWritten {
+                        call: failed.call,
+                        module: failed.module,
+                        path: failed.path.into(),
+                        implicit: failed.implicit,
+                        diagnostic: failed.failed.diagnostic,
+                        notes: failed.failed.notes().into(),
+                    },
+                    None => match blaze_scope::main_call::MainCall::of(names, 0) {
+                        Some(taken) => Front2Refusal::MainTakenBy { call: taken.call, path: taken.path.into(), implicit: taken.implicit, why: taken.why },
+                        None => Front2Refusal::NoMain,
+                    },
+                }
+            })?;
+            let rust_main: LibKey = found.whole(1).ok_or(Front2Refusal::NoMain)?.key;
+            // The process's entry: an exported one ([`exported_entry`]); else the root's
+            // start by THE rule the record walk takes too (run_entry.rs `RootStart`, decided
+            // once from crate 0's `Implicit::std` and root attributes): a blaze-edition root
+            // that exports nothing is refused by name, never started at its `main`
+            // directly; a Rust root starts through the `#[lang = "start"]` the program links
+            // (start.rs `linked_lang_start`, Rust's rule), else at its `fn main` directly (a
+            // program that links no std). The walk and `entry()` start at its root.
+            // The rule is [`start_of`], which `blaze run` asks too before anything is built
+            // (run.rs `entry_start`): one home.
+            let entry = match start_of(names, alloc)? {
+                StartOf::Exported(e) => e,
+                StartOf::LangStart(lang_start) => super::start::Entry2::Rust(super::start::rust_start(names, lang_start, rust_main, store, keys)?),
+                StartOf::Direct => super::start::Entry2::Direct(rust_main),
+            };
+            roots.push(entry.root());
+            start2 = Some(entry);
+            false
+        }
+        Starts::Tests(list) | Starts::Within { roots: list, .. } => {
+            roots.extend_from_slice(list);
+            true
+        }
+    };
+    Ok((roots, start2, tests))
+}
+
+#[inline(never)]
+fn lower_root_bodies<'n>(
+    records: &mut Records<'_, 'n>,
+    prepared: &'n Prepares<'n>,
+    roots: Vec<LibKey, Global>,
+    within_survey: bool,
+    mut left_out: Option<&mut Vec<(Box<str>, LeftOut), Global>>,
+    alloc: Alloc<'static>,
+) -> Result<(Vec<LibKey, Global>, Vec<Body<'n>, Global>), Front2Refusal> {
+    let mut mains: Vec<Body<'n>, Global> = Vec::with_capacity_in(roots.len(), Global);
+    let mut kept: Vec<LibKey, Global> = Vec::with_capacity_in(roots.len(), Global);
+    for &lib in roots.iter() {
+        // An entry declared in a block (super::nested_exports): the bodies around it are
+        // lowered first, outermost first, so each keeps its local items (locals.rs
+        // `Locals::keep`, which runs before the body's check) and the entry's head and text
+        // are known. An enclosing body's refusal stops the run, named (no quiet pass;
+        // coordinator's ruling 19:1x).
+        let mut lowered = Ok(());
+        for &outer in super::nested_exports::enclosing_bodies(records.names, alloc, lib)?.iter() {
+            if let Err(e) = lower_made(records, prepared, LowerTarget::Free(outer)) {
+                lowered = Err(e);
+                break;
+            }
+        }
+        let lowered = lowered.and_then(|()| lower_made(records, prepared, LowerTarget::Free(lib)));
+        match (lowered, left_out.as_deref_mut()) {
+            (Ok(m), _) => {
+                mains.push(m);
+                kept.push(lib);
+            }
+            // A survey limited by `Within` (its roots are every fn of some crates, no suite's
+            // rows): a root that does not lower is filed and left out, as a reached fn is.
+            (Err(e), Some(out)) if within_survey => {
+                // By its path, as every reached fn's row is (`fn_shown`), so a census files
+                // it by its crate; its key only when the names hold no path.
+                let item = super::item_shown::ItemShown::of_lib(records.names, lib);
+                let shown: Box<str> = item.path().map_or_else(|| item.boxed(), Box::from);
+                out.push((shown, LeftOut::named(Box::from("lower: root"), Front2Refusal::Lower(e))));
+            }
+            (Err(e), _) => return Err(Front2Refusal::Lower(e)),
+        }
+    }
+    Ok((kept, mains))
+}
+
+#[inline(never)]
+fn check_root_bodies<'n>(
+    records: &mut Records<'_, 'n>,
+    prepared: &'n Prepares<'n>,
+    mains: &mut [Body<'n>],
+    recipes: &mut Vec<super::coroutine_recipes::RecipeRow, Global>,
+    mut left_out: Option<&mut Vec<(Box<str>, LeftOut), Global>>,
+    alloc: Alloc<'static>,
+) -> Result<Vec<Option<Checked<'static>>, Global>, Front2Refusal> {
+    // In a survey a root that does not check is filed and left out, and the walk goes on
+    // from what it calls by name: what is reachable is surveyed whatever the root is.
+    let mut checked: Vec<Option<Checked<'static>>, Global> = Vec::with_capacity_in(mains.len(), Global);
+    for m in mains.iter_mut() {
+        let checked_res = if m.typeck.inline_fors.is_empty() {
+            let v = m.lowered.view();
+            let s = Spelling::of(&v).map_err(Front2Refusal::Spell)?;
+            let scope = m.scope(&s);
+            check_body(records, m, &scope)
+        } else {
+            super::inline_for::unroll_concrete_body(records, prepared, m)
+        };
+        let done = checked_res.and_then(|c| {
+            super::coroutine_recipes::recipes_of(records, m, &c, recipes, alloc)
+                .map_err(|error| CheckFail::Check { owner: m.owner, error })?;
+            Ok(c)
+        });
+        checked.push(match done {
+            Ok(c) => Some(c),
+            Err(e) => match left_out.as_deref_mut() {
+                Some(out) => {
+                    let d = format!("{e:?}");
+                    let class = format!("check: {}", &d[..d.find(['(', ' ', '{']).unwrap_or(d.len())]);
+                    let whole = format!("{e}").into_boxed_str();
+                    let row = LeftOut::reached(records, class.into_boxed_str(), whole, Front2Refusal::Check(e));
+                    out.push((fn_shown(records, m.owner).into_boxed_str(), row));
+                    None
+                }
+                None => return Err(Front2Refusal::Check(e)),
+            },
+        });
+    }
+    Ok(checked)
+}
+
+#[inline(never)]
+fn collect_extra_roots<'n>(
+    records: &mut Records<'_, 'n>,
+    linked: &super::linked::Linked,
+    mains: &[Body<'n>],
+    roots: &[LibKey],
+    tests: bool,
+    start2: Option<super::start::Entry2>,
+    alloc: Alloc<'static>,
+) -> Result<(Vec<Result<EntryShape, TestEntryRefusal>, Global>, Vec<ItemKey, Global>, Option<ItemKey>), Front2Refusal> {
+    // A test's entry, from its head alone (test_entry.rs): a refusal is that test's own (the
+    // runner fails it by name; the rest of the suite goes on). A `Report` entry's `report`
+    // fn is a root of the walk, so it is tabled and in the test's reach.
+    let mut shapes: Vec<Result<EntryShape, TestEntryRefusal>, Global> = Vec::new_in(Global);
+    let mut also: Vec<ItemKey, Global> = Vec::new_in(Global);
+    let mut termination_report_fn: Option<ItemKey> = None;
+    if tests {
+        let mut has_report = false;
+        for (m, &lib) in mains.iter().zip(roots.iter()) {
+            let shape = super::test_entry::entry_shape(records, lib, m.owner);
+            if let Ok(EntryShape::Report { report, .. }) = shape {
+                also.push(report);
+                has_report = true;
+            }
+            shapes.push(shape);
+        }
+        if has_report
+            && let Some(term_lib) = records.index.lang(super::test_entry::TERMINATION_LANG)
+            && records.store.ensure(records.names, records.keys, super::heads::Want::Members(term_lib)).is_ok()
+            && let Ok(term_key) = records.keys.item(term_lib)
+        {
+            termination_report_fn = records.keys.filed_member(term_key, MemberKind::Fn, "report");
+        }
+        also.sort_unstable();
+        also.dedup();
+    }
+    // A Rust program's start: `lang_start` is reached beside `main` like any fn it calls;
+    // its instance at `T` is the builder's (LADDER.md L1b).
+    if let Some(super::start::Entry2::Rust(s)) = start2 {
+        let k = records.keys.item(s.lang_start).map_err(|clash| Front2Refusal::Unchecked {
+            function: Box::from("lang_start"),
+            class: Box::from("key clash"),
+            first: format!("{clash}").into_boxed_str(),
+        })?;
+        also.push(k);
+    }
+    // The program's compiler_builtins soft-float routines (builtins_shim.rs): an `f128`
+    // operation is a call of one, made by the emitter's legalize, so no body names them;
+    // each found one is reached beside the roots, so its row and body are the build's
+    // (run.rs `build_from` binds them as the record walk does, run/make_one.rs).
+    let builtins = super::builtins_shim::find(records.names, linked.roots(), alloc);
+    for r in blaze_lir::legalize::SoftFloat::ALL {
+        let Some(lib) = builtins.lib(r) else { continue };
+        let k = records.keys.item(lib).map_err(|clash| Front2Refusal::Unchecked {
+            function: Box::from(r.symbol()),
+            class: Box::from("key clash"),
+            first: format!("{clash}").into_boxed_str(),
+        })?;
+        also.push(k);
+    }
+    Ok((shapes, also, termination_report_fn))
+}
+
+#[inline(never)]
+fn reach_and_specialize<'n>(
+    records: &mut Records<'_, 'n>,
+    prepared: &'n Prepares<'n>,
+    mains: &[Body<'n>],
+    checked: &mut [Option<Checked<'static>>],
+    also: &[ItemKey],
+    starts: Starts<'_>,
+) -> Result<(super::reach::Census<'n>, blaze_own::Vec<super::inline_for::SpecializedBody<'n>, Alloc<'static>>, Vec<(usize, usize), Global>), Front2Refusal> {
+    let mut lowered = Vec::with_capacity_in(mains.len(), Global);
+    for m in mains.iter() {
+        lowered.push(m.lowered.view());
+    }
+    let mut spells = Vec::with_capacity_in(mains.len(), Global);
+    for v in lowered.iter() {
+        spells.push(Spelling::of(v).map_err(Front2Refusal::Spell)?);
+    }
+    let mut scopes = Vec::with_capacity_in(mains.len(), Global);
+    for (m, s) in mains.iter().zip(spells.iter()) {
+        scopes.push(m.scope(s));
+    }
+    let mut walk_from = Vec::with_capacity_in(mains.len(), Global);
+    for ((m, c), scope) in mains.iter().zip(checked.iter_mut()).zip(scopes.iter()) {
+        let first = match c {
+            Some(c) => First::CheckedBody(m, c),
+            None => First::Unchecked(m),
+        };
+        walk_from.push(Start { owner: m.owner, first, scope });
+    }
+    let within = match starts {
+        Starts::Within { within, .. } => within,
+        Starts::Main | Starts::Tests(_) => super::reach::Within::ALL,
+    };
+    let mut census = reach_all(records, prepared, walk_from, also, within);
+    if census.capped {
+        let entry = mains.first().map_or_else(|| String::from("the suite's tests"), |m| fn_shown(records, m.owner));
+        let report = super::reach::capped_report(records, &census).into_boxed_str();
+        return Err(Front2Refusal::Capped { entry: entry.into_boxed_str(), queued: census.queued, cap: census.cap, items: census.items, forced: census.forced, report });
+    }
+    // Specialize any reached generic `inline for` functions at every concrete call site and
+    // merge newly discovered callees into `census`.
+    let inline_specs = super::inline_for::specialize_generic_inline_fors(records, prepared, mains, checked, &mut census)
+        .map_err(Front2Refusal::Check)?;
+    let reached_by_crate = super::reach::by_crate(records, &census.fns);
+    Ok((census, inline_specs, reached_by_crate))
+}
+
+#[inline(never)]
+fn classify_reached_fns<'n>(
+    records: &Records<'_, 'n>,
+    mains: &[Body<'n>],
+    checked: &[Option<Checked<'static>>],
+    census: &mut super::reach::Census<'n>,
+    inline_specs: &[super::inline_for::SpecializedBody<'n>],
+    termination_report_fn: Option<ItemKey>,
+    mut left_out: Option<&mut Vec<(Box<str>, LeftOut), Global>>,
+) -> Result<ClassifiedFns, Front2Refusal> {
+    // Every fn the walk met is checked clean, or the program is refused by its first one
+    // that is not: a fn with any diagnostic or gap is never built.
+    // Each row's path, or why none is built: decided per fn by `tabled::left_out_or_stop`
+    // in the table loop below (a survey files it and goes on), never returned from here.
+    let mut bodiless: Vec<RowPathEntry, Global> = Vec::new_in(Global);
+    let mut ctors: Vec<RowPathEntry, Global> = Vec::new_in(Global);
+    let mut declared: Vec<RowPathEntry, Global> = Vec::new_in(Global);
+    // Every key a survey leaves out, with its cause: the seam's `left_out`.
+    let mut left: HashMap<ItemKey, Box<str>, Global> = HashMap::new_in(Global);
+    for (k, outcome) in census.fns.iter_mut() {
+        match outcome {
+            Reached::Failed { class, detail, refusal } if let Some(out) = left_out.as_deref_mut() => {
+                // The cause a caller's build names ([`RunError::LeftOut`]'s `why`): the class
+                // and its WHOLE detail, on one line (rule 19: an error names the thing; a cut
+                // at 160 characters hid the failing goal of Class O, 2026-11-16).
+                let mut why = String::with_capacity(class.len() + 2 + detail.len());
+                why.push_str(class);
+                why.push_str(": ");
+                why.extend(detail.chars().map(|c| if c == '\n' { ' ' } else { c }));
+                left.insert(*k, why.into_boxed_str());
+                // The row keeps the walk's typed refusal (program/left_out.rs); a site that
+                // named its cause by text only keeps the refusal a run stops with.
+                let refusal = match refusal.take() {
+                    Some(r) => *r,
+                    None => Front2Refusal::Unchecked { function: super::item_shown::refused(records, *k), class: class.clone(), first: detail.clone() },
+                };
+                let row = LeftOut::reached(records, core::mem::take(class), core::mem::take(detail), refusal);
+                out.push((fn_shown(records, *k).into_boxed_str(), row));
+            }
+            Reached::Failed { class, detail, .. } => {
+                return Err(Front2Refusal::Unchecked {
+                    function: super::item_shown::refused(records, *k),
+                    class: core::mem::take(class),
+                    first: core::mem::take(detail),
+                });
+            }
+            Reached::NoBody => bodiless.push((*k, super::row_path::row_path_of(records, *k))),
+            // A ctor is the language's: tabled as one, the build makes its value.
+            Reached::Ctor => ctors.push((*k, super::row_path::row_path_of(records, *k))),
+            // A call on a parameter or `dyn` is resolved by the back half at the instance,
+            // to an impl fn the walk tabled (reach.rs `Instances`); the trait's fn itself is
+            // tabled as declared: the build reads its ABI at the call before resolving it.
+            Reached::AtInstance | Reached::AtObject => declared.push((*k, super::row_path::row_path_of(records, *k))),
+            Reached::Checked => {}
+        }
+    }
+    // A trait's fn called on a concrete type (`?`'s `Try::branch` on a `Result`, a path
+    // call `Tr::f(&x)`) is named by the call as the trait's: the back half reads its ABI at
+    // the call, then resolves it to the impl's fn the walk reached. Tabled as declared.
+    let mut met: HashMap<ItemKey, (), Global> = HashMap::new_in(Global);
+    met.extend(census.fns.iter().map(|(k, _)| (*k, ())));
+    for m in mains.iter() {
+        met.insert(m.owner, ());
+    }
+    for c in checked.iter().flatten().chain(census.bodies.iter().map(|(_, c)| c)).chain(inline_specs.iter().map(|s| &s.checked)) {
+        for &item in c.callees.column::<1>() {
+            let of_trait = matches!(records.keys.origin(item), Some(super::keys::Origin::Member { container, kind: MemberKind::Fn, .. }) if !records.store.impls.contains_key(container));
+            if of_trait && met.insert(item, ()).is_none() {
+                declared.push((item, super::row_path::row_path_of(records, item)));
+            }
+        }
+    }
+    // If any test of a suite is entered through the report shim, table `Termination::report`
+    // as a declared trait fn so whole-program builds can read its signature and ABI.
+    if let Some(report_fn) = termination_report_fn
+        && met.insert(report_fn, ()).is_none()
+    {
+        declared.push((report_fn, super::row_path::row_path_of(records, report_fn)));
+    }
+    Ok(ClassifiedFns { bodiless, ctors, declared, left })
+}
+
+#[inline(never)]
+fn ensure_program_adts<'n>(
+    records: &mut Records<'_, 'n>,
+    checked: &[Option<Checked<'static>>],
+    census_bodies: &[(Body<'n>, Checked<'static>)],
+    inline_specs: &[super::inline_for::SpecializedBody<'n>],
+    mut left_out: Option<&mut Vec<(Box<str>, LeftOut), Global>>,
+    left: &mut HashMap<ItemKey, Box<str>, Global>,
+) -> Result<(), Front2Refusal> {
+    // Every ADT a type of the program names has its row before the build: the back half
+    // lays out each type it meets (an impl's signature's `ControlFlow<..>` too, which no
+    // body's check needed the row of). Rounds, as a row's fields name more ADTs.
+    // In a survey a row that cannot be made is filed in `left_out` and given up on: the
+    // builder then refuses each type naming it, by name.
+    let mut given_up: HashMap<ItemKey, (), Global> = HashMap::new_in(Global);
+    for round in 0.. {
+        let mut missing: Vec<ItemKey, Global> = Vec::new_in(Global);
+        let views = core::iter::once(records.store.tys.view())
+            .chain(checked.iter().flatten().map(|c| c.types.view()))
+            .chain(census_bodies.iter().map(|(_, c)| c.types.view()))
+            .chain(inline_specs.iter().map(|s| s.checked.types.view()));
+        for v in views {
+            for n in v.nodes() {
+                if let tc::PNode::Adt(k, _) = n
+                    && !records.store.adts.contains_key(k)
+                    && !given_up.contains_key(k)
+                {
+                    missing.push(*k);
+                }
+            }
+        }
+        if let Some(lib) = records.index.lang("panic_location") {
+            let k = super::keys::asked_key(records.names, lib);
+            if !records.store.adts.contains_key(&k) && !given_up.contains_key(&k) {
+                missing.push(k);
+            }
+        }
+        missing.sort_unstable();
+        missing.dedup();
+        let Some(&first) = missing.first() else { break };
+        let refuse = |r: &Records<'_, '_>, k: ItemKey, why: String| Front2Refusal::AdtRow { adt: super::item_shown::refused(r, k), why: why.into_boxed_str() };
+        if round == super::reach::MOST_FNS {
+            return Err(refuse(records, first, String::from("rows still missing after the most rounds")));
+        }
+        for k in missing {
+            let why = match records.keys.library_in(records.names, k) {
+                None => Some(String::from("no library key")),
+                // A constant a head names (a pattern type's range end, `UsizeNoHighBit`'s
+                // `HALF_USIZE`) is evaluated as met and the head made again, at most
+                // `MOST_ADT_LENS` times, as a body's lowering does.
+                Some(lib) => {
+                    let mut lens = 0;
+                    loop {
+                        match records.store.ensure(records.names, records.keys, super::heads::Want::Adt(lib)) {
+                            Err(super::heads::HeadError::Item(_, Why::NeedConst(c, _))) if lens < MOST_ADT_LENS => {
+                                lens += 1;
+                                if let Err(e) = super::check::eval_len(records, c) {
+                                    break Some(format!("the constant {c:x} its head names: {e:?}"));
+                                }
+                            }
+                            Err(e) => break Some(format!("{e:?}")),
+                            Ok(()) if !records.store.adts.contains_key(&k) => break Some(String::from("made, but no row filed under its key")),
+                            Ok(()) => break None,
+                        }
+                    }
+                }
+            };
+            let Some(why) = why else { continue };
+            let (adt, why) = (fn_shown(records, k).into_boxed_str(), why.into_boxed_str());
+            match left_out.as_deref_mut() {
+                Some(out) => {
+                    let cut = why.char_indices().nth(160).map_or(&*why, |(i, _)| &why[..i]);
+                    let class = format!("ADT row: {cut}").into_boxed_str();
+                    left.insert(k, class.clone());
+                    out.push((adt, LeftOut::named(class, Front2Refusal::AdtRow { adt: super::item_shown::refused(records, k), why })));
+                    given_up.insert(k, ());
+                }
+                None => return Err(Front2Refusal::AdtRow { adt: super::item_shown::refused(records, k), why }),
+            }
+        }
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn populate_consts_statics_objects<'n>(
+    records: &mut Records<'_, 'n>,
+    checked: &[Option<Checked<'static>>],
+    census_bodies: &[(Body<'n>, Checked<'static>)],
+    inline_specs: &[super::inline_for::SpecializedBody<'n>],
+    mut left_out: Option<&mut Vec<(Box<str>, LeftOut), Global>>,
+    left: &mut HashMap<ItemKey, Box<str>, Global>,
+) -> Result<(Vec<(ItemKey, DataRecord<Global>), Global>, super::statics::Statics, HashMap<ItemKey, ObjectTable, Global>), Front2Refusal> {
+    // Every constant a checked body reads by value, evaluated once now (the builder's
+    // `const_value` reads the record); one the evaluator refuses is named: in a survey filed
+    // and left out (each reader's build then names it), in a run the program's refusal.
+    let (values, refused) = const_values(
+        records,
+        checked.iter().flatten().chain(census_bodies.iter().map(|(_, c)| c)).chain(inline_specs.iter().map(|s| &s.checked)),
+    );
+    for (k, why) in refused {
+        let constant = fn_shown(records, k).into_boxed_str();
+        match left_out.as_deref_mut() {
+            Some(out) => {
+                let class = format!("constant: {why}").into_boxed_str();
+                left.insert(k, class.clone());
+                out.push((constant, LeftOut::named(class, Front2Refusal::Const { constant: super::item_shown::refused(records, k), why })));
+            }
+            None => return Err(Front2Refusal::Const { constant: super::item_shown::refused(records, k), why }),
+        }
+    }
+    let statics = made_statics(
+        records,
+        checked.iter().flatten().chain(census_bodies.iter().map(|(_, c)| c)).chain(inline_specs.iter().map(|s| &s.checked)),
+        left_out.as_deref_mut(),
+        left,
+    )?;
+    let views = core::iter::once(records.store.tys.view())
+        .chain(checked.iter().flatten().map(|c| c.types.view()))
+        .chain(census_bodies.iter().map(|(_, c)| c.types.view()))
+        .chain(inline_specs.iter().map(|s| s.checked.types.view()));
+    let asked = dyn_principals(views);
+    let mut objects: HashMap<ItemKey, ObjectTable, Global> = HashMap::new_in(Global);
+    object_tables(records, asked, &mut objects, left_out.as_deref_mut())?;
+    Ok((values, statics, objects))
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn relower_program_bodies<'n>(
+    records: &mut Records<'_, 'n>,
+    prepared: &'n Prepares<'n>,
+    roots: &[LibKey],
+    mains: &[Body<'n>],
+    checked: Vec<Option<Checked<'static>>, Global>,
+    census_bodies: Vec<(Body<'n>, Checked<'static>), Global>,
+    inline_specs: blaze_own::Vec<super::inline_for::SpecializedBody<'n>, Alloc<'static>>,
+    mut left_out: Option<&mut Vec<(Box<str>, LeftOut), Global>>,
+    left: &mut HashMap<ItemKey, Box<str>, Global>,
+    alloc: Alloc<'static>,
+) -> Result<ReloweredBodies<'n>, Front2Refusal> {
+    // Each checked root's and each reached body's row path, or why none is built, in the
+    // order they are lowered again below; `None`: a root that did not check.
+    let mut main_paths: Vec<Option<Result<super::row_path::RowPath, super::row_path::NoRowPath>>, Global> = Vec::with_capacity_in(mains.len(), Global);
+    for (m, c) in mains.iter().zip(checked.iter()) {
+        main_paths.push(c.as_ref().map(|_| super::row_path::row_path_of(records, m.owner)));
+    }
+    let mut body_paths: Vec<Result<super::row_path::RowPath, super::row_path::NoRowPath>, Global> = Vec::with_capacity_in(census_bodies.len(), Global);
+    for (b, _) in census_bodies.iter() {
+        body_paths.push(super::row_path::row_path_of(records, b.owner));
+    }
+    let mut spec_paths: blaze_own::Vec<Result<super::row_path::RowPath, super::row_path::NoRowPath>, Alloc<'static>> = blaze_own::Vec::with_capacity_in(inline_specs.len(), alloc);
+    for s in inline_specs.iter() {
+        spec_paths.push(super::row_path::row_path_of(records, s.orig));
+    }
+    // One table for the back half, which reads every body and record from one: the
+    // records' table, then each body lowered again into it in the order tabled. (A checked
+    // body's own table is a copy of the records' at its lowering, so two bodies' own types
+    // would share indices; the records' table never holds a body's type.)
+    // A table error names the first root (the crate's root module when a suite has none).
+    let table_item = roots.first().copied().unwrap_or_else(|| records.names.root(0));
+    let mut tys = records.store.tys.fork_in(alloc).map_err(|error| Front2Refusal::Lower(BodyError::Table { item: table_item, error }))?;
+    // A bodied fn is lowered again only when its row path is built; no path, or a body that
+    // does not lower again, is that ONE fn's refusal (tabled.rs `lowered_row`), decided
+    // where every fn's is (`left_out_or_stop`): a survey files it and goes on, a run stops.
+    let mut main = Vec::with_capacity_in(mains.len(), Global);
+    for ((m, c), path) in mains.iter().zip(checked).zip(main_paths) {
+        let (Some(c), Some(path)) = (c, path) else { continue };
+        match tabled::lowered_row(records.names, prepared, records.keys, records.store, m, &mut tys, path) {
+            Ok((body, path)) => main.push((body, c, path)),
+            Err((shown, refusal)) => tabled::left_out_or_stop(m.owner, shown, refusal, left, left_out.as_deref_mut())?,
+        }
+    }
+    let mut bodies = Vec::with_capacity_in(census_bodies.len(), Global);
+    for ((b, c), path) in census_bodies.into_iter().zip(body_paths) {
+        match tabled::lowered_row(records.names, prepared, records.keys, records.store, &b, &mut tys, path) {
+            Ok((body, path)) => bodies.push((body, c, path)),
+            Err((shown, refusal)) => tabled::left_out_or_stop(b.owner, shown, refusal, left, left_out.as_deref_mut())?,
+        }
+    }
+    let mut spec_lowered: blaze_own::Vec<(ItemKey, blaze_own::Vec<PTy, Alloc<'static>>, Body<'n>, Checked<'static>, super::row_path::RowPath), Alloc<'static>> = blaze_own::Vec::with_capacity_in(inline_specs.len(), alloc);
+    for (s, path) in inline_specs.into_iter().zip(spec_paths) {
+        match tabled::lowered_row(records.names, prepared, records.keys, records.store, &s.body, &mut tys, path) {
+            Ok((body, path)) => spec_lowered.push((s.orig, s.args, body, s.checked, path)),
+            Err((shown, refusal)) => tabled::left_out_or_stop(s.spec_key, shown, refusal, left, left_out.as_deref_mut())?,
+        }
+    }
+    Ok(ReloweredBodies { tys, main, bodies, spec_lowered })
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn table_program_fns<'n>(
+    names: &'n Names<'n>,
+    front: &Front2<'n>,
+    store: &Store<'n>,
+    main: Vec<(Body<'n>, Checked<'static>, super::row_path::RowPath), Global>,
+    bodies: Vec<(Body<'n>, Checked<'static>, super::row_path::RowPath), Global>,
+    spec_lowered: blaze_own::Vec<(ItemKey, blaze_own::Vec<PTy, Alloc<'static>>, Body<'n>, Checked<'static>, super::row_path::RowPath), Alloc<'static>>,
+    bodiless: Vec<RowPathEntry, Global>,
+    ctors: Vec<RowPathEntry, Global>,
+    declared: Vec<RowPathEntry, Global>,
+    tests: bool,
+    left: &mut HashMap<ItemKey, Box<str>, Global>,
+    mut left_out: Option<&mut Vec<(Box<str>, LeftOut), Global>>,
+    alloc: Alloc<'static>,
+) -> Result<TabledProgram<'n>, Front2Refusal> {
+    // `main`'s program enters at row 0 (none when a survey left `main` out above); a
+    // suite's rows are entered by the launcher, each by its test's row (program/suite.rs),
+    // so it has no one entry.
+    let mut entry = if tests { None } else { main.first().map(|_| 0) };
+    let mut fns = Vec::with_capacity_in(main.len() + bodies.len() + bodiless.len(), Global);
+    let mut by_key = HashMap::new_in(Global);
+    let all = main.into_iter().chain(bodies);
+    let bodied = all.map(|(body, checked, path)| (body.owner, Some((body, checked)), Ok::<_, super::row_path::NoRowPath>(path), false));
+    let bodiless = bodiless.into_iter().map(|(k, path)| (k, None, path, false));
+    let declared = declared.into_iter().map(|(k, path)| (k, None, path, true));
+    // Each fn's row is made with a verdict (program/tabled.rs): nothing that goes wrong
+    // for ONE fn can return from here except through `left_out_or_stop`, the one place
+    // that says what a fn's refusal means: a survey files it and goes on (a call of the
+    // fn is then a refused callee), a run stops with it.
+    let mut first = true;
+    for (key, body, path, of_trait) in bodied.chain(bodiless).chain(declared) {
+        let of_main = core::mem::replace(&mut first, false) && entry.is_some();
+        let path = match path {
+            Ok(path) => path,
+            Err(no) => {
+                tabled::left_out_or_stop(key, no.item.boxed(), Front2Refusal::NoRowPath(no), left, left_out.as_deref_mut())?;
+                if of_main {
+                    entry = None;
+                }
+                continue;
+            }
+        };
+        match tabled::table_one(names, &front.keys, store, front.index.scope(), key, body, path, of_trait) {
+            tabled::Verdict::Tabled(row) => {
+                by_key.insert(key, fns.len());
+                fns.push(row);
+            }
+            tabled::Verdict::LeftOut { path, refusal } => {
+                tabled::left_out_or_stop(key, path, refusal, left, left_out.as_deref_mut())?;
+                // A survey whose `main` is left out has no entry (index 0 is another fn).
+                if of_main {
+                    entry = None;
+                }
+            }
+        }
+    }
+    let mut inline_for_specs: blaze_own::Vec<super::inline_for::SpecRow, Alloc<'static>> = blaze_own::Vec::with_capacity_in(spec_lowered.len(), alloc);
+    for (orig, args, body, checked, path) in spec_lowered {
+        let key = body.owner;
+        match tabled::table_one(names, &front.keys, store, front.index.scope(), key, Some((body, checked)), path, false) {
+            tabled::Verdict::Tabled(row) => {
+                let row_idx = fns.len();
+                by_key.insert(key, row_idx);
+                fns.push(row);
+                inline_for_specs.push(super::inline_for::SpecRow { orig, args, row: row_idx });
+            }
+            tabled::Verdict::LeftOut { path, refusal } => {
+                tabled::left_out_or_stop(key, path, refusal, left, left_out.as_deref_mut())?;
+            }
+        }
+    }
+    for (key, path) in ctors {
+        let path = match path {
+            Ok(path) => path,
+            Err(no) => {
+                tabled::left_out_or_stop(key, no.item.boxed(), Front2Refusal::NoRowPath(no), left, left_out.as_deref_mut())?;
+                continue;
+            }
+        };
+        // A ctor with no row in the store is that ONE ctor's refusal: a survey files it and
+        // goes on (a call of it is then a refused callee), a run stops, named.
+        if !store.ctors.contains_key(&key) {
+            let function = path.into_text();
+            tabled::left_out_or_stop(key, function.clone(), Front2Refusal::NoHead { function }, left, left_out.as_deref_mut())?;
+            continue;
+        }
+        by_key.insert(key, fns.len());
+        let at = head_abi::placed_ctor(names, front.keys.library_in(names, key));
+        let none = Box::<str>::from("");
+        fns.push(Tabled { key, body: None, checked: None, kind: FnKind::Ctor, path: path.into_text(), at, abi: Abi::Rust, nounwind: false, track_caller: false, fn_attrs: blaze_lir::func::FnAttrs::default(), symbol: none, export: None, lits: Literals::default(), intrinsic: None });
+    }
+    let mut langs = [(LangItem::Drop, None); SEAM_LANGS.len()];
+    for (slot, item) in langs.iter_mut().zip(SEAM_LANGS) {
+        *slot = (item, lang_of(front, item).map_err(|l| Front2Refusal::Lang { item: l.item, why: l.why })?);
+    }
+    Ok(TabledProgram { fns, by_key, entry, inline_for_specs, langs })
+}
+
 impl<'n> Front2Program<'n> {
     /// `main` of the program's crate (index 0 of `names`), lowered and checked; refused by name
     /// where the back half would ask what front2 cannot answer yet.
@@ -852,71 +1509,19 @@ impl<'n> Front2Program<'n> {
         }
         .map_err(|e| Front2Refusal::Front(super::FrontError::Roots(e)))?;
         let mut front = Front2::for_program(names, frame, user, &linked).map_err(Front2Refusal::Front)?;
-        let mut roots: Vec<LibKey, Global> = Vec::new_in(Global);
         // Made before the roots: a Rust program's start reads `main`'s head (start.rs).
         let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
         store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
         store.sources = body_sources;
-        let mut start2: Option<super::start::Entry2> = None;
-        let tests = match starts {
-            Starts::Main => {
-                let written = Written { kind: PathKind::Plain, segments: &["main"] };
-                // A miss behind a failed call (D104's implicit `::std::main` that took no arm)
-                // names that call and why (blaze-scope failed_call.rs), never "no `main`"; one
-                // behind an attribute call that wrote no `main` names that call (main_call.rs).
-                let found = names::path(names, names.root(0), Namespace::Values, written, alloc).map_err(|error| {
-                    match blaze_scope::failed_call::FailedCall::of(names, &error, "main") {
-                        Some(failed) => Front2Refusal::MainNotWritten {
-                            call: failed.call,
-                            module: failed.module,
-                            path: failed.path.into(),
-                            implicit: failed.implicit,
-                            diagnostic: failed.failed.diagnostic,
-                            notes: failed.failed.notes().into(),
-                        },
-                        None => match blaze_scope::main_call::MainCall::of(names, 0) {
-                            Some(taken) => Front2Refusal::MainTakenBy { call: taken.call, path: taken.path.into(), implicit: taken.implicit, why: taken.why },
-                            None => Front2Refusal::NoMain,
-                        },
-                    }
-                })?;
-                let rust_main: LibKey = found.whole(1).ok_or(Front2Refusal::NoMain)?.key;
-                // The process's entry: an exported one ([`exported_entry`]); else the root's
-                // start by THE rule the record walk takes too (run_entry.rs `RootStart`, decided
-                // once from crate 0's `Implicit::std` and root attributes): a blaze-edition root
-                // that exports nothing is refused by name, never started at its `main`
-                // directly; a Rust root starts through the `#[lang = "start"]` the program links
-                // (start.rs `linked_lang_start`, Rust's rule), else at its `fn main` directly (a
-                // program that links no std). The walk and `entry()` start at its root.
-                // The rule is [`start_of`], which `blaze run` asks too before anything is built
-                // (run.rs `entry_start`): one home.
-                let entry = match start_of(names, alloc)? {
-                    StartOf::Exported(e) => e,
-                    StartOf::LangStart(lang_start) => super::start::Entry2::Rust(super::start::rust_start(names, lang_start, rust_main, &mut store, &mut front.keys)?),
-                    StartOf::Direct => super::start::Entry2::Direct(rust_main),
-                };
-                roots.push(entry.root());
-                start2 = Some(entry);
-                false
-            }
-            Starts::Tests(list) | Starts::Within { roots: list, .. } => {
-                roots.extend_from_slice(list);
-                true
-            }
-        };
+        let (roots, start2, tests) = resolve_start_roots(names, starts, &mut store, &mut front.keys, alloc)?;
         let mut buckets = None;
         let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
         let prepared = Prepares::new_in(bump);
         store.prepared = Some(prepared);
-        let mut mains: Vec<Body<'n>, Global> = Vec::with_capacity_in(roots.len(), Global);
-        let mut kept: Vec<LibKey, Global> = Vec::with_capacity_in(roots.len(), Global);
         // The records, with the program's one constant evaluator, are made BEFORE the roots
         // are lowered: a root's written type may name a constant (`size_of::<[u32;
         // BUFFER_SIZE]>()` in `main`: the Reference, "Array types": the length is a constant
-        // expression, a const context), which its lowering asks for as `Why::NeedConst`. A
-        // root is lowered by the one loop that evaluates what a lowering needs and lowers
-        // again (front2/lower_made.rs), as every reached fn is (reach.rs); a bare `lower_fn`
-        // here returned the need as `main`'s refusal.
+        // expression, a const context), which its lowering asks for as `Why::NeedConst`.
         let mut consts = Consts::default();
         let mut records = Records {
             names,
@@ -927,466 +1532,51 @@ impl<'n> Front2Program<'n> {
             order: BuildOrder::AsAsked,
             consts: Some((&mut consts, prepared)),
         };
-        for &lib in roots.iter() {
-            // An entry declared in a block (super::nested_exports): the bodies around it are
-            // lowered first, outermost first, so each keeps its local items (locals.rs
-            // `Locals::keep`, which runs before the body's check) and the entry's head and text
-            // are known. An enclosing body's refusal stops the run, named (no quiet pass;
-            // coordinator's ruling 19:1x).
-            let mut lowered = Ok(());
-            for &outer in super::nested_exports::enclosing_bodies(names, alloc, lib)?.iter() {
-                if let Err(e) = lower_made(&mut records, prepared, LowerTarget::Free(outer)) {
-                    lowered = Err(e);
-                    break;
-                }
-            }
-            let lowered = lowered.and_then(|()| lower_made(&mut records, prepared, LowerTarget::Free(lib)));
-            match (lowered, left_out.as_deref_mut()) {
-                (Ok(m), _) => {
-                    mains.push(m);
-                    kept.push(lib);
-                }
-                // A survey limited by `Within` (its roots are every fn of some crates, no suite's
-                // rows): a root that does not lower is filed and left out, as a reached fn is.
-                (Err(e), Some(out)) if matches!(starts, Starts::Within { .. }) => {
-                    // By its path, as every reached fn's row is (`fn_shown`), so a census files
-                    // it by its crate; its key only when the names hold no path.
-                    let item = super::item_shown::ItemShown::of_lib(names, lib);
-                    let shown: Box<str> = item.path().map_or_else(|| item.boxed(), Box::from);
-                    out.push((shown, LeftOut::named(Box::from("lower: root"), Front2Refusal::Lower(e))));
-                }
-                (Err(e), _) => return Err(Front2Refusal::Lower(e)),
-            }
-        }
-        // The roots that lowered, in the order given: what `mains` is the bodies of.
-        roots = kept;
-        // In a survey a root that does not check is filed and left out, and the walk goes on
-        // from what it calls by name: what is reachable is surveyed whatever the root is.
-        let mut checked: Vec<Option<Checked<'static>>, Global> = Vec::with_capacity_in(mains.len(), Global);
+        let within_survey = matches!(starts, Starts::Within { .. });
+        let (roots, mut mains) = lower_root_bodies(&mut records, prepared, roots, within_survey, left_out.as_deref_mut(), alloc)?;
         // Each checked body's async blocks' state recipes, made with its check (coroutine_recipes.rs).
         let mut recipes: Vec<super::coroutine_recipes::RecipeRow, Global> = Vec::new_in(Global);
-        for m in mains.iter_mut() {
-            let checked_res = if m.typeck.inline_fors.is_empty() {
-                let v = m.lowered.view();
-                let s = Spelling::of(&v).map_err(Front2Refusal::Spell)?;
-                let scope = m.scope(&s);
-                check_body(&mut records, m, &scope)
-            } else {
-                super::inline_for::unroll_concrete_body(&mut records, prepared, m)
-            };
-            let done = checked_res.and_then(|c| {
-                super::coroutine_recipes::recipes_of(&mut records, m, &c, &mut recipes, alloc)
-                    .map_err(|error| CheckFail::Check { owner: m.owner, error })?;
-                Ok(c)
-            });
-            checked.push(match done {
-                Ok(c) => Some(c),
-                Err(e) => match left_out.as_deref_mut() {
-                    Some(out) => {
-                        let d = format!("{e:?}");
-                        let class = format!("check: {}", &d[..d.find(['(', ' ', '{']).unwrap_or(d.len())]);
-                        let whole = format!("{e}").into_boxed_str();
-                        let row = LeftOut::reached(&records, class.into_boxed_str(), whole, Front2Refusal::Check(e));
-                        out.push((fn_shown(&records, m.owner).into_boxed_str(), row));
-                        None
-                    }
-                    None => return Err(Front2Refusal::Check(e)),
-                },
-            });
-        }
-        let mut lowered = Vec::with_capacity_in(mains.len(), Global);
-        for m in mains.iter() {
-            lowered.push(m.lowered.view());
-        }
-        let mut spells = Vec::with_capacity_in(mains.len(), Global);
-        for v in lowered.iter() {
-            spells.push(Spelling::of(v).map_err(Front2Refusal::Spell)?);
-        }
-        let mut scopes = Vec::with_capacity_in(mains.len(), Global);
-        for (m, s) in mains.iter().zip(spells.iter()) {
-            scopes.push(m.scope(s));
-        }
-        // A test's entry, from its head alone (test_entry.rs): a refusal is that test's own (the
-        // runner fails it by name; the rest of the suite goes on). A `Report` entry's `report`
-        // fn is a root of the walk, so it is tabled and in the test's reach.
-        let mut shapes: Vec<Result<EntryShape, TestEntryRefusal>, Global> = Vec::new_in(Global);
-        let mut also: Vec<ItemKey, Global> = Vec::new_in(Global);
-        let mut termination_report_fn: Option<ItemKey> = None;
-        if tests {
-            let mut has_report = false;
-            for (m, &lib) in mains.iter().zip(roots.iter()) {
-                let shape = super::test_entry::entry_shape(&mut records, lib, m.owner);
-                if let Ok(EntryShape::Report { report, .. }) = shape {
-                    also.push(report);
-                    has_report = true;
-                }
-                shapes.push(shape);
-            }
-            if has_report
-                && let Some(term_lib) = records.index.lang(super::test_entry::TERMINATION_LANG)
-                && records.store.ensure(names, &mut records.keys, super::heads::Want::Members(term_lib)).is_ok()
-                && let Ok(term_key) = records.keys.item(term_lib)
-            {
-                termination_report_fn = records.keys.filed_member(term_key, MemberKind::Fn, "report");
-            }
-            also.sort_unstable();
-            also.dedup();
-        }
-        // A Rust program's start: `lang_start` is reached beside `main` like any fn it calls;
-        // its instance at `T` is the builder's (LADDER.md L1b).
-        if let Some(super::start::Entry2::Rust(s)) = start2 {
-            let k = records.keys.item(s.lang_start).map_err(|clash| Front2Refusal::Unchecked {
-                function: Box::from("lang_start"),
-                class: Box::from("key clash"),
-                first: format!("{clash}").into_boxed_str(),
-            })?;
-            also.push(k);
-        }
-        // The program's compiler_builtins soft-float routines (builtins_shim.rs): an `f128`
-        // operation is a call of one, made by the emitter's legalize, so no body names them;
-        // each found one is reached beside the roots, so its row and body are the build's
-        // (run.rs `build_from` binds them as the record walk does, run/make_one.rs).
-        let builtins = super::builtins_shim::find(names, linked.roots(), alloc);
-        for r in blaze_lir::legalize::SoftFloat::ALL {
-            let Some(lib) = builtins.lib(r) else { continue };
-            let k = records.keys.item(lib).map_err(|clash| Front2Refusal::Unchecked {
-                function: Box::from(r.symbol()),
-                class: Box::from("key clash"),
-                first: format!("{clash}").into_boxed_str(),
-            })?;
-            also.push(k);
-        }
-        let mut walk_from = Vec::with_capacity_in(mains.len(), Global);
-        for ((m, c), scope) in mains.iter().zip(checked.iter_mut()).zip(scopes.iter()) {
-            let first = match c {
-                Some(c) => First::CheckedBody(m, c),
-                None => First::Unchecked(m),
-            };
-            walk_from.push(Start { owner: m.owner, first, scope });
-        }
-        let within = match starts {
-            Starts::Within { within, .. } => within,
-            Starts::Main | Starts::Tests(_) => super::reach::Within::ALL,
-        };
-        let mut census = reach_all(&mut records, prepared, walk_from, &also, within);
-        if census.capped {
-            let entry = mains.first().map_or_else(|| String::from("the suite's tests"), |m| fn_shown(&records, m.owner));
-            let report = super::reach::capped_report(&records, &census).into_boxed_str();
-            return Err(Front2Refusal::Capped { entry: entry.into_boxed_str(), queued: census.queued, cap: census.cap, items: census.items, forced: census.forced, report });
-        }
-        // Specialize any reached generic `inline for` functions at every concrete call site and
-        // merge newly discovered callees into `census`.
-        let inline_specs = super::inline_for::specialize_generic_inline_fors(&mut records, prepared, &mains, &checked, &mut census)
-            .map_err(Front2Refusal::Check)?;
-        let reached_by_crate = super::reach::by_crate(&records, &census.fns);
-        // Every fn the walk met is checked clean, or the program is refused by its first one
-        // that is not: a fn with any diagnostic or gap is never built.
-        // Each row's path, or why none is built: decided per fn by `tabled::left_out_or_stop`
-        // in the table loop below (a survey files it and goes on), never returned from here.
-        let mut bodiless: Vec<(ItemKey, Result<super::row_path::RowPath, super::row_path::NoRowPath>), Global> = Vec::new_in(Global);
-        let mut ctors: Vec<(ItemKey, Result<super::row_path::RowPath, super::row_path::NoRowPath>), Global> = Vec::new_in(Global);
-        let mut declared: Vec<(ItemKey, Result<super::row_path::RowPath, super::row_path::NoRowPath>), Global> = Vec::new_in(Global);
-        // Every key a survey leaves out, with its cause: the seam's `left_out`.
-        let mut left: HashMap<ItemKey, Box<str>, Global> = HashMap::new_in(Global);
-        for (k, outcome) in census.fns.iter_mut() {
-            match outcome {
-                Reached::Failed { class, detail, refusal } if let Some(out) = left_out.as_deref_mut() => {
-                    // The cause a caller's build names ([`RunError::LeftOut`]'s `why`): the class
-                    // and its WHOLE detail, on one line (rule 19: an error names the thing; a cut
-                    // at 160 characters hid the failing goal of Class O, 2026-11-16).
-                    let mut why = String::with_capacity(class.len() + 2 + detail.len());
-                    why.push_str(class);
-                    why.push_str(": ");
-                    why.extend(detail.chars().map(|c| if c == '\n' { ' ' } else { c }));
-                    left.insert(*k, why.into_boxed_str());
-                    // The row keeps the walk's typed refusal (program/left_out.rs); a site that
-                    // named its cause by text only keeps the refusal a run stops with.
-                    let refusal = match refusal.take() {
-                        Some(r) => *r,
-                        None => Front2Refusal::Unchecked { function: super::item_shown::refused(&records, *k), class: class.clone(), first: detail.clone() },
-                    };
-                    let row = LeftOut::reached(&records, core::mem::take(class), core::mem::take(detail), refusal);
-                    out.push((fn_shown(&records, *k).into_boxed_str(), row));
-                }
-                Reached::Failed { class, detail, .. } => {
-                    return Err(Front2Refusal::Unchecked {
-                        function: super::item_shown::refused(&records, *k),
-                        class: core::mem::take(class),
-                        first: core::mem::take(detail),
-                    });
-                }
-                Reached::NoBody => bodiless.push((*k, super::row_path::row_path_of(&records, *k))),
-                // A ctor is the language's: tabled as one, the build makes its value.
-                Reached::Ctor => ctors.push((*k, super::row_path::row_path_of(&records, *k))),
-                // A call on a parameter or `dyn` is resolved by the back half at the instance,
-                // to an impl fn the walk tabled (reach.rs `Instances`); the trait's fn itself is
-                // tabled as declared: the build reads its ABI at the call before resolving it.
-                Reached::AtInstance | Reached::AtObject => declared.push((*k, super::row_path::row_path_of(&records, *k))),
-                Reached::Checked => {}
-            }
-        }
-        // A trait's fn called on a concrete type (`?`'s `Try::branch` on a `Result`, a path
-        // call `Tr::f(&x)`) is named by the call as the trait's: the back half reads its ABI at
-        // the call, then resolves it to the impl's fn the walk reached. Tabled as declared.
-        let mut met: HashMap<ItemKey, (), Global> = HashMap::new_in(Global);
-        met.extend(census.fns.iter().map(|(k, _)| (*k, ())));
-        for m in mains.iter() {
-            met.insert(m.owner, ());
-        }
-        for c in checked.iter().flatten().chain(census.bodies.iter().map(|(_, c)| c)).chain(inline_specs.iter().map(|s| &s.checked)) {
-            for &item in c.callees.column::<1>() {
-                let of_trait = matches!(records.keys.origin(item), Some(super::keys::Origin::Member { container, kind: MemberKind::Fn, .. }) if !records.store.impls.contains_key(container));
-                if of_trait && met.insert(item, ()).is_none() {
-                    declared.push((item, super::row_path::row_path_of(&records, item)));
-                }
-            }
-        }
-        // If any test of a suite is entered through the report shim, table `Termination::report`
-        // as a declared trait fn so whole-program builds can read its signature and ABI.
-        if let Some(report_fn) = termination_report_fn
-            && met.insert(report_fn, ()).is_none()
-        {
-            declared.push((report_fn, super::row_path::row_path_of(&records, report_fn)));
-        }
-        // Every ADT a type of the program names has its row before the build: the back half
-        // lays out each type it meets (an impl's signature's `ControlFlow<..>` too, which no
-        // body's check needed the row of). Rounds, as a row's fields name more ADTs.
-        // In a survey a row that cannot be made is filed in `left_out` and given up on: the
-        // builder then refuses each type naming it, by name.
-        let mut given_up: HashMap<ItemKey, (), Global> = HashMap::new_in(Global);
-        for round in 0.. {
-            let mut missing: Vec<ItemKey, Global> = Vec::new_in(Global);
-            let views = core::iter::once(records.store.tys.view())
-                .chain(checked.iter().flatten().map(|c| c.types.view()))
-                .chain(census.bodies.iter().map(|(_, c)| c.types.view()))
-                .chain(inline_specs.iter().map(|s| s.checked.types.view()));
-            for v in views {
-                for n in v.nodes() {
-                    if let tc::PNode::Adt(k, _) = n
-                        && !records.store.adts.contains_key(k)
-                        && !given_up.contains_key(k)
-                    {
-                        missing.push(*k);
-                    }
-                }
-            }
-            if let Some(lib) = records.index.lang("panic_location") {
-                let k = super::keys::asked_key(names, lib);
-                if !records.store.adts.contains_key(&k) && !given_up.contains_key(&k) {
-                    missing.push(k);
-                }
-            }
-            missing.sort_unstable();
-            missing.dedup();
-            let Some(&first) = missing.first() else { break };
-            let refuse = |r: &Records<'_, '_>, k: ItemKey, why: String| Front2Refusal::AdtRow { adt: super::item_shown::refused(r, k), why: why.into_boxed_str() };
-            if round == super::reach::MOST_FNS {
-                return Err(refuse(&records, first, String::from("rows still missing after the most rounds")));
-            }
-            for k in missing {
-                let why = match records.keys.library_in(names, k) {
-                    None => Some(String::from("no library key")),
-                    // A constant a head names (a pattern type's range end, `UsizeNoHighBit`'s
-                    // `HALF_USIZE`) is evaluated as met and the head made again, at most
-                    // `MOST_ADT_LENS` times, as a body's lowering does.
-                    Some(lib) => {
-                        let mut lens = 0;
-                        loop {
-                            match records.store.ensure(names, records.keys, super::heads::Want::Adt(lib)) {
-                                Err(super::heads::HeadError::Item(_, Why::NeedConst(c, _))) if lens < MOST_ADT_LENS => {
-                                    lens += 1;
-                                    if let Err(e) = super::check::eval_len(&mut records, c) {
-                                        break Some(format!("the constant {c:x} its head names: {e:?}"));
-                                    }
-                                }
-                                Err(e) => break Some(format!("{e:?}")),
-                                Ok(()) if !records.store.adts.contains_key(&k) => break Some(String::from("made, but no row filed under its key")),
-                                Ok(()) => break None,
-                            }
-                        }
-                    }
-                };
-                let Some(why) = why else { continue };
-                let (adt, why) = (fn_shown(&records, k).into_boxed_str(), why.into_boxed_str());
-                match left_out.as_deref_mut() {
-                    Some(out) => {
-                        let cut = why.char_indices().nth(160).map_or(&*why, |(i, _)| &why[..i]);
-                        let class = format!("ADT row: {cut}").into_boxed_str();
-                        left.insert(k, class.clone());
-                        out.push((adt, LeftOut::named(class, Front2Refusal::AdtRow { adt: super::item_shown::refused(&records, k), why })));
-                        given_up.insert(k, ());
-                    }
-                    None => return Err(Front2Refusal::AdtRow { adt: super::item_shown::refused(&records, k), why }),
-                }
-            }
-        }
-        // Every constant a checked body reads by value, evaluated once now (the builder's
-        // `const_value` reads the record); one the evaluator refuses is named: in a survey filed
-        // and left out (each reader's build then names it), in a run the program's refusal.
-        let (values, refused) = const_values(
-            &mut records,
-            checked.iter().flatten().chain(census.bodies.iter().map(|(_, c)| c)).chain(inline_specs.iter().map(|s| &s.checked)),
-        );
-        for (k, why) in refused {
-            let constant = fn_shown(&records, k).into_boxed_str();
-            match left_out.as_deref_mut() {
-                Some(out) => {
-                    let class = format!("constant: {why}").into_boxed_str();
-                    left.insert(k, class.clone());
-                    out.push((constant, LeftOut::named(class, Front2Refusal::Const { constant: super::item_shown::refused(&records, k), why })));
-                }
-                None => return Err(Front2Refusal::Const { constant: super::item_shown::refused(&records, k), why }),
-            }
-        }
-        let statics = made_statics(
-            &mut records,
-            checked.iter().flatten().chain(census.bodies.iter().map(|(_, c)| c)).chain(inline_specs.iter().map(|s| &s.checked)),
-            left_out.as_deref_mut(),
-            &mut left,
-        )?;
-        let views = core::iter::once(records.store.tys.view())
-            .chain(checked.iter().flatten().map(|c| c.types.view()))
-            .chain(census.bodies.iter().map(|(_, c)| c.types.view()))
-            .chain(inline_specs.iter().map(|s| s.checked.types.view()));
-        let asked = dyn_principals(views);
-        let mut objects: HashMap<ItemKey, ObjectTable, Global> = HashMap::new_in(Global);
-        object_tables(&mut records, asked, &mut objects, left_out.as_deref_mut())?;
-        // Each checked root's and each reached body's row path, or why none is built, in the
-        // order they are lowered again below; `None`: a root that did not check.
-        let mut main_paths: Vec<Option<Result<super::row_path::RowPath, super::row_path::NoRowPath>>, Global> = Vec::with_capacity_in(mains.len(), Global);
-        for (m, c) in mains.iter().zip(checked.iter()) {
-            main_paths.push(c.as_ref().map(|_| super::row_path::row_path_of(&records, m.owner)));
-        }
-        let mut body_paths: Vec<Result<super::row_path::RowPath, super::row_path::NoRowPath>, Global> = Vec::with_capacity_in(census.bodies.len(), Global);
-        for (b, _) in census.bodies.iter() {
-            body_paths.push(super::row_path::row_path_of(&records, b.owner));
-        }
-        let mut spec_paths: blaze_own::Vec<Result<super::row_path::RowPath, super::row_path::NoRowPath>, Alloc<'static>> = blaze_own::Vec::with_capacity_in(inline_specs.len(), alloc);
-        for s in inline_specs.iter() {
-            spec_paths.push(super::row_path::row_path_of(&records, s.orig));
-        }
-        drop(scopes);
-        drop(spells);
-        drop(lowered);
-        // One table for the back half, which reads every body and record from one: the
-        // records' table, then each body lowered again into it in the order tabled. (A checked
-        // body's own table is a copy of the records' at its lowering, so two bodies' own types
-        // would share indices; the records' table never holds a body's type.)
-        // A table error names the first root (the crate's root module when a suite has none).
-        let table_item = roots.first().copied().unwrap_or_else(|| names.root(0));
-        let mut tys = store.tys.fork_in(alloc).map_err(|error| Front2Refusal::Lower(BodyError::Table { item: table_item, error }))?;
-        // A bodied fn is lowered again only when its row path is built; no path, or a body that
-        // does not lower again, is that ONE fn's refusal (tabled.rs `lowered_row`), decided
-        // where every fn's is (`left_out_or_stop`): a survey files it and goes on, a run stops.
-        let mut main = Vec::with_capacity_in(mains.len(), Global);
-        for ((m, c), path) in mains.iter().zip(checked).zip(main_paths) {
-            let (Some(c), Some(path)) = (c, path) else { continue };
-            match tabled::lowered_row(names, prepared, &mut front.keys, &mut store, m, &mut tys, path) {
-                Ok((body, path)) => main.push((body, c, path)),
-                Err((shown, refusal)) => tabled::left_out_or_stop(m.owner, shown, refusal, &mut left, left_out.as_deref_mut())?,
-            }
-        }
-        // `main`'s program enters at row 0 (none when a survey left `main` out above); a
-        // suite's rows are entered by the launcher, each by its test's row (program/suite.rs),
-        // so it has no one entry.
-        let entry = if tests { None } else { main.first().map(|_| 0) };
+        let mut checked = check_root_bodies(&mut records, prepared, &mut mains, &mut recipes, left_out.as_deref_mut(), alloc)?;
+        let (shapes, also, termination_report_fn) = collect_extra_roots(&mut records, &linked, &mains, &roots, tests, start2, alloc)?;
+        let (mut census, inline_specs, reached_by_crate) = reach_and_specialize(&mut records, prepared, &mains, &mut checked, &also, starts)?;
+        let ClassifiedFns { bodiless, ctors, declared, mut left } =
+            classify_reached_fns(&records, &mains, &checked, &mut census, &inline_specs, termination_report_fn, left_out.as_deref_mut())?;
+        ensure_program_adts(&mut records, &checked, &census.bodies, &inline_specs, left_out.as_deref_mut(), &mut left)?;
+        let (values, statics, objects) =
+            populate_consts_statics_objects(&mut records, &checked, &census.bodies, &inline_specs, left_out.as_deref_mut(), &mut left)?;
         recipes.extend(census.recipes);
         super::coroutine_recipes::sort(&mut recipes);
-        let mut bodies = Vec::with_capacity_in(census.bodies.len(), Global);
-        for ((b, c), path) in census.bodies.into_iter().zip(body_paths) {
-            match tabled::lowered_row(names, prepared, &mut front.keys, &mut store, &b, &mut tys, path) {
-                Ok((body, path)) => bodies.push((body, c, path)),
-                Err((shown, refusal)) => tabled::left_out_or_stop(b.owner, shown, refusal, &mut left, left_out.as_deref_mut())?,
-            }
-        }
-        let mut spec_lowered: blaze_own::Vec<(ItemKey, blaze_own::Vec<PTy, Alloc<'static>>, Body<'n>, Checked<'static>, super::row_path::RowPath), Alloc<'static>> = blaze_own::Vec::with_capacity_in(inline_specs.len(), alloc);
-        for (s, path) in inline_specs.into_iter().zip(spec_paths) {
-            match tabled::lowered_row(names, prepared, &mut front.keys, &mut store, &s.body, &mut tys, path) {
-                Ok((body, path)) => spec_lowered.push((s.orig, s.args, body, s.checked, path)),
-                Err((shown, refusal)) => tabled::left_out_or_stop(s.spec_key, shown, refusal, &mut left, left_out.as_deref_mut())?,
-            }
-        }
         // The walk's steps, sorted and once each: what a test's reach is read from.
         let mut edges = census.edges;
         edges.sort_unstable();
         edges.dedup();
-        let mut fns = Vec::with_capacity_in(main.len() + bodies.len() + bodiless.len(), Global);
-        let mut by_key = HashMap::new_in(Global);
-        let all = main.into_iter().chain(bodies);
-        let bodied = all.map(|(body, checked, path)| (body.owner, Some((body, checked)), Ok::<_, super::row_path::NoRowPath>(path), false));
-        let bodiless = bodiless.into_iter().map(|(k, path)| (k, None, path, false));
-        let declared = declared.into_iter().map(|(k, path)| (k, None, path, true));
-        // Each fn's row is made with a verdict (program/tabled.rs): nothing that goes wrong
-        // for ONE fn can return from here except through `left_out_or_stop`, the one place
-        // that says what a fn's refusal means: a survey files it and goes on (a call of the
-        // fn is then a refused callee), a run stops with it.
-        let mut entry = entry;
-        let mut first = true;
-        for (key, body, path, of_trait) in bodied.chain(bodiless).chain(declared) {
-            let of_main = core::mem::replace(&mut first, false) && entry.is_some();
-            let path = match path {
-                Ok(path) => path,
-                Err(no) => {
-                    tabled::left_out_or_stop(key, no.item.boxed(), Front2Refusal::NoRowPath(no), &mut left, left_out.as_deref_mut())?;
-                    if of_main {
-                        entry = None;
-                    }
-                    continue;
-                }
-            };
-            match tabled::table_one(names, &front.keys, &store, front.index.scope(), key, body, path, of_trait) {
-                tabled::Verdict::Tabled(row) => {
-                    by_key.insert(key, fns.len());
-                    fns.push(row);
-                }
-                tabled::Verdict::LeftOut { path, refusal } => {
-                    tabled::left_out_or_stop(key, path, refusal, &mut left, left_out.as_deref_mut())?;
-                    // A survey whose `main` is left out has no entry (index 0 is another fn).
-                    if of_main {
-                        entry = None;
-                    }
-                }
-            }
-        }
-        let mut inline_for_specs: blaze_own::Vec<super::inline_for::SpecRow, Alloc<'static>> = blaze_own::Vec::with_capacity_in(spec_lowered.len(), alloc);
-        for (orig, args, body, checked, path) in spec_lowered {
-            let key = body.owner;
-            match tabled::table_one(names, &front.keys, &store, front.index.scope(), key, Some((body, checked)), path, false) {
-                tabled::Verdict::Tabled(row) => {
-                    let row_idx = fns.len();
-                    by_key.insert(key, row_idx);
-                    fns.push(row);
-                    inline_for_specs.push(super::inline_for::SpecRow { orig, args, row: row_idx });
-                }
-                tabled::Verdict::LeftOut { path, refusal } => {
-                    tabled::left_out_or_stop(key, path, refusal, &mut left, left_out.as_deref_mut())?;
-                }
-            }
-        }
-        for (key, path) in ctors {
-            let path = match path {
-                Ok(path) => path,
-                Err(no) => {
-                    tabled::left_out_or_stop(key, no.item.boxed(), Front2Refusal::NoRowPath(no), &mut left, left_out.as_deref_mut())?;
-                    continue;
-                }
-            };
-            // A ctor with no row in the store is that ONE ctor's refusal: a survey files it and
-            // goes on (a call of it is then a refused callee), a run stops, named.
-            if !store.ctors.contains_key(&key) {
-                let function = path.into_text();
-                tabled::left_out_or_stop(key, function.clone(), Front2Refusal::NoHead { function }, &mut left, left_out.as_deref_mut())?;
-                continue;
-            }
-            by_key.insert(key, fns.len());
-            let at = head_abi::placed_ctor(names, front.keys.library_in(names, key));
-            let none = Box::<str>::from("");
-            fns.push(Tabled { key, body: None, checked: None, kind: FnKind::Ctor, path: path.into_text(), at, abi: Abi::Rust, nounwind: false, track_caller: false, fn_attrs: blaze_lir::func::FnAttrs::default(), symbol: none, export: None, lits: Literals::default(), intrinsic: None });
-        }
-        let mut langs = [(LangItem::Drop, None); SEAM_LANGS.len()];
-        for (slot, item) in langs.iter_mut().zip(SEAM_LANGS) {
-            *slot = (item, lang_of(&front, item).map_err(|l| Front2Refusal::Lang { item: l.item, why: l.why })?);
-        }
+        let ReloweredBodies { tys, main, bodies, spec_lowered } = relower_program_bodies(
+            &mut records,
+            prepared,
+            &roots,
+            &mains,
+            checked,
+            census.bodies,
+            inline_specs,
+            left_out.as_deref_mut(),
+            &mut left,
+            alloc,
+        )?;
+        let TabledProgram { fns, by_key, entry, inline_for_specs, langs } = table_program_fns(
+            names,
+            &front,
+            &store,
+            main,
+            bodies,
+            spec_lowered,
+            bodiless,
+            ctors,
+            declared,
+            tests,
+            &mut left,
+            left_out.as_deref_mut(),
+            alloc,
+        )?;
         // Each root's row: `None` for one left out (a survey) or that did not check.
         let mut rows: Vec<(ItemKey, Option<usize>), Global> = Vec::with_capacity_in(mains.len(), Global);
         rows.extend(mains.iter().map(|m| (m.owner, by_key.get(&m.owner).copied())));

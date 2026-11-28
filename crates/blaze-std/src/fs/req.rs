@@ -13,13 +13,15 @@ use blaze_machine::{
 };
 
 pub use blaze_core::handle::{
-    Dir, File, FileId, FixedFileSlot, Flushed, Lock, ReadOnly, ReadWrite, Unflushed,
+    Dir, ExitKind, File, FileId, FixedFileSlot, Flushed, Lock, ReadOnly, ReadWrite, TaskId,
+    Unflushed,
 };
 pub use blaze_core::request::{
-    BufError, ByteLen, ByteOffset, Close, CopyData, CopyDataOpts, DmaBuf, FilledBuf, FixedBufIndex,
-    Flush, FlushedProof, FsAnswer, FsError, FsRequest, LENT_READ_MAX, List, ListOpts,
-    Lock as LockReq, LockOpts, LockOutcome, MakeDir, MaxBytes, OpenOpts, OpenRead, OpenWrite, Read,
-    ReadAll, ReadAllOpts, ReadInto, ReadIntoOpts, ReadOpts, Remove, RemoveDir, RenameFlushed,
+    BufError, ByteLen, ByteOffset, Close, CopyData, CopyDataOpts, DirectFsBackend, DirectFsHandler,
+    DirectFsHandlerError, DmaBuf, FilledBuf, FixedBufIndex, Flush, FlushedProof, FsAnswer, FsError,
+    FsRequest, InMemoryDirectFs, LENT_READ_MAX, List, ListOpts, Lock as LockReq, LockOpts,
+    LockOutcome, MakeDir, MaxBytes, NativeDirectFs, OpenOpts, OpenRead, OpenWrite, Read, ReadAll,
+    ReadAllOpts, ReadInto, ReadIntoOpts, ReadOpts, Remove, RemoveDir, RenameFlushed,
     RenameFlushedOpts, RenameUnsynced, RenameUnsyncedOpts, Stat, SyncDir, Truncate, TruncateOpts,
     Unlock, WriteDurable, WriteDurableOpts, WriteFrom, WriteFromOpts,
 };
@@ -471,6 +473,152 @@ pub const fn atomic_publish_graph() -> MachineGraph<'static> {
     }
 }
 
+/// Options for [`publish_atomic_direct`] (`#[blaze::args]`, rule 83).
+#[blaze::args]
+pub struct DirectAtomicPublishOpts<'a> {
+    pub tmp: FileName,
+    pub target: FileName,
+    pub bytes: &'a [u8],
+    pub task: TaskId = TaskId(1),
+}
+
+/// Failure returned by [`publish_atomic_direct`] when driving [`AtomicPublishMachine`] over
+/// [`DirectFsHandler`] and [`crate::cx::Cx::drive_machine`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum DirectAtomicPublishError {
+    /// Driving [`AtomicPublishMachine`] failed (filesystem error, stop, handler error, or step
+    /// budget exhaustion).
+    Drive(blaze_machine::DriveError<AtomicPublishError, DirectFsHandlerError>),
+    /// Normal task exit detected leaked handles in [`DirectFsHandler::finish_task`].
+    Leaked(DirectFsHandlerError),
+}
+
+impl fmt::Display for DirectAtomicPublishError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DirectAtomicPublishError::Drive(err) => {
+                write!(f, "direct atomic publish failed: {err}")
+            }
+            DirectAtomicPublishError::Leaked(err) => {
+                write!(f, "direct atomic publish leaked handles: {err}")
+            }
+        }
+    }
+}
+
+impl core::error::Error for DirectAtomicPublishError {}
+
+/// Thin zero-`Effect`/`Done`-bridge adapter dispatching the [`FsRequest`] steps emitted by
+/// [`AtomicPublishMachine`] directly onto [`DirectFsHandler`].
+struct DirectAtomicPublishAdapter<'io, 'b, 'h, B: DirectFsBackend> {
+    handler: &'h mut DirectFsHandler<'io, 'b, B>,
+}
+
+impl<'io, 'a, 'b, 'h, B: DirectFsBackend> blaze_machine::Handler<FsRequest<'io, 'a>>
+    for DirectAtomicPublishAdapter<'io, 'b, 'h, B>
+{
+    type Error = DirectFsHandlerError;
+
+    fn perform<Out>(
+        &mut self,
+        request: FsRequest<'io, 'a>,
+        deliver: impl FnOnce(blaze_machine::Perform<FsAnswer<'io, 'a, '_>>) -> Out,
+    ) -> Result<Out, Self::Error> {
+        use blaze_machine::{Handler as _, Perform};
+
+        match request {
+            FsRequest::OpenWrite(req) => self.handler.perform(req, |perf| {
+                deliver(match perf {
+                    Perform::Answered(ans) => Perform::Answered(FsAnswer::OpenedWrite(ans)),
+                    Perform::Stopped(s) => Perform::Stopped(s),
+                })
+            }),
+            FsRequest::WriteFrom(req) => self.handler.perform(req, |perf| {
+                deliver(match perf {
+                    Perform::Answered(ans) => Perform::Answered(FsAnswer::Written(ans)),
+                    Perform::Stopped(s) => Perform::Stopped(s),
+                })
+            }),
+            FsRequest::Flush(req) => self.handler.perform(req, |perf| {
+                deliver(match perf {
+                    Perform::Answered(ans) => Perform::Answered(FsAnswer::Flushed(ans)),
+                    Perform::Stopped(s) => Perform::Stopped(s),
+                })
+            }),
+            FsRequest::Close(req) => self.handler.perform(req, |perf| {
+                deliver(match perf {
+                    Perform::Answered(ans) => Perform::Answered(FsAnswer::Closed(ans)),
+                    Perform::Stopped(s) => Perform::Stopped(s),
+                })
+            }),
+            FsRequest::RenameFlushed(req) => self.handler.perform(req, |perf| {
+                deliver(match perf {
+                    Perform::Answered(ans) => Perform::Answered(FsAnswer::Renamed(ans)),
+                    Perform::Stopped(s) => Perform::Stopped(s),
+                })
+            }),
+            FsRequest::SyncDir(req) => self.handler.perform(req, |perf| {
+                deliver(match perf {
+                    Perform::Answered(ans) => Perform::Answered(FsAnswer::SyncedDir(ans)),
+                    Perform::Stopped(s) => Perform::Stopped(s),
+                })
+            }),
+            FsRequest::Remove(_req) => Ok(deliver(Perform::Answered(FsAnswer::Removed(Err(
+                FsError::Io {
+                    path: None,
+                    // alloc: error path when a direct backend lacks `remove`.
+                    message: alloc::string::String::from(
+                        "DirectFsBackend does not implement remove",
+                    ),
+                },
+            ))))),
+            _ => unreachable!(
+                "AtomicPublishMachine only emits OpenWrite/WriteFrom/Flush/Close/RenameFlushed/SyncDir/Remove"
+            ),
+        }
+    }
+}
+
+/// Drives an [`AtomicPublishMachine`] over an existing [`DirectFsHandler`] through
+/// [`crate::cx::Cx::drive_machine`] with zero `Effect`/`Done` bridge.
+pub fn publish_atomic_machine<'io, 'a, 'b, B: DirectFsBackend>(
+    cx: &crate::cx::Cx,
+    handler: &mut DirectFsHandler<'io, 'b, B>,
+    machine: AtomicPublishMachine<'io, 'a>,
+    opts: blaze_machine::DriveOpts,
+) -> Result<(), blaze_machine::DriveError<AtomicPublishError, DirectFsHandlerError>> {
+    let mut adapter = DirectAtomicPublishAdapter { handler };
+    cx.drive_machine("bstd.fs.atomic_publish_direct", &mut adapter, &mut (), machine, opts)
+}
+
+/// Durably publishes `opts.bytes` to `opts.target` via `opts.tmp` by driving
+/// [`AtomicPublishMachine`] over any [`DirectFsBackend`] ([`NativeDirectFs`],
+/// [`blaze_core::sim::Sim`], or [`InMemoryDirectFs`]) through [`DirectFsHandler`] and
+/// [`crate::cx::Cx::drive_machine`] with zero `Effect`/`Done` bridge, verifying zero leaked
+/// handles on normal exit.
+pub fn publish_atomic_direct<B: DirectFsBackend>(
+    cx: &crate::cx::Cx,
+    backend: &mut B,
+    opts: DirectAtomicPublishOpts<'_>,
+) -> Result<(), DirectAtomicPublishError> {
+    let alloc = blaze_own::Alloc::global();
+    let DirectAtomicPublishOpts { tmp, target, bytes, task } = opts;
+    blaze_own::with_brand(|brand| {
+        let mut handler = DirectFsHandler::new(backend, task, brand, alloc);
+        let dir = handler.root();
+        let buf = DmaBuf::from_slice_in(bytes, alloc);
+        let machine = AtomicPublishMachine::new(AtomicPublishOpts { dir, tmp, target, buf });
+        let driven =
+            publish_atomic_machine(cx, &mut handler, machine, blaze_machine::DriveOpts { max_steps: 16 });
+        let exit = if driven.is_ok() { ExitKind::Normal } else { ExitKind::Cancelled };
+        let finish = handler.finish_task(exit);
+        match driven {
+            Ok(()) => finish.map(|_| ()).map_err(DirectAtomicPublishError::Leaked),
+            Err(err) => Err(DirectAtomicPublishError::Drive(err)),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use core::time::Duration;
@@ -545,5 +693,151 @@ mod tests {
         assert!(sim.exists(&target), "published target must survive crash");
         assert_eq!(sim.contents(&target).as_slice(), payload);
         assert!(!sim.exists(&tmp), "temporary file must not remain after rename");
+    }
+
+    #[test]
+    fn bstd_fs_atomic_publish_machine_over_native_direct_fs() {
+        use blaze_core::{
+            request::{DirectFsHandler, NativeDirectFs, ReadIntoOpts},
+            temp::TempDir,
+        };
+        use blaze_machine::{Handler, Perform};
+
+        use super::{
+            ByteLen, ByteOffset, DirectAtomicPublishOpts, DirectFsBackend, publish_atomic_direct,
+            publish_atomic_machine,
+        };
+
+        fn publish_and_readback<B: DirectFsBackend>(
+            cx: &crate::cx::Cx,
+            backend: &mut B,
+            tmp: &FileName,
+            target: &FileName,
+            payload: &[u8],
+            alloc: blaze_own::Alloc<'static>,
+        ) -> alloc::vec::Vec<u8> {
+            let mut out = alloc::vec::Vec::new();
+            with_brand(|brand| {
+                let mut handler = DirectFsHandler::new(backend, TaskId(21), brand, alloc);
+                let root = handler.root();
+                let buf = DmaBuf::from_slice_in(payload, alloc);
+                let machine = AtomicPublishMachine::new(AtomicPublishOpts {
+                    dir: root,
+                    tmp: tmp.clone(),
+                    target: target.clone(),
+                    buf,
+                });
+                assert_eq!(
+                    publish_atomic_machine(cx, &mut handler, machine, DriveOpts { max_steps: 16 }),
+                    Ok(())
+                );
+
+                let ro = root.narrow_read_only();
+                let file = handler
+                    .perform(ro.open_read(target.clone()), |p| match p {
+                        Perform::Answered(res) => res,
+                        _ => unreachable!(),
+                    })
+                    .expect("open_read handler ok")
+                    .expect("open_read ok");
+                let filled = handler
+                    .perform(
+                        file.read_into(ReadIntoOpts {
+                            at: ByteOffset(0),
+                            buf: DmaBuf::with_capacity_in(
+                                ByteLen((payload.len() + 32) as u32),
+                                alloc,
+                            ),
+                        }),
+                        |p| match p {
+                            Perform::Answered(res) => res,
+                            _ => unreachable!(),
+                        },
+                    )
+                    .expect("read_into handler ok")
+                    .expect("read_into ok");
+                assert_eq!(filled.filled, ByteLen(payload.len() as u32));
+                out.extend_from_slice(filled.buf.as_slice());
+                filled.buf.release();
+                assert_eq!(
+                    handler
+                        .perform(file.close(), |p| match p {
+                            Perform::Answered(res) => res,
+                            _ => unreachable!(),
+                        })
+                        .expect("close handler ok"),
+                    Ok(())
+                );
+                assert_eq!(handler.finish_checked(), Ok(()));
+            });
+            out
+        }
+
+        let h = heap();
+        let io = Io::simulated(SimWorld::new(88, Limits::USUAL));
+        let cx = io.cx(Duration::from_secs(10), TASK_FRAME).expect("root cx");
+
+        let dir = TempDir::for_test("bstd-atomic-publish-direct-");
+        let root_path = dir.path().to_path_buf();
+        let mut native = NativeDirectFs::new(root_path.clone());
+        let mut sim = Sim::new(88, Faults::default());
+
+        let tmp = FileName::new("record.tmp").expect("valid tmp name");
+        let target = FileName::new("record.bin").expect("valid target name");
+        let payload: alloc::vec::Vec<u8> =
+            (0..2048usize).map(|i| ((i.wrapping_mul(29).wrapping_add(11)) & 0xFF) as u8).collect();
+
+        // 1. Publish durably via `publish_atomic_direct` over `NativeDirectFs` AND `Sim`
+        //    with zero `Effect`/`Done` bridge and zero leaked handles.
+        publish_atomic_direct(
+            &cx,
+            &mut native,
+            DirectAtomicPublishOpts {
+                tmp: tmp.clone(),
+                target: target.clone(),
+                bytes: &payload,
+                task: TaskId(11),
+            },
+        )
+        .expect("native publish_atomic_direct succeeds");
+
+        publish_atomic_direct(
+            &cx,
+            &mut sim,
+            DirectAtomicPublishOpts {
+                tmp: tmp.clone(),
+                target: target.clone(),
+                bytes: &payload,
+                task: TaskId(12),
+            },
+        )
+        .expect("sim publish_atomic_direct succeeds");
+
+        // Simulated crash keeps the durable publish intact and leaves no tmp file behind.
+        sim.crash();
+        assert!(sim.exists(&target), "sim target must survive crash");
+        assert!(!sim.exists(&tmp), "sim tmp must not remain after rename");
+        assert_eq!(sim.contents(&target).as_slice(), payload.as_slice());
+
+        // Real OS temp dir holds the exact published bytes and no leftover tmp file.
+        let disk_bytes = std::fs::read(dir.join("record.bin")).expect("read native published file");
+        assert_eq!(disk_bytes.as_slice(), payload.as_slice());
+        assert!(!dir.join("record.tmp").exists(), "native tmp must not remain after rename");
+
+        // 2. Drive `AtomicPublishMachine` via `publish_atomic_machine` over caller-owned
+        //    `DirectFsHandler` + direct `ReadInto`, verifying byte-for-byte parity & zero leaks.
+        let tmp2 = FileName::new("record2.tmp").expect("valid tmp2 name");
+        let target2 = FileName::new("record2.bin").expect("valid target2 name");
+        let payload2 = b"blaze-direct-atomic-publish-machine-v2";
+
+        let native_readback =
+            publish_and_readback(&cx, &mut native, &tmp2, &target2, payload2, h.alloc());
+        let sim_readback =
+            publish_and_readback(&cx, &mut sim, &tmp2, &target2, payload2, h.alloc());
+        assert_eq!(native_readback.as_slice(), payload2);
+        assert_eq!(native_readback, sim_readback);
+
+        drop(dir);
+        assert!(!root_path.exists(), "temp dir guard must clean up {}", root_path.display());
     }
 }

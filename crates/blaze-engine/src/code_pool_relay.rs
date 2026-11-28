@@ -219,9 +219,9 @@ impl<'a, J, E> Relay<'a, J, E> {
 
     /// The earliest of the asks' deadlines and the pool's, with what it waits on; `None`: no
     /// ask is open and nothing is being made.
-    pub fn wait(&self) -> Option<(Wait, Time)> {
+    pub fn next_wait(&self) -> Option<(Wait, Time)> {
         let code = self.due.first().and_then(|&(due, child)| self.askers[child].asked.map(|asked| (Wait::Code { child: Child(child), key: asked.key }, Time(due))));
-        let pool = self.pool.wait().map(|(waiting, until)| (Wait::Pool(waiting), until));
+        let pool = self.pool.next_wait().map(|(waiting, until)| (Wait::Pool(waiting), until));
         match (code, pool) {
             (Some(code), Some(pool)) => Some(if code.1.0 <= pool.1.0 { code } else { pool }),
             (code, pool) => code.or(pool),

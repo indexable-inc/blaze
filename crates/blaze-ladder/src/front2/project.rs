@@ -880,6 +880,18 @@ fn lint_finding<'a, 'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, f: &blaze_ty
                  move owned values or arena-allocated data across `.do` so the compiled state machine remains movable without `Pin`",
             );
         }
+        blaze_typeck::TypedFinding::SuspendInSansIo { owner, .. } => {
+            let shown = super::item_shown::ItemShown::of(r.names, &*r.keys, owner);
+            text.push_str("`");
+            match shown.path() {
+                Some(path) => text.push_str(path),
+                None => text.push_str(&shown.boxed()),
+            }
+            text.push_str(
+                "` is inside `#![blaze::sans_io]` and cannot suspend via `.do`: \
+                 sans-IO cores must return requests synchronously for a `#![blaze::driver]` to execute",
+            );
+        }
     }
     BodyLintFinding { lint: f.lint(), text, start: at.start, end: at.end }
 }

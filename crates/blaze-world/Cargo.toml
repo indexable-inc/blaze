@@ -20,7 +20,7 @@ doctest = false
 
 [features]
 # `Checkout`: a workspace's own files read from a folder on disk (the one reader that does IO).
-std = ["dep:blaze-core"]
+std = ["dep:blaze-core", "dep:blaze-machine"]
 # `procs`: a macro crate's module identity and its lookup in the module store (src/procs.rs),
 # without the sandbox runtime.
 procs = ["std", "dep:blaze-proc-macro"]
@@ -52,8 +52,10 @@ edition.workspace = true
 # src/script.rs: `OutputsRef`, a build script's outputs record read in place (its cfgs join the
 # served unit's; the record itself is the expansion host's `OUT_DIR`).
 blaze-build-script.workspace = true
-# `Checkout`'s named lock.
+# `Checkout`'s named lock, and `machine`'s direct FS requests (`OpenRead`, `ReadInto`, `Close`).
 blaze-core = { workspace = true, optional = true }
+# `machine.rs`: sans-IO `Machine`/`Request`/`Handler` ABI for `StoredFileFetchMachine`.
+blaze-machine = { workspace = true, optional = true }
 # src/procs.rs: the hook a macro crate is registered in, and its module lookup.
 blaze-proc-macro = { workspace = true, optional = true }
 
