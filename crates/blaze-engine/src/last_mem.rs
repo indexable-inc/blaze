@@ -442,16 +442,12 @@ impl<'a> LastAnswer for Answer<'a> {
                 out.extend(page.readers(&cell));
             }
         }
-        if let Some(work) = &self.work {
-            let edits = &work.readers.edits;
-            let from = edits.partition_point(|((id, _), _)| *id < cell);
-            let to = edits.partition_point(|((id, _), _)| *id <= cell);
-            let delta = &edits[from..to];
-            if !delta.is_empty() {
-                out.retain(|name| delta.binary_search_by_key(name, |((_, reader), _)| *reader).is_err());
-                out.extend(delta.iter().filter_map(|((_, reader), added)| added.then_some(*reader)));
-                out.sort_unstable();
-            }
+        if let Some(work) = &self.work
+            && let Some(delta) = work.readers.edits_of(cell)
+        {
+            out.retain(|name| delta.get(name).is_none());
+            out.extend(delta.iter().filter_map(|(reader, added)| added.then_some(reader)));
+            out.sort_unstable();
         }
         out.sort_unstable();
         out.dedup();

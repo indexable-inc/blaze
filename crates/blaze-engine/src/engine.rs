@@ -612,8 +612,7 @@ impl<'a> Readers<'a> {
         {
             return;
         }
-        let mut edits = ReaderEdits::new_in(self.alloc);
-        edits.edits.push(((id, reader), true));
+        let edits = ReaderEdits::from_single(id, reader, true, self.alloc);
         self.apply_edits(&edits);
     }
 
@@ -629,7 +628,7 @@ impl<'a> Readers<'a> {
             let mut edge_count = 0usize;
             for (_, delta) in edits.iter() {
                 let mut added_here = 0usize;
-                for (_, &added) in delta.iter() {
+                for (_, added) in delta.iter() {
                     if added {
                         added_here = added_here.saturating_add(1);
                     }
@@ -641,10 +640,10 @@ impl<'a> Readers<'a> {
             }
             let mut keys = Vec::with_capacity_in(cell_count, alloc);
             let mut names = Csr::with_capacity_in(cell_count, edge_count, alloc);
-            for (&id, delta) in edits.iter() {
-                if delta.iter().any(|(_, &added)| added) {
+            for (id, delta) in edits.iter() {
+                if delta.iter().any(|(_, added)| added) {
                     keys.push(id);
-                    names.push_row(delta.iter().filter_map(|(&reader, &added)| added.then_some(reader)));
+                    names.push_row(delta.iter().filter_map(|(reader, added)| added.then_some(reader)));
                 }
             }
             self.keys = keys;
@@ -656,7 +655,7 @@ impl<'a> Readers<'a> {
         let mut added_edges = 0usize;
         for (_, delta) in edits.iter() {
             edit_cells = edit_cells.saturating_add(1);
-            for (_, &added) in delta.iter() {
+            for (_, added) in delta.iter() {
                 if added {
                     added_edges = added_edges.saturating_add(1);
                 }
@@ -680,9 +679,9 @@ impl<'a> Readers<'a> {
                     }
                 }
                 (None, Some(_)) => {
-                    if let Some((&id, delta)) = edit_iter.next() {
+                    if let Some((id, delta)) = edit_iter.next() {
                         scratch.clear();
-                        for (&reader, &added) in delta.iter() {
+                        for (reader, added) in delta.iter() {
                             if added {
                                 scratch.push(reader);
                             }
@@ -693,7 +692,7 @@ impl<'a> Readers<'a> {
                         }
                     }
                 }
-                (Some(&(old_id, _)), Some(&(edit_id, _))) => match old_id.cmp(edit_id) {
+                (Some(&(old_id, _)), Some(&(edit_id, _))) => match old_id.cmp(&edit_id) {
                     core::cmp::Ordering::Less => {
                         if let Some((&id, old_slice)) = old_iter.next() {
                             new_keys.push(id);
@@ -701,9 +700,9 @@ impl<'a> Readers<'a> {
                         }
                     }
                     core::cmp::Ordering::Greater => {
-                        if let Some((&id, delta)) = edit_iter.next() {
+                        if let Some((id, delta)) = edit_iter.next() {
                             scratch.clear();
-                            for (&reader, &added) in delta.iter() {
+                            for (reader, added) in delta.iter() {
                                 if added {
                                     scratch.push(reader);
                                 }
@@ -719,7 +718,7 @@ impl<'a> Readers<'a> {
                         let Some((_, delta)) = edit_iter.next() else { break };
                         scratch.clear();
                         let mut oi = old_slice.iter().copied().peekable();
-                        let mut di = delta.iter().map(|(&r, &a)| (r, a)).peekable();
+                        let mut di = delta.iter().peekable();
                         loop {
                             match (oi.peek().copied(), di.peek().copied()) {
                                 (None, None) => break,
@@ -834,16 +833,14 @@ impl<'a> Answer<'a> {
     /// incremental work delta). Returns `true` when there is no incremental base (`work` is `None`).
     pub fn any_reader_removed_of(&self, kind: blaze_drive::Kind) -> bool {
         let Some(work) = &self.work else { return true };
-        work.readers.edits.iter().any(|((id, _), added)| !*added && id.of.kind == kind)
+        work.readers.any_removed_of(kind)
     }
 
     /// Whether this request removed any reader from `cell` (in the folded incremental work delta).
     /// Returns `true` when there is no incremental base (`work` is `None`).
     pub fn reader_removed(&self, cell: CellId) -> bool {
         let Some(work) = &self.work else { return true };
-        let edits = &work.readers.edits;
-        let from = edits.partition_point(|((id, _), _)| *id < cell);
-        edits.get(from..).into_iter().flatten().take_while(|((id, _), _)| *id == cell).any(|(_, added)| !*added)
+        work.readers.edits_of(cell).is_some_and(|delta| delta.iter().any(|(_, added)| !added))
     }
 
     /// Establish the base proof once. An explicit audit of a paged answer visits its rows.
@@ -2909,18 +2906,19 @@ mod readers_csr_tests {
         let mut oracle: StdMap<CellId, StdSet<Name>> = StdMap::new();
 
         // Step 1: cold apply_edits fast path (empty -> populated, with a no-op removal ignored).
-        let mut cold_edits = ReaderEdits::new_in(alloc);
+        let mut cold_raw = Vec::new_in(alloc);
         for c in 0..8u32 {
             let cid = cell(c, (c % 3) as u8);
             for r in 0..6u32 {
                 if (c + r) % 2 == 0 {
-                    cold_edits.edits.push(((cid, reader(r)), true));
+                    cold_raw.push(((cid, reader(r)), true));
                     oracle.entry(cid).or_default().insert(reader(r));
                 }
             }
         }
-        cold_edits.edits.push(((cell(99, 1), reader(0)), false));
-        cold_edits.edits.sort_unstable_by_key(|&(k, _)| k);
+        cold_raw.push(((cell(99, 1), reader(0)), false));
+        cold_raw.sort_unstable_by_key(|&(k, _)| k);
+        let cold_edits = ReaderEdits::from_sorted_flat(cold_raw);
         csr.apply_edits(&cold_edits);
 
         let check_eq = |csr: &Readers<'_>, oracle: &StdMap<CellId, StdSet<Name>>| {
@@ -2940,26 +2938,27 @@ mod readers_csr_tests {
         check_eq(&csr, &oracle);
 
         // Step 2: incremental two-way merge adding new cells, adding/removing readers, and emptying a cell.
-        let mut inc = ReaderEdits::new_in(alloc);
+        let mut inc_raw = Vec::new_in(alloc);
         let c0 = cell(0, 0);
         for &r in oracle[&c0].iter() {
-            inc.edits.push(((c0, r), false));
+            inc_raw.push(((c0, r), false));
         }
         oracle.remove(&c0);
 
         let c2 = cell(2, 2);
-        inc.edits.push(((c2, reader(0)), false));
-        inc.edits.push(((c2, reader(10)), true));
+        inc_raw.push(((c2, reader(0)), false));
+        inc_raw.push(((c2, reader(10)), true));
         oracle.entry(c2).or_default().remove(&reader(0));
         oracle.entry(c2).or_default().insert(reader(10));
 
         let c_new = cell(50, 7);
-        inc.edits.push(((c_new, reader(3)), true));
-        inc.edits.push(((c_new, reader(1)), true));
+        inc_raw.push(((c_new, reader(3)), true));
+        inc_raw.push(((c_new, reader(1)), true));
         oracle.entry(c_new).or_default().insert(reader(3));
         oracle.entry(c_new).or_default().insert(reader(1));
 
-        inc.edits.sort_unstable_by_key(|&(k, _)| k);
+        inc_raw.sort_unstable_by_key(|&(k, _)| k);
+        let inc = ReaderEdits::from_sorted_flat(inc_raw);
         csr.apply_edits(&inc);
         check_eq(&csr, &oracle);
 

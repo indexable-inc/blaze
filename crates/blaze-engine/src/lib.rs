@@ -75,5 +75,5 @@ pub use crate::engine::{
 pub use crate::last::{Found, LastAnswer, LastError, LastRow, ReadOf, Touched, search};
 pub use crate::last_mem::{Ask, MemDefines, MemReads, MemSeen, StoredPages};
 pub use crate::overlay::{Fold, Generations, Overlay, RowFacts, Taken, Work};
-pub use crate::readers::{Edits, FLOOR_BYTES_PER_EDGE, IndexCost, Mapped, Paired, ReaderEdits, ReaderIndex};
+pub use crate::readers::{Edits, EditsIter, FLOOR_BYTES_PER_EDGE, IndexCost, Mapped, Paired, ReaderEdits, ReaderEditsIter, ReaderIndex};
 pub use crate::runs::{Runs, RunsCost};

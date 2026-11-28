@@ -358,19 +358,19 @@ impl Fold<'static> for GenLast {
             }
         }
         for (id, delta) in work.readers.iter() {
-            let readers = self.readers.entry(*id).or_default();
+            let readers = self.readers.entry(id).or_default();
             for (reader, added) in delta.iter() {
                 match added {
                     true => {
-                        readers.insert(*reader);
+                        readers.insert(reader);
                     }
                     false => {
-                        readers.remove(reader);
+                        readers.remove(&reader);
                     }
                 }
             }
             if readers.is_empty() {
-                self.readers.remove(id);
+                self.readers.remove(&id);
             }
         }
         for (file, names) in work.by_file.iter() {

@@ -68,7 +68,7 @@ fn request<R: ReaderIndex<'static>>(
     }
     let mut changes = Delta::new();
     let finished = engine.finish_with_readers(|delta| {
-        changes.extend_from_slice(&delta.edits);
+        changes.extend(delta.pairs());
         Ok(())
     })?;
     Ok((finished, steps, changes))
@@ -243,7 +243,7 @@ fn membership_history(tape: &Tape, plant: Plant, rows: u32, common: u32) -> Resu
             })?;
             engine.finish_with_readers(|delta| {
                 if revision == 1 {
-                    edits.extend_from_slice(&delta.edits);
+                    edits.extend(delta.pairs());
                 }
                 Ok(())
             })
@@ -313,7 +313,7 @@ fn membership_reversed_in_a_later_wave_is_absent_from_the_fold() {
                     buffer.done.push(Done { name, key: task.key, out: ContentId([17; 32]), reads, defines, findings: 0, failed: false });
                 })?;
                 engine.finish_with_readers(|changes| {
-                    delta.extend_from_slice(&changes.edits);
+                    delta.extend(changes.pairs());
                     Ok(())
                 })
             };
@@ -572,8 +572,20 @@ fn interned_soa_reader_index_round_trip_and_memory_density() {
         cost.edges,
     );
 
-    // Exact finish round-trip equivalence (strictly ascending by `(CellId, Name)`).
+    // Exact finish round-trip equivalence (strictly ascending by `(CellId, Name)`) AND compact
+    // finished representation (8 B/edge + intern tables, never 83 B/edge flat unpacking).
     let finished_p = paired.finish(alloc());
     let finished_m = mapped.finish(alloc());
-    assert_eq!(finished_p.edits.as_slice(), finished_m.edits.as_slice(), "Paired::finish must match Mapped::finish byte-for-byte");
+    assert_eq!(finished_p.len(), finished_m.len());
+    let finished_bpe = finished_p.byte_size() / finished_p.len().max(1);
+    assert!(
+        finished_bpe <= 16,
+        "Paired::finish ReaderEdits must stay <= 16 B/edge (got {finished_bpe} B/edge, {} bytes for {} edges; flat is {} bytes)",
+        finished_p.byte_size(),
+        finished_p.len(),
+        finished_m.byte_size(),
+    );
+    let pairs_p: StdVec<_> = finished_p.pairs().collect();
+    let pairs_m: StdVec<_> = finished_m.pairs().collect();
+    assert_eq!(pairs_p, pairs_m, "Paired::finish must match Mapped::finish entry-for-entry");
 }
