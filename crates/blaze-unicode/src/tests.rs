@@ -365,3 +365,14 @@ fn width_adds_up_where_nothing_joins() {
         }
     });
 }
+
+#[test]
+fn eq_canonical_matches_nfc_and_nfd_forms() {
+    assert!(eq_canonical("abc", "abc"));
+    assert!(!eq_canonical("abc", "abd"));
+    assert!(eq_canonical("caf\u{00e9}", "cafe\u{0301}"));
+    assert!(eq_canonical("cafe\u{0301}", "caf\u{00e9}"));
+    assert!(eq_canonical("q\u{0307}\u{0323}", "q\u{0323}\u{0307}"));
+    assert!(eq_canonical("\u{ac00}", "\u{1100}\u{1161}"));
+    assert!(!eq_canonical("caf\u{00e9}", "cafe"));
+}

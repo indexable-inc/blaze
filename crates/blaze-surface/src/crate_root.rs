@@ -81,11 +81,11 @@ impl<'a, N> MacroUseCrate<'a, N> {
 }
 
 impl<N: AsRef<str>> MacroUseCrate<'_, N> {
-    /// Whether this entry admits the macro `name`.
+    /// Whether this entry admits the macro `name` (under Rust's Unicode canonical equivalence).
     pub fn allows(&self, name: &str) -> bool {
         match &self.only {
             None => true,
-            Some(names) => names.iter().any(|n| n.as_ref() == name),
+            Some(names) => names.iter().any(|n| blaze_unicode::eq_canonical(n.as_ref(), name)),
         }
     }
 }

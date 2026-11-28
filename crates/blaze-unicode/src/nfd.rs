@@ -191,3 +191,13 @@ impl Iterator for Nfd<'_> {
 pub fn nfd<E: core::iter::Extend<char>>(s: &str, out: &mut E) {
     out.extend(nfd_chars(s));
 }
+
+/// Whether `a` and `b` are canonically equivalent under Unicode Normalization (UAX #15):
+/// identical in NFD, and therefore identical in NFC. ASCII strings compare directly by bytes,
+/// and non-ASCII strings allocate nothing.
+pub fn eq_canonical(a: &str, b: &str) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        return a == b;
+    }
+    nfd_chars(a).eq(nfd_chars(b))
+}

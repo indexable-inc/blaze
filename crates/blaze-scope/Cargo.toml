@@ -33,6 +33,8 @@ blaze-hash.workspace = true
 blaze-surface.workspace = true
 # `Vec`: every list of the machine, in the allocator it is made in.
 blaze-own.workspace = true
+# `eq_canonical`: Rust's Unicode canonical equivalence for selective `#[macro_use(..)]` allowlists.
+blaze-unicode.workspace = true
 # lib_features.rs: `Vector`, the walk's search across comments and strings. No cycle:
 # blaze-own already depends on it.
 blaze-memchr.workspace = true

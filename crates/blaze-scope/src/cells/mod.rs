@@ -816,11 +816,11 @@ struct MacroUseSlot<'a, N> {
     base_idx: u32,
 }
 
-impl<N: PartialEq> MacroUseSlot<'_, N> {
+impl<N: PartialEq + AsRef<str>> MacroUseSlot<'_, N> {
     fn allows(&self, name: N) -> bool {
         match &self.only {
             None => true,
-            Some(names) => names.scan_for(&name).is_some(),
+            Some(names) => names.iter().any(|n| blaze_unicode::eq_canonical(n.as_ref(), name.as_ref())),
         }
     }
 

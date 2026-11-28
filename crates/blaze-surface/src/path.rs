@@ -230,7 +230,7 @@ impl<'a> NameListView<'a> {
 
     pub fn contains(&self, name: &str) -> bool {
         let strings = self.strings;
-        self.names.iter().any(|text| text_of(strings, *text) == name)
+        self.names.iter().any(|text| blaze_unicode::eq_canonical(text_of(strings, *text), name))
     }
 
     pub fn to_vec_in<'b>(&self, alloc: Alloc<'b>) -> AVec<'b, &'a str> {

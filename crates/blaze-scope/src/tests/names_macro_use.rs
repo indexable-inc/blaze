@@ -903,11 +903,65 @@ dep_macro!(FromEditedSub);
     assert!(view.errors().next().is_none(), "edited `sub` had unexpected scope errors: {:?}", view.errors().collect::<Vec<_>>());
     assert!(view.get(Namespace::Types, "FromSub").is_some(), "`FromSub` must resolve in one-group solve");
     assert!(view.get(Namespace::Types, "FromEditedSub").is_some(), "`FromEditedSub` must resolve in one-group solve");
+
+    // Now edit the crate root to remove `if_hyper! { #[macro_use] extern crate dep; }` (keeping
+    // `if_hyper!` defined so `from_tree_record` succeeds without re-walking the crate). The
+    // returned `tree_record` must drop the removed `#[macro_use]` entry so a subsequent child-only
+    // solve of `sub` no longer resolves `dep_macro!`.
+    static USER_ROOT_REMOVED: &str = "#![no_core]
+macro_rules! if_hyper {
+    ($($item:item)*) => { $($item)* };
+}
+pub mod sub;
+";
+    static FILES_ROOT_REMOVED: Texts = Texts(&[&[("/dep/lib.rs", DEP)], &[("/user/lib.rs", USER_ROOT_REMOVED), ("/user/sub.rs", SUB_BEFORE)]]);
+    struct NoTreeAgain(core::sync::atomic::AtomicUsize);
+    impl Par for NoTreeAgain {
+        fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut blaze_own::AVec<'_, T>) {
+            Serial.map(n, f, out);
+        }
+        fn names_part(&self, part: crate::task::NamesPart) {
+            if matches!(part, crate::task::NamesPart::TreeAgain) {
+                self.0.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    let no_tree_again = NoTreeAgain(core::sync::atomic::AtomicUsize::new(0));
+    let root_key = fresh.root(1);
+    let root_member = [root_key];
+    let members_root = Members { members: &root_member, records: &records, tree: Some(user_names.tree_record) };
+    let after_root_edit = resolve_members(&user_in, deps_built, Sysroot::default(), &FILES_ROOT_REMOVED, 1, &no_tree_again, members_root, bump)
+        .unwrap_or_else(|e| panic!("root-member solve after removing #[macro_use]: {e:?}"));
+    assert_eq!(no_tree_again.0.load(core::sync::atomic::Ordering::Relaxed), 0, "root-member solve must stay on from_tree_record fast path");
+    assert!(!after_root_edit.tree.is_empty(), "root-member solve must return updated tree_record");
+
+    struct TwoRecords<'a>(&'a [crate::NameGroup<'a>], &'a [crate::NameGroup<'a>]);
+    impl GroupRecords for TwoRecords<'_> {
+        fn group_of(&self, module: ItemKey) -> Option<GroupRef<'_>> {
+            self.1.iter().chain(self.0.iter()).find(|g| g.members.binary_search(&module).is_ok()).map(GroupRef::of)
+        }
+    }
+    let updated_records = TwoRecords(&user_names.groups, &after_root_edit.groups);
+    let members_sub = Members { members: &member_list, records: &updated_records, tree: Some(after_root_edit.tree) };
+    let sub_after_remove = resolve_members(&user_in, deps_built, Sysroot::default(), &FILES_ROOT_REMOVED, 1, &Serial, members_sub, bump)
+        .unwrap_or_else(|e| panic!("child-only solve after root removed #[macro_use]: {e:?}"));
+    let sub_group = sub_after_remove.groups.iter().find(|grp| grp.members.binary_search(&sub_key).is_ok())
+        .unwrap_or_else(|| panic!("missing group for `sub` after root removal"));
+    let scope_bytes = GroupRef::of(sub_group).scope_of(sub_key).unwrap_or_else(|e| panic!("scope_of: {e:?}"));
+    let view = blaze_surface::ScopeView::read(scope_bytes).unwrap_or_else(|e| panic!("ScopeView::read: {e:?}"));
+    assert!(
+        view.errors().any(|err| matches!(err, blaze_surface::ScopeError::Macro { why: blaze_surface::Unresolved::NotFound, .. })),
+        "`dep_macro!` must fail with Unresolved::NotFound after root removes #[macro_use]; got errors {:?}, FromSub={:?}",
+        view.errors().collect::<Vec<_>>(),
+        view.get(Namespace::Types, "FromSub"),
+    );
+    assert!(view.get(Namespace::Types, "FromSub").is_none(), "`FromSub` must not resolve once #[macro_use] is removed");
 }
 
-/// Full Unicode Rust identifiers (and raw identifiers) in `#[macro_use(π, café)] extern crate dep;`:
-/// `π!()` and `café!()` resolve in crate root and child modules (fresh `Names` and encoded
-/// `RecordNames`), while excluded Unicode/ASCII macros fail with `Unresolved::NotFound`.
+/// Full Unicode Rust identifiers (including raw and decomposed/NFD forms matched against composed
+/// NFC exports) in `#[macro_use(π, r#cafe\u{0301})] extern crate dep;`: `π!()` and `café!()`
+/// resolve in crate root and child modules (fresh `Names` and encoded `RecordNames`), while
+/// excluded Unicode/ASCII macros fail with `Unresolved::NotFound`.
 #[test]
 fn macro_use_allowlist_supports_unicode_identifiers() {
     static DEP: &str = "#![no_core]
@@ -916,7 +970,7 @@ macro_rules! π {
     ($name:ident) => { pub struct $name; };
 }
 #[macro_export]
-macro_rules! café {
+macro_rules! caf\u{00e9} {
     ($name:ident) => { pub struct $name; };
 }
 #[macro_export]
@@ -929,14 +983,14 @@ macro_rules! if_hyper {
     ($($item:item)*) => { $($item)* };
 }
 if_hyper! {
-    #[macro_use(π, /* comment */ r#café,)]
+    #[macro_use(π, /* comment */ r#cafe\u{0301},)]
     extern crate dep;
     π!(FromPi);
-    café!(FromCafe);
+    caf\u{00e9}!(FromCafe);
 }
 pub mod sub {
     π!(FromSubPi);
-    café!(FromSubCafe);
+    caf\u{00e9}!(FromSubCafe);
 }
 ";
     static USER_EXCLUDED: &str = "#![no_core]

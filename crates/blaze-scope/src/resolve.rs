@@ -1822,16 +1822,19 @@ pub(crate) fn resolve_one_with<'a, 'r, 'p: 'a, S: SourceTexts<'a>, P: Par>(
         crate_root_record.macro_use = macro_use;
         root_changed = true;
     }
-    if root_changed && !tree_record.is_empty() {
+    let root_differs = root_changed || record.as_ref().is_some_and(|(_, rec)| rec.crate_root != root_bytes);
+    if root_differs && !tree_record.is_empty() {
         let updated_root = crate_root_record
             .write(alloc)
             .map_err(|e| NamesError::RootRecord { krate: input.name, error: RecordError::Refused(e) })?;
         let updated_root = aligned(&updated_root, bump);
         let mut tr = TreeRecord::read(tree_record, alloc)
             .map_err(|error| NamesError::TreeRecord { krate: input.name, error })?;
-        tr.crate_root = updated_root;
-        let rewritten = tr.write(alloc).map_err(|error| NamesError::TreeRecord { krate: input.name, error })?;
-        tree_record = aligned(&rewritten, bump);
+        if tr.crate_root != updated_root {
+            tr.crate_root = updated_root;
+            let rewritten = tr.write(alloc).map_err(|error| NamesError::TreeRecord { krate: input.name, error })?;
+            tree_record = aligned(&rewritten, bump);
+        }
     }
     // Synthesize the proc-macro crate's `_DECLS` harness static AFTER macro expansion completes
     // so macro-generated `#[proc_macro*]` exports (e.g. `derive_more-impl`'s `create_derive!`)
