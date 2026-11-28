@@ -18,9 +18,10 @@
 //! `<store>/proc-macro/compiled/<code key>` and its `.seal`, keyed by the wasm's digest and the
 //! runtime ([`COMPILED_DIR`]; `host.rs`, "Compiled records").
 
-use std::fs::{File, read, read_dir};
-use std::io::{Error as IoError, ErrorKind, Read};
-use std::path::{Path, PathBuf};
+use core::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
+use std::{fs::{self, File, read, read_dir}, io::{Error as IoError, ErrorKind, Read, Write as _}, path::{Path, PathBuf}, process};
 
 use blaze_build_script::served::{InPackage, in_package};
 use blaze_expand::ProcKind;
@@ -802,6 +803,107 @@ pub fn module_key(id: &CrateId<'_>) -> String {
     sha256_hex(identity(id).as_bytes())
 }
 
+/// Identity header for Tier-2 standalone native proc-macro executables (`native.bin`), strictly
+/// disjoint from wasm64 [`MODULE_HEADER`] keys and keyed by [`NativeTarget`].
+pub const NATIVE_MODULE_HEADER: &str = "blaze proc-macro module native-bin 1";
+
+/// Host target identity for a Tier-2 `native.bin` proc-macro module (rule 21): ensures native
+/// binaries compiled for different OSes, architectures, or ABIs never share a store directory
+/// with each other or with wasm64 modules.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NativeTarget<'a> {
+    /// Canonical host target triple (e.g. `"aarch64-unknown-linux-gnu"`, `"x86_64-unknown-linux-gnu"`,
+    /// `"aarch64-apple-darwin"`).
+    pub triple: &'a str,
+    /// Host ABI / runtime / bridge protocol version identity.
+    pub abi_id: &'a str,
+}
+
+impl NativeTarget<'static> {
+    /// Returns the running host process's default Tier-2 native proc-macro target identity.
+    pub const fn host() -> NativeTarget<'static> {
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        const TRIPLE: &str = "aarch64-unknown-linux-gnu";
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        const TRIPLE: &str = "x86_64-unknown-linux-gnu";
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        const TRIPLE: &str = "aarch64-apple-darwin";
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        const TRIPLE: &str = "x86_64-apple-darwin";
+        #[cfg(not(any(
+            all(target_os = "linux", target_arch = "aarch64"),
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64"),
+        )))]
+        const TRIPLE: &str = "unknown-native-host";
+
+        NativeTarget { triple: TRIPLE, abi_id: "bzpm-v1" }
+    }
+}
+
+/// The Tier-2 native module's identity text in `alloc`, keyed by both crate inputs and `target`.
+pub fn native_identity<'a>(
+    id: &CrateId<'_>,
+    target: NativeTarget<'_>,
+    alloc: blaze_own::Alloc<'a>,
+) -> blaze_own::AString<'a> {
+    let mut features = blaze_own::AVec::new_in(alloc);
+    for &feat in id.features {
+        features.push(feat);
+    }
+    features.sort_unstable();
+    features.dedup();
+    let mut out = blaze_own::AString::new_in(alloc);
+    let _ = core::fmt::Write::write_fmt(
+        &mut out,
+        format_args!("{NATIVE_MODULE_HEADER}\nname {}\nversion {}\n", id.name, id.version),
+    );
+    match id.source {
+        Source::Registry { checksum } => {
+            let _ = core::fmt::Write::write_fmt(&mut out, format_args!("checksum {checksum}\n"));
+        }
+        Source::Git { commit, path } => {
+            let _ = core::fmt::Write::write_fmt(&mut out, format_args!("git {commit} {path}\n"));
+        }
+        Source::Path { files_sha256 } => {
+            let _ = core::fmt::Write::write_fmt(&mut out, format_args!("files {files_sha256}\n"));
+        }
+    }
+    let _ = core::fmt::Write::write_fmt(&mut out, format_args!("deps {}\nfeatures ", id.deps));
+    for (idx, feat) in features.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(feat);
+    }
+    let _ = core::fmt::Write::write_fmt(
+        &mut out,
+        format_args!(
+            "\ntoolchain {}\ntarget {}\nabi {}\nprofile debug-assertions std-release ub-checks-off\nbuilder native-bin\n",
+            blaze_pins::TOOLCHAIN,
+            target.triple,
+            target.abi_id,
+        ),
+    );
+    out
+}
+
+/// Computes the host-target-keyed store key for a Tier-2 `native.bin` module in `alloc`.
+pub fn native_module_key<'a>(
+    id: &CrateId<'_>,
+    target: NativeTarget<'_>,
+    alloc: blaze_own::Alloc<'a>,
+) -> blaze_own::AString<'a> {
+    let text = native_identity(id, target, alloc);
+    let digest = blaze_sha256::digest(text.as_str().as_bytes());
+    let mut out = blaze_own::AString::new_in(alloc);
+    for byte in digest {
+        let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{byte:02x}"));
+    }
+    out
+}
+
 /// One macro a module exports.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Exported {
@@ -840,7 +942,18 @@ pub struct ModuleRecord {
     /// When `Some`, this proc-macro module is a native host `.dylib`/`.so` executed directly
     /// through `NativeServerPool` (zero Wasmtime, zero `-Zbuild-std`, D175 fast path).
     pub native_dylib: Option<PathBuf>,
+    /// When `Some`, this proc-macro module is a Blaze-compiled standalone native executable
+    /// (`native.bin`, Tier-2) run confined under Landlock/seccomp (Linux) or Seatbelt (macOS)
+    /// over `CHILD_FD` via `NativeBinPool` (zero `rustc`, zero `rust-analyzer-proc-macro-srv`,
+    /// zero `dlopen`).
+    pub native_bin: Option<PathBuf>,
 }
+
+/// Filename of a Tier-2 Blaze-compiled standalone native proc-macro executable in a module record.
+pub const NATIVE_BIN_FILENAME: &str = "native.bin";
+
+/// Filename holding the SHA-256 hex digest of [`NATIVE_BIN_FILENAME`] in a module record.
+pub const BIN_SHA256_FILENAME: &str = "bin-sha256";
 
 /// A store's folder of compiled module code, under the store (host.rs, "Compiled records").
 pub const COMPILED_DIR: &str = "proc-macro/compiled";
@@ -849,6 +962,27 @@ impl ModuleRecord {
     /// The macro `name` of `kind`.
     pub fn find(&self, kind: ProcKind, name: &str) -> Option<&Exported> {
         self.macros.iter().find(|it| it.kind == kind && it.name == name)
+    }
+
+    /// Verifies `native.bin` against [`Self::wasm_sha256`] and returns its path.
+    pub fn verify_native_bin(&self) -> Result<&Path, ModuleError> {
+        let Some(ref path) = self.native_bin else {
+            return Err(ModuleError::Missing {
+                name: self.name.as_str().into(),
+                version: self.version.as_str().into(),
+                key: self.key.as_str().into(),
+            });
+        };
+        let bytes = read(path).map_err(|error| ModuleError::Io { path: path.to_path_buf(), error })?;
+        let found = sha256_hex(&bytes);
+        if !is_valid_sha256_hex(self.wasm_sha256.as_str()) || found != self.wasm_sha256 {
+            return Err(ModuleError::Digest {
+                key: self.key.as_str().into(),
+                held: self.wasm_sha256.as_str().into(),
+                found,
+            });
+        }
+        Ok(path.as_path())
     }
 
     /// The module's wasm, `module.wasm` in its folder, checked against [`Self::wasm_sha256`]:
@@ -905,9 +1039,85 @@ fn native_dylib_filename() -> &'static str {
     }
 }
 
-/// Whether `store` holds `id`'s module, by its key: the native `.dylib`'s digest (zero Wasm!)
-/// when present, else the wasm's digest as the record states it.
+fn is_valid_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+}
+
+/// Verifies `bin-sha256` (strict 64-char lowercase hex) and hashes `native.bin` against it before
+/// declaring any Tier-2 native module present or readable (rule 74 / trust).
+fn verify_native_bin_in_dir<'a>(
+    dir: &Path,
+    key: &str,
+    alloc: blaze_own::Alloc<'a>,
+) -> Result<blaze_own::AString<'a>, ModuleError> {
+    let digest_path = dir.join(BIN_SHA256_FILENAME);
+    let raw = read(&digest_path).map_err(|error| ModuleError::Io { path: digest_path, error })?;
+    let held_str = core::str::from_utf8(&raw).map(str::trim).unwrap_or("");
+    let bin_path = dir.join(NATIVE_BIN_FILENAME);
+    let bin_bytes = read(&bin_path).map_err(|error| ModuleError::Io { path: bin_path, error })?;
+    let found = sha256_hex(&bin_bytes);
+    if !is_valid_sha256_hex(held_str) || found != held_str {
+        return Err(ModuleError::Digest {
+            key: key.into(),
+            held: held_str.into(),
+            found,
+        });
+    }
+    Ok(blaze_own::AString::from_str_in(held_str, alloc))
+}
+
+/// Looks up a Tier-2 `native.bin` module for `id` under its host-target-keyed directory
+/// ([`native_module_key`]), verifying `bin-sha256` and `native.bin`'s SHA-256 digest before
+/// returning `Ok((key, digest))`. Rejects truncated/corrupt binaries and malformed digests with
+/// [`ModuleError::Digest`] (never treats a corrupted record as present).
+pub fn find_native_module<'a>(
+    store: &Path,
+    id: &CrateId<'_>,
+    target: NativeTarget<'_>,
+    alloc: blaze_own::Alloc<'a>,
+) -> Result<(blaze_own::AString<'a>, blaze_own::AString<'a>), ModuleError> {
+    let key = native_module_key(id, target, alloc);
+    let dir = store.join("proc-macro/modules").join(key.as_str());
+    let has_digest = dir.join(BIN_SHA256_FILENAME).is_file();
+    let has_bin = dir.join(NATIVE_BIN_FILENAME).is_file();
+    if !has_digest && !has_bin {
+        return Err(ModuleError::Missing {
+            name: id.name.into(),
+            version: id.version.into(),
+            key: key.as_str().into(),
+        });
+    }
+    if !has_digest || !has_bin {
+        return Err(ModuleError::Digest {
+            key: key.as_str().into(),
+            held: if has_digest { "present" } else { "missing" }.into(),
+            found: if has_bin { "present" } else { "missing" }.into(),
+        });
+    }
+    let verified = verify_native_bin_in_dir(&dir, key.as_str(), alloc)?;
+    Ok((key, verified))
+}
+
+/// Reads a Tier-2 `native.bin` module for `id` under its host-target-keyed directory
+/// ([`native_module_key`]), verifying `native.bin`'s SHA-256 against `bin-sha256`.
+pub fn read_native_module(
+    store: &Path,
+    id: &CrateId<'_>,
+    target: NativeTarget<'_>,
+) -> Result<ModuleRecord, ModuleError> {
+    let key = native_module_key(id, target, blaze_own::Alloc::global());
+    read_module_by_key(store, key.as_str().into(), id.name, id.version)
+}
+
+/// Whether `store` holds `id`'s module, by its key: checks Tier-2 `native.bin` under its
+/// host-target-keyed directory ([`NativeTarget::host`], verifying `native.bin`'s SHA-256 before
+/// declaring it present), then native `.dylib`/`.so`, then `module.wasm` under `module_key(id)`.
 pub fn find_module(store: &Path, id: &CrateId<'_>) -> Result<(String, String), ModuleError> {
+    match find_native_module(store, id, NativeTarget::host(), blaze_own::Alloc::global()) {
+        Ok((key, digest)) => return Ok((key.as_str().into(), digest.as_str().into())),
+        Err(ModuleError::Missing { .. }) => {}
+        Err(err) => return Err(err),
+    }
     let key = module_key(id);
     let dir = store.join("proc-macro/modules").join(&key);
     let dylib_digest = dir.join("dylib-sha256");
@@ -924,19 +1134,36 @@ pub fn find_module(store: &Path, id: &CrateId<'_>) -> Result<(String, String), M
     }
 }
 
-/// The record of `id` in `store` (prefers native `.dylib`/`.so` over `module.wasm` when present).
+/// The record of `id` in `store` (prefers verified Tier-2 `native.bin` under its host-target key,
+/// then native `.dylib`/`.so`, then `module.wasm` under `module_key(id)`).
 pub fn read_module(store: &Path, id: &CrateId<'_>) -> Result<ModuleRecord, ModuleError> {
+    match read_native_module(store, id, NativeTarget::host()) {
+        Ok(rec) => return Ok(rec),
+        Err(ModuleError::Missing { .. }) => {}
+        Err(err) => return Err(err),
+    }
     read_module_by_key(store, module_key(id), id.name, id.version)
 }
 
-/// The record for `key` (`name` `version`) in `store` (prefers native `.dylib`/`.so` over
-/// `module.wasm` when present). Used both on initial registration ([`read_module`]) and when
-/// a `MacroModule` task self-compiles and publishes the module later in the same command.
+/// The record for `key` (`name` `version`) in `store` (reads `native.bin` when `bin-sha256` is
+/// present, else native `.dylib`/`.so`, else `module.wasm`). Verifies `native.bin`'s SHA-256
+/// digest against strict 64-char lowercase hex `bin-sha256` before returning the record.
 pub fn read_module_by_key(store: &Path, key: String, name: &str, version: &str) -> Result<ModuleRecord, ModuleError> {
     let dir = store.join("proc-macro/modules").join(&key);
+    let bin_path = dir.join(NATIVE_BIN_FILENAME);
+    let has_bin_digest = dir.join(BIN_SHA256_FILENAME).is_file();
+    let has_bin_file = bin_path.is_file();
+    if has_bin_digest != has_bin_file {
+        return Err(ModuleError::Digest {
+            key,
+            held: if has_bin_digest { "present" } else { "missing" }.into(),
+            found: if has_bin_file { "present" } else { "missing" }.into(),
+        });
+    }
+    let is_native_bin = has_bin_digest && has_bin_file;
     let native_path = dir.join(native_dylib_filename());
-    let is_native = dir.join("dylib-sha256").is_file() && native_path.is_file();
-    if !is_native && !dir.join("wasm-sha256").exists() {
+    let is_native_dylib = !is_native_bin && dir.join("dylib-sha256").is_file() && native_path.is_file();
+    if !is_native_bin && !is_native_dylib && !dir.join("wasm-sha256").exists() {
         return Err(ModuleError::Missing { name: name.to_owned(), version: version.to_owned(), key });
     }
     let read = |file: &str| -> Result<Vec<u8>, ModuleError> {
@@ -944,7 +1171,14 @@ pub fn read_module_by_key(store: &Path, key: String, name: &str, version: &str) 
         std::fs::read(&path).map_err(|error| ModuleError::Io { path, error })
     };
     let text = |file: &str| -> Result<String, ModuleError> { Ok(String::from_utf8_lossy(&read(file)?).into_owned()) };
-    let held = text(if is_native { "dylib-sha256" } else { "wasm-sha256" })?.trim().to_owned();
+    let held = if is_native_bin {
+        let verified = verify_native_bin_in_dir(&dir, key.as_str(), blaze_own::Alloc::global())?;
+        verified.as_str().into()
+    } else if is_native_dylib {
+        text("dylib-sha256")?.trim().to_owned()
+    } else {
+        text("wasm-sha256")?.trim().to_owned()
+    };
     let mut macros = Vec::new();
     for line in text("macros")?.lines() {
         let bad = || ModuleError::Macros { key: key.clone(), line: line.to_owned() };
@@ -960,7 +1194,7 @@ pub fn read_module_by_key(store: &Path, key: String, name: &str, version: &str) 
         let helpers = parts.next().unwrap_or("").split(',').filter(|it| !it.is_empty()).map(str::to_owned).collect();
         macros.push(Exported { index, kind, name: macro_name, helpers });
     }
-    let decls = if is_native {
+    let decls = if is_native_bin || is_native_dylib {
         dir.join("decls")
             .is_file()
             .then(|| text("decls").ok())
@@ -980,8 +1214,328 @@ pub fn read_module_by_key(store: &Path, key: String, name: &str, version: &str) 
         decls,
         dir,
         compiled: store.join(COMPILED_DIR),
-        native_dylib: is_native.then_some(native_path),
+        native_dylib: is_native_dylib.then_some(native_path),
+        native_bin: is_native_bin.then_some(bin_path),
     })
+}
+
+static WRITE_STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PublishPlant {
+    None,
+    #[cfg(test)]
+    SkipStageDirSync,
+    #[cfg(test)]
+    RenameBeforeDigest,
+    #[cfg(test)]
+    SkipRaceLoserParentSync,
+}
+
+trait PublishFs {
+    fn create_dir_all(&mut self, path: &Path) -> Result<(), IoError>;
+    fn remove_dir_all(&mut self, path: &Path) -> Result<(), IoError>;
+    fn write_and_sync_file(&mut self, path: &Path, bytes: &[u8], executable: bool) -> Result<(), IoError>;
+    fn sync_dir(&mut self, path: &Path) -> Result<(), IoError>;
+    fn rename(&mut self, from: &Path, to: &Path) -> Result<(), IoError>;
+    fn read_file(
+        &self,
+        path: &Path,
+        out: &mut blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>,
+    ) -> Result<(), IoError>;
+    fn is_executable(&self, path: &Path) -> bool;
+}
+
+struct OsPublishFs;
+
+impl PublishFs for OsPublishFs {
+    fn create_dir_all(&mut self, path: &Path) -> Result<(), IoError> {
+        fs::create_dir_all(path)
+    }
+
+    fn remove_dir_all(&mut self, path: &Path) -> Result<(), IoError> {
+        fs::remove_dir_all(path)
+    }
+
+    fn write_and_sync_file(&mut self, path: &Path, bytes: &[u8], executable: bool) -> Result<(), IoError> {
+        let mut file = File::create(path)?;
+        file.write_all(bytes)?;
+        #[cfg(unix)]
+        if executable {
+            file.set_permissions(fs::Permissions::from_mode(0o755))?;
+        }
+        #[cfg(not(unix))]
+        let _ = executable;
+        file.sync_all()
+    }
+
+    fn sync_dir(&mut self, path: &Path) -> Result<(), IoError> {
+        let dir = File::open(path)?;
+        dir.sync_all()
+    }
+
+    fn rename(&mut self, from: &Path, to: &Path) -> Result<(), IoError> {
+        fs::rename(from, to)
+    }
+
+    fn read_file(
+        &self,
+        path: &Path,
+        out: &mut blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>,
+    ) -> Result<(), IoError> {
+        let mut file = File::open(path)?;
+        out.clear();
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            let n = match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            };
+            if let Some(chunk) = buf.get(..n) {
+                out.extend_from_slice(chunk);
+            }
+        }
+        Ok(())
+    }
+
+    fn is_executable(&self, path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            fs::metadata(path)
+                .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            path.is_file()
+        }
+    }
+}
+
+fn verify_published_dir(
+    fs_ops: &dyn PublishFs,
+    final_dir: &Path,
+    key: &str,
+) -> Result<(), ModuleError> {
+    let shared = blaze_own::SharedAlloc::global();
+    let mut buf = blaze_own::Vec::new_in(shared);
+    for required in ["identity", "macros", "decls"] {
+        let path = final_dir.join(required);
+        fs_ops
+            .read_file(&path, &mut buf)
+            .map_err(|error| ModuleError::Io { path, error })?;
+    }
+    let digest_path = final_dir.join(BIN_SHA256_FILENAME);
+    fs_ops
+        .read_file(&digest_path, &mut buf)
+        .map_err(|error| ModuleError::Io { path: digest_path, error })?;
+    let held_str = core::str::from_utf8(buf.as_slice()).unwrap_or("").trim();
+    if !is_valid_sha256_hex(held_str) {
+        return Err(ModuleError::Digest {
+            key: key.into(),
+            held: held_str.into(),
+            found: "malformed bin-sha256".into(),
+        });
+    }
+    let mut held = blaze_own::String::new_in(shared);
+    held.push_str(held_str);
+
+    let bin_path = final_dir.join(NATIVE_BIN_FILENAME);
+    if !fs_ops.is_executable(&bin_path) {
+        return Err(ModuleError::Digest {
+            key: key.into(),
+            held: held.as_str().into(),
+            found: "native.bin missing or not executable".into(),
+        });
+    }
+    fs_ops
+        .read_file(&bin_path, &mut buf)
+        .map_err(|error| ModuleError::Io { path: bin_path, error })?;
+    let found = sha256_hex(buf.as_slice());
+    if found.as_str() != held.as_str() {
+        return Err(ModuleError::Digest {
+            key: key.into(),
+            held: held.as_str().into(),
+            found,
+        });
+    }
+    Ok(())
+}
+
+struct PublishPayload<'a> {
+    identity: &'a [u8],
+    digest_line: &'a [u8],
+    macros: &'a [u8],
+    decls_line: &'a [u8],
+    bin_bytes: &'a [u8],
+}
+
+fn publish_native_bin_dir(
+    fs_ops: &mut impl PublishFs,
+    modules_dir: &Path,
+    stage: &Path,
+    final_dir: &Path,
+    key: &str,
+    payload: &PublishPayload<'_>,
+    plant: PublishPlant,
+) -> Result<(), ModuleError> {
+    #[cfg(not(test))]
+    let _ = plant;
+    fs_ops.create_dir_all(modules_dir).map_err(|error| ModuleError::Io {
+        path: modules_dir.to_path_buf(),
+        error,
+    })?;
+    let _ = fs_ops.remove_dir_all(stage);
+    fs_ops.create_dir_all(stage).map_err(|error| ModuleError::Io {
+        path: stage.to_path_buf(),
+        error,
+    })?;
+
+    let write_stage = |ops: &mut dyn PublishFs| -> Result<(), ModuleError> {
+        let mut put = |file: &str, bytes: &[u8], exec: bool| -> Result<(), ModuleError> {
+            let path = stage.join(file);
+            ops.write_and_sync_file(&path, bytes, exec)
+                .map_err(|error| ModuleError::Io { path, error })
+        };
+        put("identity", payload.identity, false)?;
+        put("macros", payload.macros, false)?;
+        put("decls", payload.decls_line, false)?;
+        put(NATIVE_BIN_FILENAME, payload.bin_bytes, true)?;
+        #[cfg(test)]
+        let defer_digest = plant == PublishPlant::RenameBeforeDigest;
+        #[cfg(not(test))]
+        let defer_digest = false;
+        if !defer_digest {
+            put(BIN_SHA256_FILENAME, payload.digest_line, false)?;
+        }
+        #[cfg(test)]
+        let skip_stage_sync = plant == PublishPlant::SkipStageDirSync;
+        #[cfg(not(test))]
+        let skip_stage_sync = false;
+        if !skip_stage_sync {
+            ops.sync_dir(stage).map_err(|error| ModuleError::Io {
+                path: stage.to_path_buf(),
+                error,
+            })?;
+        }
+        Ok(())
+    };
+
+    if let Err(err) = write_stage(fs_ops) {
+        let _ = fs_ops.remove_dir_all(stage);
+        return Err(err);
+    }
+
+    match fs_ops.rename(stage, final_dir) {
+        Ok(()) => {
+            #[cfg(test)]
+            if plant == PublishPlant::RenameBeforeDigest {
+                let path = final_dir.join(BIN_SHA256_FILENAME);
+                fs_ops
+                    .write_and_sync_file(&path, payload.digest_line, false)
+                    .map_err(|error| ModuleError::Io { path, error })?;
+            }
+            fs_ops.sync_dir(modules_dir).map_err(|error| ModuleError::Io {
+                path: modules_dir.to_path_buf(),
+                error,
+            })?;
+        }
+        Err(error) => {
+            let _ = fs_ops.remove_dir_all(stage);
+            if !matches!(error.kind(), ErrorKind::AlreadyExists | ErrorKind::DirectoryNotEmpty) {
+                return Err(ModuleError::Io { path: final_dir.to_path_buf(), error });
+            }
+            // A concurrent winner may have renamed `final_dir` into place without yet syncing
+            // `modules_dir`. Persist `modules_dir` and verify the complete on-disk record before
+            // returning `Ok` so a crash immediately after cannot lose the published module.
+            #[cfg(test)]
+            let skip_race_parent_sync = plant == PublishPlant::SkipRaceLoserParentSync;
+            #[cfg(not(test))]
+            let skip_race_parent_sync = false;
+            if !skip_race_parent_sync {
+                fs_ops.sync_dir(modules_dir).map_err(|sync_err| ModuleError::Io {
+                    path: modules_dir.to_path_buf(),
+                    error: sync_err,
+                })?;
+            }
+            verify_published_dir(fs_ops, final_dir, key)?;
+        }
+    }
+    Ok(())
+}
+
+/// Crash-durably publishes a Tier-2 Blaze-compiled standalone native proc-macro module (`native.bin`
+/// with `0o755` executable mode, `bin-sha256`, `identity`, `macros`, and `decls`) under its
+/// host-target-keyed directory `<store>/proc-macro/modules/<native_module_key(id, target)>`.
+///
+/// Every file is fsynced before `sync_all` on the staging directory, atomic directory rename, and
+/// `sync_all` on the parent `modules/` directory.
+pub fn write_native_bin_module(
+    store: &Path,
+    id: &CrateId<'_>,
+    target: NativeTarget<'_>,
+    bin_bytes: &[u8],
+    macros: &[Exported],
+    decls: &str,
+) -> Result<ModuleRecord, ModuleError> {
+    let shared = blaze_own::SharedAlloc::global();
+    let alloc = blaze_own::Alloc::global();
+    let identity_text = native_identity(id, target, alloc);
+    let key = native_module_key(id, target, alloc);
+    let modules_dir = store.join("proc-macro/modules");
+    let seq = WRITE_STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = process::id();
+    let mut stage_name = blaze_own::String::new_in(shared);
+    let _ = core::fmt::Write::write_fmt(
+        &mut stage_name,
+        format_args!(".tmp-{}-{pid}-{seq}", key.as_str()),
+    );
+    let stage = modules_dir.join(stage_name.as_str());
+    let final_dir = modules_dir.join(key.as_str());
+
+    let digest = sha256_hex(bin_bytes);
+    let mut digest_line = blaze_own::String::new_in(shared);
+    let _ = core::fmt::Write::write_fmt(&mut digest_line, format_args!("{digest}\n"));
+
+    let mut macros_text = blaze_own::String::new_in(shared);
+    for exported in macros {
+        let kind_word = match exported.kind {
+            ProcKind::Derive => "derive",
+            ProcKind::Attr => "attr",
+            ProcKind::FnLike => "bang",
+        };
+        let _ = core::fmt::Write::write_fmt(
+            &mut macros_text,
+            format_args!("{} {} {}", exported.index, kind_word, exported.name),
+        );
+        if !exported.helpers.is_empty() {
+            macros_text.push(' ');
+            for (idx, helper) in exported.helpers.iter().enumerate() {
+                if idx > 0 {
+                    macros_text.push(',');
+                }
+                macros_text.push_str(helper);
+            }
+        }
+        macros_text.push('\n');
+    }
+
+    let mut decls_line = blaze_own::String::new_in(shared);
+    let _ = core::fmt::Write::write_fmt(&mut decls_line, format_args!("{decls}\n"));
+
+    let payload = PublishPayload {
+        identity: identity_text.as_str().as_bytes(),
+        digest_line: digest_line.as_str().as_bytes(),
+        macros: macros_text.as_str().as_bytes(),
+        decls_line: decls_line.as_str().as_bytes(),
+        bin_bytes,
+    };
+
+    let mut os_fs = OsPublishFs;
+    publish_native_bin_dir(&mut os_fs, &modules_dir, &stage, &final_dir, key.as_str(), &payload, PublishPlant::None)?;
+    read_module_by_key(store, key.as_str().into(), id.name, id.version)
 }
 
 #[cfg(test)]
@@ -1075,6 +1629,427 @@ mod header_tests {
         assert_eq!(rec.macros[0].name, "Demo");
 
         let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn write_and_read_native_bin_module_verifies_digest_and_exec_permissions() {
+        use std::{env, fs, process};
+        let store = env::temp_dir().join(format!("blaze-pm-native-bin-test-{}", process::id()));
+        let _ = fs::remove_dir_all(&store);
+
+        let id = CrateId {
+            name: "sqlx_macros",
+            version: "0.9.0",
+            source: Source::Registry { checksum: "ab12" },
+            deps: "deps-tier2",
+            features: &["runtime-tokio", "postgres"],
+        };
+        let host_target = NativeTarget::host();
+        let expected_key = native_module_key(&id, host_target, blaze_own::Alloc::global());
+        let bin_bytes = b"\x7fELF-synthetic-native-bin-payload";
+        let exports = vec![
+            Exported { index: 0, kind: ProcKind::FnLike, name: "expand_query".to_owned(), helpers: Vec::new() },
+            Exported { index: 1, kind: ProcKind::Derive, name: "FromRow".to_owned(), helpers: vec!["sqlx".to_owned()] },
+            Exported { index: 2, kind: ProcKind::Attr, name: "test".to_owned(), helpers: Vec::new() },
+        ];
+
+        let rec = write_native_bin_module(
+            &store,
+            &id,
+            host_target,
+            bin_bytes,
+            &exports,
+            "__blaze_pm_decls__",
+        )
+        .expect("write native.bin module");
+
+        assert_eq!(rec.key, expected_key.as_str());
+        assert_ne!(rec.key, module_key(&id), "native.bin key must never collide with wasm64 module_key");
+        assert_eq!(rec.wasm_sha256, sha256_hex(bin_bytes));
+        assert_eq!(rec.macros, exports);
+        assert_eq!(rec.decls, "__blaze_pm_decls__");
+        assert!(rec.native_dylib.is_none());
+        let bin_path = rec.native_bin.as_ref().expect("native_bin present");
+        assert_eq!(bin_path, &rec.dir.join(NATIVE_BIN_FILENAME));
+        assert_eq!(rec.verify_native_bin().expect("verify"), bin_path.as_path());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(bin_path).expect("meta").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "native.bin must have 0o755 executable permissions");
+        }
+
+        let (found_key, found_digest) = find_module(&store, &id).expect("find_module");
+        assert_eq!(found_key, expected_key.as_str());
+        assert_eq!(found_digest, sha256_hex(bin_bytes));
+
+        let reread = read_module(&store, &id).expect("read_module");
+        assert_eq!(reread.native_bin.as_deref(), Some(bin_path.as_path()));
+        assert_eq!(reread.macros, exports);
+
+        // Truncating or tampering with native.bin MUST fail find_module AND read_module with Digest!
+        fs::write(bin_path, b"\x7fELF-trunc").expect("truncate");
+        assert!(matches!(find_module(&store, &id), Err(ModuleError::Digest { .. })));
+        assert!(matches!(read_module(&store, &id), Err(ModuleError::Digest { .. })));
+        assert!(matches!(rec.verify_native_bin(), Err(ModuleError::Digest { .. })));
+
+        // Restoring binary but writing malformed/non-UTF-8 bin-sha256 MUST fail find_module!
+        fs::write(bin_path, bin_bytes).expect("restore bin");
+        fs::write(rec.dir.join(BIN_SHA256_FILENAME), b"\xff\xfe\x00bad").expect("bad digest");
+        assert!(matches!(find_module(&store, &id), Err(ModuleError::Digest { .. })));
+        fs::write(rec.dir.join(BIN_SHA256_FILENAME), b"not-64-hex\n").expect("short digest");
+        assert!(matches!(find_module(&store, &id), Err(ModuleError::Digest { .. })));
+
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn native_module_key_is_distinct_across_host_targets_and_wasm() {
+        use std::{env, fs, process};
+        let alloc = blaze_own::testing::heap().alloc();
+        let id = CrateId {
+            name: "sqlx_macros",
+            version: "0.9.0",
+            source: Source::Registry { checksum: "cd34" },
+            deps: "deps-tier2",
+            features: &["runtime-tokio"],
+        };
+        let linux_arm64 = NativeTarget { triple: "aarch64-unknown-linux-gnu", abi_id: "bzpm-v1" };
+        let linux_x64 = NativeTarget { triple: "x86_64-unknown-linux-gnu", abi_id: "bzpm-v1" };
+        let macos_arm64 = NativeTarget { triple: "aarch64-apple-darwin", abi_id: "bzpm-v1" };
+        let linux_arm64_v2 = NativeTarget { triple: "aarch64-unknown-linux-gnu", abi_id: "bzpm-v2" };
+
+        let k_la = native_module_key(&id, linux_arm64, alloc);
+        let k_lx = native_module_key(&id, linux_x64, alloc);
+        let k_ma = native_module_key(&id, macos_arm64, alloc);
+        let k_v2 = native_module_key(&id, linux_arm64_v2, alloc);
+        let k_wasm = module_key(&id);
+
+        let all = [k_la.as_str(), k_lx.as_str(), k_ma.as_str(), k_v2.as_str(), k_wasm.as_str()];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j], "keys {i} and {j} must not collide");
+            }
+        }
+
+        // Publishing two different host targets in the same store keeps them completely isolated.
+        let store = env::temp_dir().join(format!("blaze-pm-multi-target-test-{}", process::id()));
+        let _ = fs::remove_dir_all(&store);
+        let exports = vec![Exported { index: 0, kind: ProcKind::FnLike, name: "q".to_owned(), helpers: Vec::new() }];
+        let r_la = write_native_bin_module(&store, &id, linux_arm64, b"elf-arm64", &exports, "").expect("la");
+        let r_ma = write_native_bin_module(&store, &id, macos_arm64, b"macho-arm64", &exports, "").expect("ma");
+        assert_ne!(r_la.dir, r_ma.dir);
+        assert_eq!(
+            find_native_module(&store, &id, linux_arm64, alloc).expect("find la").1.as_str(),
+            sha256_hex(b"elf-arm64")
+        );
+        assert_eq!(
+            find_native_module(&store, &id, macos_arm64, alloc).expect("find ma").1.as_str(),
+            sha256_hex(b"macho-arm64")
+        );
+        assert!(matches!(find_native_module(&store, &id, linux_x64, alloc), Err(ModuleError::Missing { .. })));
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    /// Power-loss and sync-failure Deterministic Simulation Test (AGENTS.md rule 43) for
+    /// `publish_native_bin_dir`: models volatile vs durable disk state, injects write/sync/rename
+    /// errors and power-loss crashes at every operation boundary, checks the atomic recovery oracle
+    /// (final directory is either completely absent or 100% intact with matching `bin-sha256` and
+    /// executable `native.bin`), and proves two planted-bug controls fail the oracle.
+    #[test]
+    fn write_native_bin_module_crash_and_sync_failure_dst() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        #[derive(Clone, Default)]
+        struct SimFile {
+            bytes: Vec<u8>,
+            exec: bool,
+        }
+
+        #[derive(Clone, Default)]
+        struct SimDisk {
+            dirs: BTreeSet<PathBuf>,
+            files: BTreeMap<PathBuf, SimFile>,
+        }
+
+        struct SimCrashFs {
+            volatile: SimDisk,
+            durable: SimDisk,
+            synced_dirs: BTreeSet<PathBuf>,
+            /// For each renamed directory awaiting parent `sync_dir`, holds the exact files whose
+            /// directory entries were durable in the staging directory at the moment of `rename`.
+            /// (Syncing `modules_dir` persists the renamed entry itself, NOT unsynced files added
+            /// inside `final_dir` after rename.)
+            renamed_durable_files: BTreeMap<PathBuf, Vec<(PathBuf, SimFile)>>,
+            op_count: usize,
+            fail_at: Option<usize>,
+            crash_at: Option<usize>,
+            crashed: bool,
+            /// Models ext4/APFS power-loss reordering: if a directory was renamed without first
+            /// syncing the staging directory, its child entries are lost on crash.
+            drop_unsynced_rename_children: bool,
+        }
+
+        impl SimCrashFs {
+            fn new(fail_at: Option<usize>, crash_at: Option<usize>, drop_unsynced: bool) -> Self {
+                Self {
+                    volatile: SimDisk::default(),
+                    durable: SimDisk::default(),
+                    synced_dirs: BTreeSet::new(),
+                    renamed_durable_files: BTreeMap::new(),
+                    op_count: 0,
+                    fail_at,
+                    crash_at,
+                    crashed: false,
+                    drop_unsynced_rename_children: drop_unsynced,
+                }
+            }
+
+            fn tick(&mut self, what: &str) -> Result<(), IoError> {
+                let idx = self.op_count;
+                self.op_count += 1;
+                if self.crash_at == Some(idx) {
+                    self.crashed = true;
+                    return Err(IoError::new(ErrorKind::Other, format!("power loss at op {idx} ({what})")));
+                }
+                if self.fail_at == Some(idx) {
+                    return Err(IoError::new(ErrorKind::Other, format!("injected I/O error at op {idx} ({what})")));
+                }
+                Ok(())
+            }
+        }
+
+        impl PublishFs for SimCrashFs {
+            fn create_dir_all(&mut self, path: &Path) -> Result<(), IoError> {
+                self.tick("create_dir_all")?;
+                let mut cur = PathBuf::new();
+                for comp in path.components() {
+                    cur.push(comp);
+                    self.volatile.dirs.insert(cur.clone());
+                }
+                Ok(())
+            }
+
+            fn remove_dir_all(&mut self, path: &Path) -> Result<(), IoError> {
+                self.volatile.dirs.retain(|d| !d.starts_with(path));
+                self.volatile.files.retain(|f, _| !f.starts_with(path));
+                self.synced_dirs.remove(path);
+                self.renamed_durable_files.remove(path);
+                Ok(())
+            }
+
+            fn write_and_sync_file(&mut self, path: &Path, bytes: &[u8], executable: bool) -> Result<(), IoError> {
+                self.tick("write_file")?;
+                self.volatile.files.insert(path.to_path_buf(), SimFile { bytes: bytes.to_vec(), exec: executable });
+                self.tick("sync_file")?;
+                // File data is durable in its inode, but directory entry is only durable once
+                // the containing directory is synced!
+                if let Some(parent) = path.parent() {
+                    self.synced_dirs.remove(parent);
+                }
+                Ok(())
+            }
+
+            fn sync_dir(&mut self, path: &Path) -> Result<(), IoError> {
+                self.tick("sync_dir")?;
+                self.synced_dirs.insert(path.to_path_buf());
+                if self.volatile.dirs.contains(path) {
+                    self.durable.dirs.insert(path.to_path_buf());
+                }
+                // Persist direct child files of `path` into `durable`.
+                for (fpath, file) in &self.volatile.files {
+                    if fpath.parent() == Some(path) {
+                        self.durable.files.insert(fpath.clone(), file.clone());
+                    }
+                }
+                // Persist direct child directories of `path` into `durable`; for a renamed child
+                // dir, ONLY files already synced in its staging dir before rename become durable
+                // when the parent dir is synced (unsynced post-rename additions require syncing
+                // the child dir itself).
+                for dpath in &self.volatile.dirs {
+                    if dpath.parent() == Some(path) {
+                        self.durable.dirs.insert(dpath.clone());
+                        if let Some(durable_children) = self.renamed_durable_files.get(dpath) {
+                            for (fpath, file) in durable_children {
+                                self.durable.files.insert(fpath.clone(), file.clone());
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            fn rename(&mut self, from: &Path, to: &Path) -> Result<(), IoError> {
+                self.tick("rename")?;
+                if self.volatile.dirs.contains(to) {
+                    return Err(IoError::new(ErrorKind::DirectoryNotEmpty, "target exists"));
+                }
+                let stage_was_synced = self.synced_dirs.contains(from);
+                let moved_files: Vec<(PathBuf, SimFile)> = self
+                    .volatile
+                    .files
+                    .iter()
+                    .filter(|(p, _)| p.starts_with(from))
+                    .map(|(p, f)| (to.join(p.strip_prefix(from).expect("strip")), f.clone()))
+                    .collect();
+                self.volatile.dirs.remove(from);
+                self.volatile.files.retain(|p, _| !p.starts_with(from));
+                self.volatile.dirs.insert(to.to_path_buf());
+                for (new_p, f) in &moved_files {
+                    self.volatile.files.insert(new_p.clone(), f.clone());
+                }
+                // Directory rename is only durable once the parent directory (`modules_dir`) is
+                // synced; and even then, only files whose staging directory had been synced before
+                // rename survive power loss.
+                let durable_children = if stage_was_synced || !self.drop_unsynced_rename_children {
+                    moved_files
+                } else {
+                    Vec::new()
+                };
+                self.renamed_durable_files.insert(to.to_path_buf(), durable_children);
+                Ok(())
+            }
+
+            fn read_file(
+                &self,
+                path: &Path,
+                out: &mut blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>,
+            ) -> Result<(), IoError> {
+                let Some(file) = self.volatile.files.get(path) else {
+                    return Err(IoError::new(ErrorKind::NotFound, "not found"));
+                };
+                out.clear();
+                out.extend_from_slice(&file.bytes);
+                Ok(())
+            }
+
+            fn is_executable(&self, path: &Path) -> bool {
+                self.volatile.files.get(path).is_some_and(|f| f.exec)
+            }
+        }
+
+        let modules_dir = PathBuf::from("/store/proc-macro/modules");
+        let stage = modules_dir.join(".tmp-key-1-0");
+        let stage_b = modules_dir.join(".tmp-key-2-0");
+        let final_dir = modules_dir.join("key-native-1");
+        let bin_bytes = b"\x7fELF-crash-dst-native-bin";
+        let expected_digest = sha256_hex(bin_bytes);
+        let digest_line = format!("{expected_digest}\n");
+        let payload = PublishPayload {
+            identity: b"id\n",
+            digest_line: digest_line.as_bytes(),
+            macros: b"0 bang query\n",
+            decls_line: b"__decls__\n",
+            bin_bytes,
+        };
+
+        let check_durable_oracle = |disk: &SimDisk, must_exist: bool| -> Result<(), String> {
+            let exists = disk.dirs.contains(&final_dir);
+            if !exists {
+                if must_exist {
+                    return Err("expected final_dir to be durable after Ok publish".to_owned());
+                }
+                // No orphan file under final_dir may exist if final_dir itself is absent.
+                if disk.files.keys().any(|p| p.starts_with(&final_dir)) {
+                    return Err("orphan durable files under absent final_dir".to_owned());
+                }
+                return Ok(());
+            }
+            for req in ["identity", "macros", "decls", BIN_SHA256_FILENAME, NATIVE_BIN_FILENAME] {
+                if !disk.files.contains_key(&final_dir.join(req)) {
+                    return Err(format!("durable final_dir missing `{req}` after crash"));
+                }
+            }
+            let bin = &disk.files[&final_dir.join(NATIVE_BIN_FILENAME)];
+            if !bin.exec {
+                return Err("durable native.bin lost executable mode".to_owned());
+            }
+            let held = core::str::from_utf8(&disk.files[&final_dir.join(BIN_SHA256_FILENAME)].bytes)
+                .unwrap_or("")
+                .trim();
+            let found = sha256_hex(&bin.bytes);
+            if !is_valid_sha256_hex(held) || held != found {
+                return Err(format!("durable digest mismatch: held={held:?} found={found:?}"));
+            }
+            Ok(())
+        };
+
+        let run_matrix = |plant: PublishPlant| -> Result<(), String> {
+            // 1. Clean publish must succeed and satisfy oracle with must_exist=true.
+            let mut clean = SimCrashFs::new(None, None, true);
+            publish_native_bin_dir(&mut clean, &modules_dir, &stage, &final_dir, "key-native-1", &payload, plant)
+                .map_err(|e| format!("clean publish failed: {e}"))?;
+            check_durable_oracle(&clean.durable, true)?;
+            let total_ops = clean.op_count;
+
+            // 2. Inject I/O error at EVERY op index 0..total_ops.
+            for fail_at in 0..total_ops {
+                let mut fs_sim = SimCrashFs::new(Some(fail_at), None, true);
+                let _ = publish_native_bin_dir(&mut fs_sim, &modules_dir, &stage, &final_dir, "key-native-1", &payload, plant);
+                check_durable_oracle(&fs_sim.durable, false)?;
+            }
+
+            // 3. Inject power-loss crash at EVERY op index 0..=total_ops.
+            for crash_at in 0..=total_ops {
+                let mut fs_sim = SimCrashFs::new(None, Some(crash_at), true);
+                let res = publish_native_bin_dir(&mut fs_sim, &modules_dir, &stage, &final_dir, "key-native-1", &payload, plant);
+                check_durable_oracle(&fs_sim.durable, res.is_ok())?;
+            }
+
+            // 4. Two-writer race interleaving: Writer A writes & syncs its stage and renames into
+            //    `final_dir` WITHOUT yet calling `sync_dir(modules_dir)`; Writer B runs and hits
+            //    `DirectoryNotEmpty`, then power loss occurs immediately after Writer B returns Ok!
+            let mut race_fs = SimCrashFs::new(None, None, true);
+            race_fs.create_dir_all(&modules_dir).expect("mkdir modules");
+            race_fs.create_dir_all(&stage).expect("mkdir stage A");
+            race_fs.write_and_sync_file(&stage.join("identity"), payload.identity, false).expect("id");
+            race_fs.write_and_sync_file(&stage.join("macros"), payload.macros, false).expect("macros");
+            race_fs.write_and_sync_file(&stage.join("decls"), payload.decls_line, false).expect("decls");
+            race_fs.write_and_sync_file(&stage.join(NATIVE_BIN_FILENAME), payload.bin_bytes, true).expect("bin");
+            race_fs.write_and_sync_file(&stage.join(BIN_SHA256_FILENAME), payload.digest_line, false).expect("sha");
+            race_fs.sync_dir(&stage).expect("sync stage A");
+            race_fs.rename(&stage, &final_dir).expect("writer A rename");
+            // Writer A paused BEFORE `sync_dir(modules_dir)` -> `durable` does NOT have `final_dir` yet!
+            assert!(!race_fs.durable.dirs.contains(&final_dir));
+            publish_native_bin_dir(&mut race_fs, &modules_dir, &stage_b, &final_dir, "key-native-1", &payload, plant)
+                .map_err(|e| format!("writer B race-loser failed: {e}"))?;
+            // Immediate crash after Writer B returned Ok -> `final_dir` MUST be durable!
+            check_durable_oracle(&race_fs.durable, true)?;
+
+            Ok(())
+        };
+
+        // Clean implementation passes every failure, crash, and 2-writer race point.
+        run_matrix(PublishPlant::None).expect("clean publish DST must pass");
+
+        // Race-loser MUST fail closed when an existing `final_dir` is incomplete/corrupt (missing `macros`).
+        let mut corrupt_fs = SimCrashFs::new(None, None, true);
+        corrupt_fs.create_dir_all(&final_dir).expect("mkdir final");
+        corrupt_fs.write_and_sync_file(&final_dir.join(BIN_SHA256_FILENAME), payload.digest_line, false).expect("sha");
+        corrupt_fs.write_and_sync_file(&final_dir.join(NATIVE_BIN_FILENAME), payload.bin_bytes, true).expect("bin");
+        assert!(
+            publish_native_bin_dir(&mut corrupt_fs, &modules_dir, &stage_b, &final_dir, "key-native-1", &payload, PublishPlant::None).is_err(),
+            "race-loser must reject incomplete pre-existing final_dir missing identity/macros/decls"
+        );
+
+        // Planted-bug control 1: skipping stage dir sync MUST fail the crash oracle.
+        assert!(
+            run_matrix(PublishPlant::SkipStageDirSync).is_err(),
+            "DST must catch PublishPlant::SkipStageDirSync"
+        );
+
+        // Planted-bug control 2: renaming before writing bin-sha256 MUST fail the crash oracle.
+        assert!(
+            run_matrix(PublishPlant::RenameBeforeDigest).is_err(),
+            "DST must catch PublishPlant::RenameBeforeDigest"
+        );
+
+        // Planted-bug control 3: skipping parent dir sync on race-loser MUST fail the 2-writer race oracle.
+        assert!(
+            run_matrix(PublishPlant::SkipRaceLoserParentSync).is_err(),
+            "DST must catch PublishPlant::SkipRaceLoserParentSync"
+        );
     }
 
     #[test]

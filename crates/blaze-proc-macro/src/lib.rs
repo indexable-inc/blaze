@@ -45,6 +45,10 @@ pub mod host;
 #[cfg(feature = "runtime")]
 pub mod jobserver;
 #[cfg(feature = "runtime")]
+pub mod native_bin;
+#[cfg(feature = "runtime")]
+pub mod native_bin_proto;
+#[cfg(feature = "runtime")]
 pub mod native_bridge;
 #[cfg(feature = "runtime")]
 pub mod native_c;

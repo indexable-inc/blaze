@@ -3512,6 +3512,7 @@ mod proc_macro_reads_tests {
             dir: std::path::PathBuf::new(),
             compiled: std::path::PathBuf::new(),
             native_dylib: None,
+            native_bin: None,
         };
         let runner = env.runner(std::vec![
             (0, CrateItemKey(ContentId([1; 32])), "askama_macros", Ok(loaded)),

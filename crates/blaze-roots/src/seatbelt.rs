@@ -23,6 +23,11 @@ pub const MACOS_SYSTEM: [&str; 3] = ["/usr/lib", "/System/Library", "/System/Vol
 const PREAMBLE: &[u8] = b"(version 1)\n(deny default)\n(allow process-fork)\n(allow sysctl-read)\n\
 (allow signal (target same-sandbox))\n(allow file-read* (literal \"/\"))\n";
 
+/// Same as [`PREAMBLE`] but omits `(allow process-fork)` for confined workers that may spawn
+/// threads (which macOS permits without `process-fork`) but must not fork child processes.
+const PREAMBLE_NO_FORK: &[u8] = b"(version 1)\n(deny default)\n(allow sysctl-read)\n\
+(allow signal (target same-sandbox))\n(allow file-read* (literal \"/\"))\n";
+
 /// What an SBPL rule grants.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SbplAccess {
@@ -67,11 +72,20 @@ pub fn one_spelling(path: &[u8]) -> bool {
     rest.split(|&b| b == b'/').all(|part| !part.is_empty() && part != b"." && part != b"..")
 }
 
-/// Renders `rules` into a NUL-terminated SBPL profile in `alloc`.
+/// Renders `rules` into a NUL-terminated SBPL profile in `alloc` (permitting `process-fork`).
 pub fn render_sbpl<'a, 'r>(rules: impl Iterator<Item = SbplRule<'r>>, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, SbplError> {
+    render_sbpl_with_fork(rules, true, alloc)
+}
+
+/// Renders `rules` into a NUL-terminated SBPL profile in `alloc`, optionally denying `process-fork`.
+pub fn render_sbpl_with_fork<'a, 'r>(
+    rules: impl Iterator<Item = SbplRule<'r>>,
+    allow_fork: bool,
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, u8>, SbplError> {
     let mut out = AVec::new_in(alloc);
     let mut put = |bytes: &[u8]| out.try_extend_from_slice(bytes).map_err(|_| SbplError::OutOfMemory);
-    put(PREAMBLE)?;
+    put(if allow_fork { PREAMBLE } else { PREAMBLE_NO_FORK })?;
     for (idx, rule) in rules.enumerate() {
         let path = rule.path.as_bytes();
         if !one_spelling(path) {
@@ -106,4 +120,31 @@ pub fn render_sbpl<'a, 'r>(rules: impl Iterator<Item = SbplRule<'r>>, alloc: All
     }
     put(&[0])?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_sbpl_no_fork_denies_process_fork_while_preserving_rules() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let rules = [
+            SbplRule { path: "/opt/bin/worker", subtree: false, access: SbplAccess::Exec },
+            SbplRule { path: "/workspace/crate", subtree: true, access: SbplAccess::Read },
+            SbplRule { path: "/dev/null", subtree: false, access: SbplAccess::Write },
+        ];
+        let with_fork = render_sbpl(rules.into_iter(), alloc).expect("with fork");
+        let no_fork = render_sbpl_with_fork(rules.into_iter(), false, alloc).expect("no fork");
+
+        let with_text = core::str::from_utf8(&with_fork[..with_fork.len() - 1]).expect("utf8");
+        let no_text = core::str::from_utf8(&no_fork[..no_fork.len() - 1]).expect("utf8");
+
+        assert!(with_text.contains("(allow process-fork)"));
+        assert!(!no_text.contains("process-fork"), "no-fork profile must omit process-fork:\n{no_text}");
+        assert!(no_text.starts_with("(version 1)\n(deny default)\n"));
+        assert!(no_text.contains("(allow process-exec (literal \"/opt/bin/worker\"))"));
+        assert!(no_text.contains("(allow file-read* (subpath \"/workspace/crate\"))"));
+        assert!(!no_text.contains("network"));
+    }
 }

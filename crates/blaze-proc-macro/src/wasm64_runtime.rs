@@ -2161,6 +2161,7 @@ mod tests {
             dir: dir.clone(),
             compiled: dir.join("compiled"),
             native_dylib: None,
+            native_bin: None,
         };
 
         let rt = Runtime::new(blaze_own::testing::heap()).expect("Runtime initializes");

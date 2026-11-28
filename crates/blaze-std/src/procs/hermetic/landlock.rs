@@ -115,13 +115,14 @@ impl Prepared {
 /// closure use that exact opened descriptor and the child executes it via `execveat(...,
 /// AT_EMPTY_PATH)`.
 pub fn prepare(plan: &Plan<'_>, budget: Budget, processes: bool) -> Result<Prepared, Fault> {
-    prepare_with_exec(plan, budget, processes, None, None)
+    prepare_with_exec(plan, budget, processes, false, None, None)
 }
 
 pub(super) fn prepare_with_exec(
     plan: &Plan<'_>,
     budget: Budget,
     processes: bool,
+    deny_signals: bool,
     exec_fd: Option<Fd>,
     alloc: Option<Alloc<'_>>,
 ) -> Result<Prepared, Fault> {
@@ -183,7 +184,8 @@ pub(super) fn prepare_with_exec(
         }
     }
     let mut filter = [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; MOST_FILTER];
-    let filter_len = confine::build(Filter { processes }, &mut filter).len();
+    let scope_signals = deny_signals || (!processes && abi < 6);
+    let filter_len = confine::build_scoped(Filter { processes }, scope_signals, &mut filter).len();
     let seconds = budget.cpu.as_secs() + u64::from(budget.cpu.subsec_nanos() > 0);
     let limits = [
         (Resource::Cpu, Rlimit { soft: seconds.max(1), hard: seconds.max(1) + 1 }),
@@ -421,7 +423,8 @@ fn walk_nix_elf_closure(
     let Ok(interp_cstr) = CStr::from_bytes_until_nul(&interp_c) else {
         return Ok(false);
     };
-    // Check whether the ELF interpreter symlinks into `/nix/store/` (NixOS).
+    // Check whether the ELF interpreter is in `/nix/store/` (either directly, as a Nix-built
+    // executable's `PT_INTERP`, or via symlink such as `/lib/ld-linux-*.so.*` -> `nix-ld`).
     // Propagate filesystem/permission errors on `readlinkat` rather than treating them as
     // non-NixOS (only `EINVAL`, a regular non-symlink interpreter file, means non-symlink).
     let mut link_buf = [0u8; 512];
@@ -431,7 +434,7 @@ fn walk_nix_elf_closure(
             let nix_ld = nix && target.windows(6).any(|w| w == b"nix-ld");
             (nix, nix_ld)
         }
-        Err(blaze_sys::Errno::Inval) => (false, false),
+        Err(blaze_sys::Errno::Inval) => (interp_cstr.to_bytes().starts_with(b"/nix/store/"), false),
         Err(errno) => {
             return Err(Fault::Host { call: "readlinkat (nix ELF PT_INTERP)", code: errno.raw() });
         }
@@ -547,6 +550,9 @@ fn walk_nix_elf_closure(
             let slash = resolved.iter().rposition(|&b| b == b'/')?;
             resolved.get(..=slash)
         })
+    } else if is_nix {
+        let interp = interp_cstr.to_bytes();
+        interp.iter().rposition(|&b| b == b'/').and_then(|slash| interp.get(..=slash))
     } else {
         None
     };
@@ -2091,7 +2097,7 @@ impl Confiner for Landlock {
         let Program::Stored { path, .. } = spec.program() else {
             return Err(Fault::RecordsNeedExecution);
         };
-        let prepared = prepare_with_exec(plan, spec.budget(), spec.starts_programs(), spec.verified_exec_fd(), Some(alloc))?;
+        let prepared = prepare_with_exec(plan, spec.budget(), spec.starts_programs(), false, spec.verified_exec_fd(), Some(alloc))?;
         // `prepared` (the ruleset descriptor, the filter, the limits, and any verified exec fd)
         // lives until the start returns, by which time the child has exec'd (CLONE_VFORK) and
         // holds its own domain.

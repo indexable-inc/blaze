@@ -182,7 +182,7 @@ pub mod req;
 #[cfg(unix)]
 mod linked;
 #[cfg(target_os = "linux")]
-pub use self::linked::run::{TestSandbox, UNWOUND_FD, UnwoundChannel};
+pub use self::linked::run::{ChildConfine, TestSandbox, UNWOUND_FD, UnwoundChannel};
 #[cfg(unix)]
 pub use self::linked::{
     BorrowedFd, Exit, Linked, LinkedSpec, Spawner, Waited,

@@ -200,6 +200,10 @@ pub struct ProcMacros<'r> {
     /// Warm pool of native `rust-analyzer-proc-macro-srv` workers for zero-Wasm `.dylib`/`.so`
     /// proc-macro modules (D175 fast path; spawned lazily only when a native module runs).
     native_pool: Arc<crate::native_bridge::NativeServerPool>,
+    /// Warm pool of confined Tier-2 standalone `native.bin` proc-macro workers speaking Blaze's
+    /// binary bridge RPC over `CHILD_FD` (zero `rustc`, zero `rust-analyzer-proc-macro-srv`,
+    /// zero `dlopen`; spawned lazily only when a `native.bin` module runs).
+    native_bin_pool: crate::native_bin::NativeBinPool,
     /// Whether the built-in comptime patch library (`crate::comptime_patch`: `serde_derive`,
     /// `bytemuck_derive`, `thiserror-impl`, `derive_more`, `strum_macros`, `paste`) is enabled.
     /// Enabled by default; disable with `BLAZE_NO_COMPTIME_PATCH=1` or [`Self::set_comptime_patch`].
@@ -248,6 +252,7 @@ impl<'r> ProcMacros<'r> {
             crates: Vec::new(),
             findings: Mutex::new(Vec::new()),
             native_pool: Arc::new(crate::native_bridge::NativeServerPool::new()),
+            native_bin_pool: crate::native_bin::NativeBinPool::standard(),
             comptime_patch_enabled,
             patch_hits: AtomicU64::new(0),
             patch_fallbacks: AtomicU64::new(0),
@@ -425,18 +430,21 @@ impl<'r> ProcMacros<'r> {
     /// load is reported once, as its first call would. Gives how many modules were compiled
     /// (the rest came from their compiled records).
     pub fn load_all(&self, workers: usize) -> Result<u64, RuntimeError> {
-        // Skip native `.dylib` modules — they expand directly via `NativeServerPool` (zero Wasmtime!).
+        // Skip native `.dylib` and Tier-2 `native.bin` modules — they do not run in Wasmtime.
         let modules: Vec<&ModuleRecord> = self
             .crates
             .iter()
             .filter_map(|it| it.module.as_ref().ok())
-            .filter(|m| m.native_dylib.is_none())
+            .filter(|m| m.native_dylib.is_none() && m.native_bin.is_none())
             .collect();
         if modules.is_empty() {
             return Ok(0);
         }
         let before = self.runtime.compiles();
-        let with = self.crates.iter().filter(|it| it.module.as_ref().is_ok_and(|m| m.native_dylib.is_none()));
+        let with = self
+            .crates
+            .iter()
+            .filter(|it| it.module.as_ref().is_ok_and(|m| m.native_dylib.is_none() && m.native_bin.is_none()));
         for (macro_crate, loaded) in with.zip(self.runtime.load_all(&modules, workers)?) {
             if let Err(error) = loaded
                 && !macro_crate.reported.swap(true, Ordering::Relaxed)
@@ -488,7 +496,7 @@ impl<'r> ProcMacros<'r> {
             }
             return Some(Finding::NoSuchMacro { krate: macro_crate.label.clone(), name: name.to_owned(), kind });
         }
-        if module.native_dylib.is_some() {
+        if module.native_dylib.is_some() || module.native_bin.is_some() {
             return None;
         }
         match macro_crate.loaded(self.runtime, module) {
@@ -572,6 +580,130 @@ impl<'r> ProcMacros<'r> {
                 return Err(failed);
             }
         };
+        // Tier-2 confined standalone native executable (`native.bin`): runs under Landlock + seccomp
+        // (Linux) or Seatbelt (macOS) with strictly read-only scoped roots, speaking Blaze's own
+        // binary `Server` bridge RPC over `CHILD_FD` (zero rustc, zero dlopen). Every file/dir
+        // readable under the granted roots is snapshotted into `Produced.reads` before caching.
+        if let Some(ref native_bin) = module.native_bin {
+            let listed_dir: Option<blaze_own::AString<'_>>;
+            let member_joined;
+            let (raw_manifest_dir, raw_workspace_root): (Option<&Path>, Option<&Path>) = match &package.files {
+                crate::sandbox::Files::Folder(dir) => (Some(dir.as_path()), None),
+                crate::sandbox::Files::Member { workspace, root } => {
+                    let seen = root.seen().to_string();
+                    let rel = seen.strip_prefix("/workspace").unwrap_or("").trim_start_matches('/');
+                    let base = if workspace.as_os_str().is_empty() {
+                        Path::new(".")
+                    } else {
+                        workspace.as_path()
+                    };
+                    if rel.is_empty() {
+                        (Some(base), Some(base))
+                    } else {
+                        member_joined = base.join(rel);
+                        (Some(member_joined.as_path()), Some(base))
+                    }
+                }
+                crate::sandbox::Files::Listed(listed) => {
+                    if let Some((sub, commit)) = listed.iter().find_map(|(p, b)| match b {
+                        crate::sandbox::ListedBytes::Submodule(c) => Some((p.as_str(), *c)),
+                        _ => None,
+                    }) {
+                        let mut hex = blaze_own::AString::new_in(alloc);
+                        for byte in commit {
+                            let _ = core::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+                        }
+                        let mut why = blaze_own::AString::new_in(alloc);
+                        let _ = core::fmt::Write::write_fmt(
+                            &mut why,
+                            format_args!(
+                                "package contains unpopulated git submodule `{sub}` at commit {hex}; native proc-macro materialization refuses unpopulated submodules"
+                            ),
+                        );
+                        let expand_err = ExpandError {
+                            krate: macro_crate.label.as_str().into(),
+                            name: export.name.as_str().into(),
+                            error: CallError::Failed(why.as_str().into()),
+                        };
+                        let refused = RunRefused {
+                            host: expand_err.error.host_error(),
+                            call: Some(CallError::Failed(why.as_str().into())),
+                        };
+                        self.report(Finding::Call { base, error: expand_err });
+                        return Err(refused);
+                    }
+                    let base_dir = native_manifest_stage_root();
+                    let seq = self.stage_seq.fetch_add(1, Ordering::Relaxed);
+                    listed_dir = materialize_listed_in(&base_dir, &package.files, seq, alloc);
+                    (listed_dir.as_deref().map(Path::new), None)
+                }
+            };
+            let canon_str = |p: &Path| -> Option<blaze_own::AString<'_>> {
+                let resolved = fs::canonicalize(p).ok()?;
+                let text = resolved.to_str()?;
+                Some(blaze_own::AString::from_str_in(text, alloc))
+            };
+            let canon_bin = fs::canonicalize(native_bin).unwrap_or_else(|_| native_bin.to_path_buf());
+            let canon_manifest = raw_manifest_dir.and_then(&canon_str);
+            let canon_workspace = raw_workspace_root.and_then(&canon_str);
+            // Grant the full served tree root read-only (for `Files::Member`, the full workspace
+            // root so sibling reads like `../shared/schema.sql` match Wasm's `/workspace` view;
+            // for `Files::Folder`/`Files::Listed`, the package root) and snapshot that exact root
+            // (`Path::new("")`) pre+post in `NativeBinServer::expand` (marking uncacheable if the
+            // bounded snapshot cap is exceeded or any file mutates mid-expansion).
+            let mut read_roots: blaze_own::AVec<'_, &str> = blaze_own::AVec::new_in(alloc);
+            let mut granted_rel_roots: blaze_own::AVec<'_, &Path> = blaze_own::AVec::new_in(alloc);
+            if let Some(ref ws) = canon_workspace {
+                read_roots.push(ws.as_str());
+                granted_rel_roots.push(Path::new(""));
+            } else if let Some(ref m) = canon_manifest {
+                read_roots.push(m.as_str());
+                granted_rel_roots.push(Path::new(""));
+            }
+            let paths = crate::native_bin::NativePaths {
+                manifest_dir: canon_manifest.as_deref(),
+                workspace_root: canon_workspace.as_deref(),
+            };
+            use crate::ShareArc as _;
+            match self.native_bin_pool.expand(
+                &canon_bin,
+                &module.wasm_sha256,
+                read_roots.as_slice(),
+                granted_rel_roots.as_slice(),
+                export,
+                call,
+                edition,
+                crate::sandbox::Sandbox::new(package.share_arc()),
+                self.limits,
+                paths,
+                self.runtime.heap().alloc(),
+                alloc,
+            ) {
+                Ok(crate::native_bin::NativeBinExpand { produced, cacheable }) => {
+                    if cacheable {
+                        let mut mark = parts.start();
+                        let kept = slot.results.insert(self.store, base, &produced);
+                        mark.lap(Part::Keep);
+                        if let Err(error) = kept {
+                            self.report(Finding::Record { base, error });
+                        }
+                    }
+                    return Ok(produced);
+                }
+                Err(error) => {
+                    let host_err = error.host_error();
+                    let copy = copy_call_error(&error);
+                    let expand_err = ExpandError {
+                        krate: macro_crate.label.as_str().into(),
+                        name: export.name.as_str().into(),
+                        error: copy,
+                    };
+                    let refused = RunRefused { host: host_err, call: Some(error) };
+                    self.report(Finding::Call { base, error: expand_err });
+                    return Err(refused);
+                }
+            }
+        }
         // Native zero-Wasm fast path (D175): expand directly via `NativeServerPool` on host `.dylib`/`.so`.
         if let Some(ref dylib) = module.native_dylib {
             let listed_dir: Option<blaze_own::AString<'_>>;
@@ -617,7 +749,7 @@ impl<'r> ProcMacros<'r> {
                     // Materialize all safe relative files from the fetched crate once by content
                     // digest so proc macros (`proc-macro-crate`, `i18n-embed-fl`, `jsonrpsee`,
                     // `rust-embed`, etc.) can read any package file under `$CARGO_MANIFEST_DIR`.
-                    let base = std::env::temp_dir().join("blaze-pm-manifests");
+                    let base = native_manifest_stage_root();
                     let seq = self.stage_seq.fetch_add(1, Ordering::Relaxed);
                     listed_dir = materialize_listed_in(&base, &package.files, seq, alloc);
                     listed_dir.as_deref().map(Path::new)
@@ -790,6 +922,22 @@ impl<C: ExpandCx> ExpandCx for ProcCx<'_, '_, C> {
 
     fn run_proc_macro<'a>(&self, def: &MacroDefinition<'_>, call: ProcCall<'_>, alloc: Alloc<'a>) -> Result<Produced<'a>, HostError> {
         self.procs.run(def, &call, self.edition, &self.package, alloc)
+    }
+}
+
+fn native_manifest_stage_root() -> std::path::PathBuf {
+    std::env::temp_dir().join("blaze-pm-manifests")
+}
+
+fn copy_call_error(err: &CallError) -> CallError {
+    match err {
+        CallError::Limit { limit, why } => CallError::Limit { limit: *limit, why: why.as_str().into() },
+        CallError::Refused(why) => CallError::Refused(why.as_str().into()),
+        CallError::EnvUnknown(refused) => CallError::EnvUnknown(crate::package_env::EnvRefused {
+            name: refused.name.as_str().into(),
+            krate: refused.krate.as_deref().map(Into::into),
+        }),
+        CallError::Failed(why) => CallError::Failed(why.as_str().into()),
     }
 }
 
@@ -1017,6 +1165,7 @@ mod listed_dir_tests {
             dir: std::path::PathBuf::new(),
             compiled: std::path::PathBuf::new(),
             native_dylib: None,
+            native_bin: None,
         };
         let exported = vec![Exported { index: 0, kind: ProcKind::Derive, name: "Template".into(), helpers: vec!["template".into()] }];
         procs.add_crate(key_with, "askama_macros", "0.15.6", Ok(mk("askama_macros", exported.clone())));

@@ -6882,6 +6882,7 @@ pub fn pkg_version(_input: TokenStream) -> TokenStream {\n\
             dir: mod_dir.clone(),
             compiled: mod_dir.join("compiled"),
             native_dylib: None,
+            native_bin: None,
         };
         let rt = blaze_proc_macro::host::Runtime::new(heap).expect("Runtime");
         let loaded = rt.load(&record).expect("load proc-macro");

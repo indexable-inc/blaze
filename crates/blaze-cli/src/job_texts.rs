@@ -741,6 +741,7 @@ mod tests {
             dir: std::path::PathBuf::new(),
             compiled: std::path::PathBuf::new(),
             native_dylib: None,
+            native_bin: None,
         }
     }
 

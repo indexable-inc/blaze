@@ -83,6 +83,11 @@ fn hostile_child() {
             }
             return;
         }
+        #[cfg(target_os = "linux")]
+        "@served_confined" => {
+            run_served_confined_child();
+            return;
+        }
         _ => {}
     }
     let said = match std::fs::read(&path) {
@@ -411,5 +416,220 @@ blaze_sim::kind_test! {
             assert_eq!(attempt(&folder.path("inside/inside.txt")), "D177 READ OK");
             assert!(attempt(&folder.path("outside.txt")).starts_with("D177 READ REFUSED"));
         });
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_served_confined_child() {
+    use blaze_sys::{
+        Fd,
+        linux::{Family, SockFlags, SockKind, read, socket, write},
+    };
+    let fd = Fd::new(i32::try_from(crate::procs::CHILD_FD).expect("CHILD_FD fits i32"));
+    let read_exact = |buf: &mut [u8]| -> bool {
+        let mut at = 0usize;
+        while at < buf.len() {
+            match read(fd, &mut buf[at..]) {
+                Ok(0) => return false,
+                Ok(n) => at += n,
+                Err(blaze_sys::Errno::Intr) => continue,
+                Err(_) => return false,
+            }
+        }
+        true
+    };
+    let write_all = |bytes: &[u8]| {
+        let mut at = 0usize;
+        while at < bytes.len() {
+            match write(fd, &bytes[at..]) {
+                Ok(0) => break,
+                Ok(n) => at += n,
+                Err(blaze_sys::Errno::Intr) => continue,
+                Err(_) => break,
+            }
+        }
+    };
+    loop {
+        let mut hdr = [0u8; 4];
+        if !read_exact(&mut hdr) {
+            break;
+        }
+        let len = usize::try_from(u32::from_be_bytes(hdr)).expect("len");
+        let mut body = alloc::vec![0u8; len];
+        if !read_exact(&mut body) {
+            break;
+        }
+        let req = core::str::from_utf8(&body).expect("utf8 req");
+        let reply = if req == "ping" {
+            String::from("pong")
+        } else {
+            let mut lines = req.lines();
+            let inside = lines.next().expect("inside path");
+            let outside = lines.next().expect("outside path");
+            let write_target = lines.next().expect("write path");
+            let parent_pid: i32 = lines.next().expect("parent pid").parse().expect("pid int");
+
+            let r_in = match std::fs::read(inside) {
+                Ok(b) if b == b"inside" => "ok",
+                Ok(_) => "wrong",
+                Err(_) => "err",
+            };
+            let r_out = match std::fs::read(outside) {
+                Ok(_) => "allowed",
+                Err(e) if e.raw_os_error() == Some(13) => "eacces",
+                Err(_) => "other_err",
+            };
+            let w_in = match std::fs::write(write_target, b"blocked") {
+                Ok(()) => "allowed",
+                Err(e) if e.raw_os_error() == Some(13) => "eacces",
+                Err(_) => "other_err",
+            };
+            let sock = match socket(Family::V4, SockKind::Stream, SockFlags::CLOSE_ON_EXEC) {
+                Ok(_) => "allowed",
+                Err(blaze_sys::Errno::Perm) => "eperm",
+                Err(_) => "other_err",
+            };
+            let sig = match blaze_sys::linux::kill(parent_pid, 0) {
+                Ok(()) => "allowed",
+                Err(blaze_sys::Errno::Perm) => "eperm",
+                Err(_) => "other_err",
+            };
+            let panic_caught = if std::panic::catch_unwind(|| panic!("contained")).is_err() {
+                "ok"
+            } else {
+                "missed"
+            };
+            let thr = std::thread::spawn(|| 40u32 + 2u32).join().expect("thread join");
+            std::format!(
+                "read_inside={r_in};read_outside={r_out};write_inside={w_in};socket_inet={sock};kill_parent={sig};panic_caught={panic_caught};thread={thr}"
+            )
+        };
+        let reply_bytes = reply.as_bytes();
+        let reply_len = u32::try_from(reply_bytes.len()).expect("reply len");
+        write_all(&reply_len.to_be_bytes());
+        write_all(reply_bytes);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn start_served_confined_enforces_readonly_landlock_and_seccomp_over_child_fd() {
+    use crate::{
+        args::ArgList,
+        env::Vars,
+        io::{Io, Limits, NativeWorld},
+        mem::TASK_FRAME,
+        procs::{Input, Message, Output, PREFIX, ParentDeath, RunChild as _, RunSpec, Streams},
+    };
+
+    let folder = Folder::new("served-confined");
+    let exe = this_binary();
+    let inside_dir = folder.path("inside");
+    let inside_file = folder.path("inside/inside.txt");
+    let outside_file = folder.path("outside.txt");
+    let write_target = folder.path("inside/should_fail.txt");
+
+    let io = Io::native(NativeWorld {
+        root: Path::new("/"),
+        threads: 1,
+        env: Vars::given(StdVec::new()),
+        args: ArgList::given(StdVec::new()),
+        host_name: alloc::sync::Arc::from(""),
+        seed: Some(0),
+        above: 0,
+        limits: Limits::USUAL,
+    })
+    .expect("native world");
+    let spawner = io.need_host().expect("host").spawner().expect("spawner");
+    let cx = io.cx(Duration::from_secs(30), TASK_FRAME).expect("cx");
+
+    let budget = Budget { cpu: Duration::from_secs(10), memory: 4 << 30, steps: None };
+    let prepared = super::prepare_read_only(&exe, &[&inside_dir], budget, heap()).expect("prepare_read_only");
+    let env = [(ATTEMPT, "@served_confined")];
+    let spec = RunSpec {
+        program: &exe,
+        arg0: None,
+        args: &CHILD_ARGS,
+        env: &env,
+        dir: &inside_dir,
+        streams: Streams { stdin: Input::Null, stdout: Output::Null, stderr: Output::Null },
+        own_group: false,
+        parent_death: ParentDeath::Channel,
+    };
+    let started = spawner
+        .start_served_confined(&cx, &spec, &prepared.confine())
+        .expect("start_served_confined");
+    let mut child = started.child;
+
+    let send_and_recv = |child: &mut crate::procs::Served, payload: &str| -> String {
+        let mut frame = StdVec::new();
+        frame.extend_from_slice(&u32::try_from(payload.len()).expect("len").to_be_bytes());
+        frame.extend_from_slice(payload.as_bytes());
+        let deadline = Deadline::after(child.now(), Duration::from_secs(10));
+        child.send(&frame, deadline).expect("send");
+        let mut inbox = blaze_own::Vec::new_in(heap());
+        let Message::Whole { len } = child.recv_message(&mut inbox, 1 << 20, deadline).expect("recv") else {
+            panic!("expected whole reply message");
+        };
+        core::str::from_utf8(&inbox[PREFIX..len]).expect("utf8 reply").into()
+    };
+
+    let parent_pid = std::process::id();
+    let req = std::format!("{inside_file}\n{outside_file}\n{write_target}\n{parent_pid}");
+    let reply = send_and_recv(&mut child, &req);
+    assert_eq!(
+        reply,
+        "read_inside=ok;read_outside=eacces;write_inside=eacces;socket_inet=eperm;kill_parent=eperm;panic_caught=ok;thread=42",
+        "unexpected confined child report: {reply}"
+    );
+    // Second round-trip proves persistent bidirectional IPC over CHILD_FD stays healthy.
+    assert_eq!(send_and_recv(&mut child, "ping"), "pong");
+
+    let reaped = child.kill().expect("kill and reap confined child");
+    assert!(matches!(reaped.exit, crate::procs::Exit::Signaled(_) | crate::procs::Exit::Exited(_)));
+}
+
+#[test]
+fn start_served_read_only_rejects_unmetered_steps_budget() {
+    use crate::{
+        args::ArgList,
+        env::Vars,
+        io::{Io, Limits, NativeWorld},
+        mem::TASK_FRAME,
+        procs::{Input, Output, ParentDeath, RunSpec, Streams},
+    };
+
+    let io = Io::native(NativeWorld {
+        root: Path::new("/"),
+        threads: 1,
+        env: Vars::given(StdVec::new()),
+        args: ArgList::given(StdVec::new()),
+        host_name: alloc::sync::Arc::from(""),
+        seed: Some(0),
+        above: 0,
+        limits: Limits::USUAL,
+    })
+    .expect("native world");
+    let spawner = io.need_host().expect("host").spawner().expect("spawner");
+    let cx = io.cx(Duration::from_secs(5), TASK_FRAME).expect("cx");
+    let exe = this_binary();
+    let spec = RunSpec {
+        program: &exe,
+        arg0: None,
+        args: &[],
+        env: &[],
+        dir: "/",
+        streams: Streams { stdin: Input::Null, stdout: Output::Null, stderr: Output::Null },
+        own_group: false,
+        parent_death: ParentDeath::Channel,
+    };
+
+    for steps in [Some(100), Some(0)] {
+        let budget = Budget { cpu: Duration::from_secs(5), memory: 1 << 30, steps };
+        let res = super::start_served_read_only(&spawner, &cx, &spec, &[], budget, heap());
+        assert!(
+            matches!(res, Err(Fault::StepsNotMetered)),
+            "expected StepsNotMetered for steps={steps:?}"
+        );
     }
 }
