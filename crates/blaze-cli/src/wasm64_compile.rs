@@ -2184,52 +2184,6 @@ fn checkout_package_from_member<'a>(
     package
 }
 
-/// Result of comparing a candidate `wasm_graph` unit's feature set against the requested
-/// `host_graph` feature set (`want_sorted_dedup`, sorted and deduplicated).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FeatureMatch {
-    /// Candidate is missing at least one requested feature.
-    Missing,
-    /// Candidate has the exact same feature set (`got == want`).
-    Exact,
-    /// Candidate contains every requested feature plus WASI-added features (`got ⊃ want`).
-    Superset,
-}
-
-fn classify_unit_features(unit: &Unit<'_>, want_sorted_dedup: &[&str], alloc: Alloc<'_>) -> FeatureMatch {
-    if unit.features.len() < want_sorted_dedup.len() {
-        return FeatureMatch::Missing;
-    }
-    let mut got: AVec<'_, &str> = OwnVec::with_capacity_in(unit.features.len(), alloc);
-    for f in unit.features.iter() {
-        got.push(f.as_str());
-    }
-    got.sort_unstable();
-    got.dedup();
-    if got.len() < want_sorted_dedup.len() {
-        return FeatureMatch::Missing;
-    }
-    let mut gi = 0usize;
-    for &want in want_sorted_dedup {
-        while let Some(&g) = got.get(gi) {
-            if g < want {
-                gi += 1;
-            } else {
-                break;
-            }
-        }
-        if got.get(gi).copied() != Some(want) {
-            return FeatureMatch::Missing;
-        }
-        gi += 1;
-    }
-    if got.len() == want_sorted_dedup.len() {
-        FeatureMatch::Exact
-    } else {
-        FeatureMatch::Superset
-    }
-}
-
 /// Locates the matching `BuildScript` or `ProcMacro` unit in `wasm_graph` corresponding to
 /// `root_unit` in `host_graph`, preserving distinct `HostFeatureSide` namespaces and requiring
 /// every host-resolved feature to be present in `wasm_graph`.
@@ -2277,13 +2231,13 @@ fn locate_root_in_wasm_graph(
         {
             continue;
         }
-        match classify_unit_features(u, want_root_feats.as_slice(), alloc) {
-            FeatureMatch::Missing => {}
-            FeatureMatch::Exact => {
+        match blaze_proc_macro::module::classify_unit_features(u, want_root_feats.as_slice(), alloc) {
+            blaze_proc_macro::module::FeatureMatch::Missing => {}
+            blaze_proc_macro::module::FeatureMatch::Exact => {
                 exact_idx.get_or_insert(i);
                 exact_count += 1;
             }
-            FeatureMatch::Superset => {
+            blaze_proc_macro::module::FeatureMatch::Superset => {
                 superset_idx.get_or_insert(i);
                 superset_count += 1;
             }
@@ -5969,6 +5923,252 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
                 .expect("exact ProcMacro root must match"),
             UnitId(2)
         );
+    }
+
+    /// End-to-end `Resolution::new` + `Resolution::for_host_units` regression for the `libc 0.2.191`
+    /// / `rustix` failure: on Linux host, `rustix_like`'s `libc` dep is optional and off so
+    /// `libc (BuildScript, Host)` resolves with `["default", "std"]`; on `wasm64-blaze-wasip1`,
+    /// `rustix_like`'s WASI-gated non-optional `libc` dep activates `libc?/extra_traits`, unifying
+    /// `["default", "extra_traits", "std"]` onto `libc (BuildScript, Host)`.
+    /// Includes a negative control removing the WASI-gated `libc` edge to prove causality.
+    #[test]
+    fn locate_root_in_wasm_graph_resolves_wasi_unified_libc_feature_superset_via_resolution() {
+        use blaze_manifest::layout::DepKind;
+        use blaze_unit_graph::{
+            Ask, Dep, DepSource, FeatureDef, FeatureValue, HostFeatureSide, HostUnitAsk,
+            HostUnitKind, Lib, PackageMeta, Platform, Resolution, Resolver, TargetDesc,
+        };
+
+        let frame = Frame::with_reserve(8 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let a = erased.handle();
+        let t = |s: &str| Text::from_str_in(s, a);
+
+        let lock_text = "\
+version = 4
+
+[[package]]
+name = \"app\"
+version = \"0.1.0\"
+dependencies = [
+ \"host_user\",
+ \"rustix_like\",
+]
+
+[[package]]
+name = \"host_user\"
+version = \"0.1.0\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+checksum = \"1111111111111111111111111111111111111111111111111111111111111111\"
+dependencies = [
+ \"libc\",
+]
+
+[[package]]
+name = \"libc\"
+version = \"0.2.191\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+checksum = \"2222222222222222222222222222222222222222222222222222222222222222\"
+
+[[package]]
+name = \"rustix_like\"
+version = \"0.38.44\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+checksum = \"3333333333333333333333333333333333333333333333333333333333333333\"
+dependencies = [
+ \"libc\",
+]
+";
+        let lock = Lock::read(lock_text.as_bytes(), a).expect("parse lock");
+        let app_id = lock.named("app").next().expect("app");
+        let host_user_id = lock.named("host_user").next().expect("host_user");
+        let libc_id = lock.named("libc").next().expect("libc");
+        let rustix_id = lock.named("rustix_like").next().expect("rustix_like");
+
+        let linux_desc = {
+            let mut cfg = OwnVec::new_in(a);
+            cfg.push(CfgAtom::pair("target_os", "linux", a));
+            cfg.push(CfgAtom::pair("target_arch", "aarch64", a));
+            cfg.push(CfgAtom::pair("target_family", "unix", a));
+            TargetDesc::new("aarch64-unknown-linux-gnu", cfg, a)
+        };
+        let wasi_desc = {
+            let mut cfg = OwnVec::new_in(a);
+            cfg.push(CfgAtom::pair("target_os", "wasi", a));
+            cfg.push(CfgAtom::pair("target_env", "p1", a));
+            cfg.push(CfgAtom::pair("target_arch", "wasm64", a));
+            TargetDesc::new(WASM64_TARGET, cfg, a)
+        };
+
+        let mk_feat = |name: &str, vals: &[&str]| -> FeatureDef<'_> {
+            let mut vs = OwnVec::new_in(a);
+            for &v in vals {
+                vs.push(FeatureValue::parse(v, a));
+            }
+            FeatureDef { name: t(name), values: vs }
+        };
+        let mk_dep = |name: &str, kind: DepKind, platform: Option<&str>, optional: bool, default_features: bool| -> Dep<'_> {
+            Dep {
+                key: t(name),
+                package: t(name),
+                kind,
+                platform: platform.map(|p| Platform::parse(p, a)),
+                optional,
+                default_features,
+                features: OwnVec::new_in(a),
+                source: DepSource::Registry { req: None },
+            }
+        };
+        fn mk_pkg<'a>(
+            name: &str,
+            has_build: bool,
+            feats: &mut [FeatureDef<'a>],
+            deps: OwnVec<Dep<'a>, Alloc<'a>>,
+            a: Alloc<'a>,
+        ) -> Package<'a> {
+            feats.sort_by(|x, y| x.name.as_str().cmp(y.name.as_str()));
+            let mut fvec = OwnVec::with_capacity_in(feats.len(), a);
+            for f in feats.iter() {
+                fvec.push(f.clone());
+            }
+            Package {
+                name: Text::from_str_in(name, a),
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                lib: Some(Lib {
+                    crate_name: Text::from_str_in(name, a),
+                    root: Text::from_str_in("src/lib.rs", a),
+                    proc_macro: false,
+                }),
+                bins: OwnVec::new_in(a),
+                extras: OwnVec::new_in(a),
+                build: has_build.then(|| Text::from_str_in("build.rs", a)),
+                links: None,
+                features: fvec,
+                deps,
+                meta: PackageMeta::unstated(a),
+                patched_from: OwnVec::new_in(a),
+            }
+        }
+
+        let resolve_pair = |with_wasi_libc_edge: bool| -> (UnitGraph<'_>, UnitGraph<'_>) {
+            let mut app_deps = OwnVec::new_in(a);
+            app_deps.push(mk_dep("host_user", DepKind::Build, None, false, true));
+            app_deps.push(mk_dep("rustix_like", DepKind::Build, None, false, true));
+            let app_pkg = mk_pkg("app", true, &mut [], app_deps, a);
+
+            let mut host_user_deps = OwnVec::new_in(a);
+            host_user_deps.push(mk_dep("libc", DepKind::Normal, None, false, true));
+            let host_user_pkg = mk_pkg("host_user", false, &mut [], host_user_deps, a);
+
+            let mut libc_feats = [
+                mk_feat("default", &["std"]),
+                mk_feat("extra_traits", &[]),
+                mk_feat("std", &[]),
+            ];
+            let libc_pkg = mk_pkg("libc", true, &mut libc_feats, OwnVec::new_in(a), a);
+
+            let mut rustix_deps = OwnVec::new_in(a);
+            rustix_deps.push(mk_dep("libc", DepKind::Normal, Some("cfg(target_os = \"linux\")"), true, false));
+            if with_wasi_libc_edge {
+                rustix_deps.push(mk_dep("libc", DepKind::Normal, Some("cfg(target_os = \"wasi\")"), false, false));
+            }
+            let mut rustix_feats = [
+                mk_feat("default", &["std", "libc-extra-traits"]),
+                mk_feat("libc", &["dep:libc"]),
+                mk_feat("libc-extra-traits", &["libc?/extra_traits"]),
+                mk_feat("std", &["libc?/std"]),
+            ];
+            let rustix_pkg = mk_pkg("rustix_like", false, &mut rustix_feats, rustix_deps, a);
+
+            let mut ask_roots = OwnVec::new_in(a);
+            ask_roots.push(app_id);
+            let ask = Ask { roots: ask_roots, features: OwnVec::new_in(a), all_features: false, no_default_features: false, tests: false };
+            let mut host_res = Resolution::new(&lock, &linux_desc, &linux_desc, &ask, Resolver::V2, a);
+            host_res.member(app_id, app_pkg).expect("app");
+            host_res.package(host_user_id, Some(host_user_pkg)).expect("host_user");
+            host_res.package(libc_id, Some(libc_pkg)).expect("libc");
+            host_res.package(rustix_id, Some(rustix_pkg)).expect("rustix_like");
+            let host_graph = match host_res.pass().expect("host pass") {
+                GraphPass::Done(g) => g,
+                _ => panic!("expected Done on Linux host resolution"),
+            };
+
+            let mut wasm_roots: AVec<'_, HostUnitAsk<'_>> = OwnVec::new_in(a);
+            for (idx, unit) in host_graph.units.iter().enumerate() {
+                let kind = match unit.kind {
+                    UnitKind::BuildScript => HostUnitKind::BuildScript,
+                    UnitKind::ProcMacro => HostUnitKind::ProcMacro,
+                    _ => continue,
+                };
+                let uid = u32::try_from(idx).expect("uid fits");
+                let mut features: AVec<'_, Text<'_>> = OwnVec::with_capacity_in(unit.features.len(), a);
+                for feat in unit.features.iter() {
+                    features.push(t(feat.as_str()));
+                }
+                wasm_roots.push(HostUnitAsk {
+                    package: unit.package,
+                    kind,
+                    side: host_graph.host_unit_side(UnitId(uid)),
+                    features,
+                });
+            }
+            let mut wasm_res = Resolution::for_host_units(&lock, &wasi_desc, wasm_roots, host_graph.resolver, a);
+            host_res.move_packages_into(&mut wasm_res).expect("move packages");
+            let wasm_graph = match wasm_res.pass().expect("wasm64 pass") {
+                GraphPass::Done(g) => g,
+                _ => panic!("expected Done on wasm64 resolution"),
+            };
+            (host_graph, wasm_graph)
+        };
+
+        // Positive case: WASI-gated non-optional `rustix_like -> libc` activates `libc?/extra_traits`.
+        let (host_with, wasm_with) = resolve_pair(true);
+        let host_libc_bs = UnitId(
+            u32::try_from(
+                host_with
+                    .units
+                    .iter()
+                    .position(|u| u.package == libc_id && u.kind == UnitKind::BuildScript)
+                    .expect("host libc BuildScript"),
+            )
+            .expect("uid"),
+        );
+        assert_eq!(host_with.host_unit_side(host_libc_bs), HostFeatureSide::Host);
+        let host_feats: std::vec::Vec<&str> = host_with.units[host_libc_bs.index()].features.iter().map(|f| f.as_str()).collect();
+        assert_eq!(host_feats.as_slice(), &["default", "std"]);
+
+        let wasm_libc_bs = locate_root_in_wasm_graph(&host_with, &wasm_with, host_libc_bs, CompileMode::BuildScript, a)
+            .expect("WASI-unified libc BuildScript feature superset must locate cleanly");
+        assert_eq!(wasm_with.host_unit_side(wasm_libc_bs), HostFeatureSide::Host);
+        let wasm_feats: std::vec::Vec<&str> = wasm_with.units[wasm_libc_bs.index()].features.iter().map(|f| f.as_str()).collect();
+        assert_eq!(wasm_feats.as_slice(), &["default", "extra_traits", "std"]);
+
+        let superset_digest = script_unit::script_deps_digest(&host_with, Some(&wasm_with), &lock, host_libc_bs, |_| None)
+            .expect("digest ok")
+            .expect("WASI-added extra_traits on zero-dep libc must still produce a Rule 21 deps digest");
+
+        // Negative control: removing the WASI-gated `rustix_like -> libc` edge produces exact
+        // `["default", "std"]` in `wasm_graph` and `None` deps digest (proving causality & Rule 21).
+        let (host_without, wasm_without) = resolve_pair(false);
+        let host_libc_bs_exact = UnitId(
+            u32::try_from(
+                host_without
+                    .units
+                    .iter()
+                    .position(|u| u.package == libc_id && u.kind == UnitKind::BuildScript)
+                    .expect("host libc BuildScript without WASI edge"),
+            )
+            .expect("uid"),
+        );
+        let wasm_libc_bs_exact = locate_root_in_wasm_graph(&host_without, &wasm_without, host_libc_bs_exact, CompileMode::BuildScript, a)
+            .expect("exact libc BuildScript must locate cleanly");
+        let wasm_exact_feats: std::vec::Vec<&str> =
+            wasm_without.units[wasm_libc_bs_exact.index()].features.iter().map(|f| f.as_str()).collect();
+        assert_eq!(wasm_exact_feats.as_slice(), &["default", "std"]);
+        let exact_digest = script_unit::script_deps_digest(&host_without, Some(&wasm_without), &lock, host_libc_bs_exact, |_| None)
+            .expect("digest ok");
+        assert_eq!(exact_digest, None, "exact zero-dep libc match must stay None");
+        assert_ne!(Some(superset_digest), exact_digest);
     }
 
     #[test]

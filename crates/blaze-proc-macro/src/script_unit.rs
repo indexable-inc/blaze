@@ -224,6 +224,38 @@ pub fn script_deps_digest(
     Ok(script_deps_digest_with(graph, wasm_graph, lock, script, path_files, &frame)?.map(|s| s.as_str().to_owned()))
 }
 
+/// Resolved graph and root unit for walking a build script's dependency closure.
+/// Encodes the exact matching outcome so impossible states (such as a host fallback carrying
+/// WASI-added root features) cannot be represented.
+#[derive(Clone, Copy)]
+enum ScriptClosureSource<'g, 'u> {
+    HostFallback { graph: &'g UnitGraph<'u>, root: UnitId },
+    WasmExact { graph: &'g UnitGraph<'u>, root: UnitId },
+    WasmSuperset { graph: &'g UnitGraph<'u>, root: UnitId },
+}
+
+impl<'g, 'u> ScriptClosureSource<'g, 'u> {
+    fn graph(self) -> &'g UnitGraph<'u> {
+        match self {
+            Self::HostFallback { graph, .. } | Self::WasmExact { graph, .. } | Self::WasmSuperset { graph, .. } => graph,
+        }
+    }
+
+    fn root(self) -> UnitId {
+        match self {
+            Self::HostFallback { root, .. } | Self::WasmExact { root, .. } | Self::WasmSuperset { root, .. } => root,
+        }
+    }
+
+    fn is_wasm(self) -> bool {
+        matches!(self, Self::WasmExact { .. } | Self::WasmSuperset { .. })
+    }
+
+    fn has_extra_wasm_root_feats(self) -> bool {
+        matches!(self, Self::WasmSuperset { .. })
+    }
+}
+
 /// Like [`script_deps_digest`], accepting any `AsRef<str>` return from `path_files` (e.g. `&str`
 /// from a caller-side memoization cache) and allocating the returned hex digest in `alloc` so
 /// callers avoid global heap allocations on both cache hits and results.
@@ -249,7 +281,7 @@ pub fn script_deps_digest_with<S: AsRef<str>, A: core::alloc::Allocator>(
     // `UnitGraph`'s key only covers build-deps, rule 60: normal `.rs` edits never invalidate
     // `build.rs` modules). Any missing, ambiguous, or wrong-side match falls back to the host
     // graph + conservative lock walk instead of silently binding to another side's unit.
-    let (active_graph, active_root, resolved_wasm, has_extra_wasm_root_feats) = match wasm_graph {
+    let source = match wasm_graph {
         Some(wg) => {
             let want_side = graph.host_unit_side(script);
             let mut want_feats = blaze_own::Vec::with_capacity_in(root.features.len(), &frame);
@@ -286,21 +318,23 @@ pub fn script_deps_digest_with<S: AsRef<str>, A: core::alloc::Allocator>(
             if exact_count == 1
                 && let Some(uid) = exact_uid
             {
-                (wg, uid, true, false)
+                ScriptClosureSource::WasmExact { graph: wg, root: uid }
             } else if exact_count == 0
                 && superset_count == 1
                 && let Some(uid) = superset_uid
             {
-                (wg, uid, true, true)
+                ScriptClosureSource::WasmSuperset { graph: wg, root: uid }
             } else {
-                (graph, script, false, false)
+                ScriptClosureSource::HostFallback { graph, root: script }
             }
         }
-        None => (graph, script, false, false),
+        None => ScriptClosureSource::HostFallback { graph, root: script },
     };
 
+    let active_graph = source.graph();
+    let active_root = source.root();
     let active_root_unit = active_graph.units.get(active_root.index());
-    if resolved_wasm && !has_extra_wasm_root_feats && active_root_unit.is_none_or(|u| u.deps.is_empty()) {
+    if source.is_wasm() && !source.has_extra_wasm_root_feats() && active_root_unit.is_none_or(|u| u.deps.is_empty()) {
         return Ok(None);
     }
 
@@ -353,11 +387,11 @@ pub fn script_deps_digest_with<S: AsRef<str>, A: core::alloc::Allocator>(
         }
     };
 
-    let mut lock_seen = blaze_own::Vec::with_capacity_in(if resolved_wasm { 0 } else { lock.packages.len() }, &frame);
+    let mut lock_seen = blaze_own::Vec::with_capacity_in(if source.is_wasm() { 0 } else { lock.packages.len() }, &frame);
     let mut lock_stack = blaze_own::Vec::<LockId, _>::new_in(&frame);
-    if !resolved_wasm {
+    if !source.is_wasm() {
         lock_seen.resize(lock.packages.len(), false);
-        // Without an exact `wasm_graph` match, seed the lock walk from `root.package` so WASI-only
+        // Without a unique `wasm_graph` match, seed the lock walk from `root.package` so WASI-only
         // registry/git build-deps (absent from the host `UnitGraph`) still enter the digest.
         // Path packages NOT in `active_graph` are NEVER hashed via `path_files` here because
         // `Cargo.lock` mixes normal/dev/build deps and `UnitGraph`'s key only sweeps build-deps
@@ -376,7 +410,7 @@ pub fn script_deps_digest_with<S: AsRef<str>, A: core::alloc::Allocator>(
     }
 
     let mut lines = blaze_own::Vec::<blaze_own::String<&bstd::mem::Frame>, _>::new_in(&frame);
-    if has_extra_wasm_root_feats
+    if source.has_extra_wasm_root_feats()
         && let Some(active_root_unit) = active_root_unit
     {
         let mut root_feats = blaze_own::Vec::with_capacity_in(active_root_unit.features.len(), &frame);
@@ -407,7 +441,7 @@ pub fn script_deps_digest_with<S: AsRef<str>, A: core::alloc::Allocator>(
                 push_deps(bs_unit, &mut visited, &mut stack);
             }
         }
-        if !resolved_wasm
+        if !source.is_wasm()
             && let Some(slot) = lock_seen.get_mut(u.package.index())
             && !*slot
         {

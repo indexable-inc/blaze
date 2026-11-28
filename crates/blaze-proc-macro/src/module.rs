@@ -481,8 +481,8 @@ pub const MODULE_HEADER: &str = "blaze proc-macro module wasm64 11";
 
 /// Result of comparing a candidate `wasm_graph` unit's feature set against the requested
 /// `host_graph` feature set (`want_sorted_dedup`, sorted and deduplicated).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FeatureMatch {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FeatureMatch {
     /// Candidate is missing at least one requested feature.
     Missing,
     /// Candidate has the exact same feature set (`got == want`).
@@ -492,7 +492,7 @@ pub(crate) enum FeatureMatch {
 }
 
 /// Classifies `unit.features` against `want_sorted_dedup` without global heap allocation.
-pub(crate) fn classify_unit_features<A: core::alloc::Allocator + Copy>(
+pub fn classify_unit_features<A: core::alloc::Allocator + Copy>(
     unit: &blaze_unit_graph::Unit<'_>,
     want_sorted_dedup: &[&str],
     alloc: A,
@@ -578,14 +578,19 @@ pub fn deps_with_wasm_features<S: AsRef<str>, D: AsRef<str>, A: core::alloc::All
             }
         }
     }
+    #[derive(Clone, Copy)]
+    enum MatchedWasmRoot {
+        Exact(usize),
+        Superset(usize),
+    }
     let matched = if exact_count == 1 {
-        exact_idx.map(|i| (i, false))
+        exact_idx.map(MatchedWasmRoot::Exact)
     } else if exact_count == 0 && superset_count == 1 {
-        superset_idx.map(|i| (i, true))
+        superset_idx.map(MatchedWasmRoot::Superset)
     } else {
         None
     };
-    let Some((root_idx, has_extra_wasm_root_feats)) = matched else {
+    let Some(matched_root) = matched else {
         let root_pkg = lock.package(package);
         let mut version = blaze_own::String::new_in(alloc);
         let _ = write!(version, "{}", root_pkg.version);
@@ -593,6 +598,9 @@ pub fn deps_with_wasm_features<S: AsRef<str>, D: AsRef<str>, A: core::alloc::All
             name: root_pkg.name.as_str().to_owned(),
             version: version.as_str().to_owned(),
         });
+    };
+    let root_idx = match matched_root {
+        MatchedWasmRoot::Exact(i) | MatchedWasmRoot::Superset(i) => i,
     };
     let mut visited = blaze_own::Vec::with_capacity_in(wasm_graph.units.len(), alloc);
     visited.resize(wasm_graph.units.len(), false);
@@ -640,7 +648,7 @@ pub fn deps_with_wasm_features<S: AsRef<str>, D: AsRef<str>, A: core::alloc::All
         path_cache.push(None);
     }
     let mut rows = blaze_own::Vec::<blaze_own::String<A>, A>::new_in(alloc);
-    if has_extra_wasm_root_feats
+    if matches!(matched_root, MatchedWasmRoot::Superset(_))
         && let Some(root_u) = wasm_graph.units.get(root_idx)
     {
         let mut rfeats = blaze_own::Vec::with_capacity_in(root_u.features.len(), alloc);
