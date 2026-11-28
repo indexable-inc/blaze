@@ -1233,3 +1233,147 @@ dep::make_body_macro_fn!();
     assert!(errors.is_empty(), "the records filed {errors:?}");
     assert!(failed.is_empty(), "positive CallSite.ctx bodies failed: {failed:?}");
 }
+
+/// Recursive `macro_rules!` local hygiene on `TextMark` (`prost::encoding::varint!` pattern):
+/// Arm 1 emits a recursive call to Arm 2 passing its own `value` identifier (`to_uint64(value)`
+/// and `from_uint64(value)`), while Arm 2 declares parameter `value: &mut $ty`, binds
+/// `let $from_uint64_value: u64 = 42u64;`, and assigns `*value = $from_uint64;` (plus passes both
+/// `value`s through a body-level helper `id!($e)` to prove `lex_marked` + `as_outer_mark()`
+/// preserves Arm 1 vs Arm 2 distinctness).
+///
+/// Negative control: `varint_same_arm!` binds `let value: u64 = 42u64;` and derefs `*value` in
+/// the SAME expansion arm and MUST fail with `CantDeref` (E0614).
+#[test]
+fn recursive_macro_rules_varint_local_hygiene_isolates_arms() {
+    const VARINT_ROOT: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = \"pointee_sized\"]
+pub trait PointeeSized {}
+#[lang = \"meta_sized\"]
+pub trait MetaSized: PointeeSized {}
+#[lang = \"sized\"]
+pub trait Sized: MetaSized {}
+#[lang = \"deref\"]
+pub trait Deref: PointeeSized {
+    #[lang = \"deref_target\"]
+    type Target: PointeeSized;
+    fn deref(&self) -> &Self::Target;
+}
+#[lang = \"deref_mut\"]
+pub trait DerefMut: Deref + PointeeSized {
+    fn deref_mut(&mut self) -> &mut Self::Target;
+}
+
+macro_rules! id {
+    ($e:expr) => { $e };
+}
+
+macro_rules! varint {
+    ($ty:ty, $proto_ty:ident) => (
+        varint!($ty, $proto_ty,
+                to_uint64(value) { *value as u64 },
+                from_uint64(value) { value as $ty });
+    );
+    ($ty:ty, $proto_ty:ident,
+     to_uint64($to_uint64_value:ident) $to_uint64:expr,
+     from_uint64($from_uint64_value:ident) $from_uint64:expr) => (
+        pub mod $proto_ty {
+            pub fn to_u64(value: &$ty) -> u64 {
+                let $to_uint64_value = value;
+                $to_uint64
+            }
+            pub fn merge(value: &mut $ty) {
+                let $from_uint64_value: u64 = 42u64;
+                *value = $from_uint64;
+            }
+            pub fn merge_via_inner_macro(value: &mut $ty) {
+                let $from_uint64_value: u64 = 42u64;
+                *id!(value) = id!($from_uint64);
+            }
+        }
+    );
+}
+
+macro_rules! varint_same_arm {
+    ($ty:ty, $proto_ty:ident) => (
+        pub mod $proto_ty {
+            pub fn merge(value: &mut $ty) {
+                let value: u64 = 42u64;
+                *value = value as $ty;
+            }
+        }
+    );
+}
+
+varint!(i32, int32);
+varint_same_arm!(i32, bad_int32);
+";
+    const VARINT_PATH: &str = "/varint_app/src/main.rs";
+    struct VarintFiles;
+    impl SourceTexts<'static> for VarintFiles {
+        fn read(&self, krate: usize, path: &str) -> Option<&'static str> {
+            (krate == 0 && path == VARINT_PATH).then_some(VARINT_ROOT)
+        }
+    }
+
+    let rust = PackageEdition { syntax: edition::Edition::Edition2021, blaze: None };
+    let lib = implicit(rust, &blaze_unit_graph::UnitKind::Lib);
+    const CFG: &[(&str, Option<&str>)] = &[];
+    let crates = [CrateInput {
+        name: "varint_app",
+        key: CrateItemKey(ContentId::of("front2_token_mark_bodies varint", b"varint_app")),
+        edition: syntax_of(rust),
+        implicit: lib,
+        root: VARINT_PATH,
+        shown_from: "/varint_app/",
+        features: &[],
+        deps: &[],
+        cfg: CFG,
+        script: None,
+    }];
+    let crate_names: &'static [&'static str] = &["varint_app"];
+    let keys: &'static [CrateItemKey] = Vec::leak(crates.iter().map(|c| c.key).collect());
+    let names = resolve_crates(&crates, Sysroot::default(), &VarintFiles, &Serial, blaze_own::testing::bump())
+        .unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    assert!(names.notes(0).is_empty(), "varint_app scope notes must be empty: {:?}", names.notes(0));
+
+    let fn_key = |segments: &[&str]| {
+        Paths { names: &names }
+            .path(names.root(0), false, segments, Ns::Value)
+            .unwrap_or_else(|e| panic!("`{segments:?}` from varint_app root: {e:?}"))
+            .key
+    };
+    let positive_fns = [
+        ("int32::to_u64", Asked::Free(fn_key(&["int32", "to_u64"]))),
+        ("int32::merge", Asked::Free(fn_key(&["int32", "merge"]))),
+        ("int32::merge_via_inner_macro", Asked::Free(fn_key(&["int32", "merge_via_inner_macro"]))),
+    ];
+    let bad_merge = Asked::Free(fn_key(&["bad_int32", "merge"]));
+
+    let mut failed = Vec::new();
+    let sources = [SourceFile { path: "src/main.rs", text: VARINT_ROOT }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+    {
+        let mut front = Front2::new(&names, &frame, &sources, Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
+        let solved = rows(&names, &front.index, &mut front.keys, front.frame, front.index.lang("sized"), &positive_fns, &mut failed);
+        let prepared = Prepares::new_in(blaze_own::testing::bump());
+        let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+        let bad = checked(&names, prepared, &mut front.keys, &front.index, &mut store, bad_merge);
+        println!("front2_token_mark_bodies varint names: {solved}; bad_int32::merge: {bad}");
+        assert!(bad.contains("CantDeref"), "same-arm shadowing must fail with CantDeref (E0614) over names, got: {bad}");
+    }
+
+    let (records, frame) = reader(keys, crate_names, kept_of(&names));
+    let mut front = Front2::from_records(records, frame, &[0]).unwrap_or_else(|e| panic!("front2 over records: {e}"));
+    let over_records = rows(records, &front.index, &mut front.keys, front.frame, front.index.lang("sized"), &positive_fns, &mut failed);
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
+    let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+    let bad_rec = checked(records, prepared, &mut front.keys, &front.index, &mut store, bad_merge);
+    println!("front2_token_mark_bodies varint records: {over_records}; bad_int32::merge: {bad_rec}");
+    assert!(bad_rec.contains("CantDeref"), "same-arm shadowing must fail with CantDeref (E0614) over records, got: {bad_rec}");
+    let errors: Vec<String> = records.errors().iter().map(|e| e.to_string()).collect();
+    assert!(errors.is_empty(), "the records filed {errors:?}");
+    assert!(failed.is_empty(), "recursive varint bodies failed: {failed:?}");
+}

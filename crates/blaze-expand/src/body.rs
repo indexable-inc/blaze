@@ -196,13 +196,14 @@ pub fn body_words<'a>(stream: &TokenStream<'_>, this: ContentId, alloc: Alloc<'a
                 true => tokens[at + 1].ctx,
                 false => token.ctx,
             };
+            let mark = stream.text_mark_of(ctx, this);
             words.push(BodyWord {
                 text: (start, start),
                 token: crate::tokens::index(at),
                 end: crate::tokens::index(at + if quote { 2 } else { 1 }),
-                hygiene: local_hygiene(stream, ctx, this),
+                hygiene: mark.map_or(0, |m| m.hygiene),
                 parent_hygiene: template_parent_hygiene(stream, ctx, this),
-                mark: stream.text_mark(ctx),
+                mark,
                 space_before: !glued,
             });
         }

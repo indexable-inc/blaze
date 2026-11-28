@@ -96,6 +96,7 @@ fn origins_of(call: ItemKey, bump: blaze_own::Bump<'static>) -> &'static [u8] {
             transparency: Transparency::SemiOpaque,
             edition: Edition::E2021,
             local_inner: false,
+            hygiene: 0,
         };
         column.push(start, start + 1, TextOrigin::Def(i as u32), Some(mark)).expect("rows in order");
     }

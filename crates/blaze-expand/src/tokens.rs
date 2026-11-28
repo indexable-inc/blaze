@@ -522,21 +522,25 @@ impl<'a> TokenStream<'a> {
     }
 
     /// The [`crate::origin_column::TextMark`] projected onto rendered text or body words for a
-    /// token of `ctx`: hygiene (`site` and `transparency`) comes from the innermost
-    /// non-transparent mark when one exists (preserving `$crate`, def-site, and local hygiene),
-    /// or else from the innermost [`Transparency::Transparent`] mark (which hygiene consumers
-    /// treat identically to unmarked); `edition` always comes from the innermost mark node so a
-    /// `Transparent` (`Span::call_site()`) proc-macro invoked inside a `SemiOpaque`/`Opaque`
-    /// macro preserves its own defining edition (and vice versa). Returns `None` at a root
-    /// context (tokens written in a file or included via `include!`).
-    pub fn text_mark(&self, ctx: Ctx) -> Option<crate::origin_column::TextMark> {
+    /// token of `ctx` in an expansion keyed by `this`: hygiene (`site` and `transparency`) comes
+    /// from the innermost non-transparent mark when one exists (preserving `$crate`, def-site,
+    /// and local hygiene), or else from the innermost [`Transparency::Transparent`] mark (which
+    /// hygiene consumers treat identically to unmarked); `edition` always comes from the
+    /// innermost mark node so a `Transparent` (`Span::call_site()`) proc-macro invoked inside a
+    /// `SemiOpaque`/`Opaque` macro preserves its own defining edition (and vice versa); and
+    /// `hygiene` carries [`crate::local_hygiene`] across the full non-transparent context chain
+    /// (so tokens from distinct recursive invocations of the same macro stay hygienically
+    /// distinct). Returns `None` at a root context (tokens written in a file or included via
+    /// `include!`).
+    pub fn text_mark_of(&self, ctx: Ctx, this: ContentId) -> Option<crate::origin_column::TextMark> {
         let innermost = self.node(ctx)?.mark;
-        let hygiene = self.non_transparent_mark(ctx).unwrap_or(innermost);
+        let hygiene_mark = self.non_transparent_mark(ctx).unwrap_or(innermost);
         Some(crate::origin_column::TextMark {
-            site: hygiene.site,
-            transparency: hygiene.transparency,
+            site: hygiene_mark.site,
+            transparency: hygiene_mark.transparency,
             edition: innermost.edition,
-            local_inner: hygiene.local_inner,
+            local_inner: hygiene_mark.local_inner,
+            hygiene: crate::body::local_hygiene(self, ctx, this),
         })
     }
 

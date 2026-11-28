@@ -200,7 +200,7 @@ mod tests {
     }
 
     fn mark(transparency: Transparency, module: Option<ItemKey>) -> TextMark {
-        TextMark { site: DefSite { krate: CrateItemKey(ContentId([9; 32])), module }, transparency, edition: Edition::E2021, local_inner: false }
+        TextMark { site: DefSite { krate: CrateItemKey(ContentId([9; 32])), module }, transparency, edition: Edition::E2021, local_inner: false, hygiene: 0 }
     }
 
     /// The Reference, "Macros By Example", Hygiene: a `macro_rules!` (semi-opaque) writes an
@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn local_inner_crate_applies_only_to_single_plain_segment_with_non_transparent_flag() {
         let dep = CrateItemKey(ContentId([9; 32]));
-        let yes = TextMark { site: DefSite { krate: dep, module: None }, transparency: Transparency::SemiOpaque, edition: Edition::E2021, local_inner: true };
+        let yes = TextMark { site: DefSite { krate: dep, module: None }, transparency: Transparency::SemiOpaque, edition: Edition::E2021, local_inner: true, hygiene: 0 };
         let no = TextMark { local_inner: false, ..yes };
         let trans = TextMark { transparency: Transparency::Transparent, ..yes };
         assert_eq!(local_inner_crate(Some(yes), "opts", 1, false), Some(dep));

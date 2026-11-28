@@ -558,6 +558,7 @@ mod tests {
                     transparency: Transparency::Opaque,
                     edition: Edition::E2021,
                     local_inner: false,
+                    hygiene: 0,
                 },
             ));
             ask.clone().carry_marks(marks).need
