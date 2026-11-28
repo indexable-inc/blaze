@@ -19,7 +19,7 @@ blaze-cad-out	1	0	0	0	0	0
 blaze-cad-picture	1	0	0	0	0	0
 blaze-cas	1	3	0	0	1	0
 blaze-check	4	4	0	0	0	0
-blaze-cli	1	16	0	1	1	0
+blaze-cli	1	15	0	1	1	0
 blaze-columns	9	1	0	0	0	0
 blaze-cond	9	1	0	0	0	0
 blaze-consteval	4	3	0	1	0	0

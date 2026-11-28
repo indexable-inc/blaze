@@ -1998,13 +1998,16 @@ fn body_macro_call_inside_macro_rules_inherits_call_site_ctx_hygiene() {
 
     // 1. Body-level `macro_rules!` emitting `let host = 1u32; use_call_site!()` (CallInput::Expanded).
     let run_body_case = |mac_name: &str| {
+        let alloc = blaze_own::testing::heap().alloc();
+        let bump = blaze_own::testing::bump();
         let body_rule = format!("() => {{{{ let host = 1u32; {mac_name}!() }}}}");
-        let def = MacroDefinition::rules(lex(&body_rule, Edition::E2024, Alloc::global()).expect("lex"), at());
-        let def: &'static MacroDefinition<'static> = Box::leak(Box::new(def));
-        let rules: &'static [(&'static str, Prepared<'static>)] = Box::leak(Box::new([("make_body", prepare(def).expect("prepare"))]));
+        let def = MacroDefinition::rules(lex(&body_rule, Edition::E2024, bump.alloc()).expect("lex"), at());
+        let def: &'static MacroDefinition<'static> = bump.alloc_val(def);
+        let rules: &'static [(&'static str, Prepared<'static>)] =
+            bump.alloc_val([("make_body", prepare(def).expect("prepare"))]);
         let lists = crate::by_name::Lists { rules, builtin_at: at(), then: Some(&HygieneProcs) };
-        let mut expander = ByName::with_names(&lists, HygieneProcHost, Alloc::global());
-        let l = crate::lower_body_expanding("fn f() -> u32 { make_body!() }", Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global())
+        let mut expander = ByName::with_names(&lists, HygieneProcHost, alloc);
+        let l = crate::lower_body_expanding("fn f() -> u32 { make_body!() }", Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, alloc)
             .expect("body lowers");
         let v = l.view();
         assert!(v.diags.is_empty(), "{mac_name}: diags {:?}\n{}", v.diags, dump_of(&l));
@@ -2016,6 +2019,7 @@ fn body_macro_call_inside_macro_rules_inherits_call_site_ctx_hygiene() {
 
     // 2. Item-level macro-written body calling a body-level proc-macro (`CallInput::Text` + `ItemMarks`).
     let run_item_marked_case = |mac_name: &str| {
+        let alloc = blaze_own::testing::heap().alloc();
         let text = format!("fn f() -> u32 {{ let host = 1u32; {mac_name}!() }}");
         let host_at = u32::try_from(text.find("host").expect("host")).expect("short");
         let call_at = u32::try_from(text.find(mac_name).expect("call")).expect("short");
@@ -2026,16 +2030,16 @@ fn body_macro_call_inside_macro_rules_inherits_call_site_ctx_hygiene() {
             local_inner: false,
             hygiene: 0,
         };
-        let mut col = blaze_expand::origin_column::OriginColumn::new_in(Alloc::global());
+        let mut col = blaze_expand::origin_column::OriginColumn::new_in(alloc);
         col.push(host_at as usize, host_at as usize + 4, blaze_expand::origin_column::TextOrigin::Made, Some(mark)).expect("push host");
         col.push(call_at as usize, call_at as usize + mac_name.len(), blaze_expand::origin_column::TextOrigin::Made, Some(mark)).expect("push call");
-        let mut bytes = AVec::new_in(Alloc::global());
+        let mut bytes = AVec::new_in(alloc);
         col.write(&mut bytes).expect("write");
         let (origins, _) = blaze_expand::origin_column::OriginsRef::open(&bytes).expect("open");
         let marks = crate::mark_site::ItemMarks::of(&text, blaze_scope::crate_roots::TextMarks { text: &text, column: origins }).expect("marks");
         let lists = crate::by_name::Lists { rules: &[], builtin_at: at(), then: Some(&HygieneProcs) };
-        let mut expander = ByName::with_names(&lists, HygieneProcHost, Alloc::global());
-        let l = crate::lower_body_expanding_marked(marks, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global())
+        let mut expander = ByName::with_names(&lists, HygieneProcHost, alloc);
+        let l = crate::lower_body_expanding_marked(marks, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, alloc)
             .expect("marked body lowers");
         let v = l.view();
         assert!(v.diags.is_empty(), "{mac_name} (item-marked): diags {:?}\n{}", v.diags, dump_of(&l));

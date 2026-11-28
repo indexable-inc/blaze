@@ -1172,8 +1172,6 @@ impl<'a> ReaderIndex<'a> for Mapped<'a> {
 mod compact_reader_edits_tests {
     use super::*;
     use blaze_id::ContentId;
-    use std::collections::BTreeMap as StdMap;
-    use std::vec::Vec as StdVec;
 
     fn mk_name(kind: Kind, n: u32) -> Name {
         Name::new(kind, ContentId::of("compact reader edits name", &n.to_le_bytes()))
@@ -1185,8 +1183,11 @@ mod compact_reader_edits_tests {
         CellId { of: mk_name(kind, owner), cell: Cell(bytes) }
     }
 
-    fn collect_via_iter(edits: &ReaderEdits<'_>) -> StdVec<((CellId, Name), bool)> {
-        let mut out = StdVec::new();
+    fn collect_via_iter<'a>(
+        edits: &ReaderEdits<'_>,
+        alloc: SharedAlloc<'a>,
+    ) -> Vec<((CellId, Name), bool), SharedAlloc<'a>> {
+        let mut out = Vec::new_in(alloc);
         for (id, delta) in edits.iter() {
             for (reader, reads) in delta.iter() {
                 out.push(((id, reader), reads));
@@ -1200,7 +1201,7 @@ mod compact_reader_edits_tests {
         let alloc = blaze_own::testing::heap().shared();
         let mut paired = Paired::new_in(alloc, Plant::None);
         let mut mapped = Mapped::new_in(alloc, Plant::None);
-        let mut oracle: StdMap<(CellId, Name), bool> = StdMap::new();
+        let mut oracle: SMap<'_, (CellId, Name), bool> = SMap::new_in(alloc);
 
         // 10,000 edges across 100 unique cells and 100 unique reader names, with overwrites
         // and deletions (`reads = false`).
@@ -1229,7 +1230,9 @@ mod compact_reader_edits_tests {
 
         let compact = paired.finish(alloc);
         let flat = mapped.finish(alloc);
-        let expected: StdVec<((CellId, Name), bool)> = oracle.iter().map(|(&k, &v)| (k, v)).collect();
+        let mut expected = Vec::new_in(alloc);
+        expected.extend(oracle.iter().map(|(&k, &v)| (k, v)));
+        expected.sort_unstable_by_key(|&(k, _)| k);
 
         assert_eq!(compact.len(), 10_000);
         assert!(!compact.is_empty());
@@ -1248,9 +1251,9 @@ mod compact_reader_edits_tests {
         assert!(compact.byte_size() * 5 < flat.byte_size(), "compact ({}) must be >5x smaller than flat ({})", compact.byte_size(), flat.byte_size());
 
         // Exact ordering & element equivalence via iter(), pairs(), and get(i).
-        assert_eq!(collect_via_iter(&compact), expected);
-        assert_eq!(collect_via_iter(&flat), expected);
-        assert_eq!(compact.pairs().collect::<StdVec<_>>(), expected);
+        assert_eq!(collect_via_iter(&compact, alloc).as_slice(), expected.as_slice());
+        assert_eq!(collect_via_iter(&flat, alloc).as_slice(), expected.as_slice());
+        assert!(compact.pairs().eq(expected.iter().copied()));
         for (i, &want) in expected.iter().enumerate() {
             assert_eq!(compact.get(i), Some(want));
             assert_eq!(flat.get(i), Some(want));
@@ -1271,7 +1274,7 @@ mod compact_reader_edits_tests {
         let dc = compact.edits_of(present).expect("present cell in compact");
         let df = flat.edits_of(present).expect("present cell in flat");
         assert_eq!(dc.len(), df.len());
-        assert_eq!(dc.iter().collect::<StdVec<_>>(), df.iter().collect::<StdVec<_>>());
+        assert!(dc.iter().eq(df.iter()));
         for r in 0..100u32 {
             let reader = mk_name(Kind::BodyCheck, r);
             assert_eq!(dc.get(&reader), df.get(&reader));
@@ -1329,7 +1332,7 @@ mod compact_reader_edits_tests {
         let filter = |id: CellId, reader: Name, _added: bool| -> Result<bool, ()> { Ok(!(id == c1 && reader == r1)) };
         old_c.try_retain(filter).expect("retain compact");
         old_f.try_retain(filter).expect("retain flat");
-        assert_eq!(old_c.pairs().collect::<StdVec<_>>(), old_f.pairs().collect::<StdVec<_>>());
+        assert!(old_c.pairs().eq(old_f.pairs()));
 
         let mut p_new = Paired::new_in(alloc, Plant::None);
         p_new.write(c0, r0, false);
@@ -1343,7 +1346,7 @@ mod compact_reader_edits_tests {
 
         let merged_cc = ReaderEdits::merge_newer(old_c, new_c, alloc);
         let merged_ff = ReaderEdits::merge_newer(old_f, new_f, alloc);
-        assert_eq!(merged_cc.pairs().collect::<StdVec<_>>(), merged_ff.pairs().collect::<StdVec<_>>());
+        assert!(merged_cc.pairs().eq(merged_ff.pairs()));
         assert_eq!(merged_cc.len(), 3);
         assert_eq!(merged_cc.edits_of(c0).and_then(|d| d.get(&r0)), Some(false));
         assert_eq!(merged_cc.edits_of(c1).and_then(|d| d.get(&r2)), Some(false));

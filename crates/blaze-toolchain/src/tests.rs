@@ -199,7 +199,8 @@ fn wasm64_target_cfg_and_desc_append_getrandom_custom_without_duplicates() {
     let bytes = record::write(&[], &targets, alloc).expect("record");
     let view = ToolchainView::open(bytes.as_slice(), ToolchainView::id_of_bytes(bytes.as_slice())).expect("view");
 
-    let wasm_atoms: std::vec::Vec<_> = crate::target_cfg(&view, crate::WASM64_TARGET).expect("wasm64 cfg").collect();
+    let mut wasm_atoms = blaze_own::Vec::new_in(alloc);
+    wasm_atoms.extend(crate::target_cfg(&view, crate::WASM64_TARGET).expect("wasm64 cfg"));
     assert_eq!(
         wasm_atoms.iter().filter(|&&a| a == ("getrandom_backend", Some("custom"))).count(),
         1,
@@ -217,7 +218,8 @@ fn wasm64_target_cfg_and_desc_append_getrandom_custom_without_duplicates() {
     );
 
     // Negative control: non-wasm64 targets must NOT receive wasm64 extra cfgs.
-    let host_atoms: std::vec::Vec<_> = crate::target_cfg(&view, "aarch64-apple-darwin").expect("host cfg").collect();
+    let mut host_atoms = blaze_own::Vec::new_in(alloc);
+    host_atoms.extend(crate::target_cfg(&view, "aarch64-apple-darwin").expect("host cfg"));
     assert!(
         !host_atoms.iter().any(|&(k, _)| k == "getrandom_backend"),
         "non-wasm64 target must not get getrandom_backend: {host_atoms:?}"
@@ -235,7 +237,8 @@ fn wasm64_target_cfg_and_desc_append_getrandom_custom_without_duplicates() {
     let targets_dedup = [TargetIn { triple: crate::WASM64_TARGET, units: &[], cfg: &already_cfg }];
     let bytes_dedup = record::write(&[], &targets_dedup, alloc).expect("record dedup");
     let view_dedup = ToolchainView::open(bytes_dedup.as_slice(), ToolchainView::id_of_bytes(bytes_dedup.as_slice())).expect("view dedup");
-    let dedup_atoms: std::vec::Vec<_> = crate::target_cfg(&view_dedup, crate::WASM64_TARGET).expect("dedup cfg").collect();
+    let mut dedup_atoms = blaze_own::Vec::new_in(alloc);
+    dedup_atoms.extend(crate::target_cfg(&view_dedup, crate::WASM64_TARGET).expect("dedup cfg"));
     assert_eq!(
         dedup_atoms.iter().filter(|&&a| a == ("getrandom_backend", Some("custom"))).count(),
         1,

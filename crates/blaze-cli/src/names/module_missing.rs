@@ -124,7 +124,9 @@ mod tests {
         }
     }
 
-    fn run_findings(files: &'static [(&'static str, &'static str)]) -> std::vec::Vec<(u16, (u32, u32), std::vec::Vec<u8>)> {
+    fn run_findings(
+        files: &'static [(&'static str, &'static str)],
+    ) -> blaze_own::Vec<(u16, (u32, u32), blaze_own::Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>> {
         let texts = Texts(files);
         let input = CrateInput {
             key: CrateItemKey(ContentId([1; 32])),
@@ -141,10 +143,11 @@ mod tests {
         let sb = bstd::mem::SharedBump::new(4 * 1024 * 1024, bstd::mem::Tag::Nameres).expect("bump");
         let names = resolve_crates(&[input], Sysroot::default(), &texts, &Serial, blaze_own::Bump::of(&sb)).expect("resolves");
         let kept = blaze_own::testing::heap().shared();
-        findings(names.krate(0), kept)
-            .iter()
-            .map(|f| (f.rule, f.at, f.message.to_vec()))
-            .collect()
+        let mut out = blaze_own::Vec::new_in(kept);
+        for f in findings(names.krate(0), kept).iter() {
+            out.push((f.rule, f.at, blaze_own::Vec::from_slice_in(f.message.as_slice(), kept)));
+        }
+        out
     }
 
     #[test]
