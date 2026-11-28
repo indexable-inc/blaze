@@ -521,7 +521,7 @@ pub(crate) fn export_as(cx: &mut Exporter<'_, '_, '_>, t: Ty, ground: &mut Porta
     enum Kind {
         Future(crate::ids::ExprId),
         Tuple,
-        Record(crate::ids::RecordSchema),
+        Record(crate::ids::RecordSchema, u64),
         Union,
         Ref(crate::ids::Mutbl),
         Ptr(crate::ids::Mutbl),
@@ -548,13 +548,17 @@ pub(crate) fn export_as(cx: &mut Exporter<'_, '_, '_>, t: Ty, ground: &mut Porta
         extra: Option<Ty>,
     }
     fn finish(ground: &mut PortableTys<'_>, kind: Kind, slice: &[PTy]) -> Result<Option<PTy>, CheckError> {
+        if let Kind::Record(s, d) = kind {
+            let l = ground.intern_list(slice)?;
+            return Ok(Some(ground.intern_record_with_defaults(s, l, d)?));
+        }
         let n = match kind {
             Kind::Future(e) => {
                 let [o, i] = *slice else { return Ok(None) };
                 PNode::Future(e, o, i)
             }
             Kind::Tuple => PNode::Tuple(ground.intern_list(slice)?),
-            Kind::Record(s) => PNode::Record(s, ground.intern_list(slice)?),
+            Kind::Record(s, _) => PNode::Record(s, ground.intern_list(slice)?),
             Kind::Union => PNode::Union(ground.intern_list(slice)?),
             Kind::Ref(m) => {
                 let Some(&p) = slice.first() else { return Ok(None) };
@@ -675,7 +679,7 @@ pub(crate) fn export_as(cx: &mut Exporter<'_, '_, '_>, t: Ty, ground: &mut Porta
             view => {
                 let (kind, l) = match view {
                     TyView::Tuple(l) => (Kind::Tuple, l),
-                    TyView::Record(s, l) => (Kind::Record(s), l),
+                    TyView::Record(s, l) => (Kind::Record(s, cx.record_defaults_tag(resolved)), l),
                     TyView::Union(l) => (Kind::Union, l),
                     TyView::Adt(k, l) => (Kind::Adt(k), l),
                     TyView::FnDef(k, l) => (Kind::FnDef(k), l),
@@ -1324,5 +1328,95 @@ mod tests {
             export(&mut cx.exporter(), value, &mut table, MAX_DEPTH),
             Err(CheckError::Limit(Limit::InstanceExportDepth { node: child, depth: MAX_DEPTH + 1, limit: MAX_DEPTH })),
         );
+    }
+
+    #[test]
+    fn normalize_projection_and_resolve_instance_preserve_record_defaults_tag() {
+        use crate::ids::{Name, RecordSchema};
+
+        const TAG_A: u64 = 0xAAAA_1111_2222_3333;
+        const TAG_B: u64 = 0xBBBB_4444_5555_6666;
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut world = crate::fixture::Fx::new();
+        let u8_t = world.u8();
+        let usize_t = world.usize();
+        let unit = world.unit();
+        let schema = RecordSchema::of_sorted_names(&[Name::of("buf")]);
+        world.t.register_record_schema(schema, &[Name::of("buf")]).expect("schema");
+
+        // `trait Assoc { type Out; }`
+        let assoc_tr = world.tr("Assoc", 1, std::vec![], &["Out"]);
+        let carrier_a = world.strukt("CarrierA", 1, &[]);
+        world.const_param(carrier_a, 0, usize_t);
+        let carrier_b = world.strukt("CarrierB", 1, &[]);
+        world.const_param(carrier_b, 0, usize_t);
+        let carrier_plain = world.strukt("CarrierPlain", 1, &[]);
+        world.const_param(carrier_plain, 0, usize_t);
+
+        let n_param = world.ty(PNode::ConstParam(0));
+        let arr_n = world.ty(PNode::Array(u8_t, n_param));
+        let rec_fields_n = world.list(&[arr_n]);
+        let rec_n_a = world.t.intern_record_with_defaults(schema, rec_fields_n, TAG_A).expect("rec_n_a");
+        let rec_n_b = world.t.intern_record_with_defaults(schema, rec_fields_n, TAG_B).expect("rec_n_b");
+        let rec_n_plain = world.t.intern_record_with_defaults(schema, rec_fields_n, 0).expect("rec_n_plain");
+
+        let self_a = crate::fixture::Fx::adt(&mut world, carrier_a, &[n_param]);
+        let imp_a = world.imp("impl_assoc_a", 1, self_a, Some((assoc_tr, &[])), &[("Out", rec_n_a)], std::vec![]);
+        world.const_param(imp_a, 0, usize_t);
+
+        let self_b = crate::fixture::Fx::adt(&mut world, carrier_b, &[n_param]);
+        let imp_b = world.imp("impl_assoc_b", 1, self_b, Some((assoc_tr, &[])), &[("Out", rec_n_b)], std::vec![]);
+        world.const_param(imp_b, 0, usize_t);
+
+        let self_plain = crate::fixture::Fx::adt(&mut world, carrier_plain, &[n_param]);
+        let imp_plain = world.imp("impl_assoc_plain", 1, self_plain, Some((assoc_tr, &[])), &[("Out", rec_n_plain)], std::vec![]);
+        world.const_param(imp_plain, 0, usize_t);
+
+        // `trait Take { fn take(self); }` with `impl<T> Take for Wrap<T>`.
+        let take_tr = world.tr("Take", 1, std::vec![], &[]);
+        let trait_take = world.trait_fn(take_tr, "take", true, &[], unit);
+        let wrap = world.strukt("Wrap", 1, &[]);
+        let t_param = world.param(0);
+        let wrap_t = crate::fixture::Fx::adt(&mut world, wrap, &[t_param]);
+        let imp_wrap = world.imp("impl_take_wrap", 1, wrap_t, Some((take_tr, &[])), &[], std::vec![]);
+        let impl_take = world.impl_fn(imp_wrap, "take", true, &[], unit);
+
+        world.finish();
+
+        let mut ground = world.t.fork_in(alloc).expect("ground");
+        let c4 = ground.intern(PNode::ConstValue { ty: usize_t, bits: 4 }).expect("4usize");
+        let c4_list = ground.intern_list(&[c4]).expect("c4_list");
+        let arg_a = ground.intern(PNode::Adt(carrier_a, c4_list)).expect("CarrierA<4>");
+        let arg_b = ground.intern(PNode::Adt(carrier_b, c4_list)).expect("CarrierB<4>");
+        let arg_plain = ground.intern(PNode::Adt(carrier_plain, c4_list)).expect("CarrierPlain<4>");
+
+        // 1) `normalize_projection` preserves distinct tags and keeps plain records untagged (0).
+        let out_a = normalize_projection(&world, assoc_tr, Name::of("Out"), &[arg_a], &mut ground, alloc)
+            .expect("normalize CarrierA<4>::Out")
+            .expect("ground Out A");
+        let out_b = normalize_projection(&world, assoc_tr, Name::of("Out"), &[arg_b], &mut ground, alloc)
+            .expect("normalize CarrierB<4>::Out")
+            .expect("ground Out B");
+        let out_plain = normalize_projection(&world, assoc_tr, Name::of("Out"), &[arg_plain], &mut ground, alloc)
+            .expect("normalize CarrierPlain<4>::Out")
+            .expect("ground Out plain");
+
+        assert_eq!(ground.view().record_defaults_tag(out_a), TAG_A, "normalize_projection must preserve TAG_A");
+        assert_eq!(ground.view().record_defaults_tag(out_b), TAG_B, "normalize_projection must preserve TAG_B");
+        assert_eq!(ground.view().record_defaults_tag(out_plain), 0, "plain record without defaults must remain untagged (0)");
+        assert_ne!(out_a, out_b, "distinct defaults tags must export to distinct PTy nodes");
+        assert_ne!(out_a, out_plain, "tagged and plain records must export to distinct PTy nodes");
+
+        // 2) `resolve_instance` preserves defaults_tag when exporting impl arguments.
+        for (rec_ty, expected_tag, label) in [(out_a, TAG_A, "TAG_A"), (out_b, TAG_B, "TAG_B"), (out_plain, 0, "plain")] {
+            let wrap_args = ground.intern_list(&[rec_ty]).expect("wrap args");
+            let wrap_rec = ground.intern(PNode::Adt(wrap, wrap_args)).expect("Wrap<Rec>");
+            let call_args = ground.intern_list(&[wrap_rec]).expect("call args");
+            let resolved = resolve_instance(&world, trait_take, call_args, &mut ground, alloc).expect("resolve_instance");
+            assert_eq!(resolved.item, impl_take, "{label}: resolved impl method");
+            let impl_arg = ground.view().list(resolved.args).expect("resolved args")[0];
+            assert_eq!(ground.view().record_defaults_tag(impl_arg), expected_tag, "resolve_instance must preserve {label}");
+        }
     }
 }
